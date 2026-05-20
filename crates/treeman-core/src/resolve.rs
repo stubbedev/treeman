@@ -634,7 +634,7 @@ mod tests {
         cfg.connections.mysql = Some(MysqlConn {
             host: "127.0.0.1".into(),
             port: 3306,
-            user: "kontainer".into(),
+            user: "myapp".into(),
             password_env: Some("DB_TEST_PASSWORD".into()),
             password: None,
             pool_max: 8,

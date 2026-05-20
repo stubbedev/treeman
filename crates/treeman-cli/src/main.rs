@@ -130,9 +130,9 @@ Treeman — pure-wire per-worktree DB orchestrator.
 Common flows:
   treeman init                       # generate .treeman.yaml from detected framework
   treeman daemon start               # ensure treemand running
-  treeman wt create KON-1234         # git worktree add + DB scoping + prepare
+  treeman wt create PROJ-1234        # git worktree add + DB scoping + prepare
   treeman watcher start              # daemon-managed migration file watcher
-  treeman wt delete KON-1234         # predelete hook + DB teardown + git worktree remove
+  treeman wt delete PROJ-1234        # predelete hook + DB teardown + git worktree remove
 
 Tab completions:
   treeman completions zsh > _treeman    # then drop on fpath / source
@@ -2678,8 +2678,8 @@ fn init_cmd(args: InitArgs) -> Result<()> {
 # so the modeline above lights up YAML completions in your editor.
 #
 # Template keys available in env_scoping.patches and *_template fields:
-#   {{slug}}              — e.g. kon_1234  (from KON-1234 branch/dir)
-#   {{slug_dash}}         — e.g. kon-1234  (S3/minio-safe, no underscores)
+#   {{slug}}              — e.g. proj_1234 (from PROJ-1234 branch/dir)
+#   {{slug_dash}}         — e.g. proj-1234 (S3/minio-safe, no underscores)
 #   {{slug_redis_queue}}  — redis db index 6..15, deterministic from slug
 #   {{slug_redis_cache}}  — second redis db index, distinct from queue
 #   {{n}}                 — replica index, only valid inside paratest.name_template

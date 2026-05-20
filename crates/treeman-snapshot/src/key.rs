@@ -82,7 +82,7 @@ mod tests {
         let mut k = SnapshotKey::new(
             "mysql",
             "8.0.30",
-            "kontainer_testing_kon_1234",
+            "myapp_testing_proj_1234",
             "laravel",
             "filename",
             "abc123".into(),

@@ -135,7 +135,7 @@ server_id              = 1   # any nonzero
 and grants on the user `connections.mysql.user`:
 
 ```sql
-GRANT REPLICATION SLAVE, RELOAD ON *.* TO 'kontainer'@'%';
+GRANT REPLICATION SLAVE, RELOAD ON *.* TO 'treeman'@'%';
 ```
 
 When the source MySQL has binlog disabled, the watcher falls back to

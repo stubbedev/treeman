@@ -142,16 +142,16 @@ mod tests {
     fn ticket_in_branch_wins() {
         let s = slug_for(
             &PathBuf::from("/tmp/random-dir"),
-            Some("feature/KON-1234-foo"),
+            Some("feature/PROJ-1234-foo"),
         );
-        assert_eq!(s.value, "kon_1234");
+        assert_eq!(s.value, "proj_1234");
         assert_eq!(s.source, SlugSource::Ticket);
     }
 
     #[test]
     fn ticket_in_path_basename() {
-        let s = slug_for(&PathBuf::from("/tmp/KON-9001-bar"), None);
-        assert_eq!(s.value, "kon_9001");
+        let s = slug_for(&PathBuf::from("/tmp/PROJ-9001-bar"), None);
+        assert_eq!(s.value, "proj_9001");
     }
 
     #[test]
@@ -165,16 +165,16 @@ mod tests {
     #[test]
     fn slug_dashed_replaces_underscores() {
         let s = Slug {
-            value: "kon_1234".into(),
+            value: "proj_1234".into(),
             source: SlugSource::Ticket,
         };
-        assert_eq!(s.dashed(), "kon-1234");
+        assert_eq!(s.dashed(), "proj-1234");
     }
 
     #[test]
     fn redis_indices_in_range_6_15() {
         let s = Slug {
-            value: "kon_1234".into(),
+            value: "proj_1234".into(),
             source: SlugSource::Ticket,
         };
         let (q, c) = s.redis_indices();
@@ -184,10 +184,10 @@ mod tests {
 
     #[test]
     fn sysv_cksum_known_vectors() {
-        // `printf '' | cksum`              => 4294967295 (0xFFFFFFFF), 0
-        // `printf 'a' | cksum`             => 1220704766, 1
-        // `printf 'abc' | cksum`           => 1219131554, 3
-        // `printf 'kon_1234' | cksum`      => verified via `printf 'kon_1234' | cksum` on linux
+        // Cross-checked against POSIX `cksum`:
+        //   `printf '' | cksum`     => 4294967295 (0xFFFFFFFF), 0
+        //   `printf 'a' | cksum`    => 1220704766, 1
+        //   `printf 'abc' | cksum`  => 1219131554, 3
         assert_eq!(sysv_cksum(b""), 4294967295);
         assert_eq!(sysv_cksum(b"a"), 1220704766);
         assert_eq!(sysv_cksum(b"abc"), 1219131554);

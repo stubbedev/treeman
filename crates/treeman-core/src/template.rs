@@ -83,7 +83,7 @@ mod tests {
 
     fn ctx() -> TemplateContext {
         TemplateContext::from_slug(&Slug {
-            value: "kon_1234".into(),
+            value: "proj_1234".into(),
             source: SlugSource::Ticket,
         })
     }
@@ -92,12 +92,12 @@ mod tests {
     fn renders_known_keys() {
         let c = ctx();
         assert_eq!(
-            render("kontainer_testing_{slug}", &c).unwrap(),
-            "kontainer_testing_kon_1234"
+            render("myapp_testing_{slug}", &c).unwrap(),
+            "myapp_testing_proj_1234"
         );
         assert_eq!(
             render("phpunit-{slug_dash}-", &c).unwrap(),
-            "phpunit-kon-1234-"
+            "phpunit-proj-1234-"
         );
     }
 
