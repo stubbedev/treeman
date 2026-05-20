@@ -1,12 +1,6 @@
-/target
-Cargo.lock.bak
-*.swp
 .direnv/
 .envrc.local
+*.swp
 
 # Go build output
 /bin/
-
-# Per-user cargo override (linker swap, sccache, etc.) — see
-# .cargo/config.toml for opt-in instructions.
-/.cargo/config.local.toml

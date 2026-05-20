@@ -8,64 +8,46 @@ on:
 permissions:
   contents: write
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: short
-
 jobs:
   build:
-    name: build (${{ matrix.target }})
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - goos: linux
+            goarch: amd64
             os: ubuntu-latest
-            cross: false
-          - target: aarch64-unknown-linux-gnu
+          - goos: linux
+            goarch: arm64
             os: ubuntu-latest
-            cross: true
-          - target: x86_64-apple-darwin
-            # macos-13 (Intel) runners are scarce + deprecated; cross-
-            # compile from arm64 instead. Apple SDK ships both slices.
+          - goos: darwin
+            goarch: amd64
             os: macos-latest
-            cross: false
-          - target: aarch64-apple-darwin
+          - goos: darwin
+            goarch: arm64
             os: macos-latest
-            cross: false
-
     steps:
       - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
         with:
-          targets: ${{ matrix.target }}
+          go-version-file: go.mod
+          cache: true
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Install cross (linux aarch64 only)
-        if: ${{ matrix.cross }}
-        run: cargo install cross --locked --version 0.2.5
-
-      - name: Build (cross)
-        if: ${{ matrix.cross }}
-        run: cross build --release --workspace --target ${{ matrix.target }}
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
-        run: cargo build --release --workspace --target ${{ matrix.target }}
-
-      - name: Package
+      - name: Build
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          STAGE="treeman-${VERSION}-${{ matrix.target }}"
+          STAGE="treeman-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}"
           mkdir -p "dist/$STAGE"
-          cp target/${{ matrix.target }}/release/treeman   "dist/$STAGE/"
-          cp target/${{ matrix.target }}/release/treemand  "dist/$STAGE/"
+          export CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
+          go build -trimpath \
+            -ldflags="-s -w -X github.com/stubbedev/treeman/internal/version.Version=${VERSION}" \
+            -o "dist/$STAGE/treeman"  ./cmd/treeman
+          go build -trimpath \
+            -ldflags="-s -w -X github.com/stubbedev/treeman/internal/version.Version=${VERSION}" \
+            -o "dist/$STAGE/treemand" ./cmd/treemand
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/$STAGE/" 2>/dev/null || true
           cd dist
           tar -czf "${STAGE}.tar.gz" "$STAGE"
@@ -73,7 +55,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/treeman-*.tar.gz*
           retention-days: 7
 
@@ -83,18 +65,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - name: Collect artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-
-      - name: Show
-        run: ls -la dist/
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
+      - run: ls -la dist/
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
