@@ -1915,25 +1915,48 @@ async fn watch(args: WatchArgs) -> Result<()> {
                     ).await;
                     if !matches!(dispatch, treeman_watcher::Dispatch::Noop) {
                         let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
-                        match treeman_prepare::run(
-                            &cfg, &repo_root, &slug, &pool, repo_id, wt_id,
-                        ).await {
-                            Ok(outs) => for o in outs {
-                                let label = if o.cache_hit {
-                                    paint("cache_hit", Style::new().cyan())
-                                } else {
-                                    paint("rebuilt", Style::new().yellow())
-                                };
-                                println!("  prepare[{}] src={} ({label})", o.engine, o.source_db);
-                            },
-                            Err(e) => {
-                                eprintln!("prepare error: {e:#}");
-                                let _ = treeman_store::write_event(
-                                    &pool, "error", "prepare_error",
-                                    Some(&e.to_string()),
-                                    Some(repo_id), Some(wt_id), None, None, "{}",
-                                ).await;
+                        let res: Result<(), anyhow::Error> = match &dispatch {
+                            treeman_watcher::Dispatch::Delta(_) => {
+                                match treeman_prepare::delta_run(
+                                    &cfg, &repo_root, &slug, &pool, repo_id, wt_id,
+                                ).await {
+                                    Ok(outs) => {
+                                        for o in outs {
+                                            let label = paint("delta", Style::new().green());
+                                            println!("  {label} [{}] src={} clones={}",
+                                                o.engine, o.source_db, o.clones.len());
+                                        }
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(e),
+                                }
                             }
+                            _ => {
+                                match treeman_prepare::run(
+                                    &cfg, &repo_root, &slug, &pool, repo_id, wt_id,
+                                ).await {
+                                    Ok(outs) => {
+                                        for o in outs {
+                                            let label = if o.cache_hit {
+                                                paint("cache_hit", Style::new().cyan())
+                                            } else {
+                                                paint("rebuilt", Style::new().yellow())
+                                            };
+                                            println!("  prepare[{}] src={} ({label})", o.engine, o.source_db);
+                                        }
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                        };
+                        if let Err(e) = res {
+                            eprintln!("prepare error: {e:#}");
+                            let _ = treeman_store::write_event(
+                                &pool, "error", "prepare_error",
+                                Some(&e.to_string()),
+                                Some(repo_id), Some(wt_id), None, None, "{}",
+                            ).await;
                         }
                     }
                 }

@@ -42,6 +42,241 @@ pub struct PrepareOutcome {
     pub clones: Vec<String>,
 }
 
+/// Incremental "delta" path. Run the framework's pending migrations
+/// against the source DB and every paratest clone, skipping the full
+/// rebuild. Triggered by the watcher when `Dispatch::Delta` fires
+/// (newly-added migration files only).
+///
+/// This is the practical alternative to binlog row-event replay:
+/// every supported framework already tracks applied migrations, so a
+/// pending-only invocation against each clone is idempotent and
+/// orders-of-magnitude faster than wiping + reseeding + re-cloning.
+pub async fn delta_run(
+    cfg: &Config,
+    repo_root: &Path,
+    slug: &Slug,
+    sqlite: &SqlitePool,
+    repo_id: i64,
+    worktree_id: i64,
+) -> Result<Vec<DeltaOutcome>> {
+    let ctx = TemplateContext::from_slug(slug);
+    let mut outcomes = Vec::new();
+    for d in &cfg.databases {
+        let outcome = match d {
+            DatabaseConfig::Mysql {
+                name_template,
+                migrations,
+                paratest,
+                ..
+            }
+            | DatabaseConfig::Mariadb {
+                name_template,
+                migrations,
+                paratest,
+                ..
+            }
+            | DatabaseConfig::Tidb {
+                name_template,
+                migrations,
+                paratest,
+                ..
+            }
+            | DatabaseConfig::Postgres {
+                name_template,
+                migrations,
+                paratest,
+                ..
+            }
+            | DatabaseConfig::Cockroach {
+                name_template,
+                migrations,
+                paratest,
+                ..
+            } => {
+                let engine = engine_name_for(d);
+                let Some(mspec) = migrations.as_ref() else {
+                    info!(engine, "no migrations: skipping delta");
+                    continue;
+                };
+                let source_db = render(name_template, &ctx)?;
+                let clones = resolve_clone_names(paratest.as_ref(), slug, repo_root)?;
+                run_delta(
+                    engine,
+                    &source_db,
+                    &clones,
+                    mspec,
+                    repo_root,
+                    sqlite,
+                    repo_id,
+                    worktree_id,
+                )
+                .await?
+            }
+            _ => continue,
+        };
+        outcomes.push(outcome);
+    }
+    Ok(outcomes)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaOutcome {
+    pub engine: String,
+    pub source_db: String,
+    pub clones: Vec<String>,
+    pub migrate_exit_codes: Vec<i32>,
+}
+
+fn engine_name_for(d: &DatabaseConfig) -> &'static str {
+    match d {
+        DatabaseConfig::Mysql { .. } => "mysql",
+        DatabaseConfig::Mariadb { .. } => "mariadb",
+        DatabaseConfig::Tidb { .. } => "tidb",
+        DatabaseConfig::Postgres { .. } => "postgres",
+        DatabaseConfig::Cockroach { .. } => "cockroach",
+        _ => "other",
+    }
+}
+
+fn resolve_clone_names(
+    paratest: Option<&ParatestSpec>,
+    slug: &Slug,
+    repo_root: &Path,
+) -> Result<Vec<String>> {
+    let Some(p) = paratest else { return Ok(vec![]) };
+    let n = match p.clones {
+        ClonesSetting::Fixed(v) => v,
+        ClonesSetting::Auto => treeman_migrations::testfw::detected_clone_count(repo_root)
+            .unwrap_or_else(treeman_snapshot::auto_clones),
+    };
+    if n == 0 {
+        return Ok(vec![]);
+    }
+    let base_ctx = TemplateContext::from_slug(slug);
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 1..=n {
+        let ctx = base_ctx.clone().with_n(i);
+        out.push(render(&p.name_template, &ctx)?);
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_delta(
+    engine: &'static str,
+    source_db: &str,
+    clones: &[String],
+    mspec: &MigrationSpec,
+    repo_root: &Path,
+    sqlite: &SqlitePool,
+    repo_id: i64,
+    worktree_id: i64,
+) -> Result<DeltaOutcome> {
+    let mut codes = Vec::new();
+    // Source first — frameworks track state, so subsequent clone runs
+    // pick up the same pending set.
+    let out = run_migration(
+        &mspec.framework,
+        repo_root,
+        source_db,
+        MigrateMode::Pending,
+        &[],
+    )
+    .await?;
+    codes.push(out.exit_code);
+    if out.exit_code != 0 {
+        emit(
+            sqlite,
+            "error",
+            "delta_migrate",
+            engine,
+            source_db,
+            repo_id,
+            worktree_id,
+            &out.stderr_tail,
+        )
+        .await;
+        anyhow::bail!(
+            "delta migrate failed on source {source_db}: exit {} — {}",
+            out.exit_code,
+            out.stderr_tail
+        );
+    }
+
+    for clone in clones {
+        let out = run_migration(
+            &mspec.framework,
+            repo_root,
+            clone,
+            MigrateMode::Pending,
+            &[],
+        )
+        .await?;
+        codes.push(out.exit_code);
+        if out.exit_code != 0 {
+            emit(
+                sqlite,
+                "error",
+                "delta_migrate",
+                engine,
+                clone,
+                repo_id,
+                worktree_id,
+                &out.stderr_tail,
+            )
+            .await;
+            anyhow::bail!(
+                "delta migrate failed on clone {clone}: exit {} — {}",
+                out.exit_code,
+                out.stderr_tail
+            );
+        }
+    }
+    emit(
+        sqlite,
+        "info",
+        "delta_done",
+        engine,
+        source_db,
+        repo_id,
+        worktree_id,
+        &format!("clones={}", clones.len()),
+    )
+    .await;
+    Ok(DeltaOutcome {
+        engine: engine.into(),
+        source_db: source_db.into(),
+        clones: clones.to_vec(),
+        migrate_exit_codes: codes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit(
+    sqlite: &SqlitePool,
+    level: &str,
+    event_type: &str,
+    engine: &str,
+    target: &str,
+    repo_id: i64,
+    worktree_id: i64,
+    message: &str,
+) {
+    let payload = serde_json::json!({ "engine": engine, "target": target }).to_string();
+    let _ = treeman_store::write_event(
+        sqlite,
+        level,
+        event_type,
+        Some(message),
+        Some(repo_id),
+        Some(worktree_id),
+        None,
+        None,
+        &payload,
+    )
+    .await;
+}
+
 /// Drive prepare across all SQL databases configured for the repo.
 pub async fn run(
     cfg: &Config,

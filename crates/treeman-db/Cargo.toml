@@ -23,3 +23,18 @@ base64 = "0.22"
 tokio = { workspace = true }
 tracing = { workspace = true }
 treeman-core = { workspace = true }
+
+[features]
+default = []
+# Live integration tests that spin up real DB containers via
+# testcontainers-rs. Run with:
+#   cargo test --features integration -p treeman-db -- --include-ignored
+integration = ["dep:testcontainers-modules"]
+
+[dependencies.testcontainers-modules]
+version = "0.13"
+optional = true
+features = ["mysql", "postgres", "redis"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

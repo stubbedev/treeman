@@ -100,7 +100,7 @@ impl DaemonState {
                     &payload,
                 )
                 .await;
-                // Action: call prepare unless Noop.
+                // Action: incremental delta on add-only, full prepare otherwise.
                 if !matches!(dispatch, treeman_watcher::Dispatch::Noop) {
                     if let Ok(cfg) = treeman_core::config::load_layered(Some(&canonical_path)) {
                         let slug = treeman_core::slug_for(&canonical_path, None);
@@ -114,10 +114,29 @@ impl DaemonState {
                         )
                         .await
                         .unwrap_or(0);
-                        if let Err(e) =
-                            treeman_prepare::run(&cfg, &canonical_path, &slug, &pool, rid, wt_id)
-                                .await
-                        {
+                        let res = match dispatch {
+                            treeman_watcher::Dispatch::Delta(_) => treeman_prepare::delta_run(
+                                &cfg,
+                                &canonical_path,
+                                &slug,
+                                &pool,
+                                rid,
+                                wt_id,
+                            )
+                            .await
+                            .map(|_| ()),
+                            _ => treeman_prepare::run(
+                                &cfg,
+                                &canonical_path,
+                                &slug,
+                                &pool,
+                                rid,
+                                wt_id,
+                            )
+                            .await
+                            .map(|_| ()),
+                        };
+                        if let Err(e) = res {
                             let _ = treeman_store::write_event(
                                 &pool,
                                 "error",

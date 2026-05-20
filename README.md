@@ -474,13 +474,37 @@ nix run .#treeman -- status
 
 ---
 
-## Known gaps
+## Tested against real engines
 
-- **MySQL binlog DML replay** (M9) — scaffolded, not yet wired. Watcher's
-  `Delta` dispatch falls back to full `prepare` (correctness-preserving;
-  cache-hit makes it fast in the common case).
-- **Live integration tests** — no `testcontainers-rs` suite yet; unit
-  tests cover the pure-logic crates.
+`treeman-db` has a `testcontainers`-backed integration suite covering
+MySQL, PostgreSQL, and Redis. Each test spins up a real container,
+exercises `ensure_db` → `drop_matching` → `snapshot_create` →
+`snapshot_restore`, and tears down.
+
+```sh
+cargo test --features integration -p treeman-db -- --include-ignored
+```
+
+Tests are gated by `--features integration` and marked `#[ignore]` so
+default `cargo test` invocations don't pull container images on
+machines without Docker.
+
+## Delta migrate path
+
+When the watcher detects newly-added migration files (`Dispatch::Delta`),
+`treeman-prepare::delta_run` invokes the framework's pending-migration
+command (e.g. `php artisan migrate --force` for Laravel,
+`sqlx migrate run` for sqlx-cli) against the source DB and every
+paratest clone. Frameworks track applied migrations themselves, so the
+pending-only invocation is idempotent and skips the dump-reload + full
+re-clone that `Rebuild` requires.
+
+The `treeman-db::binlog` module ships a `BinlogReplicator` skeleton for
+MySQL binlog row-event replay — useful if the migration includes seed
+data the framework can't reproduce. Wiring real DML application against
+arbitrary table schemas is non-trivial and tracked as a future
+optimization; the framework-migrate delta above covers the common case
+correctly and is the default.
 
 ---
 
