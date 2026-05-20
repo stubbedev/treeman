@@ -3,6 +3,8 @@
 //! M4 ships mysql + redis. Postgres, MongoDB, Elasticsearch land in
 //! later milestones.
 
+pub mod elasticsearch;
+pub mod mongo;
 pub mod mysql;
 pub mod postgres;
 pub mod redis_driver;

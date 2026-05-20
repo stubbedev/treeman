@@ -424,17 +424,35 @@ fn open_driver(engine: &str, cfg: &treeman_core::Config) -> Result<Box<dyn treem
         "mysql" => {
             let mc = cfg.connections.mysql.clone()
                 .context("connections.mysql not configured")?;
-            // sqlx connect is async; we're in tokio runtime already (#[tokio::main]).
             let rt = tokio::runtime::Handle::current();
             let driver = rt.block_on(mysql::MysqlDriver::connect(&mc))?;
             Ok(Box::new(driver))
+        }
+        "postgres" => {
+            let pc = cfg.connections.postgres.clone()
+                .context("connections.postgres not configured")?;
+            let rt = tokio::runtime::Handle::current();
+            let driver = rt.block_on(postgres::PostgresDriver::connect(&pc))?;
+            Ok(Box::new(driver))
+        }
+        "mongodb" | "mongo" => {
+            let mc = cfg.connections.mongodb.clone()
+                .context("connections.mongodb not configured")?;
+            let rt = tokio::runtime::Handle::current();
+            let driver = rt.block_on(mongo::MongoDriver::connect(&mc))?;
+            Ok(Box::new(driver))
+        }
+        "elasticsearch" | "es" => {
+            let ec = cfg.connections.elasticsearch.clone()
+                .context("connections.elasticsearch not configured")?;
+            Ok(Box::new(elasticsearch::ElasticsearchDriver::connect(&ec)?))
         }
         "redis" => {
             let rc = cfg.connections.redis.clone()
                 .context("connections.redis not configured")?;
             Ok(Box::new(redis_driver::RedisDriver::connect(&rc)?))
         }
-        other => bail!("unsupported engine for this milestone: {other}"),
+        other => bail!("unsupported engine: {other}"),
     }
 }
 
@@ -627,9 +645,33 @@ async fn teardown_databases(
                     record(sqlite_pool, "db_drop", "mysql", slug, &name, dropped.len(), repo_id, wt_id).await;
                     Ok(())
                 }
-                DB::Postgres { .. } => Ok(()),  // M6
-                DB::Mongodb { .. } => Ok(()),   // M7
-                DB::Elasticsearch { .. } => Ok(()), // M7
+                DB::Postgres { name_template, .. } => {
+                    let name = render(name_template, &ctx)?;
+                    let pc = cfg.connections.postgres.clone()
+                        .context("connections.postgres not configured")?;
+                    let drv = treeman_db::postgres::PostgresDriver::connect(&pc).await?;
+                    let dropped = drv.drop_matching(&name).await?;
+                    record(sqlite_pool, "db_drop", "postgres", slug, &name, dropped.len(), repo_id, wt_id).await;
+                    Ok(())
+                }
+                DB::Mongodb { name_template } => {
+                    let name = render(name_template, &ctx)?;
+                    let mc = cfg.connections.mongodb.clone()
+                        .context("connections.mongodb not configured")?;
+                    let drv = treeman_db::mongo::MongoDriver::connect(&mc).await?;
+                    let dropped = drv.drop_matching(&name).await?;
+                    record(sqlite_pool, "db_drop", "mongodb", slug, &name, dropped.len(), repo_id, wt_id).await;
+                    Ok(())
+                }
+                DB::Elasticsearch { namespaces } => {
+                    let prefix = render(&namespaces.index_prefix_template, &ctx)?;
+                    let ec = cfg.connections.elasticsearch.clone()
+                        .context("connections.elasticsearch not configured")?;
+                    let drv = treeman_db::elasticsearch::ElasticsearchDriver::connect(&ec)?;
+                    let dropped = drv.drop_matching(&prefix).await?;
+                    record(sqlite_pool, "db_drop", "elasticsearch", slug, &prefix, dropped.len(), repo_id, wt_id).await;
+                    Ok(())
+                }
                 DB::Redis { namespaces } => {
                     let idx_str = render(&namespaces.db_index_template, &ctx)?;
                     let idx: u8 = idx_str.parse().context("redis db index parse")?;
