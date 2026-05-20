@@ -23,24 +23,62 @@ use treeman_store::query::{EventFilter, query_events, tail_events};
 #[clap(rename_all = "lower")]
 enum EngineArg {
     Mysql,
+    Mariadb,
+    Tidb,
     Postgres,
+    Cockroach,
     #[clap(alias = "mongo")]
     Mongodb,
     Redis,
     #[clap(alias = "es")]
     Elasticsearch,
+    Opensearch,
     Sqlite,
+    Duckdb,
+    Clickhouse,
+    Meilisearch,
+    Typesense,
+    Qdrant,
+    Weaviate,
+    Milvus,
+    Neo4j,
+    Influxdb,
+    Memcached,
+    Rabbitmq,
+    Nats,
+    Etcd,
+    Kafka,
+    S3,
 }
 
 impl EngineArg {
     fn as_str(self) -> &'static str {
         match self {
             EngineArg::Mysql => "mysql",
+            EngineArg::Mariadb => "mariadb",
+            EngineArg::Tidb => "tidb",
             EngineArg::Postgres => "postgres",
+            EngineArg::Cockroach => "cockroach",
             EngineArg::Mongodb => "mongodb",
             EngineArg::Redis => "redis",
             EngineArg::Elasticsearch => "elasticsearch",
+            EngineArg::Opensearch => "opensearch",
             EngineArg::Sqlite => "sqlite",
+            EngineArg::Duckdb => "duckdb",
+            EngineArg::Clickhouse => "clickhouse",
+            EngineArg::Meilisearch => "meilisearch",
+            EngineArg::Typesense => "typesense",
+            EngineArg::Qdrant => "qdrant",
+            EngineArg::Weaviate => "weaviate",
+            EngineArg::Milvus => "milvus",
+            EngineArg::Neo4j => "neo4j",
+            EngineArg::Influxdb => "influxdb",
+            EngineArg::Memcached => "memcached",
+            EngineArg::Rabbitmq => "rabbitmq",
+            EngineArg::Nats => "nats",
+            EngineArg::Etcd => "etcd",
+            EngineArg::Kafka => "kafka",
+            EngineArg::S3 => "s3",
         }
     }
 }
@@ -1525,6 +1563,219 @@ fn open_driver(engine: &str, cfg: &treeman_core::Config) -> Result<Box<dyn treem
                 .clone()
                 .context("connections.redis not configured")?;
             Ok(Box::new(redis_driver::RedisDriver::connect(&rc)?))
+        }
+        // Wire-compat variants
+        "mariadb" | "tidb" => {
+            let mc = cfg
+                .connections
+                .mysql
+                .clone()
+                .context("connections.mysql not configured")?;
+            let rt = tokio::runtime::Handle::current();
+            Ok(Box::new(rt.block_on(mysql::MysqlDriver::connect(&mc))?))
+        }
+        "cockroach" => {
+            let pc = cfg
+                .connections
+                .postgres
+                .clone()
+                .context("connections.postgres not configured")?;
+            let rt = tokio::runtime::Handle::current();
+            Ok(Box::new(
+                rt.block_on(postgres::PostgresDriver::connect(&pc))?,
+            ))
+        }
+        "opensearch" => {
+            let ec = cfg
+                .connections
+                .elasticsearch
+                .clone()
+                .context("connections.elasticsearch not configured")?;
+            Ok(Box::new(elasticsearch::ElasticsearchDriver::connect(&ec)?))
+        }
+        "clickhouse" => {
+            let hc = cfg
+                .connections
+                .clickhouse
+                .clone()
+                .context("connections.clickhouse not configured")?;
+            let pw = hc
+                .password_env
+                .as_deref()
+                .and_then(|e| std::env::var(e).ok());
+            Ok(Box::new(clickhouse::ClickhouseDriver::connect(
+                &hc.url,
+                hc.user.as_deref(),
+                pw.as_deref(),
+            )?))
+        }
+        "duckdb" => {
+            let dc = cfg
+                .connections
+                .duckdb
+                .clone()
+                .context("connections.duckdb not configured")?;
+            Ok(Box::new(duckdb_driver::DuckdbDriver::new(&dc.base_dir)?))
+        }
+        "meilisearch" => {
+            let hc = cfg
+                .connections
+                .meilisearch
+                .clone()
+                .context("connections.meilisearch not configured")?;
+            let k = hc
+                .api_key_env
+                .as_deref()
+                .and_then(|e| std::env::var(e).ok());
+            Ok(Box::new(http_engines::MeilisearchDriver::connect(
+                &hc.url,
+                k.as_deref(),
+            )?))
+        }
+        "typesense" => {
+            let hc = cfg
+                .connections
+                .typesense
+                .clone()
+                .context("connections.typesense not configured")?;
+            let k = hc
+                .api_key_env
+                .as_deref()
+                .and_then(|e| std::env::var(e).ok())
+                .context("typesense api_key_env not set in environment")?;
+            Ok(Box::new(http_engines::TypesenseDriver::connect(
+                &hc.url, &k,
+            )?))
+        }
+        "qdrant" => {
+            let hc = cfg
+                .connections
+                .qdrant
+                .clone()
+                .context("connections.qdrant not configured")?;
+            let k = hc
+                .api_key_env
+                .as_deref()
+                .and_then(|e| std::env::var(e).ok());
+            Ok(Box::new(http_engines::QdrantDriver::connect(
+                &hc.url,
+                k.as_deref(),
+            )?))
+        }
+        "weaviate" => {
+            let hc = cfg
+                .connections
+                .weaviate
+                .clone()
+                .context("connections.weaviate not configured")?;
+            let k = hc
+                .api_key_env
+                .as_deref()
+                .and_then(|e| std::env::var(e).ok());
+            Ok(Box::new(http_engines::WeaviateDriver::connect(
+                &hc.url,
+                k.as_deref(),
+            )?))
+        }
+        "milvus" => {
+            let hc = cfg
+                .connections
+                .milvus
+                .clone()
+                .context("connections.milvus not configured")?;
+            let k = hc
+                .api_key_env
+                .as_deref()
+                .and_then(|e| std::env::var(e).ok());
+            Ok(Box::new(http_engines::MilvusDriver::connect(
+                &hc.url,
+                k.as_deref(),
+            )?))
+        }
+        "neo4j" => {
+            let nc = cfg
+                .connections
+                .neo4j
+                .clone()
+                .context("connections.neo4j not configured")?;
+            let pw = std::env::var(&nc.password_env)
+                .with_context(|| format!("neo4j password_env {} not set", nc.password_env))?;
+            Ok(Box::new(neo4j::Neo4jDriver::connect(
+                &nc.url, &nc.user, &pw,
+            )?))
+        }
+        "influxdb" => {
+            let ic = cfg
+                .connections
+                .influxdb
+                .clone()
+                .context("connections.influxdb not configured")?;
+            let token = std::env::var(&ic.token_env)
+                .with_context(|| format!("influxdb token_env {} not set", ic.token_env))?;
+            Ok(Box::new(influxdb::InfluxdbDriver::connect(
+                &ic.url, &token, &ic.org_id,
+            )?))
+        }
+        "memcached" => {
+            let mc = cfg
+                .connections
+                .memcached
+                .clone()
+                .context("connections.memcached not configured")?;
+            Ok(Box::new(memcached::MemcachedDriver::connect(
+                mc.host, mc.port,
+            )))
+        }
+        "rabbitmq" => {
+            let hc = cfg
+                .connections
+                .rabbitmq
+                .clone()
+                .context("connections.rabbitmq not configured")?;
+            let user = hc.user.clone().context("rabbitmq user missing")?;
+            let pw = hc
+                .password_env
+                .as_deref()
+                .and_then(|e| std::env::var(e).ok())
+                .context("rabbitmq password_env not set")?;
+            Ok(Box::new(rabbitmq::RabbitmqDriver::connect(
+                &hc.url, &user, &pw,
+            )?))
+        }
+        "nats" => {
+            let hc = cfg
+                .connections
+                .nats
+                .clone()
+                .context("connections.nats not configured")?;
+            Ok(Box::new(http_engines::NatsDriver::connect(&hc.url)?))
+        }
+        "etcd" => {
+            let hc = cfg
+                .connections
+                .etcd
+                .clone()
+                .context("connections.etcd not configured")?;
+            Ok(Box::new(etcd::EtcdDriver::connect(&hc.url)?))
+        }
+        "kafka" => {
+            let hp = cfg
+                .connections
+                .kafka
+                .clone()
+                .context("connections.kafka not configured")?;
+            // Kafka driver expects a REST Proxy URL; build one if user
+            // gave only host:port.
+            let url = format!("http://{}:{}", hp.host, hp.port);
+            Ok(Box::new(http_engines::KafkaDriver::connect(&url)?))
+        }
+        "s3" => {
+            let sc = cfg
+                .connections
+                .s3
+                .clone()
+                .context("connections.s3 not configured")?;
+            Ok(Box::new(s3::S3Driver::connect(&sc.endpoint, &sc.region)))
         }
         other => bail!("unsupported engine: {other}"),
     }
