@@ -752,8 +752,15 @@ async fn prepare_mysql(
             }
         }
         if let Some(m) = migration_spec {
-            let out =
-                run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[], inherited_env).await?;
+            let out = run_migration(
+                &m.framework,
+                repo_root,
+                source_db,
+                MigrateMode::Up,
+                &[],
+                inherited_env,
+            )
+            .await?;
             if out.exit_code != 0 {
                 anyhow::bail!(
                     "migrate failed (exit {}): {}",
@@ -840,8 +847,15 @@ async fn prepare_postgres(
             }
         }
         if let Some(m) = migration_spec {
-            let out =
-                run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[], inherited_env).await?;
+            let out = run_migration(
+                &m.framework,
+                repo_root,
+                source_db,
+                MigrateMode::Up,
+                &[],
+                inherited_env,
+            )
+            .await?;
             if out.exit_code != 0 {
                 anyhow::bail!(
                     "migrate failed (exit {}): {}",

@@ -66,9 +66,8 @@ pub async fn run_hooks(
 ) -> Result<HookRunOutcome> {
     let log_dir = worktree_path.join(".treeman-hooks");
     if !entries.is_empty() {
-        std::fs::create_dir_all(&log_dir).with_context(|| {
-            format!("create hook log dir {}", log_dir.display())
-        })?;
+        std::fs::create_dir_all(&log_dir)
+            .with_context(|| format!("create hook log dir {}", log_dir.display()))?;
     }
     let mut outcomes = Vec::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
@@ -197,9 +196,9 @@ fn spawn_detached(
         .truncate(true)
         .open(log_path)
         .with_context(|| format!("open hook log {}", log_path.display()))?;
-    let log_for_stderr = log_file.try_clone().with_context(|| {
-        format!("clone hook log fd {}", log_path.display())
-    })?;
+    let log_for_stderr = log_file
+        .try_clone()
+        .with_context(|| format!("clone hook log fd {}", log_path.display()))?;
 
     let mut spawn = std::process::Command::new("setsid");
     spawn
@@ -224,7 +223,9 @@ fn spawn_detached(
     spawn.env("GWT_WT", worktree_path);
     spawn.env("TREEMAN_SLUG", slug);
 
-    let child = spawn.spawn().with_context(|| format!("setsid spawn `{cmd}`"))?;
+    let child = spawn
+        .spawn()
+        .with_context(|| format!("setsid spawn `{cmd}`"))?;
     Ok(child.id())
 }
 
@@ -328,10 +329,9 @@ mod tests {
             crate::config::GroupChild::Cmd("touch a".into()),
             crate::config::GroupChild::Cmd("touch b".into()),
         ])];
-        let out =
-            run_hooks("postcreate", &entries, &wt, &wt, "slug", &empty_env())
-                .await
-                .unwrap();
+        let out = run_hooks("postcreate", &entries, &wt, &wt, "slug", &empty_env())
+            .await
+            .unwrap();
         // Wait for the detached driver to finish.
         wait_until(|| wt.join("b").exists(), 2000).await;
         // Both files exist + b created after a.
@@ -350,10 +350,9 @@ mod tests {
             HookEntry::Cmd("sleep 0.5 && touch one".into()),
             HookEntry::Cmd("sleep 0.5 && touch two".into()),
         ];
-        let _ =
-            run_hooks("postcreate", &entries, &wt, &wt, "slug", &empty_env())
-                .await
-                .unwrap();
+        let _ = run_hooks("postcreate", &entries, &wt, &wt, "slug", &empty_env())
+            .await
+            .unwrap();
         // run_hooks itself must return immediately — driver spawn only.
         assert!(
             started.elapsed().as_millis() < 200,
@@ -362,10 +361,12 @@ mod tests {
         );
         // Both files appear within ~0.6s if groups ran in parallel,
         // not 1.0s+.
-        wait_until(|| wt.join("one").exists() && wt.join("two").exists(), 1200)
-            .await;
+        wait_until(|| wt.join("one").exists() && wt.join("two").exists(), 1200).await;
         let total = started.elapsed().as_millis();
-        assert!(total < 900, "parallel groups took {total}ms — should be <900ms");
+        assert!(
+            total < 900,
+            "parallel groups took {total}ms — should be <900ms"
+        );
         std::fs::remove_dir_all(&wt).ok();
     }
 
@@ -416,10 +417,9 @@ mod tests {
                 cwd: None,
             },
         ];
-        let out =
-            run_precreate_hooks(&steps, &wt, &wt, "slug", &empty_env())
-                .await
-                .unwrap();
+        let out = run_precreate_hooks(&steps, &wt, &wt, "slug", &empty_env())
+            .await
+            .unwrap();
         assert_eq!(out.aggregate_exit_code, 1);
         assert!(wt.join("ran-first").exists());
         assert!(!wt.join("ran-third").exists(), "third step must be skipped");

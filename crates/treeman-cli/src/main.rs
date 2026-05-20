@@ -2584,8 +2584,7 @@ async fn worktree_create(
         );
     }
     if !skip_prepare && !cfg.databases.is_empty() {
-        match treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id, &env).await
-        {
+        match treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id, &env).await {
             Ok(outs) => {
                 for o in outs {
                     println!(
@@ -3014,7 +3013,6 @@ watcher:
 // the CLI crate. This module re-exports it as `teardown_databases`
 // for the local call sites.
 use treeman_prepare::teardown_databases;
-
 
 fn detect_branch(worktree: &Path) -> Option<String> {
     let head = worktree.join(".git/HEAD");

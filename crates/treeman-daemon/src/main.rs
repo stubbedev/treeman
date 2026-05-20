@@ -224,8 +224,7 @@ async fn dispatch(
             let wt_for_task = worktree_path.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    finalize_worktree(&st, &repo_for_task, &wt_for_task, &inherited_env)
-                        .await
+                    finalize_worktree(&st, &repo_for_task, &wt_for_task, &inherited_env).await
                 {
                     let _ = treeman_store::write_event(
                         st.sqlite(),
@@ -257,14 +256,9 @@ async fn dispatch(
             let repo_for_task = repo_path.clone();
             let wt_for_task = worktree_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = teardown_worktree(
-                    &st,
-                    &repo_for_task,
-                    &wt_for_task,
-                    force,
-                    &inherited_env,
-                )
-                .await
+                if let Err(e) =
+                    teardown_worktree(&st, &repo_for_task, &wt_for_task, force, &inherited_env)
+                        .await
                 {
                     let _ = treeman_store::write_event(
                         st.sqlite(),
@@ -395,14 +389,9 @@ async fn teardown_worktree(
         .and_then(|s| s.to_str())
         .unwrap_or("repo");
     let repo_id = treeman_store::ensure_repo(state.sqlite(), &repo_root, repo_name).await?;
-    let wt_id = treeman_store::ensure_worktree(
-        state.sqlite(),
-        repo_id,
-        &wt_root,
-        &slug.value,
-        None,
-    )
-    .await?;
+    let wt_id =
+        treeman_store::ensure_worktree(state.sqlite(), repo_id, &wt_root, &slug.value, None)
+            .await?;
 
     let _ = treeman_store::write_event(
         state.sqlite(),
@@ -434,8 +423,7 @@ async fn teardown_worktree(
         .await?;
     }
 
-    treeman_prepare::teardown_databases(&cfg, &slug.value, repo_id, wt_id, state.sqlite())
-        .await?;
+    treeman_prepare::teardown_databases(&cfg, &slug.value, repo_id, wt_id, state.sqlite()).await?;
 
     // Shell out to git for the actual worktree removal. The
     // daemon's PATH already has git on it (it's needed at boot to

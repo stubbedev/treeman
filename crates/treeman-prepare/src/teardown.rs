@@ -109,8 +109,7 @@ pub async fn teardown_databases(
                         .elasticsearch
                         .clone()
                         .context("connections.elasticsearch not configured")?;
-                    let drv =
-                        treeman_db::elasticsearch::ElasticsearchDriver::connect(&ec)?;
+                    let drv = treeman_db::elasticsearch::ElasticsearchDriver::connect(&ec)?;
                     let dropped = drv.drop_matching(&prefix).await?;
                     record(
                         sqlite_pool,
@@ -199,8 +198,7 @@ pub async fn teardown_databases(
                         .elasticsearch
                         .clone()
                         .context("connections.elasticsearch not configured")?;
-                    let drv =
-                        treeman_db::elasticsearch::ElasticsearchDriver::connect(&ec)?;
+                    let drv = treeman_db::elasticsearch::ElasticsearchDriver::connect(&ec)?;
                     let dropped = drv.drop_matching(&prefix).await?;
                     record(
                         sqlite_pool,
