@@ -28,5 +28,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
-jsonrpsee = { workspace = true, features = ["client", "http-client"] }
 directories = { workspace = true }

@@ -21,6 +21,38 @@ pub struct StatusResponse {
     pub watcher_count: u32,
 }
 
+/// CLI → daemon. One per request; daemon writes one `Response` and
+/// either closes the connection or keeps it open for the next line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum Request {
+    Status,
+    Ping,
+    /// Register or update a repo (path + name).
+    RepoRegister { path: String, name: String },
+    /// Start a per-repo watcher in the daemon.
+    WatcherStart { repo_path: String },
+    /// Stop a previously-started watcher.
+    WatcherStop  { repo_path: String },
+    /// List currently-running watchers.
+    WatcherList,
+    /// Tell the daemon to shut down cleanly (used by `treeman daemon stop`).
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Response {
+    Ok,
+    Pong,
+    Status(StatusResponse),
+    RepoRegistered { repo_id: i64 },
+    WatcherStarted { repo_path: String },
+    WatcherStopped { repo_path: String },
+    WatcherList { repos: Vec<String> },
+    Error { message: String },
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum HookPhase {
