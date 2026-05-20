@@ -53,33 +53,65 @@ impl FrameworkSpec {
     }
 
     /// Existing migration directories on disk that match
-    /// `migration_dir_patterns`.
+    /// `migration_dir_patterns`. Walks the repo once and matches each
+    /// glob against every directory entry, pruning heavy subtrees
+    /// (.git / node_modules / vendor / target / __pycache__ / etc.).
+    /// Literal (glob-free) patterns short-circuit without walking.
     pub fn migration_dirs(&self, repo_root: &Path) -> Vec<PathBuf> {
-        let mut out = vec![];
+        let mut out: Vec<PathBuf> = vec![];
+
+        // Literal patterns first — cheap, no walk.
+        let mut glob_patterns: Vec<String> = vec![];
         for p in &self.migration_dir_patterns {
-            // Treat patterns without a `*` as literal paths for speed.
-            if !p.contains('*') && !p.contains('?') {
+            if p.contains('*') || p.contains('?') {
+                glob_patterns.push(p.clone());
+            } else {
                 let dir = repo_root.join(p);
                 if dir.is_dir() { out.push(dir); }
-            } else {
-                // Walk + glob.
-                if let Ok(set) = build_globset(&[p.clone()]) {
-                    for e in walkdir::WalkDir::new(repo_root).follow_links(false) {
-                        let Ok(e) = e else { continue };
-                        if !e.file_type().is_dir() { continue; }
-                        let rel = e.path().strip_prefix(repo_root).unwrap_or(e.path());
-                        if set.is_match(rel) { out.push(e.path().to_path_buf()); }
-                    }
-                }
             }
         }
+        if glob_patterns.is_empty() {
+            dedup_sorted(&mut out);
+            return out;
+        }
+        let Ok(set) = build_globset(&glob_patterns) else {
+            dedup_sorted(&mut out);
+            return out;
+        };
+
+        // Single walk for all glob patterns together. Prune heavy
+        // dirs via filter_entry so a vendor/ or node_modules/ doesn't
+        // turn detection into a multi-GB stat-fest.
+        let iter = walkdir::WalkDir::new(repo_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                if e.depth() == 0 { return true; }
+                let name = e.file_name().to_string_lossy();
+                !is_skip_dir(name.as_ref())
+            });
+        for e in iter {
+            let Ok(e) = e else { continue };
+            if !e.file_type().is_dir() { continue; }
+            let rel = e.path().strip_prefix(repo_root).unwrap_or(e.path());
+            if set.is_match(rel) { out.push(e.path().to_path_buf()); }
+        }
+        dedup_sorted(&mut out);
         out
     }
 
     pub fn migration_files(&self, dir: &Path) -> Vec<PathBuf> {
         let Ok(set) = build_globset(&self.file_globs) else { return vec![]; };
         let mut out = vec![];
-        for e in walkdir::WalkDir::new(dir).follow_links(false) {
+        let iter = walkdir::WalkDir::new(dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                if e.depth() == 0 { return true; }
+                let name = e.file_name().to_string_lossy();
+                !is_skip_dir(name.as_ref())
+            });
+        for e in iter {
             let Ok(e) = e else { continue };
             if !e.file_type().is_file() { continue; }
             let name = match e.file_name().to_str() { Some(n) => n, None => continue };
@@ -127,6 +159,29 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
         b.add(globset::Glob::new(p)?);
     }
     Ok(b.build()?)
+}
+
+/// Directory names pruned from migration_dirs / migration_files walks.
+/// Anything generated, vendored, or known not to host hand-written
+/// migrations. Keeps detection O(repo source size), not O(repo+deps).
+fn is_skip_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | ".hg" | ".svn"
+        | "node_modules" | ".pnpm-store" | ".yarn"
+        | "vendor"
+        | "target" | "build" | "dist" | "out"
+        | ".venv" | "venv" | "__pycache__" | ".tox"
+        | ".idea" | ".vscode"
+        | ".next" | ".nuxt" | ".cache"
+        | ".gradle" | ".m2"
+        | "tmp"
+    )
+}
+
+fn dedup_sorted(v: &mut Vec<PathBuf>) {
+    v.sort();
+    v.dedup();
 }
 
 fn file_sha(p: &Path) -> Result<String> {
@@ -195,54 +250,104 @@ fn builtins() -> Vec<FrameworkSpec> {
         }
     }
     vec![
+        // Laravel — canonical + nwidart/laravel-modules (app/Modules and
+        // legacy top-level Modules/) + lowercase variants.
         fw("laravel",
-           &["artisan"], &["database/migrations"], &["*.php"],
-           &["composer.lock"], Filename, Rebuild, Some("mysql")),
+           &["artisan"],
+           &[
+               "database/migrations",
+               "app/Modules/*/Database/Migrations",
+               "app/Modules/*/Database/migrations",
+               "Modules/*/Database/Migrations",
+               "Modules/*/Database/migrations",
+           ],
+           &["*.php"], &["composer.lock"], Filename, Rebuild, Some("mysql")),
+        // Rails — canonical + engines (mountable engines hold their own db/migrate).
         fw("rails",
            &["bin/rails", "Gemfile", "config/database.yml"],
-           &["db/migrate"], &["*.rb"], &["Gemfile.lock"], Filename, Rebuild, None),
+           &["db/migrate", "engines/*/db/migrate"],
+           &["*.rb"], &["Gemfile.lock"], Filename, Rebuild, None),
+        // Django — every app has its own */migrations folder.
         fw("django",
            &["manage.py"], &["**/migrations"], &["[0-9]*_*.py"],
            &["Pipfile.lock", "poetry.lock", "requirements.txt"],
            Filename, Rebuild, None),
+        // golang-migrate — single + Go monorepo (services / cmd).
         fw("golang-migrate",
-           &["go.mod"], &["**/migrations"], &["*.up.sql"],
-           &["go.sum"], Filename, Rebuild, None),
+           &["go.mod"],
+           &["**/migrations", "services/*/migrations", "cmd/*/migrations"],
+           &["*.up.sql"], &["go.sum"], Filename, Rebuild, None),
+        // sqlx-cli — single + cargo workspace crates / services.
         fw("sqlx-cli",
-           &["Cargo.toml", "migrations"], &["migrations"], &["*.sql"],
-           &["Cargo.lock"], Checksum, Delta, None),
+           &["Cargo.toml", "migrations"],
+           &["migrations", "crates/*/migrations", "services/*/migrations"],
+           &["*.sql"], &["Cargo.lock"], Checksum, Delta, None),
+        // Diesel — single + cargo workspace.
         fw("diesel",
-           &["diesel.toml"], &["migrations"], &["up.sql"],
-           &["Cargo.lock"], Filename, Rebuild, None),
+           &["diesel.toml"],
+           &["migrations", "crates/*/migrations"],
+           &["up.sql"], &["Cargo.lock"], Filename, Rebuild, None),
+        // Prisma — single + NX / yarn monorepo (apps + packages).
         fw("prisma",
-           &["prisma/schema.prisma"], &["prisma/migrations"], &["migration.sql"],
+           &["prisma/schema.prisma"],
+           &[
+               "prisma/migrations",
+               "apps/*/prisma/migrations",
+               "packages/*/prisma/migrations",
+           ],
+           &["migration.sql"],
            &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
            Checksum, Delta, None),
+        // Knex — single + monorepo.
         fw("knex",
-           &["knexfile.js"], &["migrations"], &["*.js"],
+           &["knexfile.js"],
+           &["migrations", "apps/*/migrations", "packages/*/migrations"],
+           &["*.js"],
            &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
            Filename, Rebuild, None),
+        // Alembic — every package can have versions/.
         fw("alembic",
            &["alembic.ini"], &["**/versions"], &["*.py"],
            &["poetry.lock", "Pipfile.lock", "requirements.txt"],
            Filename, Rebuild, None),
+        // Flyway — already a glob; covers Spring Boot multi-module too.
         fw("flyway",
            &["flyway.conf"], &["**/db/migration"], &["[VRU]*.sql"],
            &[], Checksum, Rebuild, None),
+        // TypeORM — single + NX/yarn monorepo.
         fw("typeorm",
-           &["package.json"], &["src/migrations"], &["*.ts"],
+           &["package.json"],
+           &[
+               "src/migrations",
+               "apps/*/src/migrations",
+               "packages/*/src/migrations",
+           ],
+           &["*.ts"],
            &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
            Filename, Rebuild, None),
+        // Drizzle — single + monorepo.
         fw("drizzle",
-           &["drizzle.config.ts"], &["drizzle"], &["*.sql"],
+           &["drizzle.config.ts"],
+           &["drizzle", "apps/*/drizzle", "packages/*/drizzle"],
+           &["*.sql"],
            &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
            Checksum, Delta, None),
+        // Sequelize — single + monorepo.
         fw("sequelize",
-           &[".sequelizerc"], &["migrations"], &["*.js"],
+           &[".sequelizerc"],
+           &["migrations", "apps/*/migrations", "packages/*/migrations"],
+           &["*.js"],
            &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
            Filename, Rebuild, None),
+        // MikroORM — single + monorepo.
         fw("mikro-orm",
-           &["mikro-orm.config.ts"], &["src/migrations"], &["Migration*.ts"],
+           &["mikro-orm.config.ts"],
+           &[
+               "src/migrations",
+               "apps/*/src/migrations",
+               "packages/*/src/migrations",
+           ],
+           &["Migration*.ts"],
            &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
            Filename, Rebuild, None),
     ]
@@ -260,6 +365,36 @@ mod tests {
         let len = names.len();
         names.dedup();
         assert_eq!(names.len(), len, "duplicate framework name");
+    }
+
+    #[test]
+    fn laravel_finds_module_migration_dirs() {
+        let dir = std::env::temp_dir().join(format!("treeman-laravel-mod-{}",
+            blake3::hash(format!("{:?}", std::time::Instant::now()).as_bytes()).to_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("artisan"), "").unwrap();
+        std::fs::create_dir_all(dir.join("database/migrations")).unwrap();
+        std::fs::create_dir_all(dir.join("app/Modules/Foo/Database/Migrations")).unwrap();
+        std::fs::create_dir_all(dir.join("app/Modules/Bar/Database/migrations")).unwrap();
+        std::fs::create_dir_all(dir.join("Modules/Legacy/Database/Migrations")).unwrap();
+        // Heavy dirs should be pruned, not matched.
+        std::fs::create_dir_all(dir.join("vendor/somepkg/Database/Migrations")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/foo/database/migrations")).unwrap();
+
+        let r = Registry::with_builtins();
+        let spec = r.specs.iter().find(|s| s.name == "laravel").unwrap();
+        let mut dirs: Vec<String> = spec.migration_dirs(&dir).iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().display().to_string())
+            .collect();
+        dirs.sort();
+        assert!(dirs.contains(&"database/migrations".to_string()));
+        assert!(dirs.contains(&"app/Modules/Foo/Database/Migrations".to_string()));
+        assert!(dirs.contains(&"app/Modules/Bar/Database/migrations".to_string()));
+        assert!(dirs.contains(&"Modules/Legacy/Database/Migrations".to_string()));
+        // Pruned heavy dirs:
+        assert!(!dirs.iter().any(|d| d.starts_with("vendor")));
+        assert!(!dirs.iter().any(|d| d.starts_with("node_modules")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
