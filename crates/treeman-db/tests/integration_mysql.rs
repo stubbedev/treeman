@@ -33,6 +33,7 @@ async fn backing() -> (Backing, MysqlConn, String) {
             port: parsed.port.unwrap_or(3306),
             user: parsed.user.clone().unwrap_or_else(|| "root".into()),
             password_env: None,
+            password: None,
             pool_max: 4,
         };
         let stem = format!(
