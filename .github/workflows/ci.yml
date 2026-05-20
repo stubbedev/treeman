@@ -2,9 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, go-rewrite]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, go-rewrite]
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,6 +16,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # Go (v1.0 rewrite — primary going forward)
+  # ──────────────────────────────────────────────────────────────────
+  go-build:
+    name: go build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: gofmt -l ./cmd ./internal | tee /dev/stderr | (! grep -q '.')
+      - run: go test ./...
+
+  # ──────────────────────────────────────────────────────────────────
+  # Rust (legacy — keep CI green during transition; removed at v1.0)
+  # ──────────────────────────────────────────────────────────────────
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -61,8 +85,5 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@v22
-      # Magic Nix Cache: shares /nix/store across runs via FlakeHub.
-      # Free for OSS, no token. Cold runs unchanged; warm runs go
-      # from ~15min to ~90s for treeman's dep graph.
       - uses: DeterminateSystems/magic-nix-cache-action@v8
       - run: nix flake check --print-build-logs

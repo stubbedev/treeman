@@ -81,11 +81,35 @@
 
       in
       {
+        # Go binaries — built via buildGoModule. These are the
+        # v1.0+ artefacts; the Rust derivations above stay for the
+        # transition window. Switch the `default` package to the Go
+        # build once feature parity lands.
+        treemanGo = pkgs.buildGoModule {
+          pname = "treeman-go";
+          version = cargoVersion;
+          src = srcRoot;
+          # `vendorHash = null` because we will commit go.sum and use
+          # the Go module proxy; bump to a fixed hash if/when we add
+          # third-party deps.
+          vendorHash = null;
+          subPackages = [ "cmd/treeman" "cmd/treemand" ];
+          ldflags = [
+            "-s"
+            "-w"
+            "-X github.com/stubbedev/treeman/internal/version.Version=${cargoVersion}"
+          ];
+          doCheck = true;
+        };
+
         packages = {
           default = treemanWorkspace;
           treeman = bin "treeman";
           treemand = bin "treemand";
           workspace = treemanWorkspace;
+
+          # `nix build .#treeman-go` for the Go rewrite preview.
+          treeman-go = treemanGo;
         };
 
         apps = {
@@ -138,6 +162,10 @@
             mold
             clang
             sccache
+            # Go toolchain for the v1.0 rewrite.
+            go
+            gopls
+            golangci-lint
           ];
           shellHook = ''
             echo "treeman dev shell — try \`just --list\`"

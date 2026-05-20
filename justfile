@@ -38,7 +38,43 @@ check-tools:
     echo "All required tools present."
 
 # =============================================================================
-# Build & Test
+# Build & Test — Go (treeman v1.0+ — see plan in
+# ~/.claude/plans/for-both-setup-and-resilient-meerkat.md)
+# =============================================================================
+
+# Go binaries: cmd/treeman + cmd/treemand. The version string is
+# baked in via -ldflags so `treeman --version` reports the right tag.
+GO_LDFLAGS := "-X github.com/stubbedev/treeman/internal/version.Version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+
+# Build both Go binaries into ./bin/.
+go-build:
+    mkdir -p bin
+    go build -ldflags="{{GO_LDFLAGS}}" -o bin/treeman  ./cmd/treeman
+    go build -ldflags="{{GO_LDFLAGS}}" -o bin/treemand ./cmd/treemand
+    @echo "Built ./bin/treeman + ./bin/treemand"
+
+# Install the Go binaries into $GOBIN (~/.go/bin or $HOME/go/bin).
+go-install:
+    go install -ldflags="{{GO_LDFLAGS}}" ./cmd/treeman ./cmd/treemand
+    @echo "Installed treeman + treemand to $(go env GOBIN || echo $(go env GOPATH)/bin)"
+
+go-fmt:
+    gofmt -w ./cmd ./internal
+
+go-lint:
+    gofmt -l ./cmd ./internal | tee /dev/stderr | (! grep -q '.')
+    go vet ./...
+
+go-test:
+    go test ./...
+
+go-check: go-lint go-test
+
+go-clean:
+    rm -rf bin/
+
+# =============================================================================
+# Build & Test — Rust (legacy; will be removed after Go v1.0 cutover)
 # =============================================================================
 
 # Cargo workspace build (debug).
