@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/stubbe/treeman"
@@ -32,14 +32,14 @@ clap = { version = "4", features = ["derive", "env"] }
 jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
 directories = "5"
 
-treeman-proto = { path = "crates/treeman-proto", version = "0.0.9" }
-treeman-core = { path = "crates/treeman-core", version = "0.0.9" }
-treeman-store = { path = "crates/treeman-store", version = "0.0.9" }
-treeman-db = { path = "crates/treeman-db", version = "0.0.9" }
-treeman-migrations = { path = "crates/treeman-migrations", version = "0.0.9" }
-treeman-watcher = { path = "crates/treeman-watcher", version = "0.0.9" }
-treeman-snapshot = { path = "crates/treeman-snapshot", version = "0.0.9" }
-treeman-prepare = { path = "crates/treeman-prepare", version = "0.0.9" }
+treeman-proto = { path = "crates/treeman-proto", version = "0.0.10" }
+treeman-core = { path = "crates/treeman-core", version = "0.0.10" }
+treeman-store = { path = "crates/treeman-store", version = "0.0.10" }
+treeman-db = { path = "crates/treeman-db", version = "0.0.10" }
+treeman-migrations = { path = "crates/treeman-migrations", version = "0.0.10" }
+treeman-watcher = { path = "crates/treeman-watcher", version = "0.0.10" }
+treeman-snapshot = { path = "crates/treeman-snapshot", version = "0.0.10" }
+treeman-prepare = { path = "crates/treeman-prepare", version = "0.0.10" }
 
 [profile.release]
 lto = "thin"
