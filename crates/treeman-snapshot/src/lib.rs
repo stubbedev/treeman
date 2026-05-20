@@ -8,5 +8,7 @@ pub mod paratest;
 pub mod store;
 
 pub use key::{SnapshotKey, lockfile_hashes_for};
-pub use paratest::{Engine as ParatestEngine, ParatestPlan, auto_clones, mysql_fanout, postgres_fanout};
+pub use paratest::{
+    Engine as ParatestEngine, ParatestPlan, auto_clones, mysql_fanout, postgres_fanout,
+};
 pub use store::{SnapshotRow, gc_lru, list, mark_used, record_built};

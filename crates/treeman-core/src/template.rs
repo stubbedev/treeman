@@ -82,14 +82,23 @@ mod tests {
     use crate::slug::{Slug, SlugSource};
 
     fn ctx() -> TemplateContext {
-        TemplateContext::from_slug(&Slug { value: "kon_1234".into(), source: SlugSource::Ticket })
+        TemplateContext::from_slug(&Slug {
+            value: "kon_1234".into(),
+            source: SlugSource::Ticket,
+        })
     }
 
     #[test]
     fn renders_known_keys() {
         let c = ctx();
-        assert_eq!(render("kontainer_testing_{slug}", &c).unwrap(), "kontainer_testing_kon_1234");
-        assert_eq!(render("phpunit-{slug_dash}-", &c).unwrap(), "phpunit-kon-1234-");
+        assert_eq!(
+            render("kontainer_testing_{slug}", &c).unwrap(),
+            "kontainer_testing_kon_1234"
+        );
+        assert_eq!(
+            render("phpunit-{slug_dash}-", &c).unwrap(),
+            "phpunit-kon-1234-"
+        );
     }
 
     #[test]

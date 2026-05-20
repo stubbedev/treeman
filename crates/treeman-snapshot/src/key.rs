@@ -20,6 +20,7 @@ pub struct SnapshotKey {
 }
 
 impl SnapshotKey {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: &str,
         engine_version: &str,
@@ -58,10 +59,14 @@ pub fn lockfile_hashes_for<P: AsRef<Path>>(paths: &[P]) -> Result<BTreeMap<Strin
     let mut out = BTreeMap::new();
     for p in paths {
         let p = p.as_ref();
-        if !p.is_file() { continue; }
+        if !p.is_file() {
+            continue;
+        }
         let bytes = std::fs::read(p)?;
         let hash = blake3::hash(&bytes).to_hex().to_string();
-        let key = p.file_name().map(|s| s.to_string_lossy().into_owned())
+        let key = p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| p.display().to_string());
         out.insert(key, hash);
     }
@@ -75,9 +80,15 @@ mod tests {
     #[test]
     fn fingerprint_changes_on_input_change() {
         let mut k = SnapshotKey::new(
-            "mysql", "8.0.30", "kontainer_testing_kon_1234",
-            "laravel", "filename",
-            "abc123".into(), None, Default::default());
+            "mysql",
+            "8.0.30",
+            "kontainer_testing_kon_1234",
+            "laravel",
+            "filename",
+            "abc123".into(),
+            None,
+            Default::default(),
+        );
         let f1 = k.fingerprint();
         k.migrations_hash_hex = "def456".into();
         let f2 = k.fingerprint();
@@ -87,9 +98,15 @@ mod tests {
     #[test]
     fn template_name_includes_engine_and_prefix() {
         let k = SnapshotKey::new(
-            "postgres", "16", "myapp_test",
-            "rails", "filename",
-            "h".into(), None, Default::default());
+            "postgres",
+            "16",
+            "myapp_test",
+            "rails",
+            "filename",
+            "h".into(),
+            None,
+            Default::default(),
+        );
         let n = k.template_name();
         assert!(n.starts_with("_tm_tmpl_postgres_"));
         assert_eq!(n.len(), "_tm_tmpl_postgres_".len() + 16);

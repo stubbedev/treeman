@@ -48,7 +48,8 @@ pub async fn record_built(
     .bind(size_bytes)
     .bind(now)
     .bind(now)
-    .execute(pool).await?;
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -58,7 +59,10 @@ pub async fn mark_used(pool: &SqlitePool, fingerprint: &str) -> Result<()> {
         "UPDATE snapshots SET last_used_at = ?, use_count = use_count + 1
          WHERE fingerprint = ?",
     )
-    .bind(now).bind(fingerprint).execute(pool).await?;
+    .bind(now)
+    .bind(fingerprint)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -66,11 +70,16 @@ pub async fn list(pool: &SqlitePool, engine: Option<&str>) -> Result<Vec<Snapsho
     if let Some(e) = engine {
         Ok(sqlx::query_as::<_, SnapshotRow>(
             "SELECT * FROM snapshots WHERE engine = ? ORDER BY last_used_at DESC",
-        ).bind(e).fetch_all(pool).await?)
+        )
+        .bind(e)
+        .fetch_all(pool)
+        .await?)
     } else {
-        Ok(sqlx::query_as::<_, SnapshotRow>(
-            "SELECT * FROM snapshots ORDER BY last_used_at DESC",
-        ).fetch_all(pool).await?)
+        Ok(
+            sqlx::query_as::<_, SnapshotRow>("SELECT * FROM snapshots ORDER BY last_used_at DESC")
+                .fetch_all(pool)
+                .await?,
+        )
     }
 }
 
@@ -91,10 +100,13 @@ pub async fn gc_lru(
     let mut by_source: std::collections::BTreeMap<(String, String), Vec<SnapshotRow>> =
         Default::default();
     for r in &all {
-        by_source.entry((r.engine.clone(), r.source_db.clone())).or_default().push(r.clone());
+        by_source
+            .entry((r.engine.clone(), r.source_db.clone()))
+            .or_default()
+            .push(r.clone());
     }
     for ((_, _), mut rows) in by_source {
-        rows.sort_by(|a, b| b.last_used_at.cmp(&a.last_used_at));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.last_used_at));
         if rows.len() > keep_per_source as usize {
             to_drop.extend(rows.split_off(keep_per_source as usize));
         }
@@ -102,8 +114,7 @@ pub async fn gc_lru(
 
     // Age cutoff
     if max_age_days > 0 {
-        let cutoff = chrono::Utc::now().timestamp_millis()
-            - (max_age_days as i64) * 86_400_000;
+        let cutoff = chrono::Utc::now().timestamp_millis() - (max_age_days as i64) * 86_400_000;
         for r in &all {
             if r.last_used_at < cutoff && !to_drop.iter().any(|x| x.fingerprint == r.fingerprint) {
                 to_drop.push(r.clone());
@@ -116,10 +127,14 @@ pub async fn gc_lru(
         let cap = max_total_gb as i64 * 1024 * 1024 * 1024;
         let mut total: i64 = all.iter().filter_map(|r| r.size_bytes).sum();
         let mut sorted = all.clone();
-        sorted.sort_by(|a, b| a.last_used_at.cmp(&b.last_used_at)); // oldest first
+        sorted.sort_by_key(|r| r.last_used_at); // oldest first
         for r in sorted {
-            if total <= cap { break; }
-            if to_drop.iter().any(|x| x.fingerprint == r.fingerprint) { continue; }
+            if total <= cap {
+                break;
+            }
+            if to_drop.iter().any(|x| x.fingerprint == r.fingerprint) {
+                continue;
+            }
             total -= r.size_bytes.unwrap_or(0);
             to_drop.push(r);
         }
@@ -127,7 +142,9 @@ pub async fn gc_lru(
 
     for r in &to_drop {
         sqlx::query("DELETE FROM snapshots WHERE fingerprint = ?")
-            .bind(&r.fingerprint).execute(pool).await?;
+            .bind(&r.fingerprint)
+            .execute(pool)
+            .await?;
     }
     Ok(to_drop)
 }

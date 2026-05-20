@@ -71,7 +71,10 @@ pub async fn run_hooks(
         }
         outcomes.push(out);
     }
-    Ok(HookRunOutcome { steps: outcomes, aggregate_exit_code: aggregate })
+    Ok(HookRunOutcome {
+        steps: outcomes,
+        aggregate_exit_code: aggregate,
+    })
 }
 
 async fn run_foreground(
@@ -82,7 +85,8 @@ async fn run_foreground(
     slug: &str,
 ) -> Result<StepOutcome> {
     let mut child = Command::new("/bin/sh")
-        .arg("-c").arg(cmd)
+        .arg("-c")
+        .arg(cmd)
         .current_dir(cwd)
         .env("GWT_MAIN", repo_root)
         .env("GWT_WT", worktree_path)
@@ -121,7 +125,9 @@ fn spawn_background(
     // setsid so the background process survives shell exit; mirrors the
     // existing .gwt-postcreate behavior.
     std::process::Command::new("setsid")
-        .arg("/bin/sh").arg("-c").arg(cmd)
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
         .current_dir(cwd)
         .env("GWT_MAIN", repo_root)
         .env("GWT_WT", worktree_path)
@@ -143,8 +149,13 @@ async fn capture_tail<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     let mut line = String::new();
     loop {
         line.clear();
-        let n = match reader.read_line(&mut line).await { Ok(n) => n, Err(_) => break };
-        if n == 0 { break; }
+        let n = match reader.read_line(&mut line).await {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
         buf.extend_from_slice(line.as_bytes());
         if buf.len() > cap_bytes {
             let drop_n = buf.len() - cap_bytes;

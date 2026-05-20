@@ -30,20 +30,38 @@ pub struct EventFilter {
 
 pub async fn query_events(pool: &SqlitePool, filter: &EventFilter) -> Result<Vec<EventRow>> {
     let mut sql = String::from(
-        "SELECT id, ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms FROM events WHERE 1=1"
+        "SELECT id, ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms FROM events WHERE 1=1",
     );
-    if filter.since_ms.is_some() { sql.push_str(" AND ts >= ?"); }
-    if filter.level.is_some() { sql.push_str(" AND level = ?"); }
-    if filter.event_type.is_some() { sql.push_str(" AND event_type = ?"); }
-    if filter.worktree_id.is_some() { sql.push_str(" AND worktree_id = ?"); }
-    if filter.grep.is_some() { sql.push_str(" AND (message LIKE ? OR payload_json LIKE ?)"); }
+    if filter.since_ms.is_some() {
+        sql.push_str(" AND ts >= ?");
+    }
+    if filter.level.is_some() {
+        sql.push_str(" AND level = ?");
+    }
+    if filter.event_type.is_some() {
+        sql.push_str(" AND event_type = ?");
+    }
+    if filter.worktree_id.is_some() {
+        sql.push_str(" AND worktree_id = ?");
+    }
+    if filter.grep.is_some() {
+        sql.push_str(" AND (message LIKE ? OR payload_json LIKE ?)");
+    }
     sql.push_str(" ORDER BY ts DESC LIMIT ?");
 
     let mut q = sqlx::query_as::<_, EventRow>(&sql);
-    if let Some(t) = filter.since_ms { q = q.bind(t); }
-    if let Some(l) = &filter.level { q = q.bind(l); }
-    if let Some(t) = &filter.event_type { q = q.bind(t); }
-    if let Some(w) = filter.worktree_id { q = q.bind(w); }
+    if let Some(t) = filter.since_ms {
+        q = q.bind(t);
+    }
+    if let Some(l) = &filter.level {
+        q = q.bind(l);
+    }
+    if let Some(t) = &filter.event_type {
+        q = q.bind(t);
+    }
+    if let Some(w) = filter.worktree_id {
+        q = q.bind(w);
+    }
     if let Some(g) = &filter.grep {
         let like = format!("%{g}%");
         q = q.bind(like.clone()).bind(like);

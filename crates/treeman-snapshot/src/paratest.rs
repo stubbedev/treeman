@@ -44,10 +44,16 @@ pub fn render_clone_names(plan: &ParatestPlan, slug: &str) -> Result<Vec<String>
 
 /// Auto = num_cpus.
 pub fn auto_clones() -> u32 {
-    std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4)
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4)
 }
 
-pub async fn mysql_fanout(driver: Arc<MysqlDriver>, plan: ParatestPlan, slug: &str) -> Result<Vec<String>> {
+pub async fn mysql_fanout(
+    driver: Arc<MysqlDriver>,
+    plan: ParatestPlan,
+    slug: &str,
+) -> Result<Vec<String>> {
     let names = render_clone_names(&plan, slug)?;
     let semaphore = Arc::new(Semaphore::new(global_concurrency(plan.clones)));
     let mut handles = Vec::with_capacity(names.len());
@@ -58,16 +64,23 @@ pub async fn mysql_fanout(driver: Arc<MysqlDriver>, plan: ParatestPlan, slug: &s
         let dst = name.clone();
         let h = tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("permit");
-            drv.snapshot_create(&src, &dst).await
+            drv.snapshot_create(&src, &dst)
+                .await
                 .with_context(|| format!("mysql clone {src} → {dst}"))
         });
         handles.push(h);
     }
-    for h in handles { h.await??; }
+    for h in handles {
+        h.await??;
+    }
     Ok(names)
 }
 
-pub async fn postgres_fanout(driver: Arc<PostgresDriver>, plan: ParatestPlan, slug: &str) -> Result<Vec<String>> {
+pub async fn postgres_fanout(
+    driver: Arc<PostgresDriver>,
+    plan: ParatestPlan,
+    slug: &str,
+) -> Result<Vec<String>> {
     let names = render_clone_names(&plan, slug)?;
     let semaphore = Arc::new(Semaphore::new(global_concurrency(plan.clones)));
     let mut handles = Vec::with_capacity(names.len());
@@ -78,12 +91,15 @@ pub async fn postgres_fanout(driver: Arc<PostgresDriver>, plan: ParatestPlan, sl
         let dst = name.clone();
         let h = tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("permit");
-            drv.snapshot_restore(&src, &dst).await
+            drv.snapshot_restore(&src, &dst)
+                .await
                 .with_context(|| format!("pg clone {src} → {dst}"))
         });
         handles.push(h);
     }
-    for h in handles { h.await??; }
+    for h in handles {
+        h.await??;
+    }
     Ok(names)
 }
 

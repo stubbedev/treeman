@@ -16,7 +16,9 @@ pub struct ElasticsearchDriver {
 
 impl ElasticsearchDriver {
     pub fn connect(cfg: &EsConn) -> Result<Self> {
-        let http = reqwest::Client::builder().build().context("reqwest client")?;
+        let http = reqwest::Client::builder()
+            .build()
+            .context("reqwest client")?;
         Ok(Self {
             base: cfg.url.trim_end_matches('/').to_string(),
             http,
@@ -31,14 +33,18 @@ impl ElasticsearchDriver {
         let res = self.http.put(self.url(path)).json(body).send().await?;
         let s = res.status();
         let v: Value = res.json().await.unwrap_or(json!({}));
-        if !s.is_success() { return Err(anyhow!("PUT {path} → HTTP {s}: {v}")); }
+        if !s.is_success() {
+            return Err(anyhow!("PUT {path} → HTTP {s}: {v}"));
+        }
         Ok(v)
     }
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let res = self.http.post(self.url(path)).json(body).send().await?;
         let s = res.status();
         let v: Value = res.json().await.unwrap_or(json!({}));
-        if !s.is_success() { return Err(anyhow!("POST {path} → HTTP {s}: {v}")); }
+        if !s.is_success() {
+            return Err(anyhow!("POST {path} → HTTP {s}: {v}"));
+        }
         Ok(v)
     }
     async fn delete(&self, path: &str) -> Result<reqwest::StatusCode> {
@@ -54,21 +60,37 @@ impl ElasticsearchDriver {
         validate_index(source)?;
         validate_index(template)?;
         // _clone requires source index to be read-only.
-        let _ = self.put(&format!("{source}/_settings"),
-            &json!({"index.blocks.write": true})).await;
-        let res = self.put(&format!("{source}/_clone/{template}"),
-            &json!({})).await;
+        let _ = self
+            .put(
+                &format!("{source}/_settings"),
+                &json!({"index.blocks.write": true}),
+            )
+            .await;
+        let res = self
+            .put(&format!("{source}/_clone/{template}"), &json!({}))
+            .await;
         // Always try to unset the block, even on error.
-        let _ = self.put(&format!("{source}/_settings"),
-            &json!({"index.blocks.write": false})).await;
+        let _ = self
+            .put(
+                &format!("{source}/_settings"),
+                &json!({"index.blocks.write": false}),
+            )
+            .await;
         match res {
-            Ok(_) => { debug!(source, template, "es snapshot _clone ok"); Ok(()) }
+            Ok(_) => {
+                debug!(source, template, "es snapshot _clone ok");
+                Ok(())
+            }
             Err(e) => {
                 // Fallback to _reindex.
                 debug!(error = %e, "es _clone failed, falling back to _reindex");
                 self.put(template, &json!({})).await?;
-                let task = self.post("_reindex?wait_for_completion=true",
-                    &json!({"source": {"index": source}, "dest": {"index": template}})).await?;
+                let task = self
+                    .post(
+                        "_reindex?wait_for_completion=true",
+                        &json!({"source": {"index": source}, "dest": {"index": template}}),
+                    )
+                    .await?;
                 debug!(task = %task, "es _reindex done");
                 Ok(())
             }
@@ -85,12 +107,18 @@ impl ElasticsearchDriver {
 
 #[async_trait]
 impl DbDriver for ElasticsearchDriver {
-    fn engine(&self) -> Engine { Engine::Elasticsearch }
+    fn engine(&self) -> Engine {
+        Engine::Elasticsearch
+    }
 
     async fn engine_version(&self) -> Result<String> {
         let body: Value = self.http.get(self.url("/")).send().await?.json().await?;
-        Ok(body.get("version").and_then(|v| v.get("number"))
-            .and_then(|v| v.as_str()).unwrap_or("unknown").to_string())
+        Ok(body
+            .get("version")
+            .and_then(|v| v.get("number"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string())
     }
 
     async fn ensure_db(&self, name: &str) -> Result<()> {
@@ -115,8 +143,14 @@ impl DbDriver for ElasticsearchDriver {
     }
 
     async fn list_matching(&self, prefix: &str) -> Result<Vec<String>> {
-        let body = self.get_text(&format!("_cat/indices/{prefix}*?h=index")).await?;
-        Ok(body.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        let body = self
+            .get_text(&format!("_cat/indices/{prefix}*?h=index"))
+            .await?;
+        Ok(body
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
     }
 
     async fn flush_namespace(&self, ns: &Namespace) -> Result<()> {
@@ -137,7 +171,12 @@ fn validate_index(name: &str) -> Result<()> {
     }
     for c in name.chars() {
         // ES rejects: \, /, *, ?, ", <, >, |, space, comma, # and uppercase.
-        if c.is_uppercase() || matches!(c, '\\'|'/'|'*'|'?'|'"'|'<'|'>'|'|'|','|'#'|' ') {
+        if c.is_uppercase()
+            || matches!(
+                c,
+                '\\' | '/' | '*' | '?' | '"' | '<' | '>' | '|' | ',' | '#' | ' '
+            )
+        {
             anyhow::bail!("invalid es index name: {name:?}");
         }
     }

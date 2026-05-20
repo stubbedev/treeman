@@ -47,14 +47,19 @@ impl EngineArg {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[clap(rename_all = "lower")]
-enum PhaseArg { Precreate, Postcreate, Predelete, Postdelete }
+enum PhaseArg {
+    Precreate,
+    Postcreate,
+    Predelete,
+    Postdelete,
+}
 
 impl PhaseArg {
     fn as_str(self) -> &'static str {
         match self {
-            PhaseArg::Precreate  => "precreate",
+            PhaseArg::Precreate => "precreate",
             PhaseArg::Postcreate => "postcreate",
-            PhaseArg::Predelete  => "predelete",
+            PhaseArg::Predelete => "predelete",
             PhaseArg::Postdelete => "postdelete",
         }
     }
@@ -62,13 +67,18 @@ impl PhaseArg {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[clap(rename_all = "lower")]
-enum LevelArg { Debug, Info, Warn, Error }
+enum LevelArg {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
 impl LevelArg {
     fn as_str(self) -> &'static str {
         match self {
             LevelArg::Debug => "debug",
-            LevelArg::Info  => "info",
-            LevelArg::Warn  => "warn",
+            LevelArg::Info => "info",
+            LevelArg::Warn => "warn",
             LevelArg::Error => "error",
         }
     }
@@ -184,9 +194,15 @@ enum DaemonCmd {
 #[derive(Subcommand, Debug)]
 enum WatcherCmd {
     /// Tell the daemon to watch this (or a given) repo.
-    Start { #[command(flatten)] common: RepoCommon },
+    Start {
+        #[command(flatten)]
+        common: RepoCommon,
+    },
     /// Stop watching a repo.
-    Stop  { #[command(flatten)] common: RepoCommon },
+    Stop {
+        #[command(flatten)]
+        common: RepoCommon,
+    },
     /// List currently-watched repos.
     List,
 }
@@ -232,11 +248,17 @@ enum SnapshotCmd {
 #[derive(Subcommand, Debug)]
 enum FrameworksCmd {
     /// List built-in + YAML-declared frameworks; print which ones the repo matches.
-    Detect { #[command(flatten)] repo: RepoCommon },
+    Detect {
+        #[command(flatten)]
+        repo: RepoCommon,
+    },
 }
 
 #[derive(clap::Args, Debug)]
-struct WatchArgs { #[command(flatten)] repo: RepoCommon }
+struct WatchArgs {
+    #[command(flatten)]
+    repo: RepoCommon,
+}
 
 #[derive(Subcommand, Debug)]
 enum DbCmd {
@@ -381,9 +403,15 @@ struct SlugArgs {
 #[derive(Subcommand, Debug)]
 enum ConfigCmd {
     /// Load global + per-repo config and report errors.
-    Validate { #[command(flatten)] repo: RepoCommon },
+    Validate {
+        #[command(flatten)]
+        repo: RepoCommon,
+    },
     /// Print the loaded, merged config as YAML.
-    Show { #[command(flatten)] repo: RepoCommon },
+    Show {
+        #[command(flatten)]
+        repo: RepoCommon,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -438,43 +466,86 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Config(ConfigCmd::Validate { repo }) => config_validate(repo.repo),
         Cmd::Config(ConfigCmd::Show { repo }) => config_show(repo.repo),
         Cmd::Schema(SchemaCmd::Dump) => schema_dump(),
-        Cmd::Logs(LogsCmd::Tail { follow, limit, level, event_type, worktree }) =>
-            logs_tail(follow, limit, level.map(|l| l.as_str().into()), event_type, worktree).await,
-        Cmd::Logs(LogsCmd::Grep { pattern, limit, level, event_type }) =>
-            logs_grep(pattern, limit, level.map(|l| l.as_str().into()), event_type).await,
-        Cmd::Worktree(WorktreeCmd::Create { branch, from, path, repo, skip_hooks, skip_prepare }) =>
-            worktree_create(branch, from, path, repo.repo, skip_hooks, skip_prepare).await,
-        Cmd::Worktree(WorktreeCmd::Delete { target, repo, force }) =>
-            worktree_delete(target, repo.repo, force).await,
-        Cmd::Worktree(WorktreeCmd::Register { path, branch, repo }) =>
-            worktree_register(path, branch, repo.repo).await,
+        Cmd::Logs(LogsCmd::Tail {
+            follow,
+            limit,
+            level,
+            event_type,
+            worktree,
+        }) => {
+            logs_tail(
+                follow,
+                limit,
+                level.map(|l| l.as_str().into()),
+                event_type,
+                worktree,
+            )
+            .await
+        }
+        Cmd::Logs(LogsCmd::Grep {
+            pattern,
+            limit,
+            level,
+            event_type,
+        }) => logs_grep(pattern, limit, level.map(|l| l.as_str().into()), event_type).await,
+        Cmd::Worktree(WorktreeCmd::Create {
+            branch,
+            from,
+            path,
+            repo,
+            skip_hooks,
+            skip_prepare,
+        }) => worktree_create(branch, from, path, repo.repo, skip_hooks, skip_prepare).await,
+        Cmd::Worktree(WorktreeCmd::Delete {
+            target,
+            repo,
+            force,
+        }) => worktree_delete(target, repo.repo, force).await,
+        Cmd::Worktree(WorktreeCmd::Register { path, branch, repo }) => {
+            worktree_register(path, branch, repo.repo).await
+        }
         Cmd::Worktree(WorktreeCmd::List) => worktree_list().await,
         Cmd::Worktree(WorktreeCmd::Unregister { path }) => worktree_unregister(path).await,
-        Cmd::Hook(HookCmd::Run { phase, worktree }) =>
-            hook_run(phase.as_str().to_string(), worktree.worktree).await,
-        Cmd::Db(DbCmd::Drop  { engine, prefix, repo }) =>
-            db_drop(engine.as_str().into(), prefix, repo.repo).await,
-        Cmd::Db(DbCmd::Flush { engine, db, prefix, repo }) =>
-            db_flush(engine.as_str().into(), db, prefix, repo.repo).await,
-        Cmd::Db(DbCmd::List  { engine, prefix, repo }) =>
-            db_list(engine.as_str().into(), prefix, repo.repo).await,
+        Cmd::Hook(HookCmd::Run { phase, worktree }) => {
+            hook_run(phase.as_str().to_string(), worktree.worktree).await
+        }
+        Cmd::Db(DbCmd::Drop {
+            engine,
+            prefix,
+            repo,
+        }) => db_drop(engine.as_str().into(), prefix, repo.repo).await,
+        Cmd::Db(DbCmd::Flush {
+            engine,
+            db,
+            prefix,
+            repo,
+        }) => db_flush(engine.as_str().into(), db, prefix, repo.repo).await,
+        Cmd::Db(DbCmd::List {
+            engine,
+            prefix,
+            repo,
+        }) => db_list(engine.as_str().into(), prefix, repo.repo).await,
         Cmd::Frameworks(FrameworksCmd::Detect { repo }) => frameworks_detect(repo.repo).await,
         Cmd::Watch(args) => watch(args).await,
-        Cmd::Snapshot(SnapshotCmd::List { engine }) =>
-            snapshot_list(engine.map(|e| e.as_str().into())).await,
+        Cmd::Snapshot(SnapshotCmd::List { engine }) => {
+            snapshot_list(engine.map(|e| e.as_str().into())).await
+        }
         Cmd::Snapshot(SnapshotCmd::Show { fingerprint }) => snapshot_show(fingerprint).await,
-        Cmd::Snapshot(SnapshotCmd::Gc { keep_per_source, max_age_days, max_total_gb }) =>
-            snapshot_gc(keep_per_source, max_age_days, max_total_gb).await,
+        Cmd::Snapshot(SnapshotCmd::Gc {
+            keep_per_source,
+            max_age_days,
+            max_total_gb,
+        }) => snapshot_gc(keep_per_source, max_age_days, max_total_gb).await,
         Cmd::Prepare(args) => prepare_cmd(args).await,
-        Cmd::Daemon(DaemonCmd::Start)     => daemon_start().await,
-        Cmd::Daemon(DaemonCmd::Stop)      => daemon_stop().await,
-        Cmd::Daemon(DaemonCmd::Restart)   => daemon_restart().await,
-        Cmd::Daemon(DaemonCmd::Status)    => status().await,
-        Cmd::Daemon(DaemonCmd::Install)   => daemon_install(),
+        Cmd::Daemon(DaemonCmd::Start) => daemon_start().await,
+        Cmd::Daemon(DaemonCmd::Stop) => daemon_stop().await,
+        Cmd::Daemon(DaemonCmd::Restart) => daemon_restart().await,
+        Cmd::Daemon(DaemonCmd::Status) => status().await,
+        Cmd::Daemon(DaemonCmd::Install) => daemon_install(),
         Cmd::Daemon(DaemonCmd::Uninstall) => daemon_uninstall(),
         Cmd::Watcher(WatcherCmd::Start { common }) => watcher_start(common.repo).await,
-        Cmd::Watcher(WatcherCmd::Stop  { common }) => watcher_stop(common.repo).await,
-        Cmd::Watcher(WatcherCmd::List)             => watcher_list().await,
+        Cmd::Watcher(WatcherCmd::Stop { common }) => watcher_stop(common.repo).await,
+        Cmd::Watcher(WatcherCmd::List) => watcher_list().await,
         Cmd::Init(args) => init_cmd(args),
         Cmd::Completions(args) => completions(args),
         Cmd::Manpage => manpage(),
@@ -487,11 +558,19 @@ static mut COLOR_ON: bool = true;
 fn init_color(no_color_flag: bool) {
     let env_no = std::env::var_os("NO_COLOR").is_some();
     let is_tty = std::io::stdout().is_terminal();
-    unsafe { COLOR_ON = !no_color_flag && !env_no && is_tty; }
+    unsafe {
+        COLOR_ON = !no_color_flag && !env_no && is_tty;
+    }
 }
-fn color_on() -> bool { unsafe { COLOR_ON } }
+fn color_on() -> bool {
+    unsafe { COLOR_ON }
+}
 fn paint(s: &str, st: Style) -> String {
-    if color_on() { s.style(st).to_string() } else { s.to_string() }
+    if color_on() {
+        s.style(st).to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 // ───────────────────────── completions / manpage ─────────────────────────
@@ -546,7 +625,10 @@ async fn daemon_stop() -> Result<()> {
         return service_stop();
     }
     match client::call(Request::Shutdown).await {
-        Ok(Response::Ok) => { println!("shutdown sent"); Ok(()) }
+        Ok(Response::Ok) => {
+            println!("shutdown sent");
+            Ok(())
+        }
         Ok(other) => bail!("unexpected response: {:?}", other),
         Err(e) => bail!("could not reach daemon: {e}"),
     }
@@ -557,7 +639,9 @@ async fn daemon_restart() -> Result<()> {
     let _ = daemon_stop().await;
     // Wait briefly for the socket to free up before starting again.
     for _ in 0..20 {
-        if client::call(Request::Ping).await.is_err() { break; }
+        if client::call(Request::Ping).await.is_err() {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     daemon_start().await
@@ -567,7 +651,10 @@ fn daemon_install() -> Result<()> {
     let exe = std::env::current_exe()?;
     let daemon_bin = exe.parent().context("exe parent")?.join("treemand");
     if !daemon_bin.is_file() {
-        bail!("treemand binary not found next to treeman at {}", daemon_bin.display());
+        bail!(
+            "treemand binary not found next to treeman at {}",
+            daemon_bin.display()
+        );
     }
     if cfg!(target_os = "macos") {
         install_launchd(&daemon_bin)
@@ -590,7 +677,9 @@ fn daemon_uninstall() -> Result<()> {
 
 // ───────────────────────── service helpers ─────────────────────────
 
-fn home() -> Result<PathBuf> { Ok(PathBuf::from(std::env::var("HOME")?)) }
+fn home() -> Result<PathBuf> {
+    Ok(PathBuf::from(std::env::var("HOME")?))
+}
 
 fn systemd_unit_path() -> Result<PathBuf> {
     Ok(home()?.join(".config/systemd/user/treemand.service"))
@@ -600,7 +689,9 @@ fn launchd_plist_path() -> Result<PathBuf> {
     Ok(home()?.join("Library/LaunchAgents/com.treeman.daemon.plist"))
 }
 
-fn launchd_label() -> &'static str { "com.treeman.daemon" }
+fn launchd_label() -> &'static str {
+    "com.treeman.daemon"
+}
 
 fn service_installed() -> bool {
     if cfg!(target_os = "macos") {
@@ -634,7 +725,9 @@ fn service_start() -> Result<()> {
             .args(["--user", "start", "treemand.service"])
             .status()
             .context("systemctl --user start")?;
-        if !s.success() { bail!("systemctl --user start treemand.service failed"); }
+        if !s.success() {
+            bail!("systemctl --user start treemand.service failed");
+        }
         println!("treemand started via systemd --user");
         Ok(())
     }
@@ -655,7 +748,9 @@ fn service_stop() -> Result<()> {
             .args(["--user", "stop", "treemand.service"])
             .status()
             .context("systemctl --user stop")?;
-        if !s.success() { bail!("systemctl --user stop treemand.service failed"); }
+        if !s.success() {
+            bail!("systemctl --user stop treemand.service failed");
+        }
         println!("treemand stopped via systemd --user");
         Ok(())
     }
@@ -665,7 +760,10 @@ async fn spawn_treemand_detached() -> Result<()> {
     let exe = std::env::current_exe()?;
     let daemon_bin = exe.parent().context("exe parent")?.join("treemand");
     if !daemon_bin.is_file() {
-        bail!("treemand binary not found next to treeman at {}", daemon_bin.display());
+        bail!(
+            "treemand binary not found next to treeman at {}",
+            daemon_bin.display()
+        );
     }
     // setsid on Linux; nohup on macOS (setsid is not on the default PATH).
     if cfg!(target_os = "macos") {
@@ -687,7 +785,10 @@ async fn spawn_treemand_detached() -> Result<()> {
     }
     for _ in 0..50 {
         if let Ok(Response::Pong) = client::call(Request::Ping).await {
-            println!("{} treemand started", paint("ok", Style::new().green().bold()));
+            println!(
+                "{} treemand started",
+                paint("ok", Style::new().green().bold())
+            );
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -701,7 +802,7 @@ fn install_systemd(daemon_bin: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let unit = format!(
-r#"[Unit]
+        r#"[Unit]
 Description=Treeman per-worktree DB orchestrator daemon
 After=default.target
 
@@ -713,13 +814,16 @@ RestartSec=2
 
 [Install]
 WantedBy=default.target
-"#, daemon = daemon_bin.display());
-    std::fs::write(&unit_path, unit)
-        .with_context(|| format!("write {}", unit_path.display()))?;
+"#,
+        daemon = daemon_bin.display()
+    );
+    std::fs::write(&unit_path, unit).with_context(|| format!("write {}", unit_path.display()))?;
     println!("wrote {}", unit_path.display());
     run_systemctl(&["--user", "daemon-reload"])?;
     run_systemctl(&["--user", "enable", "--now", "treemand.service"])?;
-    println!("treemand enabled + started (systemd --user). Check: `systemctl --user status treemand`");
+    println!(
+        "treemand enabled + started (systemd --user). Check: `systemctl --user status treemand`"
+    );
     Ok(())
 }
 
@@ -745,9 +849,13 @@ fn uninstall_systemd() -> Result<()> {
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {
-    let s = std::process::Command::new("systemctl").args(args).status()
+    let s = std::process::Command::new("systemctl")
+        .args(args)
+        .status()
         .context("invoke systemctl")?;
-    if !s.success() { bail!("systemctl {args:?} failed"); }
+    if !s.success() {
+        bail!("systemctl {args:?} failed");
+    }
     Ok(())
 }
 
@@ -760,7 +868,7 @@ fn install_launchd(daemon_bin: &Path) -> Result<()> {
     let log_dir = home()?.join("Library/Logs/treeman");
     std::fs::create_dir_all(&log_dir)?;
     let plist = format!(
-r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -782,7 +890,10 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
     <string>Interactive</string>
 </dict>
 </plist>
-"#, daemon = daemon_bin.display(), log = log_dir.display());
+"#,
+        daemon = daemon_bin.display(),
+        log = log_dir.display()
+    );
     std::fs::write(&plist_path, plist)
         .with_context(|| format!("write {}", plist_path.display()))?;
     println!("wrote {}", plist_path.display());
@@ -799,7 +910,10 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
             .args(["kickstart", "-k", &format!("{domain}/{label}")])
             .status();
     }
-    println!("treemand loaded into launchd ({label}). Logs: {}", log_dir.display());
+    println!(
+        "treemand loaded into launchd ({label}). Logs: {}",
+        log_dir.display()
+    );
     Ok(())
 }
 
@@ -824,7 +938,9 @@ fn uninstall_launchd() -> Result<()> {
 
 async fn watcher_start(repo: Option<PathBuf>) -> Result<()> {
     let repo_path = resolve_repo_for_watcher(repo)?;
-    let req = Request::WatcherStart { repo_path: repo_path.to_string_lossy().to_string() };
+    let req = Request::WatcherStart {
+        repo_path: repo_path.to_string_lossy().to_string(),
+    };
     match client::call(req).await? {
         Response::WatcherStarted { repo_path } => println!("watcher started: {repo_path}"),
         Response::Error { message } => bail!("daemon: {message}"),
@@ -835,7 +951,9 @@ async fn watcher_start(repo: Option<PathBuf>) -> Result<()> {
 
 async fn watcher_stop(repo: Option<PathBuf>) -> Result<()> {
     let repo_path = resolve_repo_for_watcher(repo)?;
-    let req = Request::WatcherStop { repo_path: repo_path.to_string_lossy().to_string() };
+    let req = Request::WatcherStop {
+        repo_path: repo_path.to_string_lossy().to_string(),
+    };
     match client::call(req).await? {
         Response::WatcherStopped { repo_path } => println!("watcher stopped: {repo_path}"),
         Response::Error { message } => bail!("daemon: {message}"),
@@ -850,7 +968,9 @@ async fn watcher_list() -> Result<()> {
             if repos.is_empty() {
                 println!("(no watchers running)");
             } else {
-                for r in repos { println!("{r}"); }
+                for r in repos {
+                    println!("{r}");
+                }
             }
         }
         Response::Error { message } => bail!("daemon: {message}"),
@@ -861,7 +981,9 @@ async fn watcher_list() -> Result<()> {
 
 fn resolve_repo_for_watcher(repo: Option<PathBuf>) -> Result<PathBuf> {
     match repo {
-        Some(p) => p.canonicalize().with_context(|| format!("canonicalize {}", p.display())),
+        Some(p) => p
+            .canonicalize()
+            .with_context(|| format!("canonicalize {}", p.display())),
         None => {
             let cwd = std::env::current_dir()?;
             discover_repo_root(&cwd).context("no repo root found")
@@ -886,7 +1008,10 @@ fn config_validate(repo: Option<PathBuf>) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let cfg = treeman_core::config::load_layered(repo.as_deref()).context("load config")?;
     let ok = paint("ok:", Style::new().green().bold());
-    println!("{ok} config loaded ({} databases configured)", cfg.databases.len());
+    println!(
+        "{ok} config loaded ({} databases configured)",
+        cfg.databases.len()
+    );
     Ok(())
 }
 
@@ -904,7 +1029,9 @@ fn schema_dump() -> Result<()> {
 }
 
 fn resolve_repo(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
-    if let Some(p) = explicit { return Ok(Some(p)); }
+    if let Some(p) = explicit {
+        return Ok(Some(p));
+    }
     let cwd = std::env::current_dir()?;
     let mut dir = cwd.as_path();
     loop {
@@ -930,21 +1057,40 @@ async fn logs_tail(
     let db_path = treeman_store::default_db_path()?;
     let pool = treeman_store::open(&db_path).await?;
     let filter = EventFilter {
-        limit: Some(limit), level: level.clone(), event_type: event_type.clone(),
-        worktree_id: worktree, ..Default::default()
+        limit: Some(limit),
+        level: level.clone(),
+        event_type: event_type.clone(),
+        worktree_id: worktree,
+        ..Default::default()
     };
     let mut rows = query_events(&pool, &filter).await?;
     rows.reverse();
     let mut last_id = rows.iter().map(|r| r.id).max().unwrap_or(0);
-    for r in &rows { print_event(r); }
-    if !follow { return Ok(()); }
+    for r in &rows {
+        print_event(r);
+    }
+    if !follow {
+        return Ok(());
+    }
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let next = tail_events(&pool, last_id).await?;
         for r in &next {
-            if let Some(ref l) = level   { if &r.level != l { continue; } }
-            if let Some(ref t) = event_type { if &r.event_type != t { continue; } }
-            if let Some(w) = worktree { if r.worktree_id != Some(w) { continue; } }
+            if let Some(ref l) = level {
+                if &r.level != l {
+                    continue;
+                }
+            }
+            if let Some(ref t) = event_type {
+                if &r.event_type != t {
+                    continue;
+                }
+            }
+            if let Some(w) = worktree {
+                if r.worktree_id != Some(w) {
+                    continue;
+                }
+            }
             print_event(r);
             last_id = r.id;
         }
@@ -952,17 +1098,25 @@ async fn logs_tail(
 }
 
 async fn logs_grep(
-    pattern: String, limit: i64, level: Option<String>, event_type: Option<String>,
+    pattern: String,
+    limit: i64,
+    level: Option<String>,
+    event_type: Option<String>,
 ) -> Result<()> {
     let db_path = treeman_store::default_db_path()?;
     let pool = treeman_store::open(&db_path).await?;
     let filter = EventFilter {
-        limit: Some(limit), level, event_type, grep: Some(pattern),
+        limit: Some(limit),
+        level,
+        event_type,
+        grep: Some(pattern),
         ..Default::default()
     };
     let mut rows = query_events(&pool, &filter).await?;
     rows.reverse();
-    for r in &rows { print_event(r); }
+    for r in &rows {
+        print_event(r);
+    }
     Ok(())
 }
 
@@ -972,10 +1126,10 @@ fn print_event(r: &treeman_store::EventRow) {
         .unwrap_or_else(|| r.ts.to_string());
     let lvl_style = match r.level.as_str() {
         "debug" => Style::new().dimmed(),
-        "info"  => Style::new().green(),
-        "warn"  => Style::new().yellow().bold(),
+        "info" => Style::new().green(),
+        "warn" => Style::new().yellow().bold(),
         "error" => Style::new().red().bold(),
-        _       => Style::new(),
+        _ => Style::new(),
     };
     let lvl = paint(&r.level.to_uppercase(), lvl_style);
     let etype = paint(&r.event_type, Style::new().cyan());
@@ -986,43 +1140,72 @@ fn print_event(r: &treeman_store::EventRow) {
 
 // ───────────────────────── hook + worktree register ─────────────────────────
 
-async fn worktree_register(path: PathBuf, branch: Option<String>, repo: Option<PathBuf>) -> Result<()> {
-    let path = path.canonicalize().with_context(|| format!("canonicalize {}", path.display()))?;
+async fn worktree_register(
+    path: PathBuf,
+    branch: Option<String>,
+    repo: Option<PathBuf>,
+) -> Result<()> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))?;
     let repo_root = match repo {
         Some(r) => r.canonicalize()?,
         None => discover_repo_root(&path).context("could not find repo root for worktree")?,
     };
-    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string();
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo")
+        .to_string();
     let branch = branch.or_else(|| detect_branch(&path));
     let slug = treeman_core::slug_for(&path, branch.as_deref());
 
     let pool = open_pool().await?;
     let repo_id = treeman_store::ensure_repo(&pool, &repo_root, &repo_name).await?;
-    let wt_id = treeman_store::ensure_worktree(&pool, repo_id, &path, &slug.value, branch.as_deref()).await?;
-    println!("worktree #{} slug={} repo=#{} ({})", wt_id, slug.value, repo_id, repo_root.display());
+    let wt_id =
+        treeman_store::ensure_worktree(&pool, repo_id, &path, &slug.value, branch.as_deref())
+            .await?;
+    println!(
+        "worktree #{} slug={} repo=#{} ({})",
+        wt_id,
+        slug.value,
+        repo_id,
+        repo_root.display()
+    );
     Ok(())
 }
 
 async fn worktree_list() -> Result<()> {
     let pool = open_pool().await?;
     let rows = treeman_store::hook_runs::list_worktrees(&pool).await?;
-    if rows.is_empty() { println!("(no worktrees registered)"); return Ok(()); }
+    if rows.is_empty() {
+        println!("(no worktrees registered)");
+        return Ok(());
+    }
     let hdr = paint(
         &format!("{:<4} {:<24} {:<24} {}", "ID", "SLUG", "BRANCH", "PATH"),
         Style::new().bold(),
     );
     println!("{hdr}");
     for r in rows {
-        println!("{:<4} {:<24} {:<24} {}",
-            r.id, r.slug, r.branch.as_deref().unwrap_or("-"), r.path);
+        println!(
+            "{:<4} {:<24} {:<24} {}",
+            r.id,
+            r.slug,
+            r.branch.as_deref().unwrap_or("-"),
+            r.path
+        );
     }
     Ok(())
 }
 
 async fn worktree_unregister(path: PathBuf) -> Result<()> {
-    let path = path.canonicalize().with_context(|| format!("canonicalize {}", path.display()))?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))?;
     let pool = open_pool().await?;
-    let wt = treeman_store::hook_runs::find_worktree_by_path(&pool, &path.to_string_lossy()).await?
+    let wt = treeman_store::hook_runs::find_worktree_by_path(&pool, &path.to_string_lossy())
+        .await?
         .with_context(|| format!("worktree not registered: {}", path.display()))?;
     treeman_store::mark_worktree_deleted(&pool, wt.id).await?;
     println!("unregistered worktree #{} ({})", wt.id, wt.path);
@@ -1034,12 +1217,13 @@ async fn hook_run(phase: String, worktree: Option<PathBuf>) -> Result<()> {
         Some(p) => p.canonicalize()?,
         None => std::env::current_dir()?,
     };
-    let repo_root = discover_repo_root(&wt_path).context("could not find repo root containing worktree")?;
+    let repo_root =
+        discover_repo_root(&wt_path).context("could not find repo root containing worktree")?;
     let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
     let steps = match phase.as_str() {
-        "precreate"  => &cfg.hooks.precreate,
+        "precreate" => &cfg.hooks.precreate,
         "postcreate" => &cfg.hooks.postcreate,
-        "predelete"  => &cfg.hooks.predelete,
+        "predelete" => &cfg.hooks.predelete,
         "postdelete" => &cfg.hooks.postdelete,
         other => bail!("unknown hook phase: {other}"),
     };
@@ -1047,9 +1231,14 @@ async fn hook_run(phase: String, worktree: Option<PathBuf>) -> Result<()> {
     let slug = treeman_core::slug_for(&wt_path, branch.as_deref());
 
     let pool = open_pool().await?;
-    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo");
     let repo_id = treeman_store::ensure_repo(&pool, &repo_root, repo_name).await?;
-    let wt_id = treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, branch.as_deref()).await?;
+    let wt_id =
+        treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, branch.as_deref())
+            .await?;
     let run_id = treeman_store::hook_runs::start_hook_run(&pool, wt_id, &phase).await?;
 
     let start = std::time::Instant::now();
@@ -1058,7 +1247,11 @@ async fn hook_run(phase: String, worktree: Option<PathBuf>) -> Result<()> {
     let mut stdout = String::new();
     let mut stderr = String::new();
     for (i, s) in outcome.steps.iter().enumerate() {
-        let kind = if s.background { "background" } else { "foreground" };
+        let kind = if s.background {
+            "background"
+        } else {
+            "foreground"
+        };
         stdout.push_str(&format!("--- step {i} ({kind}) ---\n{}\n", s.stdout_tail));
         if !s.stderr_tail.is_empty() {
             stderr.push_str(&format!("--- step {i} stderr ---\n{}\n", s.stderr_tail));
@@ -1066,23 +1259,53 @@ async fn hook_run(phase: String, worktree: Option<PathBuf>) -> Result<()> {
         let payload = serde_json::json!({
             "command": s.command, "exit_code": s.exit_code, "background": s.background,
             "stdout_tail": s.stdout_tail, "stderr_tail": s.stderr_tail,
-        }).to_string();
+        })
+        .to_string();
         let level = if s.exit_code == 0 { "info" } else { "error" };
         treeman_store::write_event(
-            &pool, level, "hook_step", Some(&s.command),
-            Some(repo_id), Some(wt_id), Some(&phase), None, &payload,
-        ).await?;
+            &pool,
+            level,
+            "hook_step",
+            Some(&s.command),
+            Some(repo_id),
+            Some(wt_id),
+            Some(&phase),
+            None,
+            &payload,
+        )
+        .await?;
     }
-    treeman_store::hook_runs::finish_hook_run(&pool, run_id, outcome.aggregate_exit_code, &stdout, &stderr).await?;
+    treeman_store::hook_runs::finish_hook_run(
+        &pool,
+        run_id,
+        outcome.aggregate_exit_code,
+        &stdout,
+        &stderr,
+    )
+    .await?;
     let summary = serde_json::json!({
         "run_id": run_id, "exit_code": outcome.aggregate_exit_code, "step_count": outcome.steps.len()
     }).to_string();
-    let level = if outcome.aggregate_exit_code == 0 { "info" } else { "error" };
+    let level = if outcome.aggregate_exit_code == 0 {
+        "info"
+    } else {
+        "error"
+    };
     treeman_store::write_event(
-        &pool, level, "hook_run",
-        Some(&format!("hook {} → exit {}", phase, outcome.aggregate_exit_code)),
-        Some(repo_id), Some(wt_id), Some(&phase), Some(duration_ms), &summary,
-    ).await?;
+        &pool,
+        level,
+        "hook_run",
+        Some(&format!(
+            "hook {} → exit {}",
+            phase, outcome.aggregate_exit_code
+        )),
+        Some(repo_id),
+        Some(wt_id),
+        Some(&phase),
+        Some(duration_ms),
+        &summary,
+    )
+    .await?;
 
     if phase == "predelete" {
         teardown_databases(&cfg, &slug.value, repo_id, wt_id, &pool).await?;
@@ -1093,7 +1316,10 @@ async fn hook_run(phase: String, worktree: Option<PathBuf>) -> Result<()> {
     } else {
         paint("err", Style::new().red().bold())
     };
-    println!("{label} hook_run #{run_id} phase={phase} exit={}", outcome.aggregate_exit_code);
+    println!(
+        "{label} hook_run #{run_id} phase={phase} exit={}",
+        outcome.aggregate_exit_code
+    );
     if outcome.aggregate_exit_code != 0 {
         std::process::exit(outcome.aggregate_exit_code);
     }
@@ -1109,22 +1335,31 @@ async fn db_drop(engine: String, prefix: String, repo: Option<PathBuf>) -> Resul
     if dropped.is_empty() {
         println!("(no databases matched {prefix}*)");
     } else {
-        for n in dropped { println!("dropped {n}"); }
+        for n in dropped {
+            println!("dropped {n}");
+        }
     }
     Ok(())
 }
 
 async fn db_flush(
-    engine: String, db: Option<u8>, prefix: Option<String>, repo: Option<PathBuf>,
+    engine: String,
+    db: Option<u8>,
+    prefix: Option<String>,
+    repo: Option<PathBuf>,
 ) -> Result<()> {
     let cfg = load_cfg(repo)?;
     let driver = open_driver(&engine, &cfg)?;
     if let Some(idx) = db {
-        driver.flush_namespace(&treeman_db::Namespace::RedisDb(idx)).await?;
+        driver
+            .flush_namespace(&treeman_db::Namespace::RedisDb(idx))
+            .await?;
         println!("flushed redis db {idx}");
     } else if let Some(p) = prefix {
         for name in driver.list_matching(&p).await? {
-            driver.flush_namespace(&treeman_db::Namespace::Database(name.clone())).await?;
+            driver
+                .flush_namespace(&treeman_db::Namespace::Database(name.clone()))
+                .await?;
             println!("flushed {name}");
         }
     } else {
@@ -1136,7 +1371,9 @@ async fn db_flush(
 async fn db_list(engine: String, prefix: String, repo: Option<PathBuf>) -> Result<()> {
     let cfg = load_cfg(repo)?;
     let driver = open_driver(&engine, &cfg)?;
-    for n in driver.list_matching(&prefix).await? { println!("{n}"); }
+    for n in driver.list_matching(&prefix).await? {
+        println!("{n}");
+    }
     Ok(())
 }
 
@@ -1152,26 +1389,48 @@ fn open_driver(engine: &str, cfg: &treeman_core::Config) -> Result<Box<dyn treem
     use treeman_db::*;
     match engine {
         "mysql" => {
-            let mc = cfg.connections.mysql.clone().context("connections.mysql not configured")?;
+            let mc = cfg
+                .connections
+                .mysql
+                .clone()
+                .context("connections.mysql not configured")?;
             let rt = tokio::runtime::Handle::current();
             Ok(Box::new(rt.block_on(mysql::MysqlDriver::connect(&mc))?))
         }
         "postgres" => {
-            let pc = cfg.connections.postgres.clone().context("connections.postgres not configured")?;
+            let pc = cfg
+                .connections
+                .postgres
+                .clone()
+                .context("connections.postgres not configured")?;
             let rt = tokio::runtime::Handle::current();
-            Ok(Box::new(rt.block_on(postgres::PostgresDriver::connect(&pc))?))
+            Ok(Box::new(
+                rt.block_on(postgres::PostgresDriver::connect(&pc))?,
+            ))
         }
         "mongodb" => {
-            let mc = cfg.connections.mongodb.clone().context("connections.mongodb not configured")?;
+            let mc = cfg
+                .connections
+                .mongodb
+                .clone()
+                .context("connections.mongodb not configured")?;
             let rt = tokio::runtime::Handle::current();
             Ok(Box::new(rt.block_on(mongo::MongoDriver::connect(&mc))?))
         }
         "elasticsearch" => {
-            let ec = cfg.connections.elasticsearch.clone().context("connections.elasticsearch not configured")?;
+            let ec = cfg
+                .connections
+                .elasticsearch
+                .clone()
+                .context("connections.elasticsearch not configured")?;
             Ok(Box::new(elasticsearch::ElasticsearchDriver::connect(&ec)?))
         }
         "redis" => {
-            let rc = cfg.connections.redis.clone().context("connections.redis not configured")?;
+            let rc = cfg
+                .connections
+                .redis
+                .clone()
+                .context("connections.redis not configured")?;
             Ok(Box::new(redis_driver::RedisDriver::connect(&rc)?))
         }
         other => bail!("unsupported engine: {other}"),
@@ -1194,18 +1453,31 @@ async fn frameworks_detect(repo: Option<PathBuf>) -> Result<()> {
         println!("migration frameworks: (none detected)");
     } else {
         let hdr = paint(
-            &format!("{:<18} {:<14} {:<10} {}", "MIGRATION_FW", "HASH_MODE", "ON_MODIFY", "DIRS"),
+            &format!(
+                "{:<18} {:<14} {:<10} {}",
+                "MIGRATION_FW", "HASH_MODE", "ON_MODIFY", "DIRS"
+            ),
             Style::new().bold(),
         );
         println!("{hdr}");
         for s in mig {
-            let dirs: Vec<_> = s.migration_dirs(&repo_root).iter()
-                .map(|p| p.strip_prefix(&repo_root).unwrap_or(p).display().to_string())
+            let dirs: Vec<_> = s
+                .migration_dirs(&repo_root)
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&repo_root)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string()
+                })
                 .collect();
-            println!("{:<18} {:<14} {:<10} {}",
-                s.name, format!("{:?}", s.hash_mode).to_lowercase(),
+            println!(
+                "{:<18} {:<14} {:<10} {}",
+                s.name,
+                format!("{:?}", s.hash_mode).to_lowercase(),
                 format!("{:?}", s.on_modify).to_lowercase(),
-                dirs.join(", "));
+                dirs.join(", ")
+            );
         }
     }
     println!();
@@ -1216,7 +1488,10 @@ async fn frameworks_detect(repo: Option<PathBuf>) -> Result<()> {
         println!("test frameworks: (none detected)");
     } else {
         let hdr = paint(
-            &format!("{:<22} {:<10} {:<14} {:<10} {}", "TEST_FW", "LANGUAGE", "STRATEGY", "WORKER_IDX", "WORKER_ENV"),
+            &format!(
+                "{:<22} {:<10} {:<14} {:<10} {}",
+                "TEST_FW", "LANGUAGE", "STRATEGY", "WORKER_IDX", "WORKER_ENV"
+            ),
             Style::new().bold(),
         );
         println!("{hdr}");
@@ -1224,7 +1499,10 @@ async fn frameworks_detect(repo: Option<PathBuf>) -> Result<()> {
             let strategy = format!("{:?}", t.clone_strategy).to_lowercase();
             let idx = format!("{:?}", t.worker_index).to_lowercase();
             let env = t.worker_env.unwrap_or_else(|| "-".into());
-            println!("{:<22} {:<10} {:<14} {:<10} {}", t.name, t.language, strategy, idx, env);
+            println!(
+                "{:<22} {:<10} {:<14} {:<10} {}",
+                t.name, t.language, strategy, idx, env
+            );
         }
         if let Some(n) = treeman_migrations::testfw::detected_clone_count(&repo_root) {
             println!();
@@ -1241,25 +1519,40 @@ async fn watch(args: WatchArgs) -> Result<()> {
     };
     let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
     let registry = treeman_migrations::Registry::with_builtins().merge_yaml(&cfg.frameworks);
-    let detected: Vec<_> = registry.detect_all(&repo_root).into_iter().cloned().collect();
+    let detected: Vec<_> = registry
+        .detect_all(&repo_root)
+        .into_iter()
+        .cloned()
+        .collect();
     if detected.is_empty() {
         bail!("no migration frameworks detected — nothing to watch");
     }
-    println!("watching {} ({} framework(s))", repo_root.display(), detected.len());
+    println!(
+        "watching {} ({} framework(s))",
+        repo_root.display(),
+        detected.len()
+    );
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let _handles = treeman_watcher::spawn_repo_watcher(
-        repo_root.clone(), detected, cfg.watcher.debounce_ms, tx,
-    ).await?;
+        repo_root.clone(),
+        detected,
+        cfg.watcher.debounce_ms,
+        tx,
+    )
+    .await?;
     let pool = open_pool().await?;
-    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo");
     let repo_id = treeman_store::ensure_repo(&pool, &repo_root, repo_name).await?;
     let wt_path = std::env::current_dir()?;
     let branch = detect_branch(&wt_path);
     let slug = treeman_core::slug_for(&wt_path, branch.as_deref());
-    let wt_id = treeman_store::ensure_worktree(
-        &pool, repo_id, &wt_path, &slug.value, branch.as_deref(),
-    ).await?;
+    let wt_id =
+        treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, branch.as_deref())
+            .await?;
 
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
@@ -1317,16 +1610,24 @@ async fn snapshot_list(engine: Option<String>) -> Result<()> {
         return Ok(());
     }
     let hdr = paint(
-        &format!("{:<18} {:<10} {:<22} {:<10} {}", "FINGERPRINT", "ENGINE", "SOURCE_DB", "USES", "LAST_USED"),
+        &format!(
+            "{:<18} {:<10} {:<22} {:<10} {}",
+            "FINGERPRINT", "ENGINE", "SOURCE_DB", "USES", "LAST_USED"
+        ),
         Style::new().bold(),
     );
     println!("{hdr}");
     for r in rows {
         let ts = chrono::DateTime::from_timestamp_millis(r.last_used_at)
-            .map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
-        println!("{:<18} {:<10} {:<22} {:<10} {ts}",
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        println!(
+            "{:<18} {:<10} {:<22} {:<10} {ts}",
             &r.fingerprint[..16.min(r.fingerprint.len())],
-            r.engine, r.source_db, r.use_count);
+            r.engine,
+            r.source_db,
+            r.use_count
+        );
     }
     Ok(())
 }
@@ -1334,7 +1635,9 @@ async fn snapshot_list(engine: Option<String>) -> Result<()> {
 async fn snapshot_show(fingerprint: String) -> Result<()> {
     let pool = open_pool().await?;
     let rows = treeman_snapshot::list(&pool, None).await?;
-    let row = rows.into_iter().find(|r| r.fingerprint.starts_with(&fingerprint))
+    let row = rows
+        .into_iter()
+        .find(|r| r.fingerprint.starts_with(&fingerprint))
         .with_context(|| format!("snapshot not found: {fingerprint}"))?;
     println!("{}", serde_json::to_string_pretty(&row)?);
     Ok(())
@@ -1348,7 +1651,12 @@ async fn snapshot_gc(keep: u32, max_age_days: u32, max_total_gb: u32) -> Result<
     } else {
         println!("dropped {} snapshot catalog row(s):", dropped.len());
         for r in dropped {
-            println!("  {} ({}) template={}", &r.fingerprint[..16], r.engine, r.template_name);
+            println!(
+                "  {} ({}) template={}",
+                &r.fingerprint[..16],
+                r.engine,
+                r.template_name
+            );
         }
         println!("note: engine-side DROP DATABASE is up to the caller (run `treeman db drop`)");
     }
@@ -1371,9 +1679,14 @@ async fn prepare_cmd(args: PrepareArgs) -> Result<()> {
     let slug = treeman_core::slug_for(&wt_path, branch.as_deref());
 
     let pool = open_pool().await?;
-    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo");
     let repo_id = treeman_store::ensure_repo(&pool, &repo_root, repo_name).await?;
-    let wt_id = treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, branch.as_deref()).await?;
+    let wt_id =
+        treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, branch.as_deref())
+            .await?;
 
     let outcomes = treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id).await?;
     for o in outcomes {
@@ -1382,9 +1695,17 @@ async fn prepare_cmd(args: PrepareArgs) -> Result<()> {
         } else {
             paint("cold_build", Style::new().yellow().bold())
         };
-        println!("[{}] {} src={} template={} ({} clones)",
-            o.engine, label, o.source_db, o.template_name, o.clones.len());
-        for c in &o.clones { println!("  → {c}"); }
+        println!(
+            "[{}] {} src={} template={} ({} clones)",
+            o.engine,
+            label,
+            o.source_db,
+            o.template_name,
+            o.clones.len()
+        );
+        for c in &o.clones {
+            println!("  → {c}");
+        }
     }
     Ok(())
 }
@@ -1408,7 +1729,13 @@ async fn worktree_create(
     let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
 
     let wt_path = match path {
-        Some(p) => if p.is_absolute() { p } else { repo_root.join(p) },
+        Some(p) => {
+            if p.is_absolute() {
+                p
+            } else {
+                repo_root.join(p)
+            }
+        }
         None => {
             let root = if cfg.worktrees.root.starts_with('/') {
                 PathBuf::from(&cfg.worktrees.root)
@@ -1428,25 +1755,42 @@ async fn worktree_create(
         None => detect_default_branch(&repo_root)?,
     };
     let branch_exists = std::process::Command::new("git")
-        .arg("-C").arg(&repo_root)
-        .arg("rev-parse").arg("--verify").arg("--quiet")
+        .arg("-C")
+        .arg(&repo_root)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
         .arg(format!("refs/heads/{branch}"))
-        .status().map(|s| s.success()).unwrap_or(false);
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
     let status = if branch_exists {
         std::process::Command::new("git")
-            .arg("-C").arg(&repo_root)
-            .arg("worktree").arg("add").arg(&wt_path).arg(&branch)
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("worktree")
+            .arg("add")
+            .arg(&wt_path)
+            .arg(&branch)
             .status()?
     } else {
         std::process::Command::new("git")
-            .arg("-C").arg(&repo_root)
-            .arg("worktree").arg("add").arg("-b").arg(&branch).arg(&wt_path).arg(&base)
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("worktree")
+            .arg("add")
+            .arg("-b")
+            .arg(&branch)
+            .arg(&wt_path)
+            .arg(&base)
             .status()?
     };
-    if !status.success() { bail!("git worktree add failed"); }
-    let wt_path = wt_path.canonicalize().with_context(|| {
-        format!("canonicalize new worktree {}", wt_path.display())
-    })?;
+    if !status.success() {
+        bail!("git worktree add failed");
+    }
+    let wt_path = wt_path
+        .canonicalize()
+        .with_context(|| format!("canonicalize new worktree {}", wt_path.display()))?;
 
     for rel in &cfg.worktrees.links {
         let src = repo_root.join(rel);
@@ -1455,21 +1799,34 @@ async fn worktree_create(
             eprintln!("warn: link source missing, skipping: {}", src.display());
             continue;
         }
-        if dst.exists() { continue; }
-        if let Some(parent) = dst.parent() { std::fs::create_dir_all(parent).ok(); }
+        if dst.exists() {
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
         std::os::unix::fs::symlink(&src, &dst)
             .with_context(|| format!("symlink {} → {}", dst.display(), src.display()))?;
     }
 
     let slug = treeman_core::slug_for(&wt_path, Some(&branch));
     let ctx = TemplateContext::from_slug(&slug);
-    let env_files: Vec<PathBuf> = cfg.env_scoping.files.iter()
-        .map(|f| wt_path.join(f)).collect();
-    let pairs: Vec<(String, String)> = cfg.env_scoping.patches.iter()
+    let env_files: Vec<PathBuf> = cfg
+        .env_scoping
+        .files
+        .iter()
+        .map(|f| wt_path.join(f))
+        .collect();
+    let pairs: Vec<(String, String)> = cfg
+        .env_scoping
+        .patches
+        .iter()
         .map(|p| render(&p.template, &ctx).map(|v| (p.key.clone(), v)))
         .collect::<Result<Vec<_>, _>>()?;
     for f in &env_files {
-        if !f.exists() { continue; }
+        if !f.exists() {
+            continue;
+        }
         let is_xml = f.extension().and_then(|s| s.to_str()) == Some("xml");
         let outcome = if is_xml {
             treeman_core::patcher::patch_phpunit_file(f, &pairs)?
@@ -1485,25 +1842,50 @@ async fn worktree_create(
     }
 
     let pool = open_pool().await?;
-    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo");
     let repo_id = treeman_store::ensure_repo(&pool, &repo_root, repo_name).await?;
-    let wt_id = treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, Some(&branch)).await?;
+    let wt_id =
+        treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, Some(&branch))
+            .await?;
     let ok = paint("ok", Style::new().green().bold());
-    println!("{ok} created worktree #{wt_id} slug={} path={}", slug.value, wt_path.display());
+    println!(
+        "{ok} created worktree #{wt_id} slug={} path={}",
+        slug.value,
+        wt_path.display()
+    );
 
-    if skip_hooks { return Ok(()); }
-    for (phase_name, steps) in [("precreate", &cfg.hooks.precreate), ("postcreate", &cfg.hooks.postcreate)] {
-        if steps.is_empty() { continue; }
-        let outcome = treeman_core::hooks::run_hooks(steps, &repo_root, &wt_path, &slug.value).await?;
+    if skip_hooks {
+        return Ok(());
+    }
+    for (phase_name, steps) in [
+        ("precreate", &cfg.hooks.precreate),
+        ("postcreate", &cfg.hooks.postcreate),
+    ] {
+        if steps.is_empty() {
+            continue;
+        }
+        let outcome =
+            treeman_core::hooks::run_hooks(steps, &repo_root, &wt_path, &slug.value).await?;
         println!("{phase_name}: exit={}", outcome.aggregate_exit_code);
-        if outcome.aggregate_exit_code != 0 { bail!("{phase_name} failed"); }
+        if outcome.aggregate_exit_code != 0 {
+            bail!("{phase_name} failed");
+        }
     }
     if !skip_prepare && !cfg.databases.is_empty() {
         match treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id).await {
-            Ok(outs) => for o in outs {
-                println!("prepare[{}] {} ({})", o.engine, o.source_db,
-                    if o.cache_hit { "cache_hit" } else { "rebuilt" });
-            },
+            Ok(outs) => {
+                for o in outs {
+                    println!(
+                        "prepare[{}] {} ({})",
+                        o.engine,
+                        o.source_db,
+                        if o.cache_hit { "cache_hit" } else { "rebuilt" }
+                    );
+                }
+            }
             Err(e) => eprintln!("warn: prepare failed: {e:#}"),
         }
     }
@@ -1514,12 +1896,15 @@ async fn worktree_delete(target: String, repo: Option<PathBuf>, force: bool) -> 
     let pool = open_pool().await?;
     let wt = if let Ok(p) = PathBuf::from(&target).canonicalize() {
         treeman_store::hook_runs::find_worktree_by_path(&pool, &p.to_string_lossy()).await?
-    } else { None };
+    } else {
+        None
+    };
     let wt = match wt {
         Some(w) => w,
         None => {
             let rows = treeman_store::hook_runs::list_worktrees(&pool).await?;
-            rows.into_iter().find(|r| r.branch.as_deref() == Some(target.as_str()))
+            rows.into_iter()
+                .find(|r| r.branch.as_deref() == Some(target.as_str()))
                 .with_context(|| format!("worktree not found: {target}"))?
         }
     };
@@ -1535,7 +1920,9 @@ async fn worktree_delete(target: String, repo: Option<PathBuf>, force: bool) -> 
     };
 
     if !cfg.hooks.predelete.is_empty() {
-        let outcome = treeman_core::hooks::run_hooks(&cfg.hooks.predelete, &repo_root, &wt_path, &slug.value).await?;
+        let outcome =
+            treeman_core::hooks::run_hooks(&cfg.hooks.predelete, &repo_root, &wt_path, &slug.value)
+                .await?;
         if outcome.aggregate_exit_code != 0 && !force {
             bail!("predelete hook failed; pass --force to delete anyway");
         }
@@ -1543,10 +1930,13 @@ async fn worktree_delete(target: String, repo: Option<PathBuf>, force: bool) -> 
     teardown_databases(&cfg, &slug.value, wt.repo_id, wt.id, &pool).await?;
 
     let mut args = vec!["worktree".to_string(), "remove".into()];
-    if force { args.push("--force".into()); }
+    if force {
+        args.push("--force".into());
+    }
     args.push(wt_path.to_string_lossy().to_string());
     let status = std::process::Command::new("git")
-        .arg("-C").arg(&repo_root)
+        .arg("-C")
+        .arg(&repo_root)
         .args(&args)
         .status()?;
     if !status.success() && !force {
@@ -1560,8 +1950,11 @@ async fn worktree_delete(target: String, repo: Option<PathBuf>, force: bool) -> 
 
 fn detect_default_branch(repo_root: &Path) -> Result<String> {
     let out = std::process::Command::new("git")
-        .arg("-C").arg(repo_root)
-        .arg("symbolic-ref").arg("--short").arg("refs/remotes/origin/HEAD")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("symbolic-ref")
+        .arg("--short")
+        .arg("refs/remotes/origin/HEAD")
         .output()?;
     if out.status.success() {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1570,8 +1963,11 @@ fn detect_default_branch(repo_root: &Path) -> Result<String> {
         }
     }
     let out = std::process::Command::new("git")
-        .arg("-C").arg(repo_root)
-        .arg("rev-parse").arg("--abbrev-ref").arg("HEAD")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("rev-parse")
+        .arg("--abbrev-ref")
+        .arg("HEAD")
         .output()?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -1585,7 +1981,10 @@ fn init_cmd(args: InitArgs) -> Result<()> {
     };
     let target = repo_root.join(".treeman.yaml");
     if target.exists() && !args.force {
-        bail!("{} already exists (pass --force to overwrite)", target.display());
+        bail!(
+            "{} already exists (pass --force to overwrite)",
+            target.display()
+        );
     }
     let registry = treeman_migrations::Registry::with_builtins();
     let detected = registry.detect_all(&repo_root);
@@ -1593,11 +1992,16 @@ fn init_cmd(args: InitArgs) -> Result<()> {
     let mut engine_hint = "mysql";
     if let Some(s) = detected.first() {
         framework_hint = s.name.as_str();
-        if let Some(e) = &s.engine_hint { engine_hint = e.as_str(); }
+        if let Some(e) = &s.engine_hint {
+            engine_hint = e.as_str();
+        }
     }
-    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo");
     let content = format!(
-r#"# Generated by `treeman init`. Trim / extend to taste.
+        r#"# Generated by `treeman init`. Trim / extend to taste.
 repo:
   name: {repo_name}
 worktrees:
@@ -1622,9 +2026,13 @@ watcher:
   paths:
     - {{ glob: "database/migrations/**", on: auto }}
   debounce_ms: 500
-"#);
+"#
+    );
     std::fs::write(&target, content)?;
-    println!("wrote {} (detected framework: {framework_hint}, engine: {engine_hint})", target.display());
+    println!(
+        "wrote {} (detected framework: {framework_hint}, engine: {engine_hint})",
+        target.display()
+    );
     Ok(())
 }
 
@@ -1651,63 +2059,138 @@ async fn teardown_databases(
             match d {
                 DB::Mysql { name_template, .. } => {
                     let name = render(name_template, &ctx)?;
-                    let mc = cfg.connections.mysql.clone()
+                    let mc = cfg
+                        .connections
+                        .mysql
+                        .clone()
                         .context("connections.mysql not configured")?;
                     let drv = treeman_db::mysql::MysqlDriver::connect(&mc).await?;
                     let dropped = drv.drop_matching(&name).await?;
-                    record(sqlite_pool, "db_drop", "mysql", slug, &name, dropped.len(), repo_id, wt_id).await;
+                    record(
+                        sqlite_pool,
+                        "db_drop",
+                        "mysql",
+                        slug,
+                        &name,
+                        dropped.len(),
+                        repo_id,
+                        wt_id,
+                    )
+                    .await;
                     Ok(())
                 }
                 DB::Postgres { name_template, .. } => {
                     let name = render(name_template, &ctx)?;
-                    let pc = cfg.connections.postgres.clone()
+                    let pc = cfg
+                        .connections
+                        .postgres
+                        .clone()
                         .context("connections.postgres not configured")?;
                     let drv = treeman_db::postgres::PostgresDriver::connect(&pc).await?;
                     let dropped = drv.drop_matching(&name).await?;
-                    record(sqlite_pool, "db_drop", "postgres", slug, &name, dropped.len(), repo_id, wt_id).await;
+                    record(
+                        sqlite_pool,
+                        "db_drop",
+                        "postgres",
+                        slug,
+                        &name,
+                        dropped.len(),
+                        repo_id,
+                        wt_id,
+                    )
+                    .await;
                     Ok(())
                 }
                 DB::Mongodb { name_template } => {
                     let name = render(name_template, &ctx)?;
-                    let mc = cfg.connections.mongodb.clone()
+                    let mc = cfg
+                        .connections
+                        .mongodb
+                        .clone()
                         .context("connections.mongodb not configured")?;
                     let drv = treeman_db::mongo::MongoDriver::connect(&mc).await?;
                     let dropped = drv.drop_matching(&name).await?;
-                    record(sqlite_pool, "db_drop", "mongodb", slug, &name, dropped.len(), repo_id, wt_id).await;
+                    record(
+                        sqlite_pool,
+                        "db_drop",
+                        "mongodb",
+                        slug,
+                        &name,
+                        dropped.len(),
+                        repo_id,
+                        wt_id,
+                    )
+                    .await;
                     Ok(())
                 }
                 DB::Elasticsearch { namespaces } => {
                     let prefix = render(&namespaces.index_prefix_template, &ctx)?;
-                    let ec = cfg.connections.elasticsearch.clone()
+                    let ec = cfg
+                        .connections
+                        .elasticsearch
+                        .clone()
                         .context("connections.elasticsearch not configured")?;
                     let drv = treeman_db::elasticsearch::ElasticsearchDriver::connect(&ec)?;
                     let dropped = drv.drop_matching(&prefix).await?;
-                    record(sqlite_pool, "db_drop", "elasticsearch", slug, &prefix, dropped.len(), repo_id, wt_id).await;
+                    record(
+                        sqlite_pool,
+                        "db_drop",
+                        "elasticsearch",
+                        slug,
+                        &prefix,
+                        dropped.len(),
+                        repo_id,
+                        wt_id,
+                    )
+                    .await;
                     Ok(())
                 }
                 DB::Redis { namespaces } => {
                     let idx_str = render(&namespaces.db_index_template, &ctx)?;
                     let idx: u8 = idx_str.parse().context("redis db index parse")?;
-                    let rc = cfg.connections.redis.clone()
+                    let rc = cfg
+                        .connections
+                        .redis
+                        .clone()
                         .context("connections.redis not configured")?;
                     let drv = treeman_db::redis_driver::RedisDriver::connect(&rc)?;
                     drv.flush_namespace(&Namespace::RedisDb(idx)).await?;
-                    record(sqlite_pool, "db_flush", "redis", slug, &format!("db{idx}"), 1, repo_id, wt_id).await;
+                    record(
+                        sqlite_pool,
+                        "db_flush",
+                        "redis",
+                        slug,
+                        &format!("db{idx}"),
+                        1,
+                        repo_id,
+                        wt_id,
+                    )
+                    .await;
                     Ok(())
                 }
             }
-        }.await;
+        }
+        .await;
         if let Err(e) = result {
             eprintln!("warn: teardown failed for {:?}: {e}", d);
             let _ = treeman_store::write_event(
-                sqlite_pool, "warn", "db_teardown_error",
-                Some(&e.to_string()), Some(repo_id), Some(wt_id), None, None, "{}"
-            ).await;
+                sqlite_pool,
+                "warn",
+                "db_teardown_error",
+                Some(&e.to_string()),
+                Some(repo_id),
+                Some(wt_id),
+                None,
+                None,
+                "{}",
+            )
+            .await;
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record(
     pool: &sqlx::SqlitePool,
     event_type: &str,
@@ -1720,12 +2203,20 @@ async fn record(
 ) {
     let payload = serde_json::json!({
         "engine": engine, "slug": slug, "target": target, "count": count,
-    }).to_string();
+    })
+    .to_string();
     let _ = treeman_store::write_event(
-        pool, "info", event_type,
+        pool,
+        "info",
+        event_type,
         Some(&format!("{engine}: {target} ({count})")),
-        Some(repo_id), Some(wt_id), None, None, &payload,
-    ).await;
+        Some(repo_id),
+        Some(wt_id),
+        None,
+        None,
+        &payload,
+    )
+    .await;
 }
 
 fn detect_branch(worktree: &Path) -> Option<String> {
@@ -1738,7 +2229,9 @@ fn detect_branch(worktree: &Path) -> Option<String> {
         PathBuf::from(gitdir).join("HEAD")
     };
     let raw = std::fs::read_to_string(&head_path).ok()?;
-    raw.trim().strip_prefix("ref: refs/heads/").map(|s| s.to_string())
+    raw.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(|s| s.to_string())
 }
 
 fn discover_repo_root(start: &Path) -> Option<PathBuf> {
@@ -1755,7 +2248,10 @@ fn discover_repo_root(start: &Path) -> Option<PathBuf> {
             if let Ok(rel) = std::fs::read_to_string(&common) {
                 let gitdir = PathBuf::from(gd);
                 let common_dir = gitdir.join(rel.trim());
-                return common_dir.canonicalize().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+                return common_dir
+                    .canonicalize()
+                    .ok()
+                    .and_then(|p| p.parent().map(|p| p.to_path_buf()));
             }
             return Some(dir.to_path_buf());
         }

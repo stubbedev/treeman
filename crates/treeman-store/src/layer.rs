@@ -93,7 +93,13 @@ where
         let message = v.fields.remove("message");
         // Anything that wasn't a structured field we recognize goes into
         // the payload.
-        for k in ["event_type", "phase", "repo_id", "worktree_id", "duration_ms"] {
+        for k in [
+            "event_type",
+            "phase",
+            "repo_id",
+            "worktree_id",
+            "duration_ms",
+        ] {
             v.fields.remove(k);
         }
         let payload_json = serde_json::to_string(&v.fields).unwrap_or_else(|_| "{}".into());
@@ -125,24 +131,29 @@ struct FieldVisitor {
 
 impl Visit for FieldVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.fields.insert(field.name().to_string(), format!("{value:?}"));
+        self.fields
+            .insert(field.name().to_string(), format!("{value:?}"));
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 }
 
 /// Build a `tracing_subscriber` registry combining a console `fmt` layer
-/// + the SQLite layer. The caller is expected to call this once at daemon
+/// plus the SQLite layer. The caller is expected to call this once at daemon
 /// startup before any tracing macros fire.
 pub fn init_subscriber(pool: SqlitePool) -> anyhow::Result<()> {
     use tracing_subscriber::layer::SubscriberExt;

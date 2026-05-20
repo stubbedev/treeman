@@ -24,8 +24,8 @@ pub fn patch_env_file(path: &Path, pairs: &[(String, String)]) -> Result<PatchOu
     if !path.exists() {
         return Ok(PatchOutcome::Missing);
     }
-    let original = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let original =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut content = original.clone();
     for (key, value) in pairs {
         content = patch_env_one(&content, key, value);
@@ -33,8 +33,7 @@ pub fn patch_env_file(path: &Path, pairs: &[(String, String)]) -> Result<PatchOu
     if content == original {
         return Ok(PatchOutcome::Unchanged);
     }
-    std::fs::write(path, &content)
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(path, &content).with_context(|| format!("write {}", path.display()))?;
     Ok(PatchOutcome::Updated)
 }
 
@@ -42,7 +41,8 @@ fn patch_env_one(content: &str, key: &str, value: &str) -> String {
     let pattern = format!(r"(?m)^{}\s*=.*$", regex::escape(key));
     let re = Regex::new(&pattern).expect("dynamic regex");
     if re.is_match(content) {
-        re.replace_all(content, format!("{key}={value}").as_str()).into_owned()
+        re.replace_all(content, format!("{key}={value}").as_str())
+            .into_owned()
     } else {
         let mut out = content.to_string();
         if !out.is_empty() && !out.ends_with('\n') {
@@ -60,8 +60,8 @@ pub fn patch_phpunit_file(path: &Path, pairs: &[(String, String)]) -> Result<Pat
     if !path.exists() {
         return Ok(PatchOutcome::Missing);
     }
-    let original = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let original =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut content = original.clone();
     for (key, value) in pairs {
         content = patch_phpunit_one(&content, key, value);
@@ -69,8 +69,7 @@ pub fn patch_phpunit_file(path: &Path, pairs: &[(String, String)]) -> Result<Pat
     if content == original {
         return Ok(PatchOutcome::Unchanged);
     }
-    std::fs::write(path, &content)
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(path, &content).with_context(|| format!("write {}", path.display()))?;
     Ok(PatchOutcome::Updated)
 }
 
@@ -79,7 +78,9 @@ fn patch_phpunit_one(content: &str, key: &str, value: &str) -> String {
     let existing = Regex::new(&format!(r#"<env name="{key_esc}"[^/]*/>"#)).unwrap();
     let replacement = format!(r#"<env name="{key}" value="{value}" force="true"/>"#);
     if existing.is_match(content) {
-        existing.replace_all(content, replacement.as_str()).into_owned()
+        existing
+            .replace_all(content, replacement.as_str())
+            .into_owned()
     } else {
         // Bash impl uses `\t<env ... force="true"/>\n\t</php>` indent;
         // mirror that for byte-exact diff parity.
@@ -129,8 +130,10 @@ mod tests {
 
     fn tmpfile(content: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("treeman-test-{}.tmp",
-            blake3::hash(format!("{:?}", std::time::Instant::now()).as_bytes()).to_hex()));
+        p.push(format!(
+            "treeman-test-{}.tmp",
+            blake3::hash(format!("{:?}", std::time::Instant::now()).as_bytes()).to_hex()
+        ));
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         p
@@ -164,7 +167,7 @@ mod tests {
     #[test]
     fn phpunit_replace_existing_env() {
         let p = tmpfile(
-            "<phpunit>\n<php>\n\t<env name=\"FOO\" value=\"old\"/>\n\t</php>\n</phpunit>\n"
+            "<phpunit>\n<php>\n\t<env name=\"FOO\" value=\"old\"/>\n\t</php>\n</phpunit>\n",
         );
         patch_phpunit_file(&p, &[("FOO".into(), "new".into())]).unwrap();
         let s = std::fs::read_to_string(&p).unwrap();

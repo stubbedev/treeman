@@ -53,10 +53,16 @@ pub struct DaemonConfig {
 }
 impl Default for DaemonConfig {
     fn default() -> Self {
-        Self { socket: None, log_level: default_log_level(), db_log_path: None }
+        Self {
+            socket: None,
+            log_level: default_log_level(),
+            db_log_path: None,
+        }
     }
 }
-fn default_log_level() -> String { "info".into() }
+fn default_log_level() -> String {
+    "info".into()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ConnectionsConfig {
@@ -109,7 +115,9 @@ pub struct EsConn {
     pub url: String,
 }
 
-fn default_pool() -> u32 { 8 }
+fn default_pool() -> u32 {
+    8
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotsConfig {
@@ -137,9 +145,15 @@ impl Default for RetentionConfig {
         }
     }
 }
-fn default_keep_per_source() -> u32 { 5 }
-fn default_max_age_days() -> u32 { 30 }
-fn default_max_total_gb() -> u32 { 50 }
+fn default_keep_per_source() -> u32 {
+    5
+}
+fn default_max_age_days() -> u32 {
+    30
+}
+fn default_max_total_gb() -> u32 {
+    50
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RepoBlock {
@@ -161,8 +175,12 @@ impl Default for SlugRules {
         }
     }
 }
-fn default_ticket_regex() -> String { r"^([A-Z]+)-(\d+)".into() }
-fn default_fallback() -> String { "wt_{shorthash8}".into() }
+fn default_ticket_regex() -> String {
+    r"^([A-Z]+)-(\d+)".into()
+}
+fn default_fallback() -> String {
+    "wt_{shorthash8}".into()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct WorktreesConfig {
@@ -171,7 +189,9 @@ pub struct WorktreesConfig {
     #[serde(default)]
     pub links: Vec<String>,
 }
-fn default_worktrees_root() -> String { "../worktrees".into() }
+fn default_worktrees_root() -> String {
+    "../worktrees".into()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct EnvScoping {
@@ -182,7 +202,9 @@ pub struct EnvScoping {
     #[serde(default)]
     pub patches: Vec<EnvPatch>,
 }
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EnvPatch {
@@ -242,7 +264,9 @@ pub struct ParatestSpec {
     pub clones: ClonesSetting,
     pub name_template: String,
 }
-fn default_clones() -> ClonesSetting { ClonesSetting::Auto }
+fn default_clones() -> ClonesSetting {
+    ClonesSetting::Auto
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(untagged)]
@@ -263,12 +287,17 @@ impl<'de> Deserialize<'de> for ClonesSetting {
                 Ok(ClonesSetting::Fixed(v as u32))
             }
             fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-                if v < 0 { return Err(E::custom("clones must be >= 0")); }
+                if v < 0 {
+                    return Err(E::custom("clones must be >= 0"));
+                }
                 Ok(ClonesSetting::Fixed(v as u32))
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                if v == "auto" { Ok(ClonesSetting::Auto) }
-                else { Err(E::custom(format!("expected 'auto' or integer, got '{v}'"))) }
+                if v == "auto" {
+                    Ok(ClonesSetting::Auto)
+                } else {
+                    Err(E::custom(format!("expected 'auto' or integer, got '{v}'")))
+                }
             }
         }
         d.deserialize_any(V)
@@ -315,10 +344,15 @@ pub struct WatcherConfig {
 }
 impl Default for WatcherConfig {
     fn default() -> Self {
-        Self { paths: vec![], debounce_ms: default_debounce_ms() }
+        Self {
+            paths: vec![],
+            debounce_ms: default_debounce_ms(),
+        }
     }
 }
-fn default_debounce_ms() -> u64 { 500 }
+fn default_debounce_ms() -> u64 {
+    500
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WatcherPath {
@@ -371,6 +405,7 @@ pub enum OnModify {
 ///   1. global  = $XDG_CONFIG_HOME/treeman/config.yaml (or ~/.config/...)
 ///   2. repo    = <repo_root>/.treeman.yaml
 ///   3. local   = <repo_root>/.treeman.local.yaml
+///
 /// Later layers override earlier. Missing files are ignored.
 pub fn load_layered(repo_root: Option<&Path>) -> anyhow::Result<Config> {
     let mut fig = Figment::new();

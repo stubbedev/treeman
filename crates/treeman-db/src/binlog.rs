@@ -43,19 +43,26 @@ pub struct BinlogReplicator {
 
 impl BinlogReplicator {
     pub async fn connect(cfg: &MysqlConn) -> Result<Self> {
-        let password = cfg.password_env.as_deref()
+        let password = cfg
+            .password_env
+            .as_deref()
             .map(|k| std::env::var(k).unwrap_or_default())
             .unwrap_or_default();
         let url = format!(
             "mysql://{user}:{pass}@{host}:{port}",
             user = cfg.user,
             pass = urlencode(&password),
-            host = cfg.host, port = cfg.port,
+            host = cfg.host,
+            port = cfg.port,
         );
         let pool = Pool::from_url(&url).context("mysql_async pool")?;
         // Pseudo-random server_id that doesn't collide with the source.
         let server_id = 100_000 + (std::process::id() % 50_000);
-        Ok(Self { cfg: cfg.clone(), pool, server_id })
+        Ok(Self {
+            cfg: cfg.clone(),
+            pool,
+            server_id,
+        })
     }
 
     /// `SHOW MASTER STATUS` → (file, pos). Returns None if binlog is off.
@@ -93,10 +100,14 @@ impl BinlogReplicator {
         let request = BinlogStreamRequest::new(self.server_id)
             .with_filename(from.file.as_bytes())
             .with_pos(from.pos as u64);
-        let mut stream = conn.get_binlog_stream(request).await
+        let mut stream = conn
+            .get_binlog_stream(request)
+            .await
             .context("open binlog stream")?;
 
-        let to = self.current_position().await?
+        let to = self
+            .current_position()
+            .await?
             .context("no current master position (binlog off?)")?;
         debug!(?from, ?to, "replaying binlog range");
 
@@ -106,7 +117,7 @@ impl BinlogReplicator {
             let header = event.header();
             // Track the file position progress. mysql_async returns the
             // current position as `log_pos` on the event header.
-            if header.log_pos() as u32 >= to.pos {
+            if header.log_pos() >= to.pos {
                 // Reached the new master position.
                 break;
             }
@@ -157,13 +168,21 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+#[allow(dead_code)]
+fn _suppress_field_unused(c: &BinlogReplicator) -> (&MysqlConn, u32) {
+    (&c.cfg, c.server_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn position_equality() {
-        let a = BinlogPosition { file: "bin.000001".into(), pos: 4 };
+        let a = BinlogPosition {
+            file: "bin.000001".into(),
+            pos: 4,
+        };
         let b = a.clone();
         assert_eq!(a, b);
     }
@@ -180,9 +199,4 @@ mod tests {
     fn _suppress() {
         let _ = |c: &BinlogReplicator| c.server_id;
     }
-}
-
-#[allow(dead_code)]
-fn _suppress_field_unused(c: &BinlogReplicator) -> (&MysqlConn, u32) {
-    (&c.cfg, c.server_id)
 }

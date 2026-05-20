@@ -117,8 +117,8 @@ fn apply_framework_env(c: &mut Command, framework: &str, target_db: &str) {
         "sqlx-cli" => {
             c.env("DATABASE_URL_NAME", target_db);
         }
-        "alembic" | "flyway" | "prisma" | "knex" | "typeorm" | "drizzle"
-        | "sequelize" | "mikro-orm" | "diesel" => {
+        "alembic" | "flyway" | "prisma" | "knex" | "typeorm" | "drizzle" | "sequelize"
+        | "mikro-orm" | "diesel" => {
             // Generic env knob — frameworks that read DATABASE_URL must
             // be configured to interpolate ${TREEMAN_TARGET_DB}.
             c.env("DATABASE_NAME", target_db);
@@ -140,7 +140,9 @@ async fn capture_tail<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
             Ok(n) => n,
             Err(_) => break,
         };
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         buf.extend_from_slice(line.as_bytes());
         if buf.len() > cap_bytes {
             let drop_n = buf.len() - cap_bytes;

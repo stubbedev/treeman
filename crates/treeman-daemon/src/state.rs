@@ -26,10 +26,19 @@ pub struct DaemonState {
 
 impl DaemonState {
     pub fn new(pool: SqlitePool, started_at_unix: i64, pid: u32) -> Self {
-        Self { pool, started_at_unix, pid: pid, watchers: Default::default() }
+        Self {
+            pool,
+            started_at_unix,
+            pid,
+            watchers: Default::default(),
+        }
     }
-    pub fn sqlite(&self) -> &SqlitePool { &self.pool }
-    pub fn watcher_count(&self) -> usize { self.watchers.lock().unwrap().len() }
+    pub fn sqlite(&self) -> &SqlitePool {
+        &self.pool
+    }
+    pub fn watcher_count(&self) -> usize {
+        self.watchers.lock().unwrap().len()
+    }
     pub fn list_watchers(&self) -> Vec<String> {
         let g = self.watchers.lock().unwrap();
         let mut k: Vec<String> = g.keys().cloned().collect();
@@ -38,55 +47,89 @@ impl DaemonState {
     }
 
     pub async fn start_watcher(&self, repo_path: &str) -> Result<()> {
-        let canonical = PathBuf::from(repo_path).canonicalize()
+        let canonical = PathBuf::from(repo_path)
+            .canonicalize()
             .with_context(|| format!("canonicalize {repo_path}"))?;
         let key = canonical.to_string_lossy().to_string();
         if self.watchers.lock().unwrap().contains_key(&key) {
-            return Ok(());  // already running
+            return Ok(()); // already running
         }
         let cfg = treeman_core::config::load_layered(Some(&canonical))?;
         let registry = Registry::with_builtins().merge_yaml(&cfg.frameworks);
-        let detected: Vec<_> = registry.detect_all(&canonical).into_iter().cloned().collect();
+        let detected: Vec<_> = registry
+            .detect_all(&canonical)
+            .into_iter()
+            .cloned()
+            .collect();
         if detected.is_empty() {
             anyhow::bail!("no migration frameworks detected in {key}");
         }
         let (tx, mut rx) = mpsc::channel(64);
         let handles = treeman_watcher::spawn_repo_watcher(
-            canonical.clone(), detected, cfg.watcher.debounce_ms, tx,
-        ).await?;
+            canonical.clone(),
+            detected,
+            cfg.watcher.debounce_ms,
+            tx,
+        )
+        .await?;
         // Forwarder task: drain dispatches and persist as events.
         let pool = self.pool.clone();
         let canonical_path = canonical.clone();
         let forward = tokio::spawn(async move {
-            let repo_name = canonical_path.file_name()
-                .and_then(|s| s.to_str()).unwrap_or("repo");
+            let repo_name = canonical_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("repo");
             let repo_id = treeman_store::ensure_repo(&pool, &canonical_path, repo_name)
-                .await.ok();
+                .await
+                .ok();
             while let Some((framework, dispatch)) = rx.recv().await {
                 let payload = serde_json::json!({
                     "framework": framework, "dispatch": &dispatch,
-                }).to_string();
+                })
+                .to_string();
                 let _ = treeman_store::write_event(
-                    &pool, "info", "watcher_event",
+                    &pool,
+                    "info",
+                    "watcher_event",
                     Some(&format!("{framework}: {:?}", dispatch)),
-                    repo_id, None, None, None, &payload,
-                ).await;
+                    repo_id,
+                    None,
+                    None,
+                    None,
+                    &payload,
+                )
+                .await;
                 // Action: call prepare unless Noop.
                 if !matches!(dispatch, treeman_watcher::Dispatch::Noop) {
                     if let Ok(cfg) = treeman_core::config::load_layered(Some(&canonical_path)) {
                         let slug = treeman_core::slug_for(&canonical_path, None);
                         let rid = repo_id.unwrap_or(0);
                         let wt_id = treeman_store::ensure_worktree(
-                            &pool, rid, &canonical_path, &slug.value, None,
-                        ).await.unwrap_or(0);
-                        if let Err(e) = treeman_prepare::run(
-                            &cfg, &canonical_path, &slug, &pool, rid, wt_id,
-                        ).await {
+                            &pool,
+                            rid,
+                            &canonical_path,
+                            &slug.value,
+                            None,
+                        )
+                        .await
+                        .unwrap_or(0);
+                        if let Err(e) =
+                            treeman_prepare::run(&cfg, &canonical_path, &slug, &pool, rid, wt_id)
+                                .await
+                        {
                             let _ = treeman_store::write_event(
-                                &pool, "error", "prepare_error",
+                                &pool,
+                                "error",
+                                "prepare_error",
                                 Some(&e.to_string()),
-                                repo_id, Some(wt_id), None, None, "{}",
-                            ).await;
+                                repo_id,
+                                Some(wt_id),
+                                None,
+                                None,
+                                "{}",
+                            )
+                            .await;
                         }
                     }
                 }
@@ -99,12 +142,15 @@ impl DaemonState {
     }
 
     pub async fn stop_watcher(&self, repo_path: &str) -> Result<()> {
-        let canonical = PathBuf::from(repo_path).canonicalize()
+        let canonical = PathBuf::from(repo_path)
+            .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(repo_path));
         let key = canonical.to_string_lossy().to_string();
         let entry = self.watchers.lock().unwrap().remove(&key);
         if let Some(e) = entry {
-            for h in e.handles { h.abort(); }
+            for h in e.handles {
+                h.abort();
+            }
             e.forward.abort();
             info!(repo = %key, "watcher stopped");
         }

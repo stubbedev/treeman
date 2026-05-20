@@ -16,18 +16,23 @@ pub struct PostgresDriver {
 
 impl PostgresDriver {
     pub async fn connect(cfg: &PostgresConn) -> Result<Self> {
-        let password = cfg.password_env.as_deref()
+        let password = cfg
+            .password_env
+            .as_deref()
             .map(|k| std::env::var(k).unwrap_or_default())
             .unwrap_or_default();
         let url = format!(
             "postgres://{user}:{pass}@{host}:{port}/postgres?sslmode=disable",
             user = cfg.user,
             pass = urlencode(&password),
-            host = cfg.host, port = cfg.port,
+            host = cfg.host,
+            port = cfg.port,
         );
         let pool = PgPoolOptions::new()
             .max_connections(cfg.pool_max)
-            .connect(&url).await.context("connect postgres")?;
+            .connect(&url)
+            .await
+            .context("connect postgres")?;
         Ok(Self { pool })
     }
 
@@ -35,6 +40,7 @@ impl PostgresDriver {
     ///   - no active connections to template
     ///   - same owner
     ///   - same encoding/locale
+    ///
     /// Steps: ALTER DATABASE template ALLOW_CONNECTIONS=false → terminate
     /// stragglers → CREATE … TEMPLATE → restore ALLOW_CONNECTIONS=true.
     pub async fn snapshot_create(&self, source: &str, template: &str) -> Result<()> {
@@ -43,12 +49,15 @@ impl PostgresDriver {
         // ALLOW_CONNECTIONS=false to fence the template
         self.execute_outside_tx(&format!(
             r#"ALTER DATABASE "{source}" ALLOW_CONNECTIONS false"#
-        )).await?;
+        ))
+        .await?;
         let res = self.snapshot_create_inner(source, template).await;
         // Restore.
-        let _ = self.execute_outside_tx(&format!(
-            r#"ALTER DATABASE "{source}" ALLOW_CONNECTIONS true"#
-        )).await;
+        let _ = self
+            .execute_outside_tx(&format!(
+                r#"ALTER DATABASE "{source}" ALLOW_CONNECTIONS true"#
+            ))
+            .await;
         res
     }
 
@@ -57,14 +66,15 @@ impl PostgresDriver {
         self.execute_outside_tx(&format!(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
              WHERE datname = '{source}' AND pid <> pg_backend_pid()",
-        )).await?;
+        ))
+        .await?;
         // Drop existing template same-name
-        self.execute_outside_tx(&format!(
-            r#"DROP DATABASE IF EXISTS "{template}""#
-        )).await?;
+        self.execute_outside_tx(&format!(r#"DROP DATABASE IF EXISTS "{template}""#))
+            .await?;
         self.execute_outside_tx(&format!(
             r#"CREATE DATABASE "{template}" WITH TEMPLATE "{source}""#
-        )).await?;
+        ))
+        .await?;
         debug!(source, template, "pg snapshot create");
         Ok(())
     }
@@ -76,20 +86,25 @@ impl PostgresDriver {
         self.execute_outside_tx(&format!(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
              WHERE datname = '{target}' AND pid <> pg_backend_pid()",
-        )).await?;
-        self.execute_outside_tx(&format!(
-            r#"DROP DATABASE IF EXISTS "{target}""#
-        )).await?;
+        ))
+        .await?;
+        self.execute_outside_tx(&format!(r#"DROP DATABASE IF EXISTS "{target}""#))
+            .await?;
         // Mark template not-connectable while we clone from it.
         self.execute_outside_tx(&format!(
             r#"ALTER DATABASE "{template}" ALLOW_CONNECTIONS false"#
-        )).await?;
-        let res = self.execute_outside_tx(&format!(
-            r#"CREATE DATABASE "{target}" WITH TEMPLATE "{template}""#
-        )).await;
-        let _ = self.execute_outside_tx(&format!(
-            r#"ALTER DATABASE "{template}" ALLOW_CONNECTIONS true"#
-        )).await;
+        ))
+        .await?;
+        let res = self
+            .execute_outside_tx(&format!(
+                r#"CREATE DATABASE "{target}" WITH TEMPLATE "{template}""#
+            ))
+            .await;
+        let _ = self
+            .execute_outside_tx(&format!(
+                r#"ALTER DATABASE "{template}" ALLOW_CONNECTIONS true"#
+            ))
+            .await;
         res
     }
 
@@ -108,7 +123,9 @@ impl PostgresDriver {
     /// the lower-level conn handle and explicitly disable autocommit
     /// wrapping by issuing a simple query via `Executor::execute`.
     async fn execute_outside_tx(&self, sql: &str) -> Result<()> {
-        sqlx::query(sql).execute(&self.pool).await
+        sqlx::query(sql)
+            .execute(&self.pool)
+            .await
             .with_context(|| format!("pg: {sql}"))?;
         Ok(())
     }
@@ -116,20 +133,27 @@ impl PostgresDriver {
 
 #[async_trait]
 impl DbDriver for PostgresDriver {
-    fn engine(&self) -> Engine { Engine::Postgres }
+    fn engine(&self) -> Engine {
+        Engine::Postgres
+    }
 
     async fn engine_version(&self) -> Result<String> {
-        let row = sqlx::query("SHOW server_version").fetch_one(&self.pool).await?;
+        let row = sqlx::query("SHOW server_version")
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.try_get::<String, _>(0)?)
     }
 
     async fn ensure_db(&self, name: &str) -> Result<()> {
         validate_ident(name)?;
-        let exists: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM pg_database WHERE datname = $1"
-        ).bind(name).fetch_optional(&self.pool).await?;
+        let exists: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
         if exists.is_none() {
-            self.execute_outside_tx(&format!(r#"CREATE DATABASE "{name}""#)).await?;
+            self.execute_outside_tx(&format!(r#"CREATE DATABASE "{name}""#))
+                .await?;
         }
         Ok(())
     }
@@ -141,8 +165,10 @@ impl DbDriver for PostgresDriver {
             self.execute_outside_tx(&format!(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
                  WHERE datname = '{name}' AND pid <> pg_backend_pid()",
-            )).await?;
-            self.execute_outside_tx(&format!(r#"DROP DATABASE IF EXISTS "{name}""#)).await?;
+            ))
+            .await?;
+            self.execute_outside_tx(&format!(r#"DROP DATABASE IF EXISTS "{name}""#))
+                .await?;
         }
         Ok(matched)
     }
@@ -150,8 +176,13 @@ impl DbDriver for PostgresDriver {
     async fn list_matching(&self, prefix: &str) -> Result<Vec<String>> {
         let like = format!("{}%", prefix.replace('_', "\\_"));
         let rows = sqlx::query("SELECT datname FROM pg_database WHERE datname LIKE $1 ESCAPE '\\'")
-            .bind(&like).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect())
+            .bind(&like)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.try_get::<String, _>(0).ok())
+            .collect())
     }
 
     async fn flush_namespace(&self, ns: &Namespace) -> Result<()> {

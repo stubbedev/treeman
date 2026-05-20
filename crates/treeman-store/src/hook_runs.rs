@@ -21,7 +21,9 @@ pub async fn start_hook_run(pool: &SqlitePool, worktree_id: i64, phase: &str) ->
     let id = sqlx::query_scalar(
         "INSERT INTO hook_runs(worktree_id, phase, started_at) VALUES (?, ?, ?) RETURNING id",
     )
-    .bind(worktree_id).bind(phase).bind(now)
+    .bind(worktree_id)
+    .bind(phase)
+    .bind(now)
     .fetch_one(pool)
     .await?;
     Ok(id)
@@ -39,7 +41,11 @@ pub async fn finish_hook_run(
         "UPDATE hook_runs SET finished_at = ?, exit_code = ?, stdout_tail = ?, stderr_tail = ?
          WHERE id = ?",
     )
-    .bind(now).bind(exit_code as i64).bind(stdout_tail).bind(stderr_tail).bind(id)
+    .bind(now)
+    .bind(exit_code as i64)
+    .bind(stdout_tail)
+    .bind(stderr_tail)
+    .bind(id)
     .execute(pool)
     .await?;
     Ok(())

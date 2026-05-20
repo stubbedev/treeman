@@ -28,8 +28,8 @@ use treeman_migrations::{
     runner::{MigrateMode, run as run_migration},
 };
 use treeman_snapshot::{
-    ParatestEngine, ParatestPlan, SnapshotKey, lockfile_hashes_for, mysql_fanout,
-    postgres_fanout, record_built,
+    ParatestEngine, ParatestPlan, SnapshotKey, lockfile_hashes_for, mysql_fanout, postgres_fanout,
+    record_built,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,30 +57,64 @@ pub async fn run(
     for d in &cfg.databases {
         match d {
             DatabaseConfig::Mysql {
-                name_template, dump, migrations, paratest,
+                name_template,
+                dump,
+                migrations,
+                paratest,
             } => {
                 let source_db = render(name_template, &ctx)?;
-                let mc = cfg.connections.mysql.clone()
+                let mc = cfg
+                    .connections
+                    .mysql
+                    .clone()
                     .context("connections.mysql not configured")?;
                 let driver = Arc::new(MysqlDriver::connect(&mc).await?);
-                outcomes.push(prepare_mysql(
-                    Arc::clone(&driver), &source_db, dump.as_ref(),
-                    migrations.as_ref(), paratest.as_ref(), &registry,
-                    repo_root, sqlite, repo_id, worktree_id, slug,
-                ).await?);
+                outcomes.push(
+                    prepare_mysql(
+                        Arc::clone(&driver),
+                        &source_db,
+                        dump.as_ref(),
+                        migrations.as_ref(),
+                        paratest.as_ref(),
+                        &registry,
+                        repo_root,
+                        sqlite,
+                        repo_id,
+                        worktree_id,
+                        slug,
+                    )
+                    .await?,
+                );
             }
             DatabaseConfig::Postgres {
-                name_template, dump, migrations, paratest,
+                name_template,
+                dump,
+                migrations,
+                paratest,
             } => {
                 let source_db = render(name_template, &ctx)?;
-                let pc = cfg.connections.postgres.clone()
+                let pc = cfg
+                    .connections
+                    .postgres
+                    .clone()
                     .context("connections.postgres not configured")?;
                 let driver = Arc::new(PostgresDriver::connect(&pc).await?);
-                outcomes.push(prepare_postgres(
-                    Arc::clone(&driver), &source_db, dump.as_ref(),
-                    migrations.as_ref(), paratest.as_ref(), &registry,
-                    repo_root, sqlite, repo_id, worktree_id, slug,
-                ).await?);
+                outcomes.push(
+                    prepare_postgres(
+                        Arc::clone(&driver),
+                        &source_db,
+                        dump.as_ref(),
+                        migrations.as_ref(),
+                        paratest.as_ref(),
+                        &registry,
+                        repo_root,
+                        sqlite,
+                        repo_id,
+                        worktree_id,
+                        slug,
+                    )
+                    .await?,
+                );
             }
             _ => continue,
         }
@@ -102,7 +136,16 @@ async fn prepare_mysql(
     worktree_id: i64,
     slug: &Slug,
 ) -> Result<PrepareOutcome> {
-    let key = build_key("mysql", driver.as_ref(), source_db, dump, migration_spec, registry, repo_root).await?;
+    let key = build_key(
+        "mysql",
+        driver.as_ref(),
+        source_db,
+        dump,
+        migration_spec,
+        registry,
+        repo_root,
+    )
+    .await?;
     let fingerprint = key.fingerprint();
     let template_name = key.template_name();
     let cache_hit = check_cache(sqlite, &fingerprint).await?;
@@ -120,26 +163,42 @@ async fn prepare_mysql(
         if let Some(d) = dump {
             let dp = repo_root.join(&d.path);
             if dp.is_file() {
-                treeman_db::dumpload::load_mysql(&driver, source_db, &dp).await
+                treeman_db::dumpload::load_mysql(&driver, source_db, &dp)
+                    .await
                     .with_context(|| format!("load dump {}", dp.display()))?;
             } else if !d.optional {
                 anyhow::bail!("dump not found: {}", dp.display());
             }
         }
         if let Some(m) = migration_spec {
-            let out = run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[]).await?;
+            let out =
+                run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[]).await?;
             if out.exit_code != 0 {
-                anyhow::bail!("migrate failed (exit {}): {}", out.exit_code, out.stderr_tail);
+                anyhow::bail!(
+                    "migrate failed (exit {}): {}",
+                    out.exit_code,
+                    out.stderr_tail
+                );
             }
         }
         driver.snapshot_create(source_db, &template_name).await?;
         record_built(sqlite, &key, &template_name, None).await?;
-        emit_snapshot_built(sqlite, repo_id, worktree_id, "mysql", &fingerprint, &template_name).await;
+        emit_snapshot_built(
+            sqlite,
+            repo_id,
+            worktree_id,
+            "mysql",
+            &fingerprint,
+            &template_name,
+        )
+        .await;
     }
 
     let clones = if let Some(p) = paratest_spec {
         do_fanout_mysql(driver, &template_name, p, slug, repo_root).await?
-    } else { vec![] };
+    } else {
+        vec![]
+    };
 
     Ok(PrepareOutcome {
         engine: "mysql".into(),
@@ -165,7 +224,16 @@ async fn prepare_postgres(
     worktree_id: i64,
     slug: &Slug,
 ) -> Result<PrepareOutcome> {
-    let key = build_key("postgres", driver.as_ref(), source_db, dump, migration_spec, registry, repo_root).await?;
+    let key = build_key(
+        "postgres",
+        driver.as_ref(),
+        source_db,
+        dump,
+        migration_spec,
+        registry,
+        repo_root,
+    )
+    .await?;
     let fingerprint = key.fingerprint();
     let template_name = key.template_name();
     let cache_hit = check_cache(sqlite, &fingerprint).await?;
@@ -182,26 +250,42 @@ async fn prepare_postgres(
         if let Some(d) = dump {
             let dp = repo_root.join(&d.path);
             if dp.is_file() {
-                treeman_db::dumpload::load_postgres(&driver, source_db, &dp).await
+                treeman_db::dumpload::load_postgres(&driver, source_db, &dp)
+                    .await
                     .with_context(|| format!("load dump {}", dp.display()))?;
             } else if !d.optional {
                 anyhow::bail!("dump not found: {}", dp.display());
             }
         }
         if let Some(m) = migration_spec {
-            let out = run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[]).await?;
+            let out =
+                run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[]).await?;
             if out.exit_code != 0 {
-                anyhow::bail!("migrate failed (exit {}): {}", out.exit_code, out.stderr_tail);
+                anyhow::bail!(
+                    "migrate failed (exit {}): {}",
+                    out.exit_code,
+                    out.stderr_tail
+                );
             }
         }
         driver.snapshot_create(source_db, &template_name).await?;
         record_built(sqlite, &key, &template_name, None).await?;
-        emit_snapshot_built(sqlite, repo_id, worktree_id, "postgres", &fingerprint, &template_name).await;
+        emit_snapshot_built(
+            sqlite,
+            repo_id,
+            worktree_id,
+            "postgres",
+            &fingerprint,
+            &template_name,
+        )
+        .await;
     }
 
     let clones = if let Some(p) = paratest_spec {
         do_fanout_pg(driver, &template_name, p, slug, repo_root).await?
-    } else { vec![] };
+    } else {
+        vec![]
+    };
 
     Ok(PrepareOutcome {
         engine: "postgres".into(),
@@ -222,7 +306,9 @@ async fn build_key<D: DbDriver + ?Sized>(
     registry: &Registry,
     repo_root: &Path,
 ) -> Result<SnapshotKey> {
-    let framework = migration_spec.map(|m| m.framework.as_str()).unwrap_or("none");
+    let framework = migration_spec
+        .map(|m| m.framework.as_str())
+        .unwrap_or("none");
     let spec = registry.specs.iter().find(|s| s.name == framework);
     let engine_version = driver.engine_version().await?;
     let migration_files: Vec<PathBuf> = if let Some(s) = spec {
@@ -232,7 +318,9 @@ async fn build_key<D: DbDriver + ?Sized>(
         }
         all.sort();
         all
-    } else { vec![] };
+    } else {
+        vec![]
+    };
     let migrations_hash_hex = blake3_hash_of_paths(&migration_files)?;
     let dump_hash_hex = match dump.map(|d| repo_root.join(&d.path)) {
         Some(p) if p.is_file() => Some(blake3_hash_of_paths(&[p])?),
@@ -242,20 +330,30 @@ async fn build_key<D: DbDriver + ?Sized>(
         .map(|s| s.lockfile_paths(repo_root))
         .unwrap_or_default();
     let lockfile_hashes = lockfile_hashes_for(&lockfile_paths)?;
-    let hash_mode_str = spec.map(|s| match s.hash_mode {
-        MigHashMode::Filename => "filename",
-        MigHashMode::Checksum => "checksum",
-    }).unwrap_or("filename");
+    let hash_mode_str = spec
+        .map(|s| match s.hash_mode {
+            MigHashMode::Filename => "filename",
+            MigHashMode::Checksum => "checksum",
+        })
+        .unwrap_or("filename");
 
     Ok(SnapshotKey::new(
-        engine, &engine_version, source_db, framework, hash_mode_str,
-        migrations_hash_hex, dump_hash_hex, lockfile_hashes,
+        engine,
+        &engine_version,
+        source_db,
+        framework,
+        hash_mode_str,
+        migrations_hash_hex,
+        dump_hash_hex,
+        lockfile_hashes,
     ))
 }
 
 async fn check_cache(sqlite: &SqlitePool, fingerprint: &str) -> Result<bool> {
     let n: Option<i64> = sqlx::query_scalar("SELECT 1 FROM snapshots WHERE fingerprint = ?")
-        .bind(fingerprint).fetch_optional(sqlite).await?;
+        .bind(fingerprint)
+        .fetch_optional(sqlite)
+        .await?;
     Ok(n.is_some())
 }
 
@@ -269,12 +367,20 @@ async fn emit_snapshot_built(
 ) {
     let payload = serde_json::json!({
         "engine": engine, "fingerprint": fingerprint, "template": template_name
-    }).to_string();
+    })
+    .to_string();
     let _ = treeman_store::write_event(
-        sqlite, "info", "snapshot_built",
+        sqlite,
+        "info",
+        "snapshot_built",
         Some(&format!("{engine}: built {template_name}")),
-        Some(repo_id), Some(worktree_id), None, None, &payload,
-    ).await;
+        Some(repo_id),
+        Some(worktree_id),
+        None,
+        None,
+        &payload,
+    )
+    .await;
 }
 
 async fn do_fanout_mysql(
@@ -285,7 +391,9 @@ async fn do_fanout_mysql(
     repo_root: &Path,
 ) -> Result<Vec<String>> {
     let n = resolve_clone_count(p, repo_root);
-    if n == 0 { return Ok(vec![]); }
+    if n == 0 {
+        return Ok(vec![]);
+    }
     let plan = ParatestPlan {
         engine: ParatestEngine::Mysql,
         source_db: template_name.into(),
@@ -303,7 +411,9 @@ async fn do_fanout_pg(
     repo_root: &Path,
 ) -> Result<Vec<String>> {
     let n = resolve_clone_count(p, repo_root);
-    if n == 0 { return Ok(vec![]); }
+    if n == 0 {
+        return Ok(vec![]);
+    }
     let plan = ParatestPlan {
         engine: ParatestEngine::Postgres,
         source_db: template_name.into(),

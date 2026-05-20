@@ -19,7 +19,7 @@ use treeman_migrations::{FrameworkSpec, HashMode, MigrationHashSet, OnModify};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Dispatch {
-    Delta(Vec<String>),  // keys of newly-added migrations
+    Delta(Vec<String>), // keys of newly-added migrations
     Rebuild,
     Noop,
 }
@@ -32,22 +32,31 @@ pub struct WatcherState {
 
 impl WatcherState {
     fn from_hash_set(hs: &MigrationHashSet) -> Self {
-        Self { by_key: hs.by_key.clone(), mode: Some(hs.mode) }
+        Self {
+            by_key: hs.by_key.clone(),
+            mode: Some(hs.mode),
+        }
     }
 }
 
 pub fn state_path(repo_root: &Path, framework: &str) -> PathBuf {
-    repo_root.join(".treeman").join(format!("watch-state-{framework}.json"))
+    repo_root
+        .join(".treeman")
+        .join(format!("watch-state-{framework}.json"))
 }
 
 pub fn load_state(path: &Path) -> Result<WatcherState> {
-    if !path.exists() { return Ok(WatcherState::default()); }
+    if !path.exists() {
+        return Ok(WatcherState::default());
+    }
     let s = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&s).unwrap_or_default())
 }
 
 pub fn save_state(path: &Path, state: &WatcherState) -> Result<()> {
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
     std::fs::write(path, serde_json::to_string_pretty(state)?)?;
     Ok(())
 }
@@ -55,14 +64,23 @@ pub fn save_state(path: &Path, state: &WatcherState) -> Result<()> {
 /// Compute the dispatch decision given prev + cur snapshots for one
 /// framework. Pure function — testable without filesystem.
 pub fn decide(prev: &WatcherState, cur: &MigrationHashSet, spec: &FrameworkSpec) -> Dispatch {
-    let added: Vec<String> = cur.by_key.keys()
+    let added: Vec<String> = cur
+        .by_key
+        .keys()
         .filter(|k| !prev.by_key.contains_key(*k))
-        .cloned().collect();
-    let removed: Vec<&String> = prev.by_key.keys()
-        .filter(|k| !cur.by_key.contains_key(*k)).collect();
-    let changed: Vec<&String> = prev.by_key.iter()
+        .cloned()
+        .collect();
+    let removed: Vec<&String> = prev
+        .by_key
+        .keys()
+        .filter(|k| !cur.by_key.contains_key(*k))
+        .collect();
+    let changed: Vec<&String> = prev
+        .by_key
+        .iter()
         .filter(|(k, v)| cur.by_key.get(*k).map(|cv| cv != *v).unwrap_or(false))
-        .map(|(k, _)| k).collect();
+        .map(|(k, _)| k)
+        .collect();
 
     if added.is_empty() && removed.is_empty() && changed.is_empty() {
         return Dispatch::Noop;
@@ -86,7 +104,11 @@ pub fn decide(prev: &WatcherState, cur: &MigrationHashSet, spec: &FrameworkSpec)
             if removed.is_empty() && changed.is_empty() {
                 Dispatch::Delta(added)
             } else if spec.on_modify == OnModify::Delta {
-                if added.is_empty() { Dispatch::Noop } else { Dispatch::Delta(added) }
+                if added.is_empty() {
+                    Dispatch::Noop
+                } else {
+                    Dispatch::Delta(added)
+                }
             } else {
                 Dispatch::Rebuild
             }
@@ -156,9 +178,12 @@ async fn spawn_one(
     let state_p = state_path(&repo_root, &spec.name);
     let initial_dirs = spec.migration_dirs(&repo_root);
     let initial_files = collect_files(&spec, &initial_dirs);
-    let initial_hs = spec.hash_inputs(&initial_files).unwrap_or(MigrationHashSet {
-        by_key: Default::default(), mode: spec.hash_mode,
-    });
+    let initial_hs = spec
+        .hash_inputs(&initial_files)
+        .unwrap_or(MigrationHashSet {
+            by_key: Default::default(),
+            mode: spec.hash_mode,
+        });
     save_state(&state_p, &WatcherState::from_hash_set(&initial_hs)).ok();
 
     let h = tokio::spawn(async move {
@@ -176,7 +201,11 @@ async fn spawn_one(
                 let already = watched.iter().any(|w| r.starts_with(w));
                 if !already {
                     use notify::Watcher;
-                    if debouncer.watcher().watch(r, notify::RecursiveMode::Recursive).is_ok() {
+                    if debouncer
+                        .watcher()
+                        .watch(r, notify::RecursiveMode::Recursive)
+                        .is_ok()
+                    {
                         debug!(root = %r.display(), "added new watch root");
                         watched.insert(r.clone());
                     }
@@ -187,10 +216,15 @@ async fn spawn_one(
             //    `app/Modules/Foo/Database/Migrations`).
             let dirs = spec.migration_dirs(&repo_root);
             let files = collect_files(&spec, &dirs);
-            for f in &files { state_files_hint.insert(f.clone(), ()); }
+            for f in &files {
+                state_files_hint.insert(f.clone(), ());
+            }
             let cur = match spec.hash_inputs(&files) {
                 Ok(h) => h,
-                Err(e) => { debug!(error = %e, "hash_inputs failed"); continue; }
+                Err(e) => {
+                    debug!(error = %e, "hash_inputs failed");
+                    continue;
+                }
             };
             let dispatch = decide(&state, &cur, &spec);
             if !matches!(dispatch, Dispatch::Noop) {
@@ -224,13 +258,16 @@ mod tests {
             migration_dir_patterns: vec![],
             file_globs: vec!["*".into()],
             lockfiles: vec![],
-            hash_mode, on_modify,
+            hash_mode,
+            on_modify,
             engine_hint: None,
         }
     }
     fn hs(pairs: &[(&str, &str)], mode: HashMode) -> MigrationHashSet {
         let mut by_key = std::collections::BTreeMap::new();
-        for (k, v) in pairs { by_key.insert(k.to_string(), v.to_string()); }
+        for (k, v) in pairs {
+            by_key.insert(k.to_string(), v.to_string());
+        }
         MigrationHashSet { by_key, mode }
     }
 

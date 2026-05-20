@@ -57,12 +57,18 @@ pub fn slug_for(worktree_path: &Path, branch: Option<&str>) -> Slug {
     let ticket_re = ticket_regex();
     if let Some(b) = branch {
         if let Some(s) = extract_ticket(b, &ticket_re) {
-            return Slug { value: s, source: SlugSource::Ticket };
+            return Slug {
+                value: s,
+                source: SlugSource::Ticket,
+            };
         }
     }
     if let Some(last) = worktree_path.file_name().and_then(|s| s.to_str()) {
         if let Some(s) = extract_ticket(last, &ticket_re) {
-            return Slug { value: s, source: SlugSource::Ticket };
+            return Slug {
+                value: s,
+                source: SlugSource::Ticket,
+            };
         }
     }
     let canonical = worktree_path
@@ -71,7 +77,10 @@ pub fn slug_for(worktree_path: &Path, branch: Option<&str>) -> Slug {
     let bytes = canonical.as_os_str().as_encoded_bytes();
     let h = blake3::hash(bytes);
     let hex = h.to_hex();
-    Slug { value: format!("wt_{}", &hex[..8]), source: SlugSource::PathHash }
+    Slug {
+        value: format!("wt_{}", &hex[..8]),
+        source: SlugSource::PathHash,
+    }
 }
 
 fn extract_ticket(s: &str, re: &Regex) -> Option<String> {
@@ -131,7 +140,10 @@ mod tests {
 
     #[test]
     fn ticket_in_branch_wins() {
-        let s = slug_for(&PathBuf::from("/tmp/random-dir"), Some("feature/KON-1234-foo"));
+        let s = slug_for(
+            &PathBuf::from("/tmp/random-dir"),
+            Some("feature/KON-1234-foo"),
+        );
         assert_eq!(s.value, "kon_1234");
         assert_eq!(s.source, SlugSource::Ticket);
     }
@@ -152,13 +164,19 @@ mod tests {
 
     #[test]
     fn slug_dashed_replaces_underscores() {
-        let s = Slug { value: "kon_1234".into(), source: SlugSource::Ticket };
+        let s = Slug {
+            value: "kon_1234".into(),
+            source: SlugSource::Ticket,
+        };
         assert_eq!(s.dashed(), "kon-1234");
     }
 
     #[test]
     fn redis_indices_in_range_6_15() {
-        let s = Slug { value: "kon_1234".into(), source: SlugSource::Ticket };
+        let s = Slug {
+            value: "kon_1234".into(),
+            source: SlugSource::Ticket,
+        };
         let (q, c) = s.redis_indices();
         assert!((6..=15).contains(&q));
         assert!((6..=15).contains(&c));

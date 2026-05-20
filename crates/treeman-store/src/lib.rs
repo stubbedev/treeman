@@ -22,11 +22,10 @@ pub fn default_db_path() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("TREEMAN_DB_PATH") {
         return Ok(PathBuf::from(p));
     }
-    let dirs = directories::ProjectDirs::from("", "", "treeman")
-        .context("project dirs unavailable")?;
+    let dirs =
+        directories::ProjectDirs::from("", "", "treeman").context("project dirs unavailable")?;
     let dir = dirs.data_local_dir();
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir.join("treeman.db"))
 }
 
@@ -90,17 +89,22 @@ pub async fn ensure_worktree(
 ) -> Result<i64> {
     let path_s = path.to_string_lossy().to_string();
     let now = chrono::Utc::now().timestamp_millis();
-    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
-        "SELECT id, deleted_at FROM worktrees WHERE path = ?",
-    )
-    .bind(&path_s)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(i64, Option<i64>)> =
+        sqlx::query_as("SELECT id, deleted_at FROM worktrees WHERE path = ?")
+            .bind(&path_s)
+            .fetch_optional(pool)
+            .await?;
     if let Some((id, deleted_at)) = row {
         if deleted_at.is_some() {
             // Re-activate.
-            sqlx::query("UPDATE worktrees SET deleted_at = NULL, slug = ?, branch = ? WHERE id = ?")
-                .bind(slug).bind(branch).bind(id).execute(pool).await?;
+            sqlx::query(
+                "UPDATE worktrees SET deleted_at = NULL, slug = ?, branch = ? WHERE id = ?",
+            )
+            .bind(slug)
+            .bind(branch)
+            .bind(id)
+            .execute(pool)
+            .await?;
         }
         return Ok(id);
     }
@@ -108,7 +112,11 @@ pub async fn ensure_worktree(
         "INSERT INTO worktrees(repo_id, path, slug, branch, created_at)
          VALUES (?, ?, ?, ?, ?) RETURNING id",
     )
-    .bind(repo_id).bind(&path_s).bind(slug).bind(branch).bind(now)
+    .bind(repo_id)
+    .bind(&path_s)
+    .bind(slug)
+    .bind(branch)
+    .bind(now)
     .fetch_one(pool)
     .await?;
     Ok(id)
@@ -117,7 +125,10 @@ pub async fn ensure_worktree(
 pub async fn mark_worktree_deleted(pool: &SqlitePool, worktree_id: i64) -> Result<()> {
     let now = chrono::Utc::now().timestamp_millis();
     sqlx::query("UPDATE worktrees SET deleted_at = ? WHERE id = ?")
-        .bind(now).bind(worktree_id).execute(pool).await?;
+        .bind(now)
+        .bind(worktree_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

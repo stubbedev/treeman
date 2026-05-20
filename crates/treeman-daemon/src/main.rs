@@ -35,7 +35,9 @@ async fn main() -> Result<()> {
     socket::lockdown(&socket_path)?;
 
     let started_at_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let pid = std::process::id();
     let shutdown = Arc::new(Notify::new());
     let state = Arc::new(state::DaemonState::new(pool.clone(), started_at_unix, pid));
@@ -80,12 +82,19 @@ async fn handle_conn(stream: UnixStream, state: Arc<state::DaemonState>, shutdow
             Ok(n) => n,
             Err(_) => break,
         };
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let req: Request = match serde_json::from_str(line.trim_end()) {
             Ok(r) => r,
             Err(e) => {
-                let _ = write_response(&mut write_half,
-                    &Response::Error { message: format!("parse: {e}") }).await;
+                let _ = write_response(
+                    &mut write_half,
+                    &Response::Error {
+                        message: format!("parse: {e}"),
+                    },
+                )
+                .await;
                 continue;
             }
         };
@@ -112,20 +121,30 @@ async fn dispatch(
         }),
         Request::Ping => Response::Pong,
         Request::RepoRegister { path, name } => {
-            match treeman_store::ensure_repo(state.sqlite(), std::path::Path::new(&path), &name).await {
+            match treeman_store::ensure_repo(state.sqlite(), std::path::Path::new(&path), &name)
+                .await
+            {
                 Ok(repo_id) => Response::RepoRegistered { repo_id },
-                Err(e) => Response::Error { message: e.to_string() },
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
             }
         }
         Request::WatcherStart { repo_path } => match state.start_watcher(&repo_path).await {
             Ok(_) => Response::WatcherStarted { repo_path },
-            Err(e) => Response::Error { message: e.to_string() },
+            Err(e) => Response::Error {
+                message: e.to_string(),
+            },
         },
         Request::WatcherStop { repo_path } => match state.stop_watcher(&repo_path).await {
             Ok(_) => Response::WatcherStopped { repo_path },
-            Err(e) => Response::Error { message: e.to_string() },
+            Err(e) => Response::Error {
+                message: e.to_string(),
+            },
         },
-        Request::WatcherList => Response::WatcherList { repos: state.list_watchers() },
+        Request::WatcherList => Response::WatcherList {
+            repos: state.list_watchers(),
+        },
         Request::Shutdown => {
             shutdown.notify_one();
             Response::Ok

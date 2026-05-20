@@ -19,14 +19,27 @@ pub async fn load_mysql(driver: &MysqlDriver, target_db: &str, dump_path: &Path)
     let mut conn = driver.acquire().await?;
     // Switch to target schema once.
     sqlx::query(&format!("USE `{target_db}`"))
-        .execute(&mut *conn).await?;
-    sqlx::query("SET SESSION foreign_key_checks=0").execute(&mut *conn).await.ok();
-    sqlx::query("SET SESSION unique_checks=0").execute(&mut *conn).await.ok();
-    sqlx::query("SET SESSION sql_log_bin=0").execute(&mut *conn).await.ok();
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("SET SESSION foreign_key_checks=0")
+        .execute(&mut *conn)
+        .await
+        .ok();
+    sqlx::query("SET SESSION unique_checks=0")
+        .execute(&mut *conn)
+        .await
+        .ok();
+    sqlx::query("SET SESSION sql_log_bin=0")
+        .execute(&mut *conn)
+        .await
+        .ok();
     let mut applied: u64 = 0;
     for stmt in iter_statements(&sql) {
-        if stmt.trim().is_empty() { continue; }
-        conn.execute(sqlx::query(stmt)).await
+        if stmt.trim().is_empty() {
+            continue;
+        }
+        conn.execute(sqlx::query(stmt))
+            .await
             .with_context(|| format!("apply dump stmt #{applied}"))?;
         applied += 1;
     }
@@ -34,14 +47,21 @@ pub async fn load_mysql(driver: &MysqlDriver, target_db: &str, dump_path: &Path)
     Ok(applied)
 }
 
-pub async fn load_postgres(driver: &PostgresDriver, target_db: &str, dump_path: &Path) -> Result<u64> {
+pub async fn load_postgres(
+    driver: &PostgresDriver,
+    target_db: &str,
+    dump_path: &Path,
+) -> Result<u64> {
     let sql = std::fs::read_to_string(dump_path)
         .with_context(|| format!("read dump {}", dump_path.display()))?;
     let mut conn = driver.acquire_db(target_db).await?;
     let mut applied: u64 = 0;
     for stmt in iter_statements(&sql) {
-        if stmt.trim().is_empty() { continue; }
-        conn.execute(sqlx::query(stmt)).await
+        if stmt.trim().is_empty() {
+            continue;
+        }
+        conn.execute(sqlx::query(stmt))
+            .await
             .with_context(|| format!("apply dump stmt #{applied}"))?;
         applied += 1;
     }
@@ -63,7 +83,9 @@ struct StatementIter<'a> {
 impl<'a> Iterator for StatementIter<'a> {
     type Item = &'a str;
     fn next(&mut self) -> Option<&'a str> {
-        if self.rest.is_empty() { return None; }
+        if self.rest.is_empty() {
+            return None;
+        }
         let bytes = self.rest.as_bytes();
         let mut i = 0;
         let mut in_single = false;
@@ -74,7 +96,9 @@ impl<'a> Iterator for StatementIter<'a> {
             if !(in_single || in_double || in_backtick) {
                 // line comment
                 if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-                    while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
                     continue;
                 }
                 // block comment
@@ -83,7 +107,8 @@ impl<'a> Iterator for StatementIter<'a> {
                     while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                         i += 1;
                     }
-                    i += 2; continue;
+                    i += 2;
+                    continue;
                 }
             }
             match b {

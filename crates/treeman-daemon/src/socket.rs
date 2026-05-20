@@ -15,11 +15,9 @@ pub fn resolve_path() -> Result<PathBuf> {
             return Ok(PathBuf::from(rt).join(SOCKET_BASENAME));
         }
     }
-    let dirs = ProjectDirs::from("", "", "treeman")
-        .context("project dirs unavailable")?;
+    let dirs = ProjectDirs::from("", "", "treeman").context("project dirs unavailable")?;
     let state = dirs.data_local_dir();
-    std::fs::create_dir_all(state)
-        .with_context(|| format!("create {}", state.display()))?;
+    std::fs::create_dir_all(state).with_context(|| format!("create {}", state.display()))?;
     Ok(state.join(SOCKET_BASENAME))
 }
 
@@ -44,17 +42,31 @@ pub fn check_peer_uid(stream: &UnixStream) -> Result<()> {
     let our_uid = unsafe { libc::geteuid() };
     let fd = stream.as_raw_fd();
     #[repr(C)]
-    struct Ucred { pid: libc::pid_t, uid: libc::uid_t, gid: libc::gid_t }
-    let mut cred = Ucred { pid: 0, uid: 0, gid: 0 };
+    struct Ucred {
+        pid: libc::pid_t,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+    let mut cred = Ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
     let mut len = std::mem::size_of::<Ucred>() as libc::socklen_t;
     let rc = unsafe {
         libc::getsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void, &mut len,
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
         )
     };
     if rc != 0 {
-        bail!("getsockopt SO_PEERCRED: {}", std::io::Error::last_os_error());
+        bail!(
+            "getsockopt SO_PEERCRED: {}",
+            std::io::Error::last_os_error()
+        );
     }
     if cred.uid != our_uid {
         bail!("peer uid {} != daemon uid {}", cred.uid, our_uid);

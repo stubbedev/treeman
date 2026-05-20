@@ -15,29 +15,39 @@ pub struct MysqlDriver {
 
 impl MysqlDriver {
     pub async fn connect(cfg: &MysqlConn) -> Result<Self> {
-        let password = cfg.password_env.as_deref()
+        let password = cfg
+            .password_env
+            .as_deref()
             .map(|k| std::env::var(k).unwrap_or_default())
             .unwrap_or_default();
         // No DB scope; connection lives at the server level so DDL like
         // CREATE/DROP DATABASE works.
         let url = format!(
             "mysql://{user}:{pass}@{host}:{port}/?ssl-mode=DISABLED",
-            user = cfg.user, pass = urlencoding::encode_no_alloc(&password),
-            host = cfg.host, port = cfg.port,
+            user = cfg.user,
+            pass = urlencoding::encode_no_alloc(&password),
+            host = cfg.host,
+            port = cfg.port,
         );
         let pool = MySqlPoolOptions::new()
             .max_connections(cfg.pool_max)
-            .connect(&url).await.context("connect mysql")?;
+            .connect(&url)
+            .await
+            .context("connect mysql")?;
         Ok(Self { pool })
     }
 }
 
 #[async_trait]
 impl DbDriver for MysqlDriver {
-    fn engine(&self) -> Engine { Engine::Mysql }
+    fn engine(&self) -> Engine {
+        Engine::Mysql
+    }
 
     async fn engine_version(&self) -> Result<String> {
-        let row = sqlx::query("SELECT VERSION() AS v").fetch_one(&self.pool).await?;
+        let row = sqlx::query("SELECT VERSION() AS v")
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.try_get::<String, _>("v")?)
     }
 
@@ -49,7 +59,9 @@ impl DbDriver for MysqlDriver {
             "CREATE DATABASE IF NOT EXISTS `{}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
             name
         );
-        sqlx::query(&stmt).execute(&self.pool).await
+        sqlx::query(&stmt)
+            .execute(&self.pool)
+            .await
             .with_context(|| format!("CREATE DATABASE `{name}`"))?;
         debug!(db = name, "ensured mysql database");
         Ok(())
@@ -60,7 +72,9 @@ impl DbDriver for MysqlDriver {
         for name in &matched {
             validate_ident(name)?;
             let stmt = format!("DROP DATABASE IF EXISTS `{}`", name);
-            sqlx::query(&stmt).execute(&self.pool).await
+            sqlx::query(&stmt)
+                .execute(&self.pool)
+                .await
                 .with_context(|| format!("DROP DATABASE `{name}`"))?;
             debug!(db = name, "dropped mysql database");
         }
@@ -70,12 +84,14 @@ impl DbDriver for MysqlDriver {
     async fn list_matching(&self, prefix: &str) -> Result<Vec<String>> {
         let like = format!("{}%", prefix.replace('_', "\\_"));
         let rows = sqlx::query(
-            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE ?"
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE ?",
         )
         .bind(&like)
-        .fetch_all(&self.pool).await
+        .fetch_all(&self.pool)
+        .await
         .context("list mysql databases")?;
-        Ok(rows.into_iter()
+        Ok(rows
+            .into_iter()
             .filter_map(|r| r.try_get::<String, _>("SCHEMA_NAME").ok())
             .collect())
     }
@@ -109,22 +125,35 @@ impl MysqlDriver {
         validate_ident(template)?;
         // Drop + create the template DB.
         sqlx::query(&format!("DROP DATABASE IF EXISTS `{}`", template))
-            .execute(&self.pool).await?;
+            .execute(&self.pool)
+            .await?;
         sqlx::query(&format!(
             "CREATE DATABASE `{}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
             template
-        )).execute(&self.pool).await?;
+        ))
+        .execute(&self.pool)
+        .await?;
 
         // Enumerate source tables.
         let table_rows = sqlx::query(
             "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME"
-        ).bind(source).fetch_all(&self.pool).await?;
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+        )
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
 
         let mut conn = self.pool.acquire().await?;
-        sqlx::query("SET SESSION foreign_key_checks=0").execute(&mut *conn).await?;
-        sqlx::query("SET SESSION unique_checks=0").execute(&mut *conn).await?;
-        sqlx::query("SET SESSION sql_log_bin=0").execute(&mut *conn).await.ok();
+        sqlx::query("SET SESSION foreign_key_checks=0")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("SET SESSION unique_checks=0")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("SET SESSION sql_log_bin=0")
+            .execute(&mut *conn)
+            .await
+            .ok();
 
         for r in &table_rows {
             let table: String = r.try_get("TABLE_NAME")?;
@@ -132,19 +161,28 @@ impl MysqlDriver {
             validate_ident(&table)?;
             // Get CREATE TABLE/VIEW from source.
             let create_kind = if ttype == "VIEW" { "VIEW" } else { "TABLE" };
-            let create_row = sqlx::query(&format!(
-                "SHOW CREATE {create_kind} `{source}`.`{table}`",
-            )).fetch_one(&mut *conn).await?;
+            let create_row =
+                sqlx::query(&format!("SHOW CREATE {create_kind} `{source}`.`{table}`",))
+                    .fetch_one(&mut *conn)
+                    .await?;
             let create_stmt: String = create_row.try_get(1)?;
             // The DDL references the source schema implicitly — switch
             // session schema to target before executing.
-            sqlx::query(&format!("USE `{}`", template)).execute(&mut *conn).await?;
-            sqlx::query(&create_stmt).execute(&mut *conn).await
+            sqlx::query(&format!("USE `{}`", template))
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query(&create_stmt)
+                .execute(&mut *conn)
+                .await
                 .with_context(|| format!("recreate `{table}`"))?;
 
             if ttype != "VIEW" {
-                let copy = format!("INSERT INTO `{template}`.`{table}` SELECT * FROM `{source}`.`{table}`");
-                sqlx::query(&copy).execute(&mut *conn).await
+                let copy = format!(
+                    "INSERT INTO `{template}`.`{table}` SELECT * FROM `{source}`.`{table}`"
+                );
+                sqlx::query(&copy)
+                    .execute(&mut *conn)
+                    .await
                     .with_context(|| format!("copy data for `{table}`"))?;
             }
         }
@@ -156,7 +194,8 @@ impl MysqlDriver {
         validate_ident(template)?;
         validate_ident(target)?;
         sqlx::query(&format!("DROP DATABASE IF EXISTS `{}`", target))
-            .execute(&self.pool).await?;
+            .execute(&self.pool)
+            .await?;
         self.snapshot_create(template, target).await
     }
 }

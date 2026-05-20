@@ -29,11 +29,18 @@ pub enum Request {
     Status,
     Ping,
     /// Register or update a repo (path + name).
-    RepoRegister { path: String, name: String },
+    RepoRegister {
+        path: String,
+        name: String,
+    },
     /// Start a per-repo watcher in the daemon.
-    WatcherStart { repo_path: String },
+    WatcherStart {
+        repo_path: String,
+    },
     /// Stop a previously-started watcher.
-    WatcherStop  { repo_path: String },
+    WatcherStop {
+        repo_path: String,
+    },
     /// List currently-running watchers.
     WatcherList,
     /// Tell the daemon to shut down cleanly (used by `treeman daemon stop`).
