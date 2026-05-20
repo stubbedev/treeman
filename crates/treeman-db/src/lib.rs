@@ -3,6 +3,7 @@
 //! M4 ships mysql + redis. Postgres, MongoDB, Elasticsearch land in
 //! later milestones.
 
+pub mod binlog;
 pub mod elasticsearch;
 pub mod mongo;
 pub mod mysql;
