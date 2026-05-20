@@ -16,7 +16,7 @@ tracing = { workspace = true }
 notify = "6"
 notify-debouncer-full = "0.3"
 treeman-core = { workspace = true }
-treeman-migrations = { path = "../treeman-migrations", version = "0.1.3" }
+treeman-migrations = { path = "../treeman-migrations", version = "0.1.4" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
