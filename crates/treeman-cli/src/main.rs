@@ -52,6 +52,21 @@ enum Cmd {
     /// Snapshot catalog operations.
     #[command(subcommand)]
     Snapshot(SnapshotCmd),
+    /// Paratest clone fan-out.
+    Paratest(ParatestArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct ParatestArgs {
+    /// Worktree path (slug derives from it).
+    #[arg(long)]
+    worktree: Option<PathBuf>,
+    /// Limit fan-out to a specific engine.
+    #[arg(long)]
+    engine: Option<String>,
+    /// Repo dir for config discovery.
+    #[arg(long)]
+    repo: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -250,7 +265,75 @@ async fn main() -> Result<()> {
         Cmd::Snapshot(SnapshotCmd::Gc { keep_per_source, max_age_days, max_total_gb }) => {
             snapshot_gc(keep_per_source, max_age_days, max_total_gb).await
         }
+        Cmd::Paratest(args) => paratest(args).await,
     }
+}
+
+async fn paratest(args: ParatestArgs) -> Result<()> {
+    use std::sync::Arc;
+    use treeman_core::config::{ClonesSetting, DatabaseConfig as DB};
+    use treeman_core::template::{TemplateContext, render};
+
+    let wt_path = match args.worktree {
+        Some(p) => p.canonicalize()?,
+        None => std::env::current_dir()?,
+    };
+    let repo_root = match args.repo {
+        Some(r) => r.canonicalize()?,
+        None => discover_repo_root(&wt_path).context("no repo root")?,
+    };
+    let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
+    let branch = detect_branch(&wt_path);
+    let slug = treeman_core::slug_for(&wt_path, branch.as_deref());
+    let ctx = TemplateContext::from_slug(&slug);
+
+    for d in &cfg.databases {
+        let (engine_name, source_db, paratest_spec) = match d {
+            DB::Mysql { name_template, paratest, .. } => {
+                ("mysql", render(name_template, &ctx)?, paratest.as_ref())
+            }
+            DB::Postgres { name_template, paratest, .. } => {
+                ("postgres", render(name_template, &ctx)?, paratest.as_ref())
+            }
+            _ => continue,
+        };
+        if let Some(filter) = &args.engine {
+            if filter != engine_name { continue; }
+        }
+        let Some(spec) = paratest_spec else {
+            println!("[{engine_name}] no paratest spec; skipping");
+            continue;
+        };
+        let clones = match spec.clones {
+            ClonesSetting::Auto => treeman_snapshot::auto_clones(),
+            ClonesSetting::Fixed(n) => n,
+        };
+        let plan = treeman_snapshot::ParatestPlan {
+            engine: match engine_name {
+                "mysql" => treeman_snapshot::ParatestEngine::Mysql,
+                "postgres" => treeman_snapshot::ParatestEngine::Postgres,
+                _ => continue,
+            },
+            source_db: source_db.clone(),
+            clones,
+            name_template: spec.name_template.clone(),
+        };
+        println!("[{engine_name}] cloning {} → {} parallel test DBs", source_db, clones);
+        let names = match plan.engine {
+            treeman_snapshot::ParatestEngine::Mysql => {
+                let mc = cfg.connections.mysql.clone().context("connections.mysql missing")?;
+                let drv = Arc::new(treeman_db::mysql::MysqlDriver::connect(&mc).await?);
+                treeman_snapshot::mysql_fanout(drv, plan, &slug.value).await?
+            }
+            treeman_snapshot::ParatestEngine::Postgres => {
+                let pc = cfg.connections.postgres.clone().context("connections.postgres missing")?;
+                let drv = Arc::new(treeman_db::postgres::PostgresDriver::connect(&pc).await?);
+                treeman_snapshot::postgres_fanout(drv, plan, &slug.value).await?
+            }
+        };
+        for n in names { println!("  → {n}"); }
+    }
+    Ok(())
 }
 
 async fn snapshot_list(engine: Option<String>) -> Result<()> {
