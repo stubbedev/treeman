@@ -1,0 +1,24 @@
+[package]
+name = "treeman-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Treeman core: config, slug, env patcher, schemars-derived JSON Schema."
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+schemars = { version = "0.8", features = ["preserve_order"] }
+figment = { version = "0.10", features = ["yaml", "env"] }
+regex = "1"
+blake3 = "1"
+twox-hash = { version = "1", default-features = false }
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+tinytemplate = "1"
+tracing = { workspace = true }
+directories = { workspace = true }

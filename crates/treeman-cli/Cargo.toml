@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 treeman-proto = { workspace = true }
+treeman-core = { workspace = true }
+serde_yaml = "0.9"
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
