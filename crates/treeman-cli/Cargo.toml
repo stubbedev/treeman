@@ -28,4 +28,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
+clap_complete = "4"
+clap_mangen = "0.2"
+owo-colors = "4"
+is-terminal = "0.4"
 directories = { workspace = true }
