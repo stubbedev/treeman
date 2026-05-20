@@ -2256,9 +2256,9 @@ async fn prepare_cmd(args: PrepareArgs) -> Result<()> {
 // ───────────────────────── worktree create/delete ─────────────────────────
 
 async fn worktree_finalize(path: PathBuf, repo: Option<PathBuf>) -> Result<()> {
-    let wt_path = path.canonicalize().with_context(|| {
-        format!("canonicalize {} — does the worktree exist?", path.display())
-    })?;
+    let wt_path = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize {} — does the worktree exist?", path.display()))?;
     let repo_root = match repo {
         Some(r) => r.canonicalize()?,
         None => discover_repo_root(&wt_path).context("could not find repo root for worktree")?,
@@ -2439,13 +2439,9 @@ async fn worktree_create(
     // succeed before the worktree is considered usable (e.g. fetch a
     // submodule into the worktree).
     if !cfg.hooks.precreate.is_empty() {
-        let outcome = treeman_core::hooks::run_hooks(
-            &cfg.hooks.precreate,
-            &repo_root,
-            &wt_path,
-            &slug.value,
-        )
-        .await?;
+        let outcome =
+            treeman_core::hooks::run_hooks(&cfg.hooks.precreate, &repo_root, &wt_path, &slug.value)
+                .await?;
         println!("precreate: exit={}", outcome.aggregate_exit_code);
         if outcome.aggregate_exit_code != 0 {
             bail!("precreate failed");
@@ -2471,9 +2467,7 @@ async fn worktree_create(
                 return Ok(());
             }
             Err(e) => {
-                eprintln!(
-                    "warn: daemon RPC failed ({e}); falling back to foreground"
-                );
+                eprintln!("warn: daemon RPC failed ({e}); falling back to foreground");
             }
         }
     }

@@ -222,9 +222,7 @@ async fn dispatch(
             let repo_for_task = repo_path.clone();
             let wt_for_task = worktree_path.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    finalize_worktree(&st, &repo_for_task, &wt_for_task).await
-                {
+                if let Err(e) = finalize_worktree(&st, &repo_for_task, &wt_for_task).await {
                     let _ = treeman_store::write_event(
                         st.sqlite(),
                         "error",
@@ -271,16 +269,10 @@ async fn finalize_worktree(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("repo");
-    let repo_id =
-        treeman_store::ensure_repo(state.sqlite(), &repo_root, repo_name).await?;
-    let wt_id = treeman_store::ensure_worktree(
-        state.sqlite(),
-        repo_id,
-        &wt_root,
-        &slug.value,
-        None,
-    )
-    .await?;
+    let repo_id = treeman_store::ensure_repo(state.sqlite(), &repo_root, repo_name).await?;
+    let wt_id =
+        treeman_store::ensure_worktree(state.sqlite(), repo_id, &wt_root, &slug.value, None)
+            .await?;
 
     let _ = treeman_store::write_event(
         state.sqlite(),
@@ -312,8 +304,7 @@ async fn finalize_worktree(
     }
 
     if !cfg.databases.is_empty() {
-        treeman_prepare::run(&cfg, &repo_root, &slug, state.sqlite(), repo_id, wt_id)
-            .await?;
+        treeman_prepare::run(&cfg, &repo_root, &slug, state.sqlite(), repo_id, wt_id).await?;
     }
 
     let _ = treeman_store::write_event(

@@ -68,16 +68,30 @@ pub enum Response {
     Ok,
     Pong,
     Status(StatusResponse),
-    RepoRegistered { repo_id: i64 },
-    WatcherStarted { repo_path: String },
-    WatcherStopped { repo_path: String },
-    WatcherList { repos: Vec<WatcherSummary> },
-    WorktreeList { worktrees: Vec<String> },
+    RepoRegistered {
+        repo_id: i64,
+    },
+    WatcherStarted {
+        repo_path: String,
+    },
+    WatcherStopped {
+        repo_path: String,
+    },
+    WatcherList {
+        repos: Vec<WatcherSummary>,
+    },
+    WorktreeList {
+        worktrees: Vec<String>,
+    },
     /// Daemon accepted the finalize request and detached a task.
     /// The caller should not wait — use `treeman logs tail -f` to
     /// follow progress.
-    WorktreeFinalizeQueued { worktree_path: String },
-    Error { message: String },
+    WorktreeFinalizeQueued {
+        worktree_path: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
