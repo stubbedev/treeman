@@ -1,0 +1,392 @@
+# treeman
+
+**Per-worktree DB orchestrator with file watcher.** Generic Rust replacement
+for hand-rolled `gwt`/`build_helper` style shell hooks: spin up scoped test
+databases per git worktree, tear them down on delete, keep them in sync as
+migrations change.
+
+Pure wire-protocol DB access (sqlx / mysql_async / mongodb / redis / reqwest);
+no `mysql` / `psql` / `mongosh` / `redis-cli` / `docker exec` shell-out.
+Single global daemon, thin CLI client, SQLite-backed event log.
+
+---
+
+## Features
+
+- **5 DB engines** — MySQL, PostgreSQL, MongoDB, Redis, Elasticsearch (also
+  SQLite for the event log).
+- **14 migration frameworks auto-detected** — Laravel (incl. nwidart-style
+  modules), Rails (incl. engines), Django, golang-migrate, sqlx-cli, Diesel,
+  Prisma, Knex, Alembic, Flyway, TypeORM, Drizzle, Sequelize, MikroORM.
+- **Multi-module / monorepo aware** — modules created mid-watch are picked
+  up without restart (dynamic re-watch).
+- **Snapshot/template cache** — first `prepare` builds; subsequent worktrees
+  for the same migration set restore in seconds. Postgres uses native
+  `CREATE DATABASE … TEMPLATE`; MySQL uses cross-DB `INSERT … SELECT`.
+- **Paratest fan-out** — clone the template into N parallel test DBs so
+  `php artisan test --parallel` / `pytest -n auto` / etc. just work.
+- **Declarative YAML config** — global `~/.config/treeman/config.yaml` +
+  per-repo `.treeman.yaml` (JSON-schema validated; emit the schema with
+  `treeman schema dump`).
+- **Single daemon** — owns connection pools + file watchers; CLI is a thin
+  unix-socket client (SO_PEERCRED uid check; mode 0600).
+- **SQLite event log** — every hook run, watcher event, snapshot build,
+  and DB op is queryable via `treeman logs grep`.
+
+---
+
+## Install
+
+### From source (current)
+
+```sh
+git clone https://github.com/stubbe/treeman
+cd treeman
+cargo install --path crates/treeman-cli
+cargo install --path crates/treeman-daemon
+```
+
+### Nix flake
+
+```sh
+nix run github:stubbe/treeman -- --help          # ephemeral
+nix profile install github:stubbe/treeman        # persistent
+```
+
+### Pre-built binaries
+
+Each git tag (`vX.Y.Z`) ships Linux x86_64 + aarch64 and macOS x86_64 +
+aarch64 tarballs as GitHub release assets. See the
+[releases page](https://github.com/stubbe/treeman/releases).
+
+---
+
+## Quick start
+
+```sh
+# 1. Bootstrap config in your repo.
+cd ~/code/my-laravel-app
+treeman init               # writes .treeman.yaml from detected framework
+
+# 2. Ensure the daemon is running.
+treeman daemon install     # drops a systemd --user unit and enables it
+# … or for a one-shot session:
+treeman daemon start
+
+# 3. Create a worktree end-to-end.
+treeman wt create KON-1234
+#   ↳ git worktree add ../my-laravel-app-worktrees/KON-1234 -b KON-1234 main
+#   ↳ symlinks .env, .env.testing, justfile, etc.
+#   ↳ patches .env.testing's DB_DATABASE to my-laravel-app_testing_kon_1234
+#   ↳ runs postcreate hooks
+#   ↳ prepare: ensure_db → load dump → migrate → snapshot → N paratest clones
+
+# 4. Tell the daemon to watch for migration changes.
+treeman watcher start
+
+# 5. Work in the worktree. New migration files trigger delta updates;
+#    edits to existing migrations trigger a wipe+reseed (cached against
+#    fingerprint so repeats are fast).
+
+# 6. Done with the ticket.
+treeman wt delete KON-1234
+#   ↳ predelete hook
+#   ↳ drops scoped mysql DBs + mongo DBs + flushes scoped redis db indices
+#     + deletes elasticsearch index prefix
+#   ↳ git worktree remove
+```
+
+---
+
+## CLI reference
+
+Run `treeman --help` for the full tree. Highlights:
+
+| Command | What it does |
+|---|---|
+| `treeman init` | Generate `.treeman.yaml` from detected framework |
+| `treeman daemon {start,stop,status,install}` | Daemon lifecycle |
+| `treeman wt {create,delete,list,register,unregister}` | Worktree lifecycle |
+| `treeman watcher {start,stop,list}` | Daemon-managed file watcher |
+| `treeman watch` | Foreground CLI watcher (debugging) |
+| `treeman hook run <phase>` | Run a configured hook phase |
+| `treeman prepare` | ensure → dump → migrate → snapshot → paratest |
+| `treeman paratest` | Paratest fan-out (no preceding migrate) |
+| `treeman snapshot {list,show,gc}` | Snapshot cache management |
+| `treeman db {drop,flush,list}` | Direct DB driver ops |
+| `treeman fw detect` | Show detected migration frameworks |
+| `treeman logs {tail,grep}` | Query the SQLite event log |
+| `treeman slug [path]` | Print the slug derived from a worktree path |
+| `treeman config {validate,show}` | Config helpers |
+| `treeman schema dump` | JSON Schema for `.treeman.yaml` |
+| `treeman completions <shell>` | Emit shell completions (bash/zsh/fish/…) |
+| `treeman manpage` | Emit roff(7) for `man treeman` |
+
+Short flags everywhere (`-r` repo, `-w` worktree, `-f` force, `-e` engine,
+`-n` limit, `-l` level, …). Env-var defaults: `TREEMAN_REPO`,
+`TREEMAN_WORKTREE`, `TREEMAN_DB_PATH`, `TREEMAN_SOCKET`.
+
+Aliases: `wt` ↔ `worktree`, `fw` ↔ `frameworks`, `snap` ↔ `snapshot`,
+`log` ↔ `logs`, `wt new` ↔ `wt create`, `wt rm` ↔ `wt delete`,
+`db rm` ↔ `db drop`, `db ls` ↔ `db list`, etc.
+
+---
+
+## Configuration
+
+Layered: global `~/.config/treeman/config.yaml` → per-repo `.treeman.yaml`
+→ per-repo `.treeman.local.yaml` (gitignored). Later layers override.
+
+Full schema (emit JSON Schema with `treeman schema dump`):
+
+```yaml
+# Global
+daemon:
+  socket: $XDG_RUNTIME_DIR/treeman.sock
+  log_level: info
+  db_log_path: ~/.local/state/treeman/treeman.db
+connections:
+  mysql:    { host: 127.0.0.1, port: 3306, user: root,
+              password_env: MYSQL_PWD, pool_max: 8 }
+  postgres: { host: 127.0.0.1, port: 5432, user: postgres,
+              password_env: PGPASSWORD, pool_max: 8 }
+  mongodb:  { uri: mongodb://localhost:27017 }
+  redis:    { url: redis://localhost:6379 }
+  elasticsearch: { url: http://localhost:9200 }
+snapshots:
+  cache_dir: ~/.cache/treeman/snapshots
+  retention: { keep_per_source: 5, max_age_days: 30, max_total_gb: 50 }
+
+# Per-repo (.treeman.yaml)
+repo:
+  name: kontainer
+slug:
+  ticket_regex: "^([A-Z]+)-(\\d+)"
+  fallback: "wt_{shorthash8}"
+worktrees:
+  root: ../worktrees
+  links:
+    - .env
+    - .env.testing
+    - justfile
+env_scoping:
+  files: [".env.testing", "phpunit.xml"]
+  skip_worktree: true
+  patches:
+    - { key: DB_TEST_DATABASE,    template: "kontainer_testing_{slug}" }
+    - { key: MONGO_DB_DATABASE,   template: "mongodb_testing_{slug}" }
+    - { key: ELASTICSEARCH_PREFIX, template: "kho_testing_{slug}" }
+    - { key: REDIS_QUEUE_DATABASE, template: "{slug_redis_queue}" }
+    - { key: REDIS_CACHE_DATABASE, template: "{slug_redis_cache}" }
+databases:
+  - engine: mysql
+    name_template: "kontainer_testing_{slug}"
+    dump: { path: "tests/_data/dump.sql" }
+    migrations: { framework: laravel, dir: "database/migrations" }
+    paratest: { clones: auto, name_template: "kontainer_testing_{slug}_test_{n}" }
+  - engine: mongodb
+    name_template: "mongodb_testing_{slug}"
+  - engine: redis
+    namespaces: { db_index_template: "{slug_redis_queue}" }
+  - engine: elasticsearch
+    namespaces: { index_prefix_template: "kho_testing_{slug}" }
+hooks:
+  postcreate:
+    - { run: "composer install --no-interaction" }
+    - { run: "yarn install --frozen-lockfile", background: true }
+  predelete: []
+watcher:
+  paths:
+    - { glob: "database/migrations/**", on: auto }
+  debounce_ms: 500
+
+# Optional: declare a custom migration framework
+frameworks:
+  kontainer_mongo:
+    markers: ["database/mongo_migrations/.marker"]
+    migration_dirs: ["database/mongo_migrations"]
+    file_pattern: "*.php"
+    hash_mode: filename       # | checksum
+    on_modify: rebuild        # | delta
+    engine_hint: mongodb
+```
+
+### Slug derivation
+
+- If the branch (or worktree basename) matches `[A-Z]+-\d+`, slug =
+  `<prefix>_<num>` lowercased (`KON-1234` → `kon_1234`). Stable across
+  renames.
+- Else slug = `wt_<blake3(canonical-path)[..8]>`. Stable across runs.
+
+Derived template vars: `{slug}`, `{slug_dash}` (underscores → hyphens for
+S3/minio buckets), `{slug_redis_queue}` and `{slug_redis_cache}`
+(deterministic indices 6..15, reproduce the bash `cksum` algorithm from
+the original gwt hooks), `{n}` (1-indexed paratest clone).
+
+---
+
+## Migration framework matrix
+
+| Framework | Markers | Migration dirs (single-app + monorepo) | Hash mode | On modify |
+|---|---|---|---|---|
+| Laravel | `artisan` | `database/migrations`, `app/Modules/*/Database/Migrations`, `Modules/*/Database/Migrations`, lowercase variants | filename | rebuild |
+| Rails | `bin/rails`, `Gemfile`, `config/database.yml` | `db/migrate`, `engines/*/db/migrate` | filename | rebuild |
+| Django | `manage.py` | `**/migrations` | filename | rebuild |
+| golang-migrate | `go.mod` | `**/migrations`, `services/*/migrations`, `cmd/*/migrations` | filename | rebuild |
+| sqlx-cli | `Cargo.toml`, `migrations` | `migrations`, `crates/*/migrations`, `services/*/migrations` | checksum | delta |
+| Diesel | `diesel.toml` | `migrations`, `crates/*/migrations` | filename | rebuild |
+| Prisma | `prisma/schema.prisma` | `prisma/migrations`, `apps/*/prisma/migrations`, `packages/*/prisma/migrations` | checksum | delta |
+| Knex | `knexfile.js` | `migrations`, `apps/*/migrations`, `packages/*/migrations` | filename | rebuild |
+| Alembic | `alembic.ini` | `**/versions` | filename | rebuild |
+| Flyway | `flyway.conf` | `**/db/migration` | checksum | rebuild |
+| TypeORM | `package.json` | `src/migrations`, `apps/*/src/migrations`, `packages/*/src/migrations` | filename | rebuild |
+| Drizzle | `drizzle.config.ts` | `drizzle`, `apps/*/drizzle`, `packages/*/drizzle` | checksum | delta |
+| Sequelize | `.sequelizerc` | `migrations`, `apps/*/migrations`, `packages/*/migrations` | filename | rebuild |
+| MikroORM | `mikro-orm.config.ts` | `src/migrations`, `apps/*/src/migrations`, `packages/*/src/migrations` | filename | rebuild |
+
+Hash mode + on-modify control watcher dispatch (see plan §7):
+
+- **Filename + rebuild** — frameworks that track migration names (not
+  content) in a `migrations` table. Any edit to an existing migration is
+  silently ignored by the framework, so treeman must wipe + reseed.
+- **Checksum + delta** — frameworks like sqlx-cli, Prisma, Drizzle that
+  record checksums. Renames of unmodified files are no-ops; edits force
+  rebuild; new files apply as delta.
+
+### Adding your own framework
+
+Drop a `frameworks:` block into `.treeman.yaml`. Same-name override
+replaces the built-in. No recompile.
+
+---
+
+## Watcher behavior
+
+Each detected framework runs in its own task. On every debounced event:
+
+1. Dynamically expand watch coverage. If a parent dir for a glob pattern
+   (e.g. `app/Modules/`, `engines/`, `apps/`) was just created, the
+   recursive watcher picks it up via re-resolve.
+2. Recompute hash inputs over the union of all matching dirs.
+3. Compare against the on-disk state in
+   `<repo>/.treeman/watch-state-<framework>.json`.
+4. Dispatch:
+
+| Event | Filename mode | Checksum mode |
+|---|---|---|
+| New file | `Delta(new_keys)` | `Delta(new_keys)` |
+| Content changed (same name) | `Rebuild` | `Rebuild` |
+| Rename only (same content) | `Rebuild` | `Noop` |
+| File deleted | `Rebuild` | `Rebuild` |
+| Lockfile changed | `Rebuild` | `Rebuild` |
+
+5. `Delta` and `Rebuild` both currently invoke `treeman_prepare::run`
+   (full prepare with cache-hit fast path). MySQL binlog-based delta
+   replay is M9 — scaffolded but the row-image → DML rewrite isn't yet
+   wired.
+
+Heavy directories are pruned from walks (`.git`, `node_modules`,
+`.pnpm-store`, `.yarn`, `vendor`, `target`, `build`, `dist`, `.venv`,
+`__pycache__`, `.gradle`, `.m2`, `.idea`, `.vscode`, `.next`, `.nuxt`,
+`tmp`, etc.).
+
+---
+
+## Architecture
+
+```
+┌──────────────┐  unix socket   ┌────────────────────────────────┐
+│   treeman    │ ─────────────► │           treemand             │
+│   (CLI)      │ JSON RPC       │ ┌────────────────────────────┐ │
+└──────────────┘                │ │ shared sqlx pools          │ │
+                                │ │ (mysql, pg, mongo, redis)  │ │
+                                │ └────────────────────────────┘ │
+                                │ ┌────────────────────────────┐ │
+                                │ │ per-repo watcher tasks     │ │
+                                │ │ (notify + debouncer-full)  │ │
+                                │ └────────────────────────────┘ │
+                                │ ┌────────────────────────────┐ │
+                                │ │ tracing → SQLite events    │ │
+                                │ └────────────────────────────┘ │
+                                └────────────────────────────────┘
+```
+
+Crates (cargo workspace):
+
+| Crate | Role |
+|---|---|
+| `treeman-proto` | IPC wire types (Request/Response enums) |
+| `treeman-core` | Config, slug, env patcher, hook runner |
+| `treeman-store` | SQLite schema, tracing layer, event queries |
+| `treeman-db` | DbDriver trait + mysql/pg/mongo/redis/es impls + dumpload + binlog scaffold |
+| `treeman-migrations` | Framework registry + 14 built-in detectors + migrate runner |
+| `treeman-watcher` | notify-debouncer-full per-framework watcher |
+| `treeman-snapshot` | SnapshotKey fingerprinting + cache catalog + paratest fanout |
+| `treeman-prepare` | The full prepare orchestrator |
+| `treeman-daemon` | `treemand` binary |
+| `treeman-cli` | `treeman` binary |
+
+---
+
+## Hacking
+
+Requires:
+
+- Rust 1.85+ (edition 2024). `rust-toolchain.toml` pins the channel.
+- `just` for the project commands (optional but recommended).
+- `nix` for the flake-based dev shell (optional).
+
+```sh
+just test         # cargo test --workspace
+just lint         # cargo clippy --all-targets --all-features -- -D warnings
+just fmt          # cargo fmt --all
+just build        # debug build
+just build-release
+```
+
+### Release
+
+`just` recipes bump version, refresh `Cargo.lock`, refresh `flake.lock`,
+commit, tag, push, and push the tag — which triggers the GitHub Actions
+release workflow.
+
+```sh
+just release-patch   # 0.0.1 → 0.0.2
+just release-minor   # 0.0.2 → 0.1.0
+just release-major   # 0.1.0 → 1.0.0
+```
+
+Each variant:
+
+1. `cargo set-version --workspace --bump {patch,minor,major}` (needs
+   `cargo-edit`).
+2. `cargo update -p treeman-cli` to refresh `Cargo.lock`.
+3. `nix flake update --commit-lock-file` (if `nix` is available).
+4. `git add -A && git commit -m "release vX.Y.Z"`.
+5. `git tag -a vX.Y.Z -m "vX.Y.Z"`.
+6. `git push && git push --tags`.
+
+### Nix dev shell
+
+```sh
+nix develop                  # drops into a shell with rustc/cargo/just/sqlx-cli
+nix build .#treeman          # builds the CLI binary
+nix build .#treemand         # builds the daemon binary
+nix run .#treeman -- status
+```
+
+---
+
+## Known gaps
+
+- **MySQL binlog DML replay** (M9) — scaffolded, not yet wired. Watcher's
+  `Delta` dispatch falls back to full `prepare` (correctness-preserving;
+  cache-hit makes it fast in the common case).
+- **Live integration tests** — no `testcontainers-rs` suite yet; unit
+  tests cover the pure-logic crates.
+
+---
+
+## License
+
+MIT OR Apache-2.0.
