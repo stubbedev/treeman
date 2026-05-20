@@ -321,16 +321,21 @@ pub struct WorktreesConfig {
     #[serde(default)]
     pub links: Vec<String>,
     /// When `true`, `treeman wt create` performs the fast steps
-    /// inline (git worktree add → symlinks → env scoping → store
+    /// inline (git worktree add, symlinks, env scoping, store
     /// register) and then RPCs the daemon to run the slow tail
-    /// (postcreate hooks + prepare = DB ensure, dump-load, framework
-    /// migrate, paratest clones) in the background. The caller
-    /// returns in <2s instead of blocking ~30s+ on composer install
-    /// + paratest replication. Progress is logged to the SQLite
-    /// event log; follow with `treeman logs tail -f`. Default `true`
-    /// because the responsive UX matters more than command-line
-    /// determinism for interactive `gwt`-style flows; pass
-    /// `treeman wt create --foreground` to override.
+    /// (postcreate hooks plus prepare: DB ensure, dump-load,
+    /// framework migrate, paratest clones) in the background.
+    ///
+    /// The caller returns in under two seconds instead of blocking
+    /// 30s+ on composer install and paratest replication. Progress
+    /// lands in the SQLite event log; follow with
+    /// `treeman logs tail -f`.
+    ///
+    /// Default `true` since the responsive UX matters more than
+    /// command-line determinism for interactive `gwt`-style flows.
+    /// Pass `--foreground` to `wt create` (or set this to `false`)
+    /// for CI / scripted runs where the exit code must reflect
+    /// whether DB scaffolding succeeded.
     #[serde(default = "default_true")]
     pub async_create: bool,
 }
