@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 treeman-proto = { workspace = true }
 treeman-core = { workspace = true }
+treeman-store = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yaml = "0.9"
 anyhow = { workspace = true }
 serde = { workspace = true }

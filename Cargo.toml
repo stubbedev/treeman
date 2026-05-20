@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/treeman-proto",
     "crates/treeman-core",
+    "crates/treeman-store",
     "crates/treeman-daemon",
     "crates/treeman-cli",
 ]
@@ -28,6 +29,7 @@ directories = "5"
 
 treeman-proto = { path = "crates/treeman-proto", version = "0.0.1" }
 treeman-core = { path = "crates/treeman-core", version = "0.0.1" }
+treeman-store = { path = "crates/treeman-store", version = "0.0.1" }
 
 [profile.release]
 lto = "thin"

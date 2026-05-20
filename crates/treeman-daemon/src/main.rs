@@ -1,8 +1,5 @@
 //! `treemand` — Treeman daemon. Listens on a unix socket and serves
 //! JSON-RPC requests from the `treeman` CLI.
-//!
-//! M0 only implements `status`. Subsequent milestones layer in
-//! `repo.register`, `worktree.register`, `hook.run`, `snapshot.*`, `logs.*`.
 
 mod socket;
 
@@ -19,13 +16,11 @@ const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    let db_path = treeman_store::default_db_path()?;
+    let pool = treeman_store::open(&db_path).await?;
+    treeman_store::init_subscriber(pool.clone())?;
+
+    info!(db = %db_path.display(), "treemand starting");
 
     let socket_path = socket::resolve_path()?;
     socket::clear_stale(&socket_path)?;
@@ -35,7 +30,6 @@ async fn main() -> Result<()> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let pid = std::process::id();
-
     let state = DaemonState { started_at_unix };
 
     let mut module = RpcModule::new(state);
@@ -49,34 +43,27 @@ async fn main() -> Result<()> {
         })
     })?;
 
-    // jsonrpsee 0.24 ships a stable HTTP/WS server but no first-class
-    // unix-socket transport; we accept the unix socket ourselves and bridge
-    // each connection via tower::Service. For M0 use the lightweight HTTP
-    // wire on a unix socket — the protocol is JSON-RPC either way and the
-    // CLI client only has to know how to send framed JSON.
-    //
-    // Approach: bind a localhost TCP server on an ephemeral port and have
-    // the CLI dial that; replace with a unix-socket+JSON-line transport
-    // in M1 once `socket::serve_jsonrpc` is implemented.
     let server = ServerBuilder::default()
         .build("127.0.0.1:0")
         .await?;
     let local_addr = server.local_addr()?;
 
-    // Write the address to a sidecar file alongside the socket path so the
-    // CLI can find it. M1 replaces this with a proper unix socket.
     let addr_path = socket_path.with_extension("addr");
     tokio::fs::write(&addr_path, local_addr.to_string()).await?;
-    info!(addr = %local_addr, addr_path = %addr_path.display(), "treemand listening");
+    info!(
+        event_type = "daemon_started",
+        addr = %local_addr,
+        pid = pid as i64,
+        "treemand listening"
+    );
 
     let handle: ServerHandle = server.start(module);
 
-    // Wait for SIGINT / SIGTERM, then shutdown cleanly.
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     tokio::select! {
-        _ = sigint.recv()  => info!("SIGINT, shutting down"),
-        _ = sigterm.recv() => info!("SIGTERM, shutting down"),
+        _ = sigint.recv()  => info!(event_type = "daemon_stopped", "SIGINT received"),
+        _ = sigterm.recv() => info!(event_type = "daemon_stopped", "SIGTERM received"),
     }
 
     if let Err(e) = tokio::fs::remove_file(&addr_path).await {
@@ -84,6 +71,8 @@ async fn main() -> Result<()> {
     }
     handle.stop()?;
     handle.stopped().await;
+    // Let the writer drain.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     Ok(())
 }
 

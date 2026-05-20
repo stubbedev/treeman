@@ -10,6 +10,7 @@ use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
 use treeman_proto::{SOCKET_BASENAME, SOCKET_ENV, StatusResponse};
+use treeman_store::query::{EventFilter, query_events, tail_events};
 
 #[derive(Parser, Debug)]
 #[command(name = "treeman", version, about = "Treeman CLI", long_about = None)]
@@ -30,6 +31,37 @@ enum Cmd {
     /// Emit the JSON Schema for `.treeman.yaml`.
     #[command(subcommand)]
     Schema(SchemaCmd),
+    /// Inspect the SQLite event log.
+    #[command(subcommand)]
+    Logs(LogsCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum LogsCmd {
+    /// Tail recent events (newest last). With `--follow`, poll for new
+    /// rows until interrupted.
+    Tail {
+        #[arg(short, long)]
+        follow: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        #[arg(long)]
+        level: Option<String>,
+        #[arg(long)]
+        event_type: Option<String>,
+        #[arg(long)]
+        worktree: Option<i64>,
+    },
+    /// Grep recent events.
+    Grep {
+        pattern: String,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+        #[arg(long)]
+        level: Option<String>,
+        #[arg(long)]
+        event_type: Option<String>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -75,7 +107,72 @@ async fn main() -> Result<()> {
         Cmd::Config(ConfigCmd::Validate { repo }) => config_validate(repo),
         Cmd::Config(ConfigCmd::Show { repo }) => config_show(repo),
         Cmd::Schema(SchemaCmd::Dump) => schema_dump(),
+        Cmd::Logs(LogsCmd::Tail { follow, limit, level, event_type, worktree }) => {
+            logs_tail(follow, limit, level, event_type, worktree).await
+        }
+        Cmd::Logs(LogsCmd::Grep { pattern, limit, level, event_type }) => {
+            logs_grep(pattern, limit, level, event_type).await
+        }
     }
+}
+
+async fn logs_tail(
+    follow: bool,
+    limit: i64,
+    level: Option<String>,
+    event_type: Option<String>,
+    worktree: Option<i64>,
+) -> Result<()> {
+    let db_path = treeman_store::default_db_path()?;
+    let pool = treeman_store::open(&db_path).await?;
+    let filter = EventFilter {
+        limit: Some(limit), level: level.clone(), event_type: event_type.clone(),
+        worktree_id: worktree, ..Default::default()
+    };
+    let mut rows = query_events(&pool, &filter).await?;
+    rows.reverse(); // newest last
+    let mut last_id = rows.iter().map(|r| r.id).max().unwrap_or(0);
+    for r in &rows { print_event(r); }
+    if !follow {
+        return Ok(());
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let next = tail_events(&pool, last_id).await?;
+        for r in &next {
+            if let Some(ref l) = level   { if &r.level != l { continue; } }
+            if let Some(ref t) = event_type { if &r.event_type != t { continue; } }
+            if let Some(w) = worktree { if r.worktree_id != Some(w) { continue; } }
+            print_event(r);
+            last_id = r.id;
+        }
+    }
+}
+
+async fn logs_grep(
+    pattern: String,
+    limit: i64,
+    level: Option<String>,
+    event_type: Option<String>,
+) -> Result<()> {
+    let db_path = treeman_store::default_db_path()?;
+    let pool = treeman_store::open(&db_path).await?;
+    let filter = EventFilter {
+        limit: Some(limit), level, event_type, grep: Some(pattern),
+        ..Default::default()
+    };
+    let mut rows = query_events(&pool, &filter).await?;
+    rows.reverse();
+    for r in &rows { print_event(r); }
+    Ok(())
+}
+
+fn print_event(r: &treeman_store::EventRow) {
+    let ts = chrono::DateTime::from_timestamp_millis(r.ts)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+        .unwrap_or_else(|| r.ts.to_string());
+    let msg = r.message.as_deref().unwrap_or("");
+    println!("{ts} {:5} {} {}", r.level.to_uppercase(), r.event_type, msg);
 }
 
 async fn status() -> Result<()> {
