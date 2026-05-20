@@ -138,7 +138,7 @@ async fn prepare_mysql(
     }
 
     let clones = if let Some(p) = paratest_spec {
-        do_fanout_mysql(driver, &template_name, p, slug).await?
+        do_fanout_mysql(driver, &template_name, p, slug, repo_root).await?
     } else { vec![] };
 
     Ok(PrepareOutcome {
@@ -200,7 +200,7 @@ async fn prepare_postgres(
     }
 
     let clones = if let Some(p) = paratest_spec {
-        do_fanout_pg(driver, &template_name, p, slug).await?
+        do_fanout_pg(driver, &template_name, p, slug, repo_root).await?
     } else { vec![] };
 
     Ok(PrepareOutcome {
@@ -282,11 +282,10 @@ async fn do_fanout_mysql(
     template_name: &str,
     p: &ParatestSpec,
     slug: &Slug,
+    repo_root: &Path,
 ) -> Result<Vec<String>> {
-    let n = match p.clones {
-        ClonesSetting::Auto => treeman_snapshot::auto_clones(),
-        ClonesSetting::Fixed(v) => v,
-    };
+    let n = resolve_clone_count(p, repo_root);
+    if n == 0 { return Ok(vec![]); }
     let plan = ParatestPlan {
         engine: ParatestEngine::Mysql,
         source_db: template_name.into(),
@@ -301,11 +300,10 @@ async fn do_fanout_pg(
     template_name: &str,
     p: &ParatestSpec,
     slug: &Slug,
+    repo_root: &Path,
 ) -> Result<Vec<String>> {
-    let n = match p.clones {
-        ClonesSetting::Auto => treeman_snapshot::auto_clones(),
-        ClonesSetting::Fixed(v) => v,
-    };
+    let n = resolve_clone_count(p, repo_root);
+    if n == 0 { return Ok(vec![]); }
     let plan = ParatestPlan {
         engine: ParatestEngine::Postgres,
         source_db: template_name.into(),
@@ -313,6 +311,20 @@ async fn do_fanout_pg(
         name_template: p.name_template.clone(),
     };
     postgres_fanout(driver, plan, &slug.value).await
+}
+
+/// Resolve N from config + auto-detected test framework.
+///
+/// `ClonesSetting::Fixed(n)` always wins. `Auto` consults
+/// `treeman_migrations::testfw::detected_clone_count`; if no test
+/// framework is detected, falls back to num_cpus (preserves prior
+/// behavior).
+fn resolve_clone_count(p: &ParatestSpec, repo_root: &Path) -> u32 {
+    match p.clones {
+        ClonesSetting::Fixed(v) => v,
+        ClonesSetting::Auto => treeman_migrations::testfw::detected_clone_count(repo_root)
+            .unwrap_or_else(treeman_snapshot::auto_clones),
+    }
 }
 
 fn blake3_hash_of_paths(paths: &[PathBuf]) -> Result<String> {

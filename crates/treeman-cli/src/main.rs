@@ -147,9 +147,7 @@ enum Cmd {
     /// Snapshot catalog operations.
     #[command(subcommand, visible_alias = "snap")]
     Snapshot(SnapshotCmd),
-    /// Paratest clone fan-out.
-    Paratest(ParatestArgs),
-    /// Full prepare: ensure → dump → migrate → snapshot → paratest.
+    /// Full prepare: ensure → dump → migrate → snapshot → replicate (DB clones for the detected test framework).
     Prepare(PrepareArgs),
     /// Daemon lifecycle.
     #[command(subcommand)]
@@ -169,14 +167,18 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum DaemonCmd {
-    /// Start the daemon if it isn't already running.
+    /// Start the daemon (via systemctl/launchctl if installed, else spawn directly).
     Start,
-    /// Send Shutdown to a running daemon.
+    /// Stop the daemon (via systemctl/launchctl if installed, else send Shutdown RPC).
     Stop,
+    /// Stop then start.
+    Restart,
     /// Same as `treeman status`.
     Status,
-    /// Drop a systemd user unit + enable+start it.
+    /// Install as a user service (systemd --user on Linux, LaunchAgent on macOS) and start it.
     Install,
+    /// Stop the service and remove the user-service unit/plist.
+    Uninstall,
 }
 
 #[derive(Subcommand, Debug)]
@@ -202,17 +204,6 @@ struct InitArgs {
 struct PrepareArgs {
     #[command(flatten)]
     worktree: WorktreeCommon,
-    #[command(flatten)]
-    repo: RepoCommon,
-}
-
-#[derive(clap::Args, Debug)]
-struct ParatestArgs {
-    #[command(flatten)]
-    worktree: WorktreeCommon,
-    /// Limit fan-out to a specific engine.
-    #[arg(short, long, value_enum)]
-    engine: Option<EngineArg>,
     #[command(flatten)]
     repo: RepoCommon,
 }
@@ -474,12 +465,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Snapshot(SnapshotCmd::Show { fingerprint }) => snapshot_show(fingerprint).await,
         Cmd::Snapshot(SnapshotCmd::Gc { keep_per_source, max_age_days, max_total_gb }) =>
             snapshot_gc(keep_per_source, max_age_days, max_total_gb).await,
-        Cmd::Paratest(args) => paratest(args).await,
         Cmd::Prepare(args) => prepare_cmd(args).await,
-        Cmd::Daemon(DaemonCmd::Start)   => daemon_start().await,
-        Cmd::Daemon(DaemonCmd::Stop)    => daemon_stop().await,
-        Cmd::Daemon(DaemonCmd::Status)  => status().await,
-        Cmd::Daemon(DaemonCmd::Install) => daemon_install(),
+        Cmd::Daemon(DaemonCmd::Start)     => daemon_start().await,
+        Cmd::Daemon(DaemonCmd::Stop)      => daemon_stop().await,
+        Cmd::Daemon(DaemonCmd::Restart)   => daemon_restart().await,
+        Cmd::Daemon(DaemonCmd::Status)    => status().await,
+        Cmd::Daemon(DaemonCmd::Install)   => daemon_install(),
+        Cmd::Daemon(DaemonCmd::Uninstall) => daemon_uninstall(),
         Cmd::Watcher(WatcherCmd::Start { common }) => watcher_start(common.repo).await,
         Cmd::Watcher(WatcherCmd::Stop  { common }) => watcher_stop(common.repo).await,
         Cmd::Watcher(WatcherCmd::List)             => watcher_list().await,
@@ -543,18 +535,156 @@ async fn daemon_start() -> Result<()> {
         println!("treemand already running");
         return Ok(());
     }
+    if service_installed() {
+        return service_start();
+    }
+    spawn_treemand_detached().await
+}
+
+async fn daemon_stop() -> Result<()> {
+    if service_installed() {
+        return service_stop();
+    }
+    match client::call(Request::Shutdown).await {
+        Ok(Response::Ok) => { println!("shutdown sent"); Ok(()) }
+        Ok(other) => bail!("unexpected response: {:?}", other),
+        Err(e) => bail!("could not reach daemon: {e}"),
+    }
+}
+
+async fn daemon_restart() -> Result<()> {
+    // Best-effort stop; ignore failure when the daemon isn't running.
+    let _ = daemon_stop().await;
+    // Wait briefly for the socket to free up before starting again.
+    for _ in 0..20 {
+        if client::call(Request::Ping).await.is_err() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    daemon_start().await
+}
+
+fn daemon_install() -> Result<()> {
     let exe = std::env::current_exe()?;
     let daemon_bin = exe.parent().context("exe parent")?.join("treemand");
     if !daemon_bin.is_file() {
         bail!("treemand binary not found next to treeman at {}", daemon_bin.display());
     }
-    std::process::Command::new("setsid")
-        .arg(&daemon_bin)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawn treemand via setsid")?;
+    if cfg!(target_os = "macos") {
+        install_launchd(&daemon_bin)
+    } else if cfg!(target_os = "linux") {
+        install_systemd(&daemon_bin)
+    } else {
+        bail!("daemon install is only implemented on Linux (systemd) and macOS (launchd)");
+    }
+}
+
+fn daemon_uninstall() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        uninstall_launchd()
+    } else if cfg!(target_os = "linux") {
+        uninstall_systemd()
+    } else {
+        bail!("daemon uninstall is only implemented on Linux (systemd) and macOS (launchd)");
+    }
+}
+
+// ───────────────────────── service helpers ─────────────────────────
+
+fn home() -> Result<PathBuf> { Ok(PathBuf::from(std::env::var("HOME")?)) }
+
+fn systemd_unit_path() -> Result<PathBuf> {
+    Ok(home()?.join(".config/systemd/user/treemand.service"))
+}
+
+fn launchd_plist_path() -> Result<PathBuf> {
+    Ok(home()?.join("Library/LaunchAgents/com.treeman.daemon.plist"))
+}
+
+fn launchd_label() -> &'static str { "com.treeman.daemon" }
+
+fn service_installed() -> bool {
+    if cfg!(target_os = "macos") {
+        launchd_plist_path().map(|p| p.is_file()).unwrap_or(false)
+    } else if cfg!(target_os = "linux") {
+        systemd_unit_path().map(|p| p.is_file()).unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+fn service_start() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let plist = launchd_plist_path()?;
+        let uid = unsafe { libc::geteuid() }.to_string();
+        // `launchctl bootstrap` loads + starts the service; idempotent
+        // re-bootstrap fails, so try kickstart -k as fallback.
+        let s = std::process::Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{uid}")])
+            .arg(&plist)
+            .status();
+        if !s.map(|s| s.success()).unwrap_or(false) {
+            let _ = std::process::Command::new("launchctl")
+                .args(["kickstart", "-k", &format!("gui/{uid}/{}", launchd_label())])
+                .status();
+        }
+        println!("treemand started via launchd ({})", launchd_label());
+        Ok(())
+    } else {
+        let s = std::process::Command::new("systemctl")
+            .args(["--user", "start", "treemand.service"])
+            .status()
+            .context("systemctl --user start")?;
+        if !s.success() { bail!("systemctl --user start treemand.service failed"); }
+        println!("treemand started via systemd --user");
+        Ok(())
+    }
+}
+
+fn service_stop() -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let plist = launchd_plist_path()?;
+        let uid = unsafe { libc::geteuid() }.to_string();
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}")])
+            .arg(&plist)
+            .status();
+        println!("treemand stopped via launchd");
+        Ok(())
+    } else {
+        let s = std::process::Command::new("systemctl")
+            .args(["--user", "stop", "treemand.service"])
+            .status()
+            .context("systemctl --user stop")?;
+        if !s.success() { bail!("systemctl --user stop treemand.service failed"); }
+        println!("treemand stopped via systemd --user");
+        Ok(())
+    }
+}
+
+async fn spawn_treemand_detached() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let daemon_bin = exe.parent().context("exe parent")?.join("treemand");
+    if !daemon_bin.is_file() {
+        bail!("treemand binary not found next to treeman at {}", daemon_bin.display());
+    }
+    // setsid on Linux; nohup on macOS (setsid is not on the default PATH).
+    if cfg!(target_os = "macos") {
+        std::process::Command::new("nohup")
+            .arg(&daemon_bin)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("spawn treemand via nohup")?;
+    } else {
+        std::process::Command::new("setsid")
+            .arg(&daemon_bin)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("spawn treemand via setsid")?;
+    }
     for _ in 0..50 {
         if let Ok(Response::Pong) = client::call(Request::Ping).await {
             println!("{} treemand started", paint("ok", Style::new().green().bold()));
@@ -565,20 +695,11 @@ async fn daemon_start() -> Result<()> {
     bail!("treemand failed to come up within 5s");
 }
 
-async fn daemon_stop() -> Result<()> {
-    match client::call(Request::Shutdown).await {
-        Ok(Response::Ok) => { println!("shutdown sent"); Ok(()) }
-        Ok(other) => bail!("unexpected response: {:?}", other),
-        Err(e) => bail!("could not reach daemon: {e}"),
+fn install_systemd(daemon_bin: &Path) -> Result<()> {
+    let unit_path = systemd_unit_path()?;
+    if let Some(parent) = unit_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-}
-
-fn daemon_install() -> Result<()> {
-    let unit_dir = std::path::PathBuf::from(std::env::var("HOME")?).join(".config/systemd/user");
-    std::fs::create_dir_all(&unit_dir)?;
-    let unit_path = unit_dir.join("treemand.service");
-    let exe = std::env::current_exe()?;
-    let daemon_bin = exe.parent().context("exe parent")?.join("treemand");
     let unit = format!(
 r#"[Unit]
 Description=Treeman per-worktree DB orchestrator daemon
@@ -596,9 +717,108 @@ WantedBy=default.target
     std::fs::write(&unit_path, unit)
         .with_context(|| format!("write {}", unit_path.display()))?;
     println!("wrote {}", unit_path.display());
-    let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
-    let _ = std::process::Command::new("systemctl").args(["--user", "enable", "--now", "treemand.service"]).status();
-    println!("(systemctl --user daemon-reload + enable --now invoked; check `systemctl --user status treemand`)");
+    run_systemctl(&["--user", "daemon-reload"])?;
+    run_systemctl(&["--user", "enable", "--now", "treemand.service"])?;
+    println!("treemand enabled + started (systemd --user). Check: `systemctl --user status treemand`");
+    Ok(())
+}
+
+fn uninstall_systemd() -> Result<()> {
+    let unit_path = systemd_unit_path()?;
+    let existed = unit_path.is_file();
+    // Stop + disable; ignore failures (unit may already be gone).
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "disable", "--now", "treemand.service"])
+        .status();
+    if existed {
+        std::fs::remove_file(&unit_path)
+            .with_context(|| format!("remove {}", unit_path.display()))?;
+        println!("removed {}", unit_path.display());
+    }
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+    if !existed {
+        println!("no systemd user unit at {}", unit_path.display());
+    }
+    Ok(())
+}
+
+fn run_systemctl(args: &[&str]) -> Result<()> {
+    let s = std::process::Command::new("systemctl").args(args).status()
+        .context("invoke systemctl")?;
+    if !s.success() { bail!("systemctl {args:?} failed"); }
+    Ok(())
+}
+
+fn install_launchd(daemon_bin: &Path) -> Result<()> {
+    let plist_path = launchd_plist_path()?;
+    if let Some(parent) = plist_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let label = launchd_label();
+    let log_dir = home()?.join("Library/Logs/treeman");
+    std::fs::create_dir_all(&log_dir)?;
+    let plist = format!(
+r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{daemon}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{log}/treemand.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>{log}/treemand.err.log</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"#, daemon = daemon_bin.display(), log = log_dir.display());
+    std::fs::write(&plist_path, plist)
+        .with_context(|| format!("write {}", plist_path.display()))?;
+    println!("wrote {}", plist_path.display());
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let domain = format!("gui/{uid}");
+    // bootstrap = load + run; if already loaded, kickstart -k restarts it.
+    let s = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain])
+        .arg(&plist_path)
+        .status()
+        .context("invoke launchctl bootstrap")?;
+    if !s.success() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &format!("{domain}/{label}")])
+            .status();
+    }
+    println!("treemand loaded into launchd ({label}). Logs: {}", log_dir.display());
+    Ok(())
+}
+
+fn uninstall_launchd() -> Result<()> {
+    let plist_path = launchd_plist_path()?;
+    let existed = plist_path.is_file();
+    let uid = unsafe { libc::geteuid() }.to_string();
+    let domain = format!("gui/{uid}");
+    if existed {
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &domain])
+            .arg(&plist_path)
+            .status();
+        std::fs::remove_file(&plist_path)
+            .with_context(|| format!("remove {}", plist_path.display()))?;
+        println!("removed {}", plist_path.display());
+    } else {
+        println!("no LaunchAgent at {}", plist_path.display());
+    }
     Ok(())
 }
 
@@ -967,24 +1187,49 @@ async fn frameworks_detect(repo: Option<PathBuf>) -> Result<()> {
     };
     let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
     let registry = treeman_migrations::Registry::with_builtins().merge_yaml(&cfg.frameworks);
-    let detected = registry.detect_all(&repo_root);
-    if detected.is_empty() {
-        println!("(no frameworks detected in {})", repo_root.display());
-        return Ok(());
+
+    // Migration frameworks
+    let mig = registry.detect_all(&repo_root);
+    if mig.is_empty() {
+        println!("migration frameworks: (none detected)");
+    } else {
+        let hdr = paint(
+            &format!("{:<18} {:<14} {:<10} {}", "MIGRATION_FW", "HASH_MODE", "ON_MODIFY", "DIRS"),
+            Style::new().bold(),
+        );
+        println!("{hdr}");
+        for s in mig {
+            let dirs: Vec<_> = s.migration_dirs(&repo_root).iter()
+                .map(|p| p.strip_prefix(&repo_root).unwrap_or(p).display().to_string())
+                .collect();
+            println!("{:<18} {:<14} {:<10} {}",
+                s.name, format!("{:?}", s.hash_mode).to_lowercase(),
+                format!("{:?}", s.on_modify).to_lowercase(),
+                dirs.join(", "));
+        }
     }
-    let hdr = paint(
-        &format!("{:<18} {:<14} {:<10} {}", "FRAMEWORK", "HASH_MODE", "ON_MODIFY", "DIRS"),
-        Style::new().bold(),
-    );
-    println!("{hdr}");
-    for s in detected {
-        let dirs: Vec<_> = s.migration_dirs(&repo_root).iter()
-            .map(|p| p.strip_prefix(&repo_root).unwrap_or(p).display().to_string())
-            .collect();
-        println!("{:<18} {:<14} {:<10} {}",
-            s.name, format!("{:?}", s.hash_mode).to_lowercase(),
-            format!("{:?}", s.on_modify).to_lowercase(),
-            dirs.join(", "));
+    println!();
+
+    // Test frameworks
+    let tfw = treeman_migrations::testfw::detect_all(&repo_root);
+    if tfw.is_empty() {
+        println!("test frameworks: (none detected)");
+    } else {
+        let hdr = paint(
+            &format!("{:<22} {:<10} {:<14} {:<10} {}", "TEST_FW", "LANGUAGE", "STRATEGY", "WORKER_IDX", "WORKER_ENV"),
+            Style::new().bold(),
+        );
+        println!("{hdr}");
+        for t in tfw {
+            let strategy = format!("{:?}", t.clone_strategy).to_lowercase();
+            let idx = format!("{:?}", t.worker_index).to_lowercase();
+            let env = t.worker_env.unwrap_or_else(|| "-".into());
+            println!("{:<22} {:<10} {:<14} {:<10} {}", t.name, t.language, strategy, idx, env);
+        }
+        if let Some(n) = treeman_migrations::testfw::detected_clone_count(&repo_root) {
+            println!();
+            println!("auto-clones (replication target): {n}");
+        }
     }
     Ok(())
 }
@@ -1110,73 +1355,7 @@ async fn snapshot_gc(keep: u32, max_age_days: u32, max_total_gb: u32) -> Result<
     Ok(())
 }
 
-// ───────────────────────── paratest / prepare ─────────────────────────
-
-async fn paratest(args: ParatestArgs) -> Result<()> {
-    use std::sync::Arc;
-    use treeman_core::config::{ClonesSetting, DatabaseConfig as DB};
-    use treeman_core::template::{TemplateContext, render};
-
-    let wt_path = match args.worktree.worktree {
-        Some(p) => p.canonicalize()?,
-        None => std::env::current_dir()?,
-    };
-    let repo_root = match args.repo.repo {
-        Some(r) => r.canonicalize()?,
-        None => discover_repo_root(&wt_path).context("no repo root")?,
-    };
-    let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
-    let branch = detect_branch(&wt_path);
-    let slug = treeman_core::slug_for(&wt_path, branch.as_deref());
-    let ctx = TemplateContext::from_slug(&slug);
-
-    let engine_filter = args.engine.map(|e| e.as_str());
-    for d in &cfg.databases {
-        let (engine_name, source_db, paratest_spec) = match d {
-            DB::Mysql { name_template, paratest, .. } =>
-                ("mysql", render(name_template, &ctx)?, paratest.as_ref()),
-            DB::Postgres { name_template, paratest, .. } =>
-                ("postgres", render(name_template, &ctx)?, paratest.as_ref()),
-            _ => continue,
-        };
-        if let Some(filter) = engine_filter {
-            if filter != engine_name { continue; }
-        }
-        let Some(spec) = paratest_spec else {
-            println!("[{engine_name}] no paratest spec; skipping");
-            continue;
-        };
-        let clones = match spec.clones {
-            ClonesSetting::Auto => treeman_snapshot::auto_clones(),
-            ClonesSetting::Fixed(n) => n,
-        };
-        let plan = treeman_snapshot::ParatestPlan {
-            engine: match engine_name {
-                "mysql" => treeman_snapshot::ParatestEngine::Mysql,
-                "postgres" => treeman_snapshot::ParatestEngine::Postgres,
-                _ => continue,
-            },
-            source_db: source_db.clone(),
-            clones,
-            name_template: spec.name_template.clone(),
-        };
-        println!("[{engine_name}] cloning {} → {} parallel test DBs", source_db, clones);
-        let names = match plan.engine {
-            treeman_snapshot::ParatestEngine::Mysql => {
-                let mc = cfg.connections.mysql.clone().context("connections.mysql missing")?;
-                let drv = Arc::new(treeman_db::mysql::MysqlDriver::connect(&mc).await?);
-                treeman_snapshot::mysql_fanout(drv, plan, &slug.value).await?
-            }
-            treeman_snapshot::ParatestEngine::Postgres => {
-                let pc = cfg.connections.postgres.clone().context("connections.postgres missing")?;
-                let drv = Arc::new(treeman_db::postgres::PostgresDriver::connect(&pc).await?);
-                treeman_snapshot::postgres_fanout(drv, plan, &slug.value).await?
-            }
-        };
-        for n in names { println!("  → {n}"); }
-    }
-    Ok(())
-}
+// ───────────────────────── prepare ─────────────────────────
 
 async fn prepare_cmd(args: PrepareArgs) -> Result<()> {
     let wt_path = match args.worktree.worktree {

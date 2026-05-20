@@ -3710,6 +3710,7 @@ dependencies = [
  "clap_mangen",
  "directories",
  "is-terminal",
+ "libc",
  "owo-colors",
  "serde",
  "serde_json",

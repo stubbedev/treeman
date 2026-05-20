@@ -6,6 +6,7 @@
 //! logic in `treeman-watcher`.
 
 pub mod runner;
+pub mod testfw;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

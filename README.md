@@ -1,7 +1,6 @@
 # treeman
 
-**Per-worktree DB orchestrator with file watcher.** Generic Rust replacement
-for hand-rolled `gwt`/`build_helper` style shell hooks: spin up scoped test
+**Per-worktree DB orchestrator with file watcher.** Spin up scoped test
 databases per git worktree, tear them down on delete, keep them in sync as
 migrations change.
 
@@ -18,13 +17,21 @@ Single global daemon, thin CLI client, SQLite-backed event log.
 - **14 migration frameworks auto-detected** — Laravel (incl. nwidart-style
   modules), Rails (incl. engines), Django, golang-migrate, sqlx-cli, Diesel,
   Prisma, Knex, Alembic, Flyway, TypeORM, Drizzle, Sequelize, MikroORM.
+- **Test framework auto-detected** — paratest, pest, pytest-xdist,
+  pytest-parallel, parallel_tests, jest, vitest, playwright,
+  mocha-parallel-tests, cargo-nextest, Maven Surefire, Gradle, plus the
+  shared-DB defaults (phpunit, plain pytest, rspec, mocha, cargo test,
+  go test, dotnet test). Replication count (per-worker vs shared) is
+  derived from detection — no explicit subcommand.
 - **Multi-module / monorepo aware** — modules created mid-watch are picked
   up without restart (dynamic re-watch).
 - **Snapshot/template cache** — first `prepare` builds; subsequent worktrees
   for the same migration set restore in seconds. Postgres uses native
   `CREATE DATABASE … TEMPLATE`; MySQL uses cross-DB `INSERT … SELECT`.
-- **Paratest fan-out** — clone the template into N parallel test DBs so
-  `php artisan test --parallel` / `pytest -n auto` / etc. just work.
+- **Replication fan-out** — clones the template into N per-worker test
+  DBs (count auto-derived from the detected test framework) so
+  `php artisan test --parallel` / `pytest -n auto` / `jest` / etc.
+  just work.
 - **Declarative YAML config** — global `~/.config/treeman/config.yaml` +
   per-repo `.treeman.yaml` (JSON-schema validated; emit the schema with
   `treeman schema dump`).
@@ -69,15 +76,15 @@ cd ~/code/my-laravel-app
 treeman init               # writes .treeman.yaml from detected framework
 
 # 2. Ensure the daemon is running.
-treeman daemon install     # drops a systemd --user unit and enables it
+treeman daemon install     # systemd --user (Linux) or LaunchAgent (macOS)
 # … or for a one-shot session:
-treeman daemon start
+treeman daemon start       # service if installed, else spawn detached
 
 # 3. Create a worktree end-to-end.
-treeman wt create KON-1234
-#   ↳ git worktree add ../my-laravel-app-worktrees/KON-1234 -b KON-1234 main
+treeman wt create PROJ-123
+#   ↳ git worktree add ../my-laravel-app-worktrees/PROJ-123 -b PROJ-123 main
 #   ↳ symlinks .env, .env.testing, justfile, etc.
-#   ↳ patches .env.testing's DB_DATABASE to my-laravel-app_testing_kon_1234
+#   ↳ patches .env.testing's DB_DATABASE to my-laravel-app_testing_proj_123
 #   ↳ runs postcreate hooks
 #   ↳ prepare: ensure_db → load dump → migrate → snapshot → N paratest clones
 
@@ -89,7 +96,7 @@ treeman watcher start
 #    fingerprint so repeats are fast).
 
 # 6. Done with the ticket.
-treeman wt delete KON-1234
+treeman wt delete PROJ-123
 #   ↳ predelete hook
 #   ↳ drops scoped mysql DBs + mongo DBs + flushes scoped redis db indices
 #     + deletes elasticsearch index prefix
@@ -105,16 +112,15 @@ Run `treeman --help` for the full tree. Highlights:
 | Command | What it does |
 |---|---|
 | `treeman init` | Generate `.treeman.yaml` from detected framework |
-| `treeman daemon {start,stop,status,install}` | Daemon lifecycle |
+| `treeman daemon {start,stop,restart,status,install,uninstall}` | Daemon lifecycle (systemd --user on Linux, launchd LaunchAgent on macOS) |
 | `treeman wt {create,delete,list,register,unregister}` | Worktree lifecycle |
 | `treeman watcher {start,stop,list}` | Daemon-managed file watcher |
 | `treeman watch` | Foreground CLI watcher (debugging) |
 | `treeman hook run <phase>` | Run a configured hook phase |
-| `treeman prepare` | ensure → dump → migrate → snapshot → paratest |
-| `treeman paratest` | Paratest fan-out (no preceding migrate) |
+| `treeman prepare` | ensure → dump → migrate → snapshot → replicate |
 | `treeman snapshot {list,show,gc}` | Snapshot cache management |
 | `treeman db {drop,flush,list}` | Direct DB driver ops |
-| `treeman fw detect` | Show detected migration frameworks |
+| `treeman fw detect` | Show detected migration + test frameworks |
 | `treeman logs {tail,grep}` | Query the SQLite event log |
 | `treeman slug [path]` | Print the slug derived from a worktree path |
 | `treeman config {validate,show}` | Config helpers |
@@ -159,7 +165,7 @@ snapshots:
 
 # Per-repo (.treeman.yaml)
 repo:
-  name: kontainer
+  name: myapp
 slug:
   ticket_regex: "^([A-Z]+)-(\\d+)"
   fallback: "wt_{shorthash8}"
@@ -173,23 +179,27 @@ env_scoping:
   files: [".env.testing", "phpunit.xml"]
   skip_worktree: true
   patches:
-    - { key: DB_TEST_DATABASE,    template: "kontainer_testing_{slug}" }
+    - { key: DB_TEST_DATABASE,    template: "myapp_testing_{slug}" }
     - { key: MONGO_DB_DATABASE,   template: "mongodb_testing_{slug}" }
-    - { key: ELASTICSEARCH_PREFIX, template: "kho_testing_{slug}" }
+    - { key: ELASTICSEARCH_PREFIX, template: "search_testing_{slug}" }
     - { key: REDIS_QUEUE_DATABASE, template: "{slug_redis_queue}" }
     - { key: REDIS_CACHE_DATABASE, template: "{slug_redis_cache}" }
 databases:
   - engine: mysql
-    name_template: "kontainer_testing_{slug}"
+    name_template: "myapp_testing_{slug}"
     dump: { path: "tests/_data/dump.sql" }
     migrations: { framework: laravel, dir: "database/migrations" }
-    paratest: { clones: auto, name_template: "kontainer_testing_{slug}_test_{n}" }
+    # `clones: auto` consults the detected test framework: per-worker
+    # frameworks (paratest, pytest-xdist, jest, …) get num_cpus clones;
+    # shared-DB frameworks (plain pytest, mocha, go test, …) get one.
+    # Pin an explicit number with `clones: 8` to override detection.
+    paratest: { clones: auto, name_template: "myapp_testing_{slug}_test_{n}" }
   - engine: mongodb
     name_template: "mongodb_testing_{slug}"
   - engine: redis
     namespaces: { db_index_template: "{slug_redis_queue}" }
   - engine: elasticsearch
-    namespaces: { index_prefix_template: "kho_testing_{slug}" }
+    namespaces: { index_prefix_template: "search_testing_{slug}" }
 hooks:
   postcreate:
     - { run: "composer install --no-interaction" }
@@ -202,7 +212,7 @@ watcher:
 
 # Optional: declare a custom migration framework
 frameworks:
-  kontainer_mongo:
+  app_mongo:
     markers: ["database/mongo_migrations/.marker"]
     migration_dirs: ["database/mongo_migrations"]
     file_pattern: "*.php"
@@ -214,14 +224,13 @@ frameworks:
 ### Slug derivation
 
 - If the branch (or worktree basename) matches `[A-Z]+-\d+`, slug =
-  `<prefix>_<num>` lowercased (`KON-1234` → `kon_1234`). Stable across
+  `<prefix>_<num>` lowercased (`PROJ-123` → `proj_123`). Stable across
   renames.
 - Else slug = `wt_<blake3(canonical-path)[..8]>`. Stable across runs.
 
 Derived template vars: `{slug}`, `{slug_dash}` (underscores → hyphens for
 S3/minio buckets), `{slug_redis_queue}` and `{slug_redis_cache}`
-(deterministic indices 6..15, reproduce the bash `cksum` algorithm from
-the original gwt hooks), `{n}` (1-indexed paratest clone).
+(deterministic indices 6..15), `{n}` (1-indexed paratest clone).
 
 ---
 
@@ -257,6 +266,66 @@ Hash mode + on-modify control watcher dispatch (see plan §7):
 
 Drop a `frameworks:` block into `.treeman.yaml`. Same-name override
 replaces the built-in. No recompile.
+
+---
+
+## Test framework matrix
+
+`treeman` detects the test runner used by your repo and uses it to pick
+the replication strategy (one DB clone per worker, or a single shared
+DB). Detection runs on every `prepare` / watcher rebuild; no config
+needed.
+
+| Test framework | Marker | Strategy | Worker index | Worker env |
+|---|---|---|---|---|
+| paratest (PHP) | `composer.json` has `brianium/paratest` | per-worker | 1-based | `TEST_TOKEN` |
+| pest (PHP) | `composer.json` has `pestphp/pest` | per-worker | 1-based | `TEST_TOKEN` |
+| phpunit (PHP) | `composer.json` has `phpunit/phpunit` (no paratest) | shared | — | — |
+| pytest-xdist | `pytest-xdist` in Python deps | per-worker | `gw0`, `gw1`, … | `PYTEST_XDIST_WORKER` |
+| pytest-parallel | `pytest-parallel` in Python deps | per-worker | `gw0`, `gw1`, … | `PYTEST_XDIST_WORKER` |
+| pytest (plain) | `pytest` in Python deps (no xdist) | shared | — | — |
+| parallel_tests (Ruby) | `Gemfile` has `parallel_tests` | per-worker | 1-based | `TEST_ENV_NUMBER` |
+| rspec / minitest | `Gemfile` has `rspec`/`minitest` (no parallel_tests) | shared | — | — |
+| jest | `package.json` has `jest` | per-worker | 1-based | `JEST_WORKER_ID` |
+| vitest | `package.json` has `vitest` | per-worker | 1-based | `VITEST_POOL_ID` |
+| playwright | `package.json` has `@playwright/test` | per-worker | 0-based | `TEST_PARALLEL_INDEX` |
+| mocha-parallel-tests | `package.json` has `mocha-parallel-tests` | per-worker | 1-based | `MOCHA_PARALLEL_INDEX` |
+| mocha (plain) | `package.json` has `mocha` (no parallel) | shared | — | — |
+| cargo-nextest | `.config/nextest.toml` or `nextest` in `Cargo.toml` | per-worker | 0-based | `NEXTEST_TEST_GLOBAL_SLOT` |
+| cargo test | `Cargo.toml` (no nextest) | shared | — | — |
+| go test | `go.mod` | shared | — | — |
+| Maven Surefire | `pom.xml` | per-worker | 1-based | `SUREFIRE_FORK_NUMBER` |
+| Gradle | `build.gradle{,.kts}` | per-worker | 1-based | `GRADLE_TEST_WORKER` |
+| dotnet test | `*.csproj`/`*.fsproj`/`*.sln` | shared | — | — |
+
+Run `treeman fw detect` to see what was matched in the current repo,
+including the suggested clone count.
+
+---
+
+## Daemon lifecycle
+
+`treeman daemon` manages the `treemand` process across Linux and macOS:
+
+| OS | Service backend | Install location |
+|---|---|---|
+| Linux | systemd `--user` | `~/.config/systemd/user/treemand.service` |
+| macOS | launchd LaunchAgent | `~/Library/LaunchAgents/com.treeman.daemon.plist` |
+
+```sh
+treeman daemon install      # writes the unit/plist and starts it
+treeman daemon start        # systemctl/launchctl if installed, else spawn detached
+treeman daemon stop         # service-aware
+treeman daemon restart      # stop + start
+treeman daemon uninstall    # stop, remove unit/plist, reload
+treeman daemon status       # version, pid, started_at, watcher count
+```
+
+`start`/`stop` are service-aware: when the user-service unit/plist
+exists, `start` invokes `systemctl --user start` (or
+`launchctl bootstrap`); when not installed, it spawns `treemand`
+detached with `setsid` (Linux) / `nohup` (macOS). `uninstall` is
+idempotent — safe to call when nothing is installed.
 
 ---
 
