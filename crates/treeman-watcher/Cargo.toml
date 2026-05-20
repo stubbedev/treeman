@@ -16,4 +16,4 @@ tracing = { workspace = true }
 notify = "6"
 notify-debouncer-full = "0.3"
 treeman-core = { workspace = true }
-treeman-migrations = { path = "../treeman-migrations", version = "0.0.6" }
+treeman-migrations = { path = "../treeman-migrations", version = "0.0.7" }
