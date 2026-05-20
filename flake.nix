@@ -27,11 +27,22 @@
         # Single source of truth — bumped by `cargo set-version` in release recipes.
         cargoVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-        # Sqlx 0.8 in offline mode needs nothing; in online mode (queries
-        # validated at compile against a real DB) it'd need DATABASE_URL.
-        # treeman doesn't use the sqlx::query! macro, so plain
-        # cleanCargoSource is enough.
-        src = craneLib.cleanCargoSource ./.;
+        # `cleanCargoSource` keeps only files crane recognises (.rs,
+        # Cargo.toml, etc.). The treeman-store crate embeds its SQLite
+        # schema via `sqlx::migrate!("./migrations")` at compile time;
+        # without including `.sql` files in the source tree, the nix-
+        # built binary ships with an empty migrations vector and the
+        # daemon creates the database file without any schema.
+        # Override the filter so `migrations/*.sql` is kept.
+        srcRoot = ./.;
+        src = pkgs.lib.cleanSourceWith {
+          src = srcRoot;
+          filter = path: type:
+            let baseName = baseNameOf path; in
+            (pkgs.lib.hasSuffix ".sql" baseName)
+            || (craneLib.filterCargoSources path type);
+          name = "treeman-source";
+        };
 
         commonArgs = {
           inherit src;
