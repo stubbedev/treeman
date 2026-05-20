@@ -41,9 +41,23 @@ Single global daemon, thin CLI client, SQLite-backed event log.
   derived from detection — no explicit subcommand.
 - **Multi-module / monorepo aware** — modules created mid-watch are picked
   up without restart (dynamic re-watch).
+- **Per-worktree fan-out** — the daemon watches `.git/worktrees/` itself, so
+  every linked worktree (existing, newly added, moved, pruned, or created
+  outside treeman) gets its own framework watcher with its own slug. No
+  polling, no CLI ↔ daemon coupling, sub-second latency.
+- **Survives daemon restarts** — `treemand` auto-resumes watchers for
+  every registered repo at boot. `systemctl restart treemand` regains
+  coverage with zero manual `treeman watcher start` calls.
+- **Config hot-reload** — edits to `.treeman.yaml`,
+  `.treeman.local.yaml`, or `~/.config/treeman/config.yaml` trigger the
+  daemon to restart that repo's watcher with the fresh config.
 - **Snapshot/template cache** — first `prepare` builds; subsequent worktrees
   for the same migration set restore in seconds. Postgres uses native
   `CREATE DATABASE … TEMPLATE`; MySQL uses cross-DB `INSERT … SELECT`.
+- **Snapshot GC** — daemon periodically evicts unused templates per
+  `snapshots.retention.*` policy (`keep_per_source`, `max_age_days`,
+  `max_total_gb`) and DROPs them from the engine. Cadence configurable
+  via `gc_interval_minutes`.
 - **Replication fan-out** — clones the template into N per-worker test
   DBs (count auto-derived from the detected test framework) so
   `php artisan test --parallel` / `pytest -n auto` / `jest` / etc.
@@ -130,7 +144,7 @@ Run `treeman --help` for the full tree. Highlights:
 | `treeman init` | Generate `.treeman.yaml` from detected framework |
 | `treeman daemon {start,stop,restart,status,install,uninstall}` | Daemon lifecycle (systemd --user on Linux, launchd LaunchAgent on macOS) |
 | `treeman wt {create,delete,list,register,unregister}` | Worktree lifecycle |
-| `treeman watcher {start,stop,list}` | Daemon-managed file watcher |
+| `treeman watcher {start,stop,list,worktrees}` | Daemon-managed file watcher (`list` shows repos + worktree counts, `worktrees <repo>` lists the linked worktrees being watched) |
 | `treeman watch` | Foreground CLI watcher (debugging) |
 | `treeman hook run <phase>` | Run a configured hook phase |
 | `treeman prepare` | ensure → dump → migrate → snapshot → replicate |
@@ -177,7 +191,11 @@ connections:
   elasticsearch: { url: http://localhost:9200 }
 snapshots:
   cache_dir: ~/.cache/treeman/snapshots
-  retention: { keep_per_source: 5, max_age_days: 30, max_total_gb: 50 }
+  retention:
+    keep_per_source: 500       # most-recent N templates per (engine, source_db)
+    max_age_days: 30           # drop templates idle longer than this
+    max_total_gb: 50           # cap total catalog-tracked size
+    gc_interval_minutes: 60    # daemon GC cadence (floor-clamped to 5)
 
 # Per-repo (.treeman.yaml)
 repo:
@@ -186,7 +204,12 @@ slug:
   ticket_regex: "^([A-Z]+)-(\\d+)"
   fallback: "wt_{shorthash8}"
 worktrees:
-  root: ../worktrees
+  # Relative paths resolve from the main repo root; absolute paths are
+  # used as-is. Branch slashes are preserved, so a branch named
+  # `feature/FOO-123-thing` lands at `<root>/feature/FOO-123-thing`.
+  # If `root` resolves inside the repo, `treeman wt create` ensures the
+  # directory is `.gitignore`d.
+  root: .worktrees
   links:
     - .env
     - .env.testing
@@ -347,6 +370,29 @@ idempotent — safe to call when nothing is installed.
 
 ## Watcher behavior
 
+### Per-worktree fan-out
+
+`treemand` runs one *worktree-index* watcher per registered repo that
+observes `.git/worktrees/` via `notify` (no polling, no `git`
+subprocess). On every diff:
+
+- **Added worktree** → spawn a framework-watcher set scoped to that
+  worktree path, with its own slug and its own per-worktree config layer
+  (`<wt>/.treeman.local.yaml` is overlaid on top of the main repo's
+  config).
+- **Removed worktree** → abort that worktree's tasks.
+
+Triggered by anything that touches `.git/worktrees/`: `treeman wt
+create`/`delete`, plain `git worktree add`/`remove`/`prune`, IDE
+worktree commands. The CLI never needs to notify the daemon.
+
+A nesting guard rejects worktree paths that fall inside `.git/` or
+inside any already-tracked worktree. `treeman wt delete` cleans up
+empty parent directories up to `worktrees.root` so the layout stays
+tidy.
+
+### Per-framework loop
+
 Each detected framework runs in its own task. On every debounced event:
 
 1. Dynamically expand watch coverage. If a parent dir for a glob pattern
@@ -375,25 +421,57 @@ Heavy directories are pruned from walks (`.git`, `node_modules`,
 `__pycache__`, `.gradle`, `.m2`, `.idea`, `.vscode`, `.next`, `.nuxt`,
 `tmp`, etc.).
 
+### Boot-time resume
+
+On startup, `treemand` reads every registered repo from SQLite and
+re-spawns its watcher set. Missing-`.git` repos log a warning and the
+rest continue. Lets `systemctl restart treemand` (or a host reboot)
+regain full coverage with zero CLI intervention.
+
+### Config hot-reload
+
+Changes to `<repo>/.treeman.yaml`, `<repo>/.treeman.local.yaml`,
+`<wt>/.treeman.local.yaml`, or `~/.config/treeman/config.yaml` trigger
+a clean stop+start of that repo's watcher with the new config. Editor
+backup files (`.swp`, `~`, …) are filtered out before the reload
+fires.
+
+### Snapshot GC
+
+A background task in `treemand` periodically calls the snapshot
+catalog GC (`treeman_snapshot::run_gc`). It evicts catalog rows per
+the `snapshots.retention.*` policy and then DROPs the matching
+template database in the engine (MySQL/MariaDB/TiDB, Postgres/Cockroach,
+MongoDB, Elasticsearch/Opensearch). Engines without a snapshot strategy
+log+skip. The interval is the smallest `gc_interval_minutes` across
+registered repos, floor-clamped to 5 minutes.
+
 ---
 
 ## Architecture
 
 ```
-┌──────────────┐  unix socket   ┌────────────────────────────────┐
-│   treeman    │ ─────────────► │           treemand             │
-│   (CLI)      │ JSON RPC       │ ┌────────────────────────────┐ │
-└──────────────┘                │ │ shared sqlx pools          │ │
-                                │ │ (mysql, pg, mongo, redis)  │ │
-                                │ └────────────────────────────┘ │
-                                │ ┌────────────────────────────┐ │
-                                │ │ per-repo watcher tasks     │ │
-                                │ │ (notify + debouncer-full)  │ │
-                                │ └────────────────────────────┘ │
-                                │ ┌────────────────────────────┐ │
-                                │ │ tracing → SQLite events    │ │
-                                │ └────────────────────────────┘ │
-                                └────────────────────────────────┘
+┌──────────────┐  unix socket   ┌────────────────────────────────────┐
+│   treeman    │ ─────────────► │             treemand               │
+│   (CLI)      │ JSON RPC       │ ┌────────────────────────────────┐ │
+└──────────────┘                │ │ shared sqlx pools              │ │
+                                │ │ (mysql, pg, mongo, redis, …)   │ │
+                                │ └────────────────────────────────┘ │
+                                │ ┌────────────────────────────────┐ │
+                                │ │ per-repo:                      │ │
+                                │ │   .git/worktrees/ index task   │ │
+                                │ │   config-file watcher          │ │
+                                │ │     ↓ (worktree diff)          │ │
+                                │ │   per-worktree framework set   │ │
+                                │ │   (notify + debouncer-full)    │ │
+                                │ └────────────────────────────────┘ │
+                                │ ┌────────────────────────────────┐ │
+                                │ │ periodic snapshot GC           │ │
+                                │ └────────────────────────────────┘ │
+                                │ ┌────────────────────────────────┐ │
+                                │ │ tracing → SQLite events        │ │
+                                │ └────────────────────────────────┘ │
+                                └────────────────────────────────────┘
 ```
 
 Crates (cargo workspace):
@@ -405,8 +483,8 @@ Crates (cargo workspace):
 | `treeman-store` | SQLite schema, tracing layer, event queries |
 | `treeman-db` | DbDriver trait + mysql/pg/mongo/redis/es impls + dumpload + binlog scaffold |
 | `treeman-migrations` | Framework registry + 14 built-in detectors + migrate runner |
-| `treeman-watcher` | notify-debouncer-full per-framework watcher |
-| `treeman-snapshot` | SnapshotKey fingerprinting + cache catalog + paratest fanout |
+| `treeman-watcher` | notify-debouncer-full watchers: `.git/worktrees/` index, config files, per-framework migration dirs |
+| `treeman-snapshot` | SnapshotKey fingerprinting + cache catalog + paratest fanout + periodic GC (`run_gc`) |
 | `treeman-prepare` | The full prepare orchestrator |
 | `treeman-daemon` | `treemand` binary |
 | `treeman-cli` | `treeman` binary |
