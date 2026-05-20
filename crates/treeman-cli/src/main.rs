@@ -629,6 +629,41 @@ fn paint(s: &str, st: Style) -> String {
     }
 }
 
+// Style presets for CLI output. Keep semantic, not raw colors, so callers
+// stay readable and we can tweak the palette in one place.
+#[allow(dead_code)]
+fn style_label() -> Style {
+    Style::new().bold()
+}
+#[allow(dead_code)]
+fn style_value() -> Style {
+    Style::new().cyan()
+}
+#[allow(dead_code)]
+fn style_path() -> Style {
+    Style::new().cyan()
+}
+#[allow(dead_code)]
+fn style_ok() -> Style {
+    Style::new().green().bold()
+}
+#[allow(dead_code)]
+fn style_warn() -> Style {
+    Style::new().yellow()
+}
+#[allow(dead_code)]
+fn style_dim() -> Style {
+    Style::new().dimmed()
+}
+#[allow(dead_code)]
+fn style_count() -> Style {
+    Style::new().yellow().bold()
+}
+#[allow(dead_code)]
+fn style_header() -> Style {
+    Style::new().magenta().bold()
+}
+
 // ───────────────────────── completions / manpage ─────────────────────────
 
 fn completions(args: CompletionsArgs) -> Result<()> {
@@ -653,11 +688,18 @@ fn manpage() -> Result<()> {
 async fn status() -> Result<()> {
     match client::call(Request::Status).await? {
         Response::Status(s) => {
-            println!("daemon_version: {}", s.daemon_version);
-            println!("protocol:       v{}", s.protocol_version);
-            println!("pid:            {}", s.pid);
-            println!("started_at:     {}", s.started_at_unix);
-            println!("watchers:       {}", s.watcher_count);
+            let row = |label: &str, val: String| {
+                println!(
+                    "{:<15} {}",
+                    paint(label, style_label()),
+                    paint(&val, style_value())
+                );
+            };
+            row("daemon_version:", s.daemon_version);
+            row("protocol:", format!("v{}", s.protocol_version));
+            row("pid:", s.pid.to_string());
+            row("started_at:", s.started_at_unix.to_string());
+            row("watchers:", s.watcher_count.to_string());
         }
         Response::Error { message } => bail!("daemon error: {message}"),
         other => bail!("unexpected response: {:?}", other),
@@ -667,7 +709,7 @@ async fn status() -> Result<()> {
 
 async fn daemon_start() -> Result<()> {
     if let Ok(Response::Pong) = client::call(Request::Ping).await {
-        println!("treemand already running");
+        println!("{} treemand already running", paint("ok:", style_ok()));
         return Ok(());
     }
     if service_installed() {
@@ -682,7 +724,7 @@ async fn daemon_stop() -> Result<()> {
     }
     match client::call(Request::Shutdown).await {
         Ok(Response::Ok) => {
-            println!("shutdown sent");
+            println!("{} shutdown sent", paint("ok:", style_ok()));
             Ok(())
         }
         Ok(other) => bail!("unexpected response: {:?}", other),
@@ -774,7 +816,11 @@ fn service_start() -> Result<()> {
                 .args(["kickstart", "-k", &format!("gui/{uid}/{}", launchd_label())])
                 .status();
         }
-        println!("treemand started via launchd ({})", launchd_label());
+        println!(
+            "{} treemand started via launchd ({})",
+            paint("ok:", style_ok()),
+            paint(launchd_label(), style_dim())
+        );
         Ok(())
     } else {
         let s = std::process::Command::new("systemctl")
@@ -784,7 +830,11 @@ fn service_start() -> Result<()> {
         if !s.success() {
             bail!("systemctl --user start treemand.service failed");
         }
-        println!("treemand started via systemd --user");
+        println!(
+            "{} treemand started via {}",
+            paint("ok:", style_ok()),
+            paint("systemd --user", style_dim())
+        );
         Ok(())
     }
 }
@@ -797,7 +847,11 @@ fn service_stop() -> Result<()> {
             .args(["bootout", &format!("gui/{uid}")])
             .arg(&plist)
             .status();
-        println!("treemand stopped via launchd");
+        println!(
+            "{} treemand stopped via {}",
+            paint("ok:", style_ok()),
+            paint("launchd", style_dim())
+        );
         Ok(())
     } else {
         let s = std::process::Command::new("systemctl")
@@ -807,7 +861,11 @@ fn service_stop() -> Result<()> {
         if !s.success() {
             bail!("systemctl --user stop treemand.service failed");
         }
-        println!("treemand stopped via systemd --user");
+        println!(
+            "{} treemand stopped via {}",
+            paint("ok:", style_ok()),
+            paint("systemd --user", style_dim())
+        );
         Ok(())
     }
 }
@@ -874,7 +932,11 @@ WantedBy=default.target
         daemon = daemon_bin.display()
     );
     std::fs::write(&unit_path, unit).with_context(|| format!("write {}", unit_path.display()))?;
-    println!("wrote {}", unit_path.display());
+    println!(
+        "{} wrote {}",
+        paint("ok:", style_ok()),
+        paint(&unit_path.display().to_string(), style_path())
+    );
     run_systemctl(&["--user", "daemon-reload"])?;
     run_systemctl(&["--user", "enable", "--now", "treemand.service"])?;
     println!(
@@ -893,13 +955,23 @@ fn uninstall_systemd() -> Result<()> {
     if existed {
         std::fs::remove_file(&unit_path)
             .with_context(|| format!("remove {}", unit_path.display()))?;
-        println!("removed {}", unit_path.display());
+        println!(
+            "{} removed {}",
+            paint("ok:", style_ok()),
+            paint(&unit_path.display().to_string(), style_path())
+        );
     }
     let _ = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
     if !existed {
-        println!("no systemd user unit at {}", unit_path.display());
+        println!(
+            "{}",
+            paint(
+                &format!("no systemd user unit at {}", unit_path.display()),
+                style_dim()
+            )
+        );
     }
     Ok(())
 }
@@ -952,7 +1024,11 @@ fn install_launchd(daemon_bin: &Path) -> Result<()> {
     );
     std::fs::write(&plist_path, plist)
         .with_context(|| format!("write {}", plist_path.display()))?;
-    println!("wrote {}", plist_path.display());
+    println!(
+        "{} wrote {}",
+        paint("ok:", style_ok()),
+        paint(&plist_path.display().to_string(), style_path())
+    );
     let uid = unsafe { libc::geteuid() }.to_string();
     let domain = format!("gui/{uid}");
     // bootstrap = load + run; if already loaded, kickstart -k restarts it.
@@ -985,9 +1061,19 @@ fn uninstall_launchd() -> Result<()> {
             .status();
         std::fs::remove_file(&plist_path)
             .with_context(|| format!("remove {}", plist_path.display()))?;
-        println!("removed {}", plist_path.display());
+        println!(
+            "{} removed {}",
+            paint("ok:", style_ok()),
+            paint(&plist_path.display().to_string(), style_path())
+        );
     } else {
-        println!("no LaunchAgent at {}", plist_path.display());
+        println!(
+            "{}",
+            paint(
+                &format!("no LaunchAgent at {}", plist_path.display()),
+                style_dim()
+            )
+        );
     }
     Ok(())
 }
@@ -998,7 +1084,11 @@ async fn watcher_start(repo: Option<PathBuf>) -> Result<()> {
         repo_path: repo_path.to_string_lossy().to_string(),
     };
     match client::call(req).await? {
-        Response::WatcherStarted { repo_path } => println!("watcher started: {repo_path}"),
+        Response::WatcherStarted { repo_path } => println!(
+            "{} watcher started: {}",
+            paint("ok:", style_ok()),
+            paint(&repo_path, style_path())
+        ),
         Response::Error { message } => bail!("daemon: {message}"),
         other => bail!("unexpected: {other:?}"),
     }
@@ -1011,7 +1101,11 @@ async fn watcher_stop(repo: Option<PathBuf>) -> Result<()> {
         repo_path: repo_path.to_string_lossy().to_string(),
     };
     match client::call(req).await? {
-        Response::WatcherStopped { repo_path } => println!("watcher stopped: {repo_path}"),
+        Response::WatcherStopped { repo_path } => println!(
+            "{} watcher stopped: {}",
+            paint("ok:", style_ok()),
+            paint(&repo_path, style_path())
+        ),
         Response::Error { message } => bail!("daemon: {message}"),
         other => bail!("unexpected: {other:?}"),
     }
@@ -1022,10 +1116,15 @@ async fn watcher_list() -> Result<()> {
     match client::call(Request::WatcherList).await? {
         Response::WatcherList { repos } => {
             if repos.is_empty() {
-                println!("(no watchers running)");
+                println!("{}", paint("(no watchers running)", style_dim()));
             } else {
                 for r in repos {
-                    println!("{} ({} worktrees)", r.repo, r.worktree_count);
+                    println!(
+                        "{}  {} {}",
+                        paint(&r.repo, style_path()),
+                        paint(&r.worktree_count.to_string(), style_count()),
+                        paint("worktrees", style_dim()),
+                    );
                 }
             }
         }
@@ -1043,10 +1142,13 @@ async fn watcher_worktrees(repo: Option<PathBuf>) -> Result<()> {
     match client::call(req).await? {
         Response::WorktreeList { worktrees } => {
             if worktrees.is_empty() {
-                println!("(no per-worktree watchers running)");
+                println!(
+                    "{}",
+                    paint("(no per-worktree watchers running)", style_dim())
+                );
             } else {
                 for w in worktrees {
-                    println!("{w}");
+                    println!("{}", paint(&w, style_path()));
                 }
             }
         }
@@ -1158,8 +1260,16 @@ fn schema_install(dir: Option<PathBuf>) -> Result<()> {
     std::fs::write(&global, &pretty).with_context(|| format!("write {}", global.display()))?;
     std::fs::write(&repo, &pretty).with_context(|| format!("write {}", repo.display()))?;
 
-    println!("wrote {}", global.display());
-    println!("wrote {}", repo.display());
+    println!(
+        "{} wrote {}",
+        paint("ok:", style_ok()),
+        paint(&global.display().to_string(), style_path())
+    );
+    println!(
+        "{} wrote {}",
+        paint("ok:", style_ok()),
+        paint(&repo.display().to_string(), style_path())
+    );
     println!();
     println!("To enable LSP completions in your editor, add a modeline to the top of");
     println!("each YAML config file:");
@@ -1337,7 +1447,7 @@ async fn worktree_list() -> Result<()> {
     let pool = open_pool().await?;
     let rows = treeman_store::hook_runs::list_worktrees(&pool).await?;
     if rows.is_empty() {
-        println!("(no worktrees registered)");
+        println!("{}", paint("(no worktrees registered)", style_dim()));
         return Ok(());
     }
     let hdr = paint(
@@ -1366,7 +1476,12 @@ async fn worktree_unregister(path: PathBuf) -> Result<()> {
         .await?
         .with_context(|| format!("worktree not registered: {}", path.display()))?;
     treeman_store::mark_worktree_deleted(&pool, wt.id).await?;
-    println!("unregistered worktree #{} ({})", wt.id, wt.path);
+    println!(
+        "{} unregistered worktree {} ({})",
+        paint("ok:", style_ok()),
+        paint(&format!("#{}", wt.id), style_count()),
+        paint(&wt.path, style_path())
+    );
     Ok(())
 }
 
@@ -2337,7 +2452,12 @@ async fn worktree_delete(target: String, repo: Option<PathBuf>, force: bool) -> 
 
     treeman_store::mark_worktree_deleted(&pool, wt.id).await?;
     prune_empty_parents(&wt_path, &resolve_worktrees_root(&cfg, &repo_root));
-    println!("deleted worktree #{} ({})", wt.id, wt_path.display());
+    println!(
+        "{} deleted worktree {} ({})",
+        paint("ok:", style_ok()),
+        paint(&format!("#{}", wt.id), style_count()),
+        paint(&wt_path.display().to_string(), style_path())
+    );
     Ok(())
 }
 
