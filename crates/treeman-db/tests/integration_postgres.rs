@@ -1,50 +1,65 @@
-//! Live PostgreSQL integration tests via testcontainers.
+//! Live PostgreSQL integration tests against an existing instance.
+//! Set `TREEMAN_TEST_POSTGRES_URL` to a `postgres://user:pass@host:port/`
+//! URL. Tests scope to a fresh `tm_it_<rand>_*` database.
 
 #![cfg(feature = "integration")]
 
-use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use treeman_core::config::PostgresConn;
+use treeman_core::dburl;
 use treeman_db::DbDriver;
 use treeman_db::postgres::PostgresDriver;
 
-async fn start_postgres() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
-    PostgresConn,
-) {
-    let container = Postgres::default().start().await.expect("start pg");
-    let port = container.get_host_port_ipv4(5432).await.expect("port");
+fn env_cfg() -> Option<(PostgresConn, String)> {
+    let url = std::env::var("TREEMAN_TEST_POSTGRES_URL").ok()?;
+    let parsed = dburl::parse(&url).ok()?;
     let cfg = PostgresConn {
-        host: "127.0.0.1".into(),
-        port,
-        user: "postgres".into(),
+        host: parsed.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+        port: parsed.port.unwrap_or(5432),
+        user: parsed.user.clone().unwrap_or_else(|| "postgres".into()),
         password_env: None,
         pool_max: 4,
     };
-    (container, cfg)
+    let stem = format!(
+        "tm_it_{}",
+        &blake3::hash(url.as_bytes()).to_hex().to_string()[..10]
+    );
+    Some((cfg, stem))
 }
 
 #[tokio::test]
-#[ignore = "requires docker"]
+#[ignore = "set TREEMAN_TEST_POSTGRES_URL"]
 async fn ensure_and_drop_db() {
-    let (_c, cfg) = start_postgres().await;
+    let Some((cfg, stem)) = env_cfg() else {
+        eprintln!("TREEMAN_TEST_POSTGRES_URL not set — skipping");
+        return;
+    };
     let drv = PostgresDriver::connect(&cfg).await.expect("connect");
-    drv.ensure_db("tm_test_a").await.expect("ensure a");
-    drv.ensure_db("tm_test_b").await.expect("ensure b");
-    let matched = drv.list_matching("tm_test_").await.expect("list");
-    assert!(matched.contains(&"tm_test_a".to_string()));
-    let dropped = drv.drop_matching("tm_test_").await.expect("drop");
-    assert!(dropped.len() >= 2);
+    let a = format!("{stem}_a");
+    let b = format!("{stem}_b");
+    drv.ensure_db(&a).await.expect("ensure a");
+    drv.ensure_db(&b).await.expect("ensure b");
+    let matched = drv.list_matching(&stem).await.expect("list");
+    assert!(matched.contains(&a));
+    let dropped = drv.drop_matching(&stem).await.expect("drop");
+    assert!(dropped.contains(&a));
+    assert!(dropped.contains(&b));
 }
 
 #[tokio::test]
-#[ignore = "requires docker"]
+#[ignore = "set TREEMAN_TEST_POSTGRES_URL"]
 async fn snapshot_via_template() {
-    let (_c, cfg) = start_postgres().await;
+    let Some((cfg, stem)) = env_cfg() else {
+        eprintln!("TREEMAN_TEST_POSTGRES_URL not set — skipping");
+        return;
+    };
+    let src = format!("{stem}_src");
+    let tmpl = format!("{stem}_tmpl");
+    let dst = format!("{stem}_dst");
     let drv = PostgresDriver::connect(&cfg).await.expect("connect");
-    drv.ensure_db("tm_src").await.expect("ensure src");
+    let _ = drv.drop_matching(&stem).await;
+    drv.ensure_db(&src).await.expect("ensure src");
     let pool = sqlx::PgPool::connect(&format!(
-        "postgres://{}:@{}:{}/tm_src",
+        "postgres://{}:@{}:{}/{src}",
         cfg.user, cfg.host, cfg.port
     ))
     .await
@@ -58,14 +73,14 @@ async fn snapshot_via_template() {
         .await
         .unwrap();
     pool.close().await;
-    drv.snapshot_create("tm_src", "tm_tmpl")
+    drv.snapshot_create(&src, &tmpl)
         .await
         .expect("snapshot create");
-    drv.snapshot_restore("tm_tmpl", "tm_dst")
+    drv.snapshot_restore(&tmpl, &dst)
         .await
         .expect("snapshot restore");
     let dst_pool = sqlx::PgPool::connect(&format!(
-        "postgres://{}:@{}:{}/tm_dst",
+        "postgres://{}:@{}:{}/{dst}",
         cfg.user, cfg.host, cfg.port
     ))
     .await
@@ -75,4 +90,5 @@ async fn snapshot_via_template() {
         .await
         .expect("row");
     assert_eq!(row, (1, "hello".to_string()));
+    let _ = drv.drop_matching(&stem).await;
 }

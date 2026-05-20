@@ -476,18 +476,24 @@ nix run .#treeman -- status
 
 ## Tested against real engines
 
-`treeman-db` has a `testcontainers`-backed integration suite covering
-MySQL, PostgreSQL, and Redis. Each test spins up a real container,
-exercises `ensure_db` → `drop_matching` → `snapshot_create` →
-`snapshot_restore`, and tears down.
+`treeman-db` ships a live integration suite covering MySQL, PostgreSQL,
+and Redis. Tests do **not** spawn containers — they run against the
+infra you already have running. Each test reads its connection URL
+from an env var, scopes itself to a unique `tm_it_<hash>_*` database
+(or Redis DB index derived from the URL hash), and drops its
+scratch state on completion so it never collides with other tenants.
 
 ```sh
+export TREEMAN_TEST_MYSQL_URL=mysql://root:@127.0.0.1:3306/
+export TREEMAN_TEST_POSTGRES_URL=postgres://postgres:@127.0.0.1:5432/
+export TREEMAN_TEST_REDIS_URL=redis://127.0.0.1:6379/
+
 cargo test --features integration -p treeman-db -- --include-ignored
 ```
 
-Tests are gated by `--features integration` and marked `#[ignore]` so
-default `cargo test` invocations don't pull container images on
-machines without Docker.
+Tests are gated by `--features integration` and marked `#[ignore]`, so
+default `cargo test` invocations don't reach for the network. Any test
+whose env var is unset prints a "skipped" line and returns.
 
 ## Delta migrate path
 

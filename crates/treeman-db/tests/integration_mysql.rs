@@ -1,59 +1,76 @@
-//! Live MySQL integration tests via testcontainers.
+//! Live MySQL integration tests against an existing instance.
 //!
-//! `cargo test --features integration -p treeman-db --test integration_mysql -- --include-ignored`
+//! Set `TREEMAN_TEST_MYSQL_URL` to a `mysql://user:pass@host:port/`
+//! URL pointing at a database where the user can `CREATE DATABASE`.
+//! Each test scopes itself to a fresh `tm_it_<rand>_*` database and
+//! tears it down on completion, so it never collides with other
+//! tenants on the same host.
 //!
-//! Each test is `#[ignore]` so the default `cargo test` invocation
-//! doesn't pull container images on developer machines / on CI runners
-//! that lack Docker.
+//! `cargo test --features integration -p treeman-db --test
+//! integration_mysql -- --include-ignored`
 
 #![cfg(feature = "integration")]
 
-use testcontainers_modules::mysql::Mysql;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use treeman_core::config::MysqlConn;
+use treeman_core::dburl;
 use treeman_db::DbDriver;
 use treeman_db::mysql::MysqlDriver;
 
-async fn start_mysql() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Mysql>,
-    MysqlConn,
-) {
-    let container = Mysql::default().start().await.expect("start mysql");
-    let port = container.get_host_port_ipv4(3306).await.expect("host port");
+fn env_cfg() -> Option<(MysqlConn, String)> {
+    let url = std::env::var("TREEMAN_TEST_MYSQL_URL").ok()?;
+    let parsed = dburl::parse(&url).ok()?;
     let cfg = MysqlConn {
-        host: "127.0.0.1".into(),
-        port,
-        user: "root".into(),
+        host: parsed.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+        port: parsed.port.unwrap_or(3306),
+        user: parsed.user.clone().unwrap_or_else(|| "root".into()),
         password_env: None,
         pool_max: 4,
     };
-    (container, cfg)
+    let stem = format!(
+        "tm_it_{}",
+        &blake3::hash(url.as_bytes()).to_hex().to_string()[..10]
+    );
+    Some((cfg, stem))
 }
 
 #[tokio::test]
-#[ignore = "requires docker"]
+#[ignore = "set TREEMAN_TEST_MYSQL_URL"]
 async fn ensure_and_drop_db() {
-    let (_c, cfg) = start_mysql().await;
+    let Some((cfg, stem)) = env_cfg() else {
+        eprintln!("TREEMAN_TEST_MYSQL_URL not set — skipping");
+        return;
+    };
     let drv = MysqlDriver::connect(&cfg).await.expect("connect");
-    drv.ensure_db("tm_test_a").await.expect("ensure a");
-    drv.ensure_db("tm_test_b").await.expect("ensure b");
-    let matched = drv.list_matching("tm_test_").await.expect("list");
-    assert!(matched.contains(&"tm_test_a".to_string()));
-    assert!(matched.contains(&"tm_test_b".to_string()));
-    let dropped = drv.drop_matching("tm_test_").await.expect("drop");
-    assert_eq!(dropped.len(), 2);
-    let after = drv.list_matching("tm_test_").await.expect("list");
+    let a = format!("{stem}_a");
+    let b = format!("{stem}_b");
+    drv.ensure_db(&a).await.expect("ensure a");
+    drv.ensure_db(&b).await.expect("ensure b");
+    let matched = drv.list_matching(&stem).await.expect("list");
+    assert!(matched.contains(&a));
+    assert!(matched.contains(&b));
+    let dropped = drv.drop_matching(&stem).await.expect("drop");
+    assert!(dropped.contains(&a));
+    assert!(dropped.contains(&b));
+    let after = drv.list_matching(&stem).await.expect("list");
     assert!(after.is_empty());
 }
 
 #[tokio::test]
-#[ignore = "requires docker"]
+#[ignore = "set TREEMAN_TEST_MYSQL_URL"]
 async fn snapshot_roundtrip() {
-    let (_c, cfg) = start_mysql().await;
+    let Some((cfg, stem)) = env_cfg() else {
+        eprintln!("TREEMAN_TEST_MYSQL_URL not set — skipping");
+        return;
+    };
+    let src = format!("{stem}_src");
+    let tmpl = format!("{stem}_tmpl");
+    let dst = format!("{stem}_dst");
     let drv = MysqlDriver::connect(&cfg).await.expect("connect");
-    drv.ensure_db("tm_src").await.expect("ensure src");
+    // Best-effort cleanup before/after.
+    let _ = drv.drop_matching(&stem).await;
+    drv.ensure_db(&src).await.expect("ensure src");
     let pool = sqlx::MySqlPool::connect(&format!(
-        "mysql://{}:@{}:{}/tm_src",
+        "mysql://{}:@{}:{}/{src}",
         cfg.user, cfg.host, cfg.port
     ))
     .await
@@ -66,14 +83,14 @@ async fn snapshot_roundtrip() {
         .execute(&pool)
         .await
         .unwrap();
-    drv.snapshot_create("tm_src", "tm_tmpl")
+    drv.snapshot_create(&src, &tmpl)
         .await
         .expect("snapshot create");
-    drv.snapshot_restore("tm_tmpl", "tm_dst")
+    drv.snapshot_restore(&tmpl, &dst)
         .await
         .expect("snapshot restore");
     let dst_pool = sqlx::MySqlPool::connect(&format!(
-        "mysql://{}:@{}:{}/tm_dst",
+        "mysql://{}:@{}:{}/{dst}",
         cfg.user, cfg.host, cfg.port
     ))
     .await
@@ -83,4 +100,5 @@ async fn snapshot_roundtrip() {
         .await
         .expect("row in cloned db");
     assert_eq!(row, (1, "hello".to_string()));
+    let _ = drv.drop_matching(&stem).await;
 }
