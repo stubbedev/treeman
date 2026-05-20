@@ -26,12 +26,17 @@ debug = false
 # extra compile cost since deps are cached after the first build.
 opt-level = 1
 
-[target.x86_64-unknown-linux-gnu]
-# mold is dramatically faster than the default linker for workspaces with
-# many small rlibs (every integration test binary re-links the world).
-# Requires `mold` + `clang` from the dev shell.
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+# clang+mold linker swap lives in a gitignored override so bare-cargo
+# builds (CI, release recipes, ad-hoc cargo from outside `nix develop`)
+# don't break when those tools aren't on PATH. Opt in locally with:
+#
+#   cat > .cargo/config.local.toml <<'EOF'
+#   [target.x86_64-unknown-linux-gnu]
+#   linker = "clang"
+#   rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#   EOF
+#
+# (cargo merges any `.cargo/config*.toml` it finds in the workspace.)
 
 [build]
 incremental = true
