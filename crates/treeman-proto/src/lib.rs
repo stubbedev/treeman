@@ -47,6 +47,17 @@ pub enum Request {
     WorktreeList {
         repo_path: String,
     },
+    /// Run the postcreate hooks + prepare for a worktree in the
+    /// daemon's runtime so the caller (e.g. `treeman wt create`)
+    /// can return immediately. The daemon detaches a tokio task,
+    /// streams output into the SQLite event log, and survives the
+    /// caller's shell exiting. See `worktrees.async_create` in
+    /// `.treeman.yaml` — set it to `true` to make `treeman wt create`
+    /// fan this off automatically.
+    WorktreeFinalize {
+        repo_path: String,
+        worktree_path: String,
+    },
     /// Tell the daemon to shut down cleanly (used by `treeman daemon stop`).
     Shutdown,
 }
@@ -62,6 +73,10 @@ pub enum Response {
     WatcherStopped { repo_path: String },
     WatcherList { repos: Vec<WatcherSummary> },
     WorktreeList { worktrees: Vec<String> },
+    /// Daemon accepted the finalize request and detached a task.
+    /// The caller should not wait — use `treeman logs tail -f` to
+    /// follow progress.
+    WorktreeFinalizeQueued { worktree_path: String },
     Error { message: String },
 }
 

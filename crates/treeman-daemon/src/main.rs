@@ -214,11 +214,121 @@ async fn dispatch(
                 message: e.to_string(),
             },
         },
+        Request::WorktreeFinalize {
+            repo_path,
+            worktree_path,
+        } => {
+            let st = state.clone();
+            let repo_for_task = repo_path.clone();
+            let wt_for_task = worktree_path.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    finalize_worktree(&st, &repo_for_task, &wt_for_task).await
+                {
+                    let _ = treeman_store::write_event(
+                        st.sqlite(),
+                        "error",
+                        "wt_finalize",
+                        Some(&e.to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        &serde_json::json!({
+                            "repo_path": repo_for_task,
+                            "worktree_path": wt_for_task,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+            });
+            Response::WorktreeFinalizeQueued { worktree_path }
+        }
         Request::Shutdown => {
             shutdown.notify_one();
             Response::Ok
         }
     }
+}
+
+/// Background tail of `treeman wt create` when
+/// `worktrees.async_create` is enabled: postcreate hooks + prepare
+/// (DB ensure + dump-load + framework migrate + paratest clones).
+/// All output is mirrored into the SQLite event log via the
+/// daemon's tracing subscriber — `treeman logs tail -f` follows it.
+async fn finalize_worktree(
+    state: &Arc<state::DaemonState>,
+    repo_path: &str,
+    worktree_path: &str,
+) -> anyhow::Result<()> {
+    let repo_root = std::path::PathBuf::from(repo_path);
+    let wt_root = std::path::PathBuf::from(worktree_path);
+    let cfg = treeman_core::config::load_layered_for_worktree(&repo_root, &wt_root)?;
+    let slug = treeman_core::slug_for(&wt_root, None);
+
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo");
+    let repo_id =
+        treeman_store::ensure_repo(state.sqlite(), &repo_root, repo_name).await?;
+    let wt_id = treeman_store::ensure_worktree(
+        state.sqlite(),
+        repo_id,
+        &wt_root,
+        &slug.value,
+        None,
+    )
+    .await?;
+
+    let _ = treeman_store::write_event(
+        state.sqlite(),
+        "info",
+        "wt_finalize_start",
+        Some("daemon-detached postcreate + prepare beginning"),
+        Some(repo_id),
+        Some(wt_id),
+        None,
+        None,
+        "{}",
+    )
+    .await;
+
+    if !cfg.hooks.postcreate.is_empty() {
+        let outcome = treeman_core::hooks::run_hooks(
+            &cfg.hooks.postcreate,
+            &repo_root,
+            &wt_root,
+            &slug.value,
+        )
+        .await?;
+        if outcome.aggregate_exit_code != 0 {
+            anyhow::bail!(
+                "postcreate hooks exited non-zero ({})",
+                outcome.aggregate_exit_code
+            );
+        }
+    }
+
+    if !cfg.databases.is_empty() {
+        treeman_prepare::run(&cfg, &repo_root, &slug, state.sqlite(), repo_id, wt_id)
+            .await?;
+    }
+
+    let _ = treeman_store::write_event(
+        state.sqlite(),
+        "info",
+        "wt_finalize_done",
+        Some("daemon-detached postcreate + prepare complete"),
+        Some(repo_id),
+        Some(wt_id),
+        None,
+        None,
+        "{}",
+    )
+    .await;
+    Ok(())
 }
 
 /// Pick the GC interval. Strategy: use the smallest

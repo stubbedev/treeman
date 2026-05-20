@@ -361,6 +361,12 @@ enum WorktreeCmd {
         /// Skip prepare even if hooks ran.
         #[arg(long)]
         skip_prepare: bool,
+        /// Force foreground execution of postcreate hooks + prepare
+        /// even when `worktrees.async_create` is enabled. Useful for
+        /// CI / scripted flows where you want the exit code to
+        /// reflect whether DB scaffolding succeeded.
+        #[arg(long)]
+        foreground: bool,
     },
     /// Delete a worktree end-to-end.
     #[command(visible_alias = "rm")]
@@ -389,6 +395,15 @@ enum WorktreeCmd {
     Unregister {
         #[arg(default_value = ".", value_hint = ValueHint::DirPath)]
         path: PathBuf,
+    },
+    /// Hand the daemon a "rerun postcreate + prepare for this
+    /// worktree" RPC. Useful when a previous create was interrupted
+    /// or the worktree dir was recovered from an orphan repair.
+    Finalize {
+        #[arg(default_value = ".", value_hint = ValueHint::DirPath)]
+        path: PathBuf,
+        #[command(flatten)]
+        repo: RepoCommon,
     },
 }
 
@@ -550,7 +565,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
             repo,
             skip_hooks,
             skip_prepare,
-        }) => worktree_create(branch, from, path, repo.repo, skip_hooks, skip_prepare).await,
+            foreground,
+        }) => {
+            worktree_create(
+                branch,
+                from,
+                path,
+                repo.repo,
+                skip_hooks,
+                skip_prepare,
+                foreground,
+            )
+            .await
+        }
         Cmd::Worktree(WorktreeCmd::Delete {
             target,
             repo,
@@ -561,6 +588,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Cmd::Worktree(WorktreeCmd::List) => worktree_list().await,
         Cmd::Worktree(WorktreeCmd::Unregister { path }) => worktree_unregister(path).await,
+        Cmd::Worktree(WorktreeCmd::Finalize { path, repo }) => {
+            worktree_finalize(path, repo.repo).await
+        }
         Cmd::Hook(HookCmd::Run { phase, worktree }) => {
             hook_run(phase.as_str().to_string(), worktree.worktree).await
         }
@@ -2225,6 +2255,38 @@ async fn prepare_cmd(args: PrepareArgs) -> Result<()> {
 
 // ───────────────────────── worktree create/delete ─────────────────────────
 
+async fn worktree_finalize(path: PathBuf, repo: Option<PathBuf>) -> Result<()> {
+    let wt_path = path.canonicalize().with_context(|| {
+        format!("canonicalize {} — does the worktree exist?", path.display())
+    })?;
+    let repo_root = match repo {
+        Some(r) => r.canonicalize()?,
+        None => discover_repo_root(&wt_path).context("could not find repo root for worktree")?,
+    };
+    send_finalize_to_daemon(&repo_root, &wt_path).await?;
+    println!(
+        "{} postcreate + prepare detached to daemon — \
+         follow with `treeman logs tail -f`",
+        paint("queued:", style_ok())
+    );
+    Ok(())
+}
+
+/// Ask the daemon to take ownership of postcreate+prepare for `wt`.
+/// Returns once the daemon has acknowledged — the actual hook + DB
+/// work runs in the daemon's runtime and is not awaited here.
+async fn send_finalize_to_daemon(repo_root: &Path, wt_path: &Path) -> Result<()> {
+    let req = treeman_proto::Request::WorktreeFinalize {
+        repo_path: repo_root.to_string_lossy().into_owned(),
+        worktree_path: wt_path.to_string_lossy().into_owned(),
+    };
+    match crate::client::call(req).await? {
+        treeman_proto::Response::WorktreeFinalizeQueued { .. } => Ok(()),
+        treeman_proto::Response::Error { message } => bail!("daemon: {message}"),
+        other => bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
 async fn worktree_create(
     branch: String,
     from: Option<String>,
@@ -2232,6 +2294,7 @@ async fn worktree_create(
     repo: Option<PathBuf>,
     skip_hooks: bool,
     skip_prepare: bool,
+    foreground: bool,
 ) -> Result<()> {
     use treeman_core::template::{TemplateContext, render};
 
@@ -2371,10 +2434,51 @@ async fn worktree_create(
     if skip_hooks {
         return Ok(());
     }
-    for (phase_name, steps) in [
-        ("precreate", &cfg.hooks.precreate),
-        ("postcreate", &cfg.hooks.postcreate),
-    ] {
+
+    // precreate is always synchronous — it may legitimately need to
+    // succeed before the worktree is considered usable (e.g. fetch a
+    // submodule into the worktree).
+    if !cfg.hooks.precreate.is_empty() {
+        let outcome = treeman_core::hooks::run_hooks(
+            &cfg.hooks.precreate,
+            &repo_root,
+            &wt_path,
+            &slug.value,
+        )
+        .await?;
+        println!("precreate: exit={}", outcome.aggregate_exit_code);
+        if outcome.aggregate_exit_code != 0 {
+            bail!("precreate failed");
+        }
+    }
+
+    // Async-create gate. The slow tail (postcreate hooks + prepare)
+    // gets handed off to the daemon when `worktrees.async_create` is
+    // true and the user didn't pass `--foreground`. The CLI returns
+    // immediately and the daemon's tokio runtime owns the work.
+    let should_async = cfg.worktrees.async_create
+        && !foreground
+        && !skip_prepare
+        && (!cfg.hooks.postcreate.is_empty() || !cfg.databases.is_empty());
+    if should_async {
+        match send_finalize_to_daemon(&repo_root, &wt_path).await {
+            Ok(()) => {
+                println!(
+                    "{} postcreate + prepare detached to daemon — \
+                     follow with `treeman logs tail -f`",
+                    paint("queued:", style_ok())
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "warn: daemon RPC failed ({e}); falling back to foreground"
+                );
+            }
+        }
+    }
+
+    for (phase_name, steps) in [("postcreate", &cfg.hooks.postcreate)] {
         if steps.is_empty() {
             continue;
         }

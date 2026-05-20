@@ -314,12 +314,34 @@ fn default_fallback() -> String {
     "wt_{shorthash8}".into()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorktreesConfig {
     #[serde(default = "default_worktrees_root")]
     pub root: String,
     #[serde(default)]
     pub links: Vec<String>,
+    /// When `true`, `treeman wt create` performs the fast steps
+    /// inline (git worktree add → symlinks → env scoping → store
+    /// register) and then RPCs the daemon to run the slow tail
+    /// (postcreate hooks + prepare = DB ensure, dump-load, framework
+    /// migrate, paratest clones) in the background. The caller
+    /// returns in <2s instead of blocking ~30s+ on composer install
+    /// + paratest replication. Progress is logged to the SQLite
+    /// event log; follow with `treeman logs tail -f`. Default `true`
+    /// because the responsive UX matters more than command-line
+    /// determinism for interactive `gwt`-style flows; pass
+    /// `treeman wt create --foreground` to override.
+    #[serde(default = "default_true")]
+    pub async_create: bool,
+}
+impl Default for WorktreesConfig {
+    fn default() -> Self {
+        Self {
+            root: default_worktrees_root(),
+            links: Vec::new(),
+            async_create: true,
+        }
+    }
 }
 fn default_worktrees_root() -> String {
     "../worktrees".into()
