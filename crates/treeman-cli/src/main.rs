@@ -54,6 +54,50 @@ enum Cmd {
     Paratest(ParatestArgs),
     /// Full prepare: ensure → dump → migrate → snapshot → paratest.
     Prepare(PrepareArgs),
+    /// Daemon lifecycle: start/stop/status/install systemd unit.
+    #[command(subcommand)]
+    Daemon(DaemonCmd),
+    /// Watcher control (talks to the daemon).
+    #[command(subcommand)]
+    Watcher(WatcherCmd),
+    /// Bootstrap .treeman.yaml from the detected framework.
+    Init(InitArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCmd {
+    /// Start the daemon if it isn't already running.
+    Start,
+    /// Send Shutdown to a running daemon.
+    Stop,
+    /// Same as `treeman status`.
+    Status,
+    /// Drop a systemd user unit + enable+start it.
+    Install,
+}
+
+#[derive(Subcommand, Debug)]
+enum WatcherCmd {
+    /// Tell the daemon to watch this (or a given) repo.
+    Start {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Stop watching a repo.
+    Stop {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// List currently-watched repos.
+    List,
+}
+
+#[derive(clap::Args, Debug)]
+struct InitArgs {
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -313,7 +357,185 @@ async fn main() -> Result<()> {
         }
         Cmd::Paratest(args) => paratest(args).await,
         Cmd::Prepare(args) => prepare_cmd(args).await,
+        Cmd::Daemon(DaemonCmd::Start) => daemon_start().await,
+        Cmd::Daemon(DaemonCmd::Stop) => daemon_stop().await,
+        Cmd::Daemon(DaemonCmd::Status) => status().await,
+        Cmd::Daemon(DaemonCmd::Install) => daemon_install(),
+        Cmd::Watcher(WatcherCmd::Start { repo }) => watcher_start(repo).await,
+        Cmd::Watcher(WatcherCmd::Stop  { repo }) => watcher_stop(repo).await,
+        Cmd::Watcher(WatcherCmd::List) => watcher_list().await,
+        Cmd::Init(args) => init_cmd(args),
     }
+}
+
+async fn daemon_start() -> Result<()> {
+    // Quick ping; if it responds, we're already running.
+    if let Ok(Response::Pong) = client::call(Request::Ping).await {
+        println!("treemand already running");
+        return Ok(());
+    }
+    // Spawn the daemon detached.
+    let exe = std::env::current_exe()?;
+    let daemon_bin = exe.parent().context("exe parent")?.join("treemand");
+    if !daemon_bin.is_file() {
+        bail!("treemand binary not found next to treeman at {}", daemon_bin.display());
+    }
+    std::process::Command::new("setsid")
+        .arg(&daemon_bin)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawn treemand via setsid")?;
+    // Wait up to 5s for the socket.
+    for _ in 0..50 {
+        if let Ok(Response::Pong) = client::call(Request::Ping).await {
+            println!("treemand started");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    bail!("treemand failed to come up within 5s");
+}
+
+async fn daemon_stop() -> Result<()> {
+    match client::call(Request::Shutdown).await {
+        Ok(Response::Ok) => { println!("shutdown sent"); Ok(()) }
+        Ok(other) => bail!("unexpected response: {:?}", other),
+        Err(e) => bail!("could not reach daemon: {e}"),
+    }
+}
+
+fn daemon_install() -> Result<()> {
+    let dirs = directories::ProjectDirs::from("", "", "treeman")
+        .context("project dirs")?;
+    let unit_dir = std::path::PathBuf::from(std::env::var("HOME")?).join(".config/systemd/user");
+    std::fs::create_dir_all(&unit_dir)?;
+    let unit_path = unit_dir.join("treemand.service");
+    let exe = std::env::current_exe()?;
+    let daemon_bin = exe.parent().context("exe parent")?.join("treemand");
+    let unit = format!(
+r#"[Unit]
+Description=Treeman per-worktree DB orchestrator daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={daemon}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+"#,
+        daemon = daemon_bin.display(),
+    );
+    std::fs::write(&unit_path, unit)
+        .with_context(|| format!("write {}", unit_path.display()))?;
+    println!("wrote {}", unit_path.display());
+    // systemctl --user daemon-reload + enable + start
+    let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    let _ = std::process::Command::new("systemctl").args(["--user", "enable", "--now", "treemand.service"]).status();
+    println!("(systemctl --user daemon-reload + enable --now invoked; check `systemctl --user status treemand`)");
+    let _ = dirs;
+    Ok(())
+}
+
+async fn watcher_start(repo: Option<PathBuf>) -> Result<()> {
+    let repo_path = resolve_repo_for_watcher(repo)?;
+    let req = Request::WatcherStart { repo_path: repo_path.to_string_lossy().to_string() };
+    match client::call(req).await? {
+        Response::WatcherStarted { repo_path } => println!("watcher started: {repo_path}"),
+        Response::Error { message } => bail!("daemon: {message}"),
+        other => bail!("unexpected: {other:?}"),
+    }
+    Ok(())
+}
+
+async fn watcher_stop(repo: Option<PathBuf>) -> Result<()> {
+    let repo_path = resolve_repo_for_watcher(repo)?;
+    let req = Request::WatcherStop { repo_path: repo_path.to_string_lossy().to_string() };
+    match client::call(req).await? {
+        Response::WatcherStopped { repo_path } => println!("watcher stopped: {repo_path}"),
+        Response::Error { message } => bail!("daemon: {message}"),
+        other => bail!("unexpected: {other:?}"),
+    }
+    Ok(())
+}
+
+async fn watcher_list() -> Result<()> {
+    match client::call(Request::WatcherList).await? {
+        Response::WatcherList { repos } => {
+            if repos.is_empty() {
+                println!("(no watchers running)");
+            } else {
+                for r in repos { println!("{r}"); }
+            }
+        }
+        Response::Error { message } => bail!("daemon: {message}"),
+        other => bail!("unexpected: {other:?}"),
+    }
+    Ok(())
+}
+
+fn resolve_repo_for_watcher(repo: Option<PathBuf>) -> Result<PathBuf> {
+    match repo {
+        Some(p) => p.canonicalize().with_context(|| format!("canonicalize {}", p.display())),
+        None => {
+            let cwd = std::env::current_dir()?;
+            discover_repo_root(&cwd).context("no repo root found")
+        }
+    }
+}
+
+fn init_cmd(args: InitArgs) -> Result<()> {
+    let repo_root = match args.repo {
+        Some(p) => p.canonicalize()?,
+        None => discover_repo_root(&std::env::current_dir()?).context("no repo root")?,
+    };
+    let target = repo_root.join(".treeman.yaml");
+    if target.exists() && !args.force {
+        bail!("{} already exists (pass --force to overwrite)", target.display());
+    }
+    let registry = treeman_migrations::Registry::with_builtins();
+    let detected = registry.detect_all(&repo_root);
+    let mut framework_hint = "none";
+    let mut engine_hint = "mysql";
+    if let Some(s) = detected.first() {
+        framework_hint = s.name.as_str();
+        if let Some(e) = &s.engine_hint { engine_hint = e.as_str(); }
+    }
+    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let content = format!(
+r#"# Generated by `treeman init`. Trim / extend to taste.
+repo:
+  name: {repo_name}
+worktrees:
+  root: ../{repo_name}-worktrees
+  links:
+    - .env
+    - .env.testing
+env_scoping:
+  files: [".env.testing"]
+  skip_worktree: true
+  patches:
+    - {{ key: DB_TEST_DATABASE, template: "{repo_name}_testing_{{slug}}" }}
+databases:
+  - engine: {engine_hint}
+    name_template: "{repo_name}_testing_{{slug}}"
+    migrations: {{ framework: {framework_hint} }}
+    paratest: {{ clones: auto, name_template: "{repo_name}_testing_{{slug}}_test_{{n}}" }}
+hooks:
+  postcreate: []
+  predelete: []
+watcher:
+  paths:
+    - {{ glob: "database/migrations/**", on: auto }}
+  debounce_ms: 500
+"#);
+    std::fs::write(&target, content)?;
+    println!("wrote {} (detected framework: {framework_hint}, engine: {engine_hint})", target.display());
+    Ok(())
 }
 
 async fn prepare_cmd(args: PrepareArgs) -> Result<()> {

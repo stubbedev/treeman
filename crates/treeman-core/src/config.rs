@@ -244,12 +244,35 @@ pub struct ParatestSpec {
 }
 fn default_clones() -> ClonesSetting { ClonesSetting::Auto }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum ClonesSetting {
-    #[serde(rename = "auto")]
     Auto,
     Fixed(u32),
+}
+
+impl<'de> Deserialize<'de> for ClonesSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ClonesSetting;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("'auto' or a non-negative integer")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(ClonesSetting::Fixed(v as u32))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 { return Err(E::custom("clones must be >= 0")); }
+                Ok(ClonesSetting::Fixed(v as u32))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v == "auto" { Ok(ClonesSetting::Auto) }
+                else { Err(E::custom(format!("expected 'auto' or integer, got '{v}'"))) }
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
