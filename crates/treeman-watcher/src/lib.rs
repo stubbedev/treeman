@@ -591,7 +591,7 @@ mod tests {
             .expect("spawn index");
 
         // Initial snapshot: contains main.
-        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let first = tokio::time::timeout(scaled(2000), rx.recv())
             .await
             .expect("initial diff timely")
             .expect("initial diff present");
@@ -620,11 +620,9 @@ mod tests {
         );
 
         let mut saw_added = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + scaled(5000);
         while tokio::time::Instant::now() < deadline && !saw_added {
-            if let Ok(Some(diff)) =
-                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
-            {
+            if let Ok(Some(diff)) = tokio::time::timeout(scaled(500), rx.recv()).await {
                 if diff.added.iter().any(|p| p.ends_with("foo")) {
                     saw_added = true;
                 }
@@ -638,11 +636,9 @@ mod tests {
         );
 
         let mut saw_removed = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + scaled(5000);
         while tokio::time::Instant::now() < deadline && !saw_removed {
-            if let Ok(Some(diff)) =
-                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
-            {
+            if let Ok(Some(diff)) = tokio::time::timeout(scaled(500), rx.recv()).await {
                 if diff.removed.iter().any(|p| p.ends_with("foo")) {
                     saw_removed = true;
                 }
@@ -656,9 +652,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&main);
     }
 
+    /// macOS uses FSEvents which coalesces over ~1s windows; Linux inotify
+    /// is near-instant. Pad budgets generously on macOS so CI passes.
+    #[cfg(target_os = "macos")]
+    const TEST_SLOW_FACTOR: u32 = 4;
+    #[cfg(not(target_os = "macos"))]
+    const TEST_SLOW_FACTOR: u32 = 1;
+
+    fn scaled(ms: u64) -> Duration {
+        Duration::from_millis(ms * TEST_SLOW_FACTOR as u64)
+    }
+
     /// Drain pending diffs after a fs operation, returning the union of all
-    /// added/removed paths observed within `deadline` plus a follow-up
-    /// settling window.
+    /// added/removed paths observed within `budget`. Idle window per recv is
+    /// scaled with `TEST_SLOW_FACTOR` so macOS FSEvents has time to fire.
     async fn drain_diffs(
         rx: &mut mpsc::Receiver<WorktreeIndexDiff>,
         budget: Duration,
@@ -666,8 +673,9 @@ mod tests {
         let mut added = vec![];
         let mut removed = vec![];
         let deadline = tokio::time::Instant::now() + budget;
+        let idle = scaled(800);
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(400), rx.recv()).await {
+            match tokio::time::timeout(idle, rx.recv()).await {
                 Ok(Some(diff)) => {
                     added.extend(diff.added);
                     removed.extend(diff.removed);
@@ -692,7 +700,7 @@ mod tests {
         let main = init_repo("move");
         let (tx, mut rx) = mpsc::channel(16);
         let _h = spawn_worktree_index(main.clone(), 100, tx).await.unwrap();
-        let _initial = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let _initial = tokio::time::timeout(scaled(2000), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -709,7 +717,7 @@ mod tests {
                 "feature/bar",
             ],
         );
-        let (added, _) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        let (added, _) = drain_diffs(&mut rx, scaled(3000)).await;
         assert!(
             added.iter().any(|p| p.ends_with("bar")),
             "added bar: {added:?}"
@@ -725,7 +733,7 @@ mod tests {
                 to.to_str().unwrap(),
             ],
         );
-        let (added2, removed2) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        let (added2, removed2) = drain_diffs(&mut rx, scaled(3000)).await;
         assert!(
             removed2.iter().any(|p| p.ends_with("bar")),
             "removed bar: {removed2:?}"
@@ -743,7 +751,7 @@ mod tests {
         let main = init_repo("prune");
         let (tx, mut rx) = mpsc::channel(16);
         let _h = spawn_worktree_index(main.clone(), 100, tx).await.unwrap();
-        let _initial = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let _initial = tokio::time::timeout(scaled(2000), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -753,7 +761,7 @@ mod tests {
             &main,
             &["worktree", "add", wt.to_str().unwrap(), "-b", "stale"],
         );
-        let (added, _) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        let (added, _) = drain_diffs(&mut rx, scaled(3000)).await;
         assert!(
             added.iter().any(|p| p.ends_with("stale")),
             "added: {added:?}"
@@ -764,7 +772,7 @@ mod tests {
         std::fs::remove_dir_all(&wt).unwrap();
         run_git(&main, &["worktree", "prune"]);
 
-        let (_, removed) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        let (_, removed) = drain_diffs(&mut rx, scaled(3000)).await;
         assert!(
             removed.iter().any(|p| p.ends_with("stale")),
             "removed: {removed:?}"
@@ -813,7 +821,7 @@ mod tests {
         let main = init_repo("churn");
         let (tx, mut rx) = mpsc::channel(32);
         let _h = spawn_worktree_index(main.clone(), 100, tx).await.unwrap();
-        let _initial = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let _initial = tokio::time::timeout(scaled(2000), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -823,14 +831,16 @@ mod tests {
             let wt = main.join(".worktrees").join(n);
             run_git(&main, &["worktree", "add", wt.to_str().unwrap(), "-b", n]);
         }
-        let (added, _) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        let (added, _) = drain_diffs(&mut rx, scaled(3000)).await;
         for n in &names {
             assert!(added.iter().any(|p| p.ends_with(n)), "added {n}: {added:?}");
         }
 
         // Settle before second burst so the debounce window doesn't collapse
         // both into a net-zero diff.
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // macOS FSEvents coalesce more aggressively than inotify; give the
+        // first burst plenty of time to settle before the second.
+        tokio::time::sleep(scaled(1500)).await;
 
         for n in &names {
             let wt = main.join(".worktrees").join(n);
@@ -839,7 +849,7 @@ mod tests {
                 &["worktree", "remove", "--force", wt.to_str().unwrap()],
             );
         }
-        let (_, removed) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        let (_, removed) = drain_diffs(&mut rx, scaled(3000)).await;
         for n in &names {
             assert!(
                 removed.iter().any(|p| p.ends_with(n)),
