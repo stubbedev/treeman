@@ -188,8 +188,8 @@ func tailLogs(ctx context.Context, n int, grep string) error {
 	}
 	defer rows.Close()
 	type row struct {
-		ts                          int64
-		level, etype, msg, payload  string
+		ts                         int64
+		level, etype, msg, payload string
 	}
 	var all []row
 	for rows.Next() {
@@ -496,7 +496,7 @@ func SlugCmd() *cli.Command {
 // Rust impl had a Laravel preset; we re-use the same shape.
 func InitCmd() *cli.Command {
 	return &cli.Command{
-		Name: "init",
+		Name:  "init",
 		Flags: []cli.Flag{&cli.BoolFlag{Name: "force"}},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			cwd, _ := os.Getwd()

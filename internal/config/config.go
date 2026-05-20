@@ -20,16 +20,16 @@ import (
 // Config is the top-level structure of a `.treeman.yaml` plus the
 // global `~/.config/treeman/config.yaml`.
 type Config struct {
-	Daemon      DaemonConfig      `yaml:"daemon,omitempty"`
-	Connections ConnectionsConfig `yaml:"connections,omitempty"`
-	Snapshots   SnapshotsConfig   `yaml:"snapshots,omitempty"`
-	Repo        *RepoBlock        `yaml:"repo,omitempty"`
-	Slug        SlugRules         `yaml:"slug,omitempty"`
-	Worktrees   WorktreesConfig   `yaml:"worktrees,omitempty"`
-	EnvScoping  EnvScoping        `yaml:"env_scoping,omitempty"`
-	Databases   []DatabaseConfig  `yaml:"databases,omitempty"`
-	Hooks       HooksConfig       `yaml:"hooks,omitempty"`
-	Watcher     WatcherConfig     `yaml:"watcher,omitempty"`
+	Daemon      DaemonConfig               `yaml:"daemon,omitempty"`
+	Connections ConnectionsConfig          `yaml:"connections,omitempty"`
+	Snapshots   SnapshotsConfig            `yaml:"snapshots,omitempty"`
+	Repo        *RepoBlock                 `yaml:"repo,omitempty"`
+	Slug        SlugRules                  `yaml:"slug,omitempty"`
+	Worktrees   WorktreesConfig            `yaml:"worktrees,omitempty"`
+	EnvScoping  EnvScoping                 `yaml:"env_scoping,omitempty"`
+	Databases   []DatabaseConfig           `yaml:"databases,omitempty"`
+	Hooks       HooksConfig                `yaml:"hooks,omitempty"`
+	Watcher     WatcherConfig              `yaml:"watcher,omitempty"`
 	Frameworks  map[string]CustomFramework `yaml:"frameworks,omitempty"`
 }
 
@@ -120,8 +120,8 @@ type WorktreesConfig struct {
 
 // EnvScoping — `env_scoping:` block.
 type EnvScoping struct {
-	Files        []string  `yaml:"files,omitempty"`
-	SkipWorktree *bool     `yaml:"skip_worktree,omitempty"`
+	Files        []string   `yaml:"files,omitempty"`
+	SkipWorktree *bool      `yaml:"skip_worktree,omitempty"`
 	Patches      []EnvPatch `yaml:"patches,omitempty"`
 }
 
@@ -275,8 +275,8 @@ type Namespaces struct {
 
 // WatcherConfig — `watcher:` block.
 type WatcherConfig struct {
-	Paths       []WatcherPath `yaml:"paths,omitempty"`
-	DebounceMs  uint64        `yaml:"debounce_ms,omitempty"`
+	Paths      []WatcherPath `yaml:"paths,omitempty"`
+	DebounceMs uint64        `yaml:"debounce_ms,omitempty"`
 }
 
 // WatcherPath — one `paths:` entry.
@@ -413,4 +413,3 @@ func globalConfigPath() (string, bool) {
 	}
 	return filepath.Join(xdg, "treeman", "config.yaml"), true
 }
-

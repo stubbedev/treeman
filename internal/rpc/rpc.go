@@ -52,28 +52,28 @@ func SocketPath() (string, error) {
 
 // RequestMethod values.
 const (
-	MethodStatus            = "status"
-	MethodPing              = "ping"
-	MethodRepoRegister      = "repo_register"
-	MethodWatcherStart      = "watcher_start"
-	MethodWatcherStop       = "watcher_stop"
-	MethodWatcherList       = "watcher_list"
-	MethodWorktreeList      = "worktree_list"
-	MethodWorktreeFinalize  = "worktree_finalize"
-	MethodWorktreeTeardown  = "worktree_teardown"
-	MethodShutdown          = "shutdown"
+	MethodStatus           = "status"
+	MethodPing             = "ping"
+	MethodRepoRegister     = "repo_register"
+	MethodWatcherStart     = "watcher_start"
+	MethodWatcherStop      = "watcher_stop"
+	MethodWatcherList      = "watcher_list"
+	MethodWorktreeList     = "worktree_list"
+	MethodWorktreeFinalize = "worktree_finalize"
+	MethodWorktreeTeardown = "worktree_teardown"
+	MethodShutdown         = "shutdown"
 )
 
 // Request is the envelope every CLI message uses. Exactly one of the
 // `*Args` pointers is non-nil for any given Method.
 type Request struct {
-	Method            string                   `json:"method"`
-	RepoRegister      *RepoRegisterArgs        `json:",omitempty"`
-	WatcherStart      *WatcherStartArgs        `json:",omitempty"`
-	WatcherStop       *WatcherStopArgs         `json:",omitempty"`
-	WorktreeList      *WorktreeListArgs        `json:",omitempty"`
-	WorktreeFinalize  *WorktreeFinalizeArgs    `json:",omitempty"`
-	WorktreeTeardown  *WorktreeTeardownArgs    `json:",omitempty"`
+	Method           string                `json:"method"`
+	RepoRegister     *RepoRegisterArgs     `json:",omitempty"`
+	WatcherStart     *WatcherStartArgs     `json:",omitempty"`
+	WatcherStop      *WatcherStopArgs      `json:",omitempty"`
+	WorktreeList     *WorktreeListArgs     `json:",omitempty"`
+	WorktreeFinalize *WorktreeFinalizeArgs `json:",omitempty"`
+	WorktreeTeardown *WorktreeTeardownArgs `json:",omitempty"`
 }
 
 // MarshalJSON flattens the discriminator + the matching args struct
@@ -213,17 +213,17 @@ type WorktreeTeardownArgs struct {
 
 // Response kinds. Wire shape: {"kind": "ok", ...}.
 const (
-	KindOk                       = "ok"
-	KindPong                     = "pong"
-	KindStatus                   = "status"
-	KindRepoRegistered           = "repo_registered"
-	KindWatcherStarted           = "watcher_started"
-	KindWatcherStopped           = "watcher_stopped"
-	KindWatcherList              = "watcher_list"
-	KindWorktreeList             = "worktree_list"
-	KindWorktreeFinalizeQueued   = "worktree_finalize_queued"
-	KindWorktreeTeardownQueued   = "worktree_teardown_queued"
-	KindError                    = "error"
+	KindOk                     = "ok"
+	KindPong                   = "pong"
+	KindStatus                 = "status"
+	KindRepoRegistered         = "repo_registered"
+	KindWatcherStarted         = "watcher_started"
+	KindWatcherStopped         = "watcher_stopped"
+	KindWatcherList            = "watcher_list"
+	KindWorktreeList           = "worktree_list"
+	KindWorktreeFinalizeQueued = "worktree_finalize_queued"
+	KindWorktreeTeardownQueued = "worktree_teardown_queued"
+	KindError                  = "error"
 )
 
 // Response is the envelope. Mirrors Rust's `#[serde(tag = "kind")]`.
@@ -238,9 +238,9 @@ type Response struct {
 	// RepoRegistered
 	RepoID int64 `json:"repo_id,omitempty"`
 	// Watcher
-	RepoPath  string            `json:"repo_path,omitempty"`
-	Repos     []WatcherSummary  `json:"repos,omitempty"`
-	Worktrees []string          `json:"worktrees,omitempty"`
+	RepoPath  string           `json:"repo_path,omitempty"`
+	Repos     []WatcherSummary `json:"repos,omitempty"`
+	Worktrees []string         `json:"worktrees,omitempty"`
 	// Finalize / Teardown queued
 	WorktreePath string `json:"worktree_path,omitempty"`
 	// Error

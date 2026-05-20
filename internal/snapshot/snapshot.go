@@ -24,15 +24,15 @@ const FormatVersion uint32 = 1
 // Key fingerprints a snapshot. Two prepare runs that share every
 // field can reuse the same template DB.
 type Key struct {
-	FormatVersion      uint32            `json:"format_version"`
-	Engine             string            `json:"engine"`
-	EngineVersion      string            `json:"engine_version"`
-	SourceDBName       string            `json:"source_db_name"`
-	Framework          string            `json:"framework"`
-	HashMode           string            `json:"hash_mode"`
-	MigrationsHashHex  string            `json:"migrations_hash_hex"`
-	DumpHashHex        string            `json:"dump_hash_hex,omitempty"`
-	LockfileHashes     map[string]string `json:"lockfile_hashes"`
+	FormatVersion     uint32            `json:"format_version"`
+	Engine            string            `json:"engine"`
+	EngineVersion     string            `json:"engine_version"`
+	SourceDBName      string            `json:"source_db_name"`
+	Framework         string            `json:"framework"`
+	HashMode          string            `json:"hash_mode"`
+	MigrationsHashHex string            `json:"migrations_hash_hex"`
+	DumpHashHex       string            `json:"dump_hash_hex,omitempty"`
+	LockfileHashes    map[string]string `json:"lockfile_hashes"`
 }
 
 // New constructs a Key with the format version pinned.
@@ -61,14 +61,14 @@ func New(engine, engineVersion, sourceDB, framework, hashMode, migrationsHash, d
 func (k Key) Fingerprint() string {
 	// Sort lockfile keys so JSON encoding is canonical.
 	type stableKey struct {
-		FormatVersion     uint32     `json:"format_version"`
-		Engine            string     `json:"engine"`
-		EngineVersion     string     `json:"engine_version"`
-		SourceDBName      string     `json:"source_db_name"`
-		Framework         string     `json:"framework"`
-		HashMode          string     `json:"hash_mode"`
-		MigrationsHashHex string     `json:"migrations_hash_hex"`
-		DumpHashHex       string     `json:"dump_hash_hex,omitempty"`
+		FormatVersion     uint32      `json:"format_version"`
+		Engine            string      `json:"engine"`
+		EngineVersion     string      `json:"engine_version"`
+		SourceDBName      string      `json:"source_db_name"`
+		Framework         string      `json:"framework"`
+		HashMode          string      `json:"hash_mode"`
+		MigrationsHashHex string      `json:"migrations_hash_hex"`
+		DumpHashHex       string      `json:"dump_hash_hex,omitempty"`
 		LockfileHashes    [][2]string `json:"lockfile_hashes"`
 	}
 	sk := stableKey{

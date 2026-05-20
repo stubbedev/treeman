@@ -134,7 +134,7 @@ func renderGroup(steps []config.SingleStep, defaultCwd string) string {
 }
 
 // shellSingleQuote wraps a string in single quotes, escaping any
-// embedded ` ' ` as `'\''` per POSIX.
+// embedded ` ' ` as `'\”` per POSIX.
 func shellSingleQuote(s string) string {
 	var b strings.Builder
 	b.Grow(len(s) + 2)

@@ -36,14 +36,14 @@ const (
 
 // Spec describes one migration framework.
 type Spec struct {
-	Name             string
-	Markers          []string // each entry may be `a|b|c` (any-of)
-	MigrationDirs    []string // glob patterns relative to repo root
-	FileGlobs        []string // glob patterns for migration files in those dirs
-	Lockfiles        []string
-	HashMode         HashMode
-	OnModify         OnModify
-	EngineHint       string // "mysql", "postgres", "" if unknown
+	Name          string
+	Markers       []string // each entry may be `a|b|c` (any-of)
+	MigrationDirs []string // glob patterns relative to repo root
+	FileGlobs     []string // glob patterns for migration files in those dirs
+	Lockfiles     []string
+	HashMode      HashMode
+	OnModify      OnModify
+	EngineHint    string // "mysql", "postgres", "" if unknown
 }
 
 // Detect returns true iff every marker group in spec.Markers has at
@@ -97,7 +97,7 @@ func (r *Registry) DetectAll(repoRoot string) []Spec {
 func builtins() []Spec {
 	return []Spec{
 		{
-			Name: "laravel",
+			Name:    "laravel",
 			Markers: []string{"artisan"},
 			MigrationDirs: []string{
 				"database/migrations",
@@ -158,7 +158,7 @@ func builtins() []Spec {
 			OnModify:      OnRebuild,
 		},
 		{
-			Name: "prisma",
+			Name:    "prisma",
 			Markers: []string{"prisma/schema.prisma"},
 			MigrationDirs: []string{
 				"prisma/migrations",

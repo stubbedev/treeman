@@ -18,10 +18,10 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/dumpload"
-	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
-	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	dbes "github.com/stubbedev/treeman/internal/db/es"
 	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
+	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
+	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/slug"
@@ -172,9 +172,9 @@ func prepareMySQL(
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
 		fmt.Sprintf("clones=%d", len(clones)),
 		repoID, worktreeID, "", 0, map[string]string{
-			"source_db":   sourceDB,
-			"template":    templateName,
-			"clones":      fmt.Sprintf("%d", len(clones)),
+			"source_db": sourceDB,
+			"template":  templateName,
+			"clones":    fmt.Sprintf("%d", len(clones)),
 		})
 
 	return Outcome{

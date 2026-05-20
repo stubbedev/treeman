@@ -63,8 +63,10 @@ func MustAbs(p string) string {
 
 // PrintOK / PrintWarn / PrintErr are convenience println helpers
 // with consistent prefixes (no ANSI colour for portability).
-func PrintOK(format string, args ...any)   { fmt.Println("ok: " + fmt.Sprintf(format, args...)) }
-func PrintWarn(format string, args ...any) { fmt.Fprintln(os.Stderr, "warn: "+fmt.Sprintf(format, args...)) }
+func PrintOK(format string, args ...any) { fmt.Println("ok: " + fmt.Sprintf(format, args...)) }
+func PrintWarn(format string, args ...any) {
+	fmt.Fprintln(os.Stderr, "warn: "+fmt.Sprintf(format, args...))
+}
 
 // Ctx returns a background context (no per-CLI cancellation today).
 func Ctx() context.Context { return context.Background() }

@@ -3,12 +3,13 @@
 // Ported from `crates/treeman-core/src/template.rs`.
 //
 // Known keys:
-//   {slug}              — the slug value (e.g. proj_1234)
-//   {slug_dash}         — underscores replaced with hyphens
-//   {slug_redis_queue}  — 6..15 (cksum-derived)
-//   {slug_redis_cache}  — 6..15 (cksum-derived, distinct from queue)
-//   {n}                 — paratest replica index (only valid when
-//                        `.WithN()` was used on the context)
+//
+//	{slug}              — the slug value (e.g. proj_1234)
+//	{slug_dash}         — underscores replaced with hyphens
+//	{slug_redis_queue}  — 6..15 (cksum-derived)
+//	{slug_redis_cache}  — 6..15 (cksum-derived, distinct from queue)
+//	{n}                 — paratest replica index (only valid when
+//	                     `.WithN()` was used on the context)
 //
 // Unknown keys fail loudly (RenderError.UnknownKey) so a YAML typo
 // doesn't silently render as empty and quietly break some downstream
@@ -54,8 +55,8 @@ func (c Context) WithN(n int) Context {
 
 // RenderError reports a typo or unsupported key in a template.
 type RenderError struct {
-	UnknownKey   string
-	UnmatchedAt  int
+	UnknownKey  string
+	UnmatchedAt int
 }
 
 func (e *RenderError) Error() string {
