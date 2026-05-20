@@ -45,6 +45,69 @@ async fn main() -> Result<()> {
     info!(event_type = "daemon_started", socket = %socket_path.display(),
           pid = pid as i64, "treemand listening");
 
+    // Periodic snapshot GC. Walks the catalog per
+    // `cfg.snapshots.retention.*` policy and drops evicted templates from
+    // their engines. Interval is configured per-repo via
+    // `snapshots.retention.gc_interval_minutes` (default 60); we use the
+    // smallest interval across all registered repos so each gets at least
+    // its own cadence.
+    let gc_pool = pool.clone();
+    let gc_shutdown = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        // Short startup delay so the first GC doesn't fight watcher resume.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        loop {
+            let interval_minutes = resolve_gc_interval(&gc_pool).await;
+            let cfg = match resolve_gc_cfg(&gc_pool).await {
+                Some(c) => c,
+                None => {
+                    // No repos registered → nothing to GC. Re-poll on
+                    // interval in case one gets registered.
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(
+                            (interval_minutes * 60).into()
+                        )) => {},
+                        _ = gc_shutdown.notified() => break,
+                    }
+                    continue;
+                }
+            };
+            match treeman_snapshot::run_gc(&gc_pool, &cfg).await {
+                Ok(report) if report.catalog_evicted > 0 => {
+                    info!(
+                        evicted = report.catalog_evicted,
+                        dropped = report.engine_dropped,
+                        failed = report.engine_failed,
+                        "snapshot GC pass complete"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "snapshot GC pass failed"),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    (interval_minutes * 60).into()
+                )) => {},
+                _ = gc_shutdown.notified() => break,
+            }
+        }
+    });
+
+    // Auto-resume watchers for every repo registered in SQLite. Lets
+    // `systemctl restart treemand` regain coverage without manual
+    // `treeman watcher start` calls.
+    match treeman_store::list_repo_paths(state.sqlite()).await {
+        Ok(paths) => {
+            for p in paths {
+                match state.start_watcher(&p).await {
+                    Ok(()) => info!(repo = %p, "resumed watcher"),
+                    Err(e) => warn!(repo = %p, error = %e, "resume watcher failed"),
+                }
+            }
+        }
+        Err(e) => warn!(error = %e, "list_repo_paths failed"),
+    }
+
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     loop {
@@ -145,11 +208,57 @@ async fn dispatch(
         Request::WatcherList => Response::WatcherList {
             repos: state.list_watchers(),
         },
+        Request::WorktreeList { repo_path } => match state.list_worktrees(&repo_path) {
+            Ok(worktrees) => Response::WorktreeList { worktrees },
+            Err(e) => Response::Error {
+                message: e.to_string(),
+            },
+        },
         Request::Shutdown => {
             shutdown.notify_one();
             Response::Ok
         }
     }
+}
+
+/// Pick the GC interval. Strategy: use the smallest
+/// `snapshots.retention.gc_interval_minutes` across all registered repos,
+/// floor-clamped to 5 minutes. If no repos are registered or no configs
+/// parse, fall back to the schema default (60 min).
+async fn resolve_gc_interval(pool: &sqlx::SqlitePool) -> u32 {
+    let default = 60u32;
+    let Ok(paths) = treeman_store::list_repo_paths(pool).await else {
+        return default;
+    };
+    if paths.is_empty() {
+        return default;
+    }
+    let mut min = u32::MAX;
+    for p in &paths {
+        let root = std::path::PathBuf::from(p);
+        if let Ok(cfg) = treeman_core::config::load_layered(Some(&root)) {
+            let v = cfg.snapshots.retention.gc_interval_minutes;
+            if v > 0 && v < min {
+                min = v;
+            }
+        }
+    }
+    if min == u32::MAX { default } else { min.max(5) }
+}
+
+/// Pick a single `Config` for GC. We need engine connection info; if
+/// multiple repos are registered we just take the first one that loads —
+/// the connections block is global per-host in practice (same MySQL/Pg
+/// server hosts every repo's templates).
+async fn resolve_gc_cfg(pool: &sqlx::SqlitePool) -> Option<treeman_core::config::Config> {
+    let paths = treeman_store::list_repo_paths(pool).await.ok()?;
+    for p in &paths {
+        let root = std::path::PathBuf::from(p);
+        if let Ok(cfg) = treeman_core::config::load_layered(Some(&root)) {
+            return Some(cfg);
+        }
+    }
+    None
 }
 
 async fn write_response(

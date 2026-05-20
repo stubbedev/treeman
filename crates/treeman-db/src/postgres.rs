@@ -108,6 +108,21 @@ impl PostgresDriver {
         res
     }
 
+    /// Drop a snapshot template database. Idempotent. Terminates any
+    /// remaining backend connections to the template first.
+    pub async fn drop_snapshot(&self, template: &str) -> Result<()> {
+        validate_ident(template)?;
+        self.execute_outside_tx(&format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = '{template}' AND pid <> pg_backend_pid()",
+        ))
+        .await
+        .ok();
+        self.execute_outside_tx(&format!(r#"DROP DATABASE IF EXISTS "{template}""#))
+            .await?;
+        Ok(())
+    }
+
     /// Open a pool scoped to a specific database (needed by dump loader
     /// which has to connect TO the target DB, not the maintenance one).
     pub async fn acquire_db(&self, db: &str) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {

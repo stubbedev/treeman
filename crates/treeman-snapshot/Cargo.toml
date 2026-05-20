@@ -19,3 +19,4 @@ treeman-core = { workspace = true }
 treeman-migrations = { workspace = true }
 treeman-db = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }

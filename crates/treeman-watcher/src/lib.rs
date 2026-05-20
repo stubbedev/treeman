@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
@@ -237,6 +237,253 @@ async fn spawn_one(
     Ok(h)
 }
 
+/// Diff emitted by [`spawn_worktree_index`]. `added`/`removed` are absolute
+/// worktree paths (including the main worktree on the initial snapshot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeIndexDiff {
+    pub added: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
+}
+
+/// Watch `.git/worktrees/` and emit a [`WorktreeIndexDiff`] whenever git adds
+/// or removes a linked worktree. The first message emitted contains the full
+/// initial set under `added` (including the main worktree). Cheap: one notify
+/// handle, no polling, no subprocess.
+pub async fn spawn_worktree_index(
+    repo_root: PathBuf,
+    debounce_ms: u64,
+    tx: mpsc::Sender<WorktreeIndexDiff>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use notify_debouncer_full::new_debouncer;
+
+    let git_common = resolve_git_common_dir(&repo_root)?;
+    let worktrees_dir = git_common.join("worktrees");
+    std::fs::create_dir_all(&worktrees_dir).ok();
+    info!(dir = %worktrees_dir.display(), "starting worktree index");
+
+    let (raw_tx, mut raw_rx) = mpsc::channel::<()>(64);
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(debounce_ms),
+        None,
+        move |res: Result<Vec<notify_debouncer_full::DebouncedEvent>, Vec<notify::Error>>| {
+            if let Ok(events) = res {
+                if !events.is_empty() {
+                    let _ = raw_tx.try_send(());
+                }
+            }
+        },
+    )?;
+    {
+        use notify::Watcher;
+        debouncer
+            .watcher()
+            .watch(&worktrees_dir, notify::RecursiveMode::Recursive)?;
+    }
+
+    let initial = list_worktrees(&repo_root, &git_common);
+    let mut known: std::collections::HashSet<PathBuf> = initial.iter().cloned().collect();
+    let _ = tx
+        .send(WorktreeIndexDiff {
+            added: initial,
+            removed: vec![],
+        })
+        .await;
+
+    let h = tokio::spawn(async move {
+        let _keep = debouncer;
+        let repo = repo_root.clone();
+        let common = git_common.clone();
+        // After each notify burst, re-scan once immediately and again
+        // after a short delay. Catches the race where `git worktree add`
+        // creates `.git/worktrees/<id>/` slightly before `<id>/gitdir` is
+        // written — the first scan may miss the new entry; the follow-up
+        // picks it up.
+        loop {
+            if raw_rx.recv().await.is_none() {
+                break;
+            }
+            // Two passes: immediate + delayed. The follow-up catches the
+            // race where `git worktree add` creates `.git/worktrees/<id>/`
+            // slightly before `<id>/gitdir` is written — the first scan
+            // may miss the new entry.
+            for delay in [Duration::from_millis(0), Duration::from_millis(300)] {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let cur: std::collections::HashSet<PathBuf> =
+                    list_worktrees(&repo, &common).into_iter().collect();
+                let added: Vec<PathBuf> = cur.difference(&known).cloned().collect();
+                let removed: Vec<PathBuf> = known.difference(&cur).cloned().collect();
+                if added.is_empty() && removed.is_empty() {
+                    continue;
+                }
+                debug!(?added, ?removed, "worktree index change");
+                known = cur;
+                if tx.send(WorktreeIndexDiff { added, removed }).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    Ok(h)
+}
+
+/// Watch a fixed set of config files. The watcher emits a unit message
+/// every time one of `paths` is created, modified, or deleted. Non-existent
+/// paths are still tracked: we recursively watch each parent directory
+/// (NonRecursive) and filter events by filename. Cheap: one debouncer.
+pub async fn spawn_config_watcher(
+    paths: Vec<PathBuf>,
+    debounce_ms: u64,
+    tx: mpsc::Sender<()>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use notify::Watcher;
+    use notify_debouncer_full::new_debouncer;
+
+    if paths.is_empty() {
+        return Ok(tokio::spawn(async {}));
+    }
+    let filenames: std::collections::HashSet<std::ffi::OsString> = paths
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
+        .collect();
+    let parents: std::collections::HashSet<PathBuf> = paths
+        .iter()
+        .filter_map(|p| p.parent().map(|p| p.to_path_buf()))
+        .collect();
+    if parents.is_empty() {
+        return Ok(tokio::spawn(async {}));
+    }
+
+    let (raw_tx, mut raw_rx) = mpsc::channel::<()>(16);
+    let filenames_for_cb = filenames.clone();
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(debounce_ms),
+        None,
+        move |res: Result<Vec<notify_debouncer_full::DebouncedEvent>, Vec<notify::Error>>| {
+            let Ok(events) = res else { return };
+            let relevant = events.iter().any(|ev| {
+                ev.event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name().is_some_and(|n| filenames_for_cb.contains(n)))
+            });
+            if relevant {
+                let _ = raw_tx.try_send(());
+            }
+        },
+    )?;
+    {
+        let w = debouncer.watcher();
+        for p in &parents {
+            std::fs::create_dir_all(p).ok();
+            let _ = w.watch(p, notify::RecursiveMode::NonRecursive);
+        }
+    }
+    info!(?paths, "starting config watcher");
+
+    let h = tokio::spawn(async move {
+        let _keep = debouncer;
+        while raw_rx.recv().await.is_some() {
+            if tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(h)
+}
+
+/// Resolve the *common* git directory for a repo root. Handles four cases:
+///
+/// 1. Plain repo: `<repo>/.git/` is a directory → it IS the common dir.
+/// 2. Linked worktree: `<repo>/.git` is a file `gitdir: <path>` pointing into
+///    `<main>/.git/worktrees/<id>/`. `commondir` marker (relative or absolute)
+///    leads to `<main>/.git`.
+/// 3. Submodule: `<repo>/.git` is a file pointing into
+///    `<super>/.git/modules/<name>/` — no `commondir` marker because the
+///    submodule has its own object store. We treat that directory as the
+///    common dir directly.
+/// 4. Symlinked `.git`: any of the above wrapped in a symlink. We
+///    canonicalize first so the resolved path is stable.
+fn resolve_git_common_dir(repo_root: &Path) -> Result<PathBuf> {
+    let dot_git = repo_root.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git)
+        .with_context(|| format!("stat {}", dot_git.display()))?;
+    if meta.file_type().is_symlink() {
+        let target = std::fs::canonicalize(&dot_git)
+            .with_context(|| format!("canonicalize {}", dot_git.display()))?;
+        return resolve_git_common_dir_from(&target);
+    }
+    if meta.is_dir() {
+        return Ok(dot_git.canonicalize().unwrap_or(dot_git));
+    }
+    if meta.is_file() {
+        let raw = std::fs::read_to_string(&dot_git)?;
+        let gitdir = raw.trim_start_matches("gitdir:").trim();
+        let gitdir_path = if Path::new(gitdir).is_absolute() {
+            PathBuf::from(gitdir)
+        } else {
+            repo_root.join(gitdir)
+        };
+        return resolve_git_common_dir_from(&gitdir_path);
+    }
+    anyhow::bail!("no .git at {}", repo_root.display())
+}
+
+/// Given a candidate gitdir (either a worktree's per-worktree dir or a
+/// submodule's `.git/modules/<name>`), resolve to the common dir.
+fn resolve_git_common_dir_from(gitdir: &Path) -> Result<PathBuf> {
+    let gitdir_abs = gitdir
+        .canonicalize()
+        .unwrap_or_else(|_| gitdir.to_path_buf());
+    let commondir_marker = gitdir_abs.join("commondir");
+    if let Ok(rel) = std::fs::read_to_string(&commondir_marker) {
+        let r = rel.trim();
+        let joined = if Path::new(r).is_absolute() {
+            PathBuf::from(r)
+        } else {
+            gitdir_abs.join(r)
+        };
+        return Ok(joined.canonicalize().unwrap_or(joined));
+    }
+    // No commondir marker → this gitdir IS the common dir (submodule case
+    // or a directly-pointed-at gitdir).
+    Ok(gitdir_abs)
+}
+
+/// Enumerate worktree paths by reading `.git/worktrees/*/gitdir`. Main
+/// worktree is identified by `<git_common>/..`. Avoids spawning git.
+fn list_worktrees(repo_root: &Path, git_common: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    let main = git_common
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| repo_root.to_path_buf());
+    if let Ok(canon) = main.canonicalize() {
+        out.push(canon);
+    } else {
+        out.push(main);
+    }
+    let wt_dir = git_common.join("worktrees");
+    if let Ok(rd) = std::fs::read_dir(&wt_dir) {
+        for ent in rd.flatten() {
+            let gitdir_marker = ent.path().join("gitdir");
+            let Ok(raw) = std::fs::read_to_string(&gitdir_marker) else {
+                continue;
+            };
+            let p = PathBuf::from(raw.trim());
+            // `gitdir` points at `<wt>/.git`; the worktree itself is its
+            // parent.
+            let wt = p.parent().map(|p| p.to_path_buf()).unwrap_or(p);
+            let canon = wt.canonicalize().unwrap_or(wt);
+            out.push(canon);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn collect_files(spec: &FrameworkSpec, dirs: &[PathBuf]) -> Vec<PathBuf> {
     let mut all = vec![];
     for d in dirs {
@@ -299,5 +546,307 @@ mod tests {
             Dispatch::Delta(added) => assert_eq!(added, vec!["h2".to_string()]),
             d => panic!("expected Delta, got {d:?}"),
         }
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!(
+            "treeman-wt-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("git exec");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worktree_index_emits_add_and_remove() {
+        let main = tmp_dir("main");
+        run_git(&main, &["init", "-q", "-b", "main"]);
+        run_git(&main, &["config", "user.email", "t@t"]);
+        run_git(&main, &["config", "user.name", "t"]);
+        run_git(&main, &["commit", "--allow-empty", "-q", "-m", "init"]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let _h = spawn_worktree_index(main.clone(), 100, tx)
+            .await
+            .expect("spawn index");
+
+        // Initial snapshot: contains main.
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("initial diff timely")
+            .expect("initial diff present");
+        assert_eq!(first.removed, Vec::<PathBuf>::new());
+        assert!(
+            first
+                .added
+                .iter()
+                .any(|p| p.canonicalize().unwrap_or_default()
+                    == main.canonicalize().unwrap_or_default()),
+            "initial added should include main, got {:?}",
+            first.added
+        );
+
+        let wt_path = main.join(".worktrees").join("feature").join("foo");
+        std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                wt_path.to_str().unwrap(),
+                "-b",
+                "feature/foo",
+            ],
+        );
+
+        let mut saw_added = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !saw_added {
+            if let Ok(Some(diff)) =
+                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            {
+                if diff.added.iter().any(|p| p.ends_with("foo")) {
+                    saw_added = true;
+                }
+            }
+        }
+        assert!(saw_added, "expected added event for feature/foo worktree");
+
+        run_git(
+            &main,
+            &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
+        );
+
+        let mut saw_removed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !saw_removed {
+            if let Ok(Some(diff)) =
+                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            {
+                if diff.removed.iter().any(|p| p.ends_with("foo")) {
+                    saw_removed = true;
+                }
+            }
+        }
+        assert!(
+            saw_removed,
+            "expected removed event for feature/foo worktree"
+        );
+
+        let _ = std::fs::remove_dir_all(&main);
+    }
+
+    /// Drain pending diffs after a fs operation, returning the union of all
+    /// added/removed paths observed within `deadline` plus a follow-up
+    /// settling window.
+    async fn drain_diffs(
+        rx: &mut mpsc::Receiver<WorktreeIndexDiff>,
+        budget: Duration,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut added = vec![];
+        let mut removed = vec![];
+        let deadline = tokio::time::Instant::now() + budget;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(400), rx.recv()).await {
+                Ok(Some(diff)) => {
+                    added.extend(diff.added);
+                    removed.extend(diff.removed);
+                }
+                _ => break,
+            }
+        }
+        (added, removed)
+    }
+
+    fn init_repo(tag: &str) -> PathBuf {
+        let p = tmp_dir(tag);
+        run_git(&p, &["init", "-q", "-b", "main"]);
+        run_git(&p, &["config", "user.email", "t@t"]);
+        run_git(&p, &["config", "user.name", "t"]);
+        run_git(&p, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        p
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worktree_move_emits_remove_then_add() {
+        let main = init_repo("move");
+        let (tx, mut rx) = mpsc::channel(16);
+        let _h = spawn_worktree_index(main.clone(), 100, tx).await.unwrap();
+        let _initial = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let from = main.join(".worktrees").join("feature").join("bar");
+        std::fs::create_dir_all(from.parent().unwrap()).unwrap();
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                from.to_str().unwrap(),
+                "-b",
+                "feature/bar",
+            ],
+        );
+        let (added, _) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        assert!(
+            added.iter().any(|p| p.ends_with("bar")),
+            "added bar: {added:?}"
+        );
+
+        let to = main.join(".worktrees").join("feature").join("baz");
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "move",
+                from.to_str().unwrap(),
+                to.to_str().unwrap(),
+            ],
+        );
+        let (added2, removed2) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        assert!(
+            removed2.iter().any(|p| p.ends_with("bar")),
+            "removed bar: {removed2:?}"
+        );
+        assert!(
+            added2.iter().any(|p| p.ends_with("baz")),
+            "added baz: {added2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&main);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worktree_prune_emits_remove() {
+        let main = init_repo("prune");
+        let (tx, mut rx) = mpsc::channel(16);
+        let _h = spawn_worktree_index(main.clone(), 100, tx).await.unwrap();
+        let _initial = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let wt = main.join(".worktrees").join("stale");
+        run_git(
+            &main,
+            &["worktree", "add", wt.to_str().unwrap(), "-b", "stale"],
+        );
+        let (added, _) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        assert!(
+            added.iter().any(|p| p.ends_with("stale")),
+            "added: {added:?}"
+        );
+
+        // Delete the worktree dir on disk without telling git → makes it
+        // prunable.
+        std::fs::remove_dir_all(&wt).unwrap();
+        run_git(&main, &["worktree", "prune"]);
+
+        let (_, removed) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        assert!(
+            removed.iter().any(|p| p.ends_with("stale")),
+            "removed: {removed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&main);
+    }
+
+    #[test]
+    fn common_dir_handles_symlinked_dot_git() {
+        let d = tmp_dir("symlink");
+        let real_git = d.join("real.git");
+        std::fs::create_dir_all(real_git.join("worktrees")).unwrap();
+        let link = d.join(".git");
+        std::os::unix::fs::symlink(&real_git, &link).unwrap();
+        let resolved = resolve_git_common_dir(&d).expect("resolve");
+        assert_eq!(
+            resolved,
+            real_git.canonicalize().unwrap(),
+            "symlinked .git should resolve to real path"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn common_dir_handles_submodule_style_gitfile() {
+        // Submodule .git is a file pointing at `<super>/.git/modules/<name>/`
+        // and has NO `commondir` marker — that gitdir IS the common dir.
+        let sup = tmp_dir("submod");
+        let module = sup.join(".git").join("modules").join("sub");
+        std::fs::create_dir_all(module.join("worktrees")).unwrap();
+        let sub = sup.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".git"), format!("gitdir: {}\n", module.display())).unwrap();
+        let resolved = resolve_git_common_dir(&sub).expect("resolve");
+        assert_eq!(
+            resolved,
+            module.canonicalize().unwrap(),
+            "submodule .git file should resolve to module dir"
+        );
+        let _ = std::fs::remove_dir_all(&sup);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worktree_rapid_churn_converges() {
+        let main = init_repo("churn");
+        let (tx, mut rx) = mpsc::channel(32);
+        let _h = spawn_worktree_index(main.clone(), 100, tx).await.unwrap();
+        let _initial = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let names = ["alpha", "beta", "gamma"];
+        for n in &names {
+            let wt = main.join(".worktrees").join(n);
+            run_git(&main, &["worktree", "add", wt.to_str().unwrap(), "-b", n]);
+        }
+        let (added, _) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        for n in &names {
+            assert!(added.iter().any(|p| p.ends_with(n)), "added {n}: {added:?}");
+        }
+
+        // Settle before second burst so the debounce window doesn't collapse
+        // both into a net-zero diff.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        for n in &names {
+            let wt = main.join(".worktrees").join(n);
+            run_git(
+                &main,
+                &["worktree", "remove", "--force", wt.to_str().unwrap()],
+            );
+        }
+        let (_, removed) = drain_diffs(&mut rx, Duration::from_secs(3)).await;
+        for n in &names {
+            assert!(
+                removed.iter().any(|p| p.ends_with(n)),
+                "removed {n}: {removed:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&main);
     }
 }

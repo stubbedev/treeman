@@ -80,6 +80,15 @@ pub async fn ensure_repo(pool: &SqlitePool, path: &Path, name: &str) -> Result<i
     Ok(id)
 }
 
+/// Return all registered repo paths, ordered by ID. Used by the daemon to
+/// auto-resume per-repo watchers on startup.
+pub async fn list_repo_paths(pool: &SqlitePool) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT path FROM repos ORDER BY id")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(p,)| p).collect())
+}
+
 pub async fn ensure_worktree(
     pool: &SqlitePool,
     repo_id: i64,

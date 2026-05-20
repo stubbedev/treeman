@@ -243,6 +243,11 @@ enum WatcherCmd {
     },
     /// List currently-watched repos.
     List,
+    /// List linked worktrees currently being watched for a repo.
+    Worktrees {
+        #[command(flatten)]
+        common: RepoCommon,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -596,6 +601,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Watcher(WatcherCmd::Start { common }) => watcher_start(common.repo).await,
         Cmd::Watcher(WatcherCmd::Stop { common }) => watcher_stop(common.repo).await,
         Cmd::Watcher(WatcherCmd::List) => watcher_list().await,
+        Cmd::Watcher(WatcherCmd::Worktrees { common }) => watcher_worktrees(common.repo).await,
         Cmd::Init(args) => init_cmd(args),
         Cmd::Completions(args) => completions(args),
         Cmd::Manpage => manpage(),
@@ -1019,7 +1025,28 @@ async fn watcher_list() -> Result<()> {
                 println!("(no watchers running)");
             } else {
                 for r in repos {
-                    println!("{r}");
+                    println!("{} ({} worktrees)", r.repo, r.worktree_count);
+                }
+            }
+        }
+        Response::Error { message } => bail!("daemon: {message}"),
+        other => bail!("unexpected: {other:?}"),
+    }
+    Ok(())
+}
+
+async fn watcher_worktrees(repo: Option<PathBuf>) -> Result<()> {
+    let repo_root = resolve_repo_for_watcher(repo)?;
+    let req = Request::WorktreeList {
+        repo_path: repo_root.to_string_lossy().to_string(),
+    };
+    match client::call(req).await? {
+        Response::WorktreeList { worktrees } => {
+            if worktrees.is_empty() {
+                println!("(no per-worktree watchers running)");
+            } else {
+                for w in worktrees {
+                    println!("{w}");
                 }
             }
         }
@@ -2104,17 +2131,15 @@ async fn worktree_create(
             }
         }
         None => {
-            let root = if cfg.worktrees.root.starts_with('/') {
-                PathBuf::from(&cfg.worktrees.root)
-            } else {
-                repo_root.join(&cfg.worktrees.root)
-            };
-            root.join(branch.replace('/', "-"))
+            let root = resolve_worktrees_root(&cfg, &repo_root);
+            root.join(&branch)
         }
     };
     if wt_path.exists() {
         bail!("destination path already exists: {}", wt_path.display());
     }
+    ensure_not_nested_worktree(&repo_root, &wt_path)?;
+    ensure_worktrees_gitignored(&cfg, &repo_root)?;
     std::fs::create_dir_all(wt_path.parent().unwrap_or(&repo_root))?;
 
     let base = match from {
@@ -2311,8 +2336,93 @@ async fn worktree_delete(target: String, repo: Option<PathBuf>, force: bool) -> 
     }
 
     treeman_store::mark_worktree_deleted(&pool, wt.id).await?;
+    prune_empty_parents(&wt_path, &resolve_worktrees_root(&cfg, &repo_root));
     println!("deleted worktree #{} ({})", wt.id, wt_path.display());
     Ok(())
+}
+
+/// If `worktrees.root` resolves inside `repo_root`, append a top-level
+/// `/<dir>/` entry to the repo's `.gitignore` (creating it if absent) so the
+/// linked-worktree dirs don't show up as untracked content. No-op if the
+/// root is absolute/outside the repo, or if `.gitignore` already lists it.
+fn ensure_worktrees_gitignored(cfg: &treeman_core::config::Config, repo_root: &Path) -> Result<()> {
+    let root = resolve_worktrees_root(cfg, repo_root);
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let repo_canon = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let Ok(rel) = root_canon.strip_prefix(&repo_canon) else {
+        return Ok(()); // root lives outside the repo — nothing to ignore here
+    };
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    if rel_str.is_empty() {
+        return Ok(());
+    }
+    let entry = format!("/{rel_str}/");
+    let gitignore = repo_root.join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    let already = existing.lines().any(|l| {
+        let t = l.trim();
+        t == entry || t == format!("/{rel_str}") || t == rel_str || t == format!("{rel_str}/")
+    });
+    if already {
+        return Ok(());
+    }
+    let mut new = existing;
+    if !new.is_empty() && !new.ends_with('\n') {
+        new.push('\n');
+    }
+    new.push_str(&entry);
+    new.push('\n');
+    std::fs::write(&gitignore, new).with_context(|| format!("writing {}", gitignore.display()))?;
+    Ok(())
+}
+
+fn resolve_worktrees_root(cfg: &treeman_core::config::Config, repo_root: &Path) -> PathBuf {
+    let raw = &cfg.worktrees.root;
+    if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        repo_root.join(raw)
+    }
+}
+
+/// Walk up from `wt_path` and `rmdir` each empty parent. Stops at
+/// `worktrees_root` (exclusive) so we never delete the configured root or
+/// anything outside it. Best-effort: any non-empty dir or `remove_dir`
+/// failure aborts the walk.
+fn prune_empty_parents(wt_path: &Path, worktrees_root: &Path) {
+    let stop = worktrees_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktrees_root.to_path_buf());
+    let mut dir = match wt_path.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return,
+    };
+    loop {
+        let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if canon == stop {
+            return;
+        }
+        if !canon.starts_with(&stop) {
+            return;
+        }
+        match std::fs::read_dir(&dir) {
+            Ok(mut rd) => {
+                if rd.next().is_some() {
+                    return; // not empty
+                }
+            }
+            Err(_) => return,
+        }
+        if std::fs::remove_dir(&dir).is_err() {
+            return;
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => return,
+        }
+    }
 }
 
 fn detect_default_branch(repo_root: &Path) -> Result<String> {
@@ -2715,6 +2825,66 @@ fn discover_repo_root(start: &Path) -> Option<PathBuf> {
         }
         dir = dir.parent()?;
     }
+}
+
+/// Reject worktree creation paths that would land inside the main repo's
+/// `.git` directory or inside any already-registered linked worktree. Prevents
+/// nested worktrees, which `git` does not support and which corrupt state.
+fn ensure_not_nested_worktree(repo_root: &Path, wt_path: &Path) -> Result<()> {
+    let anchor = wt_path
+        .ancestors()
+        .find(|p| p.exists())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| repo_root.to_path_buf());
+    let anchor_abs = anchor.canonicalize().unwrap_or(anchor);
+
+    let git_dir = repo_root.join(".git");
+    if let Ok(git_dir_abs) = git_dir.canonicalize() {
+        if anchor_abs.starts_with(&git_dir_abs) {
+            bail!(
+                "refusing to create worktree inside .git: {}",
+                wt_path.display()
+            );
+        }
+    }
+
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain")
+        .output()
+        .context("running `git worktree list --porcelain`")?;
+    if !out.status.success() {
+        bail!(
+            "`git worktree list` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let main_root_abs = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    for line in stdout.lines() {
+        let Some(p) = line.strip_prefix("worktree ") else {
+            continue;
+        };
+        let existing = PathBuf::from(p);
+        let existing_abs = existing.canonicalize().unwrap_or(existing);
+        // The main worktree is allowed to contain the worktrees root
+        // (e.g. `.worktrees/` lives inside the main repo). Skip it.
+        if existing_abs == main_root_abs {
+            continue;
+        }
+        if anchor_abs.starts_with(&existing_abs) {
+            bail!(
+                "refusing to create worktree nested inside existing worktree {}",
+                existing_abs.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn open_pool() -> Result<sqlx::SqlitePool> {

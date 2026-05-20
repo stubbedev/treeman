@@ -26,4 +26,5 @@ treeman-watcher = { workspace = true }
 treeman-migrations = { workspace = true }
 libc = "0.2"
 treeman-prepare = { workspace = true }
+treeman-snapshot = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }

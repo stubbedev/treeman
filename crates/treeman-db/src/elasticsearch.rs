@@ -103,6 +103,13 @@ impl ElasticsearchDriver {
         let _ = self.delete(target).await;
         self.snapshot_create(template, target).await
     }
+
+    /// Drop a snapshot template index. Idempotent.
+    pub async fn drop_snapshot(&self, template: &str) -> Result<()> {
+        validate_index(template)?;
+        let _ = self.delete(template).await;
+        Ok(())
+    }
 }
 
 #[async_trait]

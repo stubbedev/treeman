@@ -198,6 +198,15 @@ impl MysqlDriver {
             .await?;
         self.snapshot_create(template, target).await
     }
+
+    /// Drop a snapshot template database. Idempotent.
+    pub async fn drop_snapshot(&self, template: &str) -> Result<()> {
+        validate_ident(template)?;
+        sqlx::query(&format!("DROP DATABASE IF EXISTS `{}`", template))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 /// Reject anything that isn't `[A-Za-z0-9_]+` so we can interpolate into

@@ -43,6 +43,10 @@ pub enum Request {
     },
     /// List currently-running watchers.
     WatcherList,
+    /// List linked worktrees currently being watched for a given repo.
+    WorktreeList {
+        repo_path: String,
+    },
     /// Tell the daemon to shut down cleanly (used by `treeman daemon stop`).
     Shutdown,
 }
@@ -56,8 +60,15 @@ pub enum Response {
     RepoRegistered { repo_id: i64 },
     WatcherStarted { repo_path: String },
     WatcherStopped { repo_path: String },
-    WatcherList { repos: Vec<String> },
+    WatcherList { repos: Vec<WatcherSummary> },
+    WorktreeList { worktrees: Vec<String> },
     Error { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatcherSummary {
+    pub repo: String,
+    pub worktree_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

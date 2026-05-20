@@ -4361,6 +4361,7 @@ dependencies = [
  "treeman-migrations",
  "treeman-prepare",
  "treeman-proto",
+ "treeman-snapshot",
  "treeman-store",
  "treeman-watcher",
 ]
@@ -4441,6 +4442,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tracing",
  "treeman-core",
  "treeman-db",
  "treeman-migrations",

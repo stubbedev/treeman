@@ -79,6 +79,12 @@ impl MongoDriver {
         self.client.database(target).drop().await.ok();
         self.snapshot_create(template, target).await
     }
+
+    /// Drop a snapshot template database. Idempotent.
+    pub async fn drop_snapshot(&self, template: &str) -> Result<()> {
+        self.client.database(template).drop().await.ok();
+        Ok(())
+    }
 }
 
 #[async_trait]

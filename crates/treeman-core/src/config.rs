@@ -217,6 +217,8 @@ pub struct RetentionConfig {
     pub max_age_days: u32,
     #[serde(default = "default_max_total_gb")]
     pub max_total_gb: u32,
+    #[serde(default = "default_gc_interval_minutes")]
+    pub gc_interval_minutes: u32,
 }
 impl Default for RetentionConfig {
     fn default() -> Self {
@@ -224,17 +226,21 @@ impl Default for RetentionConfig {
             keep_per_source: default_keep_per_source(),
             max_age_days: default_max_age_days(),
             max_total_gb: default_max_total_gb(),
+            gc_interval_minutes: default_gc_interval_minutes(),
         }
     }
 }
 fn default_keep_per_source() -> u32 {
-    5
+    500
 }
 fn default_max_age_days() -> u32 {
     30
 }
 fn default_max_total_gb() -> u32 {
     50
+}
+fn default_gc_interval_minutes() -> u32 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -591,6 +597,34 @@ pub fn load_layered(repo_root: Option<&Path>) -> anyhow::Result<Config> {
         let l = repo.join(".treeman.local.yaml");
         if l.exists() {
             fig = fig.merge(Yaml::file(&l));
+        }
+    }
+    Ok(fig.extract::<Config>()?)
+}
+
+/// Like [`load_layered`] but also overlays
+/// `<wt_root>/.treeman.local.yaml` on top. Used by the daemon's per-worktree
+/// fan-out so individual linked worktrees can override env-scoping, hooks,
+/// etc., without touching the main repo's checked-in `.treeman.yaml`.
+pub fn load_layered_for_worktree(main_root: &Path, wt_root: &Path) -> anyhow::Result<Config> {
+    let mut fig = Figment::new();
+    if let Some(global) = global_path() {
+        if global.exists() {
+            fig = fig.merge(Yaml::file(&global));
+        }
+    }
+    let r = main_root.join(".treeman.yaml");
+    if r.exists() {
+        fig = fig.merge(Yaml::file(&r));
+    }
+    let l = main_root.join(".treeman.local.yaml");
+    if l.exists() {
+        fig = fig.merge(Yaml::file(&l));
+    }
+    if wt_root != main_root {
+        let wl = wt_root.join(".treeman.local.yaml");
+        if wl.exists() {
+            fig = fig.merge(Yaml::file(&wl));
         }
     }
     Ok(fig.extract::<Config>()?)
