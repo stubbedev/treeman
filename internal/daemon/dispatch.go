@@ -53,11 +53,44 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 		}
 		return rpc.Response{Kind: rpc.KindWatcherList, Repos: out}
 
-	case rpc.MethodWatcherStart, rpc.MethodWatcherStop, rpc.MethodWorktreeList,
-		rpc.MethodWorktreeFinalize, rpc.MethodWorktreeTeardown:
-		// Phases 8/10 wire these up. For now report a stub error
-		// the CLI can surface clearly during the bring-up window.
-		return errResp("not implemented yet (Go port phase " + phaseFor(req.Method) + ")")
+	case rpc.MethodWorktreeFinalize:
+		if req.WorktreeFinalize == nil {
+			return errResp("worktree_finalize: missing args")
+		}
+		args := *req.WorktreeFinalize
+		go func() {
+			err := FinalizeWorktree(context.Background(), st, args.RepoPath, args.WorktreePath, args.InheritedEnv)
+			if err != nil {
+				_ = st.Store.WriteEvent(context.Background(), "error", "wt_finalize", err.Error(),
+					0, 0, "", 0, map[string]string{
+						"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
+					})
+			}
+		}()
+		return rpc.Response{Kind: rpc.KindWorktreeFinalizeQueued, WorktreePath: args.WorktreePath}
+
+	case rpc.MethodWorktreeTeardown:
+		if req.WorktreeTeardown == nil {
+			return errResp("worktree_teardown: missing args")
+		}
+		args := *req.WorktreeTeardown
+		go func() {
+			err := TeardownWorktree(context.Background(), st, args.RepoPath, args.WorktreePath, args.Force, args.InheritedEnv)
+			if err != nil {
+				_ = st.Store.WriteEvent(context.Background(), "error", "wt_teardown", err.Error(),
+					0, 0, "", 0, map[string]string{
+						"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
+					})
+			}
+		}()
+		return rpc.Response{Kind: rpc.KindWorktreeTeardownQueued, WorktreePath: args.WorktreePath}
+
+	case rpc.MethodWatcherStart, rpc.MethodWatcherStop, rpc.MethodWorktreeList:
+		// Phase 10 (file watcher) wires these up. The fsnotify-
+		// based watcher is a future patch — kontainer's
+		// gwt-driven flow doesn't need it. For now report a stub
+		// error so callers see a clear pending status.
+		return errResp("watcher not yet wired (post-v1.0)")
 
 	default:
 		return errResp("unknown method: " + req.Method)
