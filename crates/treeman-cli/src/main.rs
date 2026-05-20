@@ -1,7 +1,7 @@
 //! `treeman` — thin CLI client for `treemand` plus a few local commands
 //! (`config validate`, `slug`, `schema dump`) that don't require the daemon.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -153,6 +153,38 @@ enum DbCmd {
 
 #[derive(Subcommand, Debug)]
 enum WorktreeCmd {
+    /// Create a new worktree end-to-end: git worktree add + links +
+    /// env patch + register + postcreate hook + prepare.
+    Create {
+        /// Branch name. Created from --from if it doesn't exist.
+        branch: String,
+        /// Base branch for new-branch creation. Defaults to the repo's
+        /// default branch.
+        #[arg(long)]
+        from: Option<String>,
+        /// Override worktree path (default: <cfg.worktrees.root>/<branch>).
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Skip running postcreate hooks + prepare (only `git worktree add`
+        /// + register + links + env patch).
+        #[arg(long)]
+        skip_hooks: bool,
+        /// Skip prepare even if hooks ran.
+        #[arg(long)]
+        skip_prepare: bool,
+    },
+    /// Delete a worktree end-to-end: predelete hook + git worktree
+    /// remove + unregister.
+    Delete {
+        /// Worktree path OR branch name.
+        target: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+    },
     /// Register a worktree path (computes slug, inserts repos+worktrees rows).
     Register {
         #[arg(default_value = ".")]
@@ -258,6 +290,12 @@ async fn main() -> Result<()> {
         }
         Cmd::Logs(LogsCmd::Grep { pattern, limit, level, event_type }) => {
             logs_grep(pattern, limit, level, event_type).await
+        }
+        Cmd::Worktree(WorktreeCmd::Create { branch, from, path, repo, skip_hooks, skip_prepare }) => {
+            worktree_create(branch, from, path, repo, skip_hooks, skip_prepare).await
+        }
+        Cmd::Worktree(WorktreeCmd::Delete { target, repo, force }) => {
+            worktree_delete(target, repo, force).await
         }
         Cmd::Worktree(WorktreeCmd::Register { path, branch, repo }) => {
             worktree_register(path, branch, repo).await
@@ -615,6 +653,220 @@ fn open_driver(engine: &str, cfg: &treeman_core::Config) -> Result<Box<dyn treem
         }
         other => bail!("unsupported engine: {other}"),
     }
+}
+
+async fn worktree_create(
+    branch: String,
+    from: Option<String>,
+    path: Option<PathBuf>,
+    repo: Option<PathBuf>,
+    skip_hooks: bool,
+    skip_prepare: bool,
+) -> Result<()> {
+    use treeman_core::template::{TemplateContext, render};
+
+    let repo_root = match repo {
+        Some(r) => r.canonicalize()?,
+        None => discover_repo_root(&std::env::current_dir()?)
+            .context("no repo root found")?,
+    };
+    let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
+
+    // Resolve destination path.
+    let wt_path = match path {
+        Some(p) => if p.is_absolute() { p } else { repo_root.join(p) },
+        None => {
+            let root = if cfg.worktrees.root.starts_with('/') {
+                PathBuf::from(&cfg.worktrees.root)
+            } else {
+                repo_root.join(&cfg.worktrees.root)
+            };
+            root.join(branch.replace('/', "-"))
+        }
+    };
+    if wt_path.exists() {
+        bail!("destination path already exists: {}", wt_path.display());
+    }
+    std::fs::create_dir_all(wt_path.parent().unwrap_or(&repo_root))?;
+
+    // Determine base branch.
+    let base = match from {
+        Some(b) => b,
+        None => detect_default_branch(&repo_root)?,
+    };
+    // git worktree add. Try existing branch first; fall back to -b.
+    let branch_exists = std::process::Command::new("git")
+        .arg("-C").arg(&repo_root)
+        .arg("rev-parse").arg("--verify").arg("--quiet")
+        .arg(format!("refs/heads/{branch}"))
+        .status().map(|s| s.success()).unwrap_or(false);
+    let status = if branch_exists {
+        std::process::Command::new("git")
+            .arg("-C").arg(&repo_root)
+            .arg("worktree").arg("add").arg(&wt_path).arg(&branch)
+            .status()?
+    } else {
+        std::process::Command::new("git")
+            .arg("-C").arg(&repo_root)
+            .arg("worktree").arg("add").arg("-b").arg(&branch).arg(&wt_path).arg(&base)
+            .status()?
+    };
+    if !status.success() {
+        bail!("git worktree add failed");
+    }
+    // Canonicalize now that the path exists on disk.
+    let wt_path = wt_path.canonicalize().with_context(|| {
+        format!("canonicalize new worktree {}", wt_path.display())
+    })?;
+
+    // Symlink the configured links (e.g. .env, .env.testing, justfile).
+    for rel in &cfg.worktrees.links {
+        let src = repo_root.join(rel);
+        let dst = wt_path.join(rel);
+        if !src.exists() {
+            eprintln!("warn: link source missing, skipping: {}", src.display());
+            continue;
+        }
+        if dst.exists() {
+            // Already populated by git (e.g. tracked file). Skip silently.
+            continue;
+        }
+        if let Some(parent) = dst.parent() { std::fs::create_dir_all(parent).ok(); }
+        std::os::unix::fs::symlink(&src, &dst)
+            .with_context(|| format!("symlink {} → {}", dst.display(), src.display()))?;
+    }
+
+    // Derive slug + render env patches.
+    let slug = treeman_core::slug_for(&wt_path, Some(&branch));
+    let ctx = TemplateContext::from_slug(&slug);
+    let env_files: Vec<PathBuf> = cfg.env_scoping.files.iter()
+        .map(|f| wt_path.join(f)).collect();
+    let pairs: Vec<(String, String)> = cfg.env_scoping.patches.iter()
+        .map(|p| render(&p.template, &ctx).map(|v| (p.key.clone(), v)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for f in &env_files {
+        if !f.exists() { continue; }
+        let is_xml = f.extension().and_then(|s| s.to_str()) == Some("xml");
+        let outcome = if is_xml {
+            treeman_core::patcher::patch_phpunit_file(f, &pairs)?
+        } else {
+            treeman_core::patcher::patch_env_file(f, &pairs)?
+        };
+        if matches!(outcome, treeman_core::patcher::PatchOutcome::Updated) {
+            println!("patched {}", f.display());
+            if cfg.env_scoping.skip_worktree {
+                let _ = treeman_core::patcher::skip_worktree(&wt_path, f);
+            }
+        }
+    }
+
+    // Register in SQLite.
+    let pool = open_pool().await?;
+    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let repo_id = treeman_store::ensure_repo(&pool, &repo_root, repo_name).await?;
+    let wt_id = treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, Some(&branch)).await?;
+    println!("created worktree #{wt_id} slug={} path={}", slug.value, wt_path.display());
+
+    if skip_hooks {
+        return Ok(());
+    }
+    // Run precreate (rare) then postcreate.
+    for (phase_name, steps) in [("precreate", &cfg.hooks.precreate), ("postcreate", &cfg.hooks.postcreate)] {
+        if steps.is_empty() { continue; }
+        let outcome = treeman_core::hooks::run_hooks(steps, &repo_root, &wt_path, &slug.value).await?;
+        println!("{phase_name}: exit={}", outcome.aggregate_exit_code);
+        if outcome.aggregate_exit_code != 0 {
+            bail!("{phase_name} failed");
+        }
+    }
+    if !skip_prepare && !cfg.databases.is_empty() {
+        match treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id).await {
+            Ok(outs) => for o in outs {
+                println!("prepare[{}] {} ({})", o.engine, o.source_db,
+                    if o.cache_hit { "cache_hit" } else { "rebuilt" });
+            },
+            Err(e) => eprintln!("warn: prepare failed: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+async fn worktree_delete(
+    target: String,
+    repo: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
+    let pool = open_pool().await?;
+    // Try path first, then branch.
+    let wt = if let Ok(p) = PathBuf::from(&target).canonicalize() {
+        treeman_store::hook_runs::find_worktree_by_path(&pool, &p.to_string_lossy()).await?
+    } else { None };
+    let wt = match wt {
+        Some(w) => w,
+        None => {
+            // Search by branch name.
+            let rows = treeman_store::hook_runs::list_worktrees(&pool).await?;
+            rows.into_iter().find(|r| r.branch.as_deref() == Some(target.as_str()))
+                .with_context(|| format!("worktree not found: {target}"))?
+        }
+    };
+    let wt_path = PathBuf::from(&wt.path);
+    let repo_root = match repo {
+        Some(r) => r.canonicalize()?,
+        None => discover_repo_root(&wt_path).context("no repo root for worktree")?,
+    };
+    let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
+    let slug = treeman_core::slug::Slug {
+        value: wt.slug.clone(),
+        source: treeman_core::slug::SlugSource::Ticket,
+    };
+
+    // 1. Run predelete hook (includes declarative teardown when phase=predelete).
+    if !cfg.hooks.predelete.is_empty() {
+        let outcome = treeman_core::hooks::run_hooks(&cfg.hooks.predelete, &repo_root, &wt_path, &slug.value).await?;
+        if outcome.aggregate_exit_code != 0 && !force {
+            bail!("predelete hook failed; pass --force to delete anyway");
+        }
+    }
+    // 2. Declarative DB teardown (mirror of hook_run predelete path).
+    teardown_databases(&cfg, &slug.value, wt.repo_id, wt.id, &pool).await?;
+
+    // 3. git worktree remove.
+    let mut args = vec!["worktree".to_string(), "remove".into()];
+    if force { args.push("--force".into()); }
+    args.push(wt_path.to_string_lossy().to_string());
+    let status = std::process::Command::new("git")
+        .arg("-C").arg(&repo_root)
+        .args(&args)
+        .status()?;
+    if !status.success() && !force {
+        bail!("git worktree remove failed; pass --force to override");
+    }
+
+    // 4. Unregister.
+    treeman_store::mark_worktree_deleted(&pool, wt.id).await?;
+    println!("deleted worktree #{} ({})", wt.id, wt_path.display());
+    Ok(())
+}
+
+fn detect_default_branch(repo_root: &Path) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(repo_root)
+        .arg("symbolic-ref").arg("--short").arg("refs/remotes/origin/HEAD")
+        .output()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // Strip "origin/" prefix.
+        if let Some(b) = s.strip_prefix("origin/") {
+            return Ok(b.to_string());
+        }
+    }
+    // Fall back to local HEAD branch.
+    let out = std::process::Command::new("git")
+        .arg("-C").arg(repo_root)
+        .arg("rev-parse").arg("--abbrev-ref").arg("HEAD")
+        .output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 async fn worktree_register(
