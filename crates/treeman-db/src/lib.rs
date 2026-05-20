@@ -1,7 +1,6 @@
 //! Pure-wire database drivers. No shelling out to mysql/psql/mongosh/etc.
 
 pub mod binlog;
-pub mod reachability;
 pub mod clickhouse;
 pub mod duckdb_driver;
 pub mod dumpload;
@@ -16,6 +15,7 @@ pub mod mysql;
 pub mod neo4j;
 pub mod postgres;
 pub mod rabbitmq;
+pub mod reachability;
 pub mod redis_driver;
 pub mod s3;
 

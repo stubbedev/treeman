@@ -172,7 +172,12 @@ fn resolve_mysql_password(env: &EnvFile, password_env: Option<&str>) -> Option<S
         }
     }
     // 2. Conventional Laravel `DB_TEST_PASSWORD` / `DB_PASSWORD`.
-    for k in ["DB_TEST_PASSWORD", "DB_PASSWORD", "MYSQL_PASSWORD", "MYSQL_PWD"] {
+    for k in [
+        "DB_TEST_PASSWORD",
+        "DB_PASSWORD",
+        "MYSQL_PASSWORD",
+        "MYSQL_PWD",
+    ] {
         if let Some(v) = env.get(k) {
             if !v.is_empty() && v != "null" {
                 return Some(v.to_string());
@@ -327,8 +332,12 @@ fn resolve_mongodb(cfg: &Config, env: &EnvFile) -> Option<(MongoConn, Source)> {
             .get("MONGO_DB_PORT")
             .or_else(|| env.get("MONGO_PORT"))
             .unwrap_or("27017");
-        let user = env.get("MONGO_DB_USERNAME").or_else(|| env.get("MONGO_USERNAME"));
-        let pass = env.get("MONGO_DB_PASSWORD").or_else(|| env.get("MONGO_PASSWORD"));
+        let user = env
+            .get("MONGO_DB_USERNAME")
+            .or_else(|| env.get("MONGO_USERNAME"));
+        let pass = env
+            .get("MONGO_DB_PASSWORD")
+            .or_else(|| env.get("MONGO_PASSWORD"));
         let userinfo = match (user, pass) {
             (Some(u), Some(p)) if !p.is_empty() && p != "null" => {
                 format!("{}:{}@", percent_encode(u), percent_encode(p))
@@ -454,9 +463,14 @@ fn resolve_elasticsearch(cfg: &Config, env: &EnvFile) -> Option<(EsConn, Source)
     // Laravel's `ELASTICSEARCH_HOSTS` may be `host:port` (no scheme) or
     // a comma-separated list. Same for ELASTIC_HOSTS / ES_HOSTS /
     // ELASTICSEARCH_DSL_HOSTS (Django).
-    let hosts_raw = ["ELASTICSEARCH_HOSTS", "ELASTIC_HOSTS", "ES_HOSTS", "ELASTICSEARCH_DSL_HOSTS"]
-        .iter()
-        .find_map(|k| env.get(k));
+    let hosts_raw = [
+        "ELASTICSEARCH_HOSTS",
+        "ELASTIC_HOSTS",
+        "ES_HOSTS",
+        "ELASTICSEARCH_DSL_HOSTS",
+    ]
+    .iter()
+    .find_map(|k| env.get(k));
     if let Some(raw) = hosts_raw {
         let first = raw.split(',').next().unwrap_or(raw).trim();
         if !first.is_empty() {
@@ -650,9 +664,7 @@ mod tests {
     #[test]
     fn redis_url_composed_from_componentized_env() {
         let cfg = Config::default();
-        let env = parse(
-            "REDIS_HOST=127.0.0.1\nREDIS_PORT=6390\nREDIS_PASSWORD=hello/world\n",
-        );
+        let env = parse("REDIS_HOST=127.0.0.1\nREDIS_PORT=6390\nREDIS_PASSWORD=hello/world\n");
         let (r, _) = resolve_redis(&cfg, &env).unwrap();
         assert_eq!(r.url, "redis://:hello%2Fworld@127.0.0.1:6390");
     }
@@ -660,8 +672,7 @@ mod tests {
     #[test]
     fn redis_skips_literal_null_password() {
         let cfg = Config::default();
-        let env =
-            parse("REDIS_HOST=127.0.0.1\nREDIS_PORT=6379\nREDIS_PASSWORD=null\n");
+        let env = parse("REDIS_HOST=127.0.0.1\nREDIS_PORT=6379\nREDIS_PASSWORD=null\n");
         let (r, _) = resolve_redis(&cfg, &env).unwrap();
         assert_eq!(r.url, "redis://127.0.0.1:6379");
     }
@@ -780,8 +791,7 @@ mod tests {
     #[test]
     fn spring_es_uris_comma_separated() {
         let cfg = Config::default();
-        let env =
-            parse("SPRING_ELASTICSEARCH_URIS=https://es-1:9200,https://es-2:9200\n");
+        let env = parse("SPRING_ELASTICSEARCH_URIS=https://es-1:9200,https://es-2:9200\n");
         let (e, _) = resolve_elasticsearch(&cfg, &env).unwrap();
         // First entry wins.
         assert_eq!(e.url, "https://es-1:9200");

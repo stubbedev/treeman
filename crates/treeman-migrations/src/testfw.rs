@@ -118,10 +118,7 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
                 WorkerIndex::OneBased,
                 CloneStrategy::Shared,
             ),
-            |r| {
-                composer_has(r, "codeception/codeception")
-                    && !composer_has(r, "brianium/paratest")
-            },
+            |r| composer_has(r, "codeception/codeception") && !composer_has(r, "brianium/paratest"),
         ),
         // PHP — vanilla phpunit (no parallel). Shared DB.
         (

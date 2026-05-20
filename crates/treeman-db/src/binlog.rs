@@ -52,13 +52,7 @@ use treeman_core::config::MysqlConn;
 /// Regex for DDL detection. Anything starting with a write keyword
 /// is a candidate for DDL replay against clones.
 const DDL_KEYWORDS: &[&str] = &[
-    "CREATE",
-    "ALTER",
-    "DROP",
-    "RENAME",
-    "TRUNCATE",
-    "GRANT",
-    "REVOKE",
+    "CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE", "GRANT", "REVOKE",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +69,9 @@ pub struct BinlogReplicator {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BinlogError {
-    #[error("mysql endpoint unreachable at {host}:{port} ({reason}) — binlog path unavailable, caller must fall back")]
+    #[error(
+        "mysql endpoint unreachable at {host}:{port} ({reason}) — binlog path unavailable, caller must fall back"
+    )]
     Unreachable {
         host: String,
         port: u16,
@@ -289,14 +285,12 @@ impl BinlogReplicator {
                 let kind = row_kind(&rows_event_data);
                 trace!(?kind, %db, %table, "replay row event");
 
-                let col_names =
-                    resolve_columns(&mut colcache, &mut writers, &db, &table).await?;
+                let col_names = resolve_columns(&mut colcache, &mut writers, &db, &table).await?;
 
                 let mut row_iter = rows_event_data.rows(tme);
                 while let Some(pair) = row_iter.next() {
-                    let pair = pair.map_err(|e| {
-                        BinlogError::Other(anyhow!("rows iter decode error: {e}"))
-                    })?;
+                    let pair = pair
+                        .map_err(|e| BinlogError::Other(anyhow!("rows iter decode error: {e}")))?;
                     for target_db in target_dbs {
                         let conn = writers
                             .get_mut(target_db)
@@ -434,9 +428,8 @@ async fn apply_one(
                 );
             }
             let placeholders = vec!["?"; values.len()].join(",");
-            let stmt = format!(
-                "INSERT INTO `{target_db}`.`{table}` ({cols_csv}) VALUES ({placeholders})"
-            );
+            let stmt =
+                format!("INSERT INTO `{target_db}`.`{table}` ({cols_csv}) VALUES ({placeholders})");
             conn.exec_drop(stmt, Params::Positional(values)).await?;
         }
         RowKind::Update => {
@@ -482,8 +475,7 @@ async fn apply_one(
                 );
             }
             let (where_clause, where_params) = build_where(col_names, &before_vals);
-            let stmt =
-                format!("DELETE FROM `{target_db}`.`{table}` WHERE {where_clause} LIMIT 1");
+            let stmt = format!("DELETE FROM `{target_db}`.`{table}` WHERE {where_clause} LIMIT 1");
             conn.exec_drop(stmt, Params::Positional(where_params))
                 .await?;
         }

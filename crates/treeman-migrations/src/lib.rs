@@ -772,8 +772,7 @@ mod tests {
         std::fs::write(dir.join("package.json"), r#"{"name":"plain"}"#).unwrap();
         std::fs::write(dir.join("yarn.lock"), "").unwrap();
         let r = Registry::with_builtins();
-        let names: Vec<&str> =
-            r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<&str> = r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
         for orm in [
             "typeorm",
             "drizzle",
@@ -798,8 +797,7 @@ mod tests {
         std::fs::write(dir.join("package.json"), r#"{"name":"app"}"#).unwrap();
         std::fs::write(dir.join("data-source.ts"), "export default ...").unwrap();
         let r = Registry::with_builtins();
-        let names: Vec<&str> =
-            r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<&str> = r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"typeorm"), "got {names:?}");
         assert!(!names.contains(&"drizzle"), "got {names:?}");
         assert!(!names.contains(&"sequelize"), "got {names:?}");
@@ -812,8 +810,7 @@ mod tests {
         let dir = fresh_tempdir("knex-ts");
         std::fs::write(dir.join("knexfile.ts"), "export default {}").unwrap();
         let r = Registry::with_builtins();
-        let names: Vec<&str> =
-            r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<&str> = r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"knex"), "got {names:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -824,8 +821,7 @@ mod tests {
         let dir = fresh_tempdir("drizzle-mjs");
         std::fs::write(dir.join("drizzle.config.mjs"), "export default {}").unwrap();
         let r = Registry::with_builtins();
-        let names: Vec<&str> =
-            r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<&str> = r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"drizzle"), "got {names:?}");
         std::fs::remove_dir_all(&dir).ok();
     }

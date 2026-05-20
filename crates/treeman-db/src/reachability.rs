@@ -25,7 +25,13 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 1500;
 /// anyhow error whose message includes `engine` so callers don't have
 /// to wrap it.
 pub async fn probe(engine: &str, host: &str, port: u16) -> Result<()> {
-    probe_with_timeout(engine, host, port, Duration::from_millis(DEFAULT_TIMEOUT_MS)).await
+    probe_with_timeout(
+        engine,
+        host,
+        port,
+        Duration::from_millis(DEFAULT_TIMEOUT_MS),
+    )
+    .await
 }
 
 pub async fn probe_with_timeout(
@@ -57,8 +63,7 @@ pub async fn probe_url(engine: &str, raw: &str) -> Result<()> {
 }
 
 fn parse_host_port(engine: &str, raw: &str) -> Result<(String, u16)> {
-    let url = Url::parse(raw)
-        .map_err(|e| anyhow!("{engine}: invalid URI {raw:?}: {e}"))?;
+    let url = Url::parse(raw).map_err(|e| anyhow!("{engine}: invalid URI {raw:?}: {e}"))?;
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("{engine}: no host in URI {raw:?}"))?
