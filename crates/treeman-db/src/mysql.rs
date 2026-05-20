@@ -96,8 +96,15 @@ impl DbDriver for MysqlDriver {
 
     async fn list_matching(&self, prefix: &str) -> Result<Vec<String>> {
         let like = format!("{}%", prefix.replace('_', "\\_"));
+        // `information_schema.SCHEMATA.SCHEMA_NAME` is declared
+        // `varchar(64)` but MySQL 8 returns it over the wire as
+        // VARBINARY whenever the client's connection charset doesn't
+        // match the metadata charset (utf8mb3 vs utf8mb4). sqlx's
+        // String decoder rejects VARBINARY. Wrap with `CONVERT … USING
+        // utf8mb4` so the wire type is always a stringy VARCHAR.
         let rows = sqlx::query(
-            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE ?",
+            "SELECT CONVERT(SCHEMA_NAME USING utf8mb4) AS SCHEMA_NAME \
+             FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE ?",
         )
         .bind(&like)
         .fetch_all(&self.pool)
@@ -147,9 +154,16 @@ impl MysqlDriver {
         .execute(&self.pool)
         .await?;
 
-        // Enumerate source tables.
+        // Enumerate source tables. `CONVERT … USING utf8mb4` — see
+        // the rationale on `list_matching` above. Without this, MySQL
+        // 8 servers configured with a non-utf8mb4 connection charset
+        // hand back VARBINARY columns and sqlx fails to decode as
+        // String.
         let table_rows = sqlx::query(
-            "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES \
+            "SELECT \
+                CONVERT(TABLE_NAME USING utf8mb4) AS TABLE_NAME, \
+                CONVERT(TABLE_TYPE USING utf8mb4) AS TABLE_TYPE \
+             FROM information_schema.TABLES \
              WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
         )
         .bind(source)

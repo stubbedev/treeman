@@ -372,9 +372,14 @@ async fn resolve_columns(
         .values_mut()
         .next()
         .ok_or_else(|| BinlogError::Other(anyhow!("no writer connection available")))?;
+    // `CONVERT … USING utf8mb4` — MySQL 8 hands information_schema
+    // VARCHARs back as VARBINARY when the connection charset doesn't
+    // match the server metadata charset. Forcing the conversion keeps
+    // the column decodable as String regardless.
     let rows: Vec<(String,)> = conn
         .exec(
-            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+            "SELECT CONVERT(COLUMN_NAME USING utf8mb4) AS COLUMN_NAME \
+             FROM information_schema.COLUMNS \
              WHERE TABLE_SCHEMA=? AND TABLE_NAME=? \
              ORDER BY ORDINAL_POSITION",
             (db, table),
