@@ -12,8 +12,24 @@ Single global daemon, thin CLI client, SQLite-backed event log.
 
 ## Features
 
-- **5 DB engines** — MySQL, PostgreSQL, MongoDB, Redis, Elasticsearch (also
-  SQLite for the event log).
+- **23 stateful resources** — relational (MySQL, MariaDB, TiDB,
+  PostgreSQL, CockroachDB, SQLite, DuckDB), analytics (ClickHouse,
+  InfluxDB), document (MongoDB), KV (Redis, Memcached, etcd), search
+  (Elasticsearch, OpenSearch, Meilisearch, Typesense), vector (Qdrant,
+  Weaviate, Milvus), graph (Neo4j), queues (RabbitMQ vhosts, NATS
+  JetStream, Kafka via REST proxy), object store (S3 / MinIO —
+  experimental).
+- **`DATABASE_URL` + dotenv-aware** — `connections.*` is optional; falls
+  back through per-engine `*_URL` env vars, generic `DATABASE_URL`, and
+  the repo's `.env`/`.env.testing`/`.env.test.local` (Laravel / Symfony /
+  Node / Cargo conventions). `treeman config show --resolved` shows
+  every connection with its provenance.
+- **JSON-schema completions** — `treeman schema install` writes the
+  global + per-repo schemas to `~/.config/treeman/schemas/` and emits
+  the `yaml-language-server: $schema=…` modeline that lights up
+  autocompletion in any LSP-backed editor (VS Code via redhat.vscode-
+  yaml, Neovim, Helix, Zed). `treeman init` stamps the modeline at the
+  top of every generated `.treeman.yaml`.
 - **14 migration frameworks auto-detected** — Laravel (incl. nwidart-style
   modules), Rails (incl. engines), Django, golang-migrate, sqlx-cli, Diesel,
   Prisma, Knex, Alembic, Flyway, TypeORM, Drizzle, Sequelize, MikroORM.

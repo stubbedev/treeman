@@ -6,6 +6,7 @@ pub mod duckdb_driver;
 pub mod dumpload;
 pub mod elasticsearch;
 pub mod etcd;
+pub mod http_engines;
 pub mod http_prefix;
 pub mod influxdb;
 pub mod memcached;
