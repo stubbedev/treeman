@@ -260,6 +260,161 @@ frameworks:
     engine_hint: mongodb
 ```
 
+### Engine catalog
+
+The Configuration block above shows the common cases (MySQL, Postgres,
+MongoDB, Redis, Elasticsearch). Below is a compact `connections.*` +
+matching `databases:` entry for every supported engine. All blocks are
+optional — declare only what you use.
+
+Three template shapes recur:
+
+| Shape | Used by | Field |
+|---|---|---|
+| `name_template` | Engines with a first-class "database" concept (MySQL, Postgres, etc.) | Per-worktree DB name |
+| `namespaces.db_index_template` | Redis only | Numeric DB index 0..15 |
+| `namespaces.prefix_template` / `namespaces.index_prefix_template` | Engines that key on string prefixes (Elasticsearch, Qdrant, S3, …) | Per-worktree prefix |
+
+#### Relational
+
+```yaml
+connections:
+  mysql:    { host: 127.0.0.1, port: 3306, user: root,
+              password_env: MYSQL_PWD, pool_max: 8 }
+  postgres: { host: 127.0.0.1, port: 5432, user: postgres,
+              password_env: PGPASSWORD, pool_max: 8 }
+
+databases:
+  - engine: mysql           # also: mariadb, tidb
+    name_template: "myapp_{slug}"
+    dump:        { path: "tests/_data/dump.sql" }
+    migrations:  { framework: laravel, dir: "database/migrations" }
+    paratest:    { clones: auto, name_template: "myapp_{slug}_test_{n}" }
+  - engine: postgres        # also: cockroach
+    name_template: "myapp_{slug}"
+    migrations:  { framework: sqlx, dir: "migrations" }
+    paratest:    { clones: auto, name_template: "myapp_{slug}_test_{n}" }
+```
+
+#### Document / KV
+
+```yaml
+connections:
+  mongodb:   { uri: mongodb://localhost:27017 }
+  redis:     { url: redis://localhost:6379 }
+  memcached: { host: 127.0.0.1, port: 11211 }
+  etcd:      { url: http://localhost:2379 }
+
+databases:
+  - engine: mongodb
+    name_template: "myapp_{slug}"
+  - engine: redis
+    namespaces: { db_index_template: "{slug_redis_queue}" }
+  - engine: memcached       # namespaceless; name_template is informational
+    name_template: "myapp_{slug}"
+  - engine: etcd
+    namespaces: { prefix_template: "/myapp/{slug}/" }
+```
+
+#### Search
+
+```yaml
+connections:
+  elasticsearch: { url: http://localhost:9200 }
+  meilisearch:   { url: http://localhost:7700, api_key_env: MEILI_KEY }
+  typesense:     { url: http://localhost:8108, api_key_env: TYPESENSE_KEY }
+
+databases:
+  - engine: elasticsearch   # also: opensearch
+    namespaces: { index_prefix_template: "search_{slug}_" }
+  - engine: meilisearch     # also: typesense
+    namespaces: { prefix_template: "{slug}_" }
+```
+
+#### Vector
+
+```yaml
+connections:
+  qdrant:   { url: http://localhost:6333, api_key_env: QDRANT_KEY }
+  weaviate: { url: http://localhost:8080 }
+  milvus:   { url: http://localhost:19530 }
+
+databases:
+  - engine: qdrant          # also: weaviate, milvus
+    namespaces: { prefix_template: "{slug}_" }
+```
+
+#### Analytics
+
+```yaml
+connections:
+  clickhouse: { url: http://localhost:8123, user: default,
+                password_env: CLICKHOUSE_PWD }
+  influxdb:   { url: http://localhost:8086, token_env: INFLUX_TOKEN,
+                org_id: my-org }
+
+databases:
+  - engine: clickhouse
+    name_template: "myapp_{slug}"
+  - engine: influxdb
+    name_template: "myapp_{slug}"
+```
+
+#### Graph
+
+```yaml
+connections:
+  neo4j: { url: bolt://localhost:7687, user: neo4j,
+           password_env: NEO4J_PWD }
+
+databases:
+  - engine: neo4j
+    name_template: "myapp_{slug}"
+```
+
+#### Queues
+
+```yaml
+connections:
+  rabbitmq: { url: http://localhost:15672, user: guest,
+              password_env: RABBITMQ_PWD }
+  nats:     { url: http://localhost:8222 }
+  kafka:    { host: 127.0.0.1, port: 9092 }
+
+databases:
+  - engine: rabbitmq        # name_template maps to a RabbitMQ vhost
+    name_template: "myapp_{slug}"
+  - engine: nats
+    namespaces: { prefix_template: "{slug}_" }
+  - engine: kafka
+    namespaces: { prefix_template: "{slug}_" }
+```
+
+#### Object store
+
+```yaml
+connections:
+  s3: { endpoint: http://localhost:9000, region: us-east-1,
+        access_key_env: MINIO_ACCESS, secret_key_env: MINIO_SECRET }
+
+databases:
+  - engine: s3              # bucket names disallow `_`, so use {slug_dash}
+    namespaces: { prefix_template: "{slug_dash}-" }
+```
+
+#### Embedded files
+
+```yaml
+connections:
+  duckdb: { base_dir: ~/.local/state/treeman/duckdb }
+
+databases:
+  - engine: sqlite
+    name_template: "tests/_data/test_{slug}.sqlite"
+  - engine: duckdb
+    name_template: "{slug}.duckdb"
+```
+
 ### Slug derivation
 
 - If the branch (or worktree basename) matches `[A-Z]+-\d+`, slug =
