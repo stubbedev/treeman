@@ -181,14 +181,27 @@ daemon:
   socket: $XDG_RUNTIME_DIR/treeman.sock
   log_level: info
   db_log_path: ~/.local/state/treeman/treeman.db
+
 connections:
-  mysql:    { host: 127.0.0.1, port: 3306, user: root,
-              password_env: MYSQL_PWD, pool_max: 8 }
-  postgres: { host: 127.0.0.1, port: 5432, user: postgres,
-              password_env: PGPASSWORD, pool_max: 8 }
-  mongodb:  { uri: mongodb://localhost:27017 }
-  redis:    { url: redis://localhost:6379 }
-  elasticsearch: { url: http://localhost:9200 }
+  mysql:
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password_env: MYSQL_PWD
+    pool_max: 8
+  postgres:
+    host: 127.0.0.1
+    port: 5432
+    user: postgres
+    password_env: PGPASSWORD
+    pool_max: 8
+  mongodb:
+    uri: mongodb://localhost:27017
+  redis:
+    url: redis://localhost:6379
+  elasticsearch:
+    url: http://localhost:9200
+
 snapshots:
   cache_dir: ~/.cache/treeman/snapshots
   retention:
@@ -200,9 +213,11 @@ snapshots:
 # Per-repo (.treeman.yaml)
 repo:
   name: myapp
+
 slug:
   ticket_regex: "^([A-Z]+)-(\\d+)"
   fallback: "wt_{shorthash8}"
+
 worktrees:
   # Relative paths resolve from the main repo root; absolute paths are
   # used as-is. Branch slashes are preserved, so a branch named
@@ -214,46 +229,68 @@ worktrees:
     - .env
     - .env.testing
     - justfile
+
 env_scoping:
-  files: [".env.testing", "phpunit.xml"]
+  files:
+    - .env.testing
+    - phpunit.xml
   skip_worktree: true
   patches:
-    - { key: DB_TEST_DATABASE,    template: "myapp_testing_{slug}" }
-    - { key: MONGO_DB_DATABASE,   template: "mongodb_testing_{slug}" }
-    - { key: ELASTICSEARCH_PREFIX, template: "search_testing_{slug}" }
-    - { key: REDIS_QUEUE_DATABASE, template: "{slug_redis_queue}" }
-    - { key: REDIS_CACHE_DATABASE, template: "{slug_redis_cache}" }
+    - key: DB_TEST_DATABASE
+      template: "myapp_testing_{slug}"
+    - key: MONGO_DB_DATABASE
+      template: "mongodb_testing_{slug}"
+    - key: ELASTICSEARCH_PREFIX
+      template: "search_testing_{slug}"
+    - key: REDIS_QUEUE_DATABASE
+      template: "{slug_redis_queue}"
+    - key: REDIS_CACHE_DATABASE
+      template: "{slug_redis_cache}"
+
 databases:
   - engine: mysql
     name_template: "myapp_testing_{slug}"
-    dump: { path: "tests/_data/dump.sql" }
-    migrations: { framework: laravel, dir: "database/migrations" }
+    dump:
+      path: "tests/_data/dump.sql"
+    migrations:
+      framework: laravel
+      dir: "database/migrations"
     # `clones: auto` consults the detected test framework: per-worker
     # frameworks (paratest, pytest-xdist, jest, …) get num_cpus clones;
     # shared-DB frameworks (plain pytest, mocha, go test, …) get one.
     # Pin an explicit number with `clones: 8` to override detection.
-    paratest: { clones: auto, name_template: "myapp_testing_{slug}_test_{n}" }
+    paratest:
+      clones: auto
+      name_template: "myapp_testing_{slug}_test_{n}"
   - engine: mongodb
     name_template: "mongodb_testing_{slug}"
   - engine: redis
-    namespaces: { db_index_template: "{slug_redis_queue}" }
+    namespaces:
+      db_index_template: "{slug_redis_queue}"
   - engine: elasticsearch
-    namespaces: { index_prefix_template: "search_testing_{slug}" }
+    namespaces:
+      index_prefix_template: "search_testing_{slug}"
+
 hooks:
   postcreate:
-    - { run: "composer install --no-interaction" }
-    - { run: "yarn install --frozen-lockfile", background: true }
+    - run: "composer install --no-interaction"
+    - run: "yarn install --frozen-lockfile"
+      background: true
   predelete: []
+
 watcher:
   paths:
-    - { glob: "database/migrations/**", on: auto }
+    - glob: "database/migrations/**"
+      on: auto
   debounce_ms: 500
 
 # Optional: declare a custom migration framework
 frameworks:
   app_mongo:
-    markers: ["database/mongo_migrations/.marker"]
-    migration_dirs: ["database/mongo_migrations"]
+    markers:
+      - "database/mongo_migrations/.marker"
+    migration_dirs:
+      - "database/mongo_migrations"
     file_pattern: "*.php"
     hash_mode: filename       # | checksum
     on_modify: rebuild        # | delta
@@ -279,79 +316,125 @@ Three template shapes recur:
 
 ```yaml
 connections:
-  mysql:    { host: 127.0.0.1, port: 3306, user: root,
-              password_env: MYSQL_PWD, pool_max: 8 }
-  postgres: { host: 127.0.0.1, port: 5432, user: postgres,
-              password_env: PGPASSWORD, pool_max: 8 }
+  mysql:
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password_env: MYSQL_PWD
+    pool_max: 8
+  postgres:
+    host: 127.0.0.1
+    port: 5432
+    user: postgres
+    password_env: PGPASSWORD
+    pool_max: 8
 
 databases:
-  - engine: mysql           # also: mariadb, tidb
+  # mysql variant also drives: mariadb, tidb
+  - engine: mysql
     name_template: "myapp_{slug}"
-    dump:        { path: "tests/_data/dump.sql" }
-    migrations:  { framework: laravel, dir: "database/migrations" }
-    paratest:    { clones: auto, name_template: "myapp_{slug}_test_{n}" }
-  - engine: postgres        # also: cockroach
+    dump:
+      path: "tests/_data/dump.sql"
+    migrations:
+      framework: laravel
+      dir: "database/migrations"
+    paratest:
+      clones: auto
+      name_template: "myapp_{slug}_test_{n}"
+  # postgres variant also drives: cockroach
+  - engine: postgres
     name_template: "myapp_{slug}"
-    migrations:  { framework: sqlx, dir: "migrations" }
-    paratest:    { clones: auto, name_template: "myapp_{slug}_test_{n}" }
+    migrations:
+      framework: sqlx
+      dir: "migrations"
+    paratest:
+      clones: auto
+      name_template: "myapp_{slug}_test_{n}"
 ```
 
 #### Document / KV
 
 ```yaml
 connections:
-  mongodb:   { uri: mongodb://localhost:27017 }
-  redis:     { url: redis://localhost:6379 }
-  memcached: { host: 127.0.0.1, port: 11211 }
-  etcd:      { url: http://localhost:2379 }
+  mongodb:
+    uri: mongodb://localhost:27017
+  redis:
+    url: redis://localhost:6379
+  memcached:
+    host: 127.0.0.1
+    port: 11211
+  etcd:
+    url: http://localhost:2379
 
 databases:
   - engine: mongodb
     name_template: "myapp_{slug}"
   - engine: redis
-    namespaces: { db_index_template: "{slug_redis_queue}" }
-  - engine: memcached       # namespaceless; name_template is informational
+    namespaces:
+      db_index_template: "{slug_redis_queue}"
+  # memcached is namespaceless; name_template is informational
+  - engine: memcached
     name_template: "myapp_{slug}"
   - engine: etcd
-    namespaces: { prefix_template: "/myapp/{slug}/" }
+    namespaces:
+      prefix_template: "/myapp/{slug}/"
 ```
 
 #### Search
 
 ```yaml
 connections:
-  elasticsearch: { url: http://localhost:9200 }
-  meilisearch:   { url: http://localhost:7700, api_key_env: MEILI_KEY }
-  typesense:     { url: http://localhost:8108, api_key_env: TYPESENSE_KEY }
+  elasticsearch:
+    url: http://localhost:9200
+  meilisearch:
+    url: http://localhost:7700
+    api_key_env: MEILI_KEY
+  typesense:
+    url: http://localhost:8108
+    api_key_env: TYPESENSE_KEY
 
 databases:
-  - engine: elasticsearch   # also: opensearch
-    namespaces: { index_prefix_template: "search_{slug}_" }
-  - engine: meilisearch     # also: typesense
-    namespaces: { prefix_template: "{slug}_" }
+  # elasticsearch variant also drives: opensearch
+  - engine: elasticsearch
+    namespaces:
+      index_prefix_template: "search_{slug}_"
+  # meilisearch variant also drives: typesense
+  - engine: meilisearch
+    namespaces:
+      prefix_template: "{slug}_"
 ```
 
 #### Vector
 
 ```yaml
 connections:
-  qdrant:   { url: http://localhost:6333, api_key_env: QDRANT_KEY }
-  weaviate: { url: http://localhost:8080 }
-  milvus:   { url: http://localhost:19530 }
+  qdrant:
+    url: http://localhost:6333
+    api_key_env: QDRANT_KEY
+  weaviate:
+    url: http://localhost:8080
+  milvus:
+    url: http://localhost:19530
 
 databases:
-  - engine: qdrant          # also: weaviate, milvus
-    namespaces: { prefix_template: "{slug}_" }
+  # qdrant variant also drives: weaviate, milvus
+  - engine: qdrant
+    namespaces:
+      prefix_template: "{slug}_"
 ```
 
 #### Analytics
 
 ```yaml
 connections:
-  clickhouse: { url: http://localhost:8123, user: default,
-                password_env: CLICKHOUSE_PWD }
-  influxdb:   { url: http://localhost:8086, token_env: INFLUX_TOKEN,
-                org_id: my-org }
+  clickhouse:
+    url: http://localhost:8123
+    user: default
+    password_env: CLICKHOUSE_PWD
+  influxdb:
+    url: http://localhost:8086
+    token_env: INFLUX_TOKEN
+    org_id: my-org
 
 databases:
   - engine: clickhouse
@@ -364,8 +447,10 @@ databases:
 
 ```yaml
 connections:
-  neo4j: { url: bolt://localhost:7687, user: neo4j,
-           password_env: NEO4J_PWD }
+  neo4j:
+    url: bolt://localhost:7687
+    user: neo4j
+    password_env: NEO4J_PWD
 
 databases:
   - engine: neo4j
@@ -376,37 +461,51 @@ databases:
 
 ```yaml
 connections:
-  rabbitmq: { url: http://localhost:15672, user: guest,
-              password_env: RABBITMQ_PWD }
-  nats:     { url: http://localhost:8222 }
-  kafka:    { host: 127.0.0.1, port: 9092 }
+  rabbitmq:
+    url: http://localhost:15672
+    user: guest
+    password_env: RABBITMQ_PWD
+  nats:
+    url: http://localhost:8222
+  kafka:
+    host: 127.0.0.1
+    port: 9092
 
 databases:
-  - engine: rabbitmq        # name_template maps to a RabbitMQ vhost
+  # rabbitmq name_template maps to a RabbitMQ vhost
+  - engine: rabbitmq
     name_template: "myapp_{slug}"
   - engine: nats
-    namespaces: { prefix_template: "{slug}_" }
+    namespaces:
+      prefix_template: "{slug}_"
   - engine: kafka
-    namespaces: { prefix_template: "{slug}_" }
+    namespaces:
+      prefix_template: "{slug}_"
 ```
 
 #### Object store
 
 ```yaml
 connections:
-  s3: { endpoint: http://localhost:9000, region: us-east-1,
-        access_key_env: MINIO_ACCESS, secret_key_env: MINIO_SECRET }
+  s3:
+    endpoint: http://localhost:9000
+    region: us-east-1
+    access_key_env: MINIO_ACCESS
+    secret_key_env: MINIO_SECRET
 
 databases:
-  - engine: s3              # bucket names disallow `_`, so use {slug_dash}
-    namespaces: { prefix_template: "{slug_dash}-" }
+  # bucket names disallow `_`, so use {slug_dash}
+  - engine: s3
+    namespaces:
+      prefix_template: "{slug_dash}-"
 ```
 
 #### Embedded files
 
 ```yaml
 connections:
-  duckdb: { base_dir: ~/.local/state/treeman/duckdb }
+  duckdb:
+    base_dir: ~/.local/state/treeman/duckdb
 
 databases:
   - engine: sqlite
