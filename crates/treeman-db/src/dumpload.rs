@@ -17,28 +17,29 @@ pub async fn load_mysql(driver: &MysqlDriver, target_db: &str, dump_path: &Path)
     let sql = std::fs::read_to_string(dump_path)
         .with_context(|| format!("read dump {}", dump_path.display()))?;
     let mut conn = driver.acquire().await?;
-    // Switch to target schema once.
-    sqlx::query(&format!("USE `{target_db}`"))
-        .execute(&mut *conn)
+    // `sqlx::raw_sql` uses the text protocol — required for statements
+    // MySQL refuses to prepare (LOCK/UNLOCK TABLES, SET PASSWORD, CALL,
+    // user-defined DELIMITER, certain SET SESSION variables, etc.).
+    // Driver default `sqlx::query` would error with
+    // 1295 (HY000): "This command is not supported in the prepared
+    // statement protocol yet". mysqldump output regularly hits this.
+    conn.execute(sqlx::raw_sql(&format!("USE `{target_db}`")))
         .await?;
-    sqlx::query("SET SESSION foreign_key_checks=0")
-        .execute(&mut *conn)
-        .await
-        .ok();
-    sqlx::query("SET SESSION unique_checks=0")
-        .execute(&mut *conn)
-        .await
-        .ok();
-    sqlx::query("SET SESSION sql_log_bin=0")
-        .execute(&mut *conn)
-        .await
-        .ok();
+    let _ = conn
+        .execute(sqlx::raw_sql("SET SESSION foreign_key_checks=0"))
+        .await;
+    let _ = conn
+        .execute(sqlx::raw_sql("SET SESSION unique_checks=0"))
+        .await;
+    let _ = conn
+        .execute(sqlx::raw_sql("SET SESSION sql_log_bin=0"))
+        .await;
     let mut applied: u64 = 0;
     for stmt in iter_statements(&sql) {
         if stmt.trim().is_empty() {
             continue;
         }
-        conn.execute(sqlx::query(stmt))
+        conn.execute(sqlx::raw_sql(stmt))
             .await
             .with_context(|| format!("apply dump stmt #{applied}"))?;
         applied += 1;
@@ -60,7 +61,9 @@ pub async fn load_postgres(
         if stmt.trim().is_empty() {
             continue;
         }
-        conn.execute(sqlx::query(stmt))
+        // Text protocol — `COPY FROM STDIN`, `\copy`, and procedural
+        // blocks (`DO $$ ... $$`) can't use prepared statements.
+        conn.execute(sqlx::raw_sql(stmt))
             .await
             .with_context(|| format!("apply dump stmt #{applied}"))?;
         applied += 1;
