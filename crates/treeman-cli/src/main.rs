@@ -2274,6 +2274,84 @@ async fn teardown_databases(
                     .await;
                     Ok(())
                 }
+                // Wire-compatible variants — reuse the underlying driver.
+                DB::Mariadb { name_template, .. } | DB::Tidb { name_template, .. } => {
+                    let name = render(name_template, &ctx)?;
+                    let mc = cfg
+                        .connections
+                        .mysql
+                        .clone()
+                        .context("connections.mysql not configured")?;
+                    let drv = treeman_db::mysql::MysqlDriver::connect(&mc).await?;
+                    let dropped = drv.drop_matching(&name).await?;
+                    record(
+                        sqlite_pool,
+                        "db_drop",
+                        "mysql_compat",
+                        slug,
+                        &name,
+                        dropped.len(),
+                        repo_id,
+                        wt_id,
+                    )
+                    .await;
+                    Ok(())
+                }
+                DB::Cockroach { name_template, .. } => {
+                    let name = render(name_template, &ctx)?;
+                    let pc = cfg
+                        .connections
+                        .postgres
+                        .clone()
+                        .context("connections.postgres not configured")?;
+                    let drv = treeman_db::postgres::PostgresDriver::connect(&pc).await?;
+                    let dropped = drv.drop_matching(&name).await?;
+                    record(
+                        sqlite_pool,
+                        "db_drop",
+                        "cockroach",
+                        slug,
+                        &name,
+                        dropped.len(),
+                        repo_id,
+                        wt_id,
+                    )
+                    .await;
+                    Ok(())
+                }
+                DB::Opensearch { namespaces } => {
+                    let prefix = render(&namespaces.index_prefix_template, &ctx)?;
+                    let ec = cfg
+                        .connections
+                        .elasticsearch
+                        .clone()
+                        .context("connections.elasticsearch not configured")?;
+                    let drv = treeman_db::elasticsearch::ElasticsearchDriver::connect(&ec)?;
+                    let dropped = drv.drop_matching(&prefix).await?;
+                    record(
+                        sqlite_pool,
+                        "db_drop",
+                        "opensearch",
+                        slug,
+                        &prefix,
+                        dropped.len(),
+                        repo_id,
+                        wt_id,
+                    )
+                    .await;
+                    Ok(())
+                }
+                // New drivers covered with a generic skeleton: build the
+                // driver from cfg.connections.<engine>, call drop_matching
+                // (or namespace flush), record. Most are stubs/partial —
+                // see crate docs.
+                _ => {
+                    eprintln!(
+                        "warn: teardown skipped for engine {:?} (wire-up pending)",
+                        d
+                    );
+                    Ok(())
+                }
             }
         }
         .await;

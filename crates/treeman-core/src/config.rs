@@ -76,6 +76,88 @@ pub struct ConnectionsConfig {
     pub redis: Option<RedisConn>,
     #[serde(default)]
     pub elasticsearch: Option<EsConn>,
+    #[serde(default)]
+    pub clickhouse: Option<HttpConn>,
+    #[serde(default)]
+    pub meilisearch: Option<HttpConn>,
+    #[serde(default)]
+    pub typesense: Option<HttpConn>,
+    #[serde(default)]
+    pub qdrant: Option<HttpConn>,
+    #[serde(default)]
+    pub weaviate: Option<HttpConn>,
+    #[serde(default)]
+    pub milvus: Option<HttpConn>,
+    #[serde(default)]
+    pub neo4j: Option<Neo4jConn>,
+    #[serde(default)]
+    pub influxdb: Option<InfluxdbConn>,
+    #[serde(default)]
+    pub memcached: Option<HostPort>,
+    #[serde(default)]
+    pub rabbitmq: Option<HttpConn>,
+    #[serde(default)]
+    pub nats: Option<HttpConn>,
+    #[serde(default)]
+    pub etcd: Option<HttpConn>,
+    #[serde(default)]
+    pub kafka: Option<HostPort>,
+    #[serde(default)]
+    pub s3: Option<S3Conn>,
+    #[serde(default)]
+    pub duckdb: Option<DuckdbConn>,
+}
+
+/// Bearer-token / API-key HTTP service.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HttpConn {
+    pub url: String,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub password_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HostPort {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Neo4jConn {
+    pub url: String,
+    pub user: String,
+    pub password_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InfluxdbConn {
+    pub url: String,
+    pub token_env: String,
+    pub org_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct S3Conn {
+    pub endpoint: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+    #[serde(default)]
+    pub access_key_env: Option<String>,
+    #[serde(default)]
+    pub secret_key_env: Option<String>,
+}
+fn default_region() -> String {
+    "us-east-1".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DuckdbConn {
+    /// Directory where per-worktree `.duckdb` files live.
+    pub base_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -224,7 +306,34 @@ pub enum DatabaseConfig {
         #[serde(default)]
         paratest: Option<ParatestSpec>,
     },
+    Mariadb {
+        name_template: String,
+        #[serde(default)]
+        dump: Option<DumpSpec>,
+        #[serde(default)]
+        migrations: Option<MigrationSpec>,
+        #[serde(default)]
+        paratest: Option<ParatestSpec>,
+    },
+    Tidb {
+        name_template: String,
+        #[serde(default)]
+        dump: Option<DumpSpec>,
+        #[serde(default)]
+        migrations: Option<MigrationSpec>,
+        #[serde(default)]
+        paratest: Option<ParatestSpec>,
+    },
     Postgres {
+        name_template: String,
+        #[serde(default)]
+        dump: Option<DumpSpec>,
+        #[serde(default)]
+        migrations: Option<MigrationSpec>,
+        #[serde(default)]
+        paratest: Option<ParatestSpec>,
+    },
+    Cockroach {
         name_template: String,
         #[serde(default)]
         dump: Option<DumpSpec>,
@@ -242,6 +351,66 @@ pub enum DatabaseConfig {
     Elasticsearch {
         namespaces: EsNamespaces,
     },
+    Opensearch {
+        namespaces: EsNamespaces,
+    },
+    Clickhouse {
+        name_template: String,
+    },
+    Duckdb {
+        name_template: String,
+    },
+    Meilisearch {
+        namespaces: PrefixNamespaces,
+    },
+    Typesense {
+        namespaces: PrefixNamespaces,
+    },
+    Qdrant {
+        namespaces: PrefixNamespaces,
+    },
+    Weaviate {
+        namespaces: PrefixNamespaces,
+    },
+    Milvus {
+        namespaces: PrefixNamespaces,
+    },
+    Neo4j {
+        name_template: String,
+    },
+    Influxdb {
+        name_template: String,
+    },
+    Memcached {
+        /// Memcached is namespaceless; this is informational only.
+        #[serde(default)]
+        name_template: Option<String>,
+    },
+    Rabbitmq {
+        /// Maps to a RabbitMQ vhost.
+        name_template: String,
+    },
+    Nats {
+        namespaces: PrefixNamespaces,
+    },
+    Etcd {
+        namespaces: PrefixNamespaces,
+    },
+    Kafka {
+        namespaces: PrefixNamespaces,
+    },
+    S3 {
+        namespaces: PrefixNamespaces,
+    },
+    Sqlite {
+        /// Path template for the per-worktree .sqlite file.
+        name_template: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PrefixNamespaces {
+    pub prefix_template: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
