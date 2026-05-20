@@ -53,7 +53,8 @@ nix-check:
 release-preview:
     #!/usr/bin/env bash
     set -euo pipefail
-    CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+    CURRENT_TAG=$(git tag -l 'v*.*.*' --sort=-v:refname | head -1)
+    CURRENT_TAG=${CURRENT_TAG:-v0.0.0}
     CURRENT_VERSION=${CURRENT_TAG#v}
     MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
     MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
@@ -86,7 +87,8 @@ _release bump:
     #!/usr/bin/env bash
     set -euo pipefail
     just _release-checks
-    CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+    CURRENT_TAG=$(git tag -l 'v*.*.*' --sort=-v:refname | head -1)
+    CURRENT_TAG=${CURRENT_TAG:-v0.0.0}
     CURRENT_VERSION=${CURRENT_TAG#v}
     MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
     MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
