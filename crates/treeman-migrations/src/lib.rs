@@ -121,6 +121,63 @@ impl FrameworkSpec {
         out
     }
 
+    /// Directories the file-watcher should `notify::watch` recursively
+    /// so that *new* module/monorepo migration dirs created mid-watch
+    /// also fire events. For a glob pattern like
+    /// `app/Modules/*/Database/Migrations`, this returns the deepest
+    /// existing ancestor of `app/Modules` so a freshly-created
+    /// `app/Modules/NewMod/Database/Migrations/2024_01_foo.php` triggers
+    /// the recursive watcher.
+    ///
+    /// Returned set is deduped and ancestor-merged: if `app/Modules` is
+    /// in the set, `app/Modules/Foo/Database/Migrations` is dropped.
+    pub fn watch_roots(&self, repo_root: &Path) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = vec![];
+        for pat in &self.migration_dir_patterns {
+            if pat.contains('*') || pat.contains('?') {
+                // Take the prefix before the first wildcard, then walk
+                // up until an existing dir is found.
+                let head = pat.split(|c| c == '*' || c == '?').next().unwrap_or("");
+                // Strip trailing '/' so `app/Modules/` → `app/Modules`.
+                let head = head.trim_end_matches('/');
+                let mut candidate = repo_root.join(head);
+                // Walk up. Never use repo_root as a watch root —
+                // recursive watch on the whole repo is too broad and
+                // creates events for every file change. If we can't
+                // find an existing ancestor below repo_root, drop the
+                // entry (no module-dir to watch yet).
+                loop {
+                    if candidate == repo_root || !candidate.starts_with(repo_root) {
+                        break;
+                    }
+                    if candidate.is_dir() {
+                        roots.push(candidate); break;
+                    }
+                    match candidate.parent() {
+                        Some(p) => candidate = p.to_path_buf(),
+                        None => break,
+                    }
+                }
+            } else {
+                let dir = repo_root.join(pat);
+                if dir.is_dir() { roots.push(dir); }
+            }
+        }
+        // Ancestor-merge: drop any path whose ancestor is already in the set.
+        roots.sort();
+        roots.dedup();
+        let mut merged: Vec<PathBuf> = vec![];
+        for r in roots {
+            if merged.iter().any(|m| r.starts_with(m)) {
+                continue; // already covered by a shallower ancestor
+            }
+            // Drop existing entries that are descendants of r.
+            merged.retain(|m| !m.starts_with(&r) || m == &r);
+            merged.push(r);
+        }
+        merged
+    }
+
     pub fn lockfile_paths(&self, repo_root: &Path) -> Vec<PathBuf> {
         self.lockfiles.iter()
             .map(|l| repo_root.join(l))
@@ -365,6 +422,53 @@ mod tests {
         let len = names.len();
         names.dedup();
         assert_eq!(names.len(), len, "duplicate framework name");
+    }
+
+    #[test]
+    fn watch_roots_picks_existing_ancestor_for_glob() {
+        let dir = std::env::temp_dir().join(format!("treeman-watch-roots-{}",
+            blake3::hash(format!("{:?}", std::time::Instant::now()).as_bytes()).to_hex()));
+        std::fs::create_dir_all(dir.join("app/Modules")).unwrap();
+        std::fs::write(dir.join("artisan"), "").unwrap();
+        std::fs::create_dir_all(dir.join("database/migrations")).unwrap();
+        // No modules yet — but app/Modules exists. Watcher should still
+        // watch app/Modules so the first `module:make` triggers events.
+
+        let r = Registry::with_builtins();
+        let spec = r.specs.iter().find(|s| s.name == "laravel").unwrap();
+        let roots: Vec<String> = spec.watch_roots(&dir).iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().display().to_string())
+            .collect();
+        assert!(roots.contains(&"database/migrations".to_string()),
+            "expected canonical dir watched, got {roots:?}");
+        assert!(roots.contains(&"app/Modules".to_string()),
+            "expected app/Modules watched (empty modules dir), got {roots:?}");
+        // Modules/ does not exist — should NOT appear (we walk up; parent
+        // would be repo_root, but that's only used as a last-resort).
+        assert!(!roots.iter().any(|r| r == ""),
+            "should not fall all the way back to repo_root, got {roots:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn watch_roots_dedupes_nested_ancestors() {
+        let dir = std::env::temp_dir().join(format!("treeman-ancestor-merge-{}",
+            blake3::hash(format!("{:?}", std::time::Instant::now()).as_bytes()).to_hex()));
+        std::fs::create_dir_all(dir.join("app/Modules/Foo/Database/Migrations")).unwrap();
+        std::fs::write(dir.join("artisan"), "").unwrap();
+        let r = Registry::with_builtins();
+        let spec = r.specs.iter().find(|s| s.name == "laravel").unwrap();
+        let roots = spec.watch_roots(&dir);
+        // Both app/Modules (from the glob root) and
+        // app/Modules/Foo/Database/Migrations (from migration_dirs)
+        // exist, but watch_roots should NOT include the deeper one once
+        // the ancestor is present.
+        let strs: Vec<String> = roots.iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().display().to_string())
+            .collect();
+        let nested = strs.iter().any(|s| s.starts_with("app/Modules/Foo"));
+        assert!(!nested, "ancestor merge failed: {strs:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

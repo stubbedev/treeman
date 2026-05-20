@@ -120,12 +120,12 @@ async fn spawn_one(
 ) -> Result<tokio::task::JoinHandle<()>> {
     use notify_debouncer_full::new_debouncer;
 
-    let mig_dirs = spec.migration_dirs(&repo_root);
+    let watch_roots = spec.watch_roots(&repo_root);
     let lockfiles = spec.lockfile_paths(&repo_root);
-    if mig_dirs.is_empty() && lockfiles.is_empty() {
+    if watch_roots.is_empty() && lockfiles.is_empty() {
         return Ok(tokio::spawn(async {}));
     }
-    info!(framework = %spec.name, dirs = ?mig_dirs, "starting watcher");
+    info!(framework = %spec.name, roots = ?watch_roots, "starting watcher");
 
     let (raw_tx, mut raw_rx) = mpsc::channel::<()>(64);
     let raw_tx_clone = raw_tx.clone();
@@ -143,7 +143,11 @@ async fn spawn_one(
     {
         let w = debouncer.watcher();
         use notify::Watcher;
-        for d in &mig_dirs {
+        // Recursive watches on the union of ancestor dirs. New module
+        // dirs created beneath these (e.g. `php artisan module:make Foo`
+        // → app/Modules/Foo/Database/Migrations) cascade up through
+        // the recursive watcher → events fire.
+        for d in &watch_roots {
             let _ = w.watch(d, notify::RecursiveMode::Recursive);
         }
         for f in &lockfiles {
@@ -153,19 +157,23 @@ async fn spawn_one(
 
     // Initial snapshot so spurious rebuilds don't fire on watcher start.
     let state_p = state_path(&repo_root, &spec.name);
-    let initial_files = collect_files(&spec, &mig_dirs);
+    let initial_dirs = spec.migration_dirs(&repo_root);
+    let initial_files = collect_files(&spec, &initial_dirs);
     let initial_hs = spec.hash_inputs(&initial_files).unwrap_or(MigrationHashSet {
         by_key: Default::default(), mode: spec.hash_mode,
     });
     save_state(&state_p, &WatcherState::from_hash_set(&initial_hs)).ok();
 
     let h = tokio::spawn(async move {
-        // Keep debouncer alive for the lifetime of the task.
         let _debouncer = debouncer;
         let mut state = WatcherState::from_hash_set(&initial_hs);
         let mut state_files_hint: HashMap<PathBuf, ()> = HashMap::new();
         while raw_rx.recv().await.is_some() {
-            let files = collect_files(&spec, &mig_dirs);
+            // Re-resolve migration_dirs on every fire so newly-created
+            // module dirs (e.g. nwidart laravel-modules) are picked up
+            // without restarting the watcher.
+            let dirs = spec.migration_dirs(&repo_root);
+            let files = collect_files(&spec, &dirs);
             for f in &files { state_files_hint.insert(f.clone(), ()); }
             let cur = match spec.hash_inputs(&files) {
                 Ok(h) => h,
