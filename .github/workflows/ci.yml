@@ -61,4 +61,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@v22
+      # Magic Nix Cache: shares /nix/store across runs via FlakeHub.
+      # Free for OSS, no token. Cold runs unchanged; warm runs go
+      # from ~15min to ~90s for treeman's dep graph.
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
       - run: nix flake check --print-build-logs

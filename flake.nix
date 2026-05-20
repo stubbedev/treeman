@@ -92,16 +92,18 @@
           };
         };
 
+        # `nix flake check` validates:
+        #   - the workspace package builds under Nix (catches buildInput
+        #     drift, missing system deps, sandbox-path issues that bare
+        #     cargo wouldn't see).
+        #   - the source passes rustfmt.
+        # Clippy + tests intentionally NOT duplicated here — the bare
+        # cargo `clippy` + `test` jobs in `.github/workflows/ci.yml` use
+        # `Swatinem/rust-cache` and run the same checks ~10× faster.
+        # Including them again would mean three workspace rebuilds per
+        # CI run.
         checks = {
           inherit treemanWorkspace;
-          treeman-test = craneLib.cargoTest (commonArgs // {
-            inherit cargoArtifacts;
-            cargoExtraArgs = "--workspace";
-          });
-          treeman-clippy = craneLib.cargoClippy (commonArgs // {
-            inherit cargoArtifacts;
-            cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
-          });
           treeman-fmt = craneLib.cargoFmt {
             inherit src;
             pname = "treeman";
