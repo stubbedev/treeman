@@ -1,59 +1,97 @@
+# justfile for treeman
+# Run `just` to see all available commands.
+
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# Project recipes for treeman.
-#
-# Common entry points:
-#   just                    # show this list
-#   just test               # cargo test --workspace
-#   just lint               # clippy + fmt check
-#   just fmt                # cargo fmt --all
-#   just build              # debug build
-#   just build-release      # release build
-#   just run-daemon         # build + run treemand in foreground
-#   just lock               # refresh Cargo.lock + flake.lock
-#   just release-patch      # bump patch + lock + tag + push
-#   just release-minor      # bump minor + lock + tag + push
-#   just release-major      # bump major + lock + tag + push
+# Configuration
+CARGO_BIN := "treeman"
+DAEMON_BIN := "treemand"
 
+# Default recipe — list all available commands.
 default:
     @just --list --unsorted
 
-# ───── dev ─────
+# =============================================================================
+# Setup & Dependencies
+# =============================================================================
 
-test:
-    cargo test --workspace --all-features
+# Verify the local environment has every tool the recipes assume.
+check-tools:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail=0
+    need() {
+        if ! command -v "$1" >/dev/null 2>&1; then
+            echo "missing: $1 ($2)" >&2; fail=1
+        fi
+    }
+    need cargo "https://rustup.rs"
+    need git "system package manager"
+    need gh "https://cli.github.com"
+    if ! cargo set-version --help >/dev/null 2>&1; then
+        echo "missing: cargo-edit (provides cargo set-version)" >&2
+        echo "  install: cargo install cargo-edit" >&2
+        fail=1
+    fi
+    command -v nix >/dev/null 2>&1 || echo "(optional) nix not installed — flake recipes will be skipped"
+    [ "$fail" = "0" ] || exit 1
+    echo "All required tools present."
 
+# =============================================================================
+# Build & Test
+# =============================================================================
+
+# Cargo workspace build (debug).
+build:
+    cargo build --workspace
+
+# Cargo workspace build (release).
+build-release:
+    cargo build --workspace --release
+
+# Install treeman + treemand into ~/.cargo/bin.
+install: build-release
+    cargo install --path crates/treeman-cli --force --locked
+    cargo install --path crates/treeman-daemon --force --locked
+    @echo "Installed treeman + treemand to $(cargo env CARGO_HOME 2>/dev/null || echo \"\$HOME/.cargo\")/bin"
+
+# Format every workspace member.
+fmt:
+    cargo fmt --all
+
+# rustfmt --check + clippy with warnings as errors.
 lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
 
-fmt:
-    cargo fmt --all
+# Run the workspace test suite.
+test:
+    cargo test --workspace --all-features
 
-build:
-    cargo build --workspace
+# CI-parity: fmt + lint + test in one shot.
+check: lint test
 
-build-release:
-    cargo build --workspace --release
-
+# Foreground daemon for local dev/debugging.
 run-daemon: build
-    ./target/debug/treemand
+    ./target/debug/{{DAEMON_BIN}}
 
-# Install locally for ad-hoc use.
-install:
-    cargo install --path crates/treeman-cli --force
-    cargo install --path crates/treeman-daemon --force
+# Remove build artifacts.
+clean:
+    cargo clean
+    rm -f coverage.out coverage.html
 
-# Refresh both Cargo.lock and flake.lock (if nix is available).
+# Refresh Cargo.lock and (if nix is available) flake.lock.
 lock:
     cargo update --workspace
     @if command -v nix >/dev/null 2>&1; then \
         nix flake update; \
     else \
-        echo "nix not installed — skipping flake.lock update"; \
+        echo "(nix not installed — skipping flake.lock update)"; \
     fi
 
-# ───── nix ─────
+# =============================================================================
+# Nix
+# =============================================================================
 
 nix-build:
     nix build .#treeman .#treemand
@@ -64,52 +102,92 @@ nix-check:
 nix-shell:
     nix develop
 
-# ───── release ─────
+# =============================================================================
+# Release
+# =============================================================================
 
-# Bump version, refresh locks, commit, tag, push. The tag push triggers
-# the GitHub Actions release workflow which builds binaries for Linux
-# (x86_64 + aarch64) and macOS (x86_64 + aarch64) and attaches them to
-# the GitHub release.
+# Show what the next versions would be for each bump (dry-run).
+release-preview:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+    CURRENT_VERSION=${CURRENT_TAG#v}
+    MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+    MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
+    PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3)
+    echo "Current tag:    $CURRENT_TAG"
+    echo "Cargo version:  $(sed -n 's/^version *= *"\(.*\)".*/\1/p' Cargo.toml | head -1)"
+    echo
+    echo "  release-major: v$((MAJOR + 1)).0.0"
+    echo "  release-minor: v${MAJOR}.$((MINOR + 1)).0"
+    echo "  release-patch: v${MAJOR}.${MINOR}.$((PATCH + 1))"
 
-release-patch: (_release "patch")
-release-minor: (_release "minor")
-release-major: (_release "major")
+# Private preflight: clean tree on default branch, autocommit any
+# drift, refresh locks. Run by every release-{major,minor,patch}.
+_release-checks:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just check-tools
 
+    BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    DEFAULT_BRANCH=$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null \
+        | sed 's|^origin/||' || true)
+    if [ -z "${DEFAULT_BRANCH:-}" ]; then
+        DEFAULT_BRANCH=$(git remote show origin 2>/dev/null \
+            | awk '/HEAD branch/ {print $NF}' || echo main)
+    fi
+    if [ "$BRANCH" != "$DEFAULT_BRANCH" ]; then
+        echo "Error: not on default branch '$DEFAULT_BRANCH' (currently '$BRANCH')." >&2
+        exit 1
+    fi
+
+    just check
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "Formatting/lint produced changes — staging + committing."
+        git add -A
+        git commit -m "chore: format code for release"
+    fi
+
+    if command -v nix >/dev/null 2>&1; then
+        echo "Refreshing flake.lock..."
+        nix flake update
+        if [ -n "$(git status --porcelain flake.lock)" ]; then
+            git add flake.lock
+            git commit -m "chore: update flake.lock for release"
+        fi
+        echo "Verifying nix build..."
+        # Crane derives all hashes from Cargo.lock automatically; no
+        # vendorHash to patch. If the build fails we just bail.
+        nix build --no-link .#workspace
+    else
+        echo "(nix not installed — skipping flake checks)"
+    fi
+
+# Bump workspace version in Cargo.toml, refresh Cargo.lock,
+# commit, tag, push, push --tags. The tag push triggers
+# .github/workflows/release.yml which builds + uploads binaries.
 _release bump:
     #!/usr/bin/env bash
     set -euo pipefail
-    # 0. preflight: clean working tree on master/main
-    branch=$(git rev-parse --abbrev-ref HEAD)
-    if [[ "$branch" != "main" && "$branch" != "master" ]]; then
-        echo "release must run on main/master, currently on '$branch'"; exit 1
-    fi
-    if [[ -n "$(git status --porcelain)" ]]; then
-        echo "working tree dirty — commit or stash first"; exit 1
-    fi
-    if ! command -v cargo-set-version >/dev/null 2>&1 \
-        && ! cargo set-version --help >/dev/null 2>&1; then
-        echo "cargo-edit not installed (need 'cargo set-version'). Install: cargo install cargo-edit"
-        exit 1
-    fi
-    # 1. bump the workspace version (touches every crate's Cargo.toml).
+    just _release-checks
     cargo set-version --workspace --bump {{ bump }}
-    NEW=$(awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml)
-    echo "new version: v${NEW}"
-    # 2. refresh Cargo.lock so the bumped versions land there too.
+    NEW=$(sed -n 's/^version *= *"\(.*\)".*/\1/p' Cargo.toml | head -1)
     cargo update --workspace
-    # 3. refresh flake.lock if nix is available — keeps reproducible builds in sync.
-    if command -v nix >/dev/null 2>&1; then
-        nix flake update
-    fi
-    # 4. sanity: build + test before tagging.
     cargo build --workspace --release
-    cargo test --workspace
-    # 5. commit + tag + push.
     git add -A
     git commit -m "release v${NEW}"
     git tag -a "v${NEW}" -m "v${NEW}"
-    git push
-    git push --tags
+    git push origin HEAD
+    git push origin "v${NEW}"
     echo
-    echo "tagged v${NEW} — release workflow will publish binaries shortly."
-    echo "watch: gh run watch || open https://github.com/stubbe/treeman/actions"
+    echo "Tagged v${NEW}."
+    echo "Watch the release build: gh run watch || open https://github.com/stubbe/treeman/actions"
+
+# Release a new patch version (x.y.Z -> x.y.Z+1).
+release-patch: (_release "patch")
+
+# Release a new minor version (x.Y.z -> x.(Y+1).0).
+release-minor: (_release "minor")
+
+# Release a new major version (X.y.z -> (X+1).0.0).
+release-major: (_release "major")

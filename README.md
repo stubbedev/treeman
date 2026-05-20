@@ -346,25 +346,37 @@ just build-release
 
 ### Release
 
-`just` recipes bump version, refresh `Cargo.lock`, refresh `flake.lock`,
-commit, tag, push, and push the tag — which triggers the GitHub Actions
-release workflow.
+`just` recipes bump version, refresh locks, run `check`, commit, tag,
+push, and push the tag — which triggers the GitHub Actions release
+workflow.
 
 ```sh
-just release-patch   # 0.0.1 → 0.0.2
-just release-minor   # 0.0.2 → 0.1.0
-just release-major   # 0.1.0 → 1.0.0
+just release-preview     # dry-run: show next version for each bump
+just release-patch       # 0.0.1 → 0.0.2
+just release-minor       # 0.0.2 → 0.1.0
+just release-major       # 0.1.0 → 1.0.0
 ```
 
-Each variant:
+Each release recipe:
 
-1. `cargo set-version --workspace --bump {patch,minor,major}` (needs
-   `cargo-edit`).
-2. `cargo update -p treeman-cli` to refresh `Cargo.lock`.
-3. `nix flake update --commit-lock-file` (if `nix` is available).
-4. `git add -A && git commit -m "release vX.Y.Z"`.
-5. `git tag -a vX.Y.Z -m "vX.Y.Z"`.
-6. `git push && git push --tags`.
+1. Runs `just check-tools` (cargo, git, gh, cargo-edit; optional nix).
+2. Verifies the working tree is clean on the default branch (auto-
+   detected via `git rev-parse --abbrev-ref origin/HEAD`; falls back
+   to `main`).
+3. Runs `just check` (= `fmt-check` + `clippy -D warnings` + `cargo
+   test --workspace`). Auto-commits any formatting drift it produces.
+4. `nix flake update` (if nix is installed); commits the lock change.
+5. `nix build --no-link .#workspace` — verifies the package still
+   builds under nix. Crane derives hashes from `Cargo.lock`, so no
+   manual hash patching is needed (unlike Go's `vendorHash` dance).
+6. `cargo set-version --workspace --bump {patch,minor,major}`.
+7. `cargo update --workspace` to refresh `Cargo.lock`.
+8. `cargo build --workspace --release` — final sanity build.
+9. `git commit -m "release vX.Y.Z"`, `git tag -a vX.Y.Z -m vX.Y.Z`.
+10. `git push origin HEAD && git push origin vX.Y.Z`.
+
+The tag push fires `.github/workflows/release.yml` which builds the
+four target tarballs and publishes them as the GitHub release.
 
 ### Nix dev shell
 
