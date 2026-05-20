@@ -36,11 +36,21 @@ pub fn lockdown(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// SO_PEERCRED uid check. Rejects any connection where the peer uid !=
-/// the daemon's uid.
+/// Peer-uid check. Rejects any connection where the peer uid !=
+/// the daemon's uid. Uses `SO_PEERCRED` on Linux and `getpeereid(3)`
+/// on macOS / *BSD.
 pub fn check_peer_uid(stream: &UnixStream) -> Result<()> {
     let our_uid = unsafe { libc::geteuid() };
     let fd = stream.as_raw_fd();
+    let peer = peer_uid(fd)?;
+    if peer != our_uid {
+        bail!("peer uid {} != daemon uid {}", peer, our_uid);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid(fd: std::os::unix::io::RawFd) -> Result<libc::uid_t> {
     #[repr(C)]
     struct Ucred {
         pid: libc::pid_t,
@@ -68,8 +78,37 @@ pub fn check_peer_uid(stream: &UnixStream) -> Result<()> {
             std::io::Error::last_os_error()
         );
     }
-    if cred.uid != our_uid {
-        bail!("peer uid {} != daemon uid {}", cred.uid, our_uid);
+    Ok(cred.uid)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+))]
+fn peer_uid(fd: std::os::unix::io::RawFd) -> Result<libc::uid_t> {
+    let mut euid: libc::uid_t = 0;
+    let mut egid: libc::gid_t = 0;
+    let rc = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
+    if rc != 0 {
+        bail!("getpeereid: {}", std::io::Error::last_os_error());
     }
-    Ok(())
+    Ok(euid)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+)))]
+fn peer_uid(_fd: std::os::unix::io::RawFd) -> Result<libc::uid_t> {
+    bail!("peer-uid lookup not implemented on this OS")
 }
