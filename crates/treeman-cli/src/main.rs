@@ -9,6 +9,7 @@ use directories::ProjectDirs;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
+use treeman_db::DbDriver;
 use treeman_proto::{SOCKET_BASENAME, SOCKET_ENV, StatusResponse};
 use treeman_store::query::{EventFilter, query_events, tail_events};
 
@@ -40,6 +41,42 @@ enum Cmd {
     /// Run a configured hook phase against the worktree containing the cwd.
     #[command(subcommand)]
     Hook(HookCmd),
+    /// Direct DB driver operations (drop matching, flush redis db, list).
+    #[command(subcommand)]
+    Db(DbCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum DbCmd {
+    /// Drop every database matching a prefix.
+    Drop {
+        #[arg(long)]
+        engine: String,
+        #[arg(long)]
+        prefix: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// FLUSHDB on a redis db index (engine=redis required).
+    Flush {
+        #[arg(long)]
+        engine: String,
+        #[arg(long, conflicts_with = "prefix")]
+        db: Option<u8>,
+        #[arg(long, conflicts_with = "db")]
+        prefix: Option<String>,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// List databases/indices matching a prefix.
+    List {
+        #[arg(long)]
+        engine: String,
+        #[arg(long, default_value = "")]
+        prefix: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -156,6 +193,81 @@ async fn main() -> Result<()> {
         Cmd::Worktree(WorktreeCmd::List) => worktree_list().await,
         Cmd::Worktree(WorktreeCmd::Unregister { path }) => worktree_unregister(path).await,
         Cmd::Hook(HookCmd::Run { phase, worktree }) => hook_run(phase, worktree).await,
+        Cmd::Db(DbCmd::Drop { engine, prefix, repo }) => db_drop(engine, prefix, repo).await,
+        Cmd::Db(DbCmd::Flush { engine, db, prefix, repo }) => db_flush(engine, db, prefix, repo).await,
+        Cmd::Db(DbCmd::List { engine, prefix, repo }) => db_list(engine, prefix, repo).await,
+    }
+}
+
+async fn db_drop(engine: String, prefix: String, repo: Option<PathBuf>) -> Result<()> {
+    let cfg = load_cfg(repo)?;
+    let driver = open_driver(&engine, &cfg)?;
+    let dropped = driver.drop_matching(&prefix).await?;
+    if dropped.is_empty() {
+        println!("(no databases matched {prefix}*)");
+    } else {
+        for n in dropped { println!("dropped {n}"); }
+    }
+    Ok(())
+}
+
+async fn db_flush(
+    engine: String,
+    db: Option<u8>,
+    prefix: Option<String>,
+    repo: Option<PathBuf>,
+) -> Result<()> {
+    let cfg = load_cfg(repo)?;
+    let driver = open_driver(&engine, &cfg)?;
+    if let Some(idx) = db {
+        driver.flush_namespace(&treeman_db::Namespace::RedisDb(idx)).await?;
+        println!("flushed redis db {idx}");
+    } else if let Some(p) = prefix {
+        for name in driver.list_matching(&p).await? {
+            driver.flush_namespace(&treeman_db::Namespace::Database(name.clone())).await?;
+            println!("flushed {name}");
+        }
+    } else {
+        bail!("--db or --prefix required");
+    }
+    Ok(())
+}
+
+async fn db_list(engine: String, prefix: String, repo: Option<PathBuf>) -> Result<()> {
+    let cfg = load_cfg(repo)?;
+    let driver = open_driver(&engine, &cfg)?;
+    for n in driver.list_matching(&prefix).await? { println!("{n}"); }
+    Ok(())
+}
+
+fn load_cfg(repo: Option<PathBuf>) -> Result<treeman_core::Config> {
+    let repo_root = match repo {
+        Some(p) => Some(p.canonicalize()?),
+        None => {
+            let cwd = std::env::current_dir()?;
+            discover_repo_root(&cwd)
+        }
+    };
+    treeman_core::config::load_layered(repo_root.as_deref())
+}
+
+fn open_driver(engine: &str, cfg: &treeman_core::Config) -> Result<Box<dyn treeman_db::DbDriver>> {
+    use treeman_db::*;
+    match engine {
+        "mysql" => {
+            let mc = cfg.connections.mysql.clone()
+                .context("connections.mysql not configured")?;
+            // sqlx connect is async; we're in tokio runtime already (#[tokio::main]).
+            let rt = tokio::runtime::Handle::current();
+            let driver = rt.block_on(mysql::MysqlDriver::connect(&mc))?;
+            Ok(Box::new(driver))
+        }
+        "redis" => {
+            let rc = cfg.connections.redis.clone()
+                .context("connections.redis not configured")?;
+            Ok(Box::new(redis_driver::RedisDriver::connect(&rc)?))
+        }
+        other => bail!("unsupported engine for this milestone: {other}"),
     }
 }
 
@@ -261,6 +373,11 @@ async fn hook_run(phase: String, worktree: Option<PathBuf>) -> Result<()> {
         Some(repo_id), Some(wt_id), Some(&phase), Some(duration_ms), &summary,
     ).await?;
 
+    // Declarative DB teardown on predelete. Mirrors .gwt-predelete-bg.
+    if phase == "predelete" {
+        teardown_databases(&cfg, &slug.value, repo_id, wt_id, &pool).await?;
+    }
+
     println!("hook_run #{run_id} phase={phase} exit={}", outcome.aggregate_exit_code);
     if outcome.aggregate_exit_code != 0 {
         std::process::exit(outcome.aggregate_exit_code);
@@ -310,6 +427,83 @@ fn discover_repo_root(start: &std::path::Path) -> Option<PathBuf> {
 async fn open_pool() -> Result<sqlx::SqlitePool> {
     let p = treeman_store::default_db_path()?;
     treeman_store::open(&p).await
+}
+
+/// Render every `databases:` entry's scoped name from the slug + drop/flush
+/// it. Each engine failure is logged and continues (parity with the bash
+/// `|| log "warn — drop failed"` behavior).
+async fn teardown_databases(
+    cfg: &treeman_core::Config,
+    slug: &str,
+    repo_id: i64,
+    wt_id: i64,
+    sqlite_pool: &sqlx::SqlitePool,
+) -> Result<()> {
+    use treeman_core::config::DatabaseConfig as DB;
+    use treeman_core::template::{TemplateContext, render};
+    use treeman_db::Namespace;
+
+    let ctx = TemplateContext::from_slug(&treeman_core::slug::Slug {
+        value: slug.into(),
+        source: treeman_core::slug::SlugSource::Ticket, // not used by render
+    });
+
+    for d in &cfg.databases {
+        let result: Result<()> = async {
+            match d {
+                DB::Mysql { name_template, .. } => {
+                    let name = render(name_template, &ctx)?;
+                    let mc = cfg.connections.mysql.clone()
+                        .context("connections.mysql not configured")?;
+                    let drv = treeman_db::mysql::MysqlDriver::connect(&mc).await?;
+                    let dropped = drv.drop_matching(&name).await?;
+                    record(sqlite_pool, "db_drop", "mysql", slug, &name, dropped.len(), repo_id, wt_id).await;
+                    Ok(())
+                }
+                DB::Postgres { .. } => Ok(()),  // M6
+                DB::Mongodb { .. } => Ok(()),   // M7
+                DB::Elasticsearch { .. } => Ok(()), // M7
+                DB::Redis { namespaces } => {
+                    let idx_str = render(&namespaces.db_index_template, &ctx)?;
+                    let idx: u8 = idx_str.parse().context("redis db index parse")?;
+                    let rc = cfg.connections.redis.clone()
+                        .context("connections.redis not configured")?;
+                    let drv = treeman_db::redis_driver::RedisDriver::connect(&rc)?;
+                    drv.flush_namespace(&Namespace::RedisDb(idx)).await?;
+                    record(sqlite_pool, "db_flush", "redis", slug, &format!("db{idx}"), 1, repo_id, wt_id).await;
+                    Ok(())
+                }
+            }
+        }.await;
+        if let Err(e) = result {
+            eprintln!("warn: teardown failed for {:?}: {e}", d);
+            let _ = treeman_store::write_event(
+                sqlite_pool, "warn", "db_teardown_error",
+                Some(&e.to_string()), Some(repo_id), Some(wt_id), None, None, "{}"
+            ).await;
+        }
+    }
+    Ok(())
+}
+
+async fn record(
+    pool: &sqlx::SqlitePool,
+    event_type: &str,
+    engine: &str,
+    slug: &str,
+    target: &str,
+    count: usize,
+    repo_id: i64,
+    wt_id: i64,
+) {
+    let payload = serde_json::json!({
+        "engine": engine, "slug": slug, "target": target, "count": count,
+    }).to_string();
+    let _ = treeman_store::write_event(
+        pool, "info", event_type,
+        Some(&format!("{engine}: {target} ({count})")),
+        Some(repo_id), Some(wt_id), None, None, &payload,
+    ).await;
 }
 
 async fn logs_tail(
