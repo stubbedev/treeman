@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/treeman-proto",
+    "crates/treeman-daemon",
+    "crates/treeman-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stubbe/treeman"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time", "fs", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive", "env"] }
+jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
+directories = "5"
+
+treeman-proto = { path = "crates/treeman-proto", version = "0.0.1" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
