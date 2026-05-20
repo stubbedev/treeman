@@ -48,6 +48,7 @@ async fn backing() -> (Backing, MysqlConn, String) {
         port,
         user: "root".into(),
         password_env: None,
+        password: None,
         pool_max: 4,
     };
     let stem = format!("tm_it_{port}");

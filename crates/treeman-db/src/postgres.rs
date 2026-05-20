@@ -16,10 +16,16 @@ pub struct PostgresDriver {
 
 impl PostgresDriver {
     pub async fn connect(cfg: &PostgresConn) -> Result<Self> {
+        crate::reachability::probe("postgres", &cfg.host, cfg.port).await?;
+
         let password = cfg
-            .password_env
-            .as_deref()
-            .map(|k| std::env::var(k).unwrap_or_default())
+            .password
+            .clone()
+            .or_else(|| {
+                cfg.password_env
+                    .as_deref()
+                    .and_then(|k| std::env::var(k).ok())
+            })
             .unwrap_or_default();
         let url = format!(
             "postgres://{user}:{pass}@{host}:{port}/postgres?sslmode=disable",

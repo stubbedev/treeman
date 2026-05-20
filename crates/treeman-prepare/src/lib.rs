@@ -42,15 +42,22 @@ pub struct PrepareOutcome {
     pub clones: Vec<String>,
 }
 
-/// Incremental "delta" path. Run the framework's pending migrations
-/// against the source DB and every paratest clone, skipping the full
-/// rebuild. Triggered by the watcher when `Dispatch::Delta` fires
-/// (newly-added migration files only).
+/// Incremental "delta" path. Triggered by the watcher when
+/// `Dispatch::Delta` fires (newly-added migration files only).
 ///
-/// This is the practical alternative to binlog row-event replay:
-/// every supported framework already tracks applied migrations, so a
-/// pending-only invocation against each clone is idempotent and
-/// orders-of-magnitude faster than wiping + reseeding + re-cloning.
+/// For mysql/mariadb/tidb: migrate the SOURCE DB once, then replay the
+/// resulting binlog row events onto every paratest clone. ~N× faster
+/// than re-running migrations on each clone for large `clones` counts.
+/// Falls back to per-clone framework-migrate if the binlog stream
+/// isn't usable (binlog off, source unreachable from where the daemon
+/// lives, replication user lacks grants, etc.).
+///
+/// For postgres/cockroach: there is no equivalent of a wire-level
+/// logical-replication stream that's universally enabled, so this
+/// path always runs the framework's pending-only migrate on the
+/// source AND each clone. Frameworks track applied migrations, so a
+/// pending-only invocation is idempotent and still faster than a
+/// full rebuild.
 pub async fn delta_run(
     cfg: &Config,
     repo_root: &Path,
@@ -80,8 +87,28 @@ pub async fn delta_run(
                 migrations,
                 paratest,
                 ..
+            } => {
+                let engine = engine_name_for(d);
+                let Some(mspec) = migrations.as_ref() else {
+                    info!(engine, "no migrations: skipping delta");
+                    continue;
+                };
+                let source_db = render(name_template, &ctx)?;
+                let clones = resolve_clone_names(paratest.as_ref(), slug, repo_root)?;
+                run_delta_mysql(
+                    cfg,
+                    engine,
+                    &source_db,
+                    &clones,
+                    mspec,
+                    repo_root,
+                    sqlite,
+                    repo_id,
+                    worktree_id,
+                )
+                .await?
             }
-            | DatabaseConfig::Postgres {
+            DatabaseConfig::Postgres {
                 name_template,
                 migrations,
                 paratest,
@@ -100,7 +127,7 @@ pub async fn delta_run(
                 };
                 let source_db = render(name_template, &ctx)?;
                 let clones = resolve_clone_names(paratest.as_ref(), slug, repo_root)?;
-                run_delta(
+                run_delta_remigrate(
                     engine,
                     &source_db,
                     &clones,
@@ -161,8 +188,10 @@ fn resolve_clone_names(
     Ok(out)
 }
 
+/// Per-clone framework-migrate fallback. Idempotent thanks to the
+/// migration framework's bookkeeping table.
 #[allow(clippy::too_many_arguments)]
-async fn run_delta(
+async fn run_delta_remigrate(
     engine: &'static str,
     source_db: &str,
     clones: &[String],
@@ -240,7 +269,295 @@ async fn run_delta(
         source_db,
         repo_id,
         worktree_id,
-        &format!("clones={}", clones.len()),
+        &format!("clones={}; mode=remigrate", clones.len()),
+    )
+    .await;
+    Ok(DeltaOutcome {
+        engine: engine.into(),
+        source_db: source_db.into(),
+        clones: clones.to_vec(),
+        migrate_exit_codes: codes,
+    })
+}
+
+/// Mysql-family delta. Capture binlog position → run framework
+/// migrate on source → replay binlog row events against every clone.
+/// Any binlog-stream failure (engine unreachable, log_bin off,
+/// replication grants missing, source DML not visible in binlog)
+/// degrades cleanly to [`run_delta_remigrate`] so the watcher is
+/// never blocked.
+#[allow(clippy::too_many_arguments)]
+async fn run_delta_mysql(
+    cfg: &Config,
+    engine: &'static str,
+    source_db: &str,
+    clones: &[String],
+    mspec: &MigrationSpec,
+    repo_root: &Path,
+    sqlite: &SqlitePool,
+    repo_id: i64,
+    worktree_id: i64,
+) -> Result<DeltaOutcome> {
+    use treeman_db::binlog::{BinlogError, BinlogReplicator};
+
+    // No clones to feed → cheap path. Still migrate source so the
+    // template/source DB stays current.
+    if clones.is_empty() {
+        return run_delta_remigrate(
+            engine,
+            source_db,
+            clones,
+            mspec,
+            repo_root,
+            sqlite,
+            repo_id,
+            worktree_id,
+        )
+        .await;
+    }
+
+    let Some(mc) = cfg.connections.mysql.clone() else {
+        // No mysql connection resolved — can't open the binlog stream.
+        // Fall back so the user still gets clones up-to-date.
+        return run_delta_remigrate(
+            engine,
+            source_db,
+            clones,
+            mspec,
+            repo_root,
+            sqlite,
+            repo_id,
+            worktree_id,
+        )
+        .await;
+    };
+
+    let replicator = match BinlogReplicator::connect(&mc).await {
+        Ok(r) => r,
+        Err(e) => {
+            emit(
+                sqlite,
+                "warn",
+                "binlog_unavailable",
+                engine,
+                source_db,
+                repo_id,
+                worktree_id,
+                &format!("falling back to per-clone migrate: {e}"),
+            )
+            .await;
+            return run_delta_remigrate(
+                engine,
+                source_db,
+                clones,
+                mspec,
+                repo_root,
+                sqlite,
+                repo_id,
+                worktree_id,
+            )
+            .await;
+        }
+    };
+
+    // Capture the pre-migration master position. If binlog is off the
+    // call returns BinlogDisabled; fall back.
+    let from = match replicator.current_position().await {
+        Ok(p) => p,
+        Err(e) => {
+            emit(
+                sqlite,
+                "warn",
+                "binlog_unavailable",
+                engine,
+                source_db,
+                repo_id,
+                worktree_id,
+                &format!("falling back to per-clone migrate: {e}"),
+            )
+            .await;
+            let _ = replicator.close().await;
+            return run_delta_remigrate(
+                engine,
+                source_db,
+                clones,
+                mspec,
+                repo_root,
+                sqlite,
+                repo_id,
+                worktree_id,
+            )
+            .await;
+        }
+    };
+
+    // Run pending migrations on the source only. Frameworks update
+    // their bookkeeping rows + DDL/DML, all of which lands in the
+    // binlog between `from` and the new master position.
+    let mut codes = Vec::new();
+    let out = run_migration(
+        &mspec.framework,
+        repo_root,
+        source_db,
+        MigrateMode::Pending,
+        &[],
+    )
+    .await?;
+    codes.push(out.exit_code);
+    if out.exit_code != 0 {
+        emit(
+            sqlite,
+            "error",
+            "delta_migrate",
+            engine,
+            source_db,
+            repo_id,
+            worktree_id,
+            &out.stderr_tail,
+        )
+        .await;
+        let _ = replicator.close().await;
+        anyhow::bail!(
+            "delta migrate failed on source {source_db}: exit {} — {}",
+            out.exit_code,
+            out.stderr_tail
+        );
+    }
+
+    // Replay BOTH DDL Query events and DML Row events between
+    // `from` and the new master position. The replayer fans the
+    // captured stream onto each clone, so we do NOT need to invoke
+    // the framework's migrate command per-clone afterwards — the
+    // schema delta, any seed inserts, and the framework's
+    // bookkeeping table row are all carried by the stream.
+    match replicator.replay_range(&from, source_db, clones).await {
+        Ok(summary) => {
+            emit(
+                sqlite,
+                "info",
+                "binlog_replay",
+                engine,
+                source_db,
+                repo_id,
+                worktree_id,
+                &format!(
+                    "events_seen={} ddl_events_applied={} row_events_applied={} \
+                     rows_applied={} clones={}",
+                    summary.events_seen,
+                    summary.ddl_events_applied,
+                    summary.row_events_applied,
+                    summary.rows_applied,
+                    clones.len()
+                ),
+            )
+            .await;
+            let _ = replicator.close().await;
+            emit(
+                sqlite,
+                "info",
+                "delta_done",
+                engine,
+                source_db,
+                repo_id,
+                worktree_id,
+                &format!("clones={}; mode=binlog", clones.len()),
+            )
+            .await;
+            Ok(DeltaOutcome {
+                engine: engine.into(),
+                source_db: source_db.into(),
+                clones: clones.to_vec(),
+                migrate_exit_codes: codes,
+            })
+        }
+        Err(BinlogError::Unreachable { .. } | BinlogError::BinlogDisabled) => {
+            // Source state already advanced. Fall through to
+            // per-clone framework migrate to bring clones up to date.
+            emit(
+                sqlite,
+                "warn",
+                "binlog_unavailable_midway",
+                engine,
+                source_db,
+                repo_id,
+                worktree_id,
+                "falling back to per-clone migrate after source-migrate",
+            )
+            .await;
+            let _ = replicator.close().await;
+            run_remaining_clones(
+                engine,
+                source_db,
+                clones,
+                mspec,
+                repo_root,
+                sqlite,
+                repo_id,
+                worktree_id,
+                codes,
+            )
+            .await
+        }
+        Err(e) => {
+            let _ = replicator.close().await;
+            anyhow::bail!("binlog replay failed for {source_db}: {e}");
+        }
+    }
+}
+
+/// Tail of `run_delta_mysql` reused when the binlog replay aborts
+/// midway. We've already migrated the source; finish the clones via
+/// framework migrate.
+#[allow(clippy::too_many_arguments)]
+async fn run_remaining_clones(
+    engine: &'static str,
+    source_db: &str,
+    clones: &[String],
+    mspec: &MigrationSpec,
+    repo_root: &Path,
+    sqlite: &SqlitePool,
+    repo_id: i64,
+    worktree_id: i64,
+    mut codes: Vec<i32>,
+) -> Result<DeltaOutcome> {
+    for clone in clones {
+        let out = run_migration(
+            &mspec.framework,
+            repo_root,
+            clone,
+            MigrateMode::Pending,
+            &[],
+        )
+        .await?;
+        codes.push(out.exit_code);
+        if out.exit_code != 0 {
+            emit(
+                sqlite,
+                "error",
+                "delta_migrate",
+                engine,
+                clone,
+                repo_id,
+                worktree_id,
+                &out.stderr_tail,
+            )
+            .await;
+            anyhow::bail!(
+                "delta migrate failed on clone {clone}: exit {} — {}",
+                out.exit_code,
+                out.stderr_tail
+            );
+        }
+    }
+    emit(
+        sqlite,
+        "info",
+        "delta_done",
+        engine,
+        source_db,
+        repo_id,
+        worktree_id,
+        &format!("clones={}; mode=binlog+remigrate-fallback", clones.len()),
     )
     .await;
     Ok(DeltaOutcome {

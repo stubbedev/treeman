@@ -77,7 +77,11 @@ type Predicate = fn(&Path) -> bool;
 
 fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
     vec![
-        // PHP — paratest (Laravel default, brianium/paratest).
+        // PHP — paratest (Laravel default, brianium/paratest). Sets
+        // TEST_TOKEN (1-based, unique among CURRENTLY running workers,
+        // reused on re-run) and UNIQUE_TEST_TOKEN (unique per run and
+        // per process). Per-worker DB scoping should use TEST_TOKEN.
+        // https://github.com/paratestphp/paratest README "Test token"
         (
             spec(
                 "paratest",
@@ -88,7 +92,8 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
             ),
             |r| composer_has(r, "brianium/paratest"),
         ),
-        // PHP — pest with --parallel uses paratest under the hood, same env.
+        // PHP — pest with --parallel uses paratest under the hood,
+        // same TEST_TOKEN. https://pestphp.com/docs/parallel-testing
         (
             spec(
                 "pest",
@@ -99,6 +104,25 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
             ),
             |r| composer_has(r, "pestphp/pest"),
         ),
+        // PHP — Codeception. Parallel via robo-paracept (Robo task
+        // runner) or via the paratest extension on PHPUnit-style
+        // tests. We mark Shared because neither path exposes a
+        // stable per-worker env var on its own; users who run
+        // Codeception inside paratest get TEST_TOKEN via that detector.
+        // https://codeception.com/docs/ParallelExecution
+        (
+            spec(
+                "codeception",
+                "php",
+                None,
+                WorkerIndex::OneBased,
+                CloneStrategy::Shared,
+            ),
+            |r| {
+                composer_has(r, "codeception/codeception")
+                    && !composer_has(r, "brianium/paratest")
+            },
+        ),
         // PHP — vanilla phpunit (no parallel). Shared DB.
         (
             spec(
@@ -108,9 +132,14 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
                 WorkerIndex::OneBased,
                 CloneStrategy::Shared,
             ),
-            |r| composer_has(r, "phpunit/phpunit") && !composer_has(r, "brianium/paratest"),
+            |r| {
+                composer_has(r, "phpunit/phpunit")
+                    && !composer_has(r, "brianium/paratest")
+                    && !composer_has(r, "pestphp/pest")
+            },
         ),
-        // Python — pytest-xdist.
+        // Python — pytest-xdist. PYTEST_XDIST_WORKER is "gw0", "gw1", …
+        // 0-based after the "gw" prefix. https://pytest-xdist.readthedocs.io/
         (
             spec(
                 "pytest-xdist",
@@ -121,14 +150,17 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
             ),
             |r| python_dep_has(r, "pytest-xdist"),
         ),
-        // Python — pytest-parallel.
+        // Python — pytest-parallel. Does NOT expose PYTEST_XDIST_WORKER
+        // or any standard per-worker env. Project is largely
+        // unmaintained; we detect it so it shows up in `fw detect`
+        // but mark Shared so we don't pretend to fan out clones.
         (
             spec(
                 "pytest-parallel",
                 "python",
-                Some("PYTEST_XDIST_WORKER"),
-                WorkerIndex::PytestXdist,
-                CloneStrategy::PerWorker,
+                None,
+                WorkerIndex::OneBased,
+                CloneStrategy::Shared,
             ),
             |r| python_dep_has(r, "pytest-parallel"),
         ),
@@ -147,7 +179,10 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
                     && !python_dep_has(r, "pytest-parallel")
             },
         ),
-        // Ruby — parallel_tests.
+        // Ruby — parallel_tests. TEST_ENV_NUMBER is empty string for
+        // worker 1 ("", not "1") and "2", "3", … for the rest unless
+        // `--first-is-1` is passed. Consuming code must handle both
+        // forms. https://github.com/grosser/parallel_tests
         (
             spec(
                 "parallel_tests",
@@ -180,7 +215,8 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
             ),
             |r| gemfile_has(r, "minitest") && !gemfile_has(r, "parallel_tests"),
         ),
-        // JS/TS — jest.
+        // JS/TS — jest. JEST_WORKER_ID is 1-based; set to "1" when
+        // --runInBand is used (single-process mode). https://jestjs.io/
         (
             spec(
                 "jest",
@@ -191,7 +227,11 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
             ),
             |r| package_json_dep_has(r, "jest"),
         ),
-        // JS/TS — vitest.
+        // JS/TS — vitest. VITEST_POOL_ID is 1-based and bounded by
+        // maxWorkers (Jest-equivalent); VITEST_WORKER_ID is globally
+        // unique but unbounded as workers are recycled. POOL_ID is
+        // the right one for DB scoping.
+        // https://github.com/vitest-dev/vitest/pull/1473
         (
             spec(
                 "vitest",
@@ -202,7 +242,9 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
             ),
             |r| package_json_dep_has(r, "vitest"),
         ),
-        // JS/TS — playwright (parallel by default; uses TEST_PARALLEL_INDEX).
+        // JS/TS — playwright. TEST_PARALLEL_INDEX is 0..workers-1
+        // (bounded — use this for DB scoping). TEST_WORKER_INDEX is
+        // 1-based globally unique (unbounded). https://playwright.dev/docs/test-parallel
         (
             spec(
                 "playwright",
@@ -213,7 +255,27 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
             ),
             |r| package_json_dep_has(r, "@playwright/test"),
         ),
-        // JS/TS — mocha-parallel-tests.
+        // JS/TS — cypress-parallel (tnicola/cypress-parallel). Sets
+        // CYPRESS_THREAD as a 1-based index. The newer
+        // @badeball/cypress-parallel and cypress-split use other
+        // names (CYPRESS_SPLIT_INDEX, CI_NODE_INDEX) — users should
+        // switch worker_env via the custom framework hook.
+        (
+            spec(
+                "cypress-parallel",
+                "javascript",
+                Some("CYPRESS_THREAD"),
+                WorkerIndex::OneBased,
+                CloneStrategy::PerWorker,
+            ),
+            |r| {
+                package_json_dep_has(r, "cypress-parallel")
+                    || package_json_dep_has(r, "@badeball/cypress-parallel")
+            },
+        ),
+        // JS/TS — mocha-parallel-tests (legacy; mocha 8+ has native
+        // --parallel but doesn't expose a per-worker env by default).
+        // https://github.com/mocha-parallel/mocha-parallel-tests
         (
             spec(
                 "mocha-parallel-tests",
@@ -237,7 +299,41 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
                 package_json_dep_has(r, "mocha") && !package_json_dep_has(r, "mocha-parallel-tests")
             },
         ),
-        // Rust — cargo-nextest.
+        // JS/TS — bun test. Bun runs tests in-process; no per-worker
+        // process env. Mark Shared.
+        // https://bun.sh/docs/cli/test
+        (
+            spec(
+                "bun-test",
+                "javascript",
+                None,
+                WorkerIndex::OneBased,
+                CloneStrategy::Shared,
+            ),
+            |r| {
+                (has_path(r, "bun.lockb") || has_path(r, "bun.lock"))
+                    && !package_json_dep_has(r, "vitest")
+                    && !package_json_dep_has(r, "jest")
+            },
+        ),
+        // JS/TS — deno test. No per-worker process env; tests are
+        // sandboxed and run concurrently in one runtime by default.
+        // https://docs.deno.com/runtime/manual/basics/testing/
+        (
+            spec(
+                "deno-test",
+                "javascript",
+                None,
+                WorkerIndex::OneBased,
+                CloneStrategy::Shared,
+            ),
+            |r| has_path(r, "deno.json") || has_path(r, "deno.jsonc"),
+        ),
+        // Rust — cargo-nextest. NEXTEST_TEST_GLOBAL_SLOT is a unique
+        // slot within the run, real env var (also NEXTEST_TEST_GROUP_SLOT
+        // for grouped tests). Slot indexing is internal — treat as
+        // 0-based by convention; user can override in custom config.
+        // https://nexte.st/docs/configuration/env-vars/
         (
             spec(
                 "cargo-nextest",
@@ -267,8 +363,31 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
                     && !has_path(r, "nextest.toml")
             },
         ),
-        // Go — go test parallelizes by package via `-p N`. Per-package
-        // DBs not idiomatic; treat as shared.
+        // Go — Ginkgo v2. Process index only available via the
+        // `GinkgoParallelProcess()` Go function (1-based). No env
+        // var is set by Ginkgo, so per-clone scoping has to be
+        // wired by the test setup code itself — typically by
+        // calling that function and using the result as the slug
+        // suffix. We mark PerWorker so the daemon still provisions
+        // clones; worker_env = None tells callers there is no env
+        // to read. https://onsi.github.io/ginkgo/
+        (
+            spec(
+                "ginkgo",
+                "go",
+                None,
+                WorkerIndex::OneBased,
+                CloneStrategy::PerWorker,
+            ),
+            |r| {
+                has_path(r, "go.mod")
+                    && (gosum_has(r, "github.com/onsi/ginkgo/v2")
+                        || gosum_has(r, "github.com/onsi/ginkgo"))
+            },
+        ),
+        // Go — go test parallelizes by package via `-p N` (and by
+        // `t.Parallel()` within a package). Per-package DBs not
+        // idiomatic; treat as shared. ginkgo handled separately.
         (
             spec(
                 "go-test",
@@ -277,9 +396,22 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
                 WorkerIndex::OneBased,
                 CloneStrategy::Shared,
             ),
-            |r| has_path(r, "go.mod"),
+            |r| {
+                has_path(r, "go.mod")
+                    && !gosum_has(r, "github.com/onsi/ginkgo/v2")
+                    && !gosum_has(r, "github.com/onsi/ginkgo")
+            },
         ),
-        // Java — Maven Surefire (forkNumber 1..N).
+        // Java — Maven Surefire. The fork number is exposed as the
+        // `${surefire.forkNumber}` PLACEHOLDER (1-based), which the
+        // plugin replaces in `argLine`, `environmentVariables`, and
+        // `systemPropertyVariables`. To use it as an env var, wire it
+        // through `<environmentVariables>` in pom.xml — e.g.
+        //   <SUREFIRE_FORK_NUMBER>${surefire.forkNumber}</SUREFIRE_FORK_NUMBER>
+        // Without this wiring there is no SUREFIRE_FORK_NUMBER env;
+        // we publish the canonical name so users can pin it the
+        // same way.
+        // https://maven.apache.org/surefire/maven-surefire-plugin/examples/fork-options-and-parallel-execution.html
         (
             spec(
                 "maven-surefire",
@@ -290,7 +422,12 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
             ),
             |r| has_path(r, "pom.xml"),
         ),
-        // Java — Gradle (gradle.test.worker idiom).
+        // Java — Gradle Test. Worker id is the `org.gradle.test.worker`
+        // SYSTEM property (1-based), not an env var. Wire it via:
+        //   test { environment 'GRADLE_TEST_WORKER',
+        //         System.getProperty('org.gradle.test.worker') }
+        // or use `systemProperty 'forkNumber', '...'`. Like Surefire
+        // above we publish the canonical name; user must wire it.
         (
             spec(
                 "gradle-test",
@@ -302,6 +439,8 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
             |r| has_path(r, "build.gradle") || has_path(r, "build.gradle.kts"),
         ),
         // .NET — xUnit / NUnit with collection parallelism (shared by default).
+        // ConnectionStrings__* / `xunit.runner.json` parallelism is
+        // intra-process; no per-fork env.
         (
             spec(
                 "dotnet-test",
@@ -311,6 +450,21 @@ fn builtins() -> Vec<(TestFrameworkSpec, Predicate)> {
                 CloneStrategy::Shared,
             ),
             |r| has_any_with_ext(r, &["csproj", "fsproj", "sln"]),
+        ),
+        // Elixir — `mix test --partitions N` shards tests across N
+        // processes (typically across CI runners or jobs). The
+        // partition number is supplied by the caller through the
+        // MIX_TEST_PARTITION env (1..N, 1-based).
+        // https://hexdocs.pm/mix/Mix.Tasks.Test.html
+        (
+            spec(
+                "mix-test",
+                "elixir",
+                Some("MIX_TEST_PARTITION"),
+                WorkerIndex::OneBased,
+                CloneStrategy::PerWorker,
+            ),
+            |r| has_path(r, "mix.exs"),
         ),
     ]
 }
@@ -391,6 +545,17 @@ fn globbed_cargo_files(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn gosum_has(root: &Path, module_path: &str) -> bool {
+    for f in ["go.sum", "go.mod"] {
+        if let Some(txt) = read_file(&root.join(f)) {
+            if txt.contains(module_path) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn gemfile_has(root: &Path, gem: &str) -> bool {

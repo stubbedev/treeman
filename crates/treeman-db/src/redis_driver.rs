@@ -14,6 +14,20 @@ pub struct RedisDriver {
 
 impl RedisDriver {
     pub fn connect(cfg: &RedisConn) -> Result<Self> {
+        // redis::Client::open does NOT establish a connection; without
+        // a probe, an unreachable Redis only surfaces at first use.
+        // Run a short async probe via a tokio handle if available; if
+        // no runtime is active, skip the probe and rely on the lazy
+        // client error.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let url = cfg.url.clone();
+            let result = std::thread::spawn(move || {
+                handle.block_on(crate::reachability::probe_url("redis", &url))
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("redis probe thread panicked"))?;
+            result?;
+        }
         let client = redis::Client::open(cfg.url.as_str()).context("redis client")?;
         Ok(Self { client })
     }

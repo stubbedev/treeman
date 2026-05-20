@@ -160,26 +160,70 @@ pub struct DuckdbConn {
     pub base_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MysqlConn {
     pub host: String,
     pub port: u16,
     pub user: String,
     #[serde(default)]
     pub password_env: Option<String>,
+    /// Runtime-resolved password. Never deserialized from YAML
+    /// (`#[serde(skip)]`). Filled by [`crate::resolve`] from the repo's
+    /// `.env*` files when present, so users don't have to bake DB
+    /// credentials into systemd-user env or rely on the daemon's
+    /// process env. Drivers prefer this over `password_env`.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub password: Option<String>,
     #[serde(default = "default_pool")]
     pub pool_max: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+// Custom Debug to keep the resolved password from leaking into
+// `treeman config show --resolved` output or log lines.
+impl std::fmt::Debug for MysqlConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MysqlConn")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password_env", &self.password_env)
+            .field("password", &redact(self.password.as_deref()))
+            .field("pool_max", &self.pool_max)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PostgresConn {
     pub host: String,
     pub port: u16,
     pub user: String,
     #[serde(default)]
     pub password_env: Option<String>,
+    /// See [`MysqlConn::password`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub password: Option<String>,
     #[serde(default = "default_pool")]
     pub pool_max: u32,
+}
+
+impl std::fmt::Debug for PostgresConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresConn")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password_env", &self.password_env)
+            .field("password", &redact(self.password.as_deref()))
+            .field("pool_max", &self.pool_max)
+            .finish()
+    }
+}
+
+fn redact(p: Option<&str>) -> &'static str {
+    if p.is_some() { "<set>" } else { "<unset>" }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -583,6 +627,18 @@ pub enum OnModify {
 ///
 /// Later layers override earlier. Missing files are ignored.
 pub fn load_layered(repo_root: Option<&Path>) -> anyhow::Result<Config> {
+    let mut cfg = load_layered_raw(repo_root)?;
+    apply_env_credentials(&mut cfg, repo_root);
+    Ok(cfg)
+}
+
+/// Like [`load_layered`] but skips the env-file credential resolver.
+/// Used by `config show --resolved` so the resolver's provenance
+/// labels (`yaml`, `file:.env.testing`, …) accurately reflect where
+/// each connection field came from rather than always showing
+/// `yaml` (which is what you'd see after `apply_env_credentials`
+/// stashes resolved values back into the cfg slot).
+pub fn load_layered_raw(repo_root: Option<&Path>) -> anyhow::Result<Config> {
     let mut fig = Figment::new();
     if let Some(global) = global_path() {
         if global.exists() {
@@ -627,7 +683,46 @@ pub fn load_layered_for_worktree(main_root: &Path, wt_root: &Path) -> anyhow::Re
             fig = fig.merge(Yaml::file(&wl));
         }
     }
-    Ok(fig.extract::<Config>()?)
+    let mut cfg = fig.extract::<Config>()?;
+    // Prefer the worktree's own .env* files (they carry the slug-
+    // patched DB names), falling back to main if the worktree is
+    // not yet patched.
+    let env_root = if wt_root.join(".env").exists() || wt_root.join(".env.testing").exists() {
+        wt_root
+    } else {
+        main_root
+    };
+    apply_env_credentials(&mut cfg, Some(env_root));
+    Ok(cfg)
+}
+
+/// Fill runtime-resolved credentials on the loaded config. Currently
+/// scopes to `connections.mysql.password` and `connections.postgres
+/// .password`, sourced from the repo's `.env*` files (Laravel /
+/// Symfony / dotenv convention) and the process env as a fallback.
+///
+/// Idempotent — calling twice produces the same result, since later
+/// calls just overwrite the password slot with whatever the resolver
+/// returns. Driver code reads the resolved password without ever
+/// touching the process env, so a single global daemon can serve many
+/// repos with different credentials.
+fn apply_env_credentials(cfg: &mut Config, repo_root: Option<&Path>) {
+    let resolved = crate::resolve::resolve(cfg, repo_root);
+    if let Some((m, _)) = resolved.mysql {
+        cfg.connections.mysql = Some(m);
+    }
+    if let Some((p, _)) = resolved.postgres {
+        cfg.connections.postgres = Some(p);
+    }
+    if let Some((mc, _)) = resolved.mongodb {
+        cfg.connections.mongodb = Some(mc);
+    }
+    if let Some((r, _)) = resolved.redis {
+        cfg.connections.redis = Some(r);
+    }
+    if let Some((e, _)) = resolved.elasticsearch {
+        cfg.connections.elasticsearch = Some(e);
+    }
 }
 
 pub fn global_path() -> Option<PathBuf> {

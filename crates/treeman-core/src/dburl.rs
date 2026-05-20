@@ -113,6 +113,10 @@ pub enum ParseError {
 
 pub fn parse(url: &str) -> Result<DbUrl, ParseError> {
     let raw = url.to_string();
+    // JDBC-style URLs (`jdbc:mysql://h:3306/db`) are Spring Boot's
+    // canonical form. Strip the `jdbc:` prefix so the rest parses as
+    // a normal driver URL.
+    let url = url.strip_prefix("jdbc:").unwrap_or(url);
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| ParseError::NoScheme(url.into()))?;

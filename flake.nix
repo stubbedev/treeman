@@ -24,6 +24,9 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
+        # Single source of truth — bumped by `cargo set-version` in release recipes.
+        cargoVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
         # Sqlx 0.8 in offline mode needs nothing; in online mode (queries
         # validated at compile against a real DB) it'd need DATABASE_URL.
         # treeman doesn't use the sqlx::query! macro, so plain
@@ -32,6 +35,8 @@
 
         commonArgs = {
           inherit src;
+          pname = "treeman";
+          version = cargoVersion;
           strictDeps = true;
           nativeBuildInputs = with pkgs; [
             pkg-config
@@ -54,7 +59,6 @@
           doCheck = false;  # `nix flake check` runs tests separately
           # Build every member of the workspace.
           cargoExtraArgs = "--workspace --locked";
-          pname = "treeman";
         });
 
         # Individually-named packages (just symlinks into the workspace
@@ -100,6 +104,8 @@
           });
           treeman-fmt = craneLib.cargoFmt {
             inherit src;
+            pname = "treeman";
+            version = cargoVersion;
           };
         };
 

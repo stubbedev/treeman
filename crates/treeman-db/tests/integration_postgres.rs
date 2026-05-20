@@ -41,6 +41,7 @@ async fn backing() -> (Backing, PostgresConn, String) {
         port,
         user: "postgres".into(),
         password_env: None,
+        password: None,
         pool_max: 4,
     };
     let stem = format!("tm_it_{port}");

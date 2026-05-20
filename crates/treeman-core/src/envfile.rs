@@ -87,6 +87,11 @@ pub fn read_layered<P: AsRef<Path>>(paths: &[P]) -> EnvFile {
     let mut out = EnvFile::default();
     for p in paths {
         let one = read_optional(p.as_ref());
+        if one.source.is_some() {
+            // Track the most recent file that actually existed; resolver
+            // reports this as the provenance for env-derived values.
+            out.source = one.source.clone();
+        }
         for (k, v) in one.vars {
             out.vars.insert(k, v);
         }

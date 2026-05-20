@@ -60,11 +60,22 @@ pub struct FrameworkSpec {
 }
 
 impl FrameworkSpec {
+    /// All marker groups must match. A marker group is a single string;
+    /// a `|`-delimited string means "any of these files satisfies the
+    /// group" (used to match config files that come in `.ts`, `.js`,
+    /// `.cjs`, `.mjs` variants without inflating the AND-list).
+    ///
+    /// Examples:
+    ///   "artisan"                                  — file must exist
+    ///   "knexfile.js|knexfile.ts|knexfile.cjs"     — any of the three
     pub fn detect(&self, repo_root: &Path) -> bool {
         if self.markers.is_empty() {
             return false;
         }
-        self.markers.iter().all(|m| repo_root.join(m).exists())
+        self.markers.iter().all(|m| {
+            m.split('|')
+                .any(|alt| !alt.is_empty() && repo_root.join(alt.trim()).exists())
+        })
     }
 
     /// Existing migration directories on disk that match
@@ -466,12 +477,14 @@ fn builtins() -> Vec<FrameworkSpec> {
             Delta,
             None,
         ),
-        // Knex — single + monorepo.
+        // Knex — single + monorepo. knexfile lives at the repo root
+        // with .js / .ts / .cjs / .mjs variants depending on the
+        // project's module system (CommonJS vs ESM vs TS).
         fw(
             "knex",
-            &["knexfile.js"],
+            &["knexfile.js|knexfile.ts|knexfile.cjs|knexfile.mjs"],
             &["migrations", "apps/*/migrations", "packages/*/migrations"],
-            &["*.js"],
+            &["*.js", "*.ts"],
             &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
             Filename,
             Rebuild,
@@ -499,25 +512,38 @@ fn builtins() -> Vec<FrameworkSpec> {
             Rebuild,
             None,
         ),
-        // TypeORM — single + NX/yarn monorepo.
+        // TypeORM — single + NX/yarn monorepo. Detect by the TypeORM
+        // DataSource config file, not just package.json (which would
+        // match every JS project). The canonical name shifted over
+        // versions: `ormconfig.{json,js,ts,yaml}` for typeorm 0.2,
+        // `data-source.ts` for 0.3+ (CLI default), plus user-named
+        // `typeorm.config.ts`.
         fw(
             "typeorm",
-            &["package.json"],
+            &[
+                "ormconfig.json|ormconfig.js|ormconfig.ts|ormconfig.yaml|ormconfig.yml|data-source.ts|data-source.js|typeorm.config.ts|typeorm.config.js",
+            ],
             &[
                 "src/migrations",
+                "src/migration",
+                "migrations",
                 "apps/*/src/migrations",
                 "packages/*/src/migrations",
             ],
-            &["*.ts"],
+            &["*.ts", "*.js"],
             &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
             Filename,
             Rebuild,
             None,
         ),
-        // Drizzle — single + monorepo.
+        // Drizzle — single + monorepo. drizzle.config can be any of
+        // .ts/.js/.mjs/.cjs/.mts; older `drizzle.config.json` exists
+        // for purely JSON-driven setups.
         fw(
             "drizzle",
-            &["drizzle.config.ts"],
+            &[
+                "drizzle.config.ts|drizzle.config.js|drizzle.config.mjs|drizzle.config.cjs|drizzle.config.mts|drizzle.config.json",
+            ],
             &["drizzle", "apps/*/drizzle", "packages/*/drizzle"],
             &["*.sql"],
             &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
@@ -525,27 +551,29 @@ fn builtins() -> Vec<FrameworkSpec> {
             Delta,
             None,
         ),
-        // Sequelize — single + monorepo.
+        // Sequelize — single + monorepo. .sequelizerc is conventional;
+        // can also be a `.js`/`.cjs` factory file.
         fw(
             "sequelize",
-            &[".sequelizerc"],
+            &[".sequelizerc|.sequelizerc.js|.sequelizerc.cjs"],
             &["migrations", "apps/*/migrations", "packages/*/migrations"],
-            &["*.js"],
+            &["*.js", "*.ts"],
             &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
             Filename,
             Rebuild,
             None,
         ),
-        // MikroORM — single + monorepo.
+        // MikroORM — single + monorepo. config file may be .ts/.js/
+        // .cjs depending on module system.
         fw(
             "mikro-orm",
-            &["mikro-orm.config.ts"],
+            &["mikro-orm.config.ts|mikro-orm.config.js|mikro-orm.config.cjs"],
             &[
                 "src/migrations",
                 "apps/*/src/migrations",
                 "packages/*/src/migrations",
             ],
-            &["Migration*.ts"],
+            &["Migration*.ts", "Migration*.js"],
             &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
             Filename,
             Rebuild,
@@ -723,6 +751,82 @@ mod tests {
         let r = Registry::with_builtins();
         let detected = r.detect_all(&dir);
         assert!(detected.iter().any(|s| s.name == "laravel"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn fresh_tempdir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "treeman-{label}-{}",
+            blake3::hash(format!("{:?}", std::time::Instant::now()).as_bytes()).to_hex()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Plain JS project (just `package.json`) must NOT match
+    /// TypeORM / Drizzle / Sequelize / MikroORM / Knex — those were
+    /// previously triggered by the loose `package.json`-only marker.
+    #[test]
+    fn plain_js_project_does_not_match_orms() {
+        let dir = fresh_tempdir("plain-js");
+        std::fs::write(dir.join("package.json"), r#"{"name":"plain"}"#).unwrap();
+        std::fs::write(dir.join("yarn.lock"), "").unwrap();
+        let r = Registry::with_builtins();
+        let names: Vec<&str> =
+            r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
+        for orm in [
+            "typeorm",
+            "drizzle",
+            "sequelize",
+            "mikro-orm",
+            "knex",
+            "prisma",
+        ] {
+            assert!(
+                !names.contains(&orm),
+                "{orm} matched a plain JS project — detector too loose. matched: {names:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// TypeORM project (data-source.ts) matches; plain package.json
+    /// alongside doesn't make any other ORM match.
+    #[test]
+    fn typeorm_matches_only_on_datasource_config() {
+        let dir = fresh_tempdir("typeorm");
+        std::fs::write(dir.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        std::fs::write(dir.join("data-source.ts"), "export default ...").unwrap();
+        let r = Registry::with_builtins();
+        let names: Vec<&str> =
+            r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"typeorm"), "got {names:?}");
+        assert!(!names.contains(&"drizzle"), "got {names:?}");
+        assert!(!names.contains(&"sequelize"), "got {names:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Knex with a TS-style knexfile.
+    #[test]
+    fn knex_matches_typescript_config() {
+        let dir = fresh_tempdir("knex-ts");
+        std::fs::write(dir.join("knexfile.ts"), "export default {}").unwrap();
+        let r = Registry::with_builtins();
+        let names: Vec<&str> =
+            r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"knex"), "got {names:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Drizzle with an mjs config.
+    #[test]
+    fn drizzle_matches_mjs_config() {
+        let dir = fresh_tempdir("drizzle-mjs");
+        std::fs::write(dir.join("drizzle.config.mjs"), "export default {}").unwrap();
+        let r = Registry::with_builtins();
+        let names: Vec<&str> =
+            r.detect_all(&dir).iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"drizzle"), "got {names:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

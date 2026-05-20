@@ -98,6 +98,53 @@ aarch64 tarballs as GitHub release assets. See the
 
 ---
 
+## Native vs containerised services
+
+Treeman speaks every supported engine over the wire — there is no
+`docker exec`, `kubectl exec`, or `mysql`/`psql`/`mongosh`/`redis-cli`
+shell-out path. Whatever the engine runs in is irrelevant **as long as
+the wire port is reachable from where `treemand` is running**:
+
+| Engine layout                                           | Works | Notes |
+|---------------------------------------------------------|-------|-------|
+| Service runs natively on the host (`apt install mysql`) | ✅    | `127.0.0.1:3306` from `.env`/`.env.testing`. |
+| Docker with `-p 3306:3306` published to host            | ✅    | Indistinguishable from native. |
+| Docker on a user-defined network, no `-p` published     | ❌    | Probe surfaces *"unreachable at host:port — check container port mapping"*. Either publish the port or run the daemon inside the same docker network. |
+| Docker Compose with a `services:` healthcheck           | ✅    | Same as above — wait for `treeman config show --resolved` to pick up your `.env` values, then run `treeman prepare`. |
+| Treemand running inside another container               | ⚠️    | `127.0.0.1` resolves to *that* container. Use `host.docker.internal` (Mac/Windows is automatic; on Linux pass `--add-host=host.docker.internal:host-gateway`), or join the engine's docker network. |
+| Remote host (SSH tunnel / VPN / cloud DB)               | ✅    | Pure-wire; throw any reachable `host:port` at it. |
+
+The reachability probe (1.5s TCP connect) runs before any auth
+handshake, so an unreachable engine fails fast with an actionable
+error rather than getting stuck inside sqlx / mongodb / redis pool
+timeouts.
+
+### Binlog requirements (MySQL delta path)
+
+The watcher's binlog DML replicator opens a replication stream against
+the source MySQL server. That requires:
+
+```ini
+# mysql.cnf / docker-compose command:
+log_bin                = ON
+binlog_format          = ROW
+binlog_row_image       = FULL
+server_id              = 1   # any nonzero
+```
+
+and grants on the user `connections.mysql.user`:
+
+```sql
+GRANT REPLICATION SLAVE, RELOAD ON *.* TO 'kontainer'@'%';
+```
+
+When the source MySQL has binlog disabled, the watcher falls back to
+re-running migrations against every paratest clone (slower but
+correct). The same `binlog: BinlogError::Unreachable` path catches the
+case where the MySQL container's wire port isn't exposed.
+
+---
+
 ## Quick start
 
 ```sh

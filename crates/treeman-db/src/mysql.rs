@@ -15,10 +15,23 @@ pub struct MysqlDriver {
 
 impl MysqlDriver {
     pub async fn connect(cfg: &MysqlConn) -> Result<Self> {
+        // Probe TCP first — surfaces "unreachable at host:port" before
+        // sqlx's pool wraps a refused-connection error.
+        crate::reachability::probe("mysql", &cfg.host, cfg.port).await?;
+
+        // The resolver fills `cfg.password` from the repo's .env*
+        // files at config-load time, so a daemon serving many repos
+        // doesn't need any process-env credentials at all. We still
+        // honor `password_env` as a fallback for global configs that
+        // declared an env var directly.
         let password = cfg
-            .password_env
-            .as_deref()
-            .map(|k| std::env::var(k).unwrap_or_default())
+            .password
+            .clone()
+            .or_else(|| {
+                cfg.password_env
+                    .as_deref()
+                    .and_then(|k| std::env::var(k).ok())
+            })
             .unwrap_or_default();
         // No DB scope; connection lives at the server level so DDL like
         // CREATE/DROP DATABASE works.

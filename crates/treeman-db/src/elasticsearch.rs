@@ -16,6 +16,15 @@ pub struct ElasticsearchDriver {
 
 impl ElasticsearchDriver {
     pub fn connect(cfg: &EsConn) -> Result<Self> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let url = cfg.url.clone();
+            let result = std::thread::spawn(move || {
+                handle.block_on(crate::reachability::probe_url("elasticsearch", &url))
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("es probe thread panicked"))?;
+            result?;
+        }
         let http = reqwest::Client::builder()
             .build()
             .context("reqwest client")?;

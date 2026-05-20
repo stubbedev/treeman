@@ -18,6 +18,17 @@ pub struct MongoDriver {
 
 impl MongoDriver {
     pub async fn connect(cfg: &MongoConn) -> Result<Self> {
+        // The mongodb crate's `with_uri_str` is lazy — it parses the
+        // URI and returns Ok even when the server is unreachable.
+        // Probe the first host:port in the URI so callers get a clear
+        // "unreachable" error before they hit the first operation.
+        if let Err(e) = crate::reachability::probe_url("mongodb", &cfg.uri).await {
+            // mongodb+srv://… discovers seeds via DNS; we can't probe
+            // a single host:port for it. Skip and let the client try.
+            if !cfg.uri.starts_with("mongodb+srv://") {
+                return Err(e);
+            }
+        }
         let client = Client::with_uri_str(&cfg.uri)
             .await
             .context("mongo connect")?;
