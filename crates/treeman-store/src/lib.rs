@@ -3,6 +3,7 @@
 //! `events` table so logs are queryable from the CLI without file
 //! plumbing.
 
+pub mod hook_runs;
 pub mod layer;
 pub mod query;
 
@@ -117,5 +118,31 @@ pub async fn mark_worktree_deleted(pool: &SqlitePool, worktree_id: i64) -> Resul
     let now = chrono::Utc::now().timestamp_millis();
     sqlx::query("UPDATE worktrees SET deleted_at = ? WHERE id = ?")
         .bind(now).bind(worktree_id).execute(pool).await?;
+    Ok(())
+}
+
+/// Insert an event row directly. Used by the CLI to record hook runs
+/// without going through tracing (CLI doesn't install the SQLite
+/// subscriber — too short-lived).
+#[allow(clippy::too_many_arguments)]
+pub async fn write_event(
+    pool: &SqlitePool,
+    level: &str,
+    event_type: &str,
+    message: Option<&str>,
+    repo_id: Option<i64>,
+    worktree_id: Option<i64>,
+    phase: Option<&str>,
+    duration_ms: Option<i64>,
+    payload_json: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT INTO events(ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(now).bind(level).bind(repo_id).bind(worktree_id)
+    .bind(event_type).bind(phase).bind(message).bind(payload_json).bind(duration_ms)
+    .execute(pool).await?;
     Ok(())
 }

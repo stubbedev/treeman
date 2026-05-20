@@ -17,6 +17,7 @@ treeman-core = { workspace = true }
 treeman-store = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yaml = "0.9"
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

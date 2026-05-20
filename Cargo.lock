@@ -2768,6 +2768,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sqlx",
  "tokio",
  "treeman-core",
  "treeman-proto",
@@ -2790,6 +2791,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "tinytemplate",
+ "tokio",
  "tracing",
  "twox-hash",
 ]

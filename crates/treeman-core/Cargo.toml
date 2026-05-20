@@ -22,3 +22,4 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 tinytemplate = "1"
 tracing = { workspace = true }
 directories = { workspace = true }
+tokio = { workspace = true }

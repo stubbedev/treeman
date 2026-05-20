@@ -1,6 +1,7 @@
 //! Treeman core. Pure logic — no tokio, no sqlite, no network.
 
 pub mod config;
+pub mod hooks;
 pub mod patcher;
 pub mod slug;
 pub mod template;

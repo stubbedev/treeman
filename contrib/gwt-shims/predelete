@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Drop-in replacement for .gwt-predelete. Delegates to treeman.
+set -euo pipefail
+exec treeman hook run predelete --worktree "$GWT_WT"
