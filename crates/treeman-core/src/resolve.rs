@@ -93,7 +93,7 @@ fn resolve_mysql(cfg: &Config, env: &EnvFile) -> Option<(MysqlConn, Source)> {
                 let mut mc = mysql_from_url(&u);
                 if let Some(p) = env
                     .get("SPRING_DATASOURCE_PASSWORD")
-                    .or_else(|| u.password.as_deref())
+                    .or(u.password.as_deref())
                     .filter(|s| !s.is_empty() && *s != "null")
                 {
                     mc.password = Some(p.to_string());
@@ -240,7 +240,7 @@ fn resolve_postgres(cfg: &Config, env: &EnvFile) -> Option<(PostgresConn, Source
                 let mut pc = postgres_from_url(&u);
                 if let Some(pw) = env
                     .get("SPRING_DATASOURCE_PASSWORD")
-                    .or_else(|| u.password.as_deref())
+                    .or(u.password.as_deref())
                     .filter(|s| !s.is_empty() && *s != "null")
                 {
                     pc.password = Some(pw.to_string());

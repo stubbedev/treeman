@@ -287,8 +287,8 @@ impl BinlogReplicator {
 
                 let col_names = resolve_columns(&mut colcache, &mut writers, &db, &table).await?;
 
-                let mut row_iter = rows_event_data.rows(tme);
-                while let Some(pair) = row_iter.next() {
+                let row_iter = rows_event_data.rows(tme);
+                for pair in row_iter {
                     let pair = pair
                         .map_err(|e| BinlogError::Other(anyhow!("rows iter decode error: {e}")))?;
                     for target_db in target_dbs {
