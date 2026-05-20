@@ -1,0 +1,37 @@
+# Build perf + disk footprint tuning.
+#
+# Why this file exists:
+#   - Default `cargo build` keeps full DWARF debug info on every dependency.
+#     With sqlx + mongodb + mysql_async + reqwest + redis + testcontainers
+#     in the tree, `target/debug/deps` had grown to ~66 GB.
+#   - The default system linker (`ld`) re-links thousands of rlibs per
+#     test binary, which dominates wall-clock build time on this workspace.
+#
+# Tunables below: cut dep debug info, switch to mold via clang, keep just
+# enough info in workspace crates to get readable backtraces.
+
+[profile.dev]
+# Backtraces need line numbers, not full DWARF. ~70% smaller binaries,
+# negligible debugging cost in practice.
+debug = "line-tables-only"
+# Linux only: split DWARF into sidecar files so rebuilds don't rewrite
+# huge object files in-place.
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+# Third-party crates: no debug info at all. Massive size win because the
+# heavy deps (sqlx, mongodb, mysql_async, reqwest, testcontainers) live here.
+debug = false
+# Optimise deps lightly. Runtime improves substantially with very little
+# extra compile cost since deps are cached after the first build.
+opt-level = 1
+
+[target.x86_64-unknown-linux-gnu]
+# mold is dramatically faster than the default linker for workspaces with
+# many small rlibs (every integration test binary re-links the world).
+# Requires `mold` + `clang` from the dev shell.
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[build]
+incremental = true

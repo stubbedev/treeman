@@ -13,7 +13,6 @@ use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::Shell;
 use is_terminal::IsTerminal;
 use owo_colors::{OwoColorize, Style};
-use treeman_db::DbDriver;
 use treeman_proto::{Request, Response};
 use treeman_store::query::{EventFilter, query_events, tail_events};
 
@@ -378,6 +377,13 @@ enum WorktreeCmd {
         /// Force removal even on dirty worktree + predelete failure.
         #[arg(short, long)]
         force: bool,
+        /// Force foreground execution of predelete + DB teardown +
+        /// git remove. By default `worktrees.async_delete` (true)
+        /// hands the work to the daemon and returns immediately;
+        /// use this for CI / scripted flows where the exit code
+        /// must reflect whether teardown succeeded.
+        #[arg(long)]
+        foreground: bool,
     },
     /// Register a worktree path (metadata only).
     Register {
@@ -582,7 +588,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             target,
             repo,
             force,
-        }) => worktree_delete(target, repo.repo, force).await,
+            foreground,
+        }) => worktree_delete(target, repo.repo, force, foreground).await,
         Cmd::Worktree(WorktreeCmd::Register { path, branch, repo }) => {
             worktree_register(path, branch, repo.repo).await
         }
@@ -1527,15 +1534,9 @@ async fn hook_run(phase: String, worktree: Option<PathBuf>) -> Result<()> {
     let repo_root =
         discover_repo_root(&wt_path).context("could not find repo root containing worktree")?;
     let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
-    let steps = match phase.as_str() {
-        "precreate" => &cfg.hooks.precreate,
-        "postcreate" => &cfg.hooks.postcreate,
-        "predelete" => &cfg.hooks.predelete,
-        "postdelete" => &cfg.hooks.postdelete,
-        other => bail!("unknown hook phase: {other}"),
-    };
     let branch = detect_branch(&wt_path);
     let slug = treeman_core::slug_for(&wt_path, branch.as_deref());
+    let env = capture_inherited_env();
 
     let pool = open_pool().await?;
     let repo_name = repo_root
@@ -1549,23 +1550,72 @@ async fn hook_run(phase: String, worktree: Option<PathBuf>) -> Result<()> {
     let run_id = treeman_store::hook_runs::start_hook_run(&pool, wt_id, &phase).await?;
 
     let start = std::time::Instant::now();
-    let outcome = treeman_core::hooks::run_hooks(steps, &repo_root, &wt_path, &slug.value).await?;
+    let outcome = match phase.as_str() {
+        "precreate" => {
+            treeman_core::hooks::run_precreate_hooks(
+                &cfg.hooks.precreate,
+                &repo_root,
+                &wt_path,
+                &slug.value,
+                &env,
+            )
+            .await?
+        }
+        "postcreate" => {
+            treeman_core::hooks::run_hooks(
+                "postcreate",
+                &cfg.hooks.postcreate,
+                &repo_root,
+                &wt_path,
+                &slug.value,
+                &env,
+            )
+            .await?
+        }
+        "predelete" => {
+            treeman_core::hooks::run_hooks(
+                "predelete",
+                &cfg.hooks.predelete,
+                &repo_root,
+                &wt_path,
+                &slug.value,
+                &env,
+            )
+            .await?
+        }
+        "postdelete" => {
+            treeman_core::hooks::run_hooks(
+                "postdelete",
+                &cfg.hooks.postdelete,
+                &repo_root,
+                &wt_path,
+                &slug.value,
+                &env,
+            )
+            .await?
+        }
+        other => bail!("unknown hook phase: {other}"),
+    };
     let duration_ms = start.elapsed().as_millis() as i64;
     let mut stdout = String::new();
     let mut stderr = String::new();
-    for (i, s) in outcome.steps.iter().enumerate() {
-        let kind = if s.background {
-            "background"
-        } else {
-            "foreground"
-        };
-        stdout.push_str(&format!("--- step {i} ({kind}) ---\n{}\n", s.stdout_tail));
+    for (i, s) in outcome.groups.iter().enumerate() {
+        stdout.push_str(&format!(
+            "--- group {i} (pid={:?}, log={}) ---\n{}\n",
+            s.pid,
+            s.log_path.display(),
+            s.stdout_tail
+        ));
         if !s.stderr_tail.is_empty() {
-            stderr.push_str(&format!("--- step {i} stderr ---\n{}\n", s.stderr_tail));
+            stderr.push_str(&format!("--- group {i} stderr ---\n{}\n", s.stderr_tail));
         }
         let payload = serde_json::json!({
-            "command": s.command, "exit_code": s.exit_code, "background": s.background,
-            "stdout_tail": s.stdout_tail, "stderr_tail": s.stderr_tail,
+            "command": s.command,
+            "exit_code": s.exit_code,
+            "pid": s.pid,
+            "log_path": s.log_path.to_string_lossy(),
+            "stdout_tail": s.stdout_tail,
+            "stderr_tail": s.stderr_tail,
         })
         .to_string();
         let level = if s.exit_code == 0 { "info" } else { "error" };
@@ -1591,7 +1641,7 @@ async fn hook_run(phase: String, worktree: Option<PathBuf>) -> Result<()> {
     )
     .await?;
     let summary = serde_json::json!({
-        "run_id": run_id, "exit_code": outcome.aggregate_exit_code, "step_count": outcome.steps.len()
+        "run_id": run_id, "exit_code": outcome.aggregate_exit_code, "group_count": outcome.groups.len()
     }).to_string();
     let level = if outcome.aggregate_exit_code == 0 {
         "info"
@@ -2091,10 +2141,11 @@ async fn watch(args: WatchArgs) -> Result<()> {
                     ).await;
                     if !matches!(dispatch, treeman_watcher::Dispatch::Noop) {
                         let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
+                        let env = capture_inherited_env();
                         let res: Result<(), anyhow::Error> = match &dispatch {
                             treeman_watcher::Dispatch::Delta(_) => {
                                 match treeman_prepare::delta_run(
-                                    &cfg, &repo_root, &slug, &pool, repo_id, wt_id,
+                                    &cfg, &repo_root, &slug, &pool, repo_id, wt_id, &env,
                                 ).await {
                                     Ok(outs) => {
                                         for o in outs {
@@ -2109,7 +2160,7 @@ async fn watch(args: WatchArgs) -> Result<()> {
                             }
                             _ => {
                                 match treeman_prepare::run(
-                                    &cfg, &repo_root, &slug, &pool, repo_id, wt_id,
+                                    &cfg, &repo_root, &slug, &pool, repo_id, wt_id, &env,
                                 ).await {
                                     Ok(outs) => {
                                         for o in outs {
@@ -2231,7 +2282,9 @@ async fn prepare_cmd(args: PrepareArgs) -> Result<()> {
         treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, branch.as_deref())
             .await?;
 
-    let outcomes = treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id).await?;
+    let env = capture_inherited_env();
+    let outcomes =
+        treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id, &env).await?;
     for o in outcomes {
         let label = if o.cache_hit {
             paint("cache_hit", Style::new().cyan().bold())
@@ -2263,7 +2316,7 @@ async fn worktree_finalize(path: PathBuf, repo: Option<PathBuf>) -> Result<()> {
         Some(r) => r.canonicalize()?,
         None => discover_repo_root(&wt_path).context("could not find repo root for worktree")?,
     };
-    send_finalize_to_daemon(&repo_root, &wt_path).await?;
+    send_finalize_to_daemon(&repo_root, &wt_path, capture_inherited_env()).await?;
     println!(
         "{} postcreate + prepare detached to daemon — \
          follow with `treeman logs tail -f`",
@@ -2272,16 +2325,51 @@ async fn worktree_finalize(path: PathBuf, repo: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Snapshot the calling process's env. The daemon `env_clear()`s
+/// before spawning hook + migrate subprocesses and replaces with
+/// this map so they see the caller's `$PATH` rather than the
+/// daemon's minimal systemd-user env.
+fn capture_inherited_env() -> std::collections::BTreeMap<String, String> {
+    std::env::vars().collect()
+}
+
 /// Ask the daemon to take ownership of postcreate+prepare for `wt`.
 /// Returns once the daemon has acknowledged — the actual hook + DB
 /// work runs in the daemon's runtime and is not awaited here.
-async fn send_finalize_to_daemon(repo_root: &Path, wt_path: &Path) -> Result<()> {
+async fn send_finalize_to_daemon(
+    repo_root: &Path,
+    wt_path: &Path,
+    inherited_env: std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     let req = treeman_proto::Request::WorktreeFinalize {
         repo_path: repo_root.to_string_lossy().into_owned(),
         worktree_path: wt_path.to_string_lossy().into_owned(),
+        inherited_env,
     };
     match crate::client::call(req).await? {
         treeman_proto::Response::WorktreeFinalizeQueued { .. } => Ok(()),
+        treeman_proto::Response::Error { message } => bail!("daemon: {message}"),
+        other => bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+/// Same shape as [`send_finalize_to_daemon`] but for `wt delete`. The
+/// daemon runs predelete hooks + DB teardown + `git worktree remove`
+/// in its tokio runtime so the calling shell returns immediately.
+async fn send_teardown_to_daemon(
+    repo_root: &Path,
+    wt_path: &Path,
+    force: bool,
+    inherited_env: std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let req = treeman_proto::Request::WorktreeTeardown {
+        repo_path: repo_root.to_string_lossy().into_owned(),
+        worktree_path: wt_path.to_string_lossy().into_owned(),
+        force,
+        inherited_env,
+    };
+    match crate::client::call(req).await? {
+        treeman_proto::Response::WorktreeTeardownQueued { .. } => Ok(()),
         treeman_proto::Response::Error { message } => bail!("daemon: {message}"),
         other => bail!("unexpected daemon response: {other:?}"),
     }
@@ -2435,13 +2523,20 @@ async fn worktree_create(
         return Ok(());
     }
 
+    let env = capture_inherited_env();
+
     // precreate is always synchronous — it may legitimately need to
     // succeed before the worktree is considered usable (e.g. fetch a
     // submodule into the worktree).
     if !cfg.hooks.precreate.is_empty() {
-        let outcome =
-            treeman_core::hooks::run_hooks(&cfg.hooks.precreate, &repo_root, &wt_path, &slug.value)
-                .await?;
+        let outcome = treeman_core::hooks::run_precreate_hooks(
+            &cfg.hooks.precreate,
+            &repo_root,
+            &wt_path,
+            &slug.value,
+            &env,
+        )
+        .await?;
         println!("precreate: exit={}", outcome.aggregate_exit_code);
         if outcome.aggregate_exit_code != 0 {
             bail!("precreate failed");
@@ -2457,7 +2552,7 @@ async fn worktree_create(
         && !skip_prepare
         && (!cfg.hooks.postcreate.is_empty() || !cfg.databases.is_empty());
     if should_async {
-        match send_finalize_to_daemon(&repo_root, &wt_path).await {
+        match send_finalize_to_daemon(&repo_root, &wt_path, env.clone()).await {
             Ok(()) => {
                 println!(
                     "{} postcreate + prepare detached to daemon — \
@@ -2472,19 +2567,25 @@ async fn worktree_create(
         }
     }
 
-    for (phase_name, steps) in [("postcreate", &cfg.hooks.postcreate)] {
-        if steps.is_empty() {
-            continue;
-        }
-        let outcome =
-            treeman_core::hooks::run_hooks(steps, &repo_root, &wt_path, &slug.value).await?;
-        println!("{phase_name}: exit={}", outcome.aggregate_exit_code);
-        if outcome.aggregate_exit_code != 0 {
-            bail!("{phase_name} failed");
-        }
+    if !cfg.hooks.postcreate.is_empty() {
+        let outcome = treeman_core::hooks::run_hooks(
+            "postcreate",
+            &cfg.hooks.postcreate,
+            &repo_root,
+            &wt_path,
+            &slug.value,
+            &env,
+        )
+        .await?;
+        println!(
+            "postcreate: {} group(s) spawned (logs in {}/.treeman-hooks/)",
+            outcome.groups.len(),
+            wt_path.display()
+        );
     }
     if !skip_prepare && !cfg.databases.is_empty() {
-        match treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id).await {
+        match treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id, &env).await
+        {
             Ok(outs) => {
                 for o in outs {
                     println!(
@@ -2501,7 +2602,12 @@ async fn worktree_create(
     Ok(())
 }
 
-async fn worktree_delete(target: String, repo: Option<PathBuf>, force: bool) -> Result<()> {
+async fn worktree_delete(
+    target: String,
+    repo: Option<PathBuf>,
+    force: bool,
+    foreground: bool,
+) -> Result<()> {
     let pool = open_pool().await?;
     let wt = if let Ok(p) = PathBuf::from(&target).canonicalize() {
         treeman_store::hook_runs::find_worktree_by_path(&pool, &p.to_string_lossy()).await?
@@ -2528,13 +2634,42 @@ async fn worktree_delete(target: String, repo: Option<PathBuf>, force: bool) -> 
         source: treeman_core::slug::SlugSource::Ticket,
     };
 
-    if !cfg.hooks.predelete.is_empty() {
-        let outcome =
-            treeman_core::hooks::run_hooks(&cfg.hooks.predelete, &repo_root, &wt_path, &slug.value)
-                .await?;
-        if outcome.aggregate_exit_code != 0 && !force {
-            bail!("predelete hook failed; pass --force to delete anyway");
+    let env = capture_inherited_env();
+
+    // Async-delete gate. Mirror of async_create: hand predelete +
+    // DB teardown + git worktree remove to the daemon and return
+    // immediately.
+    if cfg.worktrees.async_delete && !foreground {
+        match send_teardown_to_daemon(&repo_root, &wt_path, force, env.clone()).await {
+            Ok(()) => {
+                println!(
+                    "{} predelete + DB teardown + git remove detached to \
+                     daemon — follow with `treeman logs tail -f`",
+                    paint("queued:", style_ok())
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("warn: daemon RPC failed ({e}); falling back to foreground");
+            }
         }
+    }
+
+    if !cfg.hooks.predelete.is_empty() {
+        let outcome = treeman_core::hooks::run_hooks(
+            "predelete",
+            &cfg.hooks.predelete,
+            &repo_root,
+            &wt_path,
+            &slug.value,
+            &env,
+        )
+        .await?;
+        println!(
+            "predelete: {} group(s) spawned (logs in {}/.treeman-hooks/)",
+            outcome.groups.len(),
+            wt_path.display()
+        );
     }
     teardown_databases(&cfg, &slug.value, wt.repo_id, wt.id, &pool).await?;
 
@@ -2874,264 +3009,12 @@ watcher:
 
 // ───────────────────────── shared helpers ─────────────────────────
 
-async fn teardown_databases(
-    cfg: &treeman_core::Config,
-    slug: &str,
-    repo_id: i64,
-    wt_id: i64,
-    sqlite_pool: &sqlx::SqlitePool,
-) -> Result<()> {
-    use treeman_core::config::DatabaseConfig as DB;
-    use treeman_core::template::{TemplateContext, render};
-    use treeman_db::Namespace;
+// `teardown_databases` was moved to `treeman_prepare::teardown` so the
+// daemon's WorktreeTeardown handler can call it without depending on
+// the CLI crate. This module re-exports it as `teardown_databases`
+// for the local call sites.
+use treeman_prepare::teardown_databases;
 
-    let ctx = TemplateContext::from_slug(&treeman_core::slug::Slug {
-        value: slug.into(),
-        source: treeman_core::slug::SlugSource::Ticket,
-    });
-
-    for d in &cfg.databases {
-        let result: Result<()> = async {
-            match d {
-                DB::Mysql { name_template, .. } => {
-                    let name = render(name_template, &ctx)?;
-                    let mc = cfg
-                        .connections
-                        .mysql
-                        .clone()
-                        .context("connections.mysql not configured")?;
-                    let drv = treeman_db::mysql::MysqlDriver::connect(&mc).await?;
-                    let dropped = drv.drop_matching(&name).await?;
-                    record(
-                        sqlite_pool,
-                        "db_drop",
-                        "mysql",
-                        slug,
-                        &name,
-                        dropped.len(),
-                        repo_id,
-                        wt_id,
-                    )
-                    .await;
-                    Ok(())
-                }
-                DB::Postgres { name_template, .. } => {
-                    let name = render(name_template, &ctx)?;
-                    let pc = cfg
-                        .connections
-                        .postgres
-                        .clone()
-                        .context("connections.postgres not configured")?;
-                    let drv = treeman_db::postgres::PostgresDriver::connect(&pc).await?;
-                    let dropped = drv.drop_matching(&name).await?;
-                    record(
-                        sqlite_pool,
-                        "db_drop",
-                        "postgres",
-                        slug,
-                        &name,
-                        dropped.len(),
-                        repo_id,
-                        wt_id,
-                    )
-                    .await;
-                    Ok(())
-                }
-                DB::Mongodb { name_template } => {
-                    let name = render(name_template, &ctx)?;
-                    let mc = cfg
-                        .connections
-                        .mongodb
-                        .clone()
-                        .context("connections.mongodb not configured")?;
-                    let drv = treeman_db::mongo::MongoDriver::connect(&mc).await?;
-                    let dropped = drv.drop_matching(&name).await?;
-                    record(
-                        sqlite_pool,
-                        "db_drop",
-                        "mongodb",
-                        slug,
-                        &name,
-                        dropped.len(),
-                        repo_id,
-                        wt_id,
-                    )
-                    .await;
-                    Ok(())
-                }
-                DB::Elasticsearch { namespaces } => {
-                    let prefix = render(&namespaces.index_prefix_template, &ctx)?;
-                    let ec = cfg
-                        .connections
-                        .elasticsearch
-                        .clone()
-                        .context("connections.elasticsearch not configured")?;
-                    let drv = treeman_db::elasticsearch::ElasticsearchDriver::connect(&ec)?;
-                    let dropped = drv.drop_matching(&prefix).await?;
-                    record(
-                        sqlite_pool,
-                        "db_drop",
-                        "elasticsearch",
-                        slug,
-                        &prefix,
-                        dropped.len(),
-                        repo_id,
-                        wt_id,
-                    )
-                    .await;
-                    Ok(())
-                }
-                DB::Redis { namespaces } => {
-                    let idx_str = render(&namespaces.db_index_template, &ctx)?;
-                    let idx: u8 = idx_str.parse().context("redis db index parse")?;
-                    let rc = cfg
-                        .connections
-                        .redis
-                        .clone()
-                        .context("connections.redis not configured")?;
-                    let drv = treeman_db::redis_driver::RedisDriver::connect(&rc)?;
-                    drv.flush_namespace(&Namespace::RedisDb(idx)).await?;
-                    record(
-                        sqlite_pool,
-                        "db_flush",
-                        "redis",
-                        slug,
-                        &format!("db{idx}"),
-                        1,
-                        repo_id,
-                        wt_id,
-                    )
-                    .await;
-                    Ok(())
-                }
-                // Wire-compatible variants — reuse the underlying driver.
-                DB::Mariadb { name_template, .. } | DB::Tidb { name_template, .. } => {
-                    let name = render(name_template, &ctx)?;
-                    let mc = cfg
-                        .connections
-                        .mysql
-                        .clone()
-                        .context("connections.mysql not configured")?;
-                    let drv = treeman_db::mysql::MysqlDriver::connect(&mc).await?;
-                    let dropped = drv.drop_matching(&name).await?;
-                    record(
-                        sqlite_pool,
-                        "db_drop",
-                        "mysql_compat",
-                        slug,
-                        &name,
-                        dropped.len(),
-                        repo_id,
-                        wt_id,
-                    )
-                    .await;
-                    Ok(())
-                }
-                DB::Cockroach { name_template, .. } => {
-                    let name = render(name_template, &ctx)?;
-                    let pc = cfg
-                        .connections
-                        .postgres
-                        .clone()
-                        .context("connections.postgres not configured")?;
-                    let drv = treeman_db::postgres::PostgresDriver::connect(&pc).await?;
-                    let dropped = drv.drop_matching(&name).await?;
-                    record(
-                        sqlite_pool,
-                        "db_drop",
-                        "cockroach",
-                        slug,
-                        &name,
-                        dropped.len(),
-                        repo_id,
-                        wt_id,
-                    )
-                    .await;
-                    Ok(())
-                }
-                DB::Opensearch { namespaces } => {
-                    let prefix = render(&namespaces.index_prefix_template, &ctx)?;
-                    let ec = cfg
-                        .connections
-                        .elasticsearch
-                        .clone()
-                        .context("connections.elasticsearch not configured")?;
-                    let drv = treeman_db::elasticsearch::ElasticsearchDriver::connect(&ec)?;
-                    let dropped = drv.drop_matching(&prefix).await?;
-                    record(
-                        sqlite_pool,
-                        "db_drop",
-                        "opensearch",
-                        slug,
-                        &prefix,
-                        dropped.len(),
-                        repo_id,
-                        wt_id,
-                    )
-                    .await;
-                    Ok(())
-                }
-                // New drivers covered with a generic skeleton: build the
-                // driver from cfg.connections.<engine>, call drop_matching
-                // (or namespace flush), record. Most are stubs/partial —
-                // see crate docs.
-                _ => {
-                    eprintln!(
-                        "warn: teardown skipped for engine {:?} (wire-up pending)",
-                        d
-                    );
-                    Ok(())
-                }
-            }
-        }
-        .await;
-        if let Err(e) = result {
-            eprintln!("warn: teardown failed for {:?}: {e}", d);
-            let _ = treeman_store::write_event(
-                sqlite_pool,
-                "warn",
-                "db_teardown_error",
-                Some(&e.to_string()),
-                Some(repo_id),
-                Some(wt_id),
-                None,
-                None,
-                "{}",
-            )
-            .await;
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn record(
-    pool: &sqlx::SqlitePool,
-    event_type: &str,
-    engine: &str,
-    slug: &str,
-    target: &str,
-    count: usize,
-    repo_id: i64,
-    wt_id: i64,
-) {
-    let payload = serde_json::json!({
-        "engine": engine, "slug": slug, "target": target, "count": count,
-    })
-    .to_string();
-    let _ = treeman_store::write_event(
-        pool,
-        "info",
-        event_type,
-        Some(&format!("{engine}: {target} ({count})")),
-        Some(repo_id),
-        Some(wt_id),
-        None,
-        None,
-        &payload,
-    )
-    .await;
-}
 
 fn detect_branch(worktree: &Path) -> Option<String> {
     let head = worktree.join(".git/HEAD");

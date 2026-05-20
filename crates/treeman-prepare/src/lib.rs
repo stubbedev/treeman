@@ -9,6 +9,10 @@
 //!      migrations, snapshot_create(source, template), record_built.
 //!   6. paratest fan-out into N clones from the template.
 
+pub mod teardown;
+pub use teardown::teardown_databases;
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -65,6 +69,7 @@ pub async fn delta_run(
     sqlite: &SqlitePool,
     repo_id: i64,
     worktree_id: i64,
+    inherited_env: &BTreeMap<String, String>,
 ) -> Result<Vec<DeltaOutcome>> {
     let ctx = TemplateContext::from_slug(slug);
     let mut outcomes = Vec::new();
@@ -105,6 +110,7 @@ pub async fn delta_run(
                     sqlite,
                     repo_id,
                     worktree_id,
+                    inherited_env,
                 )
                 .await?
             }
@@ -136,6 +142,7 @@ pub async fn delta_run(
                     sqlite,
                     repo_id,
                     worktree_id,
+                    inherited_env,
                 )
                 .await?
             }
@@ -200,6 +207,7 @@ async fn run_delta_remigrate(
     sqlite: &SqlitePool,
     repo_id: i64,
     worktree_id: i64,
+    inherited_env: &BTreeMap<String, String>,
 ) -> Result<DeltaOutcome> {
     let mut codes = Vec::new();
     // Source first — frameworks track state, so subsequent clone runs
@@ -210,6 +218,7 @@ async fn run_delta_remigrate(
         source_db,
         MigrateMode::Pending,
         &[],
+        inherited_env,
     )
     .await?;
     codes.push(out.exit_code);
@@ -239,6 +248,7 @@ async fn run_delta_remigrate(
             clone,
             MigrateMode::Pending,
             &[],
+            inherited_env,
         )
         .await?;
         codes.push(out.exit_code);
@@ -297,6 +307,7 @@ async fn run_delta_mysql(
     sqlite: &SqlitePool,
     repo_id: i64,
     worktree_id: i64,
+    inherited_env: &BTreeMap<String, String>,
 ) -> Result<DeltaOutcome> {
     use treeman_db::binlog::{BinlogError, BinlogReplicator};
 
@@ -312,6 +323,7 @@ async fn run_delta_mysql(
             sqlite,
             repo_id,
             worktree_id,
+            inherited_env,
         )
         .await;
     }
@@ -328,6 +340,7 @@ async fn run_delta_mysql(
             sqlite,
             repo_id,
             worktree_id,
+            inherited_env,
         )
         .await;
     };
@@ -355,6 +368,7 @@ async fn run_delta_mysql(
                 sqlite,
                 repo_id,
                 worktree_id,
+                inherited_env,
             )
             .await;
         }
@@ -386,6 +400,7 @@ async fn run_delta_mysql(
                 sqlite,
                 repo_id,
                 worktree_id,
+                inherited_env,
             )
             .await;
         }
@@ -401,6 +416,7 @@ async fn run_delta_mysql(
         source_db,
         MigrateMode::Pending,
         &[],
+        inherited_env,
     )
     .await?;
     codes.push(out.exit_code);
@@ -495,6 +511,7 @@ async fn run_delta_mysql(
                 repo_id,
                 worktree_id,
                 codes,
+                inherited_env,
             )
             .await
         }
@@ -519,6 +536,7 @@ async fn run_remaining_clones(
     repo_id: i64,
     worktree_id: i64,
     mut codes: Vec<i32>,
+    inherited_env: &BTreeMap<String, String>,
 ) -> Result<DeltaOutcome> {
     for clone in clones {
         let out = run_migration(
@@ -527,6 +545,7 @@ async fn run_remaining_clones(
             clone,
             MigrateMode::Pending,
             &[],
+            inherited_env,
         )
         .await?;
         codes.push(out.exit_code);
@@ -595,6 +614,12 @@ async fn emit(
 }
 
 /// Drive prepare across all SQL databases configured for the repo.
+///
+/// `inherited_env` is the env captured at CLI invocation and threaded
+/// through the daemon RPC. Hook + framework-migrate subprocesses run
+/// with this as their full env so `php` / `composer` / `yarn` /
+/// `php artisan migrate` find the tools the user has on PATH, not
+/// the daemon's minimal systemd-user env.
 pub async fn run(
     cfg: &Config,
     repo_root: &Path,
@@ -602,6 +627,7 @@ pub async fn run(
     sqlite: &SqlitePool,
     repo_id: i64,
     worktree_id: i64,
+    inherited_env: &BTreeMap<String, String>,
 ) -> Result<Vec<PrepareOutcome>> {
     let ctx = TemplateContext::from_slug(slug);
     let registry = Registry::with_builtins().merge_yaml(&cfg.frameworks);
@@ -634,6 +660,7 @@ pub async fn run(
                         repo_id,
                         worktree_id,
                         slug,
+                        inherited_env,
                     )
                     .await?,
                 );
@@ -664,6 +691,7 @@ pub async fn run(
                         repo_id,
                         worktree_id,
                         slug,
+                        inherited_env,
                     )
                     .await?,
                 );
@@ -687,6 +715,7 @@ async fn prepare_mysql(
     repo_id: i64,
     worktree_id: i64,
     slug: &Slug,
+    inherited_env: &BTreeMap<String, String>,
 ) -> Result<PrepareOutcome> {
     let key = build_key(
         "mysql",
@@ -724,7 +753,7 @@ async fn prepare_mysql(
         }
         if let Some(m) = migration_spec {
             let out =
-                run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[]).await?;
+                run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[], inherited_env).await?;
             if out.exit_code != 0 {
                 anyhow::bail!(
                     "migrate failed (exit {}): {}",
@@ -775,6 +804,7 @@ async fn prepare_postgres(
     repo_id: i64,
     worktree_id: i64,
     slug: &Slug,
+    inherited_env: &BTreeMap<String, String>,
 ) -> Result<PrepareOutcome> {
     let key = build_key(
         "postgres",
@@ -811,7 +841,7 @@ async fn prepare_postgres(
         }
         if let Some(m) = migration_spec {
             let out =
-                run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[]).await?;
+                run_migration(&m.framework, repo_root, source_db, MigrateMode::Up, &[], inherited_env).await?;
             if out.exit_code != 0 {
                 anyhow::bail!(
                     "migrate failed (exit {}): {}",

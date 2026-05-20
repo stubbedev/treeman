@@ -338,6 +338,16 @@ pub struct WorktreesConfig {
     /// whether DB scaffolding succeeded.
     #[serde(default = "default_true")]
     pub async_create: bool,
+
+    /// Mirror of `async_create` for `treeman wt delete`. When `true`,
+    /// the CLI hands predelete hooks + DB teardown + `git worktree
+    /// remove` to the daemon and returns immediately. The daemon
+    /// runs the slow tail in its tokio runtime; progress lands in
+    /// the SQLite event log. Override per-call with `wt delete
+    /// --foreground` for scripted runs where the exit code must
+    /// reflect whether teardown succeeded.
+    #[serde(default = "default_true")]
+    pub async_delete: bool,
 }
 impl Default for WorktreesConfig {
     fn default() -> Self {
@@ -345,6 +355,7 @@ impl Default for WorktreesConfig {
             root: default_worktrees_root(),
             links: Vec::new(),
             async_create: true,
+            async_delete: true,
         }
     }
 }
@@ -562,23 +573,82 @@ pub struct EsNamespaces {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct HooksConfig {
+    /// Sync phase — runs before the worktree is considered usable.
+    /// Each step runs in order; non-zero exit aborts the create.
+    /// Use sparingly (e.g. submodule init that downstream steps need).
     #[serde(default)]
-    pub precreate: Vec<HookStep>,
+    pub precreate: Vec<SingleStep>,
+
+    /// All three of these phases run **asynchronously** via the
+    /// daemon. Every top-level entry is one "group" that runs
+    /// independently of the others; groups run in parallel. Within
+    /// a group (a list of `SingleStep`) commands run in sequence —
+    /// the next command only fires if the previous one exits zero.
     #[serde(default)]
-    pub postcreate: Vec<HookStep>,
+    pub postcreate: Vec<HookEntry>,
     #[serde(default)]
-    pub predelete: Vec<HookStep>,
+    pub predelete: Vec<HookEntry>,
     #[serde(default)]
-    pub postdelete: Vec<HookStep>,
+    pub postdelete: Vec<HookEntry>,
+}
+
+/// One hook entry as it appears in YAML. Three forms:
+///   - bare string: `- "composer install"`
+///   - single map:  `- { run: "composer install", cwd: backend }`
+///   - group list:  `- [ "npm install", "npm run build" ]`
+///
+/// Bare string + single map are convenience shorthands for a group
+/// with a single command. The group form is a sequence — commands
+/// chained with `&&` so a failure short-circuits the rest of the
+/// group. Groups never wait for each other; they're all spawned
+/// detached in parallel.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum HookEntry {
+    Cmd(String),
+    Single(SingleStep),
+    Group(Vec<GroupChild>),
+}
+
+/// Inner children of a group. Same shape as the top level minus the
+/// nested-group case (no group-within-group).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum GroupChild {
+    Cmd(String),
+    Single(SingleStep),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct HookStep {
+#[serde(deny_unknown_fields)]
+pub struct SingleStep {
     pub run: String,
     #[serde(default)]
-    pub background: bool,
-    #[serde(default)]
     pub cwd: Option<PathBuf>,
+}
+
+impl HookEntry {
+    /// Flatten into the ordered sequence of `SingleStep`s the runner
+    /// will actually execute inside its driver shell.
+    pub fn into_sequence(&self) -> Vec<SingleStep> {
+        match self {
+            HookEntry::Cmd(s) => vec![SingleStep {
+                run: s.clone(),
+                cwd: None,
+            }],
+            HookEntry::Single(s) => vec![s.clone()],
+            HookEntry::Group(children) => children
+                .iter()
+                .map(|c| match c {
+                    GroupChild::Cmd(s) => SingleStep {
+                        run: s.clone(),
+                        cwd: None,
+                    },
+                    GroupChild::Single(s) => s.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -3,6 +3,8 @@
 //! Kept dependency-light so the CLI client links without dragging in the
 //! daemon's runtime, db drivers, or sqlite.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -54,9 +56,28 @@ pub enum Request {
     /// caller's shell exiting. See `worktrees.async_create` in
     /// `.treeman.yaml` — set it to `true` to make `treeman wt create`
     /// fan this off automatically.
+    ///
+    /// `inherited_env` is `std::env::vars()` from the CLI process at
+    /// invocation time. The daemon `env_clear()`s before spawning
+    /// hook + prepare subprocesses and replaces it with this map so
+    /// they see the caller's `$PATH` (and everything else) rather
+    /// than the daemon's minimal systemd-user env.
     WorktreeFinalize {
         repo_path: String,
         worktree_path: String,
+        #[serde(default)]
+        inherited_env: BTreeMap<String, String>,
+    },
+    /// Run predelete hooks + DB teardown + git worktree remove for a
+    /// worktree in the daemon's runtime. Mirror of `WorktreeFinalize`
+    /// for the teardown half. Gated by `worktrees.async_delete` in
+    /// `.treeman.yaml`. Caller returns immediately.
+    WorktreeTeardown {
+        repo_path: String,
+        worktree_path: String,
+        force: bool,
+        #[serde(default)]
+        inherited_env: BTreeMap<String, String>,
     },
     /// Tell the daemon to shut down cleanly (used by `treeman daemon stop`).
     Shutdown,
@@ -87,6 +108,10 @@ pub enum Response {
     /// The caller should not wait — use `treeman logs tail -f` to
     /// follow progress.
     WorktreeFinalizeQueued {
+        worktree_path: String,
+    },
+    /// Daemon accepted the teardown request and detached a task.
+    WorktreeTeardownQueued {
         worktree_path: String,
     },
     Error {

@@ -217,12 +217,16 @@ async fn dispatch(
         Request::WorktreeFinalize {
             repo_path,
             worktree_path,
+            inherited_env,
         } => {
             let st = state.clone();
             let repo_for_task = repo_path.clone();
             let wt_for_task = worktree_path.clone();
             tokio::spawn(async move {
-                if let Err(e) = finalize_worktree(&st, &repo_for_task, &wt_for_task).await {
+                if let Err(e) =
+                    finalize_worktree(&st, &repo_for_task, &wt_for_task, &inherited_env)
+                        .await
+                {
                     let _ = treeman_store::write_event(
                         st.sqlite(),
                         "error",
@@ -243,6 +247,45 @@ async fn dispatch(
             });
             Response::WorktreeFinalizeQueued { worktree_path }
         }
+        Request::WorktreeTeardown {
+            repo_path,
+            worktree_path,
+            force,
+            inherited_env,
+        } => {
+            let st = state.clone();
+            let repo_for_task = repo_path.clone();
+            let wt_for_task = worktree_path.clone();
+            tokio::spawn(async move {
+                if let Err(e) = teardown_worktree(
+                    &st,
+                    &repo_for_task,
+                    &wt_for_task,
+                    force,
+                    &inherited_env,
+                )
+                .await
+                {
+                    let _ = treeman_store::write_event(
+                        st.sqlite(),
+                        "error",
+                        "wt_teardown",
+                        Some(&e.to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        &serde_json::json!({
+                            "repo_path": repo_for_task,
+                            "worktree_path": wt_for_task,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+            });
+            Response::WorktreeTeardownQueued { worktree_path }
+        }
         Request::Shutdown => {
             shutdown.notify_one();
             Response::Ok
@@ -259,6 +302,7 @@ async fn finalize_worktree(
     state: &Arc<state::DaemonState>,
     repo_path: &str,
     worktree_path: &str,
+    inherited_env: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     let repo_root = std::path::PathBuf::from(repo_path);
     let wt_root = std::path::PathBuf::from(worktree_path);
@@ -288,23 +332,30 @@ async fn finalize_worktree(
     .await;
 
     if !cfg.hooks.postcreate.is_empty() {
-        let outcome = treeman_core::hooks::run_hooks(
+        // Hooks are always async (fire-and-forget setsid drivers);
+        // run_hooks returns once all groups have been spawned.
+        treeman_core::hooks::run_hooks(
+            "postcreate",
             &cfg.hooks.postcreate,
             &repo_root,
             &wt_root,
             &slug.value,
+            inherited_env,
         )
         .await?;
-        if outcome.aggregate_exit_code != 0 {
-            anyhow::bail!(
-                "postcreate hooks exited non-zero ({})",
-                outcome.aggregate_exit_code
-            );
-        }
     }
 
     if !cfg.databases.is_empty() {
-        treeman_prepare::run(&cfg, &repo_root, &slug, state.sqlite(), repo_id, wt_id).await?;
+        treeman_prepare::run(
+            &cfg,
+            &repo_root,
+            &slug,
+            state.sqlite(),
+            repo_id,
+            wt_id,
+            inherited_env,
+        )
+        .await?;
     }
 
     let _ = treeman_store::write_event(
@@ -312,6 +363,111 @@ async fn finalize_worktree(
         "info",
         "wt_finalize_done",
         Some("daemon-detached postcreate + prepare complete"),
+        Some(repo_id),
+        Some(wt_id),
+        None,
+        None,
+        "{}",
+    )
+    .await;
+    Ok(())
+}
+
+/// Background teardown — mirror of [`finalize_worktree`] for
+/// `treeman wt delete`. Runs predelete hooks, drops every per-
+/// worktree DB declared in `.treeman.yaml`, then shells out to
+/// `git worktree remove`. All inside the daemon's tokio runtime so
+/// the calling shell returns immediately.
+async fn teardown_worktree(
+    state: &Arc<state::DaemonState>,
+    repo_path: &str,
+    worktree_path: &str,
+    force: bool,
+    inherited_env: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let repo_root = std::path::PathBuf::from(repo_path);
+    let wt_root = std::path::PathBuf::from(worktree_path);
+    let cfg = treeman_core::config::load_layered_for_worktree(&repo_root, &wt_root)?;
+    let slug = treeman_core::slug_for(&wt_root, None);
+
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo");
+    let repo_id = treeman_store::ensure_repo(state.sqlite(), &repo_root, repo_name).await?;
+    let wt_id = treeman_store::ensure_worktree(
+        state.sqlite(),
+        repo_id,
+        &wt_root,
+        &slug.value,
+        None,
+    )
+    .await?;
+
+    let _ = treeman_store::write_event(
+        state.sqlite(),
+        "info",
+        "wt_teardown_start",
+        Some("daemon-detached predelete + db teardown + git remove beginning"),
+        Some(repo_id),
+        Some(wt_id),
+        None,
+        None,
+        "{}",
+    )
+    .await;
+
+    if !cfg.hooks.predelete.is_empty() {
+        // Predelete hooks fire detached drivers (same shape as
+        // postcreate). We don't wait — they need to finish quickly
+        // enough that `git worktree remove` doesn't trip over open
+        // file handles, but the rust-side teardown doesn't depend
+        // on them.
+        treeman_core::hooks::run_hooks(
+            "predelete",
+            &cfg.hooks.predelete,
+            &repo_root,
+            &wt_root,
+            &slug.value,
+            inherited_env,
+        )
+        .await?;
+    }
+
+    treeman_prepare::teardown_databases(&cfg, &slug.value, repo_id, wt_id, state.sqlite())
+        .await?;
+
+    // Shell out to git for the actual worktree removal. The
+    // daemon's PATH already has git on it (it's needed at boot to
+    // resume watchers), so we don't need inherited_env here.
+    let mut args = vec!["worktree".to_string(), "remove".into()];
+    if force {
+        args.push("--force".into());
+    }
+    args.push(wt_root.to_string_lossy().to_string());
+    let status = tokio::task::spawn_blocking({
+        let repo_root = repo_root.clone();
+        let args = args.clone();
+        move || {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo_root)
+                .args(&args)
+                .status()
+        }
+    })
+    .await??;
+    if !status.success() && !force {
+        anyhow::bail!("git worktree remove failed (pass --force to override)");
+    }
+
+    treeman_store::mark_worktree_deleted(state.sqlite(), wt_id).await?;
+
+    let _ = treeman_store::write_event(
+        state.sqlite(),
+        "info",
+        "wt_teardown_done",
+        Some("daemon-detached teardown complete"),
         Some(repo_id),
         Some(wt_id),
         None,

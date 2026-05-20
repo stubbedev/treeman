@@ -129,8 +129,15 @@
             just
             cargo-edit
             cargo-watch
+            cargo-sweep
             sqlx-cli
             git
+            # Build-perf toolchain. `.cargo/config.toml` wires clang+mold
+            # as the linker for x86_64-linux; sccache caches rustc output
+            # across `cargo clean` cycles.
+            mold
+            clang
+            sccache
           ];
           shellHook = ''
             echo "treeman dev shell — try \`just --list\`"

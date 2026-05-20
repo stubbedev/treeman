@@ -297,6 +297,15 @@ async fn spawn_for_worktree(
                     )
                     .await
                     .unwrap_or(0);
+                    // Watcher-triggered work runs in the daemon process —
+                    // there's no interactive shell to inherit env from. Use
+                    // the daemon's own env (systemd-user, minimal), which is
+                    // enough for `php artisan migrate` etc. if the user has
+                    // configured the unit appropriately. Future improvement:
+                    // remember the inherited_env from the most recent
+                    // `wt create` for this worktree and re-use it.
+                    let env_snapshot: std::collections::BTreeMap<String, String> =
+                        std::env::vars().collect();
                     let res = match dispatch {
                         treeman_watcher::Dispatch::Delta(_) => treeman_prepare::delta_run(
                             &cfg,
@@ -305,12 +314,21 @@ async fn spawn_for_worktree(
                             &pool_fwd,
                             rid,
                             wt_id,
+                            &env_snapshot,
                         )
                         .await
                         .map(|_| ()),
-                        _ => treeman_prepare::run(&cfg, &wt_for_fwd, &slug, &pool_fwd, rid, wt_id)
-                            .await
-                            .map(|_| ()),
+                        _ => treeman_prepare::run(
+                            &cfg,
+                            &wt_for_fwd,
+                            &slug,
+                            &pool_fwd,
+                            rid,
+                            wt_id,
+                            &env_snapshot,
+                        )
+                        .await
+                        .map(|_| ()),
                     };
                     if let Err(e) = res {
                         let _ = treeman_store::write_event(

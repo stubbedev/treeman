@@ -4,6 +4,7 @@
 //! `.env`, Rails `config/database.yml`, etc.) so the runner exports
 //! framework-appropriate env vars to override the target DB name.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -28,18 +29,32 @@ pub enum MigrateMode {
 
 /// Run the framework's migrate command against `target_db`. Connection
 /// host/port/user/password come from `conn_env_overrides`.
+///
+/// `inherited_env` is the env map captured at CLI invocation. Hooks
+/// + migrate subprocesses run with this map as their full env
+/// (clearing the daemon's own env first) so a hook like
+/// `php artisan migrate` finds `php` on the user's `$PATH` — not
+/// just the minimal systemd-user env the daemon inherited.
 pub async fn run(
     framework: &str,
     repo_root: &Path,
     target_db: &str,
     mode: MigrateMode,
     conn_env_overrides: &[(String, String)],
+    inherited_env: &BTreeMap<String, String>,
 ) -> Result<RunOutcome> {
     let (cmd, args) = command_for(framework, mode)?;
     let mut c = Command::new(cmd);
-    c.args(&args)
-        .current_dir(repo_root)
-        .env("TREEMAN_TARGET_DB", target_db);
+    c.args(&args).current_dir(repo_root);
+
+    // Replace the (potentially minimal) daemon env with the caller's.
+    // Layer the framework knobs + `conn_env_overrides` on top so they
+    // win over anything in `inherited_env`.
+    c.env_clear();
+    for (k, v) in inherited_env {
+        c.env(k, v);
+    }
+    c.env("TREEMAN_TARGET_DB", target_db);
 
     // Framework-specific env override knobs. We avoid editing files —
     // every supported framework respects either DB_DATABASE / DATABASE_URL
