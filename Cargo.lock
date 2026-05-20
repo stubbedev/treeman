@@ -4297,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-cli"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4325,7 +4325,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4346,7 +4346,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-daemon"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "directories",
@@ -4367,7 +4367,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-db"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4390,7 +4390,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-migrations"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4404,7 +4404,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-prepare"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4423,7 +4423,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-proto"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -4431,7 +4431,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-snapshot"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4448,7 +4448,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-store"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4464,7 +4464,7 @@ dependencies = [
 
 [[package]]
 name = "treeman-watcher"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "notify",
