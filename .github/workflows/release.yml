@@ -27,7 +27,9 @@ jobs:
             os: ubuntu-latest
             cross: true
           - target: x86_64-apple-darwin
-            os: macos-13
+            # macos-13 (Intel) runners are scarce + deprecated; cross-
+            # compile from arm64 instead. Apple SDK ships both slices.
+            os: macos-latest
             cross: false
           - target: aarch64-apple-darwin
             os: macos-latest
