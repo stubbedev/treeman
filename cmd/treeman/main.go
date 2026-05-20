@@ -1,26 +1,39 @@
-// Command treeman is the CLI half of the treeman per-worktree DB
-// orchestrator. The full subcommand tree is being ported from the
-// Rust workspace at `crates/treeman-cli/src/main.rs` and is currently
-// stubbed; only `--version` is wired.
-//
-// The Rust workspace stays in-tree as a read-only spec until the Go
-// port reaches feature parity (see plan in
-// ~/.claude/plans/for-both-setup-and-resilient-meerkat.md).
+// Command treeman is the CLI for the treeman per-worktree DB
+// orchestrator. Mirrors the Rust workspace's subcommand tree exactly
+// so existing scripts (gwt zsh integration, CI flows) keep working.
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
+	"github.com/urfave/cli/v3"
+
+	"github.com/stubbedev/treeman/cmd/treeman/cmd"
 	"github.com/stubbedev/treeman/internal/version"
 )
 
 func main() {
-	if len(os.Args) >= 2 && (os.Args[1] == "--version" || os.Args[1] == "-V") {
-		fmt.Printf("treeman %s\n", version.Version)
-		return
+	app := &cli.Command{
+		Name:    "treeman",
+		Usage:   "per-worktree DB orchestrator",
+		Version: version.Version,
+		Commands: []*cli.Command{
+			cmd.WorktreeCmd(),
+			cmd.PrepareCmd(),
+			cmd.HookCmd(),
+			cmd.LogsCmd(),
+			cmd.ConfigCmd(),
+			cmd.SchemaCmd(),
+			cmd.DaemonCmd(),
+			cmd.FwCmd(),
+			cmd.SlugCmd(),
+			cmd.InitCmd(),
+		},
 	}
-	fmt.Fprintln(os.Stderr, "treeman: Go rewrite in progress — CLI surface not wired yet")
-	fmt.Fprintln(os.Stderr, "         Run `treeman --version` to see the build.")
-	os.Exit(64) // EX_USAGE
+	if err := app.Run(context.Background(), os.Args); err != nil {
+		fmt.Fprintln(os.Stderr, "treeman:", err)
+		os.Exit(1)
+	}
 }
