@@ -120,12 +120,12 @@ async fn spawn_one(
 ) -> Result<tokio::task::JoinHandle<()>> {
     use notify_debouncer_full::new_debouncer;
 
-    let watch_roots = spec.watch_roots(&repo_root);
+    let initial_watch_roots = spec.watch_roots(&repo_root);
     let lockfiles = spec.lockfile_paths(&repo_root);
-    if watch_roots.is_empty() && lockfiles.is_empty() {
+    if initial_watch_roots.is_empty() && lockfiles.is_empty() {
         return Ok(tokio::spawn(async {}));
     }
-    info!(framework = %spec.name, roots = ?watch_roots, "starting watcher");
+    info!(framework = %spec.name, roots = ?initial_watch_roots, "starting watcher");
 
     let (raw_tx, mut raw_rx) = mpsc::channel::<()>(64);
     let raw_tx_clone = raw_tx.clone();
@@ -140,14 +140,12 @@ async fn spawn_one(
             }
         },
     )?;
+    let mut watched: std::collections::HashSet<PathBuf> =
+        initial_watch_roots.iter().cloned().collect();
     {
         let w = debouncer.watcher();
         use notify::Watcher;
-        // Recursive watches on the union of ancestor dirs. New module
-        // dirs created beneath these (e.g. `php artisan module:make Foo`
-        // → app/Modules/Foo/Database/Migrations) cascade up through
-        // the recursive watcher → events fire.
-        for d in &watch_roots {
+        for d in &initial_watch_roots {
             let _ = w.watch(d, notify::RecursiveMode::Recursive);
         }
         for f in &lockfiles {
@@ -155,7 +153,6 @@ async fn spawn_one(
         }
     }
 
-    // Initial snapshot so spurious rebuilds don't fire on watcher start.
     let state_p = state_path(&repo_root, &spec.name);
     let initial_dirs = spec.migration_dirs(&repo_root);
     let initial_files = collect_files(&spec, &initial_dirs);
@@ -165,13 +162,29 @@ async fn spawn_one(
     save_state(&state_p, &WatcherState::from_hash_set(&initial_hs)).ok();
 
     let h = tokio::spawn(async move {
-        let _debouncer = debouncer;
+        let mut debouncer = debouncer; // keep mutable; we add watches mid-run
         let mut state = WatcherState::from_hash_set(&initial_hs);
         let mut state_files_hint: HashMap<PathBuf, ()> = HashMap::new();
         while raw_rx.recv().await.is_some() {
-            // Re-resolve migration_dirs on every fire so newly-created
-            // module dirs (e.g. nwidart laravel-modules) are picked up
-            // without restarting the watcher.
+            // 1. Dynamically expand watch coverage: re-resolve
+            //    watch_roots and add any roots that weren't watched
+            //    before. Handles the case where a module-pattern's
+            //    parent dir (e.g. `engines/`, `app/Modules/`) didn't
+            //    exist at startup and was just created.
+            let cur_roots = spec.watch_roots(&repo_root);
+            for r in &cur_roots {
+                let already = watched.iter().any(|w| r.starts_with(w));
+                if !already {
+                    use notify::Watcher;
+                    if debouncer.watcher().watch(r, notify::RecursiveMode::Recursive).is_ok() {
+                        debug!(root = %r.display(), "added new watch root");
+                        watched.insert(r.clone());
+                    }
+                }
+            }
+            // 2. Re-resolve migration_dirs (picks up new module dirs
+            //    inside already-watched roots, e.g. nwidart-style
+            //    `app/Modules/Foo/Database/Migrations`).
             let dirs = spec.migration_dirs(&repo_root);
             let files = collect_files(&spec, &dirs);
             for f in &files { state_files_hint.insert(f.clone(), ()); }

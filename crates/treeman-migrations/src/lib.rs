@@ -135,24 +135,32 @@ impl FrameworkSpec {
         let mut roots: Vec<PathBuf> = vec![];
         for pat in &self.migration_dir_patterns {
             if pat.contains('*') || pat.contains('?') {
-                // Take the prefix before the first wildcard, then walk
-                // up until an existing dir is found.
+                // Prefix before the first wildcard.
                 let head = pat.split(|c| c == '*' || c == '?').next().unwrap_or("");
-                // Strip trailing '/' so `app/Modules/` → `app/Modules`.
                 let head = head.trim_end_matches('/');
+                // `is_broad` = pattern starts with the wildcard itself
+                // (`**/migrations`, `*foo`). These are intentionally
+                // broad — fall back to repo_root if no existing
+                // ancestor is found, so Django/Alembic/Flyway projects
+                // with no apps yet still get events when `manage.py
+                // startapp foo` runs.
+                let is_broad = head.is_empty();
                 let mut candidate = repo_root.join(head);
-                // Walk up. Never use repo_root as a watch root —
-                // recursive watch on the whole repo is too broad and
-                // creates events for every file change. If we can't
-                // find an existing ancestor below repo_root, drop the
-                // entry (no module-dir to watch yet).
                 loop {
-                    if candidate == repo_root || !candidate.starts_with(repo_root) {
+                    // Check repo_root BEFORE is_dir — repo_root is always
+                    // a dir but we only want to use it as a watch root
+                    // for broad ** patterns. For finite globs whose
+                    // ancestor doesn't exist (e.g. Rails `engines/*/...`
+                    // with no engines/ dir) we drop the entry silently.
+                    if candidate == repo_root {
+                        if is_broad { roots.push(candidate); }
                         break;
                     }
                     if candidate.is_dir() {
-                        roots.push(candidate); break;
+                        roots.push(candidate);
+                        break;
                     }
+                    if !candidate.starts_with(repo_root) { break; }
                     match candidate.parent() {
                         Some(p) => candidate = p.to_path_buf(),
                         None => break,
@@ -163,15 +171,11 @@ impl FrameworkSpec {
                 if dir.is_dir() { roots.push(dir); }
             }
         }
-        // Ancestor-merge: drop any path whose ancestor is already in the set.
         roots.sort();
         roots.dedup();
         let mut merged: Vec<PathBuf> = vec![];
         for r in roots {
-            if merged.iter().any(|m| r.starts_with(m)) {
-                continue; // already covered by a shallower ancestor
-            }
-            // Drop existing entries that are descendants of r.
+            if merged.iter().any(|m| r.starts_with(m)) { continue; }
             merged.retain(|m| !m.starts_with(&r) || m == &r);
             merged.push(r);
         }
@@ -447,6 +451,48 @@ mod tests {
         // would be repo_root, but that's only used as a last-resort).
         assert!(!roots.iter().any(|r| r == ""),
             "should not fall all the way back to repo_root, got {roots:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn watch_roots_broad_pattern_falls_back_to_repo_root() {
+        // Django-style: `**/migrations` with no apps yet.
+        let dir = std::env::temp_dir().join(format!("treeman-broad-{}",
+            blake3::hash(format!("{:?}", std::time::Instant::now()).as_bytes()).to_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manage.py"), "").unwrap();
+        let r = Registry::with_builtins();
+        let spec = r.specs.iter().find(|s| s.name == "django").unwrap();
+        let roots = spec.watch_roots(&dir);
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        assert!(
+            roots.iter().any(|r| r == &dir || r == &canonical),
+            "broad ** pattern with no app dirs should fall back to repo_root, got {roots:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn watch_roots_finite_glob_drops_when_ancestor_missing() {
+        // Rails-style: `engines/*/db/migrate` with no `engines/` dir.
+        // Should NOT fall back to repo_root (would be too broad).
+        let dir = std::env::temp_dir().join(format!("treeman-finite-{}",
+            blake3::hash(format!("{:?}", std::time::Instant::now()).as_bytes()).to_hex()));
+        std::fs::create_dir_all(dir.join("db/migrate")).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("bin/rails"), "").unwrap();
+        std::fs::write(dir.join("Gemfile"), "").unwrap();
+        std::fs::write(dir.join("config/database.yml"), "").unwrap();
+        let r = Registry::with_builtins();
+        let spec = r.specs.iter().find(|s| s.name == "rails").unwrap();
+        let roots = spec.watch_roots(&dir);
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        // Should contain db/migrate but NOT repo_root itself.
+        assert!(!roots.iter().any(|r| r == &dir || r == &canonical),
+            "finite glob with missing ancestor must not fall back to repo_root, got {roots:?}");
+        assert!(roots.iter().any(|r| r.ends_with("db/migrate")),
+            "expected db/migrate watched, got {roots:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
