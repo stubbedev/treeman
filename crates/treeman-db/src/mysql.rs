@@ -95,6 +95,10 @@ impl DbDriver for MysqlDriver {
 }
 
 impl MysqlDriver {
+    pub async fn acquire(&self) -> Result<sqlx::pool::PoolConnection<sqlx::MySql>> {
+        Ok(self.pool.acquire().await?)
+    }
+
     /// Cross-DB snapshot via `INSERT INTO target.t SELECT * FROM source.t`.
     /// Mirrors build_helper/clone/clone.go: DROP+CREATE target, then DDL
     /// (tables, views, triggers) cloned, then table data copied with

@@ -4,6 +4,7 @@
 //! later milestones.
 
 pub mod binlog;
+pub mod dumpload;
 pub mod elasticsearch;
 pub mod mongo;
 pub mod mysql;

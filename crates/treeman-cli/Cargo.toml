@@ -22,6 +22,7 @@ treeman-db = { workspace = true }
 treeman-migrations = { workspace = true }
 treeman-watcher = { workspace = true }
 treeman-snapshot = { workspace = true }
+treeman-prepare = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

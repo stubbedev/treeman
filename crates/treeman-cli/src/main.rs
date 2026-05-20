@@ -54,6 +54,16 @@ enum Cmd {
     Snapshot(SnapshotCmd),
     /// Paratest clone fan-out.
     Paratest(ParatestArgs),
+    /// Full prepare: ensure → dump → migrate → snapshot → paratest.
+    Prepare(PrepareArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct PrepareArgs {
+    #[arg(long)]
+    worktree: Option<PathBuf>,
+    #[arg(long)]
+    repo: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -266,7 +276,36 @@ async fn main() -> Result<()> {
             snapshot_gc(keep_per_source, max_age_days, max_total_gb).await
         }
         Cmd::Paratest(args) => paratest(args).await,
+        Cmd::Prepare(args) => prepare_cmd(args).await,
     }
+}
+
+async fn prepare_cmd(args: PrepareArgs) -> Result<()> {
+    let wt_path = match args.worktree {
+        Some(p) => p.canonicalize()?,
+        None => std::env::current_dir()?,
+    };
+    let repo_root = match args.repo {
+        Some(r) => r.canonicalize()?,
+        None => discover_repo_root(&wt_path).context("no repo root")?,
+    };
+    let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
+    let branch = detect_branch(&wt_path);
+    let slug = treeman_core::slug_for(&wt_path, branch.as_deref());
+
+    let pool = open_pool().await?;
+    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let repo_id = treeman_store::ensure_repo(&pool, &repo_root, repo_name).await?;
+    let wt_id = treeman_store::ensure_worktree(&pool, repo_id, &wt_path, &slug.value, branch.as_deref()).await?;
+
+    let outcomes = treeman_prepare::run(&cfg, &repo_root, &slug, &pool, repo_id, wt_id).await?;
+    for o in outcomes {
+        let label = if o.cache_hit { "cache_hit" } else { "cold_build" };
+        println!("[{}] {} src={} template={} ({} clones)",
+            o.engine, label, o.source_db, o.template_name, o.clones.len());
+        for c in &o.clones { println!("  → {c}"); }
+    }
+    Ok(())
 }
 
 async fn paratest(args: ParatestArgs) -> Result<()> {
@@ -426,6 +465,14 @@ async fn watch(args: WatchArgs) -> Result<()> {
     let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
     let repo_id = treeman_store::ensure_repo(&pool, &repo_root, repo_name).await?;
 
+    // Worktree slug from the cwd (used for prepare's scoped DB names).
+    let wt_path = std::env::current_dir()?;
+    let branch = detect_branch(&wt_path);
+    let slug = treeman_core::slug_for(&wt_path, branch.as_deref());
+    let wt_id = treeman_store::ensure_worktree(
+        &pool, repo_id, &wt_path, &slug.value, branch.as_deref(),
+    ).await?;
+
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
         tokio::select! {
@@ -439,8 +486,39 @@ async fn watch(args: WatchArgs) -> Result<()> {
                     let _ = treeman_store::write_event(
                         &pool, "info", "watcher_event",
                         Some(&format!("{framework}: {:?}", dispatch)),
-                        Some(repo_id), None, None, None, &payload,
+                        Some(repo_id), Some(wt_id), None, None, &payload,
                     ).await;
+                    // Action: rebuild OR delta both go through prepare today.
+                    // Delta-via-binlog lives in M9 — until that lands, full
+                    // prepare is the correctness-preserving fallback. Cache
+                    // hit keeps the cost in line for unchanged inputs.
+                    let should_act = !matches!(
+                        dispatch, treeman_watcher::Dispatch::Noop
+                    );
+                    if should_act {
+                        let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
+                        match treeman_prepare::run(
+                            &cfg, &repo_root, &slug, &pool, repo_id, wt_id,
+                        ).await {
+                            Ok(outs) => {
+                                for o in outs {
+                                    println!(
+                                        "  prepare[{}] src={} ({})",
+                                        o.engine, o.source_db,
+                                        if o.cache_hit { "cache_hit" } else { "rebuilt" }
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("prepare error: {e:#}");
+                                let _ = treeman_store::write_event(
+                                    &pool, "error", "prepare_error",
+                                    Some(&e.to_string()),
+                                    Some(repo_id), Some(wt_id), None, None, "{}",
+                                ).await;
+                            }
+                        }
+                    }
                 }
                 None => break,
             }

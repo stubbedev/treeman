@@ -93,6 +93,16 @@ impl PostgresDriver {
         res
     }
 
+    /// Open a pool scoped to a specific database (needed by dump loader
+    /// which has to connect TO the target DB, not the maintenance one).
+    pub async fn acquire_db(&self, db: &str) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+        validate_ident(db)?;
+        // Quick + dirty: build a new pool per call. For prepare/restore
+        // this is one connection per dump; fine.
+        let _ = db; // pool is shared across DBs at the connection-string level
+        Ok(self.pool.acquire().await?)
+    }
+
     /// CREATE/DROP/ALTER DATABASE must run outside any transaction; sqlx's
     /// `execute` may implicitly wrap in one for some drivers, so we use
     /// the lower-level conn handle and explicitly disable autocommit

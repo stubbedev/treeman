@@ -15,3 +15,4 @@ walkdir = "2"
 globset = "0.4"
 blake3 = "1"
 treeman-core = { workspace = true }
+tokio = { workspace = true }

@@ -5,6 +5,8 @@
 //! framework hash mode + on-modify policy feed the watcher dispatch
 //! logic in `treeman-watcher`.
 
+pub mod runner;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
