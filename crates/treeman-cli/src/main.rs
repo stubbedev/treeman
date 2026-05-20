@@ -411,6 +411,9 @@ enum ConfigCmd {
     Show {
         #[command(flatten)]
         repo: RepoCommon,
+        /// Include per-engine connection resolution with provenance.
+        #[arg(long)]
+        resolved: bool,
     },
 }
 
@@ -418,6 +421,14 @@ enum ConfigCmd {
 enum SchemaCmd {
     /// Print the JSON Schema for the full config to stdout.
     Dump,
+    /// Write JSON Schemas to ~/.config/treeman/schemas/ and print the
+    /// `yaml-language-server` modeline that activates completions in
+    /// editors backed by an LSP (VS Code, Neovim, Helix, Zed, …).
+    Install {
+        /// Output directory (default: $XDG_CONFIG_HOME/treeman/schemas).
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -464,8 +475,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Status => status().await,
         Cmd::Slug(args) => slug(args),
         Cmd::Config(ConfigCmd::Validate { repo }) => config_validate(repo.repo),
-        Cmd::Config(ConfigCmd::Show { repo }) => config_show(repo.repo),
+        Cmd::Config(ConfigCmd::Show { repo, resolved }) => config_show(repo.repo, resolved),
         Cmd::Schema(SchemaCmd::Dump) => schema_dump(),
+        Cmd::Schema(SchemaCmd::Install { dir }) => schema_install(dir),
         Cmd::Logs(LogsCmd::Tail {
             follow,
             limit,
@@ -1015,16 +1027,97 @@ fn config_validate(repo: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn config_show(repo: Option<PathBuf>) -> Result<()> {
+fn config_show(repo: Option<PathBuf>, resolved: bool) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let cfg = treeman_core::config::load_layered(repo.as_deref())?;
     print!("{}", serde_yaml::to_string(&cfg)?);
+    if resolved {
+        use treeman_core::resolve::{Source, resolve};
+        let r = resolve(&cfg, repo.as_deref());
+        println!();
+        let hdr = paint(
+            "# resolved connections (yaml < env-url < repo-env-file)",
+            Style::new().bold(),
+        );
+        println!("{hdr}");
+        emit_resolved("mysql", r.mysql.map(|(c, s)| (format!("{c:?}"), s)));
+        emit_resolved("postgres", r.postgres.map(|(c, s)| (format!("{c:?}"), s)));
+        emit_resolved("mongodb", r.mongodb.map(|(c, s)| (format!("{c:?}"), s)));
+        emit_resolved("redis", r.redis.map(|(c, s)| (format!("{c:?}"), s)));
+        emit_resolved(
+            "elasticsearch",
+            r.elasticsearch.map(|(c, s)| (format!("{c:?}"), s)),
+        );
+
+        fn emit_resolved(name: &str, entry: Option<(String, Source)>) {
+            match entry {
+                Some((debug_str, src)) => {
+                    let label = match src {
+                        Source::Yaml => "yaml".to_string(),
+                        Source::EnvUrl(k) => format!("env:{k}"),
+                        Source::DatabaseUrl => "env:DATABASE_URL".into(),
+                        Source::RepoEnvFile(p) => format!("file:{}", p.display()),
+                        Source::Default => "default".into(),
+                    };
+                    println!("# {name} <- {label}");
+                    println!("# {debug_str}");
+                }
+                None => println!("# {name} <- (none)"),
+            }
+        }
+    }
     Ok(())
 }
 
 fn schema_dump() -> Result<()> {
     let s = treeman_core::config::json_schema();
     println!("{}", serde_json::to_string_pretty(&s)?);
+    Ok(())
+}
+
+fn schema_install(dir: Option<PathBuf>) -> Result<()> {
+    let dir = match dir {
+        Some(d) => d,
+        None => {
+            let home = std::env::var("HOME").context("HOME unset")?;
+            let xdg =
+                std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
+            PathBuf::from(xdg).join("treeman/schemas")
+        }
+    };
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let schema = treeman_core::config::json_schema();
+    let global = dir.join("global.schema.json");
+    let repo = dir.join("repo.schema.json");
+    let pretty = serde_json::to_string_pretty(&schema)?;
+    std::fs::write(&global, &pretty).with_context(|| format!("write {}", global.display()))?;
+    std::fs::write(&repo, &pretty).with_context(|| format!("write {}", repo.display()))?;
+
+    println!("wrote {}", global.display());
+    println!("wrote {}", repo.display());
+    println!();
+    println!("To enable LSP completions in your editor, add a modeline to the top of");
+    println!("each YAML config file:");
+    println!();
+    let repo_url = format!("file://{}", repo.display());
+    let global_url = format!("file://{}", global.display());
+    let h1 = paint("# In .treeman.yaml (per-repo):", Style::new().bold());
+    let h2 = paint(
+        "# In ~/.config/treeman/config.yaml (global):",
+        Style::new().bold(),
+    );
+    println!("{h1}");
+    println!("# yaml-language-server: $schema={repo_url}");
+    println!();
+    println!("{h2}");
+    println!("# yaml-language-server: $schema={global_url}");
+    println!();
+    println!("VS Code (with redhat.vscode-yaml) can also map schemas via settings.json:");
+    println!();
+    println!(r#"  "yaml.schemas": {{"#);
+    println!(r#"    "{global_url}": "~/.config/treeman/config.yaml","#);
+    println!(r#"    "{repo_url}": "**/.treeman.yaml""#);
+    println!(r#"  }}"#);
     Ok(())
 }
 
@@ -1974,6 +2067,15 @@ fn detect_default_branch(repo_root: &Path) -> Result<String> {
 
 // ───────────────────────── init ─────────────────────────
 
+fn schema_url_for_repo() -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let xdg = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
+        let path = PathBuf::from(xdg).join("treeman/schemas/repo.schema.json");
+        return format!("file://{}", path.display());
+    }
+    "file:///etc/treeman/schemas/repo.schema.json".into()
+}
+
 fn init_cmd(args: InitArgs) -> Result<()> {
     let repo_root = match args.repo.repo {
         Some(p) => p.canonicalize()?,
@@ -2000,8 +2102,12 @@ fn init_cmd(args: InitArgs) -> Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("repo");
+    let schema_url = schema_url_for_repo();
     let content = format!(
-        r#"# Generated by `treeman init`. Trim / extend to taste.
+        r#"# yaml-language-server: $schema={schema_url}
+# Generated by `treeman init`. Trim / extend to taste.
+# Tip: run `treeman schema install` once to materialize the schema files
+# so the modeline above lights up YAML completions in your editor.
 repo:
   name: {repo_name}
 worktrees:
