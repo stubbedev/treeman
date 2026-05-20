@@ -2258,7 +2258,7 @@ async fn worktree_create(
         bail!("destination path already exists: {}", wt_path.display());
     }
     ensure_not_nested_worktree(&repo_root, &wt_path)?;
-    ensure_worktrees_gitignored(&cfg, &repo_root)?;
+    let _ = check_worktrees_gitignored(&cfg, &repo_root);
     std::fs::create_dir_all(wt_path.parent().unwrap_or(&repo_root))?;
 
     let base = match from {
@@ -2465,18 +2465,18 @@ async fn worktree_delete(target: String, repo: Option<PathBuf>, force: bool) -> 
     Ok(())
 }
 
-/// If `worktrees.root` resolves inside `repo_root`, append a top-level
-/// `/<dir>/` entry to the repo's `.gitignore` (creating it if absent) so the
-/// linked-worktree dirs don't show up as untracked content. No-op if the
-/// root is absolute/outside the repo, or if `.gitignore` already lists it.
-fn ensure_worktrees_gitignored(cfg: &treeman_core::config::Config, repo_root: &Path) -> Result<()> {
+/// Hint the user (once, on stderr) when `worktrees.root` resolves
+/// inside the repo and the linked-worktree dir isn't excluded by
+/// `.gitignore`. We deliberately do NOT mutate `.gitignore` — that's
+/// the user's file and treeman has no business rewriting it.
+fn check_worktrees_gitignored(cfg: &treeman_core::config::Config, repo_root: &Path) -> Result<()> {
     let root = resolve_worktrees_root(cfg, repo_root);
     let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
     let repo_canon = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
     let Ok(rel) = root_canon.strip_prefix(&repo_canon) else {
-        return Ok(()); // root lives outside the repo — nothing to ignore here
+        return Ok(()); // root lives outside the repo — nothing to ignore
     };
     let rel_str = rel.to_string_lossy().replace('\\', "/");
     if rel_str.is_empty() {
@@ -2492,13 +2492,11 @@ fn ensure_worktrees_gitignored(cfg: &treeman_core::config::Config, repo_root: &P
     if already {
         return Ok(());
     }
-    let mut new = existing;
-    if !new.is_empty() && !new.ends_with('\n') {
-        new.push('\n');
-    }
-    new.push_str(&entry);
-    new.push('\n');
-    std::fs::write(&gitignore, new).with_context(|| format!("writing {}", gitignore.display()))?;
+    eprintln!(
+        "hint: worktrees.root resolves to '{rel_str}/' inside this repo; \
+         consider adding `/{rel_str}/` to .gitignore so linked worktrees \
+         don't show up as untracked content"
+    );
     Ok(())
 }
 
