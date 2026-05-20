@@ -477,23 +477,33 @@ nix run .#treeman -- status
 ## Tested against real engines
 
 `treeman-db` ships a live integration suite covering MySQL, PostgreSQL,
-and Redis. Tests do **not** spawn containers — they run against the
-infra you already have running. Each test reads its connection URL
-from an env var, scopes itself to a unique `tm_it_<hash>_*` database
-(or Redis DB index derived from the URL hash), and drops its
-scratch state on completion so it never collides with other tenants.
+and Redis. Each test scopes itself to a unique `tm_it_<hash>_*`
+database (or Redis DB index 1..15) and drops the scratch state on
+completion. The backing infra is chosen per-run:
+
+1. If `TREEMAN_TEST_MYSQL_URL` / `TREEMAN_TEST_POSTGRES_URL` /
+   `TREEMAN_TEST_REDIS_URL` is set, tests use it directly. Lets you
+   point the suite at your dev infra so iteration is fast.
+2. If the env var is unset, the test spins up the relevant engine via
+   `testcontainers` so CI can run the suite with no pre-provisioned
+   databases. Treeman never spawns containers at runtime — this is
+   strictly a test-pipeline concession.
 
 ```sh
+# Option A — point at existing infra.
 export TREEMAN_TEST_MYSQL_URL=mysql://root:@127.0.0.1:3306/
 export TREEMAN_TEST_POSTGRES_URL=postgres://postgres:@127.0.0.1:5432/
 export TREEMAN_TEST_REDIS_URL=redis://127.0.0.1:6379/
 
+# Option B — let testcontainers spin one up (CI default).
+unset TREEMAN_TEST_MYSQL_URL TREEMAN_TEST_POSTGRES_URL TREEMAN_TEST_REDIS_URL
+
 cargo test --features integration -p treeman-db -- --include-ignored
 ```
 
-Tests are gated by `--features integration` and marked `#[ignore]`, so
-default `cargo test` invocations don't reach for the network. Any test
-whose env var is unset prints a "skipped" line and returns.
+Tests are gated by `--features integration` and marked `#[ignore]` so
+the default `cargo test` invocation runs only the pure-logic unit
+suite.
 
 ## Delta migrate path
 

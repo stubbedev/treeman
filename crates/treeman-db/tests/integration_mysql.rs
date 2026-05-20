@@ -1,45 +1,63 @@
-//! Live MySQL integration tests against an existing instance.
+//! Live MySQL integration tests.
 //!
-//! Set `TREEMAN_TEST_MYSQL_URL` to a `mysql://user:pass@host:port/`
-//! URL pointing at a database where the user can `CREATE DATABASE`.
-//! Each test scopes itself to a fresh `tm_it_<rand>_*` database and
-//! tears it down on completion, so it never collides with other
-//! tenants on the same host.
+//! If `TREEMAN_TEST_MYSQL_URL` is set, runs against that instance.
+//! Otherwise spins up a `testcontainers` MySQL container — the CI
+//! path. Tests scope themselves to a unique `tm_it_<hash>_*` database
+//! and drop their state on completion.
 //!
 //! `cargo test --features integration -p treeman-db --test
 //! integration_mysql -- --include-ignored`
 
 #![cfg(feature = "integration")]
 
+use testcontainers_modules::mysql::Mysql;
+use testcontainers_modules::testcontainers::ContainerAsync;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use treeman_core::config::MysqlConn;
 use treeman_core::dburl;
 use treeman_db::DbDriver;
 use treeman_db::mysql::MysqlDriver;
 
-fn env_cfg() -> Option<(MysqlConn, String)> {
-    let url = std::env::var("TREEMAN_TEST_MYSQL_URL").ok()?;
-    let parsed = dburl::parse(&url).ok()?;
+#[allow(dead_code, clippy::large_enum_variant)]
+enum Backing {
+    Env,
+    // Held purely to keep the container alive for the test duration.
+    Container(ContainerAsync<Mysql>),
+}
+
+async fn backing() -> (Backing, MysqlConn, String) {
+    if let Ok(url) = std::env::var("TREEMAN_TEST_MYSQL_URL") {
+        let parsed = dburl::parse(&url).expect("parse TREEMAN_TEST_MYSQL_URL");
+        let cfg = MysqlConn {
+            host: parsed.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+            port: parsed.port.unwrap_or(3306),
+            user: parsed.user.clone().unwrap_or_else(|| "root".into()),
+            password_env: None,
+            pool_max: 4,
+        };
+        let stem = format!(
+            "tm_it_{}",
+            &blake3::hash(url.as_bytes()).to_hex().to_string()[..10]
+        );
+        return (Backing::Env, cfg, stem);
+    }
+    let container = Mysql::default().start().await.expect("start mysql");
+    let port = container.get_host_port_ipv4(3306).await.expect("host port");
     let cfg = MysqlConn {
-        host: parsed.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
-        port: parsed.port.unwrap_or(3306),
-        user: parsed.user.clone().unwrap_or_else(|| "root".into()),
+        host: "127.0.0.1".into(),
+        port,
+        user: "root".into(),
         password_env: None,
         pool_max: 4,
     };
-    let stem = format!(
-        "tm_it_{}",
-        &blake3::hash(url.as_bytes()).to_hex().to_string()[..10]
-    );
-    Some((cfg, stem))
+    let stem = format!("tm_it_{port}");
+    (Backing::Container(container), cfg, stem)
 }
 
 #[tokio::test]
-#[ignore = "set TREEMAN_TEST_MYSQL_URL"]
+#[ignore = "live MySQL — env or docker"]
 async fn ensure_and_drop_db() {
-    let Some((cfg, stem)) = env_cfg() else {
-        eprintln!("TREEMAN_TEST_MYSQL_URL not set — skipping");
-        return;
-    };
+    let (_b, cfg, stem) = backing().await;
     let drv = MysqlDriver::connect(&cfg).await.expect("connect");
     let a = format!("{stem}_a");
     let b = format!("{stem}_b");
@@ -56,17 +74,13 @@ async fn ensure_and_drop_db() {
 }
 
 #[tokio::test]
-#[ignore = "set TREEMAN_TEST_MYSQL_URL"]
+#[ignore = "live MySQL — env or docker"]
 async fn snapshot_roundtrip() {
-    let Some((cfg, stem)) = env_cfg() else {
-        eprintln!("TREEMAN_TEST_MYSQL_URL not set — skipping");
-        return;
-    };
+    let (_b, cfg, stem) = backing().await;
+    let drv = MysqlDriver::connect(&cfg).await.expect("connect");
     let src = format!("{stem}_src");
     let tmpl = format!("{stem}_tmpl");
     let dst = format!("{stem}_dst");
-    let drv = MysqlDriver::connect(&cfg).await.expect("connect");
-    // Best-effort cleanup before/after.
     let _ = drv.drop_matching(&stem).await;
     drv.ensure_db(&src).await.expect("ensure src");
     let pool = sqlx::MySqlPool::connect(&format!(

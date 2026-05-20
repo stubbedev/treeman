@@ -1,31 +1,40 @@
-//! Live Redis integration tests against an existing instance.
-//! Set `TREEMAN_TEST_REDIS_URL` (e.g. `redis://127.0.0.1:6379/`).
-//! Each run scopes itself to a deterministically-chosen DB index
-//! (computed from the URL) so concurrent runs against the same
-//! instance don't trample each other.
+//! Live Redis integration tests. Uses `TREEMAN_TEST_REDIS_URL` when
+//! set, otherwise spins up `testcontainers` Redis. Test scopes to a
+//! deterministically-chosen DB index (1..15).
 
 #![cfg(feature = "integration")]
 
+use testcontainers_modules::redis::Redis;
+use testcontainers_modules::testcontainers::ContainerAsync;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use treeman_core::config::RedisConn;
 use treeman_db::redis_driver::RedisDriver;
 use treeman_db::{DbDriver, Namespace};
 
-fn env_cfg() -> Option<(RedisConn, u8)> {
-    let url = std::env::var("TREEMAN_TEST_REDIS_URL").ok()?;
-    let bytes = blake3::hash(url.as_bytes());
-    let idx = (bytes.as_bytes()[0] % 15) + 1; // 1..=15, leave 0 alone
-    Some((RedisConn { url }, idx))
+#[allow(dead_code, clippy::large_enum_variant)]
+enum Backing {
+    Env,
+    Container(ContainerAsync<Redis>),
+}
+
+async fn backing() -> (Backing, RedisConn, u8) {
+    if let Ok(url) = std::env::var("TREEMAN_TEST_REDIS_URL") {
+        let idx = (blake3::hash(url.as_bytes()).as_bytes()[0] % 15) + 1;
+        return (Backing::Env, RedisConn { url }, idx);
+    }
+    let container = Redis::default().start().await.expect("start redis");
+    let port = container.get_host_port_ipv4(6379).await.expect("port");
+    let cfg = RedisConn {
+        url: format!("redis://127.0.0.1:{port}/"),
+    };
+    (Backing::Container(container), cfg, 1)
 }
 
 #[tokio::test]
-#[ignore = "set TREEMAN_TEST_REDIS_URL"]
+#[ignore = "live Redis — env or docker"]
 async fn flush_indexed_db() {
-    let Some((cfg, idx)) = env_cfg() else {
-        eprintln!("TREEMAN_TEST_REDIS_URL not set — skipping");
-        return;
-    };
+    let (_b, cfg, idx) = backing().await;
     let drv = RedisDriver::connect(&cfg).expect("connect");
-    // Write into the scoped index, then flush it.
     let trimmed = cfg.url.trim_end_matches('/').to_string();
     let client = redis::Client::open(format!("{trimmed}/{idx}")).expect("client");
     let mut conn = client

@@ -26,16 +26,22 @@ treeman-core = { workspace = true }
 
 [features]
 default = []
-# Live integration tests against the developer's already-running
-# infra. Each test reads its connection URL from an env var
-# (`TREEMAN_TEST_MYSQL_URL`, `TREEMAN_TEST_POSTGRES_URL`,
-# `TREEMAN_TEST_REDIS_URL`) and scopes itself to a uniquely-named
-# database so it never collides with any other tenant on that host.
-# Tests that don't find their env var are skipped.
+# Live integration tests. By preference the tests use connection URLs
+# from env vars (`TREEMAN_TEST_MYSQL_URL`, `TREEMAN_TEST_POSTGRES_URL`,
+# `TREEMAN_TEST_REDIS_URL`) so they can run against the developer's
+# already-running infra; when those are unset, the tests fall back to
+# `testcontainers` so CI (without pre-provisioned databases) works
+# out of the box. Either way, each test scopes itself to a unique
+# `tm_it_<hash>_*` namespace.
 #
 # Run with:
 #   cargo test --features integration -p treeman-db -- --include-ignored
-integration = []
+integration = ["dep:testcontainers-modules"]
+
+[dependencies.testcontainers-modules]
+version = "0.13"
+optional = true
+features = ["mysql", "postgres", "redis"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

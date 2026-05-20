@@ -1,38 +1,56 @@
-//! Live PostgreSQL integration tests against an existing instance.
-//! Set `TREEMAN_TEST_POSTGRES_URL` to a `postgres://user:pass@host:port/`
-//! URL. Tests scope to a fresh `tm_it_<rand>_*` database.
+//! Live PostgreSQL integration tests. Uses `TREEMAN_TEST_POSTGRES_URL`
+//! when set, otherwise spins up `testcontainers` Postgres. Tests
+//! scope to `tm_it_<hash>_*`.
 
 #![cfg(feature = "integration")]
 
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::ContainerAsync;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use treeman_core::config::PostgresConn;
 use treeman_core::dburl;
 use treeman_db::DbDriver;
 use treeman_db::postgres::PostgresDriver;
 
-fn env_cfg() -> Option<(PostgresConn, String)> {
-    let url = std::env::var("TREEMAN_TEST_POSTGRES_URL").ok()?;
-    let parsed = dburl::parse(&url).ok()?;
+#[allow(dead_code, clippy::large_enum_variant)]
+enum Backing {
+    Env,
+    Container(ContainerAsync<Postgres>),
+}
+
+async fn backing() -> (Backing, PostgresConn, String) {
+    if let Ok(url) = std::env::var("TREEMAN_TEST_POSTGRES_URL") {
+        let parsed = dburl::parse(&url).expect("parse TREEMAN_TEST_POSTGRES_URL");
+        let cfg = PostgresConn {
+            host: parsed.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
+            port: parsed.port.unwrap_or(5432),
+            user: parsed.user.clone().unwrap_or_else(|| "postgres".into()),
+            password_env: None,
+            pool_max: 4,
+        };
+        let stem = format!(
+            "tm_it_{}",
+            &blake3::hash(url.as_bytes()).to_hex().to_string()[..10]
+        );
+        return (Backing::Env, cfg, stem);
+    }
+    let container = Postgres::default().start().await.expect("start pg");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
     let cfg = PostgresConn {
-        host: parsed.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
-        port: parsed.port.unwrap_or(5432),
-        user: parsed.user.clone().unwrap_or_else(|| "postgres".into()),
+        host: "127.0.0.1".into(),
+        port,
+        user: "postgres".into(),
         password_env: None,
         pool_max: 4,
     };
-    let stem = format!(
-        "tm_it_{}",
-        &blake3::hash(url.as_bytes()).to_hex().to_string()[..10]
-    );
-    Some((cfg, stem))
+    let stem = format!("tm_it_{port}");
+    (Backing::Container(container), cfg, stem)
 }
 
 #[tokio::test]
-#[ignore = "set TREEMAN_TEST_POSTGRES_URL"]
+#[ignore = "live Postgres — env or docker"]
 async fn ensure_and_drop_db() {
-    let Some((cfg, stem)) = env_cfg() else {
-        eprintln!("TREEMAN_TEST_POSTGRES_URL not set — skipping");
-        return;
-    };
+    let (_b, cfg, stem) = backing().await;
     let drv = PostgresDriver::connect(&cfg).await.expect("connect");
     let a = format!("{stem}_a");
     let b = format!("{stem}_b");
@@ -46,16 +64,13 @@ async fn ensure_and_drop_db() {
 }
 
 #[tokio::test]
-#[ignore = "set TREEMAN_TEST_POSTGRES_URL"]
+#[ignore = "live Postgres — env or docker"]
 async fn snapshot_via_template() {
-    let Some((cfg, stem)) = env_cfg() else {
-        eprintln!("TREEMAN_TEST_POSTGRES_URL not set — skipping");
-        return;
-    };
+    let (_b, cfg, stem) = backing().await;
+    let drv = PostgresDriver::connect(&cfg).await.expect("connect");
     let src = format!("{stem}_src");
     let tmpl = format!("{stem}_tmpl");
     let dst = format!("{stem}_dst");
-    let drv = PostgresDriver::connect(&cfg).await.expect("connect");
     let _ = drv.drop_matching(&stem).await;
     drv.ensure_db(&src).await.expect("ensure src");
     let pool = sqlx::PgPool::connect(&format!(
