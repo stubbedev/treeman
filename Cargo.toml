@@ -5,6 +5,8 @@ members = [
     "crates/treeman-core",
     "crates/treeman-store",
     "crates/treeman-db",
+    "crates/treeman-migrations",
+    "crates/treeman-watcher",
     "crates/treeman-daemon",
     "crates/treeman-cli",
 ]
@@ -32,6 +34,8 @@ treeman-proto = { path = "crates/treeman-proto", version = "0.0.1" }
 treeman-core = { path = "crates/treeman-core", version = "0.0.1" }
 treeman-store = { path = "crates/treeman-store", version = "0.0.1" }
 treeman-db = { path = "crates/treeman-db", version = "0.0.1" }
+treeman-migrations = { path = "crates/treeman-migrations", version = "0.0.1" }
+treeman-watcher = { path = "crates/treeman-watcher", version = "0.0.1" }
 
 [profile.release]
 lto = "thin"

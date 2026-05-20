@@ -44,6 +44,26 @@ enum Cmd {
     /// Direct DB driver operations (drop matching, flush redis db, list).
     #[command(subcommand)]
     Db(DbCmd),
+    /// Migration-framework detection.
+    #[command(subcommand)]
+    Frameworks(FrameworksCmd),
+    /// Watch migration directories and dispatch delta/rebuild.
+    Watch(WatchArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum FrameworksCmd {
+    /// List built-in + YAML-declared frameworks; print which ones the repo matches.
+    Detect {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
+#[derive(clap::Args, Debug)]
+struct WatchArgs {
+    #[arg(long)]
+    repo: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -196,7 +216,80 @@ async fn main() -> Result<()> {
         Cmd::Db(DbCmd::Drop { engine, prefix, repo }) => db_drop(engine, prefix, repo).await,
         Cmd::Db(DbCmd::Flush { engine, db, prefix, repo }) => db_flush(engine, db, prefix, repo).await,
         Cmd::Db(DbCmd::List { engine, prefix, repo }) => db_list(engine, prefix, repo).await,
+        Cmd::Frameworks(FrameworksCmd::Detect { repo }) => frameworks_detect(repo).await,
+        Cmd::Watch(args) => watch(args).await,
     }
+}
+
+async fn frameworks_detect(repo: Option<PathBuf>) -> Result<()> {
+    let repo_root = match repo {
+        Some(p) => p.canonicalize()?,
+        None => discover_repo_root(&std::env::current_dir()?)
+            .context("no repo root found")?,
+    };
+    let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
+    let registry = treeman_migrations::Registry::with_builtins().merge_yaml(&cfg.frameworks);
+    let detected = registry.detect_all(&repo_root);
+    if detected.is_empty() {
+        println!("(no frameworks detected in {})", repo_root.display());
+        return Ok(());
+    }
+    println!("{:<18} {:<14} {:<10} {}", "FRAMEWORK", "HASH_MODE", "ON_MODIFY", "DIRS");
+    for s in detected {
+        let dirs: Vec<_> = s.migration_dirs(&repo_root).iter()
+            .map(|p| p.strip_prefix(&repo_root).unwrap_or(p).display().to_string())
+            .collect();
+        println!("{:<18} {:<14} {:<10} {}",
+            s.name, format!("{:?}", s.hash_mode).to_lowercase(),
+            format!("{:?}", s.on_modify).to_lowercase(),
+            dirs.join(", "));
+    }
+    Ok(())
+}
+
+async fn watch(args: WatchArgs) -> Result<()> {
+    let repo_root = match args.repo {
+        Some(p) => p.canonicalize()?,
+        None => discover_repo_root(&std::env::current_dir()?)
+            .context("no repo root found")?,
+    };
+    let cfg = treeman_core::config::load_layered(Some(&repo_root))?;
+    let registry = treeman_migrations::Registry::with_builtins().merge_yaml(&cfg.frameworks);
+    let detected: Vec<_> = registry.detect_all(&repo_root).into_iter().cloned().collect();
+    if detected.is_empty() {
+        bail!("no migration frameworks detected — nothing to watch");
+    }
+    println!("watching {} ({} framework(s))", repo_root.display(), detected.len());
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let _handles = treeman_watcher::spawn_repo_watcher(
+        repo_root.clone(), detected, cfg.watcher.debounce_ms, tx,
+    ).await?;
+    let pool = open_pool().await?;
+    let repo_name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let repo_id = treeman_store::ensure_repo(&pool, &repo_root, repo_name).await?;
+
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => { println!("\nstopping watcher"); break; }
+            ev = rx.recv() => match ev {
+                Some((framework, dispatch)) => {
+                    println!("[{framework}] {dispatch:?}");
+                    let payload = serde_json::json!({
+                        "framework": framework, "dispatch": dispatch,
+                    }).to_string();
+                    let _ = treeman_store::write_event(
+                        &pool, "info", "watcher_event",
+                        Some(&format!("{framework}: {:?}", dispatch)),
+                        Some(repo_id), None, None, None, &payload,
+                    ).await;
+                }
+                None => break,
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn db_drop(engine: String, prefix: String, repo: Option<PathBuf>) -> Result<()> {
