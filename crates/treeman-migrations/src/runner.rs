@@ -31,10 +31,10 @@ pub enum MigrateMode {
 /// host/port/user/password come from `conn_env_overrides`.
 ///
 /// `inherited_env` is the env map captured at CLI invocation. Hooks
-/// + migrate subprocesses run with this map as their full env
+/// and migrate subprocesses run with this map as their full env
 /// (clearing the daemon's own env first) so a hook like
-/// `php artisan migrate` finds `php` on the user's `$PATH` — not
-/// just the minimal systemd-user env the daemon inherited.
+/// `php artisan migrate` finds `php` on the user's `$PATH` rather
+/// than the minimal systemd-user env the daemon inherited.
 pub async fn run(
     framework: &str,
     repo_root: &Path,
