@@ -49,6 +49,33 @@ enum Cmd {
     Frameworks(FrameworksCmd),
     /// Watch migration directories and dispatch delta/rebuild.
     Watch(WatchArgs),
+    /// Snapshot catalog operations.
+    #[command(subcommand)]
+    Snapshot(SnapshotCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotCmd {
+    /// List recorded snapshots.
+    List {
+        #[arg(long)]
+        engine: Option<String>,
+    },
+    /// Show a single snapshot by fingerprint.
+    Show {
+        fingerprint: String,
+    },
+    /// Run LRU GC (delete catalog rows; engine-side DROP DATABASE is
+    /// reported but not executed here — pair with `treeman db drop` for
+    /// the engine side, or rely on the engine drivers when they wire in).
+    Gc {
+        #[arg(long, default_value_t = 5)]
+        keep_per_source: u32,
+        #[arg(long, default_value_t = 30)]
+        max_age_days: u32,
+        #[arg(long, default_value_t = 50)]
+        max_total_gb: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -218,7 +245,54 @@ async fn main() -> Result<()> {
         Cmd::Db(DbCmd::List { engine, prefix, repo }) => db_list(engine, prefix, repo).await,
         Cmd::Frameworks(FrameworksCmd::Detect { repo }) => frameworks_detect(repo).await,
         Cmd::Watch(args) => watch(args).await,
+        Cmd::Snapshot(SnapshotCmd::List { engine }) => snapshot_list(engine).await,
+        Cmd::Snapshot(SnapshotCmd::Show { fingerprint }) => snapshot_show(fingerprint).await,
+        Cmd::Snapshot(SnapshotCmd::Gc { keep_per_source, max_age_days, max_total_gb }) => {
+            snapshot_gc(keep_per_source, max_age_days, max_total_gb).await
+        }
     }
+}
+
+async fn snapshot_list(engine: Option<String>) -> Result<()> {
+    let pool = open_pool().await?;
+    let rows = treeman_snapshot::list(&pool, engine.as_deref()).await?;
+    if rows.is_empty() {
+        println!("(no snapshots recorded)");
+        return Ok(());
+    }
+    println!("{:<18} {:<10} {:<22} {:<10} {}", "FINGERPRINT", "ENGINE", "SOURCE_DB", "USES", "LAST_USED");
+    for r in rows {
+        let ts = chrono::DateTime::from_timestamp_millis(r.last_used_at)
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
+        println!("{:<18} {:<10} {:<22} {:<10} {ts}",
+            &r.fingerprint[..16.min(r.fingerprint.len())],
+            r.engine, r.source_db, r.use_count);
+    }
+    Ok(())
+}
+
+async fn snapshot_show(fingerprint: String) -> Result<()> {
+    let pool = open_pool().await?;
+    let rows = treeman_snapshot::list(&pool, None).await?;
+    let row = rows.into_iter().find(|r| r.fingerprint.starts_with(&fingerprint))
+        .with_context(|| format!("snapshot not found: {fingerprint}"))?;
+    println!("{}", serde_json::to_string_pretty(&row)?);
+    Ok(())
+}
+
+async fn snapshot_gc(keep: u32, max_age_days: u32, max_total_gb: u32) -> Result<()> {
+    let pool = open_pool().await?;
+    let dropped = treeman_snapshot::gc_lru(&pool, keep, max_age_days, max_total_gb).await?;
+    if dropped.is_empty() {
+        println!("(nothing to gc)");
+    } else {
+        println!("dropped {} snapshot catalog row(s):", dropped.len());
+        for r in dropped {
+            println!("  {} ({}) template={}", &r.fingerprint[..16], r.engine, r.template_name);
+        }
+        println!("note: engine-side DROP DATABASE is up to the caller (run `treeman db drop`)");
+    }
+    Ok(())
 }
 
 async fn frameworks_detect(repo: Option<PathBuf>) -> Result<()> {

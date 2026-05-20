@@ -1,0 +1,21 @@
+[package]
+name = "treeman-snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Treeman snapshot/template engine: fingerprinted DB clones with LRU GC."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = "1"
+bincode = { version = "2", features = ["serde"] }
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+treeman-core = { workspace = true }
+treeman-migrations = { workspace = true }
+treeman-db = { workspace = true }
+tokio = { workspace = true }

@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::Row;
+use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use tracing::debug;
 use treeman_core::config::MysqlConn;
 
@@ -91,6 +91,69 @@ impl DbDriver for MysqlDriver {
             }
             _ => anyhow::bail!("mysql driver only supports Namespace::Database"),
         }
+    }
+}
+
+impl MysqlDriver {
+    /// Cross-DB snapshot via `INSERT INTO target.t SELECT * FROM source.t`.
+    /// Mirrors build_helper/clone/clone.go: DROP+CREATE target, then DDL
+    /// (tables, views, triggers) cloned, then table data copied with
+    /// foreign_key_checks/unique_checks/sql_log_bin disabled for the
+    /// session.
+    pub async fn snapshot_create(&self, source: &str, template: &str) -> Result<()> {
+        validate_ident(source)?;
+        validate_ident(template)?;
+        // Drop + create the template DB.
+        sqlx::query(&format!("DROP DATABASE IF EXISTS `{}`", template))
+            .execute(&self.pool).await?;
+        sqlx::query(&format!(
+            "CREATE DATABASE `{}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            template
+        )).execute(&self.pool).await?;
+
+        // Enumerate source tables.
+        let table_rows = sqlx::query(
+            "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME"
+        ).bind(source).fetch_all(&self.pool).await?;
+
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("SET SESSION foreign_key_checks=0").execute(&mut *conn).await?;
+        sqlx::query("SET SESSION unique_checks=0").execute(&mut *conn).await?;
+        sqlx::query("SET SESSION sql_log_bin=0").execute(&mut *conn).await.ok();
+
+        for r in &table_rows {
+            let table: String = r.try_get("TABLE_NAME")?;
+            let ttype: String = r.try_get("TABLE_TYPE")?;
+            validate_ident(&table)?;
+            // Get CREATE TABLE/VIEW from source.
+            let create_kind = if ttype == "VIEW" { "VIEW" } else { "TABLE" };
+            let create_row = sqlx::query(&format!(
+                "SHOW CREATE {create_kind} `{source}`.`{table}`",
+            )).fetch_one(&mut *conn).await?;
+            let create_stmt: String = create_row.try_get(1)?;
+            // The DDL references the source schema implicitly — switch
+            // session schema to target before executing.
+            sqlx::query(&format!("USE `{}`", template)).execute(&mut *conn).await?;
+            sqlx::query(&create_stmt).execute(&mut *conn).await
+                .with_context(|| format!("recreate `{table}`"))?;
+
+            if ttype != "VIEW" {
+                let copy = format!("INSERT INTO `{template}`.`{table}` SELECT * FROM `{source}`.`{table}`");
+                sqlx::query(&copy).execute(&mut *conn).await
+                    .with_context(|| format!("copy data for `{table}`"))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn snapshot_restore(&self, template: &str, target: &str) -> Result<()> {
+        // Restore is symmetric: rebuild `target` from `template`.
+        validate_ident(template)?;
+        validate_ident(target)?;
+        sqlx::query(&format!("DROP DATABASE IF EXISTS `{}`", target))
+            .execute(&self.pool).await?;
+        self.snapshot_create(template, target).await
     }
 }
 

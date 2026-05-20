@@ -4,6 +4,7 @@
 //! later milestones.
 
 pub mod mysql;
+pub mod postgres;
 pub mod redis_driver;
 
 use async_trait::async_trait;
