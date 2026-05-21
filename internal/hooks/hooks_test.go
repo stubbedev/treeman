@@ -105,10 +105,13 @@ func TestInheritedEnvReachesSubprocess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Wait for non-empty content. The shell creates probe.out
+	// before printenv writes to it, so an existence-only poll
+	// races the write on slow runners (observed on macos GHA).
 	waitUntil(func() bool {
-		_, err := os.Stat(filepath.Join(wt, "probe.out"))
-		return err == nil
-	}, 1500)
+		fi, err := os.Stat(filepath.Join(wt, "probe.out"))
+		return err == nil && fi.Size() > 0
+	}, 3000)
 	b, err := os.ReadFile(filepath.Join(wt, "probe.out"))
 	if err != nil {
 		t.Fatal(err)

@@ -45,7 +45,7 @@ lint:
 test:
     go test ./...
 
-check: lint test
+check: lint test sync-flake
 
 clean:
     rm -rf bin/
@@ -58,47 +58,77 @@ nix-build:
 nix-check:
     nix flake check --print-build-logs
 
-# Rewrite flake.nix `vendorHash` to match the current go.sum and
-# bump `version` + the linker -X flag. With no argument, version is
-# read from `git describe --tags --always --dirty`. With an argument
-# (used by the release recipe), version is set to that literal.
+# Keep flake.nix's `vendorHash` aligned with the current go.sum.
 #
-# The hash sync works by: (1) overwriting vendorHash with a sentinel,
-# (2) running `nix build` which prints the actual hash on mismatch,
-# (3) parsing that hash and writing it back.
+# A sha256 of go.sum is embedded as a `# go-sum:` line in flake.nix.
+# When the cached digest matches go.sum on disk, sync-flake returns
+# immediately without running `nix build`. That makes it cheap
+# enough to run on every `just check`, so a dev `go get` flow can
+# never push a master commit that breaks nix CI on master.
+#
+# By default this does NOT touch the version string — release-only
+# concern. Pass an explicit `version` argument to also rewrite
+# `version = "…"` + the `-X .../Version=…` ldflag (used by the
+# release recipes). Pass `--force` to bypass the cache and re-run
+# the nix build even if go.sum looks unchanged.
 sync-flake version="":
     #!/usr/bin/env bash
     set -euo pipefail
-    VERSION="{{version}}"
-    if [ -z "$VERSION" ]; then
-        VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
-        VERSION=${VERSION#v}
+    ARG="{{version}}"
+    FORCE=0
+    VERSION=""
+    case "$ARG" in
+        "")          ;;
+        "--force")   FORCE=1 ;;
+        *)           VERSION="${ARG#v}" ;;
+    esac
+
+    GO_SUM_HASH=$(sha256sum go.sum | awk '{print $1}')
+    CACHED_HASH=$(awk -F': ' '/^[[:space:]]*#[[:space:]]*go-sum:/ {print $2; exit}' flake.nix | tr -d ' ')
+    CURRENT_VERSION=$(awk -F'"' '/^[[:space:]]*version = "/ {print $2; exit}' flake.nix)
+
+    NEED_HASH=0
+    NEED_VERSION=0
+    if [ "$FORCE" = "1" ] || [ "$GO_SUM_HASH" != "$CACHED_HASH" ]; then NEED_HASH=1; fi
+    if [ -n "$VERSION" ] && [ "$VERSION" != "$CURRENT_VERSION" ]; then NEED_VERSION=1; fi
+
+    if [ "$NEED_HASH" = "0" ] && [ "$NEED_VERSION" = "0" ]; then
+        echo "sync-flake: up-to-date (go.sum=$GO_SUM_HASH version=$CURRENT_VERSION)"
+        exit 0
     fi
-    SENTINEL="sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-    # Stamp the sentinel so `nix build` reports the expected hash.
-    sed -i -E 's|^(\s*vendorHash = )"sha256-[^"]*";|\1"'"$SENTINEL"'";|' flake.nix
-    set +e
-    OUT=$(nix build .#treeman --no-link 2>&1)
-    set -e
-    NEW_HASH=$(printf '%s\n' "$OUT" | awk '/got:[[:space:]]*sha256-/ {print $2; exit}')
-    if [ -z "$NEW_HASH" ]; then
-        # Sentinel already matched the real hash — pull it back from
-        # what we just wrote (nothing to change for vendorHash).
-        NEW_HASH="$SENTINEL"
-        # But if nix build genuinely failed for some other reason,
-        # surface that error.
-        if ! printf '%s\n' "$OUT" | grep -q "hash mismatch\|all checks passed\|/nix/store/"; then
-            echo "$OUT" >&2
-            echo "sync-flake: nix build failed with no hash to capture" >&2
-            exit 1
+
+    echo "sync-flake: refreshing (need_hash=$NEED_HASH need_version=$NEED_VERSION)"
+
+    if [ "$NEED_HASH" = "1" ]; then
+        SENTINEL="sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        sed -i -E 's|^(\s*vendorHash = )"sha256-[^"]*";|\1"'"$SENTINEL"'";|' flake.nix
+        set +e
+        OUT=$(nix build .#treeman --no-link 2>&1)
+        set -e
+        NEW_HASH=$(printf '%s\n' "$OUT" | awk '/got:[[:space:]]*sha256-/ {print $2; exit}')
+        if [ -z "$NEW_HASH" ]; then
+            NEW_HASH="$SENTINEL"
+            if ! printf '%s\n' "$OUT" | grep -q "hash mismatch\|all checks passed\|/nix/store/"; then
+                echo "$OUT" >&2
+                echo "sync-flake: nix build failed with no hash to capture" >&2
+                exit 1
+            fi
         fi
+        sed -i -E 's|^(\s*vendorHash = )"sha256-[^"]*";|\1"'"$NEW_HASH"'";|' flake.nix
+        if grep -q '^[[:space:]]*# go-sum:' flake.nix; then
+            sed -i -E 's|^(\s*# go-sum:).*|\1 '"$GO_SUM_HASH"'|' flake.nix
+        else
+            sed -i -E 's|^(\s*vendorHash = )|          # go-sum: '"$GO_SUM_HASH"'\n\1|' flake.nix
+        fi
+        echo "sync-flake: vendorHash=$NEW_HASH go-sum=$GO_SUM_HASH"
     fi
-    sed -i -E 's|^(\s*vendorHash = )"sha256-[^"]*";|\1"'"$NEW_HASH"'";|' flake.nix
-    # Version + ldflags string.
-    sed -i -E 's|^(\s*version = )"[^"]*";|\1"'"$VERSION"'";|' flake.nix
-    sed -i -E 's|(-X github.com/stubbedev/treeman/internal/version.Version=)[^"]*|\1'"$VERSION"'|' flake.nix
-    echo "sync-flake: vendorHash=$NEW_HASH version=$VERSION"
-    # Final sanity: a real build must pass with the new hash.
+
+    if [ "$NEED_VERSION" = "1" ]; then
+        sed -i -E 's|^(\s*version = )"[^"]*";|\1"'"$VERSION"'";|' flake.nix
+        sed -i -E 's|(-X github.com/stubbedev/treeman/internal/version.Version=)[^"]*|\1'"$VERSION"'|' flake.nix
+        echo "sync-flake: version=$VERSION"
+    fi
+
     nix build .#treeman --no-link
 
 # ─────────────────────────── Release ───────────────────────────

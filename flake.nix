@@ -13,19 +13,20 @@
 
         treeman = pkgs.buildGoModule {
           pname = "treeman";
-          version = "1.0.1";
+          version = "1.0.2-dev";
           src = ./.;
           # buildGoModule fetches Go deps through the module proxy and
           # hashes the resulting vendor tree; `vendorHash` pins that
           # hash so the sandboxed build is reproducible. Bump after
           # any `go get` / `go mod tidy` that changes go.sum — `nix
           # build` will print the expected hash on mismatch.
-          vendorHash = "sha256-XUKL69CzzlCaUS9vTHG0iNwBcu6yEILcTVJ+0s2t5vY=";
+          # go-sum: e8107cba35a2e098b15b68d2c06fbf6bbe8990748d9d88e651a340cab6b87819
+          vendorHash = "sha256-o6vidRrhH+BraOseyEjYD/WmqAoDZTeYRxRL4mlZMEI=";
           subPackages = [ "cmd/treeman" "cmd/treemand" ];
           ldflags = [
             "-s"
             "-w"
-            "-X github.com/stubbedev/treeman/internal/version.Version=1.0.1"
+            "-X github.com/stubbedev/treeman/internal/version.Version=1.0.2-dev"
           ];
           doCheck = true;
         };
