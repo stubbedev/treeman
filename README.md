@@ -576,30 +576,89 @@ want to override the env value.
 ### Connecting to DBs in a container
 
 If your MySQL / Postgres / Mongo / Redis / Elasticsearch runs in a
-docker (or podman) container with **no published port**, set
-`container:` on the connection block. treeman runs `<engine>
-inspect` to read the container's bridge-network IP and dials that
-directly instead of the configured `host`. The lookup is cached
-for 30s; a connection failure auto-invalidates so a container
-restart with a new IP settles within one retry.
+container, set `container:` (raw container name) or
+`compose_service:` (docker-compose service name) on the connection
+block. treeman runs `<engine> inspect` and dials whichever of these
+works:
+
+1. **Published host port** — `127.0.0.1:<HOST_PORT>` when
+   `-p HOST:CONTAINER` / `ports:` publishes the in-container port.
+   Cross-platform; works on macOS, Windows, Linux, Colima,
+   OrbStack, Docker Desktop, Podman, nerdctl, finch, lima.
+2. **Bridge-network IP** — falls back to the container's IP on the
+   chosen network (Linux + OrbStack route this directly).
+3. **`host.docker.internal`** — final fallback when treeman is
+   running *inside* a container and the configured host isn't
+   reachable.
+
+Lookups are cached for 30s; a connection failure auto-invalidates
+so a container restart settles within one retry.
 
 ```yaml
 connections:
   mysql:
-    container: myapp-mysql        # required: container name
-    container_engine: docker      # optional, default "docker"
-    port: 3306                    # optional when container exposes it
+    container: myapp-mysql        # raw container name (`docker run --name`)
+    container_engine: docker      # docker | podman | nerdctl | finch | orbctl | …
+    container_network: myapp_net  # optional: pin which network's IP to use
+    port: 3306                    # internal port; defaults to engine default
     user: root
-    password_env: MYSQL_ROOT_PASSWORD
+    password_env: MYSQL_ROOT_PASSWORD   # or omit — see "Container env" below
+
+  postgres:
+    compose_service: db           # docker-compose service name (alternative to container:)
+    compose_project: myapp        # defaults to $COMPOSE_PROJECT_NAME if unset
+    user: postgres
+
   mongodb:
     container: myapp-mongo
-    uri: "mongodb://placeholder:27017"   # host part rewritten at dial time
+    uri: "mongodb://placeholder:27017"   # host:port rewritten at dial time
 ```
 
-Works out of the box on Linux because the host can route to the
-docker bridge network. On macOS / Windows Docker Desktop, prefer
-publishing the port (`-p` or `ports:` in compose) — the container
-IP isn't reachable from the host.
+**Container env autodiscovery.** When `password_env:` is unset and
+the resolver still has no password from env files, treeman pulls
+`MYSQL_ROOT_PASSWORD` / `POSTGRES_PASSWORD` straight out of the
+container's `Config.Env`. Skip the password block when you've
+already declared the secret on the container itself.
+
+**Engines.** Anything that supports `inspect` and `ps --filter
+label=...` works — `docker`, `podman`, `nerdctl`, `finch`,
+`orbctl`, `lima nerdctl`. Default is `docker`.
+
+**Running treeman inside a devcontainer.** treeman detects
+`/.dockerenv`, `/run/.containerenv`, `REMOTE_CONTAINERS=true` and
+`DEVCONTAINER=true`. When inside a container, the inspect path is
+skipped if the engine socket isn't reachable — your configured
+`host:` is used as-is, so on a shared compose network just write
+the sibling service name (`host: db`) and it resolves via the
+compose-provided DNS. As a last resort `host.docker.internal` is
+probed before erroring.
+
+### Running hooks inside a container
+
+postcreate / predelete / postdelete hook entries accept an
+`in_container:` (or `compose_service:`) directive that wraps every
+step in `<engine> exec` so the command runs inside the named
+container rather than on the host. Useful for `composer install`,
+`npm ci`, `php artisan migrate`, `bundle install`, … that depend
+on the dev container's toolchain.
+
+```yaml
+hooks:
+  postcreate:
+    # Single-step group, in a named container.
+    - { run: "composer install", in_container: myapp-php }
+
+    # Multi-step group, in a compose service.
+    - compose_service: app
+      compose_project: myapp
+      steps:
+        - "npm ci"
+        - { run: "php artisan migrate", cwd: /var/www/html }
+```
+
+`step.cwd` becomes `-w <cwd>` on the `exec` call (interpreted
+inside the container's filesystem). Leave unset to use the
+container's `WORKDIR`.
 
 ---
 

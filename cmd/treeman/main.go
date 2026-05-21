@@ -23,6 +23,7 @@ func main() {
 		EnableShellCompletion: true,
 		Commands: []*cli.Command{
 			cmd.WorktreeCmd(),
+			cmd.BranchesCmd(),
 			cmd.PrepareCmd(),
 			cmd.HookCmd(),
 			cmd.LogsCmd(),

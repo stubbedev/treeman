@@ -27,19 +27,33 @@ type Driver struct {
 // Connect opens a server-level pool against `postgres` DB so we can
 // issue CREATE / DROP / TEMPLATE statements at the cluster level.
 func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
-	if ip, err := containerip.Resolve(cfg.Container, cfg.ContainerEngine); err != nil {
-		return nil, fmt.Errorf("resolve container %q: %w", cfg.Container, err)
-	} else if ip != "" {
-		cfg.Host = ip
-		if cfg.Port == 0 {
-			cfg.Port = 5432
+	if cfg.Port == 0 {
+		cfg.Port = 5432
+	}
+	opts := containerip.Opts{
+		Container:      cfg.Container,
+		ComposeService: cfg.ComposeService,
+		ComposeProject: cfg.ComposeProject,
+		Engine:         cfg.ContainerEngine,
+		Network:        cfg.Network,
+		InternalPort:   cfg.Port,
+	}
+	if addr, err := containerip.ResolveAddr(opts); err != nil {
+		return nil, fmt.Errorf("resolve container: %w", err)
+	} else if addr != nil {
+		cfg.Host = addr.Host
+		if addr.Port != 0 {
+			cfg.Port = addr.Port
 		}
 	}
 	if err := reachability.Probe("postgres", cfg.Host, cfg.Port); err != nil {
-		if cfg.Container != "" {
-			containerip.Refresh(cfg.Container, cfg.ContainerEngine)
-			if ip, e := containerip.Resolve(cfg.Container, cfg.ContainerEngine); e == nil && ip != "" {
-				cfg.Host = ip
+		if cfg.Container != "" || cfg.ComposeService != "" {
+			containerip.RefreshOpts(opts)
+			if addr, e := containerip.ResolveAddr(opts); e == nil && addr != nil {
+				cfg.Host = addr.Host
+				if addr.Port != 0 {
+					cfg.Port = addr.Port
+				}
 				if err2 := reachability.Probe("postgres", cfg.Host, cfg.Port); err2 != nil {
 					return nil, err2
 				}

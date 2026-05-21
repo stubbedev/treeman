@@ -78,6 +78,69 @@ hooks:
 	}
 }
 
+func TestParseHookEntryInContainerSingleStep(t *testing.T) {
+	d := writeTmp(t, `
+repo: { name: x }
+hooks:
+  postcreate:
+    - { run: "composer install", in_container: app }
+`)
+	cfg, err := LoadLayered(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := cfg.Hooks.Postcreate[0]
+	if g.Container != "app" {
+		t.Errorf("Container=%q want app", g.Container)
+	}
+	if len(g.Steps) != 1 || g.Steps[0].Run != "composer install" {
+		t.Errorf("steps: %#v", g.Steps)
+	}
+}
+
+func TestParseHookEntryComposeServiceGroup(t *testing.T) {
+	d := writeTmp(t, `
+repo: { name: x }
+hooks:
+  postcreate:
+    - compose_service: app
+      compose_project: myproj
+      container_engine: podman
+      steps:
+        - "composer install"
+        - { run: "php artisan migrate", cwd: /var/www }
+`)
+	cfg, err := LoadLayered(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := cfg.Hooks.Postcreate[0]
+	if g.ComposeService != "app" || g.ComposeProject != "myproj" || g.Engine != "podman" {
+		t.Errorf("meta: %#v", g)
+	}
+	if len(g.Steps) != 2 {
+		t.Fatalf("steps=%d", len(g.Steps))
+	}
+	if g.Steps[1].Cwd != "/var/www" {
+		t.Errorf("cwd: %#v", g.Steps[1])
+	}
+}
+
+func TestParseHookEntryContainerAndComposeServiceMutuallyExclusive(t *testing.T) {
+	d := writeTmp(t, `
+repo: { name: x }
+hooks:
+  postcreate:
+    - in_container: app
+      compose_service: also-app
+      steps:
+        - "boom"
+`)
+	if _, err := LoadLayered(d); err == nil {
+		t.Fatal("want error for combined refs")
+	}
+}
+
 func TestLegacyBackgroundFieldRejected(t *testing.T) {
 	d := writeTmp(t, `
 repo: { name: x }

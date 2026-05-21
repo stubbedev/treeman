@@ -33,22 +33,34 @@ type Driver struct {
 // probe runs first so unreachable services surface a clean error
 // before sqlx-style "connect refused" noise.
 func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
-	// Resolve `container:` to a bridge-network IP if configured.
-	// Empty container falls through and uses cfg.Host directly.
-	if ip, err := containerip.Resolve(cfg.Container, cfg.ContainerEngine); err != nil {
-		return nil, fmt.Errorf("resolve container %q: %w", cfg.Container, err)
-	} else if ip != "" {
-		cfg.Host = ip
-		if cfg.Port == 0 {
-			cfg.Port = 3306
+	if cfg.Port == 0 {
+		cfg.Port = 3306
+	}
+	opts := containerip.Opts{
+		Container:      cfg.Container,
+		ComposeService: cfg.ComposeService,
+		ComposeProject: cfg.ComposeProject,
+		Engine:         cfg.ContainerEngine,
+		Network:        cfg.Network,
+		InternalPort:   cfg.Port,
+	}
+	if addr, err := containerip.ResolveAddr(opts); err != nil {
+		return nil, fmt.Errorf("resolve container: %w", err)
+	} else if addr != nil {
+		cfg.Host = addr.Host
+		if addr.Port != 0 {
+			cfg.Port = addr.Port
 		}
 	}
 	if err := reachability.Probe("mysql", cfg.Host, cfg.Port); err != nil {
-		// Container IP may have changed (restart); evict + retry once.
-		if cfg.Container != "" {
-			containerip.Refresh(cfg.Container, cfg.ContainerEngine)
-			if ip, e := containerip.Resolve(cfg.Container, cfg.ContainerEngine); e == nil && ip != "" {
-				cfg.Host = ip
+		// Container IP/port may have changed (restart); evict + retry once.
+		if cfg.Container != "" || cfg.ComposeService != "" {
+			containerip.RefreshOpts(opts)
+			if addr, e := containerip.ResolveAddr(opts); e == nil && addr != nil {
+				cfg.Host = addr.Host
+				if addr.Port != 0 {
+					cfg.Port = addr.Port
+				}
 				if err2 := reachability.Probe("mysql", cfg.Host, cfg.Port); err2 != nil {
 					return nil, err2
 				}

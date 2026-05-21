@@ -182,6 +182,61 @@ func (s *Store) MarkWorktreeDeleted(ctx context.Context, id int64) error {
 	return err
 }
 
+// TouchWorktreeVisited stamps `last_visited_at = now` on the worktree
+// row. Called by `wt switch`, `wt go`, and any other path that
+// represents a user-driven move into a worktree. Used by `wt prev`
+// + `wt list --sort=visited` to surface recency.
+func (s *Store) TouchWorktreeVisited(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx,
+		"UPDATE worktrees SET last_visited_at = ? WHERE id = ?", nowMillis(), id)
+	return err
+}
+
+// TouchWorktreeVisitedByPath looks up the worktree id by its absolute
+// path and stamps `last_visited_at`. Idempotent; silently no-ops when
+// no row matches (e.g. unregistered ad-hoc worktrees).
+func (s *Store) TouchWorktreeVisitedByPath(ctx context.Context, path string) error {
+	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? AND deleted_at IS NULL", path)
+	var id int64
+	if err := row.Scan(&id); err != nil {
+		return nil
+	}
+	return s.TouchWorktreeVisited(ctx, id)
+}
+
+// PrevVisitedWorktree returns the most-recently-visited worktree path
+// for `repoID`, excluding `exceptPath`. Empty string + false when
+// there's no candidate.
+func (s *Store) PrevVisitedWorktree(ctx context.Context, repoID int64, exceptPath string) (string, bool) {
+	row := s.DB.QueryRowContext(ctx, `
+		SELECT path FROM worktrees
+		WHERE repo_id = ? AND deleted_at IS NULL AND path != ?
+		  AND last_visited_at IS NOT NULL
+		ORDER BY last_visited_at DESC LIMIT 1`, repoID, exceptPath)
+	var p string
+	if err := row.Scan(&p); err != nil {
+		return "", false
+	}
+	return p, true
+}
+
+// LookupRepoID resolves a repo path to its row id. Returns 0 + nil
+// when no row matches (caller treats this as "unknown").
+func (s *Store) LookupRepoID(ctx context.Context, path string) (int64, error) {
+	row := s.DB.QueryRowContext(ctx, "SELECT id FROM repos WHERE path = ?", path)
+	var id int64
+	if err := row.Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return id, nil
+}
+
 // ActiveWorktree pairs a repo path with one of its live worktree
 // paths. Used by the daemon at boot to resume per-worktree fsnotify
 // watchers.

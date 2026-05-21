@@ -22,6 +22,7 @@ import (
 	"syscall"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 )
 
 // RunOutcome bundles every group's status.
@@ -81,7 +82,10 @@ func RunHooks(
 			continue
 		}
 		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
-		cmdStr := renderGroup(entry.Steps, worktreePath)
+		cmdStr, err := renderGroupForEntry(entry, worktreePath)
+		if err != nil {
+			return out, err
+		}
 		c, err := spawnDetached(cmdStr, worktreePath, repoRoot, slug, logPath, inheritedEnv, wait)
 		if err != nil {
 			return out, err
@@ -157,6 +161,50 @@ func renderGroup(steps []config.SingleStep, defaultCwd string) string {
 		parts = append(parts, "( cd "+shellSingleQuote(cwd)+" && "+s.Run+" )")
 	}
 	return strings.Join(parts, " && ")
+}
+
+// renderGroupForEntry handles the `in_container:` / `compose_service:`
+// directive on a HookEntry. When neither is set, the rendering is
+// identical to renderGroup. When set, each step is wrapped in
+// `<engine> exec [-w cwd] <id> sh -c '<cmd>'` so the work runs
+// inside the named container instead of on the host. Step.Cwd, when
+// present, is interpreted relative to the container's filesystem
+// and passed via `-w` (no host-side `cd` is emitted).
+func renderGroupForEntry(entry config.HookEntry, defaultCwd string) (string, error) {
+	if entry.Container == "" && entry.ComposeService == "" {
+		return renderGroup(entry.Steps, defaultCwd), nil
+	}
+	engine := entry.Engine
+	if engine == "" {
+		engine = "docker"
+	}
+	id, err := containerip.ContainerID(containerip.Opts{
+		Container:      entry.Container,
+		ComposeService: entry.ComposeService,
+		ComposeProject: entry.ComposeProject,
+		Engine:         engine,
+	})
+	if err != nil {
+		return "", fmt.Errorf("hook in_container resolve: %w", err)
+	}
+	parts := make([]string, 0, len(entry.Steps))
+	for _, s := range entry.Steps {
+		args := []string{"exec"}
+		if s.Cwd != "" {
+			args = append(args, "-w", s.Cwd)
+		}
+		args = append(args, id, "sh", "-c", s.Run)
+		parts = append(parts, shellJoin(append([]string{engine}, args...)))
+	}
+	return strings.Join(parts, " && "), nil
+}
+
+func shellJoin(argv []string) string {
+	out := make([]string, 0, len(argv))
+	for _, a := range argv {
+		out = append(out, shellSingleQuote(a))
+	}
+	return strings.Join(out, " ")
 }
 
 // shellSingleQuote wraps a string in single quotes, escaping any

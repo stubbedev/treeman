@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/envfile"
 )
 
@@ -87,6 +88,13 @@ func Resolve(cfg *config.Config, repoRoot string) Resolved {
 // ApplyEnvCredentials fills `cfg.Connections.*` in-place. Used by
 // `LoadLayered` so the daemon + CLI both see a fully-resolved
 // config without each having to call Resolve themselves.
+//
+// Last-resort fallback: when a connection has a ContainerRef set
+// but its password is still empty after env-file resolution, look
+// up the container's own Config.Env (`docker inspect ...`) and
+// pick the conventional image variable (MYSQL_ROOT_PASSWORD,
+// POSTGRES_PASSWORD, ...). Saves users from duplicating
+// container secrets into a separate .env.
 func ApplyEnvCredentials(cfg *config.Config, repoRoot string) {
 	r := Resolve(cfg, repoRoot)
 	if r.Mysql != nil {
@@ -108,6 +116,42 @@ func ApplyEnvCredentials(cfg *config.Config, repoRoot string) {
 	if r.Elasticsearch != nil {
 		v := r.Elasticsearch.Conn
 		cfg.Connections.Elasticsearch = &v
+	}
+	fillFromContainerEnv(cfg)
+}
+
+// fillFromContainerEnv populates empty passwords by inspecting the
+// referenced container's env. Best-effort: any error is swallowed so
+// a missing engine binary / unreachable daemon doesn't break config
+// loading. Drivers will surface the real connectivity error later.
+func fillFromContainerEnv(cfg *config.Config) {
+	if m := cfg.Connections.Mysql; m != nil && m.Password == "" && (m.Container != "" || m.ComposeService != "") {
+		env, _ := containerip.EnvLookup(containerip.Opts{
+			Container:      m.Container,
+			ComposeService: m.ComposeService,
+			ComposeProject: m.ComposeProject,
+			Engine:         m.ContainerEngine,
+		})
+		for _, k := range []string{"MYSQL_ROOT_PASSWORD", "MARIADB_ROOT_PASSWORD", "MYSQL_PASSWORD"} {
+			if v, ok := env[k]; ok && nonEmpty(v) {
+				m.Password = v
+				break
+			}
+		}
+	}
+	if p := cfg.Connections.Postgres; p != nil && p.Password == "" && (p.Container != "" || p.ComposeService != "") {
+		env, _ := containerip.EnvLookup(containerip.Opts{
+			Container:      p.Container,
+			ComposeService: p.ComposeService,
+			ComposeProject: p.ComposeProject,
+			Engine:         p.ContainerEngine,
+		})
+		for _, k := range []string{"POSTGRES_PASSWORD", "POSTGRESQL_PASSWORD"} {
+			if v, ok := env[k]; ok && nonEmpty(v) {
+				p.Password = v
+				break
+			}
+		}
 	}
 }
 

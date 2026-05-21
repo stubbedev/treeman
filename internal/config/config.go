@@ -52,58 +52,82 @@ type ConnectionsConfig struct {
 // serialised. The resolver fills it from the repo's `.env*` files
 // + process env.
 //
-// `Container` (optional): when set, treeman runs `docker inspect`
-// (or `podman inspect`, configurable via `container_engine`) on
-// the container and uses its bridge-network IP in place of `Host`
-// before dialing. Lets you connect to a DB running in docker that
-// has no published port (so `host:port` from the host fails) as
-// long as treeman runs on the same machine and can route to the
-// docker bridge network (the default for `bridge` driver on Linux;
-// requires `host.docker.internal` workaround on macOS).
+// `Container` (optional): when set, treeman runs `<engine> inspect`
+// on the container and uses either its published host-port mapping
+// (preferred — works on macOS / Windows Docker Desktop) or its
+// bridge-network IP (Linux) in place of `Host` before dialing.
+//
+// `ComposeService` is the alternative reference for docker-compose
+// users: treeman matches the standard compose labels
+// (`com.docker.compose.service` + `com.docker.compose.project`) and
+// uses the matching running container. `ComposeProject` defaults to
+// $COMPOSE_PROJECT_NAME when unset.
+//
+// `Network` (optional) pins which docker network's IP to use when
+// the container is attached to several (compose adds a project
+// network alongside any explicit ones).
+//
+// `ContainerEngine` is the engine binary — `docker` (default),
+// `podman`, `nerdctl`, `finch`, `orbctl`. Any binary that supports
+// `inspect` and `ps --filter label=...` works.
+//
+// When treeman itself runs inside a container (devcontainer, CI,
+// etc.) and the engine socket isn't reachable, the inspect path is
+// skipped and the configured `Host` is used as-is — which on a
+// shared compose network is just the sibling service name. As a
+// final fallback `host.docker.internal` is probed for host-loopback
+// reachability.
+type ContainerRef struct {
+	Container       string `yaml:"container,omitempty"`
+	ComposeService  string `yaml:"compose_service,omitempty"`
+	ComposeProject  string `yaml:"compose_project,omitempty"`
+	ContainerEngine string `yaml:"container_engine,omitempty"`
+	Network         string `yaml:"container_network,omitempty"`
+}
+
+// MysqlConn — host/port/user. `Password` is runtime-only; never
+// serialised. The resolver fills it from the repo's `.env*` files
+// + process env (and finally the container's own env when a
+// ContainerRef is set).
 type MysqlConn struct {
-	Host            string  `yaml:"host,omitempty"`
-	Port            uint16  `yaml:"port,omitempty"`
-	User            string  `yaml:"user"`
-	PasswordEnv     *string `yaml:"password_env,omitempty"`
-	Password        string  `yaml:"-"`
-	PoolMax         uint32  `yaml:"pool_max,omitempty"`
-	Container       string  `yaml:"container,omitempty"`
-	ContainerEngine string  `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"` // "docker"|"podman"; default "docker"
+	Host         string  `yaml:"host,omitempty"`
+	Port         uint16  `yaml:"port,omitempty"`
+	User         string  `yaml:"user"`
+	PasswordEnv  *string `yaml:"password_env,omitempty"`
+	Password     string  `yaml:"-"`
+	PoolMax      uint32  `yaml:"pool_max,omitempty"`
+	ContainerRef `yaml:",inline"`
 }
 
 // PostgresConn — same shape as MysqlConn.
 type PostgresConn struct {
-	Host            string  `yaml:"host,omitempty"`
-	Port            uint16  `yaml:"port,omitempty"`
-	User            string  `yaml:"user"`
-	PasswordEnv     *string `yaml:"password_env,omitempty"`
-	Password        string  `yaml:"-"`
-	PoolMax         uint32  `yaml:"pool_max,omitempty"`
-	Container       string  `yaml:"container,omitempty"`
-	ContainerEngine string  `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"`
+	Host         string  `yaml:"host,omitempty"`
+	Port         uint16  `yaml:"port,omitempty"`
+	User         string  `yaml:"user"`
+	PasswordEnv  *string `yaml:"password_env,omitempty"`
+	Password     string  `yaml:"-"`
+	PoolMax      uint32  `yaml:"pool_max,omitempty"`
+	ContainerRef `yaml:",inline"`
 }
 
-// MongoConn — `mongodb://…` URI. When `Container` is set the URI's
-// host is rewritten to the container IP at dial time.
+// MongoConn — `mongodb://…` URI. When a ContainerRef is set, the
+// URI's host/port are rewritten at dial time.
 type MongoConn struct {
-	URI             string `yaml:"uri"`
-	Container       string `yaml:"container,omitempty"`
-	ContainerEngine string `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"`
+	URI          string `yaml:"uri"`
+	ContainerRef `yaml:",inline"`
 }
 
-// RedisConn — `redis://…` URL. Same Container semantics as MongoConn.
+// RedisConn — `redis://…` URL. Same ContainerRef semantics as MongoConn.
 type RedisConn struct {
-	URL             string `yaml:"url"`
-	Container       string `yaml:"container,omitempty"`
-	ContainerEngine string `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"`
+	URL          string `yaml:"url"`
+	ContainerRef `yaml:",inline"`
 }
 
-// EsConn — Elasticsearch / OpenSearch HTTP URL. Same Container
+// EsConn — Elasticsearch / OpenSearch HTTP URL. Same ContainerRef
 // semantics as MongoConn.
 type EsConn struct {
-	URL             string `yaml:"url"`
-	Container       string `yaml:"container,omitempty"`
-	ContainerEngine string `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"`
+	URL          string `yaml:"url"`
+	ContainerRef `yaml:",inline"`
 }
 
 // SnapshotsConfig — `snapshots:` block.
@@ -208,14 +232,27 @@ func (s *SingleStep) UnmarshalYAML(node *yaml.Node) error {
 
 // HookEntry — one of:
 //   - bare command string  → group of one
-//   - mapping              → group of one with cwd
+//   - mapping with `run:`  → group of one with cwd
+//   - mapping with `steps:` → explicit group; metadata fields
+//     (container, compose_service, container_engine, ...) wrap all
+//     steps in `docker exec` (or compose exec) at runtime.
 //   - sequence of children → group sequence (chained with `&&`)
+//
+// `Container` / `ComposeService` are mutually exclusive. When set,
+// every step in the group is wrapped in
+// `<engine> exec [-w cwd] <id> sh -c '<cmd>'` so the work runs
+// inside the named container instead of on the host. Use this to
+// run install/migrate/seed commands inside the app dev container.
 type HookEntry struct {
-	Steps []SingleStep
+	Steps          []SingleStep
+	Container      string
+	ComposeService string
+	ComposeProject string
+	Engine         string
 }
 
-// UnmarshalYAML decides which of the three shapes applies based on
-// the node kind. Strict: anything else is a typo we want to surface
+// UnmarshalYAML decides which of the shapes applies based on the
+// node kind. Strict: anything else is a typo we want to surface
 // instead of silently coalesce.
 func (h *HookEntry) UnmarshalYAML(node *yaml.Node) error {
 	switch node.Kind {
@@ -227,14 +264,59 @@ func (h *HookEntry) UnmarshalYAML(node *yaml.Node) error {
 		// always async in v1.0+; if a YAML still carries that field
 		// we want the user to see why their config no longer
 		// parses.
+		hasSteps := false
 		for i := 0; i < len(node.Content); i += 2 {
-			if node.Content[i].Value == "background" {
+			switch node.Content[i].Value {
+			case "background":
 				return fmt.Errorf("hook entry: `background` is no longer supported — hooks are always async; group commands by nesting them in a list to express sequencing (line %d)", node.Content[i].Line)
+			case "steps":
+				hasSteps = true
 			}
 		}
+		if hasSteps {
+			// Group form: { in_container/compose_service/..., steps: [...] }.
+			var raw struct {
+				Container       string       `yaml:"in_container"`
+				ContainerAlt    string       `yaml:"container"`
+				ComposeService  string       `yaml:"compose_service"`
+				ComposeProject  string       `yaml:"compose_project"`
+				Engine          string       `yaml:"container_engine"`
+				EngineAlt       string       `yaml:"engine"`
+				Steps           []SingleStep `yaml:"steps"`
+			}
+			if err := node.Decode(&raw); err != nil {
+				return err
+			}
+			h.Container = firstNonEmpty(raw.Container, raw.ContainerAlt)
+			h.ComposeService = raw.ComposeService
+			h.ComposeProject = raw.ComposeProject
+			h.Engine = firstNonEmpty(raw.Engine, raw.EngineAlt)
+			h.Steps = raw.Steps
+			if h.Container != "" && h.ComposeService != "" {
+				return fmt.Errorf("hook entry (line %d): set either `in_container:` or `compose_service:`, not both", node.Line)
+			}
+			return nil
+		}
+		// Single-step form (existing): { run: ..., cwd: ..., [in_container/compose_service/...] }.
 		var s SingleStep
 		if err := node.Decode(&s); err != nil {
 			return err
+		}
+		var meta struct {
+			Container      string `yaml:"in_container"`
+			ContainerAlt   string `yaml:"container"`
+			ComposeService string `yaml:"compose_service"`
+			ComposeProject string `yaml:"compose_project"`
+			Engine         string `yaml:"container_engine"`
+			EngineAlt      string `yaml:"engine"`
+		}
+		_ = node.Decode(&meta)
+		h.Container = firstNonEmpty(meta.Container, meta.ContainerAlt)
+		h.ComposeService = meta.ComposeService
+		h.ComposeProject = meta.ComposeProject
+		h.Engine = firstNonEmpty(meta.Engine, meta.EngineAlt)
+		if h.Container != "" && h.ComposeService != "" {
+			return fmt.Errorf("hook entry (line %d): set either `in_container:` or `compose_service:`, not both", node.Line)
 		}
 		h.Steps = []SingleStep{s}
 		return nil
@@ -252,6 +334,13 @@ func (h *HookEntry) UnmarshalYAML(node *yaml.Node) error {
 	default:
 		return fmt.Errorf("hook entry: unsupported node kind %d", node.Kind)
 	}
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // DatabaseConfig — one `databases:` entry. The `engine` discriminator

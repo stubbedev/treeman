@@ -29,13 +29,21 @@ type Driver struct {
 // unauthenticated Elasticsearch.
 func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 	url := cfg.URL
-	if cfg.Container != "" {
-		ip, err := containerip.Resolve(cfg.Container, cfg.ContainerEngine)
-		if err != nil {
-			return nil, fmt.Errorf("resolve container %q: %w", cfg.Container, err)
+	if cfg.Container != "" || cfg.ComposeService != "" {
+		opts := containerip.Opts{
+			Container:      cfg.Container,
+			ComposeService: cfg.ComposeService,
+			ComposeProject: cfg.ComposeProject,
+			Engine:         cfg.ContainerEngine,
+			Network:        cfg.Network,
+			InternalPort:   containerip.URIPort(url, 9200),
 		}
-		if ip != "" {
-			url = containerip.RewriteHostPortInURI(url, ip)
+		addr, err := containerip.ResolveAddr(opts)
+		if err != nil {
+			return nil, fmt.Errorf("resolve container: %w", err)
+		}
+		if addr != nil {
+			url = containerip.RewriteHostPortInURIWithPort(url, addr.Host, addr.Port)
 		}
 	}
 	if err := reachability.ProbeURL("elasticsearch", url); err != nil {

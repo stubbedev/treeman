@@ -79,16 +79,26 @@ func New(cfg *config.Config, st *store.Store, repoID int64, sourceDB string) (*R
 	if port == 0 {
 		port = 3306
 	}
-	// Honour `container:` for the replication dial too — keeps
-	// binlog replay reachable when the upstream MySQL is in docker
-	// with no published port.
-	if mc.Container != "" {
-		ip, err := containerip.Resolve(mc.Container, mc.ContainerEngine)
+	// Honour `container:` / `compose_service:` for the replication
+	// dial too — keeps binlog replay reachable when the upstream
+	// MySQL is in docker with no published port.
+	if mc.Container != "" || mc.ComposeService != "" {
+		addr, err := containerip.ResolveAddr(containerip.Opts{
+			Container:      mc.Container,
+			ComposeService: mc.ComposeService,
+			ComposeProject: mc.ComposeProject,
+			Engine:         mc.ContainerEngine,
+			Network:        mc.Network,
+			InternalPort:   port,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("resolve container %q: %w", mc.Container, err)
+			return nil, fmt.Errorf("resolve container: %w", err)
 		}
-		if ip != "" {
-			host = ip
+		if addr != nil {
+			host = addr.Host
+			if addr.Port != 0 {
+				port = addr.Port
+			}
 		}
 	}
 	cfgSyncer := replication.BinlogSyncerConfig{

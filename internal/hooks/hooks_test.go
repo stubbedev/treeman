@@ -223,6 +223,46 @@ func TestRenderGroupChainsWithAnd(t *testing.T) {
 	}
 }
 
+func TestRenderGroupForEntryWrapsInDockerExec(t *testing.T) {
+	entry := config.HookEntry{
+		Container: "myapp",
+		Engine:    "docker",
+		Steps: []config.SingleStep{
+			{Run: "composer install"},
+			{Run: "php artisan migrate", Cwd: "/var/www/html"},
+		},
+	}
+	got, err := renderGroupForEntry(entry, "/host/wt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No host-side cd: the container's WORKDIR controls cwd unless
+	// the user passes a step.Cwd, which becomes `-w`.
+	if contains(got, "cd '/host/wt'") {
+		t.Errorf("host cd leaked into container exec: %s", got)
+	}
+	if !contains(got, "'docker' 'exec' 'myapp' 'sh' '-c' 'composer install'") {
+		t.Errorf("first wrap wrong: %s", got)
+	}
+	if !contains(got, "'docker' 'exec' '-w' '/var/www/html' 'myapp' 'sh' '-c' 'php artisan migrate'") {
+		t.Errorf("second wrap wrong: %s", got)
+	}
+	if !contains(got, " && ") {
+		t.Errorf("steps not chained: %s", got)
+	}
+}
+
+func TestRenderGroupForEntryNoContainerPassesThrough(t *testing.T) {
+	entry := config.HookEntry{Steps: []config.SingleStep{{Run: "echo hi"}}}
+	got, err := renderGroupForEntry(entry, "/host/wt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(got, "cd '/host/wt' && echo hi") {
+		t.Errorf("expected legacy render, got: %s", got)
+	}
+}
+
 func TestShellSingleQuoteEscapesApostrophes(t *testing.T) {
 	if shellSingleQuote("plain") != "'plain'" {
 		t.Errorf("plain: %s", shellSingleQuote("plain"))

@@ -154,10 +154,46 @@ func TeardownWorktree(
 	}
 
 	_ = st.Store.MarkWorktreeDeleted(ctx, wtID)
+	pruneEmptyParentsBelow(wtRoot, worktreesRootOf(cfg.Worktrees.Root, repoRoot))
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_done",
 		"daemon-detached teardown complete",
 		repoID, wtID, "", 0, nil)
 	return nil
+}
+
+// worktreesRootOf resolves the configured worktrees.root (default
+// `.worktrees`) against the main repo. Mirrors resolveWorktreesRoot
+// in cmd/treeman/cmd — duplicated here so the daemon doesn't need to
+// import the CLI package.
+func worktreesRootOf(raw, repoRoot string) string {
+	if raw == "" {
+		raw = ".worktrees"
+	}
+	if filepath.IsAbs(raw) {
+		return raw
+	}
+	return filepath.Join(repoRoot, raw)
+}
+
+// pruneEmptyParentsBelow walks up from `start` removing now-empty
+// directories until we leave `wtRoot`. Mirrors the CLI helper —
+// daemon-side teardown needs the same cleanup so `.worktrees/feature/`
+// doesn't linger after the leaf is removed.
+func pruneEmptyParentsBelow(start, wtRoot string) {
+	if start == "" || wtRoot == "" {
+		return
+	}
+	parent := filepath.Dir(start)
+	for {
+		rel, err := filepath.Rel(wtRoot, parent)
+		if err != nil || rel == "." || rel == ".." || len(rel) >= 3 && rel[:3] == "../" {
+			return
+		}
+		if err := os.Remove(parent); err != nil {
+			return
+		}
+		parent = filepath.Dir(parent)
+	}
 }
 
 // lowPriorityCommand wraps an exec.CommandContext invocation so the

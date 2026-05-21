@@ -34,10 +34,10 @@ func ProbeWithTimeout(engine, host string, port uint16, timeout time.Duration) e
 	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf(
-				"%s unreachable at %s:%d (tcp connect timeout after %dms — is the service running and the port exposed to this host?)",
-				engine, host, port, timeout.Milliseconds())
+				"%s unreachable at %s:%d (tcp connect timeout after %dms — is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`)",
+				engine, host, port, timeout.Milliseconds(), port)
 		}
-		return fmt.Errorf("%s unreachable at %s:%d (tcp connect refused: %v — check container port mapping or service binding)", engine, host, port, err)
+		return fmt.Errorf("%s unreachable at %s:%d (tcp connect refused: %v — if the service is in docker, set `container:`/`compose_service:` so treeman can find its bridge IP or published port)", engine, host, port, err)
 	}
 	_ = conn.Close()
 	return nil

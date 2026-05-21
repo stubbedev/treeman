@@ -25,13 +25,21 @@ type Driver struct {
 // isn't mongodb+srv:// where the host is a SRV record), and dials.
 func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 	uri := cfg.URI
-	if cfg.Container != "" {
-		ip, err := containerip.Resolve(cfg.Container, cfg.ContainerEngine)
-		if err != nil {
-			return nil, fmt.Errorf("resolve container %q: %w", cfg.Container, err)
+	if cfg.Container != "" || cfg.ComposeService != "" {
+		opts := containerip.Opts{
+			Container:      cfg.Container,
+			ComposeService: cfg.ComposeService,
+			ComposeProject: cfg.ComposeProject,
+			Engine:         cfg.ContainerEngine,
+			Network:        cfg.Network,
+			InternalPort:   containerip.URIPort(uri, 27017),
 		}
-		if ip != "" {
-			uri = containerip.RewriteHostPortInURI(uri, ip)
+		addr, err := containerip.ResolveAddr(opts)
+		if err != nil {
+			return nil, fmt.Errorf("resolve container: %w", err)
+		}
+		if addr != nil {
+			uri = containerip.RewriteHostPortInURIWithPort(uri, addr.Host, addr.Port)
 		}
 	}
 	if !strings.HasPrefix(uri, "mongodb+srv://") {

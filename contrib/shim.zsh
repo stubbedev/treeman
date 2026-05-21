@@ -94,9 +94,10 @@ USAGE
 }
 
 # Completion: complete worktree names from `treeman wt list`.
+# NO_COLOR=1 suppresses ANSI escapes so the SLUG column parses cleanly.
 _gwt_complete() {
   local -a names
-  names=("${(@f)$(treeman wt list 2>/dev/null | awk 'NR>1 {print $2}')}")
+  names=("${(@f)$(NO_COLOR=1 treeman wt list 2>/dev/null | awk 'NR>1 {print $2}')}")
   _describe 'worktree' names
 }
 compdef _gwt_complete gwt 2>/dev/null || true
