@@ -13,42 +13,11 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"github.com/stubbedev/treeman/cmd/treeman/cmd"
-	"github.com/stubbedev/treeman/internal/version"
+	"github.com/stubbedev/treeman/internal/treemanapp"
 )
 
 func main() {
-	app := &cli.Command{
-		Name:                  "treeman",
-		Usage:                 "per-worktree DB orchestrator",
-		Version:               version.Version,
-		EnableShellCompletion: true,
-		// Unhide the auto-registered `completion` subcommand so
-		// users discover it via `treeman --help`. Default urfave
-		// behaviour marks it Hidden:true, which makes shell-setup
-		// docs feel like tribal knowledge.
-		ConfigureShellCompletionCommand: func(c *cli.Command) {
-			c.Hidden = false
-		},
-		Suggest: true,
-		Commands: []*cli.Command{
-			cmd.WorktreeCmd(),
-			cmd.BranchesCmd(),
-			cmd.PrepareCmd(),
-			cmd.HookCmd(),
-			cmd.LogsCmd(),
-			cmd.ConfigCmd(),
-			cmd.SchemaCmd(),
-			cmd.DaemonCmd(),
-			cmd.FwCmd(),
-			cmd.SlugCmd(),
-			cmd.InitCmd(),
-			cmd.DoctorCmd(),
-			cmd.MCPCmd(),
-		},
-	}
-	// Did-you-mean for typo'd subcommands. urfave/cli v3's `Suggest`
-	// only catches flag typos; for subcommand typos we plug in
-	// CommandNotFound at every level.
+	app := treemanapp.New()
 	wireCommandNotFound(app)
 	if err := app.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, "treeman:", err)

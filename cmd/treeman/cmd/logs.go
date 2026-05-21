@@ -28,6 +28,7 @@ func LogsCmd() *cli.Command {
 			logsTail(),
 			logsGrep(),
 			logsHooks(),
+			logsPurge(),
 		},
 	}
 }

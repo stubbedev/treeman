@@ -45,7 +45,22 @@ lint:
 test:
     go test ./...
 
-check: lint test sync-schema sync-flake
+check: lint test sync-schema sync-docs sync-flake
+
+# Regenerate `docs/cli.md` from the live cli.Command tree. Catches
+# command/flag drift in PRs by comparing the rewrite against what's
+# in git. Same pattern as sync-schema — cheap enough to run on
+# every `just check`.
+sync-docs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p docs
+    go run ./cmd/treeman-gen-docs docs/cli.md
+    if [ -n "$(git status --porcelain docs/cli.md)" ]; then
+        echo "sync-docs: regenerated docs/cli.md"
+    else
+        echo "sync-docs: docs/cli.md already in sync"
+    fi
 
 # Regenerate `schemas/treeman.schema.json` from the current
 # config.Config Go types. Cheap (pure reflection) so we run it on

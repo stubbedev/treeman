@@ -10,6 +10,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -79,13 +80,15 @@ func resolvedConfigResource(_ context.Context, req *mcpsdk.ReadResourceRequest) 
 	if err != nil {
 		return nil, err
 	}
+	// Scrub embedded credentials before exposing to LLM clients.
+	clean := redactSecrets(string(b))
 	return &mcpsdk.ReadResourceResult{
-		Contents: []*mcpsdk.ResourceContents{{URI: req.Params.URI, MIMEType: "application/json", Text: string(b)}},
+		Contents: []*mcpsdk.ResourceContents{{URI: req.Params.URI, MIMEType: "application/json", Text: clean}},
 	}, nil
 }
 
 func schemaResource(_ context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
-	b, err := renderConfigSchema()
+	b, err := schema.Render()
 	if err != nil {
 		return nil, err
 	}

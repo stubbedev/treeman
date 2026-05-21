@@ -3,8 +3,8 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"github.com/stubbedev/treeman/internal/gitcmd"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -62,7 +62,8 @@ in SQLite, then dispatches postcreate hooks + prepare to the daemon.
 Examples:
   treeman wt create PROJ-1234
   treeman wt create feature/x --from origin/develop
-  treeman wt create hotfix --foreground   # block on hooks + prepare`,
+  treeman wt create hotfix --foreground   # block on hooks + prepare
+  cd "$(treeman wt create feat --print-path)"`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "from", Usage: "base branch"},
 			&cli.StringFlag{Name: "path", Usage: "explicit worktree path"},
@@ -71,12 +72,25 @@ Examples:
 			&cli.BoolFlag{Name: "skip-prepare"},
 			&cli.BoolFlag{Name: "foreground", Usage: "force fg execution of postcreate + prepare"},
 			&cli.BoolFlag{Name: "no-fetch", Usage: "skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits)"},
+			&cli.BoolFlag{Name: "print-path", Usage: "print only the new worktree path on stdout; status lines redirect to stderr (enables `cd \"$(treeman wt create …)\"`)"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
 				return fmt.Errorf("usage: treeman wt create <branch>")
 			}
 			branch := c.Args().First()
+
+			// When --print-path is set the shell idiom is
+			// `cd "$(treeman wt create …)"`; the new path is the
+			// LAST line on stdout. Redirect all status output (Print*,
+			// ui.Success, etc.) to stderr for the rest of this call
+			// so the cd substitution can't pick up an OK marker.
+			printPathOnly := c.Bool("print-path")
+			if printPathOnly {
+				prev := ui.Out
+				ui.Out = os.Stderr
+				defer func() { ui.Out = prev }()
+			}
 
 			repoRoot, err := resolveRepo(c.String("repo"))
 			if err != nil {
@@ -94,6 +108,17 @@ Examples:
 				wtPath = filepath.Join(repoRoot, wtPath)
 			}
 			if _, err := os.Stat(wtPath); err == nil {
+				// Idempotent path: when the dest already exists and
+				// matches what we'd create (linked worktree on the
+				// requested branch, registered in SQLite), treat the
+				// call as a no-op so scripts can retry safely.
+				if isMatchingExistingWorktree(ctx, repoRoot, wtPath, branch) {
+					PrintInfo("worktree already exists at %s on %s — no-op", wtPath, branch)
+					if printPathOnly {
+						fmt.Fprintln(os.Stdout, wtPath)
+					}
+					return nil
+				}
 				return fmt.Errorf("destination path already exists: %s", wtPath)
 			}
 			if err := os.MkdirAll(filepath.Dir(wtPath), 0o755); err != nil {
@@ -109,23 +134,20 @@ Examples:
 			if base == "" {
 				base = detectDefaultBranch(repoRoot)
 			}
-			branchExists := exec.CommandContext(ctx, "git", "-C", repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil
+			branchExists := gitcmd.Exists(ctx, repoRoot, "refs/heads/"+branch)
 			if !branchExists && !c.Bool("no-fetch") {
-				_ = exec.CommandContext(ctx, "git", "-C", repoRoot, "fetch", "origin", base, "--quiet").Run()
+				_ = gitcmd.RunPiped(ctx, repoRoot, nil, nil, "fetch", "origin", base, "--quiet")
 				if refExistsRemote(repoRoot, base) {
 					base = "origin/" + base
 				}
 			}
 			var gitArgs []string
 			if branchExists {
-				gitArgs = []string{"-C", repoRoot, "worktree", "add", wtPath, branch}
+				gitArgs = []string{"worktree", "add", wtPath, branch}
 			} else {
-				gitArgs = []string{"-C", repoRoot, "worktree", "add", "-b", branch, wtPath, base}
+				gitArgs = []string{"worktree", "add", "-b", branch, wtPath, base}
 			}
-			cmd := exec.CommandContext(ctx, "git", gitArgs...)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
+			if err := gitcmd.RunPiped(ctx, repoRoot, os.Stdout, os.Stderr, gitArgs...); err != nil {
 				return fmt.Errorf("git worktree add: %w", err)
 			}
 			wtPath = MustAbs(wtPath)
@@ -226,6 +248,9 @@ Examples:
 			PrintOK("created worktree #%d slug=%s path=%s", wtID, sl.Value, wtPath)
 
 			if c.Bool("skip-hooks") {
+				if printPathOnly {
+					fmt.Fprintln(os.Stdout, wtPath)
+				}
 				return nil
 			}
 
@@ -265,10 +290,16 @@ Examples:
 			needsWork := len(cfg.Hooks.Postcreate) > 0 || (!c.Bool("skip-prepare") && len(cfg.Databases) > 0)
 			if asyncCreate && !c.Bool("foreground") && !c.Bool("skip-prepare") && needsWork {
 				if queued := dispatchFinalize(ctx, repoRoot, wtPath, env); queued {
+					if printPathOnly {
+						fmt.Fprintln(os.Stdout, wtPath)
+					}
 					return nil
 				}
 				if logPath, err := detachLocalFinalize(wtPath, repoRoot); err == nil {
 					PrintOK("queued: postcreate + prepare detached (daemon unreachable — log: %s)", logPath)
+					if printPathOnly {
+						fmt.Fprintln(os.Stdout, wtPath)
+					}
 					return nil
 				} else {
 					PrintWarn("detach failed (%v); falling back to foreground", err)
@@ -276,7 +307,13 @@ Examples:
 			}
 
 			// Foreground tail (--foreground was set, or detach failed).
-			return runLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, env, c.Bool("skip-prepare"))
+			if err := runLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, env, c.Bool("skip-prepare")); err != nil {
+				return err
+			}
+			if printPathOnly {
+				fmt.Fprintln(os.Stdout, wtPath)
+			}
+			return nil
 		},
 	}
 }
@@ -424,15 +461,12 @@ Examples:
 				_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete, repoRoot, wtPath, sl.Value, env, true)
 			}
 			_ = prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st)
-			args := []string{"-C", repoRoot, "worktree", "remove"}
+			args := []string{"worktree", "remove"}
 			if c.Bool("force") {
 				args = append(args, "--force")
 			}
 			args = append(args, wtPath)
-			cmd := exec.CommandContext(ctx, "git", args...)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil && !c.Bool("force") {
+			if err := gitcmd.RunPiped(ctx, repoRoot, os.Stdout, os.Stderr, args...); err != nil && !c.Bool("force") {
 				return fmt.Errorf("git worktree remove: %w", err)
 			}
 			_ = st.MarkWorktreeDeleted(ctx, wtID)
@@ -690,12 +724,12 @@ func wtList() *cli.Command {
 // error). Forks `git -C path log -1 --format=%ct HEAD` — cheap enough
 // per row for the dozen-or-so worktrees a typical repo carries.
 func headCommitTs(path string) int64 {
-	out, err := exec.Command("git", "-C", path, "log", "-1", "--format=%ct", "HEAD").Output()
+	out, err := gitcmd.String(context.Background(), path, "log", "-1", "--format=%ct", "HEAD")
 	if err != nil {
 		return 0
 	}
 	var ts int64
-	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &ts)
+	fmt.Sscanf(out, "%d", &ts)
 	return ts
 }
 
@@ -922,18 +956,14 @@ func resolveWorktreesRoot(cfg config.Config, repoRoot string) string {
 }
 
 func detectDefaultBranch(repoRoot string) string {
-	out, err := exec.Command("git", "-C", repoRoot, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").Output()
-	if err == nil {
-		s := string(out)
-		s = trimSpace(s)
+	if s, err := gitcmd.String(context.Background(), repoRoot, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
 		if len(s) > len("origin/") && s[:len("origin/")] == "origin/" {
 			return s[len("origin/"):]
 		}
 		return s
 	}
-	out, err = exec.Command("git", "-C", repoRoot, "rev-parse", "--abbrev-ref", "HEAD").Output()
-	if err == nil {
-		return trimSpace(string(out))
+	if s, err := gitcmd.String(context.Background(), repoRoot, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
+		return s
 	}
 	return "main"
 }
@@ -1164,11 +1194,11 @@ func wtBack() *cli.Command {
 // gitWorktreeRoot returns the top-level directory of the worktree
 // containing `start`. Wraps `git -C start rev-parse --show-toplevel`.
 func gitWorktreeRoot(start string) (string, error) {
-	out, err := exec.Command("git", "-C", start, "rev-parse", "--show-toplevel").Output()
+	out, err := gitcmd.String(context.Background(), start, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", fmt.Errorf("git rev-parse --show-toplevel: %w", err)
 	}
-	return trimSpace(string(out)), nil
+	return out, nil
 }
 
 // wtResolve — `treeman wt resolve <branch>`. Pure registry lookup.
@@ -1308,7 +1338,7 @@ func wtGo() *cli.Command {
 			// the new branch off yesterday's commit. Same heuristic
 			// as zsh's _resolve_base.
 			if mode == "create" && base != "" && !c.Bool("no-fetch") {
-				_ = exec.Command("git", "-C", repoRoot, "fetch", "origin", base, "--quiet").Run()
+				_ = gitcmd.RunPiped(ctx, repoRoot, nil, nil, "fetch", "origin", base, "--quiet")
 				if refExistsRemote(repoRoot, base) {
 					base = "origin/" + base
 				}
@@ -1319,7 +1349,7 @@ func wtGo() *cli.Command {
 			inLinked := cwdTop != "" && gitenv.IsLinkedWorktree(cwdTop)
 
 			runCheckoutIn := func(dir string) error {
-				args := []string{"-C", dir, "checkout"}
+				args := []string{"checkout"}
 				if mode == "create" {
 					args = append(args, "-b", branch)
 					if base != "" {
@@ -1328,10 +1358,9 @@ func wtGo() *cli.Command {
 				} else {
 					args = append(args, branch)
 				}
-				cmd := exec.Command("git", args...)
-				cmd.Stdout = os.Stderr // keep stdout clean (only the path goes there)
-				cmd.Stderr = os.Stderr
-				return cmd.Run()
+				// stdout goes to stderr — `wt go` reserves stdout for
+				// the worktree path (consumed by `cd $(treeman wt go …)`).
+				return gitcmd.RunPiped(ctx, dir, os.Stderr, os.Stderr, args...)
 			}
 
 			// (4) Not in a linked worktree → checkout in cwd's repo root.
@@ -1404,15 +1433,53 @@ func registryWorktreeForBranch(ctx context.Context, repoRoot, branch string) (st
 	return p, true
 }
 
+// isMatchingExistingWorktree reports whether `wtPath` is already a
+// linked git worktree of `repoRoot` checked out on `branch` and is
+// present in the SQLite registry. Used by `wt create` to short-
+// circuit re-creation: a script that retries the command after a
+// transient failure shouldn't error with "path already exists" when
+// the previous run actually succeeded.
+//
+// All four conditions must hold: (1) `wtPath` exists, (2) its
+// `.git` file is a gitlink (not a directory — so it's a linked
+// worktree), (3) `git -C <wtPath> branch --show-current` equals
+// `branch`, (4) the registry has an active row for this path.
+// Mismatches return false → caller falls back to the original
+// "already exists" error so we never silently swallow drift.
+func isMatchingExistingWorktree(ctx context.Context, repoRoot, wtPath, branch string) bool {
+	if !gitenv.IsLinkedWorktree(wtPath) {
+		return false
+	}
+	current, err := gitcmd.String(ctx, wtPath, "branch", "--show-current")
+	if err != nil || current != branch {
+		return false
+	}
+	dbPath, err := store.DefaultDBPath()
+	if err != nil {
+		return false
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return false
+	}
+	defer st.Close()
+	var n int
+	_ = st.DB.QueryRowContext(ctx,
+		`SELECT 1 FROM worktrees w JOIN repos r ON r.id = w.repo_id
+		 WHERE r.path = ? AND w.path = ? AND w.deleted_at IS NULL`,
+		repoRoot, wtPath).Scan(&n)
+	return n == 1
+}
+
 // refExistsLocal returns true when refs/heads/<name> resolves in
 // repoRoot. Used by wt go to flip --create → checkout when the
 // branch already exists.
 func refExistsLocal(repoRoot, name string) bool {
-	return exec.Command("git", "-C", repoRoot, "rev-parse", "--verify", "--quiet", "refs/heads/"+name).Run() == nil
+	return gitcmd.Exists(context.Background(), repoRoot, "refs/heads/"+name)
 }
 
 func refExistsRemote(repoRoot, name string) bool {
-	return exec.Command("git", "-C", repoRoot, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+name).Run() == nil
+	return gitcmd.Exists(context.Background(), repoRoot, "refs/remotes/origin/"+name)
 }
 
 // touchVisitedByPath stamps last_visited_at on the worktree row at

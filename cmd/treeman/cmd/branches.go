@@ -2,12 +2,12 @@ package cmd
 
 import (
 	"context"
-	"os/exec"
 	"sort"
 	"strings"
 
 	"github.com/urfave/cli/v3"
 
+	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/ui"
 )
@@ -122,13 +122,13 @@ func BranchesCmd() *cli.Command {
 // `_list_git_branches` but driven by `%(refname)` so no markers /
 // colors leak into the output.
 func listGitBranches(repoRoot string, remote bool) []string {
-	args := []string{"-C", repoRoot}
+	var args []string
 	if remote {
-		args = append(args, "branch", "-r", "--format=%(refname:short)")
+		args = []string{"branch", "-r", "--format=%(refname:short)"}
 	} else {
-		args = append(args, "branch", "--format=%(refname:short)")
+		args = []string{"branch", "--format=%(refname:short)"}
 	}
-	out, err := exec.Command("git", args...).Output()
+	out, err := gitcmd.Output(context.Background(), repoRoot, args...)
 	if err != nil {
 		return nil
 	}

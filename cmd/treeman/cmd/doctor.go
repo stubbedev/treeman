@@ -1,11 +1,9 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -14,8 +12,10 @@ import (
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/ui"
+	"github.com/stubbedev/treeman/internal/wtreg"
 )
 
 // DoctorCmd — `treeman doctor` runs a short health probe over the
@@ -36,25 +36,39 @@ func DoctorCmd() *cli.Command {
 		Usage: "health-check the local treeman setup",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "json", Usage: "emit one JSON line per check"},
+			&cli.BoolFlag{Name: "fix", Usage: "auto-apply remediations for `schema` (install) and `registry` (repair) checks; re-runs the probe so the printed result reflects the post-fix state"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			results := RunDoctorChecks(ctx)
+
+			if c.Bool("fix") {
+				results = applyDoctorFixes(ctx, results)
+			}
 
 			if c.Bool("json") {
 				return jsonStream(results)
 			}
 			failed := 0
+			warned := 0
+			fixable := 0
 			for _, r := range results {
 				switch r.Status {
 				case "ok":
 					ui.Success("%s — %s", ui.Bold(r.Name), r.Detail)
 				case "warn":
+					warned++
+					if isFixable(r.Name) {
+						fixable++
+					}
 					ui.Warn("%s — %s", ui.Bold(r.Name), r.Detail)
 					if r.Hint != "" {
 						ui.Hint("%s", r.Hint)
 					}
 				case "fail":
 					failed++
+					if isFixable(r.Name) {
+						fixable++
+					}
 					ui.Error("%s — %s", ui.Bold(r.Name), r.Detail)
 					if r.Hint != "" {
 						ui.Hint("%s", r.Hint)
@@ -63,12 +77,80 @@ func DoctorCmd() *cli.Command {
 					ui.Info("%s — %s", ui.Bold(r.Name), r.Detail)
 				}
 			}
-			if failed > 0 {
+			// One-line summary so the user knows the verdict + next step
+			// without re-reading the per-check list.
+			fmt.Fprintln(ui.Out)
+			switch {
+			case failed > 0:
+				ui.Error("%d check(s) failed, %d warning(s)", failed, warned)
+				if fixable > 0 && !c.Bool("fix") {
+					ui.Hint("auto-fixable: re-run with `--fix`")
+				}
 				return fmt.Errorf("%d check(s) failed", failed)
+			case warned > 0:
+				ui.Warn("%d warning(s)", warned)
+				if fixable > 0 && !c.Bool("fix") {
+					ui.Hint("auto-fixable: re-run with `--fix`")
+				}
+			default:
+				ui.Success("all checks passed")
 			}
 			return nil
 		},
 	}
+}
+
+// isFixable reports whether `applyDoctorFixes` knows how to remediate
+// a check by that name. Keep the set in sync with the switch in
+// applyDoctorFixes so the TLDR doesn't over-promise.
+func isFixable(name string) bool {
+	switch name {
+	case "schema", "registry":
+		return true
+	}
+	return false
+}
+
+// applyDoctorFixes walks the results and runs the auto-fix path for
+// each warn/fail check that has one wired up. After fixing, the
+// affected check is re-run so the printed result reflects the new
+// state. Fixes that aren't auto-applicable (e.g. `config` warn
+// requires `treeman init` against a non-empty cwd) are left as-is.
+func applyDoctorFixes(ctx context.Context, results []DoctorResult) []DoctorResult {
+	repoRoot, _ := resolveRepo("")
+	for i, r := range results {
+		if r.Status == "ok" || r.Status == "skip" {
+			continue
+		}
+		switch r.Name {
+		case "schema":
+			if repoRoot == "" {
+				continue
+			}
+			if _, _, err := schema.Install(repoRoot, schema.TargetRepo); err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			results[i] = checkSchema(repoRoot)
+		case "registry":
+			if repoRoot == "" {
+				continue
+			}
+			st, err := openDefaultStore(ctx)
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			if _, err := wtreg.Repair(ctx, st, repoRoot, detectBranchOfWorktree); err != nil {
+				st.Close()
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			st.Close()
+			results[i] = checkRegistry(ctx, repoRoot)
+		}
+	}
+	return results
 }
 
 // doctorResult is the shape both the human renderer and the JSON
@@ -166,7 +248,7 @@ func checkConfig(repoRoot string) doctorResult {
 // repo-local and global file locations so editors still get
 // hinting even if the modeline was hand-removed.
 func checkSchema(repoRoot string) doctorResult {
-	ref := ReadSchemaModeline(repoRoot)
+	ref := schema.ReadModeline(repoRoot)
 	if ref != "" {
 		if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
 			return doctorResult{
@@ -203,7 +285,7 @@ func checkSchema(repoRoot string) doctorResult {
 			Hint:   "wire it up: treeman schema install",
 		}
 	}
-	if gp, err := GlobalSchemaPath(); err == nil {
+	if gp, err := schema.GlobalPath(); err == nil {
 		if _, err := os.Stat(gp); err == nil {
 			return doctorResult{
 				Name:   "schema",
@@ -319,27 +401,8 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 	}
 }
 
-// gitWorktreePaths returns the absolute paths reported by `git
-// worktree list --porcelain`. The MAIN repo itself is excluded —
-// only linked worktrees are returned, matching what the registry
-// tracks.
+// gitWorktreePaths is a thin shim over wtreg.GitWorktreePaths kept
+// so existing call sites in this file don't need an import churn.
 func gitWorktreePaths(ctx context.Context, repoRoot string) ([]string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoRoot, "worktree", "list", "--porcelain").Output()
-	if err != nil {
-		return nil, fmt.Errorf("git worktree list: %w", err)
-	}
-	var paths []string
-	sc := bufio.NewScanner(strings.NewReader(string(out)))
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "worktree ") {
-			continue
-		}
-		p := strings.TrimPrefix(line, "worktree ")
-		if p == repoRoot {
-			continue
-		}
-		paths = append(paths, p)
-	}
-	return paths, nil
+	return wtreg.GitWorktreePaths(ctx, repoRoot)
 }

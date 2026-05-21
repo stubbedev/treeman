@@ -190,6 +190,34 @@ func (s *Store) SumSnapshotBytes(ctx context.Context) (int64, error) {
 	return sum, nil
 }
 
+// ListSnapshotsForRepo returns every snapshot belonging to the given
+// repo. Returns an empty slice when repoID is 0 so callers can't
+// accidentally drop snapshots that predate the repo_id column being
+// populated. Used by MCP `snapshots_purge` to wipe a repo's cache.
+func (s *Store) ListSnapshotsForRepo(ctx context.Context, repoID int64) ([]SnapshotEvictionCandidate, error) {
+	if repoID == 0 {
+		return nil, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT fingerprint, engine, template_name, source_db
+		FROM snapshots
+		WHERE repo_id = ?
+		ORDER BY last_used_at ASC`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SnapshotEvictionCandidate
+	for rows.Next() {
+		var c SnapshotEvictionCandidate
+		if err := rows.Scan(&c.Fingerprint, &c.Engine, &c.TemplateName, &c.SourceDB); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // ListSnapshotsLargestLRU returns every snapshot ordered by
 // (size_bytes DESC, last_used_at ASC). The size-sweep iterates and
 // drops from the top until total falls below the cap.

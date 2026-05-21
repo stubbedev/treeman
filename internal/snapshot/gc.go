@@ -61,6 +61,42 @@ func EvictExcess(ctx context.Context, cfg *config.Config, st *store.Store, repoI
 	}
 }
 
+// PurgeRepo drops every cached template for the given repo and
+// removes the corresponding snapshot rows. Used by MCP
+// `snapshots_purge` (and any future CLI surface) when the user wants
+// the next prepare to rebuild from scratch — e.g. after a schema
+// migration framework changes its dump format.
+//
+// Returns the count of rows dropped + a multi-error of any per-row
+// failures. Continues past per-row failures so a single bad engine
+// row doesn't strand the rest.
+func PurgeRepo(ctx context.Context, cfg *config.Config, st *store.Store, repoID int64) (dropped int, errs []error) {
+	cands, err := st.ListSnapshotsForRepo(ctx, repoID)
+	if err != nil {
+		return 0, []error{err}
+	}
+	for _, c := range cands {
+		if err := dropTemplate(ctx, cfg, c); err != nil {
+			errs = append(errs, fmt.Errorf("drop %s (%s): %w", c.TemplateName, c.Engine, err))
+			continue
+		}
+		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
+			errs = append(errs, fmt.Errorf("delete row %s: %w", c.Fingerprint, err))
+			continue
+		}
+		dropped++
+		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_purge",
+			fmt.Sprintf("purged %s (%s)", c.TemplateName, c.Engine),
+			repoID, 0, "", 0, map[string]string{
+				"engine":      c.Engine,
+				"template":    c.TemplateName,
+				"source_db":   c.SourceDB,
+				"fingerprint": c.Fingerprint,
+			})
+	}
+	return dropped, errs
+}
+
 func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvictionCandidate) error {
 	switch c.Engine {
 	case "mysql", "mariadb", "tidb":

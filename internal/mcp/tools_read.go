@@ -1,26 +1,24 @@
 package mcp
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/invopop/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/wtreg"
 )
 
 // registerReadTools binds every read-only tool to the server.
@@ -81,6 +79,11 @@ func registerReadTools(srv *mcpsdk.Server) {
 		Name:        "daemon_status",
 		Description: "Ask the running treemand for its version, PID, and watcher count. Returns a structured object with status=running|not-running.",
 	}, daemonStatusTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "snapshots_list",
+		Description: "List cached snapshots (template DBs) for the current (or specified) repo. Read-only complement to snapshots_purge so agents can see what would be wiped before purging.",
+	}, snapshotsListTool)
 }
 
 // ─── doctor ───────────────────────────────────────────────────────
@@ -139,11 +142,30 @@ func checkConfig(repoRoot string) doctorResult {
 }
 
 func checkSchema(repoRoot string) doctorResult {
-	p := filepath.Join(repoRoot, "schemas", "treeman.schema.json")
-	if _, err := os.Stat(p); err != nil {
-		return doctorResult{Name: "schema", Status: "warn", Detail: "schemas/treeman.schema.json not installed", Hint: "treeman schema install"}
+	ref := schema.ReadModeline(repoRoot)
+	if ref != "" {
+		if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+			return doctorResult{Name: "schema", Status: "ok", Detail: "modeline → " + ref}
+		}
+		p := ref
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(repoRoot, p)
+		}
+		if _, err := os.Stat(p); err == nil {
+			return doctorResult{Name: "schema", Status: "ok", Detail: "modeline → " + p}
+		}
+		return doctorResult{Name: "schema", Status: "warn", Detail: "modeline points to missing file: " + p, Hint: "schema_install"}
 	}
-	return doctorResult{Name: "schema", Status: "ok", Detail: p}
+	repoPath := filepath.Join(repoRoot, "schemas", "treeman.schema.json")
+	if _, err := os.Stat(repoPath); err == nil {
+		return doctorResult{Name: "schema", Status: "warn", Detail: repoPath + " (no modeline)", Hint: "schema_install"}
+	}
+	if gp, err := schema.GlobalPath(); err == nil {
+		if _, err := os.Stat(gp); err == nil {
+			return doctorResult{Name: "schema", Status: "warn", Detail: gp + " (no modeline)", Hint: "schema_install target=global"}
+		}
+	}
+	return doctorResult{Name: "schema", Status: "warn", Detail: "no schema installed", Hint: "schema_install"}
 }
 
 func checkFrameworks(repoRoot string) doctorResult {
@@ -208,24 +230,7 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 }
 
 func gitWorktreePaths(ctx context.Context, repoRoot string) ([]string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoRoot, "worktree", "list", "--porcelain").Output()
-	if err != nil {
-		return nil, fmt.Errorf("git worktree list: %w", err)
-	}
-	var paths []string
-	sc := bufio.NewScanner(strings.NewReader(string(out)))
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "worktree ") {
-			continue
-		}
-		p := strings.TrimPrefix(line, "worktree ")
-		if p == repoRoot {
-			continue
-		}
-		paths = append(paths, p)
-	}
-	return paths, nil
+	return wtreg.GitWorktreePaths(ctx, repoRoot)
 }
 
 // ─── config_get / validate / schema ───────────────────────────────
@@ -238,6 +243,12 @@ type configGetIn struct {
 // configGetTool returns the loaded config as a map so the SDK's
 // schema inference doesn't walk into config.Config (which uses
 // invopop-style jsonschema tags incompatible with jsonschema-go).
+//
+// Resolved connection strings carry embedded passwords. Before
+// returning, the payload is round-tripped through redactSecrets so
+// `mysql://user:pw@host` style userinfo and `password: "..."` key/
+// value pairs are scrubbed. LLM clients see structure + which
+// secrets exist, never the literal values.
 func configGetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configGetIn) (*mcpsdk.CallToolResult, map[string]any, error) {
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
@@ -251,7 +262,24 @@ func configGetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configGetIn)
 	if in.Resolved {
 		out["resolved"] = resolve.Resolve(&cfg, repoRoot)
 	}
-	return nil, out, nil
+	return nil, redactMap(out), nil
+}
+
+// redactMap round-trips `m` through JSON + redactSecrets so any
+// embedded password / token / URL-userinfo strings are scrubbed
+// regardless of how deeply nested they sit. Cheap: configs are
+// small and this only runs on tool invocation.
+func redactMap(m map[string]any) map[string]any {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return m
+	}
+	clean := redactSecrets(string(b))
+	var out map[string]any
+	if err := json.Unmarshal([]byte(clean), &out); err != nil {
+		return m
+	}
+	return out
 }
 
 type configValidateIn struct {
@@ -282,20 +310,15 @@ type configSchemaIn struct{}
 // the SDK serialises it as a nested object instead of the byte-array
 // shape that json.RawMessage produces by default.
 func configSchemaTool(_ context.Context, _ *mcpsdk.CallToolRequest, _ configSchemaIn) (*mcpsdk.CallToolResult, map[string]any, error) {
-	b, err := renderConfigSchema()
+	b, err := schema.Render()
 	if err != nil {
 		return nil, nil, err
 	}
-	var schema map[string]any
-	if err := json.Unmarshal(b, &schema); err != nil {
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
 		return nil, nil, err
 	}
-	return nil, map[string]any{"schema": schema}, nil
-}
-
-func renderConfigSchema() ([]byte, error) {
-	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
-	return json.MarshalIndent(r.Reflect(&config.Config{}), "", "  ")
+	return nil, map[string]any{"schema": out}, nil
 }
 
 // ─── worktree_list / show ─────────────────────────────────────────
@@ -600,6 +623,52 @@ type daemonStatusOut struct {
 	PID      int    `json:"pid,omitempty"`
 	Watchers int    `json:"watchers,omitempty"`
 	Error    string `json:"error,omitempty"`
+}
+
+// ─── snapshots_list ───────────────────────────────────────────────
+
+type snapshotsListIn struct {
+	Repo string `json:"repo,omitempty"`
+}
+type snapshotsListRow struct {
+	Fingerprint  string `json:"fingerprint"`
+	Engine       string `json:"engine"`
+	TemplateName string `json:"template_name"`
+	SourceDB     string `json:"source_db"`
+}
+type snapshotsListOut struct {
+	Repo      string             `json:"repo"`
+	Snapshots []snapshotsListRow `json:"snapshots"`
+}
+
+func snapshotsListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapshotsListIn) (*mcpsdk.CallToolResult, snapshotsListOut, error) {
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, snapshotsListOut{}, err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, snapshotsListOut{}, err
+	}
+	defer st.Close()
+	repoID, err := lookupRepoID(ctx, st, repoRoot)
+	if err != nil {
+		return nil, snapshotsListOut{Repo: repoRoot}, nil
+	}
+	cands, err := st.ListSnapshotsForRepo(ctx, repoID)
+	if err != nil {
+		return nil, snapshotsListOut{}, err
+	}
+	rows := make([]snapshotsListRow, 0, len(cands))
+	for _, c := range cands {
+		rows = append(rows, snapshotsListRow{
+			Fingerprint:  c.Fingerprint,
+			Engine:       c.Engine,
+			TemplateName: c.TemplateName,
+			SourceDB:     c.SourceDB,
+		})
+	}
+	return nil, snapshotsListOut{Repo: repoRoot, Snapshots: rows}, nil
 }
 
 func daemonStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, _ daemonStatusIn) (*mcpsdk.CallToolResult, daemonStatusOut, error) {

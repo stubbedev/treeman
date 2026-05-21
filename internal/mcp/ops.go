@@ -120,6 +120,25 @@ func captureEnv() map[string]string {
 	return out
 }
 
+// writeMCPEvent records that an MCP tool performed `action` against
+// `repoID` (optional). Best-effort: failures are swallowed so an
+// audit-log glitch doesn't fail the underlying operation. All
+// MCP-originated events share the `mcp_` event_type prefix and a
+// `mcp=true` payload key so `logs grep mcp_` produces a clean
+// audit trail.
+func writeMCPEvent(ctx context.Context, action, message string, repoID int64, payload map[string]string) {
+	st, err := openStore(ctx)
+	if err != nil {
+		return
+	}
+	defer st.Close()
+	if payload == nil {
+		payload = map[string]string{}
+	}
+	payload["mcp"] = "true"
+	_ = st.WriteEvent(ctx, store.LevelInfo, "mcp_"+action, message, repoID, 0, "", 0, payload)
+}
+
 // openStore opens the default SQLite event store. Caller closes.
 func openStore(ctx context.Context) (*store.Store, error) {
 	p, err := store.DefaultDBPath()

@@ -198,6 +198,53 @@ func (s *Store) QueryHookRuns(ctx context.Context, worktreeID int64, limit int) 
 }
 
 // placeholders returns "?, ?, ?" repeated n times.
+// PurgeEvents deletes events matching the filter and returns the row
+// count removed. Only SinceMs / UntilMs / RepoID / WorktreeID /
+// EventTypes / Levels are honored — every other field on the filter
+// is ignored. SQLite's DELETE is sufficient for the table sizes we
+// expect (events accumulate, but a single repo rarely tops 100k rows).
+func (s *Store) PurgeEvents(ctx context.Context, f EventFilter) (int64, error) {
+	q := "DELETE FROM events"
+	where := []string{}
+	args := []any{}
+	if f.RepoID > 0 {
+		where = append(where, "repo_id = ?")
+		args = append(args, f.RepoID)
+	}
+	if f.WorktreeID > 0 {
+		where = append(where, "worktree_id = ?")
+		args = append(args, f.WorktreeID)
+	}
+	if f.UntilMs > 0 {
+		where = append(where, "ts <= ?")
+		args = append(args, f.UntilMs)
+	}
+	if f.SinceMs > 0 {
+		where = append(where, "ts >= ?")
+		args = append(args, f.SinceMs)
+	}
+	if len(f.Levels) > 0 {
+		where = append(where, "level IN ("+placeholders(len(f.Levels))+")")
+		for _, v := range f.Levels {
+			args = append(args, v)
+		}
+	}
+	if len(f.EventTypes) > 0 {
+		where = append(where, "event_type IN ("+placeholders(len(f.EventTypes))+")")
+		for _, v := range f.EventTypes {
+			args = append(args, v)
+		}
+	}
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	res, err := s.DB.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func placeholders(n int) string {
 	if n <= 0 {
 		return ""

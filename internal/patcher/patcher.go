@@ -9,12 +9,14 @@
 package patcher
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
+
+	"github.com/stubbedev/treeman/internal/gitcmd"
 )
 
 // xmlAttrEscape returns `value` escaped for use inside an XML
@@ -130,13 +132,10 @@ func patchPhpunitOne(content, key, value string) string {
 func SkipWorktree(gitDir, file string) (bool, error) {
 	// Probe first: `git ls-files --error-unmatch <file>` exits 0
 	// when the path is tracked, non-zero otherwise.
-	probe := exec.Command("git", "-C", gitDir, "ls-files", "--error-unmatch", file)
-	probe.Stdout, probe.Stderr = nil, nil
-	if err := probe.Run(); err != nil {
+	if err := gitcmd.RunOptional(context.Background(), gitDir, "ls-files", "--error-unmatch", file); err != nil {
 		return false, nil
 	}
-	cmd := exec.Command("git", "-C", gitDir, "update-index", "--skip-worktree", file)
-	if err := cmd.Run(); err != nil {
+	if _, err := gitcmd.OutputRW(context.Background(), gitDir, false, "update-index", "--skip-worktree", file); err != nil {
 		return false, fmt.Errorf("git update-index --skip-worktree %s: %w", file, err)
 	}
 	return true, nil

@@ -10,11 +10,13 @@
 package gitenv
 
 import (
+	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/stubbedev/treeman/internal/gitcmd"
 )
 
 // MainRoot returns the main-repo working directory, even when
@@ -34,9 +36,10 @@ func MainRoot(start string) (string, error) {
 	}
 
 	// git-common-dir resolves linked worktrees → main repo's .git.
-	out, err := exec.Command("git", "-C", start, "rev-parse", "--git-common-dir").Output()
+	// Background ctx is fine: this is a fast local probe and callers
+	// upstream don't have a cancellation deadline to honor.
+	common, err := gitcmd.String(context.Background(), start, "rev-parse", "--git-common-dir")
 	if err == nil {
-		common := strings.TrimSpace(string(out))
 		if !filepath.IsAbs(common) {
 			// `git rev-parse` returns relative paths inside the
 			// repo when started from a non-toplevel dir. Resolve
@@ -84,7 +87,10 @@ func IsLinkedWorktree(path string) bool {
 // Used by `wt back --remove-if-clean` and equivalent gwt safety
 // checks.
 func IsWorktreeClean(path string) (bool, error) {
-	out, err := exec.Command("git", "-C", path, "status", "--porcelain").Output()
+	// `git status` is read-only from treeman's POV but updates the
+	// index lock by default — pass readOnly=false so we don't disable
+	// GIT_OPTIONAL_LOCKS for what is, semantically, a query.
+	out, err := gitcmd.Output(context.Background(), path, "status", "--porcelain")
 	if err != nil {
 		return false, err
 	}
@@ -98,12 +104,11 @@ func HasUnpushedCommits(path string) (bool, error) {
 	// `git -C <path> rev-list @{upstream}..HEAD --count` — empty
 	// upstream returns non-zero exit which we treat as "no tracking
 	// branch yet → can't be unpushed".
-	out, err := exec.Command("git", "-C", path, "rev-list", "@{upstream}..HEAD", "--count").Output()
+	count, err := gitcmd.String(context.Background(), path, "rev-list", "@{upstream}..HEAD", "--count")
 	if err != nil {
 		// No upstream — treat as no unpushed work.
 		return false, nil
 	}
-	count := strings.TrimSpace(string(out))
 	return count != "0" && count != "", nil
 }
 

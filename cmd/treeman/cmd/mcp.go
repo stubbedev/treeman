@@ -37,7 +37,7 @@ func MCPCmd() *cli.Command {
 			},
 			&cli.BoolFlag{
 				Name:  "allow-shell",
-				Usage: "enable shell-out tools (worktree_create, worktree_delete, init_repo, schema_install, daemon_control). Implies --allow-mutations.",
+				Usage: "enable shell-out tools (worktree_create, worktree_delete). Implies --allow-mutations.",
 			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {

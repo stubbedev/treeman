@@ -2,17 +2,30 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/daemonctl"
 	"github.com/stubbedev/treeman/internal/hooks"
+	"github.com/stubbedev/treeman/internal/initgen"
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/schema"
+	"github.com/stubbedev/treeman/internal/slug"
+	"github.com/stubbedev/treeman/internal/snapshot"
+	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/wtreg"
+	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
 
 // registerWriteTools binds tools that mutate state. Gated by
@@ -35,19 +48,57 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 		Description: "Replace .treeman.yaml with the supplied body. The body is parsed into config.Config first; the write only happens if parsing succeeds, so invalid YAML never lands on disk. Returns the byte count written.",
 	}, configWriteTool)
 
-	if !opts.AllowShellOps {
-		return
-	}
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "config_set",
+		Description: "Patch a single field of .treeman.yaml addressed by a dotted path (e.g. 'daemon.gc_interval' or 'databases[0].engine'). Preserves surrounding comments + key ordering by editing the YAML AST in place. Creates missing intermediate mapping keys; refuses to extend sequences. The result is validated by parsing into config.Config before the write lands. Returns the previous + new value as JSON.",
+	}, configSetTool)
+
+	// In-process registry mutations. No shell-out, no daemon dependency
+	// — agents can reconcile drift the same way `treeman wt
+	// register|unregister` would.
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "registry_register",
+		Description: "Register a worktree in the SQLite registry without touching git. Provide path (absolute) and branch; slug is computed automatically when omitted. Returns the upserted worktree row id.",
+	}, registryRegisterTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "init_repo",
-		Description: "Scaffold .treeman.yaml under cwd (or --repo) by shelling to `treeman init`. Pass force=true to overwrite an existing file. Returns the chosen path and whether it was newly created.",
-	}, initRepoTool)
+		Name:        "registry_unregister",
+		Description: "Mark a worktree deleted in SQLite without touching git. name resolves by slug, branch, or basename. Idempotent.",
+	}, registryUnregisterTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "registry_repair",
+		Description: "Reconcile the SQLite registry with `git worktree list` for the current (or specified) repo: register paths git knows that SQLite doesn't, and mark deleted those SQLite knows that git doesn't. Returns per-action counts.",
+	}, registryRepairTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "snapshots_purge",
+		Description: "Drop every cached snapshot (template DB) belonging to the current (or specified) repo. Frees engine-side storage and forces the next prepare to rebuild from scratch. Returns counts + any per-engine errors.",
+	}, snapshotsPurgeTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "logs_purge",
+		Description: "Delete event-log rows. Filters are AND-combined; pass older_than=24h to drop anything older than the cutoff. All filters are optional, but at least one must be specified to prevent accidental full wipes. Returns the row count removed.",
+	}, logsPurgeTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "schema_install",
-		Description: "Install schemas/treeman.schema.json by shelling to `treeman schema install`. Required for editor autocompletion against .treeman.yaml.",
+		Description: "Generate the JSON Schema for .treeman.yaml and wire it into the yaml-language-server modeline. target=repo writes <repo>/schemas/treeman.schema.json (default). target=global writes the user-XDG path so multiple repos share one file. target=url skips the file write and points the modeline at the canonical upstream URL.",
 	}, schemaInstallTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "init_repo",
+		Description: "Scaffold .treeman.yaml under cwd (or --repo). Detects migration framework + JS package manager and emits matching databases/hooks blocks. Pass force=true to overwrite an existing file. Returns the chosen path, byte count, and detected framework names.",
+	}, initRepoTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "daemon_control",
+		Description: "Start or stop treemand. Action must be one of: start, stop. Prefers the installed systemd/launchd unit when present; otherwise forks the treemand binary (start) or sends the shutdown RPC (stop). In-process — no shell-out.",
+	}, daemonControlTool)
+
+	if !opts.AllowShellOps {
+		return
+	}
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_create",
@@ -58,11 +109,6 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 		Name:        "worktree_delete",
 		Description: "Tear down a worktree: predelete hooks → DB teardown → git worktree remove. Shells to `treeman wt delete`. Returns the captured stdout/stderr and exit code.",
 	}, worktreeDeleteTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "daemon_control",
-		Description: "Start or stop treemand by shelling to `treeman daemon start|stop`. Action must be one of: start, stop.",
-	}, daemonControlTool)
 }
 
 // ─── prepare_run ──────────────────────────────────────────────────
@@ -131,23 +177,18 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 	if err := atomicWrite(target, []byte(in.Body)); err != nil {
 		return nil, configWriteOut{}, err
 	}
+	writeMCPEvent(context.Background(), "config_write", "replaced .treeman.yaml", 0, map[string]string{
+		"repo":  repoRoot,
+		"bytes": fmt.Sprintf("%d", len(in.Body)),
+	})
 	return nil, configWriteOut{Path: target, Bytes: len(in.Body)}, nil
 }
 
-// atomicWrite writes data to <path>.tmp then renames over <path> so
-// readers never see a partial config. The tmp file is created 0o600
-// so config contents (potentially including connection strings) are
-// not briefly world-readable on shared hosts before the rename.
+// atomicWrite delegates to yamlpatch.AtomicWriteWithBackup so MCP
+// mutations (config_write, config_set) leave behind a rotated
+// `.treeman.yaml.bak.*` history. Five-snapshot cap matches the CLI.
 func atomicWrite(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return yamlpatch.AtomicWriteWithBackup(path, data, 5)
 }
 
 // ─── shell-out helpers ────────────────────────────────────────────
@@ -226,31 +267,324 @@ type initIn struct {
 	Repo  string `json:"repo,omitempty"`
 	Force bool   `json:"force,omitempty"`
 }
+type initOut struct {
+	Path     string   `json:"path"`
+	Created  bool     `json:"created"`
+	Bytes    int      `json:"bytes"`
+	Detected []string `json:"detected"`
+}
 
-func initRepoTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*mcpsdk.CallToolResult, shellOut, error) {
-	args := []string{"init", "--json"}
-	if in.Force {
-		args = append(args, "--force")
-	}
-	cwd, err := resolveRepo(in.Repo)
+func initRepoTool(_ context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*mcpsdk.CallToolResult, initOut, error) {
+	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
-		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+		return nil, initOut{}, fmt.Errorf("resolve repo: %w", err)
 	}
-	out, err := runTreeman(ctx, cwd, args...)
-	return nil, out, err
+	target, created, body, err := initgen.WriteYAML(repoRoot, in.Force)
+	if err != nil {
+		return nil, initOut{}, err
+	}
+	if created {
+		writeMCPEvent(context.Background(), "init_repo", "scaffolded "+target, 0, map[string]string{
+			"repo": repoRoot,
+			"path": target,
+		})
+	}
+	return nil, initOut{
+		Path:     target,
+		Created:  created,
+		Bytes:    len(body),
+		Detected: initgen.DetectFrameworkNames(repoRoot),
+	}, nil
 }
 
 type schemaInstallIn struct {
+	Repo   string `json:"repo,omitempty"`
+	Target string `json:"target,omitempty" jsonschema:"repo|global|url; default repo"`
+}
+type schemaInstallOut struct {
+	Target          string `json:"target"`
+	Resolved        string `json:"resolved"`
+	ModelineChanged bool   `json:"modeline_changed"`
+	WroteFile       bool   `json:"wrote_file"`
+}
+
+func schemaInstallTool(_ context.Context, _ *mcpsdk.CallToolRequest, in schemaInstallIn) (*mcpsdk.CallToolResult, schemaInstallOut, error) {
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, schemaInstallOut{}, err
+	}
+	var target schema.Target
+	switch strings.ToLower(in.Target) {
+	case "", "repo":
+		target = schema.TargetRepo
+	case "global":
+		target = schema.TargetGlobal
+	case "url":
+		target = schema.TargetURL
+	default:
+		return nil, schemaInstallOut{}, fmt.Errorf("invalid target %q (want repo|global|url)", in.Target)
+	}
+	resolved, changed, err := schema.Install(repoRoot, target)
+	if err != nil {
+		return nil, schemaInstallOut{}, err
+	}
+	writeMCPEvent(context.Background(), "schema_install", "installed "+resolved, 0, map[string]string{
+		"repo":     repoRoot,
+		"target":   strings.ToLower(in.Target),
+		"resolved": resolved,
+	})
+	return nil, schemaInstallOut{
+		Target:          strings.ToLower(in.Target),
+		Resolved:        resolved,
+		ModelineChanged: changed,
+		WroteFile:       target != schema.TargetURL,
+	}, nil
+}
+
+// ─── registry mutations ───────────────────────────────────────────
+
+type registryRegisterIn struct {
+	Repo   string `json:"repo,omitempty"`
+	Path   string `json:"path" jsonschema:"absolute worktree path"`
+	Branch string `json:"branch,omitempty" jsonschema:"branch name; derived from .git/HEAD when omitted"`
+}
+type registryRegisterOut struct {
+	WorktreeID int64  `json:"worktree_id"`
+	RepoID     int64  `json:"repo_id"`
+	Slug       string `json:"slug"`
+	Branch     string `json:"branch,omitempty"`
+	Path       string `json:"path"`
+}
+
+func registryRegisterTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in registryRegisterIn) (*mcpsdk.CallToolResult, registryRegisterOut, error) {
+	if in.Path == "" {
+		return nil, registryRegisterOut{}, fmt.Errorf("path is required")
+	}
+	wt, err := filepath.Abs(in.Path)
+	if err != nil {
+		return nil, registryRegisterOut{}, fmt.Errorf("abs %s: %w", in.Path, err)
+	}
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, registryRegisterOut{}, err
+	}
+	branch := in.Branch
+	if branch == "" {
+		branch = detectBranch(wt)
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, registryRegisterOut{}, err
+	}
+	defer st.Close()
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		return nil, registryRegisterOut{}, fmt.Errorf("ensure repo: %w", err)
+	}
+	sl := slug.For(wt, branch)
+	wtID, err := st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
+	if err != nil {
+		return nil, registryRegisterOut{}, fmt.Errorf("ensure worktree: %w", err)
+	}
+	writeMCPEvent(context.Background(), "registry_register", "registered "+wt, repoID, map[string]string{
+		"path":   wt,
+		"slug":   sl.Value,
+		"branch": branch,
+	})
+	return nil, registryRegisterOut{
+		WorktreeID: wtID,
+		RepoID:     repoID,
+		Slug:       sl.Value,
+		Branch:     branch,
+		Path:       wt,
+	}, nil
+}
+
+type registryUnregisterIn struct {
+	Repo string `json:"repo,omitempty"`
+	Name string `json:"name" jsonschema:"slug, branch, or basename of the worktree"`
+}
+type registryUnregisterOut struct {
+	WorktreeID int64  `json:"worktree_id"`
+	Path       string `json:"path"`
+}
+
+func registryUnregisterTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in registryUnregisterIn) (*mcpsdk.CallToolResult, registryUnregisterOut, error) {
+	if in.Name == "" {
+		return nil, registryUnregisterOut{}, fmt.Errorf("name is required")
+	}
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, registryUnregisterOut{}, err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, registryUnregisterOut{}, err
+	}
+	defer st.Close()
+	repoID, err := lookupRepoID(ctx, st, repoRoot)
+	if err != nil {
+		return nil, registryUnregisterOut{}, fmt.Errorf("lookup repo %s: %w", repoRoot, err)
+	}
+	wtID, _ := st.LookupWorktreeID(ctx, repoID, in.Name)
+	if wtID == 0 {
+		return nil, registryUnregisterOut{}, fmt.Errorf("no worktree matches %q", in.Name)
+	}
+	var path string
+	_ = st.DB.QueryRowContext(ctx, `SELECT path FROM worktrees WHERE id = ?`, wtID).Scan(&path)
+	if err := st.MarkWorktreeDeleted(ctx, wtID); err != nil {
+		return nil, registryUnregisterOut{}, err
+	}
+	writeMCPEvent(context.Background(), "registry_unregister", "unregistered "+path, repoID, map[string]string{
+		"path": path,
+		"name": in.Name,
+	})
+	return nil, registryUnregisterOut{WorktreeID: wtID, Path: path}, nil
+}
+
+type registryRepairIn struct {
 	Repo string `json:"repo,omitempty"`
 }
 
-func schemaInstallTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in schemaInstallIn) (*mcpsdk.CallToolResult, shellOut, error) {
-	cwd, err := resolveRepo(in.Repo)
+func registryRepairTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in registryRepairIn) (*mcpsdk.CallToolResult, wtreg.RepairResult, error) {
+	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
-		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+		return nil, wtreg.RepairResult{}, err
 	}
-	out, err := runTreeman(ctx, cwd, "schema", "install")
-	return nil, out, err
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, wtreg.RepairResult{}, err
+	}
+	defer st.Close()
+	res, err := wtreg.Repair(ctx, st, repoRoot, detectBranch)
+	if err == nil && (len(res.Registered) > 0 || len(res.Unregistered) > 0) {
+		writeMCPEvent(context.Background(), "registry_repair",
+			fmt.Sprintf("repaired %d registered, %d unregistered", len(res.Registered), len(res.Unregistered)),
+			0, map[string]string{"repo": repoRoot})
+	}
+	return nil, res, err
+}
+
+// ─── snapshots_purge ──────────────────────────────────────────────
+
+type snapshotsPurgeIn struct {
+	Repo string `json:"repo,omitempty"`
+}
+type snapshotsPurgeOut struct {
+	Repo    string   `json:"repo"`
+	Dropped int      `json:"dropped"`
+	Errors  []string `json:"errors,omitempty"`
+}
+
+func snapshotsPurgeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapshotsPurgeIn) (*mcpsdk.CallToolResult, snapshotsPurgeOut, error) {
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, snapshotsPurgeOut{}, err
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, snapshotsPurgeOut{}, fmt.Errorf("load config: %w", err)
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, snapshotsPurgeOut{}, err
+	}
+	defer st.Close()
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		return nil, snapshotsPurgeOut{}, fmt.Errorf("ensure repo: %w", err)
+	}
+	dropped, errs := snapshot.PurgeRepo(ctx, &cfg, st, repoID)
+	writeMCPEvent(context.Background(), "snapshots_purge",
+		fmt.Sprintf("purged %d snapshot(s)", dropped), repoID,
+		map[string]string{"repo": repoRoot, "dropped": fmt.Sprintf("%d", dropped)})
+	out := snapshotsPurgeOut{Repo: repoRoot, Dropped: dropped}
+	for _, e := range errs {
+		out.Errors = append(out.Errors, e.Error())
+	}
+	return nil, out, nil
+}
+
+// ─── logs_purge ───────────────────────────────────────────────────
+
+type logsPurgeIn struct {
+	Repo       string   `json:"repo,omitempty"`
+	Worktree   string   `json:"worktree,omitempty" jsonschema:"slug, branch, or basename"`
+	OlderThan  string   `json:"older_than,omitempty" jsonschema:"duration (24h, 7d) or RFC3339 cutoff — events older than this are purged"`
+	Levels     []string `json:"levels,omitempty"`
+	EventTypes []string `json:"event_types,omitempty"`
+}
+type logsPurgeOut struct {
+	RowsRemoved int64 `json:"rows_removed"`
+}
+
+func logsPurgeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsPurgeIn) (*mcpsdk.CallToolResult, logsPurgeOut, error) {
+	// At least one filter required so an empty input can never wipe
+	// the entire events table.
+	if in.Repo == "" && in.Worktree == "" && in.OlderThan == "" && len(in.Levels) == 0 && len(in.EventTypes) == 0 {
+		return nil, logsPurgeOut{}, errors.New("at least one filter (repo, worktree, older_than, levels, event_types) is required")
+	}
+	f := store.EventFilter{
+		Levels:     validateLevels(in.Levels),
+		EventTypes: in.EventTypes,
+	}
+	if in.OlderThan != "" {
+		t, err := parsePurgeCutoff(in.OlderThan)
+		if err != nil {
+			return nil, logsPurgeOut{}, err
+		}
+		f.UntilMs = t.UnixMilli()
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, logsPurgeOut{}, err
+	}
+	defer st.Close()
+	if in.Repo != "" || in.Worktree != "" {
+		repoRoot, err := resolveRepo(in.Repo)
+		if err == nil && repoRoot != "" {
+			if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
+				f.RepoID = rid
+			}
+		}
+		if in.Worktree != "" {
+			wid, _ := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
+			if wid == 0 {
+				return nil, logsPurgeOut{}, fmt.Errorf("no worktree matches %q", in.Worktree)
+			}
+			f.WorktreeID = wid
+		}
+	}
+	n, err := st.PurgeEvents(ctx, f)
+	if err != nil {
+		return nil, logsPurgeOut{}, err
+	}
+	writeMCPEvent(context.Background(), "logs_purge",
+		fmt.Sprintf("purged %d event row(s)", n), f.RepoID,
+		map[string]string{"rows_removed": fmt.Sprintf("%d", n)})
+	return nil, logsPurgeOut{RowsRemoved: n}, nil
+}
+
+// parsePurgeCutoff accepts "24h" / "7d" / RFC3339 timestamps. For
+// durations the cutoff is interpreted as "older than now-d"; for an
+// absolute timestamp it's the timestamp itself.
+func parsePurgeCutoff(s string) (time.Time, error) {
+	if strings.HasSuffix(s, "d") {
+		days := strings.TrimSuffix(s, "d")
+		d, err := time.ParseDuration(days + "h")
+		if err == nil {
+			return time.Now().Add(-d * 24), nil
+		}
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return time.Now().Add(-d), nil
+	}
+	for _, f := range []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
+		if t, err := time.Parse(f, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unrecognised older_than %q", s)
 }
 
 // ─── worktree_create / delete ─────────────────────────────────────
@@ -312,11 +646,102 @@ func worktreeDeleteTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in workt
 type daemonControlIn struct {
 	Action string `json:"action" jsonschema:"start|stop"`
 }
+type daemonControlOut struct {
+	Action string `json:"action"`
+	PID    int    `json:"pid,omitempty"`
+}
 
-func daemonControlTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in daemonControlIn) (*mcpsdk.CallToolResult, shellOut, error) {
-	if in.Action != "start" && in.Action != "stop" {
-		return nil, shellOut{}, fmt.Errorf("action must be start or stop, got %q", in.Action)
+func daemonControlTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in daemonControlIn) (*mcpsdk.CallToolResult, daemonControlOut, error) {
+	switch in.Action {
+	case "start":
+		pid, err := daemonctl.Start(ctx)
+		if err != nil {
+			return nil, daemonControlOut{}, err
+		}
+		return nil, daemonControlOut{Action: "start", PID: pid}, nil
+	case "stop":
+		if err := daemonctl.Stop(ctx); err != nil {
+			return nil, daemonControlOut{}, err
+		}
+		return nil, daemonControlOut{Action: "stop"}, nil
+	default:
+		return nil, daemonControlOut{}, fmt.Errorf("action must be start or stop, got %q", in.Action)
 	}
-	out, err := runTreeman(ctx, "", "daemon", in.Action)
-	return nil, out, err
+}
+
+// ─── config_set ───────────────────────────────────────────────────
+
+type configSetIn struct {
+	Repo  string `json:"repo,omitempty"`
+	Path  string `json:"path" jsonschema:"dotted path like 'daemon.gc_interval' or 'databases[0].engine'"`
+	Value any    `json:"value" jsonschema:"the value to set (scalar, array, or object). Pass null to clear."`
+}
+type configSetOut struct {
+	Path         string `json:"path"`
+	PreviousJSON string `json:"previous_json,omitempty"`
+	NewJSON      string `json:"new_json"`
+	Bytes        int    `json:"bytes"`
+}
+
+func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn) (*mcpsdk.CallToolResult, configSetOut, error) {
+	if in.Path == "" {
+		return nil, configSetOut{}, fmt.Errorf("path is required")
+	}
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, configSetOut{}, err
+	}
+	p := filepath.Join(repoRoot, ".treeman.yaml")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil, configSetOut{}, fmt.Errorf("read %s: %w", p, err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, configSetOut{}, fmt.Errorf("parse %s: %w", p, err)
+	}
+	segs, err := yamlpatch.ParsePath(in.Path)
+	if err != nil {
+		return nil, configSetOut{}, err
+	}
+	newNode, err := yamlpatch.ValueToNode(in.Value)
+	if err != nil {
+		return nil, configSetOut{}, fmt.Errorf("encode value: %w", err)
+	}
+	prev, err := yamlpatch.Set(&doc, segs, newNode)
+	if err != nil {
+		return nil, configSetOut{}, err
+	}
+	body, err := yamlpatch.Marshal(&doc)
+	if err != nil {
+		return nil, configSetOut{}, fmt.Errorf("encode yaml: %w", err)
+	}
+	var validated config.Config
+	if err := yaml.Unmarshal(body, &validated); err != nil {
+		return nil, configSetOut{}, fmt.Errorf("validation failed — patched file would not parse as config.Config: %w", err)
+	}
+	if err := atomicWrite(p, body); err != nil {
+		return nil, configSetOut{}, err
+	}
+	prevJSON := ""
+	if prev != nil {
+		var prevVal any
+		if err := prev.Decode(&prevVal); err == nil {
+			if b, err := json.Marshal(prevVal); err == nil {
+				prevJSON = string(b)
+			}
+		}
+	}
+	newJSON, _ := json.Marshal(in.Value)
+	writeMCPEvent(context.Background(), "config_set", "patched "+in.Path, 0, map[string]string{
+		"repo":     repoRoot,
+		"path":     in.Path,
+		"new_json": string(newJSON),
+	})
+	return nil, configSetOut{
+		Path:         in.Path,
+		PreviousJSON: prevJSON,
+		NewJSON:      string(newJSON),
+		Bytes:        len(body),
+	}, nil
 }
