@@ -392,6 +392,23 @@ func DaemonCmd() *cli.Command {
 }
 
 func daemonStart(ctx context.Context, c *cli.Command) error {
+	pid, err := startDaemonProcess(ctx)
+	if err != nil {
+		return err
+	}
+	if pid > 0 {
+		PrintOK("treemand started (pid %d)", pid)
+	}
+	return nil
+}
+
+// startDaemonProcess is daemonStart minus the user-facing PrintOK.
+// Returns the spawned PID when we forked the binary directly; zero
+// when handed off to systemd / launchd (no pid known at this level).
+// Used by `daemon start` AND by the auto-recover paths in wt
+// create / wt delete that call `ensureDaemon` before falling back to
+// a detached local finalize.
+func startDaemonProcess(ctx context.Context) (int, error) {
 	// Prefer the OS-native init when its unit is installed; else
 	// spawn the binary detached.
 	switch runtime.GOOS {
@@ -399,28 +416,28 @@ func daemonStart(ctx context.Context, c *cli.Command) error {
 		uid := os.Getuid()
 		domain := fmt.Sprintf("gui/%d", uid)
 		if err := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", domain+"/"+launchdLabel).Run(); err == nil {
-			return nil
+			return 0, nil
 		}
 	default:
 		if err := exec.CommandContext(ctx, "systemctl", "--user", "is-enabled", "treemand").Run(); err == nil {
-			return exec.CommandContext(ctx, "systemctl", "--user", "start", "treemand").Run()
+			return 0, exec.CommandContext(ctx, "systemctl", "--user", "start", "treemand").Run()
 		}
 	}
 
 	binPath, err := exec.LookPath("treemand")
 	if err != nil {
-		return fmt.Errorf("treemand not on PATH: %w", err)
+		return 0, fmt.Errorf("treemand not on PATH: %w", err)
 	}
 	cmd := exec.Command(binPath)
 	cmd.Stdin = nil
 	cmd.Stdout, _ = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
-		return err
+		return 0, err
 	}
+	pid := cmd.Process.Pid
 	_ = cmd.Process.Release()
-	PrintOK("treemand started (pid %d)", cmd.Process.Pid)
-	return nil
+	return pid, nil
 }
 
 func daemonStop(ctx context.Context, c *cli.Command) error {

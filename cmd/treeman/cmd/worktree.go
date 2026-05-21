@@ -218,48 +218,64 @@ func wtCreate() *cli.Command {
 			}
 
 			// Async via daemon when async_create is true (default).
+			// On daemon failure we no longer fall through to a blocking
+			// foreground tail: that used to leave the interactive shell
+			// hanging for minutes on composer install + dump load +
+			// migrate. Instead we (a) try to bring the daemon back up,
+			// (b) failing that, detach a setsid child running `treeman
+			// wt finalize --local <wt>` and return immediately.
 			asyncCreate := cfg.Worktrees.AsyncCreate == nil || *cfg.Worktrees.AsyncCreate
 			needsWork := len(cfg.Hooks.Postcreate) > 0 || (!c.Bool("skip-prepare") && len(cfg.Databases) > 0)
 			if asyncCreate && !c.Bool("foreground") && !c.Bool("skip-prepare") && needsWork {
-				resp, err := rpc.Call(ctx, rpc.Request{
-					Method: rpc.MethodWorktreeFinalize,
-					WorktreeFinalize: &rpc.WorktreeFinalizeArgs{
-						RepoPath:     repoRoot,
-						WorktreePath: wtPath,
-						InheritedEnv: env,
-					},
-				})
-				if err != nil {
-					PrintWarn("daemon RPC failed (%v); falling back to foreground", err)
-				} else if resp.Kind == rpc.KindWorktreeFinalizeQueued {
-					PrintOK("queued: postcreate + prepare detached to daemon — follow with `treeman logs tail -f`")
+				if queued := dispatchFinalize(ctx, repoRoot, wtPath, env); queued {
 					return nil
-				} else if resp.Kind == rpc.KindError {
-					PrintWarn("daemon: %s; falling back to foreground", resp.Message)
+				}
+				if logPath, err := detachLocalFinalize(wtPath, repoRoot); err == nil {
+					PrintOK("queued: postcreate + prepare detached (daemon unreachable — log: %s)", logPath)
+					return nil
+				} else {
+					PrintWarn("detach failed (%v); falling back to foreground", err)
 				}
 			}
 
-			// Foreground tail.
-			if len(cfg.Hooks.Postcreate) > 0 {
-				if _, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate, repoRoot, wtPath, sl.Value, env); err != nil {
-					return err
-				}
-				fmt.Printf("postcreate: %d group(s) spawned (logs in %s/.treeman-hooks/)\n",
-					len(cfg.Hooks.Postcreate), wtPath)
-			}
-			if !c.Bool("skip-prepare") && len(cfg.Databases) > 0 {
-				outs, err := prepare.Run(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, env)
-				if err != nil {
-					PrintWarn("prepare failed: %v", err)
-				}
-				for _, o := range outs {
-					fmt.Printf("prepare[%s] %s template=%s clones=%d\n",
-						o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
-				}
-			}
-			return nil
+			// Foreground tail (--foreground was set, or detach failed).
+			return runLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, env, c.Bool("skip-prepare"))
 		},
 	}
+}
+
+// dispatchFinalize attempts to hand postcreate + prepare to the
+// daemon. Returns true when the daemon successfully queued the work.
+// On the first RPC error this also tries `ensureDaemon` and retries
+// once, so a daemon that's merely been signalled-but-not-yet-up gets
+// a chance to come back before we resort to detaching a child.
+func dispatchFinalize(ctx context.Context, repoRoot, wtPath string, env map[string]string) bool {
+	req := rpc.Request{
+		Method: rpc.MethodWorktreeFinalize,
+		WorktreeFinalize: &rpc.WorktreeFinalizeArgs{
+			RepoPath:     repoRoot,
+			WorktreePath: wtPath,
+			InheritedEnv: env,
+		},
+	}
+	if resp, err := rpc.Call(ctx, req); err == nil {
+		if resp.Kind == rpc.KindWorktreeFinalizeQueued {
+			PrintOK("queued: postcreate + prepare detached to daemon — follow with `treeman logs tail -f`")
+			return true
+		}
+		if resp.Kind == rpc.KindError {
+			PrintWarn("daemon: %s", resp.Message)
+		}
+	} else {
+		PrintWarn("daemon RPC failed (%v); trying daemon restart", err)
+		if startErr := ensureDaemon(ctx); startErr == nil {
+			if resp, err := rpc.Call(ctx, req); err == nil && resp.Kind == rpc.KindWorktreeFinalizeQueued {
+				PrintOK("queued: postcreate + prepare detached to daemon (auto-restarted)")
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func wtDelete() *cli.Command {
@@ -315,24 +331,23 @@ func wtDelete() *cli.Command {
 			}
 			env := CaptureInheritedEnv()
 
+			// On daemon failure we don't run teardown synchronously
+			// any more — DROP DATABASE × N + git worktree remove on a
+			// Laravel-sized vendor/ can take 10+ seconds. Try the
+			// daemon, attempt auto-restart on failure, and if that
+			// still misses, detach a setsid child running the same
+			// `--foreground` codepath so the user's shell returns
+			// immediately.
 			asyncDelete := cfg.Worktrees.AsyncDelete == nil || *cfg.Worktrees.AsyncDelete
 			if asyncDelete && !c.Bool("foreground") {
-				resp, err := rpc.Call(ctx, rpc.Request{
-					Method: rpc.MethodWorktreeTeardown,
-					WorktreeTeardown: &rpc.WorktreeTeardownArgs{
-						RepoPath:     repoRoot,
-						WorktreePath: wtPath,
-						Force:        c.Bool("force"),
-						InheritedEnv: env,
-					},
-				})
-				if err != nil {
-					PrintWarn("daemon RPC failed (%v); falling back to foreground", err)
-				} else if resp.Kind == rpc.KindWorktreeTeardownQueued {
-					PrintOK("queued: predelete + DB teardown + git remove detached to daemon — follow with `treeman logs tail -f`")
+				if queued := dispatchTeardown(ctx, repoRoot, wtPath, c.Bool("force"), env); queued {
 					return nil
-				} else if resp.Kind == rpc.KindError {
-					PrintWarn("daemon: %s; falling back to foreground", resp.Message)
+				}
+				if logPath, err := detachLocalDelete(wtPath, repoRoot, c.Bool("force")); err == nil {
+					PrintOK("queued: predelete + DB teardown + git remove detached (daemon unreachable — log: %s)", logPath)
+					return nil
+				} else {
+					PrintWarn("detach failed (%v); falling back to foreground", err)
 				}
 			}
 
@@ -472,8 +487,11 @@ func wtList() *cli.Command {
 func wtFinalize() *cli.Command {
 	return &cli.Command{
 		Name:  "finalize",
-		Usage: "ask the daemon to rerun postcreate + prepare for a worktree",
-		Flags: []cli.Flag{&cli.StringFlag{Name: "repo"}},
+		Usage: "rerun postcreate + prepare for a worktree (default via daemon; --local runs inline)",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo"},
+			&cli.BoolFlag{Name: "local", Usage: "run postcreate + prepare in this process instead of dispatching to the daemon"},
+		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			path := "."
 			if c.NArg() >= 1 {
@@ -487,6 +505,28 @@ func wtFinalize() *cli.Command {
 					return err
 				}
 			}
+
+			if c.Bool("local") {
+				// Used by the wt-create fallback path's detached child.
+				// Loads its own resolved config + opens its own store
+				// handle since the parent has already exited by the
+				// time this runs.
+				cfg, err := resolve.LoadResolved(repoRoot)
+				if err != nil {
+					return err
+				}
+				dbPath, _ := store.DefaultDBPath()
+				st, err := store.Open(ctx, dbPath)
+				if err != nil {
+					return err
+				}
+				defer st.Close()
+				sl := slug.For(wtPath, "")
+				repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+				wtID, _ := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, "")
+				return runLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, CaptureInheritedEnv(), false)
+			}
+
 			resp, err := rpc.Call(ctx, rpc.Request{
 				Method: rpc.MethodWorktreeFinalize,
 				WorktreeFinalize: &rpc.WorktreeFinalizeArgs{
@@ -505,6 +545,74 @@ func wtFinalize() *cli.Command {
 			return nil
 		},
 	}
+}
+
+// dispatchTeardown is the wt-delete twin of dispatchFinalize: tries
+// the daemon, retries once after ensureDaemon on RPC failure, and
+// returns true when the daemon successfully queued the teardown.
+func dispatchTeardown(ctx context.Context, repoRoot, wtPath string, force bool, env map[string]string) bool {
+	req := rpc.Request{
+		Method: rpc.MethodWorktreeTeardown,
+		WorktreeTeardown: &rpc.WorktreeTeardownArgs{
+			RepoPath:     repoRoot,
+			WorktreePath: wtPath,
+			Force:        force,
+			InheritedEnv: env,
+		},
+	}
+	if resp, err := rpc.Call(ctx, req); err == nil {
+		if resp.Kind == rpc.KindWorktreeTeardownQueued {
+			PrintOK("queued: predelete + DB teardown + git remove detached to daemon — follow with `treeman logs tail -f`")
+			return true
+		}
+		if resp.Kind == rpc.KindError {
+			PrintWarn("daemon: %s", resp.Message)
+		}
+	} else {
+		PrintWarn("daemon RPC failed (%v); trying daemon restart", err)
+		if startErr := ensureDaemon(ctx); startErr == nil {
+			if resp, err := rpc.Call(ctx, req); err == nil && resp.Kind == rpc.KindWorktreeTeardownQueued {
+				PrintOK("queued: predelete + DB teardown + git remove detached to daemon (auto-restarted)")
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// runLocalFinalize executes the postcreate + prepare tail in the
+// current process. Shared by wt create's last-resort foreground
+// fallback and by `wt finalize --local` (the subcommand the detach
+// helper spawns when the daemon is unreachable).
+func runLocalFinalize(
+	ctx context.Context,
+	cfg *config.Config,
+	repoRoot, wtPath string,
+	sl slug.Slug,
+	st *store.Store,
+	repoID, wtID int64,
+	env map[string]string,
+	skipPrepare bool,
+) error {
+	if len(cfg.Hooks.Postcreate) > 0 {
+		if _, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate, repoRoot, wtPath, sl.Value, env); err != nil {
+			return err
+		}
+		fmt.Printf("postcreate: %d group(s) spawned (logs in %s/.treeman-hooks/)\n",
+			len(cfg.Hooks.Postcreate), wtPath)
+	}
+	if skipPrepare || len(cfg.Databases) == 0 {
+		return nil
+	}
+	outs, err := prepare.Run(ctx, cfg, repoRoot, wtPath, sl, st, repoID, wtID, env)
+	if err != nil {
+		PrintWarn("prepare failed: %v", err)
+	}
+	for _, o := range outs {
+		fmt.Printf("prepare[%s] %s template=%s clones=%d\n",
+			o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
+	}
+	return nil
 }
 
 // resolveRepo returns the explicit `--repo` if set, else discovers
