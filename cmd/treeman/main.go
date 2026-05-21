@@ -16,9 +16,10 @@ import (
 
 func main() {
 	app := &cli.Command{
-		Name:    "treeman",
-		Usage:   "per-worktree DB orchestrator",
-		Version: version.Version,
+		Name:                  "treeman",
+		Usage:                 "per-worktree DB orchestrator",
+		Version:               version.Version,
+		EnableShellCompletion: true,
 		Commands: []*cli.Command{
 			cmd.WorktreeCmd(),
 			cmd.PrepareCmd(),

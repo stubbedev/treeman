@@ -173,6 +173,20 @@ wt list              # passthrough to `treeman wt list`
 | `treeman config {validate,show [--resolved]}` | Config helpers |
 | `treeman schema {dump,install}` | JSON Schema for `.treeman.yaml` |
 | `treeman fw detect` | List detected migration + test frameworks |
+| `treeman completion {bash,zsh,fish,pwsh}` | Print shell completion script |
+
+Source the completion script from your shell rc:
+
+```sh
+# bash (~/.bashrc)
+source <(treeman completion bash)
+
+# zsh (~/.zshrc)
+source <(treeman completion zsh)
+
+# fish (~/.config/fish/completions/treeman.fish)
+treeman completion fish > ~/.config/fish/completions/treeman.fish
+```
 
 `treeman <cmd> --help` for full flag listings.
 
