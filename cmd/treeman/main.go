@@ -34,6 +34,7 @@ func main() {
 			cmd.SlugCmd(),
 			cmd.InitCmd(),
 			cmd.DoctorCmd(),
+			cmd.MCPCmd(),
 		},
 	}
 	if err := app.Run(context.Background(), os.Args); err != nil {

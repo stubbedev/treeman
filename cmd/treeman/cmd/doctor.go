@@ -38,22 +38,7 @@ func DoctorCmd() *cli.Command {
 			&cli.BoolFlag{Name: "json", Usage: "emit one JSON line per check"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			repoRoot, _ := resolveRepo("")
-			results := []doctorResult{}
-
-			results = append(results, checkDaemon(ctx))
-			if repoRoot != "" {
-				results = append(results, checkConfig(repoRoot))
-				results = append(results, checkSchema(repoRoot))
-				results = append(results, checkFrameworks(repoRoot))
-				results = append(results, checkRegistry(ctx, repoRoot))
-			} else {
-				results = append(results, doctorResult{
-					Name:   "repo",
-					Status: "skip",
-					Detail: "not inside a git repo — repo-scoped checks skipped",
-				})
-			}
+			results := RunDoctorChecks(ctx)
 
 			if c.Bool("json") {
 				return jsonStream(results)
@@ -94,6 +79,31 @@ type doctorResult struct {
 	Status string `json:"status"`
 	Detail string `json:"detail"`
 	Hint   string `json:"hint,omitempty"`
+}
+
+// DoctorResult mirrors the internal doctorResult for callers outside
+// the cmd package (e.g. the MCP server).
+type DoctorResult = doctorResult
+
+// RunDoctorChecks executes all health probes and returns the result
+// slice. Shared by the CLI renderer and the MCP `doctor_run` tool.
+func RunDoctorChecks(ctx context.Context) []DoctorResult {
+	repoRoot, _ := resolveRepo("")
+	results := []doctorResult{}
+	results = append(results, checkDaemon(ctx))
+	if repoRoot != "" {
+		results = append(results, checkConfig(repoRoot))
+		results = append(results, checkSchema(repoRoot))
+		results = append(results, checkFrameworks(repoRoot))
+		results = append(results, checkRegistry(ctx, repoRoot))
+	} else {
+		results = append(results, doctorResult{
+			Name:   "repo",
+			Status: "skip",
+			Detail: "not inside a git repo — repo-scoped checks skipped",
+		})
+	}
+	return results
 }
 
 func checkDaemon(ctx context.Context) doctorResult {

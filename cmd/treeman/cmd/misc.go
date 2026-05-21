@@ -34,38 +34,15 @@ func PrepareCmd() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+			&cli.BoolFlag{Name: "json"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			wt := c.String("worktree")
-			if wt == "" {
-				cwd, _ := os.Getwd()
-				wt = cwd
-			}
-			wt = MustAbs(wt)
-			repoRoot, err := resolveRepo(c.String("repo"))
-			if err != nil {
-				repoRoot, err = DiscoverRepoRoot(wt)
-				if err != nil {
-					return err
-				}
-			}
-			cfg, err := resolve.LoadResolved(repoRoot)
+			outs, err := RunPrepareOnWorktree(ctx, c.String("worktree"), c.String("repo"))
 			if err != nil {
 				return err
 			}
-			branch := detectBranchOfWorktree(wt)
-			sl := slug.For(wt, branch)
-			dbPath, _ := store.DefaultDBPath()
-			st, err := store.Open(ctx, dbPath)
-			if err != nil {
-				return err
-			}
-			defer st.Close()
-			repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			wtID, _ := st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
-			outs, err := prepare.Run(ctx, &cfg, wt, sl, st, repoID, wtID, CaptureInheritedEnv())
-			if err != nil {
-				return err
+			if c.Bool("json") {
+				return jsonStream(map[string]any{"outcomes": outs})
 			}
 			for _, o := range outs {
 				fmt.Printf("[%s] %s template=%s clones=%d\n", o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
@@ -73,6 +50,42 @@ func PrepareCmd() *cli.Command {
 			return nil
 		},
 	}
+}
+
+// RunPrepareOnWorktree is the shared core for `treeman prepare` and
+// the MCP `prepare_run` tool. Discovers the worktree + repo root,
+// loads resolved config, opens the SQLite store, and dispatches
+// prepare.Run. Returns the per-engine outcomes so callers can render
+// them however they like.
+func RunPrepareOnWorktree(ctx context.Context, worktree, repoOverride string) ([]prepare.Outcome, error) {
+	wt := worktree
+	if wt == "" {
+		cwd, _ := os.Getwd()
+		wt = cwd
+	}
+	wt = MustAbs(wt)
+	repoRoot, err := resolveRepo(repoOverride)
+	if err != nil {
+		repoRoot, err = DiscoverRepoRoot(wt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	branch := detectBranchOfWorktree(wt)
+	sl := slug.For(wt, branch)
+	dbPath, _ := store.DefaultDBPath()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	wtID, _ := st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
+	return prepare.Run(ctx, &cfg, wt, sl, st, repoID, wtID, CaptureInheritedEnv())
 }
 
 // HookCmd — `treeman hook run <phase>` runs the configured hooks
@@ -84,65 +97,70 @@ func HookCmd() *cli.Command {
 		Commands: []*cli.Command{{
 			Name:  "run",
 			Usage: "run a hook phase using the cwd's repo config",
-			Flags: []cli.Flag{&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}}},
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}},
+				&cli.BoolFlag{Name: "json"},
+			},
 			Action: func(ctx context.Context, c *cli.Command) error {
 				if c.NArg() < 1 {
 					return fmt.Errorf("usage: treeman hook run <precreate|postcreate|predelete|postdelete>")
 				}
 				phase := c.Args().First()
-				wt := c.String("worktree")
-				if wt == "" {
-					cwd, _ := os.Getwd()
-					wt = cwd
-				}
-				wt = MustAbs(wt)
-				repoRoot, err := DiscoverRepoRoot(wt)
+				out, err := RunHookPhase(ctx, phase, c.String("worktree"))
 				if err != nil {
 					return err
 				}
-				cfg, err := resolve.LoadResolved(repoRoot)
-				if err != nil {
-					return err
+				if c.Bool("json") {
+					return jsonStream(map[string]any{
+						"phase":   phase,
+						"outcome": out,
+					})
 				}
-				branch := detectBranchOfWorktree(wt)
-				sl := slug.For(wt, branch)
-				env := CaptureInheritedEnv()
 				switch phase {
 				case "precreate":
-					out, err := hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wt, sl.Value, env)
-					if err != nil {
-						return err
-					}
 					fmt.Printf("precreate: exit=%d (%d steps)\n", out.AggregateExitCode, len(out.Groups))
-				case "postcreate":
-					// `treeman hook run <phase>` blocks on completion
-					// so the operator sees the real status, not a
-					// "spawned" message that fires before the work
-					// has happened.
-					_, err := hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
-					if err != nil {
-						return err
-					}
-					fmt.Printf("%s: %d group(s) complete\n", phase, len(cfg.Hooks.Postcreate))
-				case "predelete":
-					_, err := hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
-					if err != nil {
-						return err
-					}
-					fmt.Printf("%s: %d group(s) complete\n", phase, len(cfg.Hooks.Predelete))
-				case "postdelete":
-					_, err := hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
-					if err != nil {
-						return err
-					}
-					fmt.Printf("%s: %d group(s) complete\n", phase, len(cfg.Hooks.Postdelete))
 				default:
-					return fmt.Errorf("unknown phase: %s", phase)
+					fmt.Printf("%s: %d group(s) complete\n", phase, len(out.Groups))
 				}
 				return nil
 			},
 		}},
 	}
+}
+
+// RunHookPhase is the shared core for `treeman hook run <phase>`
+// and the MCP `hook_run` tool. Resolves cfg, runs the phase
+// synchronously, and returns the hooks.RunOutcome so callers can
+// inspect group exit codes / tails.
+func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome, error) {
+	wt := worktree
+	if wt == "" {
+		cwd, _ := os.Getwd()
+		wt = cwd
+	}
+	wt = MustAbs(wt)
+	repoRoot, err := DiscoverRepoRoot(wt)
+	if err != nil {
+		return hooks.RunOutcome{}, err
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return hooks.RunOutcome{}, err
+	}
+	branch := detectBranchOfWorktree(wt)
+	sl := slug.For(wt, branch)
+	env := CaptureInheritedEnv()
+	switch phase {
+	case "precreate":
+		return hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wt, sl.Value, env)
+	case "postcreate":
+		return hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
+	case "predelete":
+		return hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
+	case "postdelete":
+		return hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
+	}
+	return hooks.RunOutcome{}, fmt.Errorf("unknown phase: %s", phase)
 }
 
 // padRight pads a possibly-ANSI-colored cell with trailing spaces.
@@ -183,14 +201,28 @@ func ConfigCmd() *cli.Command {
 			{
 				Name:  "validate",
 				Usage: "validate the config loads without error",
+				Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					repoRoot, err := resolveRepo("")
 					if err != nil {
+						if c.Bool("json") {
+							return jsonStream(map[string]any{"ok": false, "error": err.Error()})
+						}
 						return err
 					}
 					cfg, err := resolve.LoadResolved(repoRoot)
 					if err != nil {
+						if c.Bool("json") {
+							return jsonStream(map[string]any{"ok": false, "repo": repoRoot, "error": err.Error()})
+						}
 						return err
+					}
+					if c.Bool("json") {
+						return jsonStream(map[string]any{
+							"ok":        true,
+							"repo":      repoRoot,
+							"databases": len(cfg.Databases),
+						})
 					}
 					PrintOK("config loaded (%d databases configured)", len(cfg.Databases))
 					return nil
@@ -202,6 +234,7 @@ func ConfigCmd() *cli.Command {
 				Flags: []cli.Flag{
 					&cli.BoolFlag{Name: "resolved"},
 					&cli.BoolFlag{Name: "no-pager", Usage: "disable the pager even when stdout is a TTY"},
+					&cli.BoolFlag{Name: "json"},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					repoRoot, err := resolveRepo("")
@@ -211,6 +244,13 @@ func ConfigCmd() *cli.Command {
 					cfg, err := resolve.LoadResolved(repoRoot)
 					if err != nil {
 						return err
+					}
+					if c.Bool("json") {
+						out := map[string]any{"repo": repoRoot, "config": cfg}
+						if c.Bool("resolved") {
+							out["resolved"] = resolve.Resolve(&cfg, repoRoot)
+						}
+						return jsonStream(out)
 					}
 					pager := newPagerIfEligible(c, false, false)
 					if pager != nil {
@@ -675,17 +715,23 @@ func SlugCmd() *cli.Command {
 // Detection is best-effort: emit what we can, comment what we can't.
 func InitCmd() *cli.Command {
 	return &cli.Command{
-		Name:  "init",
-		Flags: []cli.Flag{&cli.BoolFlag{Name: "force"}},
+		Name: "init",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "force"},
+			&cli.BoolFlag{Name: "json"},
+		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			cwd, _ := os.Getwd()
-			target := filepath.Join(cwd, ".treeman.yaml")
-			if _, err := os.Stat(target); err == nil && !c.Bool("force") {
-				return fmt.Errorf("%s already exists (pass --force to overwrite)", target)
-			}
-			body := renderInitTemplate(cwd)
-			if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+			target, created, body, err := InitTreemanYAML(cwd, c.Bool("force"))
+			if err != nil {
 				return err
+			}
+			if c.Bool("json") {
+				return jsonStream(map[string]any{
+					"path":    target,
+					"created": created,
+					"bytes":   len(body),
+				})
 			}
 			PrintOK("wrote %s", target)
 			PrintHint("review the generated databases:/hooks: blocks before first create")
@@ -695,6 +741,24 @@ func InitCmd() *cli.Command {
 			return nil
 		},
 	}
+}
+
+// InitTreemanYAML scaffolds a `.treeman.yaml` under cwd. Returns the
+// absolute target path, whether a new file was created (false when
+// the file already existed and force was true), and the body bytes.
+// Shared by the CLI and the MCP `init_repo` tool.
+func InitTreemanYAML(cwd string, force bool) (path string, created bool, body string, err error) {
+	target := filepath.Join(cwd, ".treeman.yaml")
+	_, statErr := os.Stat(target)
+	exists := statErr == nil
+	if exists && !force {
+		return target, false, "", fmt.Errorf("%s already exists (pass force to overwrite)", target)
+	}
+	body = renderInitTemplate(cwd)
+	if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+		return target, false, "", err
+	}
+	return target, !exists, body, nil
 }
 
 // renderInitTemplate inspects `cwd` and emits a fully-declarative
