@@ -104,15 +104,18 @@ sync-flake version="":
         sed -i -E 's|^(\s*vendorHash = )"sha256-[^"]*";|\1"'"$SENTINEL"'";|' flake.nix
         set +e
         OUT=$(nix build .#treeman --no-link 2>&1)
+        BUILD_STATUS=$?
         set -e
         NEW_HASH=$(printf '%s\n' "$OUT" | awk '/got:[[:space:]]*sha256-/ {print $2; exit}')
         if [ -z "$NEW_HASH" ]; then
-            NEW_HASH="$SENTINEL"
-            if ! printf '%s\n' "$OUT" | grep -q "hash mismatch\|all checks passed\|/nix/store/"; then
+            if [ "$BUILD_STATUS" = "0" ]; then
+                echo "sync-flake: unexpected nix build success with sentinel hash" >&2
                 echo "$OUT" >&2
-                echo "sync-flake: nix build failed with no hash to capture" >&2
                 exit 1
             fi
+            echo "$OUT" >&2
+            echo "sync-flake: nix build failed without printing 'got: sha256-…'" >&2
+            exit 1
         fi
         sed -i -E 's|^(\s*vendorHash = )"sha256-[^"]*";|\1"'"$NEW_HASH"'";|' flake.nix
         if grep -q '^[[:space:]]*# go-sum:' flake.nix; then
@@ -121,6 +124,15 @@ sync-flake version="":
             sed -i -E 's|^(\s*vendorHash = )|          # go-sum: '"$GO_SUM_HASH"'\n\1|' flake.nix
         fi
         echo "sync-flake: vendorHash=$NEW_HASH go-sum=$GO_SUM_HASH"
+    fi
+
+    # Hard guard: refuse to leave the sentinel in flake.nix. If we
+    # somehow get here with it still present, the working tree is
+    # broken and CI will fail on hash mismatch — fail loudly here so
+    # the dev catches it before push.
+    if grep -q '^\s*vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="' flake.nix; then
+        echo "sync-flake: refusing to leave sentinel vendorHash in flake.nix" >&2
+        exit 1
     fi
 
     if [ "$NEED_VERSION" = "1" ]; then
