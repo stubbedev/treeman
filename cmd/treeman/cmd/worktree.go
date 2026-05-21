@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/urfave/cli/v3"
 
@@ -104,20 +105,43 @@ func wtCreate() *cli.Command {
 			wtPath = MustAbs(wtPath)
 
 			// worktrees.links — symlinks from main into the new
-			// worktree.
+			// worktree. Entries containing glob meta-characters
+			// (`*`, `?`, `[`) expand against repoRoot via
+			// filepath.Glob — `.env.*.local` should pick up
+			// `.env.dev.local`, `.env.staging.local`, etc. without
+			// the user having to enumerate each. Glob entries that
+			// match nothing are silent (typical for optional dev
+			// overrides); literal entries that miss still warn.
 			for _, rel := range cfg.Worktrees.Links {
-				src := filepath.Join(repoRoot, rel)
-				dst := filepath.Join(wtPath, rel)
-				if _, err := os.Stat(src); err != nil {
-					PrintWarn("link source missing, skipping: %s", src)
+				var matches []string
+				if strings.ContainsAny(rel, "*?[") {
+					m, _ := filepath.Glob(filepath.Join(repoRoot, rel))
+					matches = m
+				} else {
+					matches = []string{filepath.Join(repoRoot, rel)}
+				}
+				if len(matches) == 0 {
 					continue
 				}
-				if _, err := os.Stat(dst); err == nil {
-					continue
-				}
-				_ = os.MkdirAll(filepath.Dir(dst), 0o755)
-				if err := os.Symlink(src, dst); err != nil {
-					return fmt.Errorf("symlink %s → %s: %w", dst, src, err)
+				for _, src := range matches {
+					if _, err := os.Stat(src); err != nil {
+						if !strings.ContainsAny(rel, "*?[") {
+							PrintWarn("link source missing, skipping: %s", src)
+						}
+						continue
+					}
+					relToRepo, err := filepath.Rel(repoRoot, src)
+					if err != nil {
+						relToRepo = filepath.Base(src)
+					}
+					dst := filepath.Join(wtPath, relToRepo)
+					if _, err := os.Stat(dst); err == nil {
+						continue
+					}
+					_ = os.MkdirAll(filepath.Dir(dst), 0o755)
+					if err := os.Symlink(src, dst); err != nil {
+						return fmt.Errorf("symlink %s → %s: %w", dst, src, err)
+					}
 				}
 			}
 
