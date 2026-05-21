@@ -21,6 +21,7 @@ type SnapshotRecord struct {
 	CreatedAt      int64
 	LastUsedAt     int64
 	UseCount       int64
+	RepoID         int64
 }
 
 // LookupSnapshot returns the snapshot row for `fingerprint`, or
@@ -60,12 +61,16 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	if r.LastUsedAt == 0 {
 		r.LastUsedAt = now
 	}
+	var repoID interface{}
+	if r.RepoID > 0 {
+		repoID = r.RepoID
+	}
 	_, err := s.DB.ExecContext(ctx, `
 		INSERT INTO snapshots(fingerprint, engine, engine_version, source_db,
 		                      template_name, migrations_hash, dump_hash,
 		                      lockfile_hashes_json, size_bytes, created_at,
-		                      last_used_at, use_count)
-		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, NULLIF(?,0), ?, ?, ?)
+		                      last_used_at, use_count, repo_id)
+		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, NULLIF(?,0), ?, ?, ?, ?)
 		ON CONFLICT(fingerprint) DO UPDATE SET
 		    template_name        = excluded.template_name,
 		    engine_version       = excluded.engine_version,
@@ -74,11 +79,54 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 		    dump_hash            = excluded.dump_hash,
 		    lockfile_hashes_json = excluded.lockfile_hashes_json,
 		    size_bytes           = excluded.size_bytes,
-		    last_used_at         = excluded.last_used_at`,
+		    last_used_at         = excluded.last_used_at,
+		    repo_id              = excluded.repo_id`,
 		r.Fingerprint, r.Engine, r.EngineVersion, r.SourceDB,
 		r.TemplateName, r.MigrationsHash, r.DumpHash, string(lockJSON),
-		r.SizeBytes, r.CreatedAt, r.LastUsedAt, r.UseCount)
+		r.SizeBytes, r.CreatedAt, r.LastUsedAt, r.UseCount, repoID)
 	return err
+}
+
+// SnapshotEvictionCandidate is the slim view returned by
+// `ListLRUEvictable`: just the fields the GC needs to drop the
+// template DB + the row.
+type SnapshotEvictionCandidate struct {
+	Fingerprint  string
+	Engine       string
+	TemplateName string
+	SourceDB     string
+}
+
+// ListLRUEvictable returns the snapshots above `cap` for a given
+// repo, ordered by LRU (`last_used_at` ascending). Used by the
+// inline GC fired after a fresh RecordSnapshot.
+//
+// `cap == 0` is treated as "no cap" and returns an empty slice
+// (defense against a misconfigured config that would otherwise wipe
+// every cached template).
+func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, cap uint32) ([]SnapshotEvictionCandidate, error) {
+	if cap == 0 || repoID == 0 {
+		return nil, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT fingerprint, engine, template_name, source_db
+		FROM snapshots
+		WHERE repo_id = ?
+		ORDER BY last_used_at DESC
+		LIMIT -1 OFFSET ?`, repoID, cap)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SnapshotEvictionCandidate
+	for rows.Next() {
+		var c SnapshotEvictionCandidate
+		if err := rows.Scan(&c.Fingerprint, &c.Engine, &c.TemplateName, &c.SourceDB); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // TouchSnapshot bumps `last_used_at` + `use_count` on a cache hit.

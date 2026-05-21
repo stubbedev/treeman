@@ -93,7 +93,17 @@ type SnapshotsConfig struct {
 }
 
 // RetentionConfig — `snapshots.retention:` policies.
+//
+// `CapPerRepo` is the hard cap that triggers eviction on every
+// `RecordSnapshot`. LRU rows above the cap are dropped immediately
+// (in a background goroutine) so a busy worktree workflow never
+// accumulates unbounded cached templates per repo.
+//
+// `KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`
+// drive the periodic daemon-side sweep; they're not consulted by
+// the inline-on-write eviction path.
 type RetentionConfig struct {
+	CapPerRepo        uint32 `yaml:"cap_per_repo,omitempty"`
 	KeepPerSource     uint32 `yaml:"keep_per_source,omitempty"`
 	MaxAgeDays        uint32 `yaml:"max_age_days,omitempty"`
 	MaxTotalGb        uint32 `yaml:"max_total_gb,omitempty"`
@@ -277,6 +287,28 @@ type Namespaces struct {
 type WatcherConfig struct {
 	Paths      []WatcherPath `yaml:"paths,omitempty"`
 	DebounceMs uint64        `yaml:"debounce_ms,omitempty"`
+	Binlog     BinlogConfig  `yaml:"binlog,omitempty"`
+}
+
+// BinlogConfig — `watcher.binlog:` block. Controls the MySQL
+// binary-log tailer that replays DDL + DML events from the source
+// database onto cached template + paratest clone databases. Off by
+// default; enabling requires a server configured with
+// `binlog_format=ROW` and a replication-privileged user.
+type BinlogConfig struct {
+	Enabled bool `yaml:"enabled,omitempty"`
+	// ServerID treeman registers as a fake replica. Must be unique
+	// among all replicas the upstream server sees. Defaults to a
+	// deterministic hash of the daemon's socket path so two
+	// developers on the same host don't clash.
+	ServerID uint32 `yaml:"server_id,omitempty"`
+	// Flavor — "mysql" (default) or "mariadb".
+	Flavor string `yaml:"flavor,omitempty"`
+	// ApplyDDL toggles execution of DDL Query events. Default true.
+	ApplyDDL *bool `yaml:"apply_ddl,omitempty"`
+	// ApplyDML toggles execution of ROW events. Default false (DDL
+	// replay is the high-value path; DML is a follow-up).
+	ApplyDML *bool `yaml:"apply_dml,omitempty"`
 }
 
 // WatcherPath — one `paths:` entry.
@@ -390,6 +422,9 @@ func applyDefaults(cfg *Config) {
 		t := true
 		cfg.EnvScoping.SkipWorktree = &t
 	}
+	if cfg.Snapshots.Retention.CapPerRepo == 0 {
+		cfg.Snapshots.Retention.CapPerRepo = 8
+	}
 	if cfg.Snapshots.Retention.KeepPerSource == 0 {
 		cfg.Snapshots.Retention.KeepPerSource = 500
 	}
@@ -404,6 +439,29 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Watcher.DebounceMs == 0 {
 		cfg.Watcher.DebounceMs = 500
+	}
+	if cfg.Watcher.Binlog.Flavor == "" {
+		cfg.Watcher.Binlog.Flavor = "mysql"
+	}
+	if cfg.Watcher.Binlog.ApplyDDL == nil {
+		t := true
+		cfg.Watcher.Binlog.ApplyDDL = &t
+	}
+	if cfg.Watcher.Binlog.ApplyDML == nil {
+		f := false
+		cfg.Watcher.Binlog.ApplyDML = &f
+	}
+	if cfg.Watcher.Binlog.ServerID == 0 {
+		// Stable per host: hash the daemon's effective socket path
+		// (XDG_RUNTIME_DIR is per-user, so two users on one host get
+		// distinct IDs). Values are kept in the 1k–1M range to leave
+		// room for explicitly-numbered production replicas.
+		var h uint32 = 2166136261
+		for _, b := range []byte(os.Getenv("XDG_RUNTIME_DIR") + os.Getenv("USER")) {
+			h ^= uint32(b)
+			h *= 16777619
+		}
+		cfg.Watcher.Binlog.ServerID = 1000 + (h % 999000)
 	}
 }
 

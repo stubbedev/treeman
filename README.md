@@ -1,76 +1,141 @@
 # treeman
 
-**Per-worktree DB orchestrator with file watcher.** Spin up scoped
-test databases per git worktree, tear them down on delete, keep them
-in sync as migrations change.
+**Per-worktree development environment helper.** Spin up scoped
+databases, search indices, and test artefacts per git worktree;
+tear them down on delete; keep them in sync as your migrations or
+fixtures change. Works across migration frameworks, test
+frameworks, and language stacks — pick a `.treeman.yaml`, run
+`treeman wt create branch-name`, get an isolated checkout with a
+ready-to-test database stamped to that worktree.
 
 Pure wire-protocol DB access (Go `database/sql` for MySQL +
-PostgreSQL, the official mongo / redis / Elasticsearch SDKs); no
-shelling out to `mysql` / `psql` / `mongosh` / `redis-cli` /
-`docker exec`. Single global daemon, thin CLI client, SQLite-backed
-event log.
-
-> **v1.0+ is a complete Go rewrite** of the previous Rust workspace.
-> See `pre-go-rewrite` tag for the last Rust commit. Drop-in: same
-> YAML schema, same SQLite schema, same JSON-line RPC socket
-> protocol — existing `~/.local/share/treeman/treeman.db` and
-> `.treeman.yaml` files keep working.
+PostgreSQL, the official Mongo / Redis / Elasticsearch SDKs); no
+shelling out to `mysql` / `psql` / `mongosh` / `redis-cli`.
+Single user-mode daemon, thin CLI client, SQLite-backed event log.
 
 ---
 
-## Why
+## Why treeman
 
-The Rust implementation hit recurring tooling friction (cargo + nix +
-clang + mold + sccache, slow `hm switch` cycle on every bug fix) and
-two protocol bugs that didn't show up until kontainer-scale usage
-(MySQL prepared-statement 1295 on `USE`/`SHOW CREATE`, watcher
-dispatch handing the worktree path instead of the main repo root to
-prepare). The Go port fixes both by construction: `database/sql`
-defaults to MySQL's text protocol, and `prepare.Run` takes
-`mainRepoRoot` + `worktreePath` as distinct arguments.
+Git worktrees give every branch its own checkout — but the
+checkout alone isn't enough. A real working tree needs:
+
+- a database scoped to that worktree (`myapp_testing_proj_123`)
+  so tests don't trample each other
+- `N` paratest clones of that database fanning out from a single
+  cached template (`CREATE DATABASE … TEMPLATE` on Postgres,
+  `INSERT … SELECT` on MySQL)
+- the framework's migrations applied
+- `.env` / `phpunit.xml` patched to point at the per-worktree DB
+- post-create install hooks (composer / yarn / pnpm / go mod /
+  cargo / bundler …) running in parallel
+- pre-delete teardown that drops the DBs + Redis index + ES
+  prefix when you're done with the branch
+
+treeman owns that lifecycle so the prompts you type stay
+`treeman wt create FOO` / `treeman wt delete FOO`, while a small
+SQLite event log records every step in a queryable way.
+
+## Features
+
+- **Per-worktree DBs** for MySQL/MariaDB/TiDB, PostgreSQL, MongoDB,
+  Redis (DB-index scoping), Elasticsearch / OpenSearch
+- **Snapshot cache** with LRU eviction — repeated `wt create` for
+  the same migrations + dump hits a cached template database and
+  skips the cold rebuild
+- **Hook groups** — declarative DAG of postcreate / predelete
+  commands. Inside a group: sequence. Across groups: parallel.
+  Drivers run detached via `setsid` so the CLI returns instantly.
+- **Migration framework detection** for Laravel, Rails, Django,
+  Flyway, sqlx-cli, diesel, golang-migrate, goose, dbmate, Knex,
+  Drizzle, Prisma, TypeORM, mikro-orm
+- **Test framework detection** for paratest, pest, pytest-xdist,
+  Jest, vitest, Go `-p`, Cargo nextest
+- **File watcher** (fsnotify + MySQL binlog tail) for live
+  rebuild-or-delta updates as migrations or seed dumps change
+- **`wt switch` / `wt back`** path-printing subcommands so shell
+  functions can `cd "$(treeman wt switch foo)"`
+- **Single static binary** per platform — no CGo, no system
+  libraries; CI cross-builds `{linux,darwin}` × `{amd64,arm64}`
 
 ---
 
 ## Install
 
-```sh
-# From source — Go 1.23+ required.
-git clone https://github.com/stubbedev/treeman
-cd treeman
-just install   # → $GOBIN/treeman + $GOBIN/treemand
+Prebuilt tarballs for every tagged release:
 
-# Or via nix.
-nix profile install github:stubbedev/treeman
+```sh
+# linux/amd64 example — substitute the platform you need
+curl -L -o /tmp/treeman.tgz \
+  https://github.com/stubbedev/treeman/releases/latest/download/treeman-1.0.1-linux-amd64.tar.gz
+tar -xzf /tmp/treeman.tgz -C /tmp
+install /tmp/treeman-*-linux-amd64/treeman  ~/.local/bin/
+install /tmp/treeman-*-linux-amd64/treemand ~/.local/bin/
 ```
 
-Pre-built binaries for `{linux,darwin}` × `{amd64,arm64}` ship with
-every tagged release. See
-[releases](https://github.com/stubbedev/treeman/releases).
+From source (Go 1.23+):
+
+```sh
+git clone https://github.com/stubbedev/treeman
+cd treeman
+just install        # → $GOBIN/treeman + $GOBIN/treemand
+```
+
+Via Nix (flake):
+
+```sh
+nix profile install github:stubbedev/treeman
+```
 
 ---
 
 ## Quick start
 
 ```sh
-# 1. Bootstrap config in your repo.
-cd ~/code/my-laravel-app
-treeman init               # writes .treeman.yaml
+# 1. Bootstrap a config in your repo. treeman init detects the
+#    package manager + framework markers and emits a tailored
+#    .treeman.yaml.
+cd ~/code/my-app
+treeman init
 
-# 2. Install + start the daemon.
-treeman daemon install     # systemd --user
+# 2. Install + start the user-mode daemon (one-time).
+treeman daemon install      # writes a systemd --user unit
+systemctl --user start treemand
 
-# 3. Create a worktree end-to-end.
-treeman wt create PROJ-123
-#   ↳ git worktree add ../my-laravel-app-worktrees/PROJ-123 -b PROJ-123 main
-#   ↳ symlinks .env, .env.testing, justfile, etc.
+# 3. Spin up a worktree end-to-end.
+treeman wt create proj-123
+#   ↳ git worktree add .worktrees/proj-123 -b proj-123 origin/HEAD
+#   ↳ symlinks .env (and any worktrees.links targets)
 #   ↳ patches .env.testing's DB_DATABASE → my_app_testing_proj_123
-#   ↳ runs postcreate hooks (composer install + yarn install)
+#   ↳ runs postcreate hooks (parallel groups, detached)
 #   ↳ prepare: ensure_db → load dump → migrate → snapshot → N paratest clones
 
-# 4. Work in the worktree. Done with the ticket:
-treeman wt delete PROJ-123
+# 4. Get the path of an existing worktree for `cd` integration:
+cd "$(treeman wt switch proj-123)"
+
+# 5. Done with the branch:
+treeman wt delete proj-123
 #   ↳ runs predelete hook (DB drops, FLUSHDB, ES index delete)
 #   ↳ git worktree remove
+
+# 6. Cd back to the main checkout (with optional auto-remove if clean):
+cd "$(treeman wt back --remove)"
+```
+
+A ready-to-source zsh shim that wraps `wt switch` / `wt back` for
+`cd`-into-worktree UX lives at `contrib/shim.zsh`:
+
+```sh
+# In ~/.zshrc:
+source /path/to/treeman/contrib/shim.zsh
+
+# Then:
+wt proj-123          # cd into existing worktree (or report missing)
+wt proj-123 -c       # create + cd to new worktree
+wt new proj-123      # same as `wt proj-123 -c`
+wt -                 # cd back to main repo
+wt - --remove        # cd back + drop current worktree if clean
+wt list              # passthrough to `treeman wt list`
 ```
 
 ---
@@ -79,53 +144,279 @@ treeman wt delete PROJ-123
 
 | Command | What |
 |---|---|
-| `treeman init` | Generate a starter `.treeman.yaml` |
+| `treeman init` | Generate a starter `.treeman.yaml` from cwd markers |
 | `treeman daemon {start,stop,restart,status,install,uninstall}` | Daemon lifecycle |
 | `treeman wt {create,delete,list,register,unregister,finalize}` | Worktree lifecycle |
+| `treeman wt switch <name> [--create]` | Print worktree path (for shell `cd $(…)`) |
+| `treeman wt back [--remove]` | Print main repo path; optionally drop clean worktree |
 | `treeman prepare` | ensure → dump → migrate → snapshot → replicate |
 | `treeman hook run <phase>` | Run a configured hook phase manually |
 | `treeman logs {tail,grep}` | Query the SQLite event log |
 | `treeman slug [path]` | Print the slug derived from a worktree path |
 | `treeman config {validate,show [--resolved]}` | Config helpers |
-| `treeman schema {dump,install}` | JSON Schema for `.treeman.yaml` (pending v1.1) |
+| `treeman schema {dump,install}` | JSON Schema for `.treeman.yaml` |
 | `treeman fw detect` | List detected migration + test frameworks |
+
+`treeman <cmd> --help` for full flag listings.
 
 ---
 
 ## Configuration
 
-Layered: global `~/.config/treeman/config.yaml` → per-repo
-`.treeman.yaml` → per-repo `.treeman.local.yaml` (gitignored). Later
-layers override.
+treeman reads config in three layers, last-write-wins:
 
-See `.treeman.yaml` in any treeman-enabled repo for examples; the
-top of the file carries a `# yaml-language-server: $schema=…`
-modeline so editors with the YAML LSP get autocomplete.
+1. `~/.config/treeman/config.yaml` — global connection defaults
+2. `.treeman.yaml` — per-repo config (committed)
+3. `.treeman.local.yaml` — per-repo overrides (gitignored)
 
-### Hook groups (v1.0)
+Sample tree of every top-level block (all optional unless marked):
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json
+
+repo:
+  name: my-app                    # required for unambiguous slug derivation
+
+worktrees:
+  root: .worktrees                # default
+  links: [".env"]                 # symlink from main repo into the worktree
+  async_create: true              # default — postcreate + prepare detach to daemon
+  async_delete: true              # default
+  skip_worktree: true             # mark .env.testing skip-worktree after patching
+
+env_scoping:
+  files: [".env.testing"]
+  skip_worktree: true
+  patches:
+    - { key: DB_DATABASE,      template: "myapp_testing_{slug}" }
+    - { key: DB_TEST_DATABASE, template: "myapp_testing_{slug}" }
+    - { key: REDIS_DB,         template: "{slug_redis_index}" }
+
+connections:
+  mysql:
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password_env: MYSQL_ROOT_PASSWORD     # resolved from worktree's .env
+  postgres:
+    host: 127.0.0.1
+    port: 5432
+    user: postgres
+    password_env: PGPASSWORD
+  mongodb: { uri: "mongodb://127.0.0.1:27017" }
+  redis:   { url: "redis://127.0.0.1:6379" }
+  elasticsearch: { url: "http://127.0.0.1:9200" }
+
+databases:
+  - engine: mysql                          # mysql|mariadb|tidb|postgres|mongodb|redis|elasticsearch
+    name_template: "myapp_testing_{slug}"
+    dump: { path: storage/dumps/seed.sql.gz }
+    migrations: { framework: laravel }     # see `treeman fw detect`
+    paratest:
+      clones: auto                         # auto = detect from phpunit.xml / pyproject / etc.
+      name_template: "myapp_testing_{slug}_test_{n}"
+
+hooks:
+  precreate:                               # synchronous, sequenced, blocks create
+    - "git pull --ff-only"
+  postcreate:                              # async (parallel groups)
+    - composer install --no-interaction --prefer-dist
+    - yarn install --frozen-lockfile
+    - group:
+        - cd frontend && yarn install
+        - cd frontend && yarn build:dev
+  predelete:                               # async; runs before git worktree remove
+    - "echo dropping caches"
+
+snapshots:
+  cache_dir: ~/.cache/treeman/snapshots    # only used by GC reports
+  retention:
+    cap_per_repo: 8                        # NEW: hard cap, LRU evicts on new generation
+    max_age_days: 30
+    max_total_gb: 50
+    gc_interval_minutes: 60                # daemon background sweep
+
+watcher:
+  paths:
+    - { glob: "database/migrations/**", on: auto }
+    - { glob: "storage/dumps/*.sql.gz",  on: rebuild }
+  debounce_ms: 500
+  binlog:
+    enabled: true                          # MySQL only — see Binlog section
+
+daemon:
+  socket: $XDG_RUNTIME_DIR/treeman.sock
+  log_level: info
+```
+
+### Hook groups
 
 Each entry under `postcreate` / `predelete` / `postdelete` is a
-**group** that spawns one detached driver via `setsid`. Within a
-group, commands chain with `&&` (sequence). Across groups, drivers
-run in **parallel**. The whole runner returns once drivers are
-spawned — interactive `gwt`-style flows return in <2s regardless of
-how slow the hooks themselves are.
+**group**. Within a group: commands run in sequence (first
+non-zero exit aborts the group). Across groups: groups run in
+**parallel**. Each group becomes one `setsid`-detached driver, so
+the CLI returns immediately after spawning drivers.
+
+Three forms:
 
 ```yaml
 hooks:
   postcreate:
-    # Three independent groups, all fire in parallel.
-    - "composer install --no-interaction"
-    - "yarn install --frozen-lockfile"
-    - { run: "yarn install", cwd: frontend }
+    # bare string — one-command group
+    - "composer install"
 
-    # Group of two — sequence within. Runs in parallel with the above.
-    - - "npm install"
-      - "npm run build"
+    # map — one-command group with extra fields
+    - { run: "yarn build", cwd: frontend, env: { NODE_ENV: production } }
+
+    # sequence — multi-command group, commands chain with &&
+    - group:
+        - "npm install"
+        - "npm run build"
 ```
 
-`precreate` is the one synchronous phase (each step awaited in
-order, first non-zero exit aborts the create).
+`precreate` is the one **synchronous** phase: each entry runs in
+order in the foreground and a non-zero exit aborts the worktree
+creation. Useful for `git pull`, `git lfs fetch`, etc.
+
+### Templated names
+
+Several config fields are template strings rendered with the
+worktree's slug:
+
+| Token | Example |
+|---|---|
+| `{slug}` | `proj_123` |
+| `{slug_dash}` | `proj-123` |
+| `{slug_upper}` | `PROJ_123` |
+| `{slug_redis_index}` | `7` (deterministic 0–15 hash of slug) |
+| `{n}` | paratest clone index (1-based) |
+
+### Snapshot cache + GC
+
+Each `prepare` run fingerprints `(engine, engine_version,
+source_db, framework, migrations_hash, dump_hash, lockfile_hashes)`
+into a SHA-256 key. If a row with that key already exists in the
+SQLite `snapshots` table AND the template DB still exists on the
+engine, treeman skips the cold rebuild and `CREATE DATABASE …
+TEMPLATE` / `INSERT … SELECT`s into the paratest clones directly.
+
+`snapshots.retention.cap_per_repo` (default `8`) hard-caps how
+many cached templates per repo treeman will retain. When the
+`(cap+1)`th snapshot is recorded, a background goroutine drops
+the LRU template DBs and clears their rows. This keeps engine
+disk usage bounded without you having to babysit it.
+
+### Frameworks
+
+`treeman fw detect` lists every framework treeman recognises in
+the current repo. Built-in detectors:
+
+| Framework | Marker | Migration dir(s) | Hash mode |
+|---|---|---|---|
+| Laravel | `artisan` | `database/migrations`, `app/Modules/*/Database/Migrations` | filename |
+| Rails | `bin/rails`, `Gemfile`, `config/database.yml` | `db/migrate` | filename |
+| Django | `manage.py` | `**/migrations` | filename |
+| golang-migrate | `go.mod` | `**/migrations` | filename |
+| sqlx-cli | `Cargo.toml`, `migrations/` | `migrations`, `crates/*/migrations` | checksum |
+| diesel | `diesel.toml` | `migrations`, `crates/*/migrations` | filename |
+| dbmate | `db/migrations` | `db/migrations` | filename |
+| Knex | `knexfile.{js,ts}` | `migrations`, `db/migrations` | filename |
+| Drizzle | `drizzle.config.{ts,js}` | `drizzle`, `src/drizzle/migrations` | filename |
+| Prisma | `prisma/schema.prisma` | `prisma/migrations` | filename |
+| TypeORM | `data-source.{ts,js}` | `src/migrations`, `migrations` | filename |
+| mikro-orm | `mikro-orm.config.*` | `src/migrations` | filename |
+| Flyway | `flyway.{conf,toml}` | `db/migration`, `src/main/resources/db/migration` | checksum |
+| goose | `dbmate`-style with `.sql` | `db/migrations` | filename |
+
+`HashFilename` mode skips file IO (Laravel/Rails/Django don't
+mutate migrations; new files alone change the hash). `HashChecksum`
+hashes contents (sqlx-cli/Flyway mutate in place).
+
+### Binlog (MySQL delta replay)
+
+When `watcher.binlog.enabled: true` and the MySQL server runs
+with `binlog_format=ROW`, `binlog_row_image=FULL`,
+`binlog_row_metadata=FULL` (5.7+/8.0+), the daemon tails the
+binary log from a checkpointed position and applies DDL + DML
+events to each cached template + clone in sequence, instead of
+cold-rebuilding from the dump every time a migration runs.
+
+The watcher dispatches `delta` vs `rebuild` per-framework: any
+`HashChecksum` framework or `on: rebuild` watcher path forces a
+full rebuild; anything else replays the binlog.
+
+---
+
+## Storage layout
+
+| Path | What |
+|---|---|
+| `~/.local/share/treeman/treeman.db` | SQLite event log + worktree registry + snapshots table |
+| `~/.local/share/treeman/treemand.log` | Daemon stderr |
+| `$XDG_RUNTIME_DIR/treeman.sock` | JSON-line RPC socket (SO_PEERCRED on Linux, stat-based owner check elsewhere) |
+| `~/.config/systemd/user/treemand.service` | systemd-user unit |
+| `<worktree>/.treeman-hooks/<phase>-<n>.log` | Per-hook driver stdout/stderr |
+
+The store schema lives at `internal/store/migrations/0001_init.sql`
+and is shipped embedded into the binary, so a fresh `treeman.db`
+self-migrates on first daemon start.
+
+---
+
+## Daemon model
+
+`treemand` is the long-running process; `treeman` is a thin RPC
+client that round-trips JSON over the unix socket. Why a daemon:
+
+1. **Watcher lifecycles** survive shell exits. `watcher start` from
+   one shell keeps watching even after the shell closes.
+2. **Hook drivers** are detached and parented to PID 1 (`setsid`),
+   so `wt create` returns in <2s regardless of how slow the hooks
+   themselves are.
+3. **Snapshot cache** is shared across shells; two terminals
+   creating two worktrees on the same branch share the cached
+   template DB.
+
+The daemon's socket is 0600 and ownership-checked on every
+accept; on Linux via `SO_PEERCRED`, on other platforms via
+`stat()` of the socket file.
+
+---
+
+## RPC envelope
+
+The line-JSON protocol is documented in `internal/rpc/rpc.go`.
+Methods:
+
+| Method | Args | Response |
+|---|---|---|
+| `ping` | — | `{ kind: "pong" }` |
+| `status` | — | `{ kind: "status", daemon_version, pid, watcher_count }` |
+| `repo_register` | `{ path }` | `{ kind: "repo_registered", repo_id }` |
+| `worktree_finalize` | `{ repo_path, worktree_path, slug, inherited_env }` | `{ kind: "worktree_finalize_queued" }` |
+| `worktree_teardown` | `{ repo_path, worktree_path, force, inherited_env }` | `{ kind: "worktree_teardown_queued" }` |
+| `watcher_start` / `watcher_stop` / `watcher_list` | `{ repo_path }` | `{ kind: "watcher_*" }` |
+| `shutdown` | — | `{ kind: "shutdown_acked" }` |
+
+The `inherited_env` field carries the calling shell's environment
+to the daemon so hook subprocesses see the user's `$PATH`,
+nvm/asdf/rbenv shims, etc.
+
+---
+
+## Development
+
+```sh
+just build    # ./bin/treeman + ./bin/treemand with version baked in
+just check    # gofmt + go vet + go test
+just nix-check
+just sync-flake [VERSION]
+just release-{patch,minor,major}   # tag + push, GH Actions builds + publishes
+```
+
+The `sync-flake` recipe rewrites `flake.nix` `vendorHash` and
+`version` to match the current `go.sum` / tag. Called automatically
+from the release recipes so the flake build never drifts.
 
 ---
 
