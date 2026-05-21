@@ -94,9 +94,10 @@ hooks:
 	}
 }
 
-func TestKontainerStyleConfig(t *testing.T) {
+func TestRealisticLaravelStyleConfig(t *testing.T) {
 	// Sanity check: a realistic Laravel-style YAML parses to the
-	// expected shape. Mirrors the new kontainer .treeman.yaml.
+	// expected shape — hook groups, env_scoping with patches,
+	// databases with paratest fan-out.
 	d := writeTmp(t, `
 repo:
   name: myapp

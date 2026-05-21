@@ -6,19 +6,20 @@ import (
 	"testing"
 )
 
-// TestLoadResolvedFillsCredsFromEnvWithoutYaml is the regression
-// for the original bug: a `.treeman.yaml` that omits the
-// `connections:` block should still get MySQL creds populated from
-// `.env.testing` (Laravel-style `DB_*`).
+// TestLoadResolvedFillsCredsFromEnvWithoutYaml verifies that with
+// `env_scoping.sources` declared, a `.treeman.yaml` that omits the
+// `connections:` block still gets MySQL creds populated from the
+// declared env files.
 func TestLoadResolvedFillsCredsFromEnvWithoutYaml(t *testing.T) {
-	// Isolate from the developer's global config.
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	repo := t.TempDir()
-	// Minimal .treeman.yaml — NO connections: block.
 	if err := os.WriteFile(filepath.Join(repo, ".treeman.yaml"), []byte(`
 repo:
-  name: laravel-app
+  name: example-app
+env_scoping:
+  sources:
+    - .env.testing
 databases:
   - engine: mysql
     name_template: "app_testing_{slug}"
@@ -105,6 +106,9 @@ func TestLoadResolvedYamlPlusEnvPassword(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, ".treeman.yaml"), []byte(`
 repo:
   name: app
+env_scoping:
+  sources:
+    - .env.testing
 connections:
   mysql:
     host: 127.0.0.1

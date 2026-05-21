@@ -137,25 +137,25 @@ func prepareMySQL(
 	lockfileHashes := map[string]string{}
 	frameworkName := ""
 	hashMode := ""
-	var spec *framework.Spec
 	if d.Migrations != nil {
 		frameworkName = d.Migrations.Framework
-		if s, ok := lookupFrameworkSpec(frameworkName); ok {
-			spec = &s
-			hashMode = string(s.HashMode)
+		s := specFromYAML(*d.Migrations)
+		hashMode = string(s.HashMode)
+		if len(s.MigrationDirs) > 0 || len(s.FileGlobs) > 0 {
 			if h, err := framework.MigrationsHash(mainRepoRoot, s); err == nil {
 				migrationsHash = h
 			}
-			lockPaths := make([]string, 0, len(s.Lockfiles))
-			for _, lf := range s.Lockfiles {
-				lockPaths = append(lockPaths, filepath.Join(mainRepoRoot, lf))
-			}
+		}
+		lockPaths := make([]string, 0, len(s.Lockfiles))
+		for _, lf := range s.Lockfiles {
+			lockPaths = append(lockPaths, filepath.Join(mainRepoRoot, lf))
+		}
+		if len(lockPaths) > 0 {
 			if h, err := snapshot.LockfileHashesFor(lockPaths); err == nil {
 				lockfileHashes = h
 			}
 		}
 	}
-	_ = spec
 	if d.Dump != nil {
 		dp := filepath.Join(mainRepoRoot, d.Dump.Path)
 		hashes, _ := snapshot.LockfileHashesFor([]string{dp})
@@ -330,15 +330,18 @@ func preparePostgres(
 	hashMode := ""
 	if d.Migrations != nil {
 		frameworkName = d.Migrations.Framework
-		if s, ok := lookupFrameworkSpec(frameworkName); ok {
-			hashMode = string(s.HashMode)
+		s := specFromYAML(*d.Migrations)
+		hashMode = string(s.HashMode)
+		if len(s.MigrationDirs) > 0 || len(s.FileGlobs) > 0 {
 			if h, err := framework.MigrationsHash(mainRepoRoot, s); err == nil {
 				migrationsHash = h
 			}
-			lockPaths := make([]string, 0, len(s.Lockfiles))
-			for _, lf := range s.Lockfiles {
-				lockPaths = append(lockPaths, filepath.Join(mainRepoRoot, lf))
-			}
+		}
+		lockPaths := make([]string, 0, len(s.Lockfiles))
+		for _, lf := range s.Lockfiles {
+			lockPaths = append(lockPaths, filepath.Join(mainRepoRoot, lf))
+		}
+		if len(lockPaths) > 0 {
 			if h, err := snapshot.LockfileHashesFor(lockPaths); err == nil {
 				lockfileHashes = h
 			}
@@ -564,16 +567,41 @@ func prepareES(
 	return Outcome{Engine: d.Engine, SourceDB: prefix}, nil
 }
 
-// lookupFrameworkSpec returns the built-in detector spec by name
-// (case-insensitive). Used to compute migrations_hash without
-// re-detecting from filesystem markers.
-func lookupFrameworkSpec(name string) (framework.Spec, bool) {
-	for _, s := range framework.DefaultRegistry().Specs {
-		if s.Name == name {
-			return s, true
-		}
+// specFromYAML builds a framework.Spec directly from the
+// migrations: block in `.treeman.yaml`. Runtime never falls back to
+// the built-in registry — every input the snapshot fingerprint
+// depends on is declared in the user's yaml. This makes the
+// hashing surface auditable: `git log .treeman.yaml` shows exactly
+// which migrations / lockfiles invalidate the cache, no hidden
+// per-framework defaults.
+//
+// `treeman init` is responsible for emitting these fields when it
+// detects a known framework; `treeman fw detect` exposes the
+// built-in presets so users can copy them in by hand.
+func specFromYAML(m config.MigrationSpec) framework.Spec {
+	hash := framework.HashMode(m.HashMode)
+	if hash == "" {
+		hash = framework.HashFilename
 	}
-	return framework.Spec{}, false
+	onMod := framework.OnModify(m.OnModify)
+	if onMod == "" {
+		onMod = framework.OnRebuild
+	}
+	// `migrations.dir` is the legacy single-value field; expand it
+	// into the slice form so the rest of the pipeline only deals
+	// with MigrationDirs.
+	dirs := append([]string(nil), m.MigrationDirs...)
+	if m.Dir != "" {
+		dirs = append(dirs, m.Dir)
+	}
+	return framework.Spec{
+		Name:          m.Framework,
+		MigrationDirs: dirs,
+		FileGlobs:     append([]string(nil), m.FileGlobs...),
+		Lockfiles:     append([]string(nil), m.Lockfiles...),
+		HashMode:      hash,
+		OnModify:      onMod,
+	}
 }
 
 func resolveCloneNames(p *config.ParatestSpec, tplCtx template.Context, repoRoot string) ([]string, error) {

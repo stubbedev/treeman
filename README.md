@@ -225,7 +225,14 @@ databases:
   - engine: mysql                          # mysql|mariadb|tidb|postgres|mongodb|redis|elasticsearch
     name_template: "myapp_testing_{slug}"
     dump: { path: storage/dumps/seed.sql.gz }
-    migrations: { framework: laravel }     # see `treeman fw detect`
+    migrations:                            # fully declarative; runtime never re-detects
+      framework: laravel                   # label only — fields below are what treeman reads
+      migration_dirs:
+        - "database/migrations"
+      file_globs: ["*.php"]
+      lockfiles: ["composer.lock"]
+      hash_mode: filename                  # "filename" (cheap) | "checksum" (mutable migrations)
+      on_modify: rebuild                   # "rebuild" | "delta"
     paratest:
       clones: auto                         # auto = detect from phpunit.xml / pyproject / etc.
       name_template: "myapp_testing_{slug}_test_{n}"
@@ -371,34 +378,43 @@ The watcher dispatches `delta` vs `rebuild` per-framework: any
 `HashChecksum` framework or `on: rebuild` watcher path forces a
 full rebuild; anything else replays the binlog.
 
+### Fully declarative — no hidden defaults
+
+treeman runs against what `.treeman.yaml` says, not what it guesses
+from filesystem markers. Init helpers (`treeman init`,
+`treeman fw detect`) inspect the repo and write the corresponding
+YAML; once written, those fields are authoritative. If a migration
+dir lives somewhere unusual, change `migration_dirs` and the next
+prepare sees it — no recompile, no rebuild of treeman, no per-
+framework code path. The same applies to env files: only what
+`env_scoping.sources` lists is read.
+
+The built-in framework presets exist solely as init-time templates
+and are listed by `treeman fw detect`. Copy fields in by hand for
+custom layouts.
+
 ### Credential resolution from .env
 
-treeman reads env files in this default order (later wins):
-
-```
-.env
-.env.local
-.env.test
-.env.testing
-.env.test.local
-.env.testing.local
-```
-
-Override the list explicitly with `env_scoping.sources`:
+treeman reads env files **only when** `env_scoping.sources` is
+declared. There is no implicit default — the runtime never reads
+files you didn't list. `treeman init` writes a `sources:` block
+matching the framework it detected (Laravel → `.env.testing` etc.);
+edit the list to suit.
 
 ```yaml
 env_scoping:
-  sources:
+  sources:                # files read in order, last wins
     - .env
-    - .env.testing       # baseline for tests
-    - .env.testing.local # per-dev overrides — last entry wins
+    - .env.testing        # baseline for tests
+    - .env.testing.local  # per-dev overrides
 ```
 
 Relative paths resolve against the repo root; absolute paths are
-honoured as-is so you can pull from outside the repo.
+honoured as-is so you can pull from outside the repo (e.g. a
+shared secret store).
 
-The resolver fills connection config when the YAML omits a block
-or leaves a field unset. Supported flavours per engine:
+When `sources` resolves to a non-empty environment, the resolver
+fills any unset fields in the `connections:` block. Supported flavours per engine:
 
 | Engine | Env vars treeman reads (first non-empty wins) |
 |---|---|
@@ -429,13 +445,13 @@ restart with a new IP settles within one retry.
 ```yaml
 connections:
   mysql:
-    container: kontainer-mysql    # required: container name
+    container: myapp-mysql        # required: container name
     container_engine: docker      # optional, default "docker"
     port: 3306                    # optional when container exposes it
     user: root
     password_env: MYSQL_ROOT_PASSWORD
   mongodb:
-    container: kontainer-mongo
+    container: myapp-mongo
     uri: "mongodb://placeholder:27017"   # host part rewritten at dial time
 ```
 

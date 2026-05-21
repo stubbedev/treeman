@@ -24,8 +24,8 @@ type Driver struct {
 }
 
 // Connect probes reachability + returns a Driver. Auth (api key /
-// basic) is left for a future patch; kontainer uses unauthenticated
-// local ES.
+// basic) is left for a future patch; the local-dev target uses
+// unauthenticated Elasticsearch.
 func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 	url := cfg.URL
 	if cfg.Container != "" {

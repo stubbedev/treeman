@@ -672,7 +672,11 @@ func InitCmd() *cli.Command {
 	}
 }
 
-// renderInitTemplate inspects `cwd` and emits a tailored YAML.
+// renderInitTemplate inspects `cwd` and emits a fully-declarative
+// `.treeman.yaml`. Detection drives WHAT to emit; the runtime never
+// re-detects — every directive treeman acts on at runtime lives in
+// the YAML this function writes.
+//
 // Pulled out into a pure function so it can be exercised in unit
 // tests against fixture trees.
 func renderInitTemplate(cwd string) string {
@@ -682,7 +686,6 @@ func renderInitTemplate(cwd string) string {
 		return err == nil
 	}
 
-	isLaravel := has("artisan") && has("composer.json")
 	jsPkgMgr := detectJSPkgMgr(cwd)
 	hasGoMod := has("go.mod")
 	hasComposer := has("composer.json")
@@ -694,17 +697,53 @@ func renderInitTemplate(cwd string) string {
 		}
 	}
 
+	// Pick the first matching built-in framework preset so init can
+	// emit its dirs/globs/lockfiles verbatim. If no preset matches,
+	// the databases: block is commented out so the user can author
+	// it by hand.
+	detected := framework.DefaultRegistry().DetectAll(cwd)
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "# yaml-language-server: $schema=https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json\n")
+	b.WriteString("# yaml-language-server: $schema=https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json\n")
 	fmt.Fprintf(&b, "repo:\n  name: %s\n", name)
 	b.WriteString("worktrees:\n  root: .worktrees\n  links:\n    - .env\n")
-	if isLaravel {
-		b.WriteString("env_scoping:\n  files: [\".env.testing\"]\n  skip_worktree: true\n  patches:\n")
-		fmt.Fprintf(&b, "    - { key: DB_TEST_DATABASE, template: \"%s_testing_{slug}\" }\n", name)
+
+	envSources := defaultEnvSourcesFor(detected, has)
+	if len(envSources) > 0 {
+		b.WriteString("env_scoping:\n")
+		b.WriteString("  sources:        # files read in order, last wins\n")
+		for _, s := range envSources {
+			fmt.Fprintf(&b, "    - %s\n", s)
+		}
+		// Only Laravel's .env.testing is conventionally patched-in-
+		// place; for anything else the user can extend the list.
+		if hasFrameworkNamed(detected, "laravel") {
+			b.WriteString("  files: [\".env.testing\"]\n")
+			b.WriteString("  skip_worktree: true\n")
+			b.WriteString("  patches:\n")
+			fmt.Fprintf(&b, "    - { key: DB_TEST_DATABASE, template: \"%s_testing_{slug}\" }\n", name)
+		}
+	}
+
+	if len(detected) > 0 {
+		spec := detected[0]
+		engine := spec.EngineHint
+		if engine == "" {
+			engine = "mysql"
+		}
 		b.WriteString("databases:\n")
-		fmt.Fprintf(&b, "  - engine: mysql\n    name_template: \"%s_testing_{slug}\"\n", name)
-		b.WriteString("    migrations:\n      framework: laravel\n")
-		fmt.Fprintf(&b, "    paratest:\n      clones: auto\n      name_template: \"%s_testing_{slug}_test_{n}\"\n", name)
+		fmt.Fprintf(&b, "  - engine: %s\n", engine)
+		fmt.Fprintf(&b, "    name_template: \"%s_testing_{slug}\"\n", name)
+		b.WriteString("    migrations:\n")
+		fmt.Fprintf(&b, "      framework: %s        # label only — runtime uses the fields below\n", spec.Name)
+		emitStringList(&b, "      ", "migration_dirs", spec.MigrationDirs)
+		emitStringList(&b, "      ", "file_globs", spec.FileGlobs)
+		emitStringList(&b, "      ", "lockfiles", spec.Lockfiles)
+		fmt.Fprintf(&b, "      hash_mode: %s\n", spec.HashMode)
+		fmt.Fprintf(&b, "      on_modify: %s\n", spec.OnModify)
+		b.WriteString("    paratest:\n")
+		b.WriteString("      clones: auto\n")
+		fmt.Fprintf(&b, "      name_template: \"%s_testing_{slug}_test_{n}\"\n", name)
 	} else {
 		b.WriteString("# databases: []   # add an engine block when DB scaffolding is needed.\n")
 	}
@@ -733,6 +772,53 @@ func renderInitTemplate(cwd string) string {
 		b.WriteString("    []\n")
 	}
 	return b.String()
+}
+
+// defaultEnvSourcesFor returns a sensible (but explicit) env source
+// list based on detected frameworks + which files actually exist
+// on disk. The user is expected to edit the list; treeman never
+// adds defaults at runtime.
+func defaultEnvSourcesFor(detected []framework.Spec, has func(string) bool) []string {
+	candidates := []string{".env", ".env.local"}
+	if hasFrameworkNamed(detected, "laravel") {
+		candidates = append(candidates, ".env.testing", ".env.testing.local")
+	} else if hasFrameworkNamed(detected, "rails", "django") {
+		candidates = append(candidates, ".env.test", ".env.test.local")
+	}
+	var out []string
+	for _, c := range candidates {
+		if has(c) {
+			out = append(out, c)
+		}
+	}
+	// Even if none exist yet, emit the conventional baseline so the
+	// user has a list to extend.
+	if len(out) == 0 {
+		out = candidates[:1]
+	}
+	return out
+}
+
+func hasFrameworkNamed(specs []framework.Spec, names ...string) bool {
+	for _, s := range specs {
+		for _, n := range names {
+			if s.Name == n {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func emitStringList(b *strings.Builder, indent, key string, vals []string) {
+	if len(vals) == 0 {
+		fmt.Fprintf(b, "%s%s: []\n", indent, key)
+		return
+	}
+	fmt.Fprintf(b, "%s%s:\n", indent, key)
+	for _, v := range vals {
+		fmt.Fprintf(b, "%s  - %q\n", indent, v)
+	}
 }
 
 // detectJSPkgMgr returns "yarn", "pnpm", "npm", "bun", or "deno"

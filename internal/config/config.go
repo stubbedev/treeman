@@ -272,10 +272,25 @@ type DumpSpec struct {
 	Optional bool   `yaml:"optional,omitempty"`
 }
 
-// MigrationSpec — `migrations:` sub-block.
+// MigrationSpec — `migrations:` sub-block. Fully declarative: every
+// input the runtime needs (migration directories, file globs,
+// lockfiles, hash mode, on-modify policy) is read from this struct,
+// never inferred at runtime from `framework`. `framework` is a free-
+// form label for logs + downstream tooling.
+//
+// `treeman init` emits these fields populated from the matching
+// built-in preset; `treeman fw detect` lists the presets so you can
+// copy fields in by hand. There is no implicit fallback — leaving
+// e.g. MigrationDirs empty means treeman has no migration source
+// for the hash, so the snapshot key won't change when files do.
 type MigrationSpec struct {
-	Framework string `yaml:"framework"`
-	Dir       string `yaml:"dir,omitempty"`
+	Framework     string   `yaml:"framework"`
+	Dir           string   `yaml:"dir,omitempty"`            // deprecated; prefer MigrationDirs
+	MigrationDirs []string `yaml:"migration_dirs,omitempty"` // glob patterns relative to repo root
+	FileGlobs     []string `yaml:"file_globs,omitempty"`     // glob patterns for migration files within those dirs
+	Lockfiles     []string `yaml:"lockfiles,omitempty"`      // files whose hash invalidates the snapshot
+	HashMode      string   `yaml:"hash_mode,omitempty"`      // "filename" (default) | "checksum"
+	OnModify      string   `yaml:"on_modify,omitempty"`      // "rebuild" (default) | "delta"
 }
 
 // ParatestSpec — `paratest:` sub-block.

@@ -17,10 +17,9 @@ import (
 // 0600) and verify the socket file's owning UID matches the daemon's
 // effective UID. This isn't as airtight as SO_PEERCRED — a
 // determined attacker who can already write into XDG_RUNTIME_DIR
-// could spoof — but the kontainer + dev-workstation deploy targets
-// are single-user, and the daemon is only built for darwin so the
-// developer's laptop can use treeman locally outside of the prod
-// Linux env.
+// could spoof — but darwin/BSD dev workstations are single-user
+// targets where the filesystem-mode + owner check is the
+// pragmatically-correct trust boundary.
 func CheckPeerUID(c net.Conn) error {
 	uc, ok := c.(*net.UnixConn)
 	if !ok {

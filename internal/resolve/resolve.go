@@ -113,33 +113,23 @@ func ApplyEnvCredentials(cfg *config.Config, repoRoot string) {
 	}
 }
 
-// loadRepoEnv reads `repoRoot`'s env files in `sources` order
-// (later layers override earlier). When `sources` is empty, the
-// default search order is used. Relative entries in `sources` are
-// resolved against `repoRoot`; absolute entries are taken as-is so
-// a config can pull from outside the repo if needed.
+// loadRepoEnv reads exactly the env files declared in
+// `env_scoping.sources` (last layer wins). When `sources` is empty
+// the resolver reads nothing — no hidden default. `treeman init`
+// emits a `sources:` list tailored to the detected framework so a
+// fresh repo gets the conventional `.env*` lineup; modify the list
+// to suit. Relative entries resolve against `repoRoot`; absolute
+// entries are honoured as-is.
 func loadRepoEnv(repoRoot string, sources []string) envfile.EnvFile {
-	if repoRoot == "" {
+	if repoRoot == "" || len(sources) == 0 {
 		return envfile.EnvFile{Vars: map[string]string{}}
 	}
-	var paths []string
-	if len(sources) > 0 {
-		paths = make([]string, 0, len(sources))
-		for _, s := range sources {
-			if filepath.IsAbs(s) {
-				paths = append(paths, s)
-			} else {
-				paths = append(paths, filepath.Join(repoRoot, s))
-			}
-		}
-	} else {
-		paths = []string{
-			filepath.Join(repoRoot, ".env"),
-			filepath.Join(repoRoot, ".env.local"),
-			filepath.Join(repoRoot, ".env.test"),
-			filepath.Join(repoRoot, ".env.testing"),
-			filepath.Join(repoRoot, ".env.test.local"),
-			filepath.Join(repoRoot, ".env.testing.local"),
+	paths := make([]string, 0, len(sources))
+	for _, s := range sources {
+		if filepath.IsAbs(s) {
+			paths = append(paths, s)
+		} else {
+			paths = append(paths, filepath.Join(repoRoot, s))
 		}
 	}
 	return envfile.ReadLayered(paths)
