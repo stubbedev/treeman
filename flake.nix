@@ -20,8 +20,8 @@
           # hash so the sandboxed build is reproducible. Bump after
           # any `go get` / `go mod tidy` that changes go.sum — `nix
           # build` will print the expected hash on mismatch.
-          # go-sum: 4b061556d69d1ec2c768a544389bf541302f2e270cf8f953b32d8211629834ee
-          vendorHash = "sha256-hmkFmeaNEG141MHuxklBYP6AuEOvoO/IPUIi/ZnOxFw=";
+          # go-sum: 93c04d6c92c0da0289a73252df39889d1ff272b69e1ced8db297396edba34b35
+          vendorHash = "sha256-sP2bJ7pv+i57To/4JM+0dFVAbSLj6xW7okKw1IXQRkk=";
           subPackages = [ "cmd/treeman" "cmd/treemand" ];
           ldflags = [
             "-s"
