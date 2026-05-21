@@ -1,5 +1,5 @@
 // Package framework detects which migration framework owns a given
-// repo. Ported from `crates/treeman-migrations/src/lib.rs`.
+// repo.
 //
 // Each detector declares marker files (filesystem paths that must
 // exist — `|`-separated alternatives are accepted), migration-dir
@@ -72,8 +72,8 @@ func (s Spec) Detect(repoRoot string) bool {
 }
 
 // Registry — the ordered list of detectors. Built-in registry below
-// covers the 14 frameworks the Rust workspace ships. Users add
-// custom detectors via the YAML `frameworks:` block.
+// covers the 14 frameworks treeman ships with. Users add custom
+// detectors via the YAML `frameworks:` block.
 type Registry struct {
 	Specs []Spec
 }

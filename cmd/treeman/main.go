@@ -1,6 +1,7 @@
 // Command treeman is the CLI for the treeman per-worktree DB
-// orchestrator. Mirrors the Rust workspace's subcommand tree exactly
-// so existing scripts (gwt zsh integration, CI flows) keep working.
+// orchestrator. The subcommand tree is treated as a stable user-
+// facing contract so existing scripts (gwt zsh integration, CI
+// flows) keep working across releases.
 package main
 
 import (

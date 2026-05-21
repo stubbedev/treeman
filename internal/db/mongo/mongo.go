@@ -1,6 +1,5 @@
-// Package mongo is the treeman MongoDB driver. Ported from
-// `crates/treeman-db/src/mongo.rs`. Uses go.mongodb.org/mongo-driver
-// v2.
+// Package mongo is the treeman MongoDB driver. Uses
+// go.mongodb.org/mongo-driver v2.
 package mongo
 
 import (

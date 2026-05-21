@@ -1,5 +1,5 @@
 // Package hooks runs the configured hook entries for a worktree
-// phase. Ported from `crates/treeman-core/src/hooks.rs`.
+// phase.
 //
 // Model: every entry under postcreate / predelete / postdelete is a
 // "group". Each group spawns one detached driver via setsid; the
@@ -119,8 +119,7 @@ func RunPrecreateHooks(
 }
 
 // renderGroup chains `( cd <cwd> && <cmd> )` clauses with ` && ` so
-// a failure short-circuits the rest of the group. Mirrors the Rust
-// `render_group`.
+// a failure short-circuits the rest of the group.
 func renderGroup(steps []config.SingleStep, defaultCwd string) string {
 	parts := make([]string, 0, len(steps))
 	for _, s := range steps {

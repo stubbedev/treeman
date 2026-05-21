@@ -1,5 +1,5 @@
-// Package postgres is the treeman PostgreSQL driver. Ported from
-// `crates/treeman-db/src/postgres.rs`. Uses pgx via database/sql.
+// Package postgres is the treeman PostgreSQL driver. Uses pgx via
+// database/sql.
 package postgres
 
 import (

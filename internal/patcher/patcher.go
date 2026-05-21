@@ -1,6 +1,5 @@
 // Package patcher applies (key,value) pairs to dotenv-style files
-// and phpunit.xml `<env>` blocks. Ported from
-// `crates/treeman-core/src/patcher.rs`.
+// and phpunit.xml `<env>` blocks.
 //
 // `SkipWorktree` calls `git update-index --skip-worktree` so the
 // per-worktree patched `.env.testing` doesn't show up as a dirty

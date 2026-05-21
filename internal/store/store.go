@@ -1,8 +1,7 @@
 // Package store wraps the SQLite event log and worktree registry.
-// Ported from `crates/treeman-store/src/lib.rs`. Schema is shared
-// verbatim with the Rust implementation (same `0001_init.sql` file)
-// so existing `~/.local/share/treeman/treeman.db` databases survive
-// the upgrade.
+// Schema lives in `0001_init.sql` and is treated as a stable
+// on-disk format so existing `~/.local/share/treeman/treeman.db`
+// databases survive upgrades.
 package store
 
 import (
@@ -181,6 +180,38 @@ func (s *Store) MarkWorktreeDeleted(ctx context.Context, id int64) error {
 	_, err := s.DB.ExecContext(ctx,
 		"UPDATE worktrees SET deleted_at = ? WHERE id = ?", nowMillis(), id)
 	return err
+}
+
+// ActiveWorktree pairs a repo path with one of its live worktree
+// paths. Used by the daemon at boot to resume per-worktree fsnotify
+// watchers.
+type ActiveWorktree struct {
+	RepoPath     string
+	WorktreePath string
+}
+
+// ListActiveWorktrees returns every (repo path, worktree path) pair
+// whose worktree row has `deleted_at IS NULL`. Ordered by worktree id.
+func (s *Store) ListActiveWorktrees(ctx context.Context) ([]ActiveWorktree, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT r.path, w.path
+		FROM worktrees w
+		JOIN repos r ON r.id = w.repo_id
+		WHERE w.deleted_at IS NULL
+		ORDER BY w.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ActiveWorktree
+	for rows.Next() {
+		var a ActiveWorktree
+		if err := rows.Scan(&a.RepoPath, &a.WorktreePath); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // ListRepoPaths returns every registered repo path in insertion order.

@@ -62,7 +62,7 @@ func PrepareCmd() *cli.Command {
 			defer st.Close()
 			repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 			wtID, _ := st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
-			outs, err := prepare.Run(ctx, &cfg, repoRoot, wt, sl, st, repoID, wtID, CaptureInheritedEnv())
+			outs, err := prepare.Run(ctx, &cfg, wt, sl, st, repoID, wtID, CaptureInheritedEnv())
 			if err != nil {
 				return err
 			}

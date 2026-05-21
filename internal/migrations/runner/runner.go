@@ -1,9 +1,7 @@
 // Package runner invokes a framework's migrate command against a
-// target database. Ported from
-// `crates/treeman-migrations/src/runner.rs`. Frameworks read
-// connection settings from their own config (Laravel .env, Rails
-// config/database.yml, etc.); we override the target DB name with
-// framework-appropriate env vars.
+// target database. Frameworks read connection settings from their
+// own config (Laravel .env, Rails config/database.yml, etc.); we
+// override the target DB name with framework-appropriate env vars.
 package runner
 
 import (

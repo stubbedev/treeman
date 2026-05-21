@@ -10,8 +10,7 @@ import (
 )
 
 // CheckPeerUID enforces SO_PEERCRED on every accepted connection so
-// only the user that owns the daemon socket can connect. Matches the
-// behaviour of `crates/treeman-daemon/src/socket.rs`.
+// only the user that owns the daemon socket can connect.
 func CheckPeerUID(c net.Conn) error {
 	uc, ok := c.(*net.UnixConn)
 	if !ok {

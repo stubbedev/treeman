@@ -1,7 +1,6 @@
 // Package reachability probes a TCP host:port quickly so that an
 // unreachable container surfaces as a clear error before the driver
-// wraps it in driver-specific noise. Ported from
-// `crates/treeman-db/src/reachability.rs`.
+// wraps it in driver-specific noise.
 package reachability
 
 import (

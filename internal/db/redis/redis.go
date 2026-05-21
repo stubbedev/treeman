@@ -1,5 +1,4 @@
-// Package redis is the treeman Redis driver. Ported from
-// `crates/treeman-db/src/redis_driver.rs`. The treeman scoping
+// Package redis is the treeman Redis driver. The treeman scoping
 // scheme reuses db indices (0..15) per worktree.
 package redis
 

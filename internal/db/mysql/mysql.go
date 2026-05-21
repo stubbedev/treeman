@@ -1,9 +1,9 @@
-// Package mysql is the treeman MySQL driver. Ported from
-// `crates/treeman-db/src/mysql.rs`. database/sql + go-sql-driver/mysql
-// uses MySQL's text protocol by default so DDL like USE / SHOW CREATE
-// TABLE / SET SESSION just works — fixing the 1295 "not supported in
-// prepared statement protocol" bug the Rust sqlx path needed
-// raw_sql() to work around.
+// Package mysql is the treeman MySQL driver. database/sql +
+// go-sql-driver/mysql uses MySQL's text protocol by default so DDL
+// like USE / SHOW CREATE TABLE / SET SESSION just works — avoiding
+// the 1295 "not supported in prepared statement protocol" error
+// these statements trigger when issued via the prepared-statement
+// protocol.
 package mysql
 
 import (
@@ -125,8 +125,8 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 
 // ListMatching returns every database whose name starts with prefix.
 // CONVERT … USING utf8mb4 guards against the MySQL 8 VARBINARY-on-
-// charset-mismatch decode failure the Rust sqlx path needed v0.3.1
-// to patch.
+// charset-mismatch decode failure that information_schema otherwise
+// returns when the server and client default charsets disagree.
 func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, error) {
 	like := strings.ReplaceAll(prefix, "_", `\_`) + "%"
 	rows, err := d.DB.QueryContext(ctx,
@@ -175,9 +175,9 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 
 // SnapshotCreate clones `source` into `template` table-by-table via
 // `SHOW CREATE TABLE` + `INSERT INTO target.t SELECT * FROM source.t`.
-// Ported from the Rust impl; the relevant detail is that `USE` and
-// `SHOW CREATE TABLE` go through MySQL's text protocol by default in
-// database/sql, fixing the v0.3.0 1295 bug for free.
+// `USE` and `SHOW CREATE TABLE` go through MySQL's text protocol by
+// default in database/sql so neither hits the 1295 prepared-protocol
+// error.
 func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
 	if err := validateIdent(source); err != nil {
 		return err

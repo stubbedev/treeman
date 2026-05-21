@@ -1,6 +1,5 @@
 // Package es is the treeman Elasticsearch / OpenSearch driver.
-// Ported from `crates/treeman-db/src/elasticsearch.rs`. Pure HTTP
-// via net/http — no fat client dependency.
+// Pure HTTP via net/http — no fat client dependency.
 package es
 
 import (

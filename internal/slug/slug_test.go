@@ -74,11 +74,9 @@ func TestSysVCksumKnownVectors(t *testing.T) {
 	}
 }
 
-// Parity test: a slug computed for the same input on the Rust side
-// and the Go side must produce identical RedisIndices values. The
-// Rust test fixture `crates/treeman-core/src/slug.rs` asserts the
-// range but not the exact pair for `proj_1234`. We pin both values
-// here so any future regression surfaces.
+// Pin RedisIndices for a known input so any change to the cksum
+// math or the redis-index formulae surfaces as a test failure.
+// The values match POSIX `cksum` on the literal "proj_1234".
 func TestRedisIndicesPinned(t *testing.T) {
 	s := Slug{Value: "proj_1234", Source: SourceTicket}
 	q, c := s.RedisIndices()

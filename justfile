@@ -27,7 +27,7 @@ install:
 fmt:
     gofmt -w ./cmd ./internal
 
-# rustfmt-equivalent — fails CI if anything is unformatted.
+# Strict gofmt check — fails CI if anything is unformatted.
 # Prints the diff on failure so the file + change is obvious.
 lint:
     #!/usr/bin/env bash

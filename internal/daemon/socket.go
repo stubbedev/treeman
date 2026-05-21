@@ -1,6 +1,5 @@
 // Package daemon hosts the long-running treemand process: socket
-// listener, per-repo watcher fanout, RPC dispatch. Ported from
-// `crates/treeman-daemon/src/`.
+// listener, per-repo watcher fanout, RPC dispatch.
 package daemon
 
 import (

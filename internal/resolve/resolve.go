@@ -10,8 +10,6 @@
 //     DB_TEST_* overrides Laravel uses. Spring Boot
 //     (SPRING_DATASOURCE_*, SPRING_DATA_MONGODB_*, SPRING_DATA_REDIS_*),
 //     Django (ELASTICSEARCH_DSL_HOSTS), Symfony aliases.
-//
-// Ported from `crates/treeman-core/src/resolve.rs`.
 package resolve
 
 import (

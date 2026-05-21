@@ -1,10 +1,9 @@
 // Package config loads `.treeman.yaml` plus the layered global +
-// per-repo + per-worktree-local overrides. Ported from
-// `crates/treeman-core/src/config.rs`.
+// per-repo + per-worktree-local overrides.
 //
-// Schema is the canonical Rust shape; YAML round-trip parity is a
-// requirement, so any new field added on either side needs the
-// other side to follow.
+// YAML round-trip parity is a requirement: loading and re-emitting
+// a config must not silently drop unknown fields, so adding a new
+// field requires touching both the struct and the test fixtures.
 package config
 
 import (
@@ -452,9 +451,8 @@ func mergeYAMLFile(cfg *Config, path string) error {
 	return nil
 }
 
-// applyDefaults sets the same defaults the Rust schemars-derived
-// defaults produced: async_create + async_delete true,
-// skip_worktree true, retention defaults.
+// applyDefaults fills in the canonical defaults: async_create +
+// async_delete true, skip_worktree true, retention defaults.
 func applyDefaults(cfg *Config) {
 	if cfg.Daemon.LogLevel == "" {
 		cfg.Daemon.LogLevel = "info"

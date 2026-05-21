@@ -1,5 +1,5 @@
 // Package snapshot implements the snapshot cache + GC + paratest
-// fan-out logic. Ported from `crates/treeman-snapshot/src/`.
+// fan-out logic.
 //
 // A SnapshotKey is the cache key the prepare orchestrator uses to
 // look up a built template DB: identical (engine, framework,
@@ -53,11 +53,10 @@ func New(engine, engineVersion, sourceDB, framework, hashMode, migrationsHash, d
 	}
 }
 
-// Fingerprint returns a stable hex-encoded hash of the key. We use
-// sha256 in the Go port (vs the Rust crate's blake3) because the
-// fingerprint never crosses the language boundary — the SQLite
-// store keys on whatever the binary writes, and the Go binary owns
-// its own state going forward.
+// Fingerprint returns a stable hex-encoded hash of the key. sha256
+// is fine here — the fingerprint is consumed only by treeman itself
+// (the SQLite store keys on whatever the binary writes), so the
+// choice of hash never crosses a compatibility boundary.
 func (k Key) Fingerprint() string {
 	// Sort lockfile keys so JSON encoding is canonical.
 	type stableKey struct {
@@ -116,9 +115,9 @@ func (k Key) TemplateName() string {
 	return fmt.Sprintf("_tm_%s", k.Fingerprint()[:16])
 }
 
-// LockfileHashesFor blake-shas a list of files. Missing files are
-// skipped (not an error) — Rust's lockfile_hashes_for behaves the
-// same way.
+// LockfileHashesFor hashes a list of files. Missing files are
+// skipped (not an error) so configs that name optional lockfiles
+// don't fail when a particular project doesn't ship them.
 func LockfileHashesFor(paths []string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, p := range paths {

@@ -1,9 +1,8 @@
 // Package rpc — wire types shared between `treemand` and `treeman`.
-// Ported from `crates/treeman-proto/src/lib.rs`. Wire format is
-// newline-delimited JSON over a unix domain socket with SO_PEERCRED
-// uid check; the JSON shape matches the Rust serde-tagged enums so
-// the Go daemon and the Rust CLI can interoperate during the
-// transition window.
+// Wire format is newline-delimited JSON over a unix domain socket
+// with an SO_PEERCRED uid check. Requests and responses use a
+// tagged-union shape: every payload carries a discriminator field
+// (`method` on requests, `kind` on responses) as the first key.
 package rpc
 
 import (
@@ -46,9 +45,9 @@ func SocketPath() (string, error) {
 
 // ─────────────────────────── Request ───────────────────────────
 //
-// Wire shape: {"method": "status", ...}.  The Rust side uses serde
-// `#[serde(tag = "method", rename_all = "snake_case")]`. We mirror
-// that by emitting `method` as the first field on every payload.
+// Wire shape: {"method": "status", ...}. `method` is the tagged-
+// union discriminator and is always emitted as the first field on
+// every payload.
 
 // RequestMethod values.
 const (
@@ -77,8 +76,8 @@ type Request struct {
 }
 
 // MarshalJSON flattens the discriminator + the matching args struct
-// onto a single object so the wire format matches Rust's
-// `#[serde(tag = "method")]` exactly.
+// onto a single object so the wire format is a flat tagged union
+// keyed by `method`.
 func (r Request) MarshalJSON() ([]byte, error) {
 	wrapper := map[string]any{"method": r.Method}
 	switch r.Method {
@@ -226,7 +225,8 @@ const (
 	KindError                  = "error"
 )
 
-// Response is the envelope. Mirrors Rust's `#[serde(tag = "kind")]`.
+// Response is the envelope. Tagged-union shape with `kind` as the
+// discriminator (always emitted as the first field).
 type Response struct {
 	Kind string `json:"kind"`
 	// Status

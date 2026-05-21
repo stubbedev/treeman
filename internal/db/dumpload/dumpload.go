@@ -1,14 +1,13 @@
 // Package dumpload streams a `.sql` dump into a target database
-// over the wire. Ported from `crates/treeman-db/src/dumpload.rs`.
-// Statement-by-statement so we don't buffer the whole file in
-// memory; quotes / backticks / `--` line comments / `/* */` block
-// comments respected so an embedded `;` inside a string literal
-// doesn't trigger a fake split.
+// over the wire. Statement-by-statement so we don't buffer the
+// whole file in memory; quotes / backticks / `--` line comments /
+// `/* */` block comments respected so an embedded `;` inside a
+// string literal doesn't trigger a fake split.
 //
-// Unlike the Rust sqlx path we use `database/sql`'s default ExecContext
-// which speaks MySQL's text protocol. That's enough for every
-// statement mysqldump emits — including LOCK TABLES / SET PASSWORD
-// / DELIMITER which the prepared protocol refuses to handle.
+// We use `database/sql`'s default ExecContext, which speaks MySQL's
+// text protocol. That's enough for every statement mysqldump emits
+// — including LOCK TABLES / SET PASSWORD / DELIMITER, which the
+// prepared-statement protocol refuses to handle.
 package dumpload
 
 import (
@@ -65,8 +64,7 @@ func LoadPostgres(ctx context.Context, db *sql.DB, targetDB, dumpPath string) (u
 	}
 	defer conn.Close()
 	// pg/`USE` doesn't exist; caller is expected to have opened db
-	// against the right database. Mirror the Rust impl where the
-	// caller acquires a DB-scoped connection.
+	// against the right database (i.e. a DB-scoped connection).
 	_ = targetDB
 	var applied uint64
 	for _, stmt := range iterStatements(string(body)) {

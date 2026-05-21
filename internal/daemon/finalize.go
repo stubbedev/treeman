@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,9 +57,15 @@ func FinalizeWorktree(
 	}
 
 	if len(cfg.Databases) > 0 {
-		if _, err := prepare.Run(ctx, &cfg, repoRoot, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv); err != nil {
+		if _, err := prepare.Run(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv); err != nil {
 			return fmt.Errorf("prepare: %w", err)
 		}
+	}
+
+	// Start (or keep) the per-worktree fsnotify watcher so subsequent
+	// migration edits inside the worktree trigger a prepare rerun.
+	if err := startWorktreeWatcher(ctx, st, repoRoot, wtRoot); err != nil {
+		slog.Warn("start worktree watcher", "wt", wtRoot, "err", err)
 	}
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done",
@@ -98,6 +105,10 @@ func TeardownWorktree(
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_start",
 		"daemon-detached predelete + db teardown + git remove beginning",
 		repoID, wtID, "", 0, nil)
+
+	// Stop the per-worktree fsnotify watcher before the checkout is
+	// removed — otherwise it would log "no such file" on shutdown.
+	st.UnregisterWtWatcher(wtRoot)
 
 	if len(cfg.Hooks.Predelete) > 0 {
 		_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete,

@@ -604,7 +604,7 @@ func runLocalFinalize(
 	if skipPrepare || len(cfg.Databases) == 0 {
 		return nil
 	}
-	outs, err := prepare.Run(ctx, cfg, repoRoot, wtPath, sl, st, repoID, wtID, env)
+	outs, err := prepare.Run(ctx, cfg, wtPath, sl, st, repoID, wtID, env)
 	if err != nil {
 		PrintWarn("prepare failed: %v", err)
 	}

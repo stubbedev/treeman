@@ -1,6 +1,5 @@
 // Package template renders the `{key}` placeholders used by
 // `.treeman.yaml`'s env_scoping.patches and database name_templates.
-// Ported from `crates/treeman-core/src/template.rs`.
 //
 // Known keys:
 //

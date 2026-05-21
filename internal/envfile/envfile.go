@@ -1,7 +1,6 @@
 // Package envfile reads shell-style env files (`.env`,
-// `.env.testing`, etc.). Ported from
-// `crates/treeman-core/src/envfile.rs`. Mirrors the subset of the
-// dotenv spec used by Laravel, Symfony, Node, Python, Ruby, sqlx-cli.
+// `.env.testing`, etc.). Mirrors the subset of the dotenv spec used
+// by Laravel, Symfony, Node, Python, Ruby, sqlx-cli.
 //
 // Supports KEY=VALUE / `export KEY=VALUE`, single/double quoted
 // values, inline `# comment` on unquoted values, and `${OTHER}`

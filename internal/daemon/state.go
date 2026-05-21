@@ -9,16 +9,17 @@ import (
 )
 
 // State holds everything the RPC dispatch needs: the SQLite store,
-// the watcher registry (one entry per registered repo), startup
-// metadata. Equivalent to `crates/treeman-daemon/src/state.rs`'s
-// `DaemonState`. Threaded into RPC handlers as a pointer.
+// the watcher registry (one entry per registered repo + one entry
+// per active worktree), startup metadata. Threaded into RPC handlers
+// as a pointer.
 type State struct {
 	Store         *store.Store
 	StartedAtUnix int64
 	PID           uint32
 
-	mu       sync.Mutex
-	watchers map[string]*WatcherEntry
+	mu          sync.Mutex
+	watchers    map[string]*WatcherEntry
+	wtWatchers  map[string]*WatcherEntry
 }
 
 // WatcherEntry — per-repo watcher placeholder. Phase 10 fills in the
@@ -37,6 +38,7 @@ func NewState(s *store.Store) *State {
 		StartedAtUnix: time.Now().Unix(),
 		PID:           uint32(syscallPid()),
 		watchers:      map[string]*WatcherEntry{},
+		wtWatchers:    map[string]*WatcherEntry{},
 	}
 }
 
@@ -83,6 +85,41 @@ func (st *State) ListWatchers() []WatcherSummary {
 		out = append(out, WatcherSummary{Repo: k, WorktreeCount: v.WorktreeCount})
 	}
 	return out
+}
+
+// HasWtWatcher reports whether a per-worktree fsnotify watcher is
+// currently registered for `wtPath`.
+func (st *State) HasWtWatcher(wtPath string) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	_, ok := st.wtWatchers[wtPath]
+	return ok
+}
+
+// RegisterWtWatcher inserts a per-worktree watcher entry, cancelling
+// and replacing any prior one for the same path.
+func (st *State) RegisterWtWatcher(wtPath string, e *WatcherEntry) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if prev, ok := st.wtWatchers[wtPath]; ok && prev.Cancel != nil {
+		prev.Cancel()
+	}
+	st.wtWatchers[wtPath] = e
+}
+
+// UnregisterWtWatcher cancels + drops a per-worktree watcher.
+func (st *State) UnregisterWtWatcher(wtPath string) bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	e, ok := st.wtWatchers[wtPath]
+	if !ok {
+		return false
+	}
+	if e.Cancel != nil {
+		e.Cancel()
+	}
+	delete(st.wtWatchers, wtPath)
+	return true
 }
 
 // WatcherSummary mirrors `rpc.WatcherSummary` — duplicated to keep

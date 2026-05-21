@@ -1,9 +1,6 @@
 // Command treemand — the treeman daemon. Listens on a unix domain
 // socket, dispatches RPCs, owns per-repo watchers, mirrors events
 // into the SQLite event log.
-//
-// Ported from `crates/treeman-daemon/src/main.rs`. The Rust
-// implementation is the spec.
 package main
 
 import (
@@ -79,10 +76,9 @@ func run() error {
 		0, 0, "", 0, map[string]string{"socket": sockPath})
 
 	// Auto-resume per-repo watchers on boot. Each known repo gets
-	// its fsnotify watcher + binlog replicators re-spawned via the
-	// same path the watcher_start RPC takes. Failures per-repo are
-	// logged + skipped — a missing or moved repo dir shouldn't
-	// abort daemon startup.
+	// its binlog replicators re-spawned via the same path the
+	// watcher_start RPC takes. Failures per-repo are logged + skipped
+	// — a missing or moved repo dir shouldn't abort daemon startup.
 	if paths, err := s.ListRepoPaths(ctx); err == nil {
 		for _, p := range paths {
 			if _, err := os.Stat(p); err != nil {
@@ -94,6 +90,25 @@ func run() error {
 				continue
 			}
 			slog.Info("resumed watcher", "repo", p)
+		}
+	}
+
+	// Auto-resume per-worktree fsnotify watchers. Migrations and
+	// dumps live in the worktree (each linked worktree has its own
+	// branch checkout), so the file watcher is rooted there.
+	if wts, err := s.ListActiveWorktrees(ctx); err == nil {
+		for _, w := range wts {
+			if _, err := os.Stat(w.WorktreePath); err != nil {
+				slog.Warn("resume wt watcher skipped (path missing)",
+					"wt", w.WorktreePath, "err", err)
+				continue
+			}
+			if err := daemon.ResumeWorktreeWatcher(ctx, st, w.RepoPath, w.WorktreePath); err != nil {
+				slog.Warn("resume wt watcher failed",
+					"wt", w.WorktreePath, "err", err)
+				continue
+			}
+			slog.Info("resumed wt watcher", "wt", w.WorktreePath)
 		}
 	}
 

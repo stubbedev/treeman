@@ -1,14 +1,14 @@
 // Package prepare orchestrates the per-worktree bring-up: ensure
 // the source DB exists, optionally load a dump, run the framework's
 // migrate command, snapshot the source for cache reuse, fan out
-// into N paratest clone DBs. Ported from
-// `crates/treeman-prepare/src/lib.rs`.
+// into N paratest clone DBs.
 //
-// Crucially: `repoRoot` here is the MAIN checkout root, NOT the
-// linked-worktree path. The Rust v0.3.x watcher passed the worktree
-// path in by mistake which broke dump-file resolution (dumps live
-// in the main checkout). The Go port forces the caller to be
-// explicit about which root is which.
+// All filesystem reads (migration files, dump file, lockfiles) and
+// the framework-migrate cwd resolve against the WORKTREE root. Each
+// linked worktree carries its own branch checkout, so migrations and
+// dumps land in the worktree's own copy; treating them as worktree-
+// scoped is the only way edits inside a worktree propagate into the
+// scoped source DB + clones.
 package prepare
 
 import (
@@ -89,34 +89,31 @@ func fanOutClones(ctx context.Context, restore cloneRestorer, template string, c
 
 // Run drives prepare for every database declared by cfg.Databases.
 //
-// `mainRepoRoot` is the main-checkout path (dump file lives there;
-// framework migrate runs there). `worktreePath` is the linked
-// worktree path the slug was derived from — used only for the
-// `{slug}` context.
+// `worktreePath` is the linked-worktree checkout root — migration
+// files, dump file, lockfiles, and the framework migrate command all
+// resolve there. The slug used in template rendering also derives
+// from this worktree.
 func Run(
 	ctx context.Context,
 	cfg *config.Config,
-	mainRepoRoot string,
 	worktreePath string,
 	sl slug.Slug,
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
 ) ([]Outcome, error) {
-	ctx2 := context.Background()
-	_ = ctx2
 	tplCtx := template.FromSlug(sl)
 	var outcomes []Outcome
 	for _, d := range cfg.Databases {
 		switch d.Engine {
 		case "mysql", "mariadb", "tidb":
-			o, err := prepareMySQL(ctx, cfg, d, tplCtx, mainRepoRoot, st, repoID, worktreeID, inheritedEnv)
+			o, err := prepareMySQL(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			if err != nil {
 				return outcomes, err
 			}
 			outcomes = append(outcomes, o)
 		case "postgres", "postgresql":
-			o, err := preparePostgres(ctx, cfg, d, tplCtx, mainRepoRoot, st, repoID, worktreeID, inheritedEnv)
+			o, err := preparePostgres(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			if err != nil {
 				return outcomes, err
 			}
@@ -155,7 +152,7 @@ func prepareMySQL(
 	cfg *config.Config,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
-	mainRepoRoot string,
+	worktreePath string,
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
@@ -187,13 +184,13 @@ func prepareMySQL(
 		s := specFromYAML(*d.Migrations)
 		hashMode = string(s.HashMode)
 		if len(s.MigrationDirs) > 0 || len(s.FileGlobs) > 0 {
-			if h, err := framework.MigrationsHash(mainRepoRoot, s); err == nil {
+			if h, err := framework.MigrationsHash(worktreePath, s); err == nil {
 				migrationsHash = h
 			}
 		}
 		lockPaths := make([]string, 0, len(s.Lockfiles))
 		for _, lf := range s.Lockfiles {
-			lockPaths = append(lockPaths, filepath.Join(mainRepoRoot, lf))
+			lockPaths = append(lockPaths, filepath.Join(worktreePath, lf))
 		}
 		if len(lockPaths) > 0 {
 			if h, err := snapshot.LockfileHashesFor(lockPaths); err == nil {
@@ -202,7 +199,7 @@ func prepareMySQL(
 		}
 	}
 	if d.Dump != nil {
-		dp := filepath.Join(mainRepoRoot, d.Dump.Path)
+		dp := filepath.Join(worktreePath, d.Dump.Path)
 		hashes, _ := snapshot.LockfileHashesFor([]string{dp})
 		dumpHash = hashes[filepath.Base(dp)]
 	}
@@ -223,7 +220,7 @@ func prepareMySQL(
 					"template":    rec.TemplateName,
 					"fingerprint": key.Fingerprint(),
 				})
-			clones, err := resolveCloneNames(d.TestClones, tplCtx, mainRepoRoot)
+			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -271,13 +268,13 @@ func prepareMySQL(
 		return Outcome{}, err
 	}
 	if d.Dump != nil {
-		dp := filepath.Join(mainRepoRoot, d.Dump.Path)
+		dp := filepath.Join(worktreePath, d.Dump.Path)
 		if _, err := dumpload.LoadMySQL(ctx, drv.DB, sourceDB, dp); err != nil {
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
 	}
 	if d.Migrations != nil {
-		out, err := runner.Run(ctx, frameworkName, mainRepoRoot, sourceDB, runner.ModeUp, nil, inheritedEnv)
+		out, err := runner.Run(ctx, frameworkName, worktreePath, sourceDB, runner.ModeUp, nil, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
@@ -307,7 +304,7 @@ func prepareMySQL(
 	// logged inside EvictExcess.
 	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
 
-	clones, err := resolveCloneNames(d.TestClones, tplCtx, mainRepoRoot)
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -343,7 +340,7 @@ func preparePostgres(
 	cfg *config.Config,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
-	mainRepoRoot string,
+	worktreePath string,
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
@@ -374,13 +371,13 @@ func preparePostgres(
 		s := specFromYAML(*d.Migrations)
 		hashMode = string(s.HashMode)
 		if len(s.MigrationDirs) > 0 || len(s.FileGlobs) > 0 {
-			if h, err := framework.MigrationsHash(mainRepoRoot, s); err == nil {
+			if h, err := framework.MigrationsHash(worktreePath, s); err == nil {
 				migrationsHash = h
 			}
 		}
 		lockPaths := make([]string, 0, len(s.Lockfiles))
 		for _, lf := range s.Lockfiles {
-			lockPaths = append(lockPaths, filepath.Join(mainRepoRoot, lf))
+			lockPaths = append(lockPaths, filepath.Join(worktreePath, lf))
 		}
 		if len(lockPaths) > 0 {
 			if h, err := snapshot.LockfileHashesFor(lockPaths); err == nil {
@@ -389,7 +386,7 @@ func preparePostgres(
 		}
 	}
 	if d.Dump != nil {
-		dp := filepath.Join(mainRepoRoot, d.Dump.Path)
+		dp := filepath.Join(worktreePath, d.Dump.Path)
 		hashes, _ := snapshot.LockfileHashesFor([]string{dp})
 		dumpHash = hashes[filepath.Base(dp)]
 	}
@@ -417,7 +414,7 @@ func preparePostgres(
 					"template":    rec.TemplateName,
 					"fingerprint": key.Fingerprint(),
 				})
-			clones, err := resolveCloneNames(d.TestClones, tplCtx, mainRepoRoot)
+			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -442,13 +439,13 @@ func preparePostgres(
 		return Outcome{}, err
 	}
 	if d.Dump != nil {
-		dp := filepath.Join(mainRepoRoot, d.Dump.Path)
+		dp := filepath.Join(worktreePath, d.Dump.Path)
 		if _, err := dumpload.LoadPostgres(ctx, drv.DB, sourceDB, dp); err != nil {
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
 	}
 	if d.Migrations != nil {
-		out, err := runner.Run(ctx, frameworkName, mainRepoRoot, sourceDB, runner.ModeUp, nil, inheritedEnv)
+		out, err := runner.Run(ctx, frameworkName, worktreePath, sourceDB, runner.ModeUp, nil, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
@@ -467,7 +464,7 @@ func preparePostgres(
 	})
 	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
 
-	clones, err := resolveCloneNames(d.TestClones, tplCtx, mainRepoRoot)
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -664,8 +661,6 @@ func resolveCloneNames(p *config.TestClonesSpec, tplCtx template.Context, repoRo
 // TeardownDatabases drops every per-worktree namespace declared by
 // cfg.Databases. Errors per-engine are logged + swallowed so a
 // missing redis doesn't block dropping mysql.
-//
-// Ported from `crates/treeman-prepare/src/teardown.rs`.
 func TeardownDatabases(
 	ctx context.Context,
 	cfg *config.Config,

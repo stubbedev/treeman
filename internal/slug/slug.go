@@ -1,12 +1,10 @@
 // Package slug derives a worktree slug from the branch name / path,
-// and exposes the deterministic redis-db indices that the Rust
-// implementation used so worktrees retain their per-engine namespace
-// across the language switch.
+// and exposes deterministic redis-db indices so worktrees retain
+// their per-engine namespace across treeman upgrades.
 //
-// Ported from `crates/treeman-core/src/slug.rs`. The SysV cksum
-// reimplementation matches POSIX `cksum` byte-for-byte so existing
-// `.gwt-postcreate` shell hooks that compute the same redis indices
-// agree with treeman's slugs.
+// The SysV cksum reimplementation matches POSIX `cksum` byte-for-
+// byte so existing `.gwt-postcreate` shell hooks that compute the
+// same redis indices agree with treeman's slugs.
 package slug
 
 import (

@@ -1,6 +1,5 @@
 // Package testfw detects which test framework owns a repo. Drives
-// the paratest clone-count math. Ported from
-// `crates/treeman-migrations/src/testfw.rs`.
+// the paratest clone-count math.
 package testfw
 
 import (

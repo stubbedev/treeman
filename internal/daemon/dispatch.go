@@ -15,8 +15,7 @@ import (
 )
 
 // Dispatch executes one RPC request against the live state, returning
-// the response to send back over the socket. Mirrors the `dispatch`
-// fn in `crates/treeman-daemon/src/main.rs`.
+// the response to send back over the socket.
 //
 // The shutdown channel is closed when a `Shutdown` request fires,
 // signalling the main loop to bail.
@@ -187,12 +186,18 @@ func ResumeRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 	return startRepoWatcher(ctx, st, repoPath)
 }
 
+// ResumeWorktreeWatcher (re)spawns the per-worktree fsnotify watcher
+// for a live worktree on daemon boot. No-op when already registered.
+func ResumeWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath string) error {
+	return startWorktreeWatcher(ctx, st, repoPath, wtPath)
+}
+
 // startRepoWatcher boots one binlog.Replicator goroutine per MySQL
 // source database declared in the repo's .treeman.yaml — if
-// `watcher.binlog.enabled = true`. Filesystem-event watching (the
-// fsnotify side that triggers `prepare` on migration edits) is the
-// deferred bit; the binlog tail covers the high-value case where
-// migrations are applied to the source DB outside treeman.
+// `watcher.binlog.enabled = true`. Filesystem-event watching now
+// lives in `startWorktreeWatcher` (rooted in each worktree's own
+// checkout) because migrations and dumps follow the worktree's
+// branch, not the main repo's.
 //
 // Each replicator runs until the WatcherEntry's cancel is invoked
 // or the daemon shuts down. State tracking lets `watcher_list` /
@@ -249,64 +254,72 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 		}
 	}
 
-	// fsnotify watcher — picks up edits to migration source files
-	// (someone adding a new migration to git) that the binlog can't
-	// see. Dispatches to every active worktree of the repo.
-	fsWatched := false
-	if len(cfg.Watcher.Paths) > 0 {
-		dispatch := makeFSDispatcher(st, repoPath, repoID)
-		w, err := watcher.New(repoPath, cfg.Watcher, dispatch)
-		if err != nil {
-			slog.Warn("fsnotify watcher init", "repo", repoPath, "err", err)
-		} else {
-			go func() {
-				if err := w.Start(wctx); err != nil {
-					slog.Warn("fsnotify watcher exit", "repo", repoPath, "err", err)
-				}
-			}()
-			fsWatched = true
-		}
-	}
-
-	slog.Info("watcher started",
-		"repo", repoPath, "binlog_replicators", binlogReps, "fsnotify", fsWatched)
+	slog.Info("repo watcher started",
+		"repo", repoPath, "binlog_replicators", binlogReps)
 	return nil
 }
 
-// makeFSDispatcher builds a watcher.Dispatcher bound to a repo + its
-// store. Each event is materialised as a `FinalizeWorktree` rerun
-// for every active worktree the repo has — equivalent to a
-// post-prepare refresh.
-func makeFSDispatcher(st *State, repoPath string, repoID int64) watcher.Dispatcher {
+// startWorktreeWatcher spawns one fsnotify watcher rooted in the
+// worktree's checkout. Edits to migration source files (or any path
+// matched by `watcher.paths`) inside the worktree trigger a
+// `FinalizeWorktree` rerun for just that worktree. Idempotent — a
+// second call for the same wtPath is a no-op.
+func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath string) error {
+	if wtPath == "" {
+		return fmt.Errorf("watcher_start: empty worktree_path")
+	}
+	if st.HasWtWatcher(wtPath) {
+		return nil
+	}
+	cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if len(cfg.Watcher.Paths) == 0 {
+		return nil
+	}
+	repoID, err := st.Store.EnsureRepo(ctx, repoPath, filepath.Base(repoPath))
+	if err != nil {
+		return fmt.Errorf("ensure repo: %w", err)
+	}
+
+	wctx, cancel := context.WithCancel(context.Background())
+	entry := &WatcherEntry{
+		RepoPath: repoPath,
+		Cancel:   cancel,
+	}
+
+	dispatch := makeWtFSDispatcher(st, repoPath, repoID, wtPath)
+	w, err := watcher.New(wtPath, cfg.Watcher, dispatch)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("fsnotify watcher init: %w", err)
+	}
+	st.RegisterWtWatcher(wtPath, entry)
+	go func() {
+		if err := w.Start(wctx); err != nil {
+			slog.Warn("fsnotify watcher exit", "wt", wtPath, "err", err)
+		}
+	}()
+	slog.Info("worktree watcher started", "repo", repoPath, "wt", wtPath)
+	return nil
+}
+
+// makeWtFSDispatcher builds a watcher.Dispatcher bound to a single
+// worktree. Each event materialises as a `FinalizeWorktree` rerun
+// for that worktree.
+func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string) watcher.Dispatcher {
 	return func(ctx context.Context, ev watcher.Event) error {
-		rows, err := st.Store.DB.QueryContext(ctx,
-			`SELECT path FROM worktrees WHERE repo_id = ? AND deleted_at IS NULL`, repoID)
-		if err != nil {
-			return fmt.Errorf("watcher dispatch query: %w", err)
-		}
-		defer rows.Close()
-		var paths []string
-		for rows.Next() {
-			var p string
-			if err := rows.Scan(&p); err == nil {
-				paths = append(paths, p)
-			}
-		}
 		_ = st.Store.WriteEvent(ctx, "info", "watcher_fired",
-			fmt.Sprintf("%s (%s) → %d worktrees", ev.Path, ev.Mode, len(paths)),
+			fmt.Sprintf("%s (%s)", ev.Path, ev.Mode),
 			repoID, 0, "", 0, map[string]string{
-				"path": ev.Path, "mode": string(ev.Mode),
+				"path": ev.Path, "mode": string(ev.Mode), "wt": wtPath,
 			})
-		// Reuse FinalizeWorktree which re-runs postcreate + prepare.
-		// Each fires a goroutine internally; this loop is non-
-		// blocking.
-		for _, p := range paths {
-			go func(wt string) {
-				if err := FinalizeWorktree(context.Background(), st, repoPath, wt, nil); err != nil {
-					slog.Warn("watcher-triggered finalize", "wt", wt, "err", err)
-				}
-			}(p)
-		}
+		go func() {
+			if err := FinalizeWorktree(context.Background(), st, repoPath, wtPath, nil); err != nil {
+				slog.Warn("watcher-triggered finalize", "wt", wtPath, "err", err)
+			}
+		}()
 		return nil
 	}
 }
