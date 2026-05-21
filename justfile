@@ -45,7 +45,23 @@ lint:
 test:
     go test ./...
 
-check: lint test sync-flake
+check: lint test sync-schema sync-flake
+
+# Regenerate `schemas/treeman.schema.json` from the current
+# config.Config Go types. Cheap (pure reflection) so we run it on
+# every `just check` to keep the canonical schema URL in sync with
+# the binary on disk. CI asserts no drift on PRs and auto-commits
+# on master pushes.
+sync-schema:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p schemas
+    go run ./cmd/treeman schema dump --out schemas/treeman.schema.json
+    if [ -n "$(git status --porcelain schemas/treeman.schema.json)" ]; then
+        echo "sync-schema: regenerated schemas/treeman.schema.json"
+    else
+        echo "sync-schema: schemas/treeman.schema.json already in sync"
+    fi
 
 clean:
     rm -rf bin/

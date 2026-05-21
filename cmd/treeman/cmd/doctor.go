@@ -155,20 +155,69 @@ func checkConfig(repoRoot string) doctorResult {
 	}
 }
 
+// checkSchema honors any of three install modes:
+//   - repo-local file       (treeman schema install)
+//   - user-global file      (treeman schema install --global)
+//   - upstream URL modeline (treeman schema install --url)
+//
+// The yaml-language-server modeline at the top of `.treeman.yaml`
+// is the source of truth; doctor resolves whatever it points at.
+// When no modeline is set, doctor falls back to probing the
+// repo-local and global file locations so editors still get
+// hinting even if the modeline was hand-removed.
 func checkSchema(repoRoot string) doctorResult {
-	p := filepath.Join(repoRoot, "schemas", "treeman.schema.json")
-	if _, err := os.Stat(p); err != nil {
+	ref := ReadSchemaModeline(repoRoot)
+	if ref != "" {
+		if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+			return doctorResult{
+				Name:   "schema",
+				Status: "ok",
+				Detail: "modeline → " + ref,
+			}
+		}
+		p := ref
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(repoRoot, p)
+		}
+		if _, err := os.Stat(p); err == nil {
+			return doctorResult{
+				Name:   "schema",
+				Status: "ok",
+				Detail: "modeline → " + p,
+			}
+		}
 		return doctorResult{
 			Name:   "schema",
 			Status: "warn",
-			Detail: "schemas/treeman.schema.json not installed",
-			Hint:   "install it for editor autocompletion: treeman schema install",
+			Detail: "modeline points to missing file: " + p,
+			Hint:   "regenerate with: treeman schema install [--global|--url]",
+		}
+	}
+
+	repoPath := filepath.Join(repoRoot, "schemas", "treeman.schema.json")
+	if _, err := os.Stat(repoPath); err == nil {
+		return doctorResult{
+			Name:   "schema",
+			Status: "warn",
+			Detail: repoPath + " (no modeline in .treeman.yaml)",
+			Hint:   "wire it up: treeman schema install",
+		}
+	}
+	if gp, err := GlobalSchemaPath(); err == nil {
+		if _, err := os.Stat(gp); err == nil {
+			return doctorResult{
+				Name:   "schema",
+				Status: "warn",
+				Detail: gp + " (no modeline in .treeman.yaml)",
+				Hint:   "wire it up: treeman schema install --global",
+			}
 		}
 	}
 	return doctorResult{
 		Name:   "schema",
-		Status: "ok",
-		Detail: p,
+		Status: "warn",
+		Detail: "no schema installed",
+		Hint:   "install for editor autocompletion: treeman schema install [--global|--url]",
 	}
 }
 

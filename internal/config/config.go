@@ -8,11 +8,14 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
+	"github.com/invopop/jsonschema"
+	orderedmap "github.com/pb33f/ordered-map/v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -215,6 +218,26 @@ type SingleStep struct {
 	Cwd string `yaml:"cwd,omitempty"`
 }
 
+// JSONSchema overrides the reflection-generated schema so editor
+// hinting accepts both YAML shapes the UnmarshalYAML below decodes:
+// a bare scalar string or a `{ run, cwd }` mapping.
+func (SingleStep) JSONSchema() *jsonschema.Schema {
+	props := orderedmap.New[string, *jsonschema.Schema]()
+	props.Set("run", &jsonschema.Schema{Type: "string"})
+	props.Set("cwd", &jsonschema.Schema{Type: "string"})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string"},
+			{
+				Type:                 "object",
+				Properties:           props,
+				Required:             []string{"run"},
+				AdditionalProperties: jsonschema.FalseSchema,
+			},
+		},
+	}
+}
+
 // UnmarshalYAML accepts either a bare scalar (`"command"`) or a
 // mapping (`{ run: ..., cwd: ... }`).
 func (s *SingleStep) UnmarshalYAML(node *yaml.Node) error {
@@ -249,6 +272,51 @@ type HookEntry struct {
 	ComposeService string
 	ComposeProject string
 	Engine         string
+}
+
+// JSONSchema overrides the reflection-generated schema so editor
+// hinting accepts every shape UnmarshalYAML below decodes: bare
+// command string, `{ run, cwd, ... }` mapping, `{ steps, ... }`
+// group mapping, or a sequence of single-step children.
+func (HookEntry) JSONSchema() *jsonschema.Schema {
+	addMeta := func(p *orderedmap.OrderedMap[string, *jsonschema.Schema]) {
+		for _, k := range []string{
+			"in_container", "container",
+			"compose_service", "compose_project",
+			"container_engine", "engine",
+		} {
+			p.Set(k, &jsonschema.Schema{Type: "string"})
+		}
+	}
+
+	runProps := orderedmap.New[string, *jsonschema.Schema]()
+	runProps.Set("run", &jsonschema.Schema{Type: "string"})
+	runProps.Set("cwd", &jsonschema.Schema{Type: "string"})
+	addMeta(runProps)
+
+	step := SingleStep{}.JSONSchema()
+	stepsProps := orderedmap.New[string, *jsonschema.Schema]()
+	stepsProps.Set("steps", &jsonschema.Schema{Type: "array", Items: step})
+	addMeta(stepsProps)
+
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string"},
+			{
+				Type:                 "object",
+				Properties:           runProps,
+				Required:             []string{"run"},
+				AdditionalProperties: jsonschema.FalseSchema,
+			},
+			{
+				Type:                 "object",
+				Properties:           stepsProps,
+				Required:             []string{"steps"},
+				AdditionalProperties: jsonschema.FalseSchema,
+			},
+			{Type: "array", Items: step},
+		},
+	}
 }
 
 // UnmarshalYAML decides which of the shapes applies based on the
@@ -400,6 +468,18 @@ type TestClonesSpec struct {
 type ClonesSetting struct {
 	Auto  bool
 	Fixed uint32
+}
+
+// JSONSchema overrides the reflection-generated schema. The YAML
+// shape is `auto` (string literal) or a non-negative integer; the
+// reflected `{Auto, Fixed}` struct shape is an internal detail.
+func (ClonesSetting) JSONSchema() *jsonschema.Schema {
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Enum: []any{"auto"}},
+			{Type: "integer", Minimum: json.Number("0")},
+		},
+	}
 }
 
 // UnmarshalYAML parses `auto` or a non-negative integer.

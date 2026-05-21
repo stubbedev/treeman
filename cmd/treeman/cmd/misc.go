@@ -303,16 +303,37 @@ func isNil(v any) bool {
 	return s == "<nil>" || s == ""
 }
 
+// SchemaURL is the canonical upstream URL for the generated JSON
+// Schema. Used by `treeman init` (modeline default) and by
+// `treeman schema install --url`.
+const SchemaURL = "https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json"
+
+// GlobalSchemaPath returns the OS-conventional user-global path for
+// the treeman JSON Schema (`$XDG_CONFIG_HOME/treeman/...` on Linux,
+// `~/Library/Application Support/treeman/...` on macOS, etc.).
+func GlobalSchemaPath() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "treeman", "treeman.schema.json"), nil
+}
+
 // SchemaCmd — `treeman schema {dump,install}`. Generates the
 // JSON Schema for `.treeman.yaml` directly from the config.Config
 // type via reflection.
 //
-//	dump          → write schema to stdout
-//	dump --out P  → write schema to file P
-//	install       → write schema to `schemas/treeman.schema.json`
-//	                relative to the current repo root + add a
-//	                yaml-language-server modeline to .treeman.yaml
-//	                if one is missing
+//	dump             → write schema to stdout
+//	dump --out P     → write schema to file P
+//	install          → write schema to `<repo>/schemas/treeman.schema.json`
+//	install --global → write schema to the user-global path (XDG)
+//	install --url    → don't write a file; point the modeline at the
+//	                   upstream URL on GitHub
+//
+// `install` always updates (or inserts) the
+// `# yaml-language-server: $schema=...` modeline at the top of
+// `.treeman.yaml` to match the chosen target so editor hinting
+// picks the right source without manual edits.
 func SchemaCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "schema",
@@ -335,29 +356,61 @@ func SchemaCmd() *cli.Command {
 			},
 			{
 				Name: "install",
-				Action: func(ctx context.Context, c *cli.Command) error {
-					cwd, _ := os.Getwd()
-					repoRoot, err := DiscoverRepoRoot(cwd)
-					if err != nil {
-						return err
-					}
-					b, err := renderConfigSchema()
-					if err != nil {
-						return err
-					}
-					dst := filepath.Join(repoRoot, "schemas", "treeman.schema.json")
-					if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-						return err
-					}
-					if err := os.WriteFile(dst, b, 0o644); err != nil {
-						return err
-					}
-					PrintOK("wrote %s", dst)
-					return nil
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "global", Usage: "write to the user-global path instead of <repo>/schemas/"},
+					&cli.BoolFlag{Name: "url", Usage: "skip the file write; point the modeline at the upstream URL"},
 				},
+				Action: schemaInstall,
 			},
 		},
 	}
+}
+
+func schemaInstall(ctx context.Context, c *cli.Command) error {
+	if c.Bool("global") && c.Bool("url") {
+		return fmt.Errorf("--global and --url are mutually exclusive")
+	}
+	cwd, _ := os.Getwd()
+	repoRoot, err := DiscoverRepoRoot(cwd)
+	if err != nil {
+		return err
+	}
+	var target string
+	switch {
+	case c.Bool("url"):
+		target = SchemaURL
+	case c.Bool("global"):
+		gp, err := GlobalSchemaPath()
+		if err != nil {
+			return err
+		}
+		target = gp
+	default:
+		target = filepath.Join(repoRoot, "schemas", "treeman.schema.json")
+	}
+	if !c.Bool("url") {
+		b, err := renderConfigSchema()
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, b, 0o644); err != nil {
+			return err
+		}
+		PrintOK("wrote %s", target)
+	} else {
+		PrintOK("using upstream URL: %s", target)
+	}
+	changed, err := SetSchemaModeline(repoRoot, target)
+	if err != nil {
+		return err
+	}
+	if changed {
+		PrintOK("updated modeline in .treeman.yaml → %s", target)
+	}
+	return nil
 }
 
 func renderConfigSchema() ([]byte, error) {
@@ -368,6 +421,63 @@ func renderConfigSchema() ([]byte, error) {
 	}
 	s := r.Reflect(&config.Config{})
 	return json.MarshalIndent(s, "", "  ")
+}
+
+// ReadSchemaModeline returns the $schema target declared by the
+// first `# yaml-language-server: $schema=...` comment line in
+// `<repo>/.treeman.yaml`. Returns "" when the file or modeline is
+// absent.
+func ReadSchemaModeline(repoRoot string) string {
+	b, err := os.ReadFile(filepath.Join(repoRoot, ".treeman.yaml"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		trim := strings.TrimSpace(line)
+		if !strings.HasPrefix(trim, "#") {
+			continue
+		}
+		body := strings.TrimSpace(strings.TrimPrefix(trim, "#"))
+		if !strings.HasPrefix(body, "yaml-language-server:") {
+			continue
+		}
+		for _, tok := range strings.Fields(strings.TrimPrefix(body, "yaml-language-server:")) {
+			if v, ok := strings.CutPrefix(tok, "$schema="); ok {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// SetSchemaModeline ensures the yaml-language-server modeline at the
+// top of `<repo>/.treeman.yaml` points at `target`. Returns
+// (changed, err). When `.treeman.yaml` is missing the call is a
+// no-op (false, nil) — `treeman init` is responsible for the
+// initial scaffold.
+func SetSchemaModeline(repoRoot, target string) (bool, error) {
+	p := filepath.Join(repoRoot, ".treeman.yaml")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	newLine := "# yaml-language-server: $schema=" + target
+	lines := strings.Split(string(raw), "\n")
+	for i, line := range lines {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "# yaml-language-server:") {
+			if line == newLine {
+				return false, nil
+			}
+			lines[i] = newLine
+			return true, os.WriteFile(p, []byte(strings.Join(lines, "\n")), 0o644)
+		}
+	}
+	out := newLine + "\n" + string(raw)
+	return true, os.WriteFile(p, []byte(out), 0o644)
 }
 
 // DaemonCmd — `treeman daemon {start,stop,status,install,uninstall}`.
@@ -820,7 +930,7 @@ func renderInitTemplate(cwd string) string {
 	detected := framework.DefaultRegistry().DetectAll(cwd)
 
 	var b strings.Builder
-	b.WriteString("# yaml-language-server: $schema=https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json\n")
+	b.WriteString("# yaml-language-server: $schema=" + SchemaURL + "\n")
 	fmt.Fprintf(&b, "repo:\n  name: %s\n", name)
 	b.WriteString("worktrees:\n  root: .worktrees\n  links:\n    - .env\n")
 

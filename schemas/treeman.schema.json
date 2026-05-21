@@ -1,0 +1,697 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "BinlogConfig": {
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "server_id": {
+          "type": "integer"
+        },
+        "flavor": {
+          "type": "string",
+          "enum": [
+            "mysql",
+            "mariadb"
+          ]
+        },
+        "apply_ddl": {
+          "type": "boolean"
+        },
+        "apply_dml": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "ClonesSetting": {
+      "properties": {
+        "Auto": {
+          "type": "boolean"
+        },
+        "Fixed": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "Auto",
+        "Fixed"
+      ]
+    },
+    "ConnectionsConfig": {
+      "properties": {
+        "mysql": {
+          "$ref": "#/$defs/MysqlConn"
+        },
+        "postgres": {
+          "$ref": "#/$defs/PostgresConn"
+        },
+        "mongodb": {
+          "$ref": "#/$defs/MongoConn"
+        },
+        "redis": {
+          "$ref": "#/$defs/RedisConn"
+        },
+        "elasticsearch": {
+          "$ref": "#/$defs/EsConn"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "CustomFramework": {
+      "properties": {
+        "markers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "migration_dirs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "file_pattern": {
+          "type": "string"
+        },
+        "hash_mode": {
+          "type": "string",
+          "enum": [
+            "filename",
+            "checksum"
+          ]
+        },
+        "on_modify": {
+          "type": "string",
+          "enum": [
+            "rebuild",
+            "delta"
+          ]
+        },
+        "lockfiles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "engine_hint": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "markers",
+        "migration_dirs",
+        "file_pattern"
+      ]
+    },
+    "DaemonConfig": {
+      "properties": {
+        "socket": {
+          "type": "string"
+        },
+        "log_level": {
+          "type": "string"
+        },
+        "db_log_path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "DatabaseConfig": {
+      "properties": {
+        "engine": {
+          "type": "string",
+          "enum": [
+            "mysql",
+            "mariadb",
+            "tidb",
+            "postgres",
+            "postgresql",
+            "mongodb",
+            "redis",
+            "elasticsearch",
+            "opensearch"
+          ]
+        },
+        "name_template": {
+          "type": "string"
+        },
+        "dump": {
+          "$ref": "#/$defs/DumpSpec"
+        },
+        "migrations": {
+          "$ref": "#/$defs/MigrationSpec"
+        },
+        "test_clones": {
+          "$ref": "#/$defs/TestClonesSpec"
+        },
+        "namespaces": {
+          "$ref": "#/$defs/Namespaces"
+        },
+        "fanout": {
+          "type": "integer",
+          "maximum": 64,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "engine"
+      ]
+    },
+    "DumpSpec": {
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "optional": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "path"
+      ]
+    },
+    "EnvPatch": {
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "template": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "key",
+        "template"
+      ]
+    },
+    "EnvScoping": {
+      "properties": {
+        "files": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sources": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "skip_worktree": {
+          "type": "boolean"
+        },
+        "patches": {
+          "items": {
+            "$ref": "#/$defs/EnvPatch"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "EsConn": {
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "container": {
+          "type": "string"
+        },
+        "compose_service": {
+          "type": "string"
+        },
+        "compose_project": {
+          "type": "string"
+        },
+        "container_engine": {
+          "type": "string"
+        },
+        "container_network": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "url"
+      ]
+    },
+    "HookEntry": {
+      "properties": {
+        "Steps": {
+          "items": {
+            "$ref": "#/$defs/SingleStep"
+          },
+          "type": "array"
+        },
+        "Container": {
+          "type": "string"
+        },
+        "ComposeService": {
+          "type": "string"
+        },
+        "ComposeProject": {
+          "type": "string"
+        },
+        "Engine": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "Steps",
+        "Container",
+        "ComposeService",
+        "ComposeProject",
+        "Engine"
+      ]
+    },
+    "HooksConfig": {
+      "properties": {
+        "precreate": {
+          "items": {
+            "$ref": "#/$defs/SingleStep"
+          },
+          "type": "array"
+        },
+        "postcreate": {
+          "items": {
+            "$ref": "#/$defs/HookEntry"
+          },
+          "type": "array"
+        },
+        "predelete": {
+          "items": {
+            "$ref": "#/$defs/HookEntry"
+          },
+          "type": "array"
+        },
+        "postdelete": {
+          "items": {
+            "$ref": "#/$defs/HookEntry"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "MigrationSpec": {
+      "properties": {
+        "framework": {
+          "type": "string"
+        },
+        "migration_dirs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "file_globs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "lockfiles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hash_mode": {
+          "type": "string",
+          "enum": [
+            "filename",
+            "checksum"
+          ]
+        },
+        "on_modify": {
+          "type": "string",
+          "enum": [
+            "rebuild",
+            "delta"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "framework"
+      ]
+    },
+    "MongoConn": {
+      "properties": {
+        "uri": {
+          "type": "string"
+        },
+        "container": {
+          "type": "string"
+        },
+        "compose_service": {
+          "type": "string"
+        },
+        "compose_project": {
+          "type": "string"
+        },
+        "container_engine": {
+          "type": "string"
+        },
+        "container_network": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "uri"
+      ]
+    },
+    "MysqlConn": {
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "user": {
+          "type": "string"
+        },
+        "password_env": {
+          "type": "string"
+        },
+        "pool_max": {
+          "type": "integer"
+        },
+        "container": {
+          "type": "string"
+        },
+        "compose_service": {
+          "type": "string"
+        },
+        "compose_project": {
+          "type": "string"
+        },
+        "container_engine": {
+          "type": "string"
+        },
+        "container_network": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "user"
+      ]
+    },
+    "Namespaces": {
+      "properties": {
+        "db_index_template": {
+          "type": "string"
+        },
+        "index_prefix_template": {
+          "type": "string"
+        },
+        "prefix_template": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "PostgresConn": {
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "user": {
+          "type": "string"
+        },
+        "password_env": {
+          "type": "string"
+        },
+        "pool_max": {
+          "type": "integer"
+        },
+        "container": {
+          "type": "string"
+        },
+        "compose_service": {
+          "type": "string"
+        },
+        "compose_project": {
+          "type": "string"
+        },
+        "container_engine": {
+          "type": "string"
+        },
+        "container_network": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "user"
+      ]
+    },
+    "RedisConn": {
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "container": {
+          "type": "string"
+        },
+        "compose_service": {
+          "type": "string"
+        },
+        "compose_project": {
+          "type": "string"
+        },
+        "container_engine": {
+          "type": "string"
+        },
+        "container_network": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "url"
+      ]
+    },
+    "RepoBlock": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name"
+      ]
+    },
+    "RetentionConfig": {
+      "properties": {
+        "cap_per_repo": {
+          "type": "integer"
+        },
+        "keep_per_source": {
+          "type": "integer"
+        },
+        "max_age_days": {
+          "type": "integer"
+        },
+        "max_total_gb": {
+          "type": "integer"
+        },
+        "gc_interval_minutes": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "SingleStep": {
+      "properties": {
+        "run": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "run"
+      ]
+    },
+    "SlugRules": {
+      "properties": {
+        "override": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "SnapshotsConfig": {
+      "properties": {
+        "cache_dir": {
+          "type": "string"
+        },
+        "retention": {
+          "$ref": "#/$defs/RetentionConfig"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "TestClonesSpec": {
+      "properties": {
+        "clones": {
+          "$ref": "#/$defs/ClonesSetting"
+        },
+        "name_template": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name_template"
+      ]
+    },
+    "WatcherConfig": {
+      "properties": {
+        "paths": {
+          "items": {
+            "$ref": "#/$defs/WatcherPath"
+          },
+          "type": "array"
+        },
+        "debounce_ms": {
+          "type": "integer"
+        },
+        "binlog": {
+          "$ref": "#/$defs/BinlogConfig"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "WatcherPath": {
+      "properties": {
+        "glob": {
+          "type": "string"
+        },
+        "on": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "delta",
+            "rebuild"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "glob"
+      ]
+    },
+    "WorktreesConfig": {
+      "properties": {
+        "root": {
+          "type": "string"
+        },
+        "links": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "async_create": {
+          "type": "boolean"
+        },
+        "async_delete": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    }
+  },
+  "properties": {
+    "daemon": {
+      "$ref": "#/$defs/DaemonConfig"
+    },
+    "connections": {
+      "$ref": "#/$defs/ConnectionsConfig"
+    },
+    "snapshots": {
+      "$ref": "#/$defs/SnapshotsConfig"
+    },
+    "repo": {
+      "$ref": "#/$defs/RepoBlock"
+    },
+    "slug": {
+      "$ref": "#/$defs/SlugRules"
+    },
+    "worktrees": {
+      "$ref": "#/$defs/WorktreesConfig"
+    },
+    "env_scoping": {
+      "$ref": "#/$defs/EnvScoping"
+    },
+    "databases": {
+      "items": {
+        "$ref": "#/$defs/DatabaseConfig"
+      },
+      "type": "array"
+    },
+    "hooks": {
+      "$ref": "#/$defs/HooksConfig"
+    },
+    "watcher": {
+      "$ref": "#/$defs/WatcherConfig"
+    },
+    "frameworks": {
+      "additionalProperties": {
+        "$ref": "#/$defs/CustomFramework"
+      },
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "type": "object"
+}
