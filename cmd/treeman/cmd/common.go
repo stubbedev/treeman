@@ -63,3 +63,89 @@ func PrintHint(format string, args ...any) { ui.Hint(format, args...) }
 
 // Ctx returns a background context (no per-CLI cancellation today).
 func Ctx() context.Context { return context.Background() }
+
+// SuggestNearestCommands returns the up-to-`max` subcommand names
+// in `commands` that are closest to `typed` by Levenshtein
+// distance. Only entries within an edit-distance budget of 3 (or
+// half the length of `typed`, whichever is larger) are returned —
+// the goal is "did you mean", not "show me random commands".
+//
+// Aliases are considered alongside primary names so `treeman
+// worktreee` still suggests `wt` if that's closer.
+func SuggestNearestCommands(typed string, commands []string, max int) []string {
+	type scored struct {
+		name string
+		d    int
+	}
+	budget := 3
+	if half := len(typed) / 2; half > budget {
+		budget = half
+	}
+	out := make([]scored, 0, len(commands))
+	for _, name := range commands {
+		d := levenshtein(typed, name)
+		if d <= budget {
+			out = append(out, scored{name, d})
+		}
+	}
+	// Insertion sort — set is tiny.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].d < out[j-1].d; j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	if max > 0 && len(out) > max {
+		out = out[:max]
+	}
+	names := make([]string, len(out))
+	for i, s := range out {
+		names[i] = s.name
+	}
+	return names
+}
+
+// levenshtein returns the edit distance between a and b. Standard
+// two-row DP; case-folded so `WT` vs `wt` distance is 0.
+func levenshtein(a, b string) int {
+	la, lb := len(a), len(b)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+	prev := make([]int, lb+1)
+	curr := make([]int, lb+1)
+	for j := 0; j <= lb; j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= la; i++ {
+		curr[0] = i
+		for j := 1; j <= lb; j++ {
+			cost := 1
+			if asciiFold(a[i-1]) == asciiFold(b[j-1]) {
+				cost = 0
+			}
+			del := prev[j] + 1
+			ins := curr[j-1] + 1
+			sub := prev[j-1] + cost
+			m := del
+			if ins < m {
+				m = ins
+			}
+			if sub < m {
+				m = sub
+			}
+			curr[j] = m
+		}
+		prev, curr = curr, prev
+	}
+	return prev[lb]
+}
+
+func asciiFold(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + 32
+	}
+	return b
+}

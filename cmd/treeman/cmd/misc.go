@@ -384,7 +384,13 @@ func DaemonCmd() *cli.Command {
 				Action: daemonStatus,
 			},
 			{Name: "install", Action: daemonInstall},
-			{Name: "uninstall", Action: daemonUninstall},
+			{
+				Name: "uninstall",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip the confirmation prompt"},
+				},
+				Action: daemonUninstall,
+			},
 		},
 	}
 }
@@ -504,6 +510,11 @@ func daemonInstall(ctx context.Context, c *cli.Command) error {
 }
 
 func daemonUninstall(ctx context.Context, c *cli.Command) error {
+	if !c.Bool("yes") {
+		if !ui.Confirm("remove the treemand systemd/launchd auto-start unit?") {
+			return fmt.Errorf("aborted")
+		}
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return daemonUninstallLaunchd(ctx)
@@ -722,16 +733,32 @@ func InitCmd() *cli.Command {
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			cwd, _ := os.Getwd()
+			detected := framework.DefaultRegistry().DetectAll(cwd)
 			target, created, body, err := InitTreemanYAML(cwd, c.Bool("force"))
 			if err != nil {
 				return err
 			}
 			if c.Bool("json") {
+				names := make([]string, 0, len(detected))
+				for _, s := range detected {
+					names = append(names, s.Name)
+				}
 				return jsonStream(map[string]any{
-					"path":    target,
-					"created": created,
-					"bytes":   len(body),
+					"path":     target,
+					"created":  created,
+					"bytes":    len(body),
+					"detected": names,
 				})
+			}
+			if len(detected) > 0 {
+				names := make([]string, 0, len(detected))
+				for _, s := range detected {
+					names = append(names, s.Name)
+				}
+				PrintInfo("detected: %s", strings.Join(names, ", "))
+			} else {
+				PrintWarn("no migration framework detected — the databases: block was left commented out")
+				PrintHint("see `treeman fw list` for built-in presets, or author databases: by hand")
 			}
 			PrintOK("wrote %s", target)
 			PrintHint("review the generated databases:/hooks: blocks before first create")

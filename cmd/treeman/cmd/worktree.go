@@ -239,7 +239,18 @@ Examples:
 				}
 				fmt.Printf("precreate: exit=%d\n", out.AggregateExitCode)
 				if out.AggregateExitCode != 0 {
-					return fmt.Errorf("precreate failed")
+					// Surface the first failing group so the user
+					// gets a log path and exit code without having
+					// to grep .treeman-hooks/ by hand.
+					for _, g := range out.Groups {
+						if g.ExitCode != 0 {
+							if g.LogPath != "" {
+								return fmt.Errorf("precreate failed (exit %d) — see %s", g.ExitCode, g.LogPath)
+							}
+							return fmt.Errorf("precreate failed (exit %d): %s", g.ExitCode, g.Command)
+						}
+					}
+					return fmt.Errorf("precreate failed (aggregate exit %d)", out.AggregateExitCode)
 				}
 			}
 
@@ -322,6 +333,7 @@ Examples:
 			&cli.StringFlag{Name: "repo"},
 			&cli.BoolFlag{Name: "force", Aliases: []string{"f"}},
 			&cli.BoolFlag{Name: "foreground", Usage: "force fg execution of predelete + teardown + git remove"},
+			&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip the confirmation prompt"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
@@ -364,6 +376,16 @@ Examples:
 				return err
 			}
 			env := CaptureInheritedEnv()
+
+			// Destructive: predelete hooks + DROP DATABASE × N +
+			// git worktree remove. Confirm with the user on a TTY;
+			// scripts and `--yes` skip the prompt.
+			if !c.Bool("yes") {
+				q := fmt.Sprintf("delete worktree %s and drop its databases?", wtPath)
+				if !ui.Confirm(q) {
+					return fmt.Errorf("aborted")
+				}
+			}
 
 			// On daemon failure we don't run teardown synchronously
 			// any more — DROP DATABASE × N + git worktree remove on a
@@ -563,16 +585,17 @@ func wtList() *cli.Command {
 			}
 			defer rows.Close()
 			type wtRow struct {
-				ID         int64  `json:"id"`
-				Slug       string `json:"slug"`
-				Branch     string `json:"branch"`
-				Path       string `json:"path"`
-				HeadTs     int64  `json:"head_ts,omitempty"`
-				VisitedTs  int64  `json:"visited_ts,omitempty"`
-				Status     string `json:"status,omitempty"`
-				Dirty      bool   `json:"dirty,omitempty"`
-				Unpushed   bool   `json:"unpushed,omitempty"`
-				FinalState string `json:"state,omitempty"`
+				ID          int64  `json:"id"`
+				Slug        string `json:"slug"`
+				Branch      string `json:"branch"`
+				Path        string `json:"path"`
+				HeadTs      int64  `json:"head_ts,omitempty"`
+				VisitedTs   int64  `json:"visited_ts,omitempty"`
+				Status      string `json:"status,omitempty"`
+				StatusError string `json:"status_error,omitempty"`
+				Dirty       bool   `json:"dirty,omitempty"`
+				Unpushed    bool   `json:"unpushed,omitempty"`
+				FinalState  string `json:"state,omitempty"`
 			}
 			var all []wtRow
 			for rows.Next() {
@@ -596,9 +619,20 @@ func wtList() *cli.Command {
 					r.HeadTs = headCommitTs(r.Path)
 				}
 				if withStatus || c.Bool("json") {
-					r.Dirty, _ = worktreeDirty(r.Path)
-					r.Unpushed, _ = gitenv.HasUnpushedCommits(r.Path)
-					r.Status = statusLabel(r.Dirty, r.Unpushed)
+					dirty, dErr := worktreeDirty(r.Path)
+					unpushed, uErr := gitenv.HasUnpushedCommits(r.Path)
+					r.Dirty = dirty
+					r.Unpushed = unpushed
+					switch {
+					case dErr != nil:
+						r.Status = "?"
+						r.StatusError = dErr.Error()
+					case uErr != nil:
+						r.Status = "?"
+						r.StatusError = uErr.Error()
+					default:
+						r.Status = statusLabel(dirty, unpushed)
+					}
 				}
 				if withState || c.Bool("json") {
 					r.FinalState = finalizeStateShort(ctx, st, r.ID)
@@ -626,10 +660,16 @@ func wtList() *cli.Command {
 			}
 			headers = append(headers, "LAST", "PATH")
 			tbl := ui.NewTable(headers...)
+			anyStatusErr := false
 			for _, r := range all {
 				cells := []string{ui.Dim(fmt.Sprintf("%d", r.ID)), ui.Cyan(r.Slug), r.Branch}
 				if withStatus {
-					cells = append(cells, colorStatus(r.Dirty, r.Unpushed))
+					if r.StatusError != "" {
+						anyStatusErr = true
+						cells = append(cells, ui.Yellow("?"))
+					} else {
+						cells = append(cells, colorStatus(r.Dirty, r.Unpushed))
+					}
 				}
 				if withState {
 					cells = append(cells, r.FinalState)
@@ -638,6 +678,9 @@ func wtList() *cli.Command {
 				tbl.Row(cells...)
 			}
 			tbl.Render(nil)
+			if anyStatusErr {
+				ui.Hint("%s", "STATUS '?' = git status failed; use --json for the per-row error")
+			}
 			return nil
 		},
 	}
@@ -1101,7 +1144,12 @@ func wtBack() *cli.Command {
 			// Delegate to wt delete to keep teardown logic in one
 			// place. Errors are surfaced on stderr; we don't exit
 			// non-zero because the caller already changed directory.
-			argv := []string{"delete", wtRoot, "--repo", repoRoot}
+			// --yes is passed: wt back has already verified the
+			// worktree is clean / not ahead of upstream above, and
+			// the caller has already cd'd to repoRoot so an
+			// interactive prompt would arrive after the cd and
+			// confuse the user.
+			argv := []string{"delete", "--yes", wtRoot, "--repo", repoRoot}
 			if c.Bool("force") {
 				argv = append(argv, "--force")
 			}

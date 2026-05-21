@@ -235,6 +235,23 @@ bypass the pager.
 and `treeman doctor` — emits one object (or one per row) suitable
 for `jq` consumption.
 
+### Environment variables
+
+| Variable | Effect | Default |
+|---|---|---|
+| `NO_COLOR` | Disable ANSI color when non-empty. | — |
+| `FORCE_COLOR` / `CLICOLOR_FORCE` | Force ANSI color even when stdout is piped. | — |
+| `TERM=dumb` | Disable ANSI color regardless of TTY detection. | — |
+| `LANG` / `LC_ALL` / `LC_CTYPE` | Non-UTF-8 locale falls back to ASCII symbols (`[ok]`, `[x]`, `->`). | host locale |
+| `PAGER` | Pager binary for long output. Set empty to disable. | `less -FRX` |
+| `TREEMAN_NO_PAGER=1` | Globally disable paging. | — |
+| `XDG_DATA_HOME` | Root for the SQLite event log (`<XDG_DATA_HOME>/treeman/treeman.db`). | `~/.local/share` |
+| `XDG_RUNTIME_DIR` | Root for the daemon's unix socket (`<XDG_RUNTIME_DIR>/treeman.sock`). | `~/.cache` fallback |
+
+All variables are read at process start; restart the daemon
+(`treeman daemon stop && treeman daemon start`) after changing
+`XDG_*` to relocate state.
+
 ---
 
 ## Configuration

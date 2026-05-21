@@ -140,7 +140,7 @@ func logsGrep() *cli.Command {
 			if useRegex {
 				re, err = regexp.Compile(pattern)
 				if err != nil {
-					return fmt.Errorf("invalid regex: %w", err)
+					return fmt.Errorf("invalid regex %q: %w", pattern, err)
 				}
 			} else {
 				// Push the substring into SQL so we don't drag the
@@ -236,7 +236,7 @@ func logsHooks() *cli.Command {
 			}
 			wtID, _ := st.LookupWorktreeID(ctx, repoID, name)
 			if wtID == 0 {
-				return fmt.Errorf("no worktree matches %q", name)
+				return fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
 			}
 			runs, err := st.QueryHookRuns(ctx, wtID, int(c.Int("n")))
 			if err != nil {

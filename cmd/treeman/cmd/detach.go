@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -46,7 +47,20 @@ func ensureDaemon(ctx context.Context) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("daemon did not respond within 2s")
+	return fmt.Errorf("daemon did not respond within 2s — %s", daemonDebugHint())
+}
+
+// daemonDebugHint returns a one-liner pointing the user at the
+// right log surface for the current platform so a stuck `ensure
+// daemon` call gives them somewhere to look. Kept terse so it
+// fits on a single error line.
+func daemonDebugHint() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "check `log show --predicate 'process == \"treemand\"' --last 5m` and run `treeman doctor`"
+	default:
+		return "check `journalctl --user -u treemand -n 50` and run `treeman doctor`"
+	}
 }
 
 // detachLocalFinalize spawns `treeman wt finalize --local <wtPath>`
