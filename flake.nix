@@ -15,10 +15,12 @@
           pname = "treeman";
           version = "1.0.0-dev";
           src = ./.;
-          # `vendorHash = null` because go.sum + Go module proxy are
-          # the authoritative dep source. Update to a fixed hash if
-          # nix sandbox builds need to vendor offline.
-          vendorHash = null;
+          # buildGoModule fetches Go deps through the module proxy and
+          # hashes the resulting vendor tree; `vendorHash` pins that
+          # hash so the sandboxed build is reproducible. Bump after
+          # any `go get` / `go mod tidy` that changes go.sum — `nix
+          # build` will print the expected hash on mismatch.
+          vendorHash = "sha256-XUKL69CzzlCaUS9vTHG0iNwBcu6yEILcTVJ+0s2t5vY=";
           subPackages = [ "cmd/treeman" "cmd/treemand" ];
           ldflags = [
             "-s"
