@@ -4,3 +4,9 @@
 
 # Go build output
 /bin/
+
+# Stray top-level binaries — `just build` emits to ./bin/, never the
+# repo root. Committed by accident once (975589c); ignore future
+# strays.
+/treeman
+/treemand
