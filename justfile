@@ -48,6 +48,49 @@ nix-build:
 nix-check:
     nix flake check --print-build-logs
 
+# Rewrite flake.nix `vendorHash` to match the current go.sum and
+# bump `version` + the linker -X flag. With no argument, version is
+# read from `git describe --tags --always --dirty`. With an argument
+# (used by the release recipe), version is set to that literal.
+#
+# The hash sync works by: (1) overwriting vendorHash with a sentinel,
+# (2) running `nix build` which prints the actual hash on mismatch,
+# (3) parsing that hash and writing it back.
+sync-flake version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION="{{version}}"
+    if [ -z "$VERSION" ]; then
+        VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+        VERSION=${VERSION#v}
+    fi
+    SENTINEL="sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    # Stamp the sentinel so `nix build` reports the expected hash.
+    sed -i -E 's|^(\s*vendorHash = )"sha256-[^"]*";|\1"'"$SENTINEL"'";|' flake.nix
+    set +e
+    OUT=$(nix build .#treeman --no-link 2>&1)
+    set -e
+    NEW_HASH=$(printf '%s\n' "$OUT" | awk '/got:[[:space:]]*sha256-/ {print $2; exit}')
+    if [ -z "$NEW_HASH" ]; then
+        # Sentinel already matched the real hash — pull it back from
+        # what we just wrote (nothing to change for vendorHash).
+        NEW_HASH="$SENTINEL"
+        # But if nix build genuinely failed for some other reason,
+        # surface that error.
+        if ! printf '%s\n' "$OUT" | grep -q "hash mismatch\|all checks passed\|/nix/store/"; then
+            echo "$OUT" >&2
+            echo "sync-flake: nix build failed with no hash to capture" >&2
+            exit 1
+        fi
+    fi
+    sed -i -E 's|^(\s*vendorHash = )"sha256-[^"]*";|\1"'"$NEW_HASH"'";|' flake.nix
+    # Version + ldflags string.
+    sed -i -E 's|^(\s*version = )"[^"]*";|\1"'"$VERSION"'";|' flake.nix
+    sed -i -E 's|(-X github.com/stubbedev/treeman/internal/version.Version=)[^"]*|\1'"$VERSION"'|' flake.nix
+    echo "sync-flake: vendorHash=$NEW_HASH version=$VERSION"
+    # Final sanity: a real build must pass with the new hash.
+    nix build .#treeman --no-link
+
 # ─────────────────────────── Release ───────────────────────────
 
 release-preview:
@@ -99,6 +142,15 @@ _release bump:
         patch) NEW="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
         *) echo "unknown bump kind: {{bump}}"; exit 1 ;;
     esac
+    # Always sync flake.nix vendorHash + version BEFORE tagging.
+    # Even when go.sum hasn't changed, the version + ldflags strings
+    # must reflect v${NEW} or `nix profile install` will report a
+    # stale version. sync-flake re-validates the build at the end.
+    just sync-flake "${NEW}"
+    if [ -n "$(git status --porcelain flake.nix)" ]; then
+        git add flake.nix
+        git commit -m "chore: bump flake.nix to v${NEW}"
+    fi
     git tag -a "v${NEW}" -m "v${NEW}"
     git push origin HEAD
     git push origin "v${NEW}"
