@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
@@ -26,11 +27,21 @@ type Driver struct {
 // basic) is left for a future patch; kontainer uses unauthenticated
 // local ES.
 func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
-	if err := reachability.ProbeURL("elasticsearch", cfg.URL); err != nil {
+	url := cfg.URL
+	if cfg.Container != "" {
+		ip, err := containerip.Resolve(cfg.Container, cfg.ContainerEngine)
+		if err != nil {
+			return nil, fmt.Errorf("resolve container %q: %w", cfg.Container, err)
+		}
+		if ip != "" {
+			url = containerip.RewriteHostPortInURI(url, ip)
+		}
+	}
+	if err := reachability.ProbeURL("elasticsearch", url); err != nil {
 		return nil, err
 	}
 	return &Driver{
-		Base: strings.TrimRight(cfg.URL, "/"),
+		Base: strings.TrimRight(url, "/"),
 		HTTP: &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }

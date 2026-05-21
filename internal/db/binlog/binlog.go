@@ -35,6 +35,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -57,9 +58,10 @@ type Replicator struct {
 	mu      sync.Mutex
 	targets []string
 
-	// columnMeta caches resolved column lists per (db, table) for
-	// row-event replay when binlog_row_metadata != FULL.
-	columnMeta map[string][]string
+	// metaCache caches resolved column + PK metadata per (db, table)
+	// for row-event replay. Refreshed lazily; invalidated when a
+	// DDL Query event hits the schema.
+	metaCache *metaCache
 }
 
 // New constructs a Replicator. Call Start to begin streaming.
@@ -76,6 +78,18 @@ func New(cfg *config.Config, st *store.Store, repoID int64, sourceDB string) (*R
 	port := uint16(mc.Port)
 	if port == 0 {
 		port = 3306
+	}
+	// Honour `container:` for the replication dial too — keeps
+	// binlog replay reachable when the upstream MySQL is in docker
+	// with no published port.
+	if mc.Container != "" {
+		ip, err := containerip.Resolve(mc.Container, mc.ContainerEngine)
+		if err != nil {
+			return nil, fmt.Errorf("resolve container %q: %w", mc.Container, err)
+		}
+		if ip != "" {
+			host = ip
+		}
 	}
 	cfgSyncer := replication.BinlogSyncerConfig{
 		ServerID: cfg.Watcher.Binlog.ServerID,
@@ -95,12 +109,12 @@ func New(cfg *config.Config, st *store.Store, repoID int64, sourceDB string) (*R
 		UseDecimal: true,
 	}
 	r := &Replicator{
-		cfg:        cfg,
-		st:         st,
-		repoID:     repoID,
-		sourceDB:   sourceDB,
-		syncer:     replication.NewBinlogSyncer(cfgSyncer),
-		columnMeta: map[string][]string{},
+		cfg:       cfg,
+		st:        st,
+		repoID:    repoID,
+		sourceDB:  sourceDB,
+		syncer:    replication.NewBinlogSyncer(cfgSyncer),
+		metaCache: newMetaCache(),
 	}
 	return r, nil
 }
@@ -266,6 +280,10 @@ func (r *Replicator) applyDDL(ctx context.Context, query string) error {
 	if strings.HasPrefix(strings.ToUpper(q), "USE ") {
 		return nil
 	}
+	// Any DDL may have altered table structure — invalidate cached
+	// column/PK metadata for the source schema so the next DML
+	// event re-reads it.
+	r.metaCache.invalidate(r.sourceDB)
 	drv, err := dbmysql.Connect(ctx, *r.cfg.Connections.Mysql)
 	if err != nil {
 		return err
@@ -289,22 +307,49 @@ func (r *Replicator) applyDDL(ctx context.Context, query string) error {
 }
 
 // applyRows reconstructs INSERT/UPDATE/DELETE from a RowsEvent and
-// runs against every target. Column names come from the binlog's
-// FULL row metadata when present; otherwise from information_schema
-// cached per (db, table).
+// runs against every target. Column + PK metadata is taken from
+// the binlog's FULL row metadata when present and from
+// information_schema (cached per table) otherwise. Each row in the
+// event maps to one prepared INSERT/UPDATE/DELETE per target.
 //
-// Implementation note: this is the high-blast-radius path and is
-// off by default (`watcher.binlog.apply_dml = false`). When enabled,
-// only enable on dev machines where wrong-row replay is recoverable
-// from the seed dump.
+// Off by default (`watcher.binlog.apply_dml = false`) — DML replay
+// is the high-blast-radius path. Errors per-target are logged and
+// skipped so one stale clone doesn't block the rest.
 func (r *Replicator) applyRows(ctx context.Context, et replication.EventType, e *replication.RowsEvent) error {
-	// First pass keeps the contract simple: warn-and-skip for now.
-	// Real DML reconstruction is a follow-up.
-	slog.Debug("binlog DML received",
-		"event", et,
-		"schema", string(e.Table.Schema),
-		"table", string(e.Table.Table),
-		"rows", len(e.Rows))
+	drv, err := dbmysql.Connect(ctx, *r.cfg.Connections.Mysql)
+	if err != nil {
+		return err
+	}
+	defer drv.Close()
+	schema := string(e.Table.Schema)
+	table := string(e.Table.Table)
+	meta, err := resolveTableMeta(ctx, drv, r.metaCache, schema, table, e.Table)
+	if err != nil {
+		return fmt.Errorf("resolve meta %s.%s: %w", schema, table, err)
+	}
+	if len(meta.Columns) == 0 {
+		return fmt.Errorf("no columns resolved for %s.%s", schema, table)
+	}
+	targets, err := r.enumerateTargets(ctx, drv)
+	if err != nil {
+		return fmt.Errorf("enumerate targets: %w", err)
+	}
+	// Sanity-check row width — a schema drift mid-stream would
+	// otherwise produce off-by-one binds.
+	for _, row := range e.Rows {
+		if len(row) != len(meta.Columns) {
+			slog.Warn("binlog dml row width mismatch — skipping batch",
+				"schema", schema, "table", table,
+				"row_len", len(row), "meta_len", len(meta.Columns))
+			r.metaCache.invalidate(schema)
+			return nil
+		}
+	}
+	for _, t := range targets {
+		if err := applyRowsForTarget(ctx, drv.DB, t, table, meta, et, e.Rows); err != nil {
+			slog.Warn("binlog dml apply", "target", t, "err", err)
+		}
+	}
 	return nil
 }
 

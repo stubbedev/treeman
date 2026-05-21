@@ -11,6 +11,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
@@ -24,8 +25,28 @@ type Driver struct {
 // Connect opens a server-level pool against `postgres` DB so we can
 // issue CREATE / DROP / TEMPLATE statements at the cluster level.
 func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
+	if ip, err := containerip.Resolve(cfg.Container, cfg.ContainerEngine); err != nil {
+		return nil, fmt.Errorf("resolve container %q: %w", cfg.Container, err)
+	} else if ip != "" {
+		cfg.Host = ip
+		if cfg.Port == 0 {
+			cfg.Port = 5432
+		}
+	}
 	if err := reachability.Probe("postgres", cfg.Host, cfg.Port); err != nil {
-		return nil, err
+		if cfg.Container != "" {
+			containerip.Refresh(cfg.Container, cfg.ContainerEngine)
+			if ip, e := containerip.Resolve(cfg.Container, cfg.ContainerEngine); e == nil && ip != "" {
+				cfg.Host = ip
+				if err2 := reachability.Probe("postgres", cfg.Host, cfg.Port); err2 != nil {
+					return nil, err2
+				}
+			} else {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 	dsn := fmt.Sprintf(
 		"postgres://%s:%s@%s:%d/postgres?sslmode=disable",

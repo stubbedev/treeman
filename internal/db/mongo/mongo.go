@@ -12,6 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
@@ -23,12 +24,22 @@ type Driver struct {
 // Connect parses cfg.URI, probes TCP reachability (when the URI
 // isn't mongodb+srv:// where the host is a SRV record), and dials.
 func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
-	if !strings.HasPrefix(cfg.URI, "mongodb+srv://") {
-		if err := reachability.ProbeURL("mongodb", cfg.URI); err != nil {
+	uri := cfg.URI
+	if cfg.Container != "" {
+		ip, err := containerip.Resolve(cfg.Container, cfg.ContainerEngine)
+		if err != nil {
+			return nil, fmt.Errorf("resolve container %q: %w", cfg.Container, err)
+		}
+		if ip != "" {
+			uri = containerip.RewriteHostPortInURI(uri, ip)
+		}
+	}
+	if !strings.HasPrefix(uri, "mongodb+srv://") {
+		if err := reachability.ProbeURL("mongodb", uri); err != nil {
 			return nil, err
 		}
 	}
-	c, err := mongo.Connect(options.Client().ApplyURI(cfg.URI))
+	c, err := mongo.Connect(options.Client().ApplyURI(uri))
 	if err != nil {
 		return nil, fmt.Errorf("mongo connect: %w", err)
 	}

@@ -52,38 +52,59 @@ type ConnectionsConfig struct {
 // MysqlConn — host/port/user. `Password` is runtime-only; never
 // serialised. The resolver fills it from the repo's `.env*` files
 // + process env.
+//
+// `Container` (optional): when set, treeman runs `docker inspect`
+// (or `podman inspect`, configurable via `container_engine`) on
+// the container and uses its bridge-network IP in place of `Host`
+// before dialing. Lets you connect to a DB running in docker that
+// has no published port (so `host:port` from the host fails) as
+// long as treeman runs on the same machine and can route to the
+// docker bridge network (the default for `bridge` driver on Linux;
+// requires `host.docker.internal` workaround on macOS).
 type MysqlConn struct {
-	Host        string  `yaml:"host"`
-	Port        uint16  `yaml:"port"`
-	User        string  `yaml:"user"`
-	PasswordEnv *string `yaml:"password_env,omitempty"`
-	Password    string  `yaml:"-"`
-	PoolMax     uint32  `yaml:"pool_max,omitempty"`
+	Host            string  `yaml:"host,omitempty"`
+	Port            uint16  `yaml:"port,omitempty"`
+	User            string  `yaml:"user"`
+	PasswordEnv     *string `yaml:"password_env,omitempty"`
+	Password        string  `yaml:"-"`
+	PoolMax         uint32  `yaml:"pool_max,omitempty"`
+	Container       string  `yaml:"container,omitempty"`
+	ContainerEngine string  `yaml:"container_engine,omitempty"` // "docker"|"podman"; default "docker"
 }
 
 // PostgresConn — same shape as MysqlConn.
 type PostgresConn struct {
-	Host        string  `yaml:"host"`
-	Port        uint16  `yaml:"port"`
-	User        string  `yaml:"user"`
-	PasswordEnv *string `yaml:"password_env,omitempty"`
-	Password    string  `yaml:"-"`
-	PoolMax     uint32  `yaml:"pool_max,omitempty"`
+	Host            string  `yaml:"host,omitempty"`
+	Port            uint16  `yaml:"port,omitempty"`
+	User            string  `yaml:"user"`
+	PasswordEnv     *string `yaml:"password_env,omitempty"`
+	Password        string  `yaml:"-"`
+	PoolMax         uint32  `yaml:"pool_max,omitempty"`
+	Container       string  `yaml:"container,omitempty"`
+	ContainerEngine string  `yaml:"container_engine,omitempty"`
 }
 
-// MongoConn — `mongodb://…` URI.
+// MongoConn — `mongodb://…` URI. When `Container` is set the URI's
+// host is rewritten to the container IP at dial time.
 type MongoConn struct {
-	URI string `yaml:"uri"`
+	URI             string `yaml:"uri"`
+	Container       string `yaml:"container,omitempty"`
+	ContainerEngine string `yaml:"container_engine,omitempty"`
 }
 
-// RedisConn — `redis://…` URL.
+// RedisConn — `redis://…` URL. Same Container semantics as MongoConn.
 type RedisConn struct {
-	URL string `yaml:"url"`
+	URL             string `yaml:"url"`
+	Container       string `yaml:"container,omitempty"`
+	ContainerEngine string `yaml:"container_engine,omitempty"`
 }
 
-// EsConn — Elasticsearch / OpenSearch HTTP URL.
+// EsConn — Elasticsearch / OpenSearch HTTP URL. Same Container
+// semantics as MongoConn.
 type EsConn struct {
-	URL string `yaml:"url"`
+	URL             string `yaml:"url"`
+	Container       string `yaml:"container,omitempty"`
+	ContainerEngine string `yaml:"container_engine,omitempty"`
 }
 
 // SnapshotsConfig — `snapshots:` block.

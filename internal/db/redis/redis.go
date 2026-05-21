@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
@@ -23,14 +24,23 @@ type Driver struct {
 // client is opened lazily per-index since FLUSHDB needs a connection
 // scoped to a specific db index.
 func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
-	if err := reachability.ProbeURL("redis", cfg.URL); err != nil {
+	url := cfg.URL
+	if cfg.Container != "" {
+		ip, err := containerip.Resolve(cfg.Container, cfg.ContainerEngine)
+		if err != nil {
+			return nil, fmt.Errorf("resolve container %q: %w", cfg.Container, err)
+		}
+		if ip != "" {
+			url = containerip.RewriteHostPortInURI(url, ip)
+		}
+	}
+	if err := reachability.ProbeURL("redis", url); err != nil {
 		return nil, err
 	}
-	// Sanity-parse so an invalid URL fails here, not at first use.
-	if _, err := redis.ParseURL(cfg.URL); err != nil {
+	if _, err := redis.ParseURL(url); err != nil {
 		return nil, fmt.Errorf("redis url: %w", err)
 	}
-	return &Driver{url: cfg.URL}, nil
+	return &Driver{url: url}, nil
 }
 
 // Close is a no-op — each FLUSHDB opens its own short-lived client.

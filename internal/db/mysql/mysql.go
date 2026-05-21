@@ -16,6 +16,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
@@ -30,8 +31,31 @@ type Driver struct {
 // probe runs first so unreachable services surface a clean error
 // before sqlx-style "connect refused" noise.
 func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
+	// Resolve `container:` to a bridge-network IP if configured.
+	// Empty container falls through and uses cfg.Host directly.
+	if ip, err := containerip.Resolve(cfg.Container, cfg.ContainerEngine); err != nil {
+		return nil, fmt.Errorf("resolve container %q: %w", cfg.Container, err)
+	} else if ip != "" {
+		cfg.Host = ip
+		if cfg.Port == 0 {
+			cfg.Port = 3306
+		}
+	}
 	if err := reachability.Probe("mysql", cfg.Host, cfg.Port); err != nil {
-		return nil, err
+		// Container IP may have changed (restart); evict + retry once.
+		if cfg.Container != "" {
+			containerip.Refresh(cfg.Container, cfg.ContainerEngine)
+			if ip, e := containerip.Resolve(cfg.Container, cfg.ContainerEngine); e == nil && ip != "" {
+				cfg.Host = ip
+				if err2 := reachability.Probe("mysql", cfg.Host, cfg.Port); err2 != nil {
+					return nil, err2
+				}
+			} else {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 	dsn := fmt.Sprintf(
 		"%s:%s@tcp(%s:%d)/?charset=utf8mb4,utf8&parseTime=true&multiStatements=true",
