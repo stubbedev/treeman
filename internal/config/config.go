@@ -276,13 +276,13 @@ func (h *HookEntry) UnmarshalYAML(node *yaml.Node) error {
 		if hasSteps {
 			// Group form: { in_container/compose_service/..., steps: [...] }.
 			var raw struct {
-				Container       string       `yaml:"in_container"`
-				ContainerAlt    string       `yaml:"container"`
-				ComposeService  string       `yaml:"compose_service"`
-				ComposeProject  string       `yaml:"compose_project"`
-				Engine          string       `yaml:"container_engine"`
-				EngineAlt       string       `yaml:"engine"`
-				Steps           []SingleStep `yaml:"steps"`
+				Container      string       `yaml:"in_container"`
+				ContainerAlt   string       `yaml:"container"`
+				ComposeService string       `yaml:"compose_service"`
+				ComposeProject string       `yaml:"compose_project"`
+				Engine         string       `yaml:"container_engine"`
+				EngineAlt      string       `yaml:"engine"`
+				Steps          []SingleStep `yaml:"steps"`
 			}
 			if err := node.Decode(&raw); err != nil {
 				return err

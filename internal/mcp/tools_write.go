@@ -90,8 +90,8 @@ type hookIn struct {
 	Worktree string `json:"worktree,omitempty"`
 }
 type hookOut struct {
-	Phase   string            `json:"phase"`
-	Outcome hooks.RunOutcome  `json:"outcome"`
+	Phase   string           `json:"phase"`
+	Outcome hooks.RunOutcome `json:"outcome"`
 }
 
 func hookTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in hookIn) (*mcpsdk.CallToolResult, hookOut, error) {

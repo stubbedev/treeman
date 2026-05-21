@@ -186,4 +186,3 @@ func branchOccupancy(ctx context.Context, repoRoot string) map[string]string {
 	}
 	return out
 }
-

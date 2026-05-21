@@ -115,7 +115,7 @@ func (o Opts) empty() bool {
 //     (sibling DNS handles it).
 //  3. `<engine> inspect` against the resolved container id:
 //     - prefer a published host port mapping for InternalPort
-//       (127.0.0.1:HOST_PORT) — works cross-platform.
+//     (127.0.0.1:HOST_PORT) — works cross-platform.
 //     - else use the preferred network's IPAddress + InternalPort.
 //  4. When inspect fails AND we're inside a container, fall back
 //     to host.docker.internal at InternalPort.
