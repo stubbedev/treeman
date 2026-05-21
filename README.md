@@ -373,10 +373,32 @@ full rebuild; anything else replays the binlog.
 
 ### Credential resolution from .env
 
-treeman reads `<repo>/.env`, `.env.local`, `.env.test`,
-`.env.testing` (+ their `.local` variants) and uses them to fill
-the connection config when the YAML omits a block or leaves a
-field unset. Supported flavours per engine:
+treeman reads env files in this default order (later wins):
+
+```
+.env
+.env.local
+.env.test
+.env.testing
+.env.test.local
+.env.testing.local
+```
+
+Override the list explicitly with `env_scoping.sources`:
+
+```yaml
+env_scoping:
+  sources:
+    - .env
+    - .env.testing       # baseline for tests
+    - .env.testing.local # per-dev overrides — last entry wins
+```
+
+Relative paths resolve against the repo root; absolute paths are
+honoured as-is so you can pull from outside the repo.
+
+The resolver fills connection config when the YAML omits a block
+or leaves a field unset. Supported flavours per engine:
 
 | Engine | Env vars treeman reads (first non-empty wins) |
 |---|---|

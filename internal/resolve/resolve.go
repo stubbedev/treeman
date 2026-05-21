@@ -72,9 +72,11 @@ type resolvedConn[T any] struct {
 }
 
 // Resolve walks the layers and returns every connection that has a
-// non-empty value.
+// non-empty value. When `cfg.EnvScoping.Sources` is set, those
+// paths are read in order (last wins); otherwise the default
+// search order is used.
 func Resolve(cfg *config.Config, repoRoot string) Resolved {
-	env := loadRepoEnv(repoRoot)
+	env := loadRepoEnv(repoRoot, cfg.EnvScoping.Sources)
 	return Resolved{
 		Mysql:         resolveMysql(cfg, env),
 		Postgres:      resolvePostgres(cfg, env),
@@ -111,17 +113,34 @@ func ApplyEnvCredentials(cfg *config.Config, repoRoot string) {
 	}
 }
 
-func loadRepoEnv(repoRoot string) envfile.EnvFile {
+// loadRepoEnv reads `repoRoot`'s env files in `sources` order
+// (later layers override earlier). When `sources` is empty, the
+// default search order is used. Relative entries in `sources` are
+// resolved against `repoRoot`; absolute entries are taken as-is so
+// a config can pull from outside the repo if needed.
+func loadRepoEnv(repoRoot string, sources []string) envfile.EnvFile {
 	if repoRoot == "" {
 		return envfile.EnvFile{Vars: map[string]string{}}
 	}
-	paths := make([]string, 0, 6)
-	for _, name := range []string{
-		".env", ".env.local",
-		".env.test", ".env.testing",
-		".env.test.local", ".env.testing.local",
-	} {
-		paths = append(paths, filepath.Join(repoRoot, name))
+	var paths []string
+	if len(sources) > 0 {
+		paths = make([]string, 0, len(sources))
+		for _, s := range sources {
+			if filepath.IsAbs(s) {
+				paths = append(paths, s)
+			} else {
+				paths = append(paths, filepath.Join(repoRoot, s))
+			}
+		}
+	} else {
+		paths = []string{
+			filepath.Join(repoRoot, ".env"),
+			filepath.Join(repoRoot, ".env.local"),
+			filepath.Join(repoRoot, ".env.test"),
+			filepath.Join(repoRoot, ".env.testing"),
+			filepath.Join(repoRoot, ".env.test.local"),
+			filepath.Join(repoRoot, ".env.testing.local"),
+		}
 	}
 	return envfile.ReadLayered(paths)
 }

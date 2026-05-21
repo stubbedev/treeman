@@ -150,8 +150,19 @@ type WorktreesConfig struct {
 }
 
 // EnvScoping — `env_scoping:` block.
+//
+// `Files` is the WRITE list — `.env*` files that get patched with
+// the per-worktree slug. `Sources` is the READ list used by the
+// credential resolver: every path is read in order and later layers
+// override earlier ones (so a `.env.testing.local` override beats
+// the committed `.env.testing` baseline). When `Sources` is empty,
+// the resolver falls back to the default search order:
+//
+//	.env  →  .env.local  →  .env.test  →  .env.testing
+//	     →  .env.test.local  →  .env.testing.local
 type EnvScoping struct {
 	Files        []string   `yaml:"files,omitempty"`
+	Sources      []string   `yaml:"sources,omitempty"`
 	SkipWorktree *bool      `yaml:"skip_worktree,omitempty"`
 	Patches      []EnvPatch `yaml:"patches,omitempty"`
 }

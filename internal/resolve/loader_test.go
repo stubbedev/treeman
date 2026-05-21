@@ -56,6 +56,46 @@ DB_PASSWORD=hunter2
 	}
 }
 
+// TestEnvScopingSourcesOrderingLastWins exercises the configurable
+// env-source list: when the YAML names a sequence, later entries
+// override earlier ones — even when the default order would say
+// otherwise.
+func TestEnvScopingSourcesOrderingLastWins(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	repo := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(repo, ".treeman.yaml"), []byte(`
+repo:
+  name: app
+env_scoping:
+  sources:
+    - .env.base
+    - .env.override
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".env.base"), []byte("DB_HOST=base\nDB_PASSWORD=base-pw\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".env.override"), []byte("DB_PASSWORD=winner\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadResolved(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Connections.Mysql == nil {
+		t.Fatal("expected mysql conn populated")
+	}
+	if cfg.Connections.Mysql.Host != "base" {
+		t.Errorf("host=%q want base (only present in base)", cfg.Connections.Mysql.Host)
+	}
+	if cfg.Connections.Mysql.Password != "winner" {
+		t.Errorf("password=%q want winner (override layer wins)", cfg.Connections.Mysql.Password)
+	}
+}
+
 // TestLoadResolvedYamlPlusEnvPassword covers the common Laravel
 // case: YAML pins host/port/user, .env.testing supplies the
 // password.
