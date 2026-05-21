@@ -23,6 +23,7 @@ import (
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/ui"
 )
 
 // PrepareCmd — `treeman prepare` runs the full pipeline foreground.
@@ -144,75 +145,15 @@ func HookCmd() *cli.Command {
 	}
 }
 
-// LogsCmd — `treeman logs {tail,grep}` queries the SQLite events.
-func LogsCmd() *cli.Command {
-	return &cli.Command{
-		Name:    "logs",
-		Aliases: []string{"log"},
-		Usage:   "query the SQLite event log",
-		Commands: []*cli.Command{
-			{
-				Name:  "tail",
-				Usage: "print the most recent N events (default 50)",
-				Flags: []cli.Flag{&cli.IntFlag{Name: "n", Value: 50}},
-				Action: func(ctx context.Context, c *cli.Command) error {
-					return tailLogs(ctx, int(c.Int("n")), "")
-				},
-			},
-			{
-				Name:  "grep",
-				Usage: "print events whose message matches a substring",
-				Action: func(ctx context.Context, c *cli.Command) error {
-					if c.NArg() < 1 {
-						return fmt.Errorf("usage: treeman logs grep <substring>")
-					}
-					return tailLogs(ctx, 500, c.Args().First())
-				},
-			},
-		},
+// padRight pads a possibly-ANSI-colored cell with trailing spaces.
+// Shared by the logs and hook tables, which both compose colored
+// fixed-width columns by hand for compactness.
+func padRight(cell string, width int) string {
+	pad := width - ui.Width(cell)
+	if pad <= 0 {
+		return cell
 	}
-}
-
-func tailLogs(ctx context.Context, n int, grep string) error {
-	dbPath, _ := store.DefaultDBPath()
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	q := `SELECT ts, level, event_type, COALESCE(message,''), payload_json FROM events`
-	args := []any{}
-	if grep != "" {
-		q += ` WHERE message LIKE ?`
-		args = append(args, "%"+grep+"%")
-	}
-	q += ` ORDER BY ts DESC LIMIT ?`
-	args = append(args, n)
-	rows, err := st.DB.QueryContext(ctx, q, args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	type row struct {
-		ts                         int64
-		level, etype, msg, payload string
-	}
-	var all []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.ts, &r.level, &r.etype, &r.msg, &r.payload); err != nil {
-			return err
-		}
-		all = append(all, r)
-	}
-	// Reverse so oldest first (cheap visual order).
-	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
-		all[i], all[j] = all[j], all[i]
-	}
-	for _, r := range all {
-		fmt.Printf("%s %-5s %-22s %s\n", formatTs(r.ts), r.level, r.etype, r.msg)
-	}
-	return nil
+	return cell + strings.Repeat(" ", pad)
 }
 
 func formatTs(ms int64) string {
@@ -258,7 +199,10 @@ func ConfigCmd() *cli.Command {
 			{
 				Name:  "show",
 				Usage: "dump the resolved config",
-				Flags: []cli.Flag{&cli.BoolFlag{Name: "resolved"}},
+				Flags: []cli.Flag{
+					&cli.BoolFlag{Name: "resolved"},
+					&cli.BoolFlag{Name: "no-pager", Usage: "disable the pager even when stdout is a TTY"},
+				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					repoRoot, err := resolveRepo("")
 					if err != nil {
@@ -268,12 +212,17 @@ func ConfigCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
+					pager := newPagerIfEligible(c, false, false)
+					if pager != nil {
+						_ = pager.Start()
+						defer pager.Close()
+					}
 					b, _ := yaml.Marshal(cfg)
-					fmt.Print(string(b))
+					fmt.Fprint(ui.Out, string(b))
 					if c.Bool("resolved") {
 						r := resolve.Resolve(&cfg, repoRoot)
-						fmt.Println()
-						fmt.Println("# resolved connections")
+						fmt.Fprintln(ui.Out)
+						fmt.Fprintln(ui.Out, "# resolved connections")
 						printResolved("mysql", r.Mysql)
 						printResolved("postgres", r.Postgres)
 						printResolved("mongodb", r.Mongodb)
@@ -290,13 +239,14 @@ func ConfigCmd() *cli.Command {
 func printResolved(name string, c any) {
 	// `c` is a pointer to a resolvedConn[…] struct from
 	// internal/resolve. We only need a string representation; JSON
-	// is good enough.
+	// is good enough. Write through ui.Out so the pager wrap in
+	// `config show` captures these lines too.
 	if isNil(c) {
-		fmt.Printf("# %s <- (none)\n", name)
+		fmt.Fprintf(ui.Out, "# %s <- (none)\n", name)
 		return
 	}
 	b, _ := json.Marshal(c)
-	fmt.Printf("# %s <- %s\n", name, string(b))
+	fmt.Fprintf(ui.Out, "# %s <- %s\n", name, string(b))
 }
 
 func isNil(v any) bool {
@@ -388,7 +338,11 @@ func DaemonCmd() *cli.Command {
 		Commands: []*cli.Command{
 			{Name: "start", Action: daemonStart},
 			{Name: "stop", Action: daemonStop},
-			{Name: "status", Action: daemonStatus},
+			{
+				Name:   "status",
+				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json"}},
+				Action: daemonStatus,
+			},
 			{Name: "install", Action: daemonInstall},
 			{Name: "uninstall", Action: daemonUninstall},
 		},
@@ -471,14 +425,29 @@ func daemonStop(ctx context.Context, c *cli.Command) error {
 
 func daemonStatus(ctx context.Context, c *cli.Command) error {
 	resp, err := rpc.Call(ctx, rpc.Request{Method: rpc.MethodStatus})
+	if c.Bool("json") {
+		out := map[string]any{}
+		if err != nil {
+			out["status"] = "not-running"
+			out["error"] = err.Error()
+		} else {
+			out["status"] = "running"
+			out["version"] = resp.DaemonVersion
+			out["pid"] = resp.Pid
+			out["watchers"] = resp.WatcherCount
+		}
+		return jsonStream(out)
+	}
 	if err != nil {
-		fmt.Println("not running")
+		ui.Warn("daemon not running")
+		ui.Hint("start it with: treeman daemon start")
+		ui.Hint("or auto-launch on login: treeman daemon install")
 		return nil
 	}
 	if resp.Kind == rpc.KindError {
 		return fmt.Errorf("daemon: %s", resp.Message)
 	}
-	fmt.Printf("treemand %s, pid %d, %d watcher(s)\n", resp.DaemonVersion, resp.Pid, resp.WatcherCount)
+	ui.Success("treemand %s — pid=%d watchers=%d", ui.Bold(resp.DaemonVersion), resp.Pid, resp.WatcherCount)
 	return nil
 }
 
@@ -613,7 +582,8 @@ func FwCmd() *cli.Command {
 		Aliases: []string{"frameworks"},
 		Usage:   "framework detection",
 		Commands: []*cli.Command{{
-			Name: "detect",
+			Name:  "detect",
+			Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
 			Action: func(ctx context.Context, c *cli.Command) error {
 				cwd, _ := os.Getwd()
 				repoRoot, err := DiscoverRepoRoot(cwd)
@@ -622,17 +592,35 @@ func FwCmd() *cli.Command {
 				}
 				r := framework.DefaultRegistry()
 				detected := r.DetectAll(repoRoot)
-				fmt.Printf("%-20s %-14s %-10s %s\n", "MIGRATION_FW", "HASH_MODE", "ON_MODIFY", "DIRS")
+				if c.Bool("json") {
+					return jsonStream(map[string]any{
+						"repo":              repoRoot,
+						"migration":         detected,
+						"test":              testfw.DetectAll(repoRoot),
+						"auto_clone_target": testfw.DetectedCloneCount(repoRoot),
+					})
+				}
+				migs := ui.NewTable("MIGRATION_FW", "HASH_MODE", "ON_MODIFY", "DIRS")
 				for _, s := range detected {
-					fmt.Printf("%-20s %-14s %-10s %s\n", s.Name, s.HashMode, s.OnModify, strings.Join(s.MigrationDirs, ","))
+					migs.Row(ui.Cyan(s.Name), string(s.HashMode), string(s.OnModify), ui.Dim(strings.Join(s.MigrationDirs, ",")))
+				}
+				if len(detected) == 0 {
+					ui.Info("no migration framework detected in %s", repoRoot)
+				} else {
+					migs.Render(nil)
 				}
 				fmt.Println()
-				fmt.Printf("%-22s %-10s %-14s %-10s %s\n", "TEST_FW", "LANGUAGE", "STRATEGY", "WORKER_IDX", "WORKER_ENV")
-				for _, t := range testfw.DetectAll(repoRoot) {
-					fmt.Printf("%-22s %-10s %-14s %-10s %s\n",
-						t.Name, t.Language, t.Strategy, t.WorkerIndex, t.WorkerEnv)
+				tests := ui.NewTable("TEST_FW", "LANGUAGE", "STRATEGY", "WORKER_IDX", "WORKER_ENV")
+				detTests := testfw.DetectAll(repoRoot)
+				for _, t := range detTests {
+					tests.Row(ui.Cyan(t.Name), t.Language, string(t.Strategy), string(t.WorkerIndex), ui.Dim(t.WorkerEnv))
 				}
-				fmt.Printf("\nauto-clones (replication target): %d\n", testfw.DetectedCloneCount(repoRoot))
+				if len(detTests) == 0 {
+					ui.Info("no test framework detected")
+				} else {
+					tests.Render(nil)
+				}
+				fmt.Printf("\nauto-clones (replication target): %s\n", ui.Bold(fmt.Sprintf("%d", testfw.DetectedCloneCount(repoRoot))))
 				return nil
 			},
 		}},
@@ -642,7 +630,9 @@ func FwCmd() *cli.Command {
 // SlugCmd — `treeman slug [path]` prints the slug of a worktree.
 func SlugCmd() *cli.Command {
 	return &cli.Command{
-		Name: "slug",
+		Name:  "slug",
+		Usage: "print the slug treeman derives for a worktree",
+		Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			path := "."
 			if c.NArg() >= 1 {
@@ -651,6 +641,16 @@ func SlugCmd() *cli.Command {
 			path = MustAbs(path)
 			branch := detectBranchOfWorktree(path)
 			sl := slug.For(path, branch)
+			if c.Bool("json") {
+				q, ca := sl.RedisIndices()
+				return jsonStream(map[string]any{
+					"slug":              sl.Value,
+					"path":              path,
+					"branch":            branch,
+					"redis_queue_index": q,
+					"redis_cache_index": ca,
+				})
+			}
 			fmt.Println(sl.Value)
 			return nil
 		},
@@ -688,6 +688,10 @@ func InitCmd() *cli.Command {
 				return err
 			}
 			PrintOK("wrote %s", target)
+			PrintHint("review the generated databases:/hooks: blocks before first create")
+			PrintHint("install the daemon (one-time): treeman daemon install")
+			PrintHint("create a worktree:               treeman wt create <branch>")
+			PrintHint("install JSON Schema (editors):   treeman schema install")
 			return nil
 		},
 	}

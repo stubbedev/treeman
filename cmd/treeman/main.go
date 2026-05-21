@@ -32,6 +32,7 @@ func main() {
 			cmd.FwCmd(),
 			cmd.SlugCmd(),
 			cmd.InitCmd(),
+			cmd.DoctorCmd(),
 		},
 	}
 	if err := app.Run(context.Background(), os.Args); err != nil {

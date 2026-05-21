@@ -20,6 +20,7 @@ import (
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
+	"github.com/stubbedev/treeman/internal/ui"
 )
 
 // WorktreeCmd — `treeman wt {create,delete,register,unregister,list,finalize}`.
@@ -34,6 +35,9 @@ func WorktreeCmd() *cli.Command {
 			wtRegister(),
 			wtUnregister(),
 			wtList(),
+			wtShow(),
+			wtLogs(),
+			wtWait(),
 			wtFinalize(),
 			wtSwitch(),
 			wtBack(),
@@ -47,6 +51,13 @@ func wtCreate() *cli.Command {
 		Aliases:   []string{"new"},
 		Usage:     "create a worktree end-to-end",
 		ArgsUsage: "<branch>",
+		Description: `Creates a linked worktree, patches the env files, registers it
+in SQLite, then dispatches postcreate hooks + prepare to the daemon.
+
+Examples:
+  treeman wt create PROJ-1234
+  treeman wt create feature/x --from origin/develop
+  treeman wt create hotfix --foreground   # block on hooks + prepare`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "from", Usage: "base branch"},
 			&cli.StringFlag{Name: "path", Usage: "explicit worktree path"},
@@ -260,7 +271,7 @@ func dispatchFinalize(ctx context.Context, repoRoot, wtPath string, env map[stri
 	}
 	if resp, err := rpc.Call(ctx, req); err == nil {
 		if resp.Kind == rpc.KindWorktreeFinalizeQueued {
-			PrintOK("queued: postcreate + prepare detached to daemon — follow with `treeman logs tail -f`")
+			PrintOK("queued: postcreate + prepare detached to daemon — follow with `treeman logs tail --follow`")
 			return true
 		}
 		if resp.Kind == rpc.KindError {
@@ -284,6 +295,14 @@ func wtDelete() *cli.Command {
 		Aliases:   []string{"rm"},
 		Usage:     "delete a worktree end-to-end",
 		ArgsUsage: "<path-or-branch>",
+		Description: `Runs predelete hooks + DB teardown + git worktree remove, then
+removes the registry row. The teardown is dispatched to the daemon
+so the shell returns immediately; pass --foreground to block.
+
+Examples:
+  treeman wt delete PROJ-1234
+  treeman wt delete /path/to/wt --force      # remove stale registry entry
+  treeman wt delete feature/x --foreground   # block on teardown`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo"},
 			&cli.BoolFlag{Name: "force", Aliases: []string{"f"}},
@@ -460,6 +479,10 @@ func wtList() *cli.Command {
 		Name:    "list",
 		Aliases: []string{"ls"},
 		Usage:   "list active worktrees",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "json"},
+			&cli.BoolFlag{Name: "with-state", Usage: "include a STATE column derived from the most recent finalize event"},
+		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			dbPath, _ := store.DefaultDBPath()
 			st, err := store.Open(ctx, dbPath)
@@ -473,16 +496,49 @@ func wtList() *cli.Command {
 				return err
 			}
 			defer rows.Close()
-			fmt.Printf("%-4s %-24s %-30s %s\n", "ID", "SLUG", "BRANCH", "PATH")
+			type wtRow struct {
+				ID     int64  `json:"id"`
+				Slug   string `json:"slug"`
+				Branch string `json:"branch"`
+				Path   string `json:"path"`
+			}
+			var all []wtRow
 			for rows.Next() {
-				var id int64
-				var slug, branch, path string
-				if err := rows.Scan(&id, &slug, &branch, &path); err != nil {
+				var r wtRow
+				if err := rows.Scan(&r.ID, &r.Slug, &r.Branch, &r.Path); err != nil {
 					return err
 				}
-				fmt.Printf("%-4d %-24s %-30s %s\n", id, slug, branch, path)
+				all = append(all, r)
 			}
-			return rows.Err()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			if c.Bool("json") {
+				return jsonStream(all)
+			}
+			if len(all) == 0 {
+				ui.Info("no active worktrees")
+				ui.Hint("%s", "create one with: treeman wt create <branch>")
+				return nil
+			}
+			withState := c.Bool("with-state")
+			var tbl *ui.Table
+			if withState {
+				tbl = ui.NewTable("ID", "SLUG", "BRANCH", "STATE", "PATH")
+			} else {
+				tbl = ui.NewTable("ID", "SLUG", "BRANCH", "PATH")
+			}
+			for _, r := range all {
+				idCell := ui.Dim(fmt.Sprintf("%d", r.ID))
+				slugCell := ui.Cyan(r.Slug)
+				if withState {
+					tbl.Row(idCell, slugCell, r.Branch, finalizeStateShort(ctx, st, r.ID), r.Path)
+				} else {
+					tbl.Row(idCell, slugCell, r.Branch, r.Path)
+				}
+			}
+			tbl.Render(nil)
+			return nil
 		},
 	}
 }
@@ -544,7 +600,7 @@ func wtFinalize() *cli.Command {
 			if resp.Kind == rpc.KindError {
 				return fmt.Errorf("daemon: %s", resp.Message)
 			}
-			PrintOK("queued: postcreate + prepare detached to daemon — follow with `treeman logs tail -f`")
+			PrintOK("queued: postcreate + prepare detached to daemon — follow with `treeman logs tail --follow`")
 			return nil
 		},
 	}
@@ -565,7 +621,7 @@ func dispatchTeardown(ctx context.Context, repoRoot, wtPath string, force bool, 
 	}
 	if resp, err := rpc.Call(ctx, req); err == nil {
 		if resp.Kind == rpc.KindWorktreeTeardownQueued {
-			PrintOK("queued: predelete + DB teardown + git remove detached to daemon — follow with `treeman logs tail -f`")
+			PrintOK("queued: predelete + DB teardown + git remove detached to daemon — follow with `treeman logs tail --follow`")
 			return true
 		}
 		if resp.Kind == rpc.KindError {

@@ -9,6 +9,7 @@ require (
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/invopop/jsonschema v0.14.0
 	github.com/jackc/pgx/v5 v5.9.2
+	github.com/mattn/go-isatty v0.0.20
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/urfave/cli/v3 v3.9.0
 	go.mongodb.org/mongo-driver/v2 v2.6.0
@@ -32,7 +33,6 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/pingcap/errors v0.11.5-0.20260310054046-9c8b3586e4b2 // indirect

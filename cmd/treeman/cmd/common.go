@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/stubbedev/treeman/internal/gitenv"
+	"github.com/stubbedev/treeman/internal/ui"
 )
 
 // DiscoverRepoRoot returns the MAIN repo root for `start`. When
@@ -51,12 +52,14 @@ func MustAbs(p string) string {
 	return abs
 }
 
-// PrintOK / PrintWarn / PrintErr are convenience println helpers
-// with consistent prefixes (no ANSI colour for portability).
-func PrintOK(format string, args ...any) { fmt.Println("ok: " + fmt.Sprintf(format, args...)) }
-func PrintWarn(format string, args ...any) {
-	fmt.Fprintln(os.Stderr, "warn: "+fmt.Sprintf(format, args...))
-}
+// PrintOK / PrintWarn delegate to the ui package's colored helpers.
+// Color auto-disables on pipes, NO_COLOR=1, or dumb terminals — see
+// internal/ui.ColorEnabled.
+func PrintOK(format string, args ...any)   { ui.Success(format, args...) }
+func PrintWarn(format string, args ...any) { ui.Warn(format, args...) }
+func PrintErr(format string, args ...any)  { ui.Error(format, args...) }
+func PrintInfo(format string, args ...any) { ui.Info(format, args...) }
+func PrintHint(format string, args ...any) { ui.Hint(format, args...) }
 
 // Ctx returns a background context (no per-CLI cancellation today).
 func Ctx() context.Context { return context.Background() }

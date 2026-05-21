@@ -118,6 +118,9 @@ treeman init
 treeman daemon install      # systemd --user on Linux, launchd on macOS
 treeman daemon start        # idempotent — uses systemctl/launchctl when installed
 
+# Sanity check whenever something feels off:
+treeman doctor              # probes daemon, config, schema, git ↔ registry drift
+
 # 3. Spin up a worktree end-to-end.
 treeman wt create proj-123
 #   ↳ git worktree add .worktrees/proj-123 -b proj-123 origin/HEAD
@@ -129,6 +132,10 @@ treeman wt create proj-123
 
 # 4. Get the path of an existing worktree for `cd` integration:
 cd "$(treeman wt switch proj-123)"
+
+# (CI flow: block on the daemon's finalize before running tests.)
+treeman wt wait proj-123                  # exits 0 on success, non-zero on failure
+treeman wt show proj-123                  # dossier + recent events + hook runs
 
 # 5. Done with the branch:
 treeman wt delete proj-123
@@ -162,18 +169,36 @@ wt list              # passthrough to `treeman wt list`
 | Command | What |
 |---|---|
 | `treeman init` | Generate a starter `.treeman.yaml` from cwd markers |
-| `treeman daemon {start,stop,restart,status,install,uninstall}` | Daemon lifecycle |
+| `treeman doctor` | Health-check the local setup (daemon, config, registry drift) |
+| `treeman daemon {start,stop,status,install,uninstall}` | Daemon lifecycle |
 | `treeman wt {create,delete,list,register,unregister,finalize}` | Worktree lifecycle |
+| `treeman wt show <name>` | Per-worktree dossier — state, recent events, hook runs |
+| `treeman wt logs <name>` | Tail events scoped to one worktree |
+| `treeman wt wait <name>` | Block until the daemon's finalize completes (CI sync primitive) |
 | `treeman wt switch <name> [--create]` | Print worktree path (for shell `cd $(…)`) |
 | `treeman wt back [--remove]` | Print main repo path; optionally drop clean worktree |
 | `treeman prepare` | ensure → dump → migrate → snapshot → replicate |
 | `treeman hook run <phase>` | Run a configured hook phase manually |
-| `treeman logs {tail,grep}` | Query the SQLite event log |
+| `treeman logs {tail,grep,hooks}` | Query the SQLite event log (see flags below) |
 | `treeman slug [path]` | Print the slug derived from a worktree path |
 | `treeman config {validate,show [--resolved]}` | Config helpers |
 | `treeman schema {dump,install}` | JSON Schema for `.treeman.yaml` |
 | `treeman fw detect` | List detected migration + test frameworks |
 | `treeman completion {bash,zsh,fish,pwsh}` | Print shell completion script |
+
+`logs tail` / `logs grep` share a filter surface:
+
+```sh
+treeman logs tail --follow                      # stream new events
+treeman logs tail --worktree PROJ-1234          # scope to one worktree
+treeman logs tail --level warn --level error    # repeatable
+treeman logs tail --since 5m                    # duration or RFC3339 timestamp
+treeman logs tail --event-type wt_finalize_done
+treeman logs tail --json | jq .                 # machine-readable
+treeman logs grep "snapshot cache" --regex
+treeman logs grep checksum --search-payload     # match payload_json instead
+treeman logs hooks PROJ-1234                    # last N hook_runs for a worktree
+```
 
 Source the completion script from your shell rc:
 
@@ -189,6 +214,26 @@ treeman completion fish > ~/.config/fish/completions/treeman.fish
 ```
 
 `treeman <cmd> --help` for full flag listings.
+
+### Output, color, paging
+
+treeman prints colored, symbol-prefixed status lines to a TTY and
+degrades to plain ASCII when stdout is piped, redirected, or
+`NO_COLOR=1` is set. `FORCE_COLOR=1` / `CLICOLOR_FORCE=1` force
+colors on even when piping (useful for `treeman ... | less -R`).
+
+Read commands that may produce more than a screen of output
+(`treeman logs tail|grep`, `treeman wt show`, `treeman config show`)
+auto-page through `$PAGER` (default: `less -FRX` — `-F` quits if the
+output fits on one screen, `-R` keeps colors, `-X` skips the
+alt-screen). Disable per-invocation with `--no-pager`, or globally
+with `TREEMAN_NO_PAGER=1` / `PAGER=`. `--follow` and `--json` always
+bypass the pager.
+
+`--json` is supported on `treeman daemon status`, `treeman wt list`,
+`treeman slug`, `treeman fw detect`, `treeman logs {tail,grep,hooks}`,
+and `treeman doctor` — emits one object (or one per row) suitable
+for `jq` consumption.
 
 ---
 
