@@ -51,23 +51,49 @@ type Outcome struct {
 // to a concrete driver type.
 type cloneRestorer func(ctx context.Context, template, target string) error
 
+// fanOutLimits caps the outer concurrency of fanOutClones per
+// engine. MySQL's SnapshotRestore itself uses up to ~6 inner
+// connections (parallel table copy), so the outer fan-out is held
+// to 4 to keep the total under a typical 100-conn ceiling. Postgres
+// SnapshotRestore is a single `CREATE DATABASE … TEMPLATE`
+// statement, so the outer fan-out can use the whole CPU budget.
+var fanOutLimits = map[string]int{
+	"mysql":      4,
+	"mariadb":    4,
+	"tidb":       4,
+	"postgres":   0, // 0 = GOMAXPROCS
+	"postgresql": 0,
+}
+
 // fanOutClones restores `template` into each of `clones` in
 // parallel. Each restore is an engine-side operation (CREATE
-// DATABASE … TEMPLATE on postgres, the table-by-table copy path on
-// mysql); the driver's connection pool throttles back-pressure but
-// nothing in the call site does. Cap concurrency at GOMAXPROCS so a
-// `clones: auto` config that resolves to 32 workers on a beefy box
-// can't open more pool slots than the DB engine will serve.
+// DATABASE … TEMPLATE on postgres, the parallel table copy path on
+// mysql); the per-engine entry in fanOutLimits caps outer
+// concurrency so a 32-core box can't overrun the DB's connection
+// ceiling.
+//
+// `override` (>0) replaces the default limit — sourced from the
+// `databases[].fanout` YAML field. Users who've raised
+// max_connections (or who run a beefier PG that doesn't contend on
+// pg_database) can opt into higher concurrency without recompiling.
 //
 // Returns the first error seen. errgroup's ctx cancellation
 // propagates so peer restores abort instead of hammering a server
 // that already refused the first one.
-func fanOutClones(ctx context.Context, restore cloneRestorer, template string, clones []string) error {
+func fanOutClones(ctx context.Context, restore cloneRestorer, template string, clones []string, engine string, override uint32) error {
 	if len(clones) == 0 {
 		return nil
 	}
 	g, gctx := errgroup.WithContext(ctx)
-	limit := runtime.GOMAXPROCS(0)
+	limit := 0
+	if override > 0 {
+		limit = int(override)
+	} else {
+		limit = fanOutLimits[engine]
+		if limit == 0 {
+			limit = runtime.GOMAXPROCS(0)
+		}
+	}
 	if limit < 2 {
 		limit = 2
 	}
@@ -93,6 +119,12 @@ func fanOutClones(ctx context.Context, restore cloneRestorer, template string, c
 // files, dump file, lockfiles, and the framework migrate command all
 // resolve there. The slug used in template rendering also derives
 // from this worktree.
+//
+// Engines run in parallel — each engine prepare touches a different
+// driver pool (mysql, postgres, mongo, redis, ES) so they don't
+// contend for the same connections. The slowest engine sets the
+// wall-clock; previously a slow mysql cold-build serialized in
+// front of a 200ms redis flush.
 func Run(
 	ctx context.Context,
 	cfg *config.Config,
@@ -103,45 +135,59 @@ func Run(
 	inheritedEnv map[string]string,
 ) ([]Outcome, error) {
 	tplCtx := template.FromSlug(sl)
+
+	results := make([]Outcome, len(cfg.Databases))
+	hasResult := make([]bool, len(cfg.Databases))
+	g, gctx := errgroup.WithContext(ctx)
+	for i, d := range cfg.Databases {
+		i, d := i, d
+		g.Go(func() error {
+			var (
+				o   Outcome
+				err error
+			)
+			switch d.Engine {
+			case "mysql", "mariadb", "tidb":
+				o, err = prepareMySQL(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+			case "postgres", "postgresql":
+				o, err = preparePostgres(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+			case "mongodb":
+				o, err = prepareMongo(gctx, cfg, d, tplCtx, st, repoID, worktreeID)
+			case "redis":
+				o, err = prepareRedis(gctx, cfg, d, tplCtx, st, repoID, worktreeID)
+			case "elasticsearch", "opensearch":
+				o, err = prepareES(gctx, cfg, d, tplCtx, st, repoID, worktreeID)
+			default:
+				// Engine not recognised. Surface via event so the
+				// user notices, but don't fail the whole prepare run.
+				_ = st.WriteEvent(gctx, store.LevelWarn, "prepare_unsupported_engine",
+					fmt.Sprintf("engine=%s not recognised", d.Engine),
+					repoID, worktreeID, "", 0, nil)
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			results[i] = o
+			hasResult[i] = true
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		// Return whatever outcomes did land so callers can log a
+		// partial-success picture before surfacing the error.
+		var outcomes []Outcome
+		for i, ok := range hasResult {
+			if ok {
+				outcomes = append(outcomes, results[i])
+			}
+		}
+		return outcomes, err
+	}
 	var outcomes []Outcome
-	for _, d := range cfg.Databases {
-		switch d.Engine {
-		case "mysql", "mariadb", "tidb":
-			o, err := prepareMySQL(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			if err != nil {
-				return outcomes, err
-			}
-			outcomes = append(outcomes, o)
-		case "postgres", "postgresql":
-			o, err := preparePostgres(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			if err != nil {
-				return outcomes, err
-			}
-			outcomes = append(outcomes, o)
-		case "mongodb":
-			o, err := prepareMongo(ctx, cfg, d, tplCtx, st, repoID, worktreeID)
-			if err != nil {
-				return outcomes, err
-			}
-			outcomes = append(outcomes, o)
-		case "redis":
-			o, err := prepareRedis(ctx, cfg, d, tplCtx, st, repoID, worktreeID)
-			if err != nil {
-				return outcomes, err
-			}
-			outcomes = append(outcomes, o)
-		case "elasticsearch", "opensearch":
-			o, err := prepareES(ctx, cfg, d, tplCtx, st, repoID, worktreeID)
-			if err != nil {
-				return outcomes, err
-			}
-			outcomes = append(outcomes, o)
-		default:
-			// Engine not recognised. Surface via event so the user
-			// notices, but don't fail the whole prepare run.
-			_ = st.WriteEvent(ctx, store.LevelWarn, "prepare_unsupported_engine",
-				fmt.Sprintf("engine=%s not recognised", d.Engine),
-				repoID, worktreeID, "", 0, nil)
+	for i, ok := range hasResult {
+		if ok {
+			outcomes = append(outcomes, results[i])
 		}
 	}
 	return outcomes, nil
@@ -184,7 +230,7 @@ func prepareMySQL(
 		s := specFromYAML(*d.Migrations)
 		hashMode = string(s.HashMode)
 		if len(s.MigrationDirs) > 0 || len(s.FileGlobs) > 0 {
-			if h, err := framework.MigrationsHash(worktreePath, s); err == nil {
+			if h, err := framework.MigrationsHashWithCache(ctx, st, worktreePath, s); err == nil {
 				migrationsHash = h
 			}
 		}
@@ -193,14 +239,14 @@ func prepareMySQL(
 			lockPaths = append(lockPaths, filepath.Join(worktreePath, lf))
 		}
 		if len(lockPaths) > 0 {
-			if h, err := snapshot.LockfileHashesFor(lockPaths); err == nil {
+			if h, err := snapshot.LockfileHashesForWithCache(ctx, st, lockPaths); err == nil {
 				lockfileHashes = h
 			}
 		}
 	}
 	if d.Dump != nil {
 		dp := filepath.Join(worktreePath, d.Dump.Path)
-		hashes, _ := snapshot.LockfileHashesFor([]string{dp})
+		hashes, _ := snapshot.LockfileHashesForWithCache(ctx, st, []string{dp})
 		dumpHash = hashes[filepath.Base(dp)]
 	}
 
@@ -224,7 +270,7 @@ func prepareMySQL(
 			if err != nil {
 				return Outcome{}, err
 			}
-			if err := fanOutClones(ctx, drv.SnapshotRestore, rec.TemplateName, clones); err != nil {
+			if err := fanOutClones(ctx, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout); err != nil {
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
@@ -308,7 +354,7 @@ func prepareMySQL(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, drv.SnapshotRestore, templateName, clones); err != nil {
+	if err := fanOutClones(ctx, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout); err != nil {
 		return Outcome{}, err
 	}
 
@@ -371,7 +417,7 @@ func preparePostgres(
 		s := specFromYAML(*d.Migrations)
 		hashMode = string(s.HashMode)
 		if len(s.MigrationDirs) > 0 || len(s.FileGlobs) > 0 {
-			if h, err := framework.MigrationsHash(worktreePath, s); err == nil {
+			if h, err := framework.MigrationsHashWithCache(ctx, st, worktreePath, s); err == nil {
 				migrationsHash = h
 			}
 		}
@@ -380,14 +426,14 @@ func preparePostgres(
 			lockPaths = append(lockPaths, filepath.Join(worktreePath, lf))
 		}
 		if len(lockPaths) > 0 {
-			if h, err := snapshot.LockfileHashesFor(lockPaths); err == nil {
+			if h, err := snapshot.LockfileHashesForWithCache(ctx, st, lockPaths); err == nil {
 				lockfileHashes = h
 			}
 		}
 	}
 	if d.Dump != nil {
 		dp := filepath.Join(worktreePath, d.Dump.Path)
-		hashes, _ := snapshot.LockfileHashesFor([]string{dp})
+		hashes, _ := snapshot.LockfileHashesForWithCache(ctx, st, []string{dp})
 		dumpHash = hashes[filepath.Base(dp)]
 	}
 
@@ -418,7 +464,7 @@ func preparePostgres(
 			if err != nil {
 				return Outcome{}, err
 			}
-			if err := fanOutClones(ctx, drv.SnapshotRestore, rec.TemplateName, clones); err != nil {
+			if err := fanOutClones(ctx, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout); err != nil {
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
@@ -468,7 +514,7 @@ func preparePostgres(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, drv.SnapshotRestore, templateName, clones); err != nil {
+	if err := fanOutClones(ctx, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout); err != nil {
 		return Outcome{}, err
 	}
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
@@ -661,6 +707,11 @@ func resolveCloneNames(p *config.TestClonesSpec, tplCtx template.Context, repoRo
 // TeardownDatabases drops every per-worktree namespace declared by
 // cfg.Databases. Errors per-engine are logged + swallowed so a
 // missing redis doesn't block dropping mysql.
+//
+// Engines tear down in parallel: each one drives a different driver
+// (mysql + mongo + redis + ES) so there's no shared connection pool
+// to contend on, and a slow ES delete-by-prefix shouldn't gate the
+// fast mysql DROP DATABASE.
 func TeardownDatabases(
 	ctx context.Context,
 	cfg *config.Config,
@@ -670,14 +721,18 @@ func TeardownDatabases(
 ) error {
 	tplCtx := template.FromSlug(slug.Slug{Value: sl, Source: slug.SourceTicket})
 
+	g, gctx := errgroup.WithContext(ctx)
 	for _, d := range cfg.Databases {
-		err := teardownOne(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
-		if err != nil {
-			_ = st.WriteEvent(ctx, store.LevelWarn, "db_teardown_error",
-				err.Error(), repoID, worktreeID, "", 0, nil)
-		}
+		d := d
+		g.Go(func() error {
+			if err := teardownOne(gctx, cfg, d, tplCtx, sl, repoID, worktreeID, st); err != nil {
+				_ = st.WriteEvent(gctx, store.LevelWarn, "db_teardown_error",
+					err.Error(), repoID, worktreeID, "", 0, nil)
+			}
+			return nil
+		})
 	}
-	return nil
+	return g.Wait()
 }
 
 func teardownOne(

@@ -68,7 +68,7 @@ type MysqlConn struct {
 	Password        string  `yaml:"-"`
 	PoolMax         uint32  `yaml:"pool_max,omitempty"`
 	Container       string  `yaml:"container,omitempty"`
-	ContainerEngine string  `yaml:"container_engine,omitempty"` // "docker"|"podman"; default "docker"
+	ContainerEngine string  `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"` // "docker"|"podman"; default "docker"
 }
 
 // PostgresConn — same shape as MysqlConn.
@@ -80,7 +80,7 @@ type PostgresConn struct {
 	Password        string  `yaml:"-"`
 	PoolMax         uint32  `yaml:"pool_max,omitempty"`
 	Container       string  `yaml:"container,omitempty"`
-	ContainerEngine string  `yaml:"container_engine,omitempty"`
+	ContainerEngine string  `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"`
 }
 
 // MongoConn — `mongodb://…` URI. When `Container` is set the URI's
@@ -88,14 +88,14 @@ type PostgresConn struct {
 type MongoConn struct {
 	URI             string `yaml:"uri"`
 	Container       string `yaml:"container,omitempty"`
-	ContainerEngine string `yaml:"container_engine,omitempty"`
+	ContainerEngine string `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"`
 }
 
 // RedisConn — `redis://…` URL. Same Container semantics as MongoConn.
 type RedisConn struct {
 	URL             string `yaml:"url"`
 	Container       string `yaml:"container,omitempty"`
-	ContainerEngine string `yaml:"container_engine,omitempty"`
+	ContainerEngine string `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"`
 }
 
 // EsConn — Elasticsearch / OpenSearch HTTP URL. Same Container
@@ -103,7 +103,7 @@ type RedisConn struct {
 type EsConn struct {
 	URL             string `yaml:"url"`
 	Container       string `yaml:"container,omitempty"`
-	ContainerEngine string `yaml:"container_engine,omitempty"`
+	ContainerEngine string `yaml:"container_engine,omitempty" jsonschema:"enum=docker,enum=podman"`
 }
 
 // SnapshotsConfig — `snapshots:` block.
@@ -256,13 +256,20 @@ func (h *HookEntry) UnmarshalYAML(node *yaml.Node) error {
 
 // DatabaseConfig — one `databases:` entry. The `engine` discriminator
 // gates which sub-fields are valid.
+//
+// `Fanout` is the optional override for the outer concurrency cap
+// during clone restore + DropMatching. Leave unset (omitempty / 0)
+// to use the safe per-engine default from internal/prepare. Raise
+// only if the server is provisioned for it (max_connections raised,
+// PG pg_database lock contention acceptable, etc.).
 type DatabaseConfig struct {
-	Engine       string          `yaml:"engine"`
+	Engine       string          `yaml:"engine" jsonschema:"enum=mysql,enum=mariadb,enum=tidb,enum=postgres,enum=postgresql,enum=mongodb,enum=redis,enum=elasticsearch,enum=opensearch"`
 	NameTemplate string          `yaml:"name_template,omitempty"`
 	Dump         *DumpSpec       `yaml:"dump,omitempty"`
 	Migrations   *MigrationSpec  `yaml:"migrations,omitempty"`
 	TestClones   *TestClonesSpec `yaml:"test_clones,omitempty"`
 	Namespaces   *Namespaces     `yaml:"namespaces,omitempty"`
+	Fanout       uint32          `yaml:"fanout,omitempty" jsonschema:"minimum=0,maximum=64"`
 }
 
 // DumpSpec — `dump:` sub-block of a DatabaseConfig.
@@ -283,12 +290,12 @@ type DumpSpec struct {
 // e.g. MigrationDirs empty means treeman has no migration source
 // for the hash, so the snapshot key won't change when files do.
 type MigrationSpec struct {
-	Framework     string   `yaml:"framework"`                // free-form label for logs + downstream tooling
-	MigrationDirs []string `yaml:"migration_dirs,omitempty"` // glob patterns relative to repo root
-	FileGlobs     []string `yaml:"file_globs,omitempty"`     // glob patterns for migration files within those dirs
-	Lockfiles     []string `yaml:"lockfiles,omitempty"`      // files whose hash invalidates the snapshot
-	HashMode      string   `yaml:"hash_mode,omitempty"`      // "filename" (default) | "checksum"
-	OnModify      string   `yaml:"on_modify,omitempty"`      // "rebuild" (default) | "delta"
+	Framework     string   `yaml:"framework"`                                                    // free-form label for logs + downstream tooling
+	MigrationDirs []string `yaml:"migration_dirs,omitempty"`                                     // glob patterns relative to repo root
+	FileGlobs     []string `yaml:"file_globs,omitempty"`                                         // glob patterns for migration files within those dirs
+	Lockfiles     []string `yaml:"lockfiles,omitempty"`                                          // files whose hash invalidates the snapshot
+	HashMode      string   `yaml:"hash_mode,omitempty" jsonschema:"enum=filename,enum=checksum"` // "filename" (default) | "checksum"
+	OnModify      string   `yaml:"on_modify,omitempty" jsonschema:"enum=rebuild,enum=delta"`     // "rebuild" (default) | "delta"
 }
 
 // TestClonesSpec — `test_clones:` sub-block. Used by every parallel
@@ -351,7 +358,7 @@ type BinlogConfig struct {
 	// developers on the same host don't clash.
 	ServerID uint32 `yaml:"server_id,omitempty"`
 	// Flavor — "mysql" (default) or "mariadb".
-	Flavor string `yaml:"flavor,omitempty"`
+	Flavor string `yaml:"flavor,omitempty" jsonschema:"enum=mysql,enum=mariadb"`
 	// ApplyDDL toggles execution of DDL Query events. Default true.
 	ApplyDDL *bool `yaml:"apply_ddl,omitempty"`
 	// ApplyDML toggles execution of ROW events. Default false (DDL
@@ -362,7 +369,7 @@ type BinlogConfig struct {
 // WatcherPath — one `paths:` entry.
 type WatcherPath struct {
 	Glob string `yaml:"glob"`
-	On   string `yaml:"on,omitempty"` // "auto" | "delta" | "rebuild"
+	On   string `yaml:"on,omitempty" jsonschema:"enum=auto,enum=delta,enum=rebuild"` // "auto" | "delta" | "rebuild"
 }
 
 // CustomFramework — `frameworks:` entry, lets users declare
@@ -371,8 +378,8 @@ type CustomFramework struct {
 	Markers       []string `yaml:"markers"`
 	MigrationDirs []string `yaml:"migration_dirs"`
 	FilePattern   string   `yaml:"file_pattern"`
-	HashMode      string   `yaml:"hash_mode,omitempty"`
-	OnModify      string   `yaml:"on_modify,omitempty"`
+	HashMode      string   `yaml:"hash_mode,omitempty" jsonschema:"enum=filename,enum=checksum"`
+	OnModify      string   `yaml:"on_modify,omitempty" jsonschema:"enum=rebuild,enum=delta"`
 	Lockfiles     []string `yaml:"lockfiles,omitempty"`
 	EngineHint    string   `yaml:"engine_hint,omitempty"`
 }

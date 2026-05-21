@@ -289,9 +289,11 @@ connections:
   elasticsearch: { url: "http://127.0.0.1:9200" }
 
 databases:
-  - engine: mysql                          # mysql|mariadb|tidb|postgres|mongodb|redis|elasticsearch
+  - engine: mysql                          # mysql|mariadb|tidb|postgres|postgresql|mongodb|redis|elasticsearch|opensearch
     name_template: "myapp_testing_{slug}"
     dump: { path: storage/dumps/seed.sql.gz }
+    fanout: 0                              # 0 = safe per-engine default (mysql 4, pg GOMAXPROCS, mongo 6, es 8).
+                                           # raise only if the server is provisioned (max_connections bumped, etc.).
     migrations:                            # fully declarative; runtime never re-detects
       framework: laravel                   # label only — fields below are what treeman reads
       migration_dirs:

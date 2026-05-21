@@ -13,6 +13,8 @@ import (
 	"net/url"
 	"strings"
 
+	"golang.org/x/sync/errgroup"
+
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -107,18 +109,40 @@ func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 
 // DropMatching drops every database whose name starts with prefix.
 // Returns the names that were actually dropped.
+//
+// DROPs run in parallel (limit 6) because each `wt delete` typically
+// fans out across source + template + N paratest clones (1+1+8 = 10
+// databases on a default setup), and DROP DATABASE serializes only
+// on the pg_database-equivalent lock — independent names don't
+// contend.
 func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
 	matched, err := d.ListMatching(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	limit := 6
+	if limit > len(matched) && len(matched) > 0 {
+		limit = len(matched)
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	g.SetLimit(limit)
 	for _, n := range matched {
-		if err := validateIdent(n); err != nil {
-			return nil, err
-		}
-		if _, err := d.DB.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", n)); err != nil {
-			return nil, fmt.Errorf("DROP DATABASE `%s`: %w", n, err)
-		}
+		n := n
+		g.Go(func() error {
+			if err := validateIdent(n); err != nil {
+				return err
+			}
+			if _, err := d.DB.ExecContext(gctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", n)); err != nil {
+				return fmt.Errorf("DROP DATABASE `%s`: %w", n, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return matched, nil
 }
@@ -178,6 +202,14 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 // `USE` and `SHOW CREATE TABLE` go through MySQL's text protocol by
 // default in database/sql so neither hits the 1295 prepared-protocol
 // error.
+//
+// Tables clone in parallel (errgroup, limited to mysqlCloneFanout
+// connections), views replay serially afterwards because views can
+// reference other views / tables and engines reject CREATE VIEW
+// against a missing dependency. Each parallel connection re-applies
+// the session flags (foreign_key_checks=0, etc.) since SET SESSION
+// is per-conn and the database/sql pool shuffles connections per
+// statement otherwise.
 func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
 	if err := validateIdent(source); err != nil {
 		return err
@@ -206,75 +238,143 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 	}
 	defer rows.Close()
 	type t struct{ name, kind string }
-	var tables []t
+	var tables, views []t
 	for rows.Next() {
 		var n, k string
 		if err := rows.Scan(&n, &k); err != nil {
 			return err
 		}
-		tables = append(tables, t{name: n, kind: k})
+		row := t{name: n, kind: k}
+		if k == "VIEW" {
+			views = append(views, row)
+		} else {
+			tables = append(tables, row)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 
-	conn, err := d.DB.Conn(ctx)
-	if err != nil {
+	// Parallel table clone. errgroup limits concurrency; each worker
+	// acquires its own pooled connection so session vars stick.
+	g, gctx := errgroup.WithContext(ctx)
+	limit := mysqlCloneFanout
+	if limit > len(tables) && len(tables) > 0 {
+		limit = len(tables)
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	g.SetLimit(limit)
+	for _, tbl := range tables {
+		tbl := tbl
+		g.Go(func() error {
+			return cloneOneTable(gctx, d.DB, source, template, tbl.name)
+		})
+	}
+	if err := g.Wait(); err != nil {
 		return err
 	}
-	defer conn.Close()
+
+	// Views need their dependencies in place — defer to a single
+	// serial pass after the parallel table copy finishes.
+	if len(views) > 0 {
+		conn, err := d.DB.Conn(ctx)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		if err := applyCloneSession(ctx, conn); err != nil {
+			return err
+		}
+		for _, v := range views {
+			if err := validateIdent(v.name); err != nil {
+				return err
+			}
+			row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE VIEW `%s`.`%s`", source, v.name))
+			var name, createStmt string
+			// SHOW CREATE VIEW returns four columns; scan into
+			// dummies for the extras.
+			var charset, collation string
+			if err := row.Scan(&name, &createStmt, &charset, &collation); err != nil {
+				return fmt.Errorf("SHOW CREATE VIEW `%s`.`%s`: %w", source, v.name, err)
+			}
+			if _, err := conn.ExecContext(ctx, fmt.Sprintf("USE `%s`", template)); err != nil {
+				return fmt.Errorf("USE `%s`: %w", template, err)
+			}
+			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+				return fmt.Errorf("recreate view `%s`: %w", v.name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// mysqlCloneFanout caps how many table copies run in parallel inside
+// SnapshotCreate. 6 is a pragmatic default: a connection per worker
+// stays comfortably under the typical 151-conn MySQL default, and
+// goes wide enough to hide round-trip latency on schemas with many
+// small tables.
+const mysqlCloneFanout = 6
+
+// applyCloneSession enables the session flags needed to skip
+// constraint enforcement and binlog overhead during the bulk copy.
+// `sql_log_bin` only takes effect when the connecting user has
+// SUPER, so errors are tolerated.
+func applyCloneSession(ctx context.Context, conn *sql.Conn) error {
 	for _, s := range []string{
 		"SET SESSION foreign_key_checks=0",
 		"SET SESSION unique_checks=0",
 		"SET SESSION sql_log_bin=0",
 	} {
-		_, _ = conn.ExecContext(ctx, s) // best-effort; sql_log_bin requires SUPER
+		_, _ = conn.ExecContext(ctx, s)
 	}
+	return nil
+}
 
-	for _, tbl := range tables {
-		if err := validateIdent(tbl.name); err != nil {
-			return err
-		}
-		kind := "TABLE"
-		if tbl.kind == "VIEW" {
-			kind = "VIEW"
-		}
-		row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE %s `%s`.`%s`", kind, source, tbl.name))
-		var name, createStmt string
-		if err := row.Scan(&name, &createStmt); err != nil {
-			return fmt.Errorf("SHOW CREATE %s `%s`.`%s`: %w", kind, source, tbl.name, err)
-		}
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf("USE `%s`", template)); err != nil {
-			return fmt.Errorf("USE `%s`: %w", template, err)
-		}
-		if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-			return fmt.Errorf("recreate `%s`: %w", tbl.name, err)
-		}
-		if tbl.kind != "VIEW" {
-			// Generated columns (STORED or VIRTUAL) reject any
-			// caller-supplied value — `INSERT … SELECT *` trips
-			// MySQL error 3105 ("The value specified for generated
-			// column X is not allowed"). Enumerate the non-generated
-			// columns explicitly so the column list matches on both
-			// sides of the copy.
-			cols, err := nonGeneratedColumns(ctx, conn, source, tbl.name)
-			if err != nil {
-				return fmt.Errorf("list columns for `%s`: %w", tbl.name, err)
-			}
-			if len(cols) == 0 {
-				// Table is composed entirely of generated columns
-				// (rare; the schema clone via SHOW CREATE TABLE
-				// already populates them). Skip the data copy.
-				continue
-			}
-			colList := backtickJoin(cols)
-			copy := fmt.Sprintf(
-				"INSERT INTO `%s`.`%s` (%s) SELECT %s FROM `%s`.`%s`",
-				template, tbl.name, colList, colList, source, tbl.name)
-			if _, err := conn.ExecContext(ctx, copy); err != nil {
-				return fmt.Errorf("copy data for `%s`: %w", tbl.name, err)
-			}
-		}
+// cloneOneTable replicates a single base table from source into
+// template. SHOW CREATE TABLE preserves indexes, constraints, and
+// AUTO_INCREMENT. The INSERT … SELECT projection enumerates only
+// non-generated columns (MySQL error 3105 otherwise).
+func cloneOneTable(ctx context.Context, db *sql.DB, source, template, name string) error {
+	if err := validateIdent(name); err != nil {
+		return err
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := applyCloneSession(ctx, conn); err != nil {
+		return err
+	}
+	row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", source, name))
+	var gotName, createStmt string
+	if err := row.Scan(&gotName, &createStmt); err != nil {
+		return fmt.Errorf("SHOW CREATE TABLE `%s`.`%s`: %w", source, name, err)
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("USE `%s`", template)); err != nil {
+		return fmt.Errorf("USE `%s`: %w", template, err)
+	}
+	if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+		return fmt.Errorf("recreate `%s`: %w", name, err)
+	}
+	cols, err := nonGeneratedColumns(ctx, conn, source, name)
+	if err != nil {
+		return fmt.Errorf("list columns for `%s`: %w", name, err)
+	}
+	if len(cols) == 0 {
+		// Table is composed entirely of generated columns. The
+		// schema clone already populates them on insert; skip the
+		// data copy.
+		return nil
+	}
+	colList := backtickJoin(cols)
+	copyStmt := fmt.Sprintf(
+		"INSERT INTO `%s`.`%s` (%s) SELECT %s FROM `%s`.`%s`",
+		template, name, colList, colList, source, name)
+	if _, err := conn.ExecContext(ctx, copyStmt); err != nil {
+		return fmt.Errorf("copy data for `%s`: %w", name, err)
 	}
 	return nil
 }

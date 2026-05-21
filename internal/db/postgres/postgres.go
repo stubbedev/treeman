@@ -10,6 +10,8 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/reachability"
@@ -98,14 +100,35 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	if err != nil {
 		return nil, err
 	}
+	// Parallel DROPs: each one acquires a brief AccessExclusiveLock
+	// on pg_database, so the engine serializes the lock-acquisition
+	// step anyway — but the pg_terminate_backend call + WAL flush per
+	// drop dominate latency on a paratest fan-out (~10 dbs). Limit
+	// 4 keeps us well under the typical max_connections=100 while
+	// extracting most of the wall-clock win.
+	g, gctx := errgroup.WithContext(ctx)
+	limit := 4
+	if limit > len(matched) && len(matched) > 0 {
+		limit = len(matched)
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	g.SetLimit(limit)
 	for _, n := range matched {
-		// Boot any straggler connections so DROP can proceed.
-		_, _ = d.DB.ExecContext(ctx,
-			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1", n)
-		_, err := d.execOutsideTx(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, n))
-		if err != nil {
-			return nil, fmt.Errorf("DROP DATABASE %q: %w", n, err)
-		}
+		n := n
+		g.Go(func() error {
+			// Boot any straggler connections so DROP can proceed.
+			_, _ = d.DB.ExecContext(gctx,
+				"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1", n)
+			if _, err := d.execOutsideTx(gctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, n)); err != nil {
+				return fmt.Errorf("DROP DATABASE %q: %w", n, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return matched, nil
 }

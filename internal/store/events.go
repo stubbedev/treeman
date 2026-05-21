@@ -30,19 +30,19 @@ type Event struct {
 // EventFilter is the union of every predicate the `logs` CLI exposes.
 // Empty fields are no-ops, so callers can construct it incrementally.
 type EventFilter struct {
-	WorktreeID   int64    // join filter — 0 = any
-	RepoID       int64    // join filter — 0 = any
-	Levels       []string // empty = any
-	EventTypes   []string // empty = any
-	Phases       []string // empty = any
-	MessageLike  string   // SQL LIKE pattern (substring match)
-	PayloadLike  string   // SQL LIKE pattern against payload_json
-	SinceMs      int64    // ts >= SinceMs when non-zero
-	UntilMs      int64    // ts <= UntilMs when non-zero
-	AfterID      int64    // id > AfterID — for incremental follow
-	Limit        int      // 0 = no LIMIT clause
-	OldestFirst  bool     // ORDER BY ts ASC instead of DESC
-	HydrateWT    bool     // LEFT JOIN worktrees to fill WorktreeSlug etc.
+	WorktreeID  int64    // join filter — 0 = any
+	RepoID      int64    // join filter — 0 = any
+	Levels      []string // empty = any
+	EventTypes  []string // empty = any
+	Phases      []string // empty = any
+	MessageLike string   // SQL LIKE pattern (substring match)
+	PayloadLike string   // SQL LIKE pattern against payload_json
+	SinceMs     int64    // ts >= SinceMs when non-zero
+	UntilMs     int64    // ts <= UntilMs when non-zero
+	AfterID     int64    // id > AfterID — for incremental follow
+	Limit       int      // 0 = no LIMIT clause
+	OldestFirst bool     // ORDER BY ts ASC instead of DESC
+	HydrateWT   bool     // LEFT JOIN worktrees to fill WorktreeSlug etc.
 }
 
 // QueryEvents returns events matching f. The default ordering is

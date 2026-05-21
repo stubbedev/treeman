@@ -9,6 +9,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
@@ -53,15 +54,35 @@ func (d *Driver) Close(ctx context.Context) error { return d.Client.Disconnect(c
 
 // DropMatching drops every database whose name starts with prefix.
 // Returns the names that were actually dropped.
+//
+// Drops run in parallel (limit 6) — each Database.Drop is an
+// independent admin command, so wall-clock for a paratest fan-out
+// (1 source + N clones) drops linearly with concurrency.
 func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
 	names, err := d.ListMatching(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	limit := 6
+	if limit > len(names) && len(names) > 0 {
+		limit = len(names)
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	g.SetLimit(limit)
 	for _, n := range names {
-		if err := d.Client.Database(n).Drop(ctx); err != nil {
-			return nil, fmt.Errorf("drop mongo db %q: %w", n, err)
-		}
+		n := n
+		g.Go(func() error {
+			if err := d.Client.Database(n).Drop(gctx); err != nil {
+				return fmt.Errorf("drop mongo db %q: %w", n, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return names, nil
 }

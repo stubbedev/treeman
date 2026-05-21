@@ -8,18 +8,24 @@
 package snapshot
 
 import (
-	"crypto/sha256"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+
+	"lukechampine.com/blake3"
 )
 
 // FormatVersion bumps any time the SnapshotKey layout changes in a
-// way that invalidates existing fingerprints.
-const FormatVersion uint32 = 1
+// way that invalidates existing fingerprints. v2 swapped sha256 →
+// blake3 across both the fingerprint hash and the per-file content
+// hashes that feed it, so every existing _tm_… template rebuilds
+// once after upgrade.
+const FormatVersion uint32 = 2
 
 // Key fingerprints a snapshot. Two prepare runs that share every
 // field can reuse the same template DB.
@@ -94,7 +100,7 @@ func (k Key) Fingerprint() string {
 		// programming error.
 		panic(fmt.Sprintf("snapshot key: %v", err))
 	}
-	sum := sha256.Sum256(b)
+	sum := blake3.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
 
@@ -115,22 +121,64 @@ func (k Key) TemplateName() string {
 	return fmt.Sprintf("_tm_%s", k.Fingerprint()[:16])
 }
 
+// HashCache is the subset of *store.Store that LockfileHashesFor +
+// MigrationsHash need: a stat-gated cache that returns hex digests
+// for absolute paths. Defined here so internal/snapshot doesn't
+// import internal/store (avoiding a cycle when other store consumers
+// want to import snapshot).
+type HashCache interface {
+	HashedFile(ctx context.Context, path string) (string, error)
+}
+
 // LockfileHashesFor hashes a list of files. Missing files are
 // skipped (not an error) so configs that name optional lockfiles
 // don't fail when a particular project doesn't ship them.
+//
+// When cache is non-nil, hashes are looked up via the stat-gated
+// SQLite cache so unchanged files (matching size + mtime_ns) skip
+// the disk read. Pass nil to force an uncached read (test paths,
+// out-of-daemon CLI flows).
 func LockfileHashesFor(paths []string) (map[string]string, error) {
+	return LockfileHashesForWithCache(context.Background(), nil, paths)
+}
+
+// LockfileHashesForWithCache is the cache-aware variant. See
+// LockfileHashesFor for semantics.
+func LockfileHashesForWithCache(ctx context.Context, cache HashCache, paths []string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, p := range paths {
 		info, err := os.Stat(p)
 		if err != nil || info.IsDir() {
 			continue
 		}
-		b, err := os.ReadFile(p)
+		if cache != nil {
+			abs, err := filepath.Abs(p)
+			if err == nil {
+				if h, err := cache.HashedFile(ctx, abs); err == nil {
+					out[filepath.Base(p)] = h
+					continue
+				}
+			}
+		}
+		h, err := hashFile(p)
 		if err != nil {
 			return out, err
 		}
-		sum := sha256.Sum256(b)
-		out[filepath.Base(p)] = hex.EncodeToString(sum[:])
+		out[filepath.Base(p)] = h
 	}
 	return out, nil
+}
+
+// hashFile streams path through a 256-bit BLAKE3 hasher.
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := blake3.New(32, nil)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/reachability"
@@ -67,15 +69,36 @@ func (d *Driver) EngineVersion(ctx context.Context) (string, error) {
 // ES rejects wildcard DELETE when
 // action.destructive_requires_name=true (the cluster default), so
 // list-then-delete-by-name.
+//
+// Deletes fan out in parallel (limit 8) — DELETE /index is a single
+// HTTP round trip with no contention between indices, and ES happily
+// fields concurrent admin requests up to thread_pool.management's
+// queue size.
 func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
 	names, err := d.ListMatching(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	limit := 8
+	if limit > len(names) && len(names) > 0 {
+		limit = len(names)
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	g.SetLimit(limit)
 	for _, n := range names {
-		if _, err := d.delete(ctx, "/"+n); err != nil {
-			return nil, fmt.Errorf("DELETE %s: %w", n, err)
-		}
+		n := n
+		g.Go(func() error {
+			if _, err := d.delete(gctx, "/"+n); err != nil {
+				return fmt.Errorf("DELETE %s: %w", n, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return names, nil
 }

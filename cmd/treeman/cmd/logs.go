@@ -469,4 +469,3 @@ func singleLine(s string, width int) string {
 	}
 	return strings.TrimSpace(s)
 }
-

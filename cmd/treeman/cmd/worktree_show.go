@@ -337,4 +337,3 @@ func newestStartTs(ctx context.Context, st *store.Store, wtID int64) int64 {
 	}
 	return rows[0].Ts
 }
-
