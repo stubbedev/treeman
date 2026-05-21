@@ -209,19 +209,23 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 	return d.EnsureDB(ctx, name)
 }
 
-// SnapshotCreate clones `source` into `template` table-by-table via
-// `SHOW CREATE TABLE` + `INSERT INTO target.t SELECT * FROM source.t`.
-// `USE` and `SHOW CREATE TABLE` go through MySQL's text protocol by
-// default in database/sql so neither hits the 1295 prepared-protocol
-// error.
+// SnapshotCreate clones `source` into `template` in two phases:
 //
-// Tables clone in parallel (errgroup, limited to mysqlCloneFanout
-// connections), views replay serially afterwards because views can
-// reference other views / tables and engines reject CREATE VIEW
-// against a missing dependency. Each parallel connection re-applies
-// the session flags (foreign_key_checks=0, etc.) since SET SESSION
-// is per-conn and the database/sql pool shuffles connections per
-// statement otherwise.
+//  1. Serial DDL pass on a single connection — every base table's
+//     `CREATE TABLE` runs against the new template, and the
+//     non-generated column list is captured for the data pass.
+//     Doing DDL serially avoids the InnoDB data-dictionary
+//     deadlocks (Error 1213) that parallel CREATE × INSERT pairs
+//     used to trigger on schemas with many FK-linked tables.
+//  2. Parallel data copy via errgroup (mysqlCloneFanout workers) —
+//     each worker holds its own pooled connection so the
+//     `SET SESSION` flags from applyCloneSession remain in scope,
+//     and the INSERTs hit pre-created destination tables so the
+//     lock graph stays purely data-side.
+//
+// Views replay serially afterwards because views can reference
+// other views / tables and engines reject CREATE VIEW against a
+// missing dependency.
 func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
 	if err := validateIdent(source); err != nil {
 		return err
@@ -267,21 +271,69 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 		return err
 	}
 
-	// Parallel table clone. errgroup limits concurrency; each worker
-	// acquires its own pooled connection so session vars stick.
+	// Phase 1 — serial DDL pass on a single connection. Captures
+	// each table's non-generated column list so Phase 2 can skip
+	// the per-worker column lookup.
+	type tableJob struct {
+		name string
+		cols []string // empty → all-generated, no data copy needed
+	}
+	jobs := make([]tableJob, 0, len(tables))
+	if err := func() error {
+		conn, err := d.DB.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("acquire DDL connection: %w", err)
+		}
+		defer conn.Close()
+		if err := applyCloneSession(ctx, conn); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("USE `%s`", template)); err != nil {
+			return fmt.Errorf("USE `%s`: %w", template, err)
+		}
+		for _, tbl := range tables {
+			if err := validateIdent(tbl.name); err != nil {
+				return err
+			}
+			row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", source, tbl.name))
+			var gotName, createStmt string
+			if err := row.Scan(&gotName, &createStmt); err != nil {
+				return fmt.Errorf("SHOW CREATE TABLE `%s`.`%s`: %w", source, tbl.name, err)
+			}
+			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+				return fmt.Errorf("recreate `%s`: %w", tbl.name, err)
+			}
+			cols, err := nonGeneratedColumns(ctx, conn, source, tbl.name)
+			if err != nil {
+				return fmt.Errorf("list columns for `%s`: %w", tbl.name, err)
+			}
+			jobs = append(jobs, tableJob{name: tbl.name, cols: cols})
+		}
+		return nil
+	}(); err != nil {
+		return err
+	}
+
+	// Phase 2 — parallel data copy against pre-created destination
+	// tables.
 	g, gctx := errgroup.WithContext(ctx)
 	limit := mysqlCloneFanout
-	if limit > len(tables) && len(tables) > 0 {
-		limit = len(tables)
+	if limit > len(jobs) && len(jobs) > 0 {
+		limit = len(jobs)
 	}
 	if limit < 1 {
 		limit = 1
 	}
 	g.SetLimit(limit)
-	for _, tbl := range tables {
-		tbl := tbl
+	for _, j := range jobs {
+		if len(j.cols) == 0 {
+			// All columns generated; DDL pass already populated
+			// the schema and there's nothing to copy.
+			continue
+		}
+		j := j
 		g.Go(func() error {
-			return cloneOneTable(gctx, d.DB, source, template, tbl.name)
+			return copyOneTableData(gctx, d.DB, source, template, j.name, j.cols)
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -331,24 +383,35 @@ const mysqlCloneFanout = 6
 
 // applyCloneSession enables the session flags needed to skip
 // constraint enforcement and binlog overhead during the bulk copy.
-// `sql_log_bin` only takes effect when the connecting user has
-// SUPER, so errors are tolerated.
+// `sql_log_bin=0` is load-bearing: without it MySQL falls back to
+// locking source reads for INSERT … SELECT (binlog determinism
+// rules), which is the root cause of the parallel-clone deadlocks
+// SnapshotCreate used to hit. The grant requirement is
+// SESSION_VARIABLES_ADMIN (or SUPER on 5.7); fail loudly when the
+// user doesn't have it instead of silently regressing into lock
+// contention.
 func applyCloneSession(ctx context.Context, conn *sql.Conn) error {
-	for _, s := range []string{
-		"SET SESSION foreign_key_checks=0",
-		"SET SESSION unique_checks=0",
-		"SET SESSION sql_log_bin=0",
-	} {
-		_, _ = conn.ExecContext(ctx, s)
+	if _, err := conn.ExecContext(ctx, "SET SESSION foreign_key_checks=0, unique_checks=0"); err != nil {
+		return fmt.Errorf("disable foreign_key_checks / unique_checks: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "SET SESSION sql_log_bin=0"); err != nil {
+		return fmt.Errorf("disable sql_log_bin for snapshot clone (grant SESSION_VARIABLES_ADMIN or SUPER to the snapshot user): %w", err)
+	}
+	var v int
+	if err := conn.QueryRowContext(ctx, "SELECT @@SESSION.sql_log_bin").Scan(&v); err != nil {
+		return fmt.Errorf("read back @@SESSION.sql_log_bin: %w", err)
+	}
+	if v != 0 {
+		return fmt.Errorf("SET SESSION sql_log_bin=0 was accepted but the session still reports %d; check user grants (need SESSION_VARIABLES_ADMIN or SUPER)", v)
 	}
 	return nil
 }
 
-// cloneOneTable replicates a single base table from source into
-// template. SHOW CREATE TABLE preserves indexes, constraints, and
-// AUTO_INCREMENT. The INSERT … SELECT projection enumerates only
-// non-generated columns (MySQL error 3105 otherwise).
-func cloneOneTable(ctx context.Context, db *sql.DB, source, template, name string) error {
+// copyOneTableData runs the data half of the clone for one table.
+// The destination has already been created during SnapshotCreate's
+// serial DDL pass, so this only issues the INSERT … SELECT against
+// pre-existing tables — no concurrent CREATEs to contend with.
+func copyOneTableData(ctx context.Context, db *sql.DB, source, template, name string, cols []string) error {
 	if err := validateIdent(name); err != nil {
 		return err
 	}
@@ -359,27 +422,6 @@ func cloneOneTable(ctx context.Context, db *sql.DB, source, template, name strin
 	defer conn.Close()
 	if err := applyCloneSession(ctx, conn); err != nil {
 		return err
-	}
-	row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", source, name))
-	var gotName, createStmt string
-	if err := row.Scan(&gotName, &createStmt); err != nil {
-		return fmt.Errorf("SHOW CREATE TABLE `%s`.`%s`: %w", source, name, err)
-	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("USE `%s`", template)); err != nil {
-		return fmt.Errorf("USE `%s`: %w", template, err)
-	}
-	if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-		return fmt.Errorf("recreate `%s`: %w", name, err)
-	}
-	cols, err := nonGeneratedColumns(ctx, conn, source, name)
-	if err != nil {
-		return fmt.Errorf("list columns for `%s`: %w", name, err)
-	}
-	if len(cols) == 0 {
-		// Table is composed entirely of generated columns. The
-		// schema clone already populates them on insert; skip the
-		// data copy.
-		return nil
 	}
 	colList := backtickJoin(cols)
 	copyStmt := fmt.Sprintf(
