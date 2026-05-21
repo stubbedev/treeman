@@ -15,6 +15,9 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"runtime"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/dumpload"
@@ -40,6 +43,48 @@ type Outcome struct {
 	Fingerprint  string
 	CacheHit     bool
 	Clones       []string
+}
+
+// cloneRestorer is the engine-specific `SnapshotRestore` signature
+// — both the mysql and postgres drivers expose it identically.
+// Letting fanOutClones take this as a func avoids tying the helper
+// to a concrete driver type.
+type cloneRestorer func(ctx context.Context, template, target string) error
+
+// fanOutClones restores `template` into each of `clones` in
+// parallel. Each restore is an engine-side operation (CREATE
+// DATABASE … TEMPLATE on postgres, the table-by-table copy path on
+// mysql); the driver's connection pool throttles back-pressure but
+// nothing in the call site does. Cap concurrency at GOMAXPROCS so a
+// `clones: auto` config that resolves to 32 workers on a beefy box
+// can't open more pool slots than the DB engine will serve.
+//
+// Returns the first error seen. errgroup's ctx cancellation
+// propagates so peer restores abort instead of hammering a server
+// that already refused the first one.
+func fanOutClones(ctx context.Context, restore cloneRestorer, template string, clones []string) error {
+	if len(clones) == 0 {
+		return nil
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	limit := runtime.GOMAXPROCS(0)
+	if limit < 2 {
+		limit = 2
+	}
+	if limit > len(clones) {
+		limit = len(clones)
+	}
+	g.SetLimit(limit)
+	for _, c := range clones {
+		c := c
+		g.Go(func() error {
+			if err := restore(gctx, template, c); err != nil {
+				return fmt.Errorf("restore %s → %s: %w", template, c, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // Run drives prepare for every database declared by cfg.Databases.
@@ -182,10 +227,8 @@ func prepareMySQL(
 			if err != nil {
 				return Outcome{}, err
 			}
-			for _, c := range clones {
-				if err := drv.SnapshotRestore(ctx, rec.TemplateName, c); err != nil {
-					return Outcome{}, fmt.Errorf("restore %s → %s: %w", rec.TemplateName, c, err)
-				}
+			if err := fanOutClones(ctx, drv.SnapshotRestore, rec.TemplateName, clones); err != nil {
+				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
 			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
@@ -268,10 +311,8 @@ func prepareMySQL(
 	if err != nil {
 		return Outcome{}, err
 	}
-	for _, c := range clones {
-		if err := drv.SnapshotRestore(ctx, templateName, c); err != nil {
-			return Outcome{}, fmt.Errorf("restore %s → %s: %w", templateName, c, err)
-		}
+	if err := fanOutClones(ctx, drv.SnapshotRestore, templateName, clones); err != nil {
+		return Outcome{}, err
 	}
 
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
@@ -380,10 +421,8 @@ func preparePostgres(
 			if err != nil {
 				return Outcome{}, err
 			}
-			for _, c := range clones {
-				if err := drv.SnapshotRestore(ctx, rec.TemplateName, c); err != nil {
-					return Outcome{}, fmt.Errorf("restore %s → %s: %w", rec.TemplateName, c, err)
-				}
+			if err := fanOutClones(ctx, drv.SnapshotRestore, rec.TemplateName, clones); err != nil {
+				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
 			return Outcome{
@@ -432,10 +471,8 @@ func preparePostgres(
 	if err != nil {
 		return Outcome{}, err
 	}
-	for _, c := range clones {
-		if err := drv.SnapshotRestore(ctx, templateName, c); err != nil {
-			return Outcome{}, fmt.Errorf("restore %s → %s: %w", templateName, c, err)
-		}
+	if err := fanOutClones(ctx, drv.SnapshotRestore, templateName, clones); err != nil {
+		return Outcome{}, err
 	}
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
 		fmt.Sprintf("clones=%d", len(clones)),
