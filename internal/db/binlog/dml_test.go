@@ -81,3 +81,55 @@ func TestIndicesOf(t *testing.T) {
 		t.Errorf("got %v want [2 0]", got)
 	}
 }
+
+func TestBuildInsertSkipsGeneratedColumns(t *testing.T) {
+	// `extension` is a STORED generated column on the Laravel `files`
+	// table; MySQL rejects any explicit value for it with error 3105.
+	// The replayer must drop it from both the column list and the
+	// row-value projection.
+	meta := &tableMeta{
+		Columns:  []string{"id", "name", "extension"},
+		PKCols:   []int{0},
+		Writable: []int{0, 1},
+	}
+	q, args := buildInsert("c", "files", meta, []any{int64(1), "doc.pdf", "pdf"})
+	wantQ := "INSERT INTO `c`.`files` (`id`, `name`) VALUES (?, ?)"
+	if q != wantQ {
+		t.Errorf("query=%q want %q", q, wantQ)
+	}
+	if !reflect.DeepEqual(args, []any{int64(1), "doc.pdf"}) {
+		t.Errorf("args=%v want [1 doc.pdf]", args)
+	}
+}
+
+func TestBuildUpdateSkipsGeneratedColumns(t *testing.T) {
+	// UPDATE … SET on a generated column triggers the same MySQL
+	// error 3105. The WHERE on PK is unaffected (PK indices point
+	// into the full Columns slice).
+	meta := &tableMeta{
+		Columns:  []string{"id", "name", "extension"},
+		PKCols:   []int{0},
+		Writable: []int{0, 1},
+	}
+	before := []any{int64(5), "a.txt", "txt"}
+	after := []any{int64(5), "a.pdf", "pdf"}
+	q, args := buildUpdate("c", "files", meta, before, after)
+	wantQ := "UPDATE `c`.`files` SET `id`=?, `name`=? WHERE `id`=? LIMIT 1"
+	if q != wantQ {
+		t.Errorf("query=%q want %q", q, wantQ)
+	}
+	if !reflect.DeepEqual(args, []any{int64(5), "a.pdf", int64(5)}) {
+		t.Errorf("args=%v want [5 a.pdf 5]", args)
+	}
+}
+
+func TestWritableMask(t *testing.T) {
+	cols := []string{"id", "name", "extension"}
+	got := writableMask(cols, []string{"extension"})
+	if !reflect.DeepEqual(got, []int{0, 1}) {
+		t.Errorf("got %v want [0 1]", got)
+	}
+	if writableMask(cols, nil) != nil {
+		t.Error("nil generated → nil sentinel expected")
+	}
+}

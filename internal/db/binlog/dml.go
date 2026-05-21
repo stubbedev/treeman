@@ -21,6 +21,26 @@ import (
 type tableMeta struct {
 	Columns []string // 1-to-1 with the binlog's row tuple, position-indexed
 	PKCols  []int    // indices into Columns. Empty when table has no PK.
+	// Writable lists the indices into Columns that the replayer is
+	// allowed to set in INSERT / UPDATE. Generated columns (STORED
+	// or VIRTUAL) are excluded — MySQL rejects any explicit value
+	// for them with error 3105. When nil (legacy paths / tests that
+	// don't populate it), every column is treated as writable.
+	Writable []int
+}
+
+// writableIdx returns Writable, or a default 0..len(Columns)-1 slice
+// when Writable hasn't been populated. Lets older callers keep
+// working unchanged while the binlog replayer fills the field in.
+func (t *tableMeta) writableIdx() []int {
+	if t.Writable != nil {
+		return t.Writable
+	}
+	out := make([]int, len(t.Columns))
+	for i := range t.Columns {
+		out[i] = i
+	}
+	return out
 }
 
 // metaCache is keyed by `<schema>.<table>`.
@@ -88,7 +108,12 @@ func resolveTableMeta(
 				pk = indicesOf(cols, pkNames)
 			}
 		}
-		t := &tableMeta{Columns: cols, PKCols: pk}
+		// information_schema is the only reliable source for which
+		// columns are GENERATED — the binlog row metadata does not
+		// expose this. One extra round trip per table-first-touch,
+		// cached for the life of the meta entry.
+		genNames, _ := generatedColumns(ctx, drv, schema, table)
+		t := &tableMeta{Columns: cols, PKCols: pk, Writable: writableMask(cols, genNames)}
 		cache.put(key, t)
 		return t, nil
 	}
@@ -98,9 +123,60 @@ func resolveTableMeta(
 		return nil, fmt.Errorf("column lookup %s.%s: %w", schema, table, err)
 	}
 	pkNames, _ := primaryKeyColumns(ctx, drv, schema, table)
-	t := &tableMeta{Columns: cols, PKCols: indicesOf(cols, pkNames)}
+	genNames, _ := generatedColumns(ctx, drv, schema, table)
+	t := &tableMeta{
+		Columns:  cols,
+		PKCols:   indicesOf(cols, pkNames),
+		Writable: writableMask(cols, genNames),
+	}
 	cache.put(key, t)
 	return t, nil
+}
+
+// generatedColumns returns the names of GENERATED columns (STORED or
+// VIRTUAL) in `<schema>.<table>`. MySQL surfaces them via the EXTRA
+// column on information_schema.COLUMNS.
+func generatedColumns(ctx context.Context, drv *dbmysql.Driver, schema, table string) ([]string, error) {
+	rows, err := drv.DB.QueryContext(ctx, `
+		SELECT CONVERT(COLUMN_NAME USING utf8mb4)
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		  AND EXTRA LIKE '%GENERATED%'
+		ORDER BY ORDINAL_POSITION`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// writableMask returns the indices of `cols` that are NOT in
+// `generated`. Order-preserving so the INSERT column list matches the
+// row-value projection.
+func writableMask(cols, generated []string) []int {
+	if len(generated) == 0 {
+		return nil // sentinel: caller treats nil as "all writable"
+	}
+	gen := make(map[string]struct{}, len(generated))
+	for _, g := range generated {
+		gen[g] = struct{}{}
+	}
+	out := make([]int, 0, len(cols))
+	for i, c := range cols {
+		if _, ok := gen[c]; ok {
+			continue
+		}
+		out = append(out, i)
+	}
+	return out
 }
 
 // pkColumnsFromMeta extracts the primary-key column indices from a
@@ -182,17 +258,23 @@ func quoteIdent(s string) string {
 
 // buildInsert constructs `INSERT INTO db.tbl (col1, col2…) VALUES
 // (?, ?…)` for one row. Columns are quoted; values are bound via
-// the placeholder list returned alongside.
+// the placeholder list returned alongside. Generated columns
+// (tracked in meta.Writable) are dropped from both the column list
+// and the value list so MySQL doesn't reject the statement with
+// error 3105 ("value specified for generated column is not allowed").
 func buildInsert(target, table string, meta *tableMeta, row []any) (string, []any) {
-	colList := make([]string, len(meta.Columns))
-	placeholders := make([]string, len(meta.Columns))
-	for i, c := range meta.Columns {
-		colList[i] = quoteIdent(c)
-		placeholders[i] = "?"
+	idx := meta.writableIdx()
+	colList := make([]string, len(idx))
+	placeholders := make([]string, len(idx))
+	args := make([]any, len(idx))
+	for j, i := range idx {
+		colList[j] = quoteIdent(meta.Columns[i])
+		placeholders[j] = "?"
+		args[j] = row[i]
 	}
 	q := "INSERT INTO " + quoteIdent(target) + "." + quoteIdent(table) +
 		" (" + strings.Join(colList, ", ") + ") VALUES (" + strings.Join(placeholders, ", ") + ")"
-	return q, row
+	return q, args
 }
 
 // buildDelete constructs `DELETE FROM db.tbl WHERE pk1=? AND
@@ -207,12 +289,14 @@ func buildDelete(target, table string, meta *tableMeta, row []any) (string, []an
 
 // buildUpdate constructs `UPDATE db.tbl SET col1=?,col2=? WHERE
 // pk=?`. `before` carries the WHERE bindings; `after` carries the
-// SET bindings.
+// SET bindings. Generated columns are skipped in SET (MySQL error
+// 3105) but remain valid in WHERE on the `before` row.
 func buildUpdate(target, table string, meta *tableMeta, before, after []any) (string, []any) {
-	setList := make([]string, len(meta.Columns))
-	args := make([]any, 0, len(meta.Columns)+len(meta.PKCols))
-	for i, c := range meta.Columns {
-		setList[i] = quoteIdent(c) + "=?"
+	idx := meta.writableIdx()
+	setList := make([]string, len(idx))
+	args := make([]any, 0, len(idx)+len(meta.PKCols))
+	for j, i := range idx {
+		setList[j] = quoteIdent(meta.Columns[i]) + "=?"
 		args = append(args, after[i])
 	}
 	where, whereArgs := whereClause(meta, before)

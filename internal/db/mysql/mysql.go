@@ -251,14 +251,71 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 			return fmt.Errorf("recreate `%s`: %w", tbl.name, err)
 		}
 		if tbl.kind != "VIEW" {
-			copy := fmt.Sprintf("INSERT INTO `%s`.`%s` SELECT * FROM `%s`.`%s`",
-				template, tbl.name, source, tbl.name)
+			// Generated columns (STORED or VIRTUAL) reject any
+			// caller-supplied value — `INSERT … SELECT *` trips
+			// MySQL error 3105 ("The value specified for generated
+			// column X is not allowed"). Enumerate the non-generated
+			// columns explicitly so the column list matches on both
+			// sides of the copy.
+			cols, err := nonGeneratedColumns(ctx, conn, source, tbl.name)
+			if err != nil {
+				return fmt.Errorf("list columns for `%s`: %w", tbl.name, err)
+			}
+			if len(cols) == 0 {
+				// Table is composed entirely of generated columns
+				// (rare; the schema clone via SHOW CREATE TABLE
+				// already populates them). Skip the data copy.
+				continue
+			}
+			colList := backtickJoin(cols)
+			copy := fmt.Sprintf(
+				"INSERT INTO `%s`.`%s` (%s) SELECT %s FROM `%s`.`%s`",
+				template, tbl.name, colList, colList, source, tbl.name)
 			if _, err := conn.ExecContext(ctx, copy); err != nil {
 				return fmt.Errorf("copy data for `%s`: %w", tbl.name, err)
 			}
 		}
 	}
 	return nil
+}
+
+// nonGeneratedColumns lists the columns of `<schema>.<table>` whose
+// EXTRA does not mark them as generated (STORED or VIRTUAL). Returned
+// in ordinal-position order so the INSERT column list matches the
+// SELECT projection one-to-one.
+func nonGeneratedColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, `
+		SELECT CONVERT(COLUMN_NAME USING utf8mb4)
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		  AND EXTRA NOT LIKE '%GENERATED%'
+		ORDER BY ORDINAL_POSITION`, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func backtickJoin(cols []string) string {
+	var b strings.Builder
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('`')
+		b.WriteString(c)
+		b.WriteByte('`')
+	}
+	return b.String()
 }
 
 // SnapshotRestore re-creates `target` from `template`. Symmetric to
