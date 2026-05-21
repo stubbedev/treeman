@@ -26,7 +26,17 @@ jobs:
           cache: true
       - run: go build ./...
       - run: go vet ./...
-      - run: gofmt -l ./cmd ./internal | tee /dev/stderr | (! grep -q '.')
+      - name: gofmt
+        run: |
+          out=$(gofmt -l ./cmd ./internal)
+          if [ -n "$out" ]; then
+            echo "::error::gofmt would rewrite the following files:"
+            printf '%s\n' "$out"
+            echo
+            echo "--- proposed diff ---"
+            gofmt -d ./cmd ./internal
+            exit 1
+          fi
       - run: go test ./...
 
   nix:

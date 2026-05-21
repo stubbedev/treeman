@@ -28,8 +28,18 @@ fmt:
     gofmt -w ./cmd ./internal
 
 # rustfmt-equivalent — fails CI if anything is unformatted.
+# Prints the diff on failure so the file + change is obvious.
 lint:
-    gofmt -l ./cmd ./internal | tee /dev/stderr | (! grep -q '.')
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=$(gofmt -l ./cmd ./internal)
+    if [ -n "$out" ]; then
+        echo "gofmt would rewrite:"
+        printf '%s\n' "$out"
+        echo
+        gofmt -d ./cmd ./internal
+        exit 1
+    fi
     go vet ./...
 
 test:
