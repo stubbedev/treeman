@@ -20,6 +20,15 @@ type State struct {
 	mu         sync.Mutex
 	watchers   map[string]*WatcherEntry
 	wtWatchers map[string]*WatcherEntry
+
+	// teardownMu serialises wt-teardown goroutines per repo so two
+	// fast-fire `gwtd`s on the same repo can't run concurrent
+	// `git worktree remove --force` + parallel DROP DATABASE storms
+	// — that combination on a Laravel-sized vendor/ + node_modules/
+	// (~250k file unlinks) saturated the I/O queue badly enough to
+	// require a forced shutdown in field testing.
+	teardownMu  sync.Mutex
+	teardownLks map[string]*sync.Mutex
 }
 
 // WatcherEntry — per-repo watcher placeholder. Phase 10 fills in the
@@ -39,7 +48,25 @@ func NewState(s *store.Store) *State {
 		PID:           uint32(syscallPid()),
 		watchers:      map[string]*WatcherEntry{},
 		wtWatchers:    map[string]*WatcherEntry{},
+		teardownLks:   map[string]*sync.Mutex{},
 	}
+}
+
+// LockRepoTeardown returns the per-repo teardown mutex, creating it
+// on first call. Callers must `Lock()` on entry and `Unlock()` on
+// exit — typically with `defer mu.Unlock()` immediately after the
+// `Lock()`. Serialises every TeardownWorktree goroutine for a given
+// repo so concurrent gwtd invocations queue instead of fanning out
+// disk + DB I/O.
+func (st *State) LockRepoTeardown(repoPath string) *sync.Mutex {
+	st.teardownMu.Lock()
+	defer st.teardownMu.Unlock()
+	mu, ok := st.teardownLks[repoPath]
+	if !ok {
+		mu = &sync.Mutex{}
+		st.teardownLks[repoPath] = mu
+	}
+	return mu
 }
 
 // WatcherCount returns how many repos currently have a live watcher.

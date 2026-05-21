@@ -86,6 +86,13 @@ func FinalizeWorktree(
 // TeardownWorktree mirrors FinalizeWorktree for `treeman wt delete`.
 // Runs predelete hooks + DB teardown + `git worktree remove`. All
 // in the daemon's runtime so the CLI returns immediately.
+//
+// Serialised per repo via st.LockRepoTeardown — two fast-fire gwtd
+// invocations on the same repo queue instead of running concurrent
+// `git worktree remove --force` + DROP DATABASE storms. The mutex
+// is held for the entire goroutine; this is intentional. A single
+// teardown on a Laravel vendor+node_modules tree is heavy enough on
+// its own; doubling it can lock the host.
 func TeardownWorktree(
 	ctx context.Context,
 	st *State,
@@ -93,6 +100,10 @@ func TeardownWorktree(
 	force bool,
 	inheritedEnv map[string]string,
 ) error {
+	mu := st.LockRepoTeardown(repoPath)
+	mu.Lock()
+	defer mu.Unlock()
+
 	repoRoot := repoPath
 	wtRoot := worktreePath
 	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
@@ -132,12 +143,12 @@ func TeardownWorktree(
 		return err
 	}
 
-	args := []string{"-C", repoRoot, "worktree", "remove"}
+	gitArgs := []string{"-C", repoRoot, "worktree", "remove"}
 	if force {
-		args = append(args, "--force")
+		gitArgs = append(gitArgs, "--force")
 	}
-	args = append(args, wtRoot)
-	cmd := exec.CommandContext(ctx, "git", args...)
+	gitArgs = append(gitArgs, wtRoot)
+	cmd := lowPriorityCommand(ctx, "git", gitArgs)
 	if err := cmd.Run(); err != nil && !force {
 		return fmt.Errorf("git worktree remove: %w (pass --force to override)", err)
 	}
@@ -147,6 +158,34 @@ func TeardownWorktree(
 		"daemon-detached teardown complete",
 		repoID, wtID, "", 0, nil)
 	return nil
+}
+
+// lowPriorityCommand wraps an exec.CommandContext invocation so the
+// child runs at low CPU + I/O priority. Used for `git worktree
+// remove` because `--force` rm -rf's vendor/ + node_modules/ — on a
+// Laravel checkout that's ~250k inode unlinks back-to-back. Without
+// nice/ionice that storm starves foreground apps for I/O and CPU
+// long enough to look like a system freeze.
+//
+// Layering: `ionice -c 3 nice -n 19 <cmd>`. `ionice -c 3` is the
+// idle class — the child only gets disk bandwidth when nothing else
+// wants it. `nice -n 19` is the lowest CPU priority. Both are
+// best-effort: when either binary is missing we fall back to the
+// next layer, and finally to plain exec.Command. macOS shells
+// usually carry `nice` but not `ionice`, so the nice-only fallback
+// still gives partial relief.
+func lowPriorityCommand(ctx context.Context, name string, args []string) *exec.Cmd {
+	if _, err := exec.LookPath("ionice"); err == nil {
+		ioArgs := append([]string{"-c", "3"}, "nice")
+		ioArgs = append(ioArgs, "-n", "19", name)
+		ioArgs = append(ioArgs, args...)
+		return exec.CommandContext(ctx, "ionice", ioArgs...)
+	}
+	if _, err := exec.LookPath("nice"); err == nil {
+		niceArgs := append([]string{"-n", "19", name}, args...)
+		return exec.CommandContext(ctx, "nice", niceArgs...)
+	}
+	return exec.CommandContext(ctx, name, args...)
 }
 
 // detectBranch reads `.git/HEAD` (or the gitlink-resolved file) and
