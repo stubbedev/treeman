@@ -14,6 +14,7 @@ import (
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -62,7 +63,7 @@ func wtCreate() *cli.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := config.LoadLayered(repoRoot)
+			cfg, err := resolve.LoadResolved(repoRoot)
 			if err != nil {
 				return err
 			}
@@ -256,7 +257,7 @@ func wtDelete() *cli.Command {
 					return err
 				}
 			}
-			cfg, err := config.LoadLayered(repoRoot)
+			cfg, err := resolve.LoadResolved(repoRoot)
 			if err != nil {
 				return err
 			}
@@ -526,7 +527,7 @@ func wtSwitch() *cli.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := config.LoadLayered(repoRoot)
+			cfg, err := resolve.LoadResolved(repoRoot)
 			if err != nil {
 				return err
 			}

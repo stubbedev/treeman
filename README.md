@@ -201,12 +201,17 @@ env_scoping:
     - { key: DB_TEST_DATABASE, template: "myapp_testing_{slug}" }
     - { key: REDIS_DB,         template: "{slug_redis_index}" }
 
+# The whole `connections:` block is optional — treeman auto-resolves
+# credentials from `.env` / `.env.testing` (Laravel `DB_*`,
+# Spring-Boot `SPRING_DATASOURCE_*`, MySQL/PG/Redis component vars).
+# Declare anything below only when you want to override the auto-
+# detected value.
 connections:
   mysql:
     host: 127.0.0.1
     port: 3306
     user: root
-    password_env: MYSQL_ROOT_PASSWORD     # resolved from worktree's .env
+    password_env: MYSQL_ROOT_PASSWORD     # overrides .env DB_PASSWORD
   postgres:
     host: 127.0.0.1
     port: 5432
@@ -365,6 +370,29 @@ rebuilding from the dump every time a migration runs.
 The watcher dispatches `delta` vs `rebuild` per-framework: any
 `HashChecksum` framework or `on: rebuild` watcher path forces a
 full rebuild; anything else replays the binlog.
+
+### Credential resolution from .env
+
+treeman reads `<repo>/.env`, `.env.local`, `.env.test`,
+`.env.testing` (+ their `.local` variants) and uses them to fill
+the connection config when the YAML omits a block or leaves a
+field unset. Supported flavours per engine:
+
+| Engine | Env vars treeman reads (first non-empty wins) |
+|---|---|
+| MySQL | `DB_TEST_*` → `DB_*` (Laravel); `MYSQL_URL`; `SPRING_DATASOURCE_URL` (jdbc:mysql://…) + `SPRING_DATASOURCE_{USERNAME,PASSWORD}`; `MYSQL_PASSWORD` / `MYSQL_PWD` |
+| Postgres | `DB_TEST_*` → `DB_*` (Laravel); `DATABASE_URL`; `PG*` (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`); `SPRING_DATASOURCE_URL` (jdbc:postgresql://…) |
+| MongoDB | `MONGODB_URI` / `MONGO_URL` / `DATABASE_URL`; `MONGO_DB_HOST` + `MONGO_DB_PORT` composed; `SPRING_DATA_MONGODB_*` |
+| Redis | `REDIS_URL`; `REDIS_HOST` + `REDIS_PORT` + `REDIS_PASSWORD` composed; literal `null` / `(null)` passwords skipped |
+| Elasticsearch | `ELASTICSEARCH_URL` / `ELASTICSEARCH_HOSTS` (auto-prefixes `http://` if missing) |
+
+Practical effect: a Laravel repo whose `.env.testing` carries the
+canonical `DB_HOST=mysql / DB_USERNAME=root / DB_PASSWORD=secret`
+needs **no** `connections:` block in `.treeman.yaml`. The same
+goes for Spring-Boot apps with `SPRING_DATASOURCE_URL`, etc.
+
+YAML always wins where present — declare a field only when you
+want to override the env value.
 
 ### Connecting to DBs in a container
 

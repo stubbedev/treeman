@@ -7,9 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -26,7 +26,7 @@ func FinalizeWorktree(
 ) error {
 	repoRoot := repoPath
 	wtRoot := worktreePath
-	cfg, err := config.LoadLayeredForWorktree(repoRoot, wtRoot)
+	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
 	if err != nil {
 		return err
 	}
@@ -79,7 +79,7 @@ func TeardownWorktree(
 ) error {
 	repoRoot := repoPath
 	wtRoot := worktreePath
-	cfg, err := config.LoadLayeredForWorktree(repoRoot, wtRoot)
+	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
 	if err != nil {
 		return err
 	}

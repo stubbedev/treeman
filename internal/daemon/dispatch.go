@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"path/filepath"
 
-	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/binlog"
+	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/version"
@@ -201,7 +201,7 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 	if repoPath == "" {
 		return fmt.Errorf("watcher_start: empty repo_path")
 	}
-	cfg, err := config.LoadLayered(repoPath)
+	cfg, err := resolve.LoadResolved(repoPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}

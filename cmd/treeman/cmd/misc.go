@@ -48,7 +48,7 @@ func PrepareCmd() *cli.Command {
 					return err
 				}
 			}
-			cfg, err := config.LoadLayered(repoRoot)
+			cfg, err := resolve.LoadResolved(repoRoot)
 			if err != nil {
 				return err
 			}
@@ -99,7 +99,7 @@ func HookCmd() *cli.Command {
 				if err != nil {
 					return err
 				}
-				cfg, err := config.LoadLayered(repoRoot)
+				cfg, err := resolve.LoadResolved(repoRoot)
 				if err != nil {
 					return err
 				}
@@ -243,7 +243,7 @@ func ConfigCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
-					cfg, err := config.LoadLayered(repoRoot)
+					cfg, err := resolve.LoadResolved(repoRoot)
 					if err != nil {
 						return err
 					}
@@ -260,7 +260,7 @@ func ConfigCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
-					cfg, err := config.LoadLayered(repoRoot)
+					cfg, err := resolve.LoadResolved(repoRoot)
 					if err != nil {
 						return err
 					}
