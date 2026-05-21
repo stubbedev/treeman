@@ -27,19 +27,17 @@
       "type": "object"
     },
     "ClonesSetting": {
-      "properties": {
-        "Auto": {
-          "type": "boolean"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
         },
-        "Fixed": {
-          "type": "integer"
+        {
+          "type": "integer",
+          "minimum": 0
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "Auto",
-        "Fixed"
       ]
     },
     "ConnectionsConfig": {
@@ -256,34 +254,120 @@
       ]
     },
     "HookEntry": {
-      "properties": {
-        "Steps": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "properties": {
+            "run": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "in_container": {
+              "type": "string"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "engine": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "run"
+          ]
+        },
+        {
+          "properties": {
+            "steps": {
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "properties": {
+                      "run": {
+                        "type": "string"
+                      },
+                      "cwd": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false,
+                    "type": "object",
+                    "required": [
+                      "run"
+                    ]
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            "in_container": {
+              "type": "string"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "engine": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "steps"
+          ]
+        },
+        {
           "items": {
-            "$ref": "#/$defs/SingleStep"
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "properties": {
+                  "run": {
+                    "type": "string"
+                  },
+                  "cwd": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "run"
+                ]
+              }
+            ]
           },
           "type": "array"
-        },
-        "Container": {
-          "type": "string"
-        },
-        "ComposeService": {
-          "type": "string"
-        },
-        "ComposeProject": {
-          "type": "string"
-        },
-        "Engine": {
-          "type": "string"
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "Steps",
-        "Container",
-        "ComposeService",
-        "ComposeProject",
-        "Engine"
       ]
     },
     "HooksConfig": {
@@ -541,18 +625,25 @@
       "type": "object"
     },
     "SingleStep": {
-      "properties": {
-        "run": {
+      "oneOf": [
+        {
           "type": "string"
         },
-        "cwd": {
-          "type": "string"
+        {
+          "properties": {
+            "run": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "run"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "run"
       ]
     },
     "SlugRules": {
