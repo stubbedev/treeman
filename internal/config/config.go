@@ -258,12 +258,12 @@ func (h *HookEntry) UnmarshalYAML(node *yaml.Node) error {
 // DatabaseConfig — one `databases:` entry. The `engine` discriminator
 // gates which sub-fields are valid.
 type DatabaseConfig struct {
-	Engine       string         `yaml:"engine"`
-	NameTemplate string         `yaml:"name_template,omitempty"`
-	Dump         *DumpSpec      `yaml:"dump,omitempty"`
-	Migrations   *MigrationSpec `yaml:"migrations,omitempty"`
-	Paratest     *ParatestSpec  `yaml:"paratest,omitempty"`
-	Namespaces   *Namespaces    `yaml:"namespaces,omitempty"`
+	Engine       string          `yaml:"engine"`
+	NameTemplate string          `yaml:"name_template,omitempty"`
+	Dump         *DumpSpec       `yaml:"dump,omitempty"`
+	Migrations   *MigrationSpec  `yaml:"migrations,omitempty"`
+	TestClones   *TestClonesSpec `yaml:"test_clones,omitempty"`
+	Namespaces   *Namespaces     `yaml:"namespaces,omitempty"`
 }
 
 // DumpSpec — `dump:` sub-block of a DatabaseConfig.
@@ -284,8 +284,7 @@ type DumpSpec struct {
 // e.g. MigrationDirs empty means treeman has no migration source
 // for the hash, so the snapshot key won't change when files do.
 type MigrationSpec struct {
-	Framework     string   `yaml:"framework"`
-	Dir           string   `yaml:"dir,omitempty"`            // deprecated; prefer MigrationDirs
+	Framework     string   `yaml:"framework"`                // free-form label for logs + downstream tooling
 	MigrationDirs []string `yaml:"migration_dirs,omitempty"` // glob patterns relative to repo root
 	FileGlobs     []string `yaml:"file_globs,omitempty"`     // glob patterns for migration files within those dirs
 	Lockfiles     []string `yaml:"lockfiles,omitempty"`      // files whose hash invalidates the snapshot
@@ -293,8 +292,11 @@ type MigrationSpec struct {
 	OnModify      string   `yaml:"on_modify,omitempty"`      // "rebuild" (default) | "delta"
 }
 
-// ParatestSpec — `paratest:` sub-block.
-type ParatestSpec struct {
+// TestClonesSpec — `test_clones:` sub-block. Used by every parallel
+// test runner (paratest, pest, pytest-xdist, Jest workers, Go
+// `-parallel`, cargo nextest, …). `clones` is either `auto` (treeman
+// reads the project's worker-count config) or an explicit integer.
+type TestClonesSpec struct {
 	Clones       ClonesSetting `yaml:"clones,omitempty"`
 	NameTemplate string        `yaml:"name_template"`
 }
@@ -395,6 +397,7 @@ func LoadLayered(repoRoot string) (Config, error) {
 			return cfg, err
 		}
 	}
+	normaliseAliases(&cfg)
 	return cfg, nil
 }
 
@@ -420,8 +423,15 @@ func LoadLayeredForWorktree(mainRoot, wtRoot string) (Config, error) {
 			return cfg, err
 		}
 	}
+	normaliseAliases(&cfg)
 	return cfg, nil
 }
+
+// normaliseAliases collapses deprecated YAML keys onto their
+// canonical fields after the layered merge completes. Currently a
+// no-op; kept as a hook for future renames so the LoadLayered
+// surface doesn't churn each time.
+func normaliseAliases(cfg *Config) {}
 
 func mergeYAMLFile(cfg *Config, path string) error {
 	b, err := os.ReadFile(path)

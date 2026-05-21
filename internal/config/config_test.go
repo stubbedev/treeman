@@ -112,7 +112,7 @@ env_scoping:
 databases:
   - engine: mysql
     name_template: "myapp_testing_{slug}"
-    paratest:
+    test_clones:
       clones: auto
       name_template: "myapp_testing_{slug}_test_{n}"
 hooks:
@@ -143,7 +143,7 @@ hooks:
 	if len(cfg.Databases) != 1 || cfg.Databases[0].Engine != "mysql" {
 		t.Errorf("databases: %#v", cfg.Databases)
 	}
-	if cfg.Databases[0].Paratest == nil || !cfg.Databases[0].Paratest.Clones.Auto {
-		t.Error("paratest.clones should be auto")
+	if cfg.Databases[0].TestClones == nil || !cfg.Databases[0].TestClones.Clones.Auto {
+		t.Error("test_clones.clones should be auto")
 	}
 }

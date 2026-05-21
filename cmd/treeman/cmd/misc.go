@@ -741,7 +741,7 @@ func renderInitTemplate(cwd string) string {
 		emitStringList(&b, "      ", "lockfiles", spec.Lockfiles)
 		fmt.Fprintf(&b, "      hash_mode: %s\n", spec.HashMode)
 		fmt.Fprintf(&b, "      on_modify: %s\n", spec.OnModify)
-		b.WriteString("    paratest:\n")
+		b.WriteString("    test_clones:\n")
 		b.WriteString("      clones: auto\n")
 		fmt.Fprintf(&b, "      name_template: \"%s_testing_{slug}_test_{n}\"\n", name)
 	} else {

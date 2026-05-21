@@ -1,12 +1,12 @@
 # treeman
 
-**Per-worktree development environment helper.** Spin up scoped
-databases, search indices, and test artefacts per git worktree;
-tear them down on delete; keep them in sync as your migrations or
-fixtures change. Works across migration frameworks, test
-frameworks, and language stacks — pick a `.treeman.yaml`, run
-`treeman wt create branch-name`, get an isolated checkout with a
-ready-to-test database stamped to that worktree.
+**Per-worktree development environment helper.** Spin up isolated
+databases, search indices, and parallel test clones per git
+worktree; tear them down on delete; keep them in sync as your
+migrations or fixtures change. Language- and framework-agnostic —
+runs the same way against a Laravel + MySQL repo, a Rails +
+Postgres repo, a Django + Postgres repo, a Go + golang-migrate
+service, or a Rust + sqlx workspace.
 
 Pure wire-protocol DB access (Go `database/sql` for MySQL +
 PostgreSQL, the official Mongo / Redis / Elasticsearch SDKs); no
@@ -18,54 +18,61 @@ Single user-mode daemon, thin CLI client, SQLite-backed event log.
 ## Why treeman
 
 Git worktrees give every branch its own checkout — but the
-checkout alone isn't enough. A real working tree needs:
+checkout alone isn't enough. A working tree needs:
 
-- a database scoped to that worktree (`myapp_testing_proj_123`)
-  so tests don't trample each other
-- `N` paratest clones of that database fanning out from a single
-  cached template (`CREATE DATABASE … TEMPLATE` on Postgres,
-  `INSERT … SELECT` on MySQL)
-- the framework's migrations applied
-- `.env` / `phpunit.xml` patched to point at the per-worktree DB
+- a database scoped to that worktree (e.g. `myapp_test_proj_123`)
+  so parallel branches don't trample each other's data
+- `N` test-runner clones of that database fanning out from a
+  single cached template, so the project's parallel test runner
+  (paratest, pest, pytest-xdist, Jest workers, Go `-parallel`,
+  cargo nextest, …) gets a fresh DB per worker
+- the project's migrations applied to the source DB
+- `.env`-style config (or `phpunit.xml`, `pyproject.toml`, etc.)
+  patched to point at the per-worktree DB names
 - post-create install hooks (composer / yarn / pnpm / go mod /
-  cargo / bundler …) running in parallel
-- pre-delete teardown that drops the DBs + Redis index + ES
-  prefix when you're done with the branch
+  cargo / bundler / pip …) running in parallel
+- pre-delete teardown that drops every per-worktree namespace
+  (DB, Redis index, ES index prefix) when you're done
 
-treeman owns that lifecycle so the prompts you type stay
-`treeman wt create FOO` / `treeman wt delete FOO`, while a small
-SQLite event log records every step in a queryable way.
+treeman owns that lifecycle. `treeman wt create FOO` /
+`treeman wt delete FOO` are the only commands you type; a SQLite
+event log records every step.
 
 ## Features
 
-- **Per-worktree DBs** for MySQL/MariaDB/TiDB, PostgreSQL, MongoDB,
-  Redis (DB-index scoping), Elasticsearch / OpenSearch — bringup
-  cache for the RDBMS engines, teardown for everything
+- **Per-worktree namespaces** for MySQL / MariaDB / TiDB,
+  PostgreSQL, MongoDB, Redis (DB-index scoping), Elasticsearch /
+  OpenSearch. Snapshot-cache bringup for the RDBMS engines,
+  flush-and-ready for the rest.
 - **Snapshot cache** with LRU eviction (`cap_per_repo`) — repeated
-  `wt create` for the same migrations + dump hits a cached template
-  and skips the cold rebuild. Native template-copy primitives:
-  `CREATE DATABASE … TEMPLATE` on Postgres, table-by-table `INSERT
-  … SELECT` on MySQL
+  `wt create` for the same migrations + dump hits a cached
+  template DB and skips the cold rebuild. Native template-copy
+  primitives: `CREATE DATABASE … TEMPLATE` on Postgres, table-by-
+  table `INSERT … SELECT` on MySQL.
 - **Hook groups** — declarative DAG of postcreate / predelete
   commands. Inside a group: sequence. Across groups: parallel.
   Drivers run detached via `setsid` so the CLI returns instantly.
-- **Migration framework detection** for Laravel, Rails, Django,
+- **Migration framework presets** for Laravel, Rails, Django,
   Flyway, sqlx-cli, diesel, golang-migrate, goose, dbmate, Knex,
-  Drizzle, Prisma, TypeORM, mikro-orm
-- **Test framework detection** for paratest, pest, pytest-xdist,
-  Jest, vitest, Go `-p`, Cargo nextest
+  Drizzle, Prisma, TypeORM, mikro-orm — used by `treeman init`
+  and `treeman fw detect`. The runtime reads only what's in the
+  YAML (see [Fully declarative](#fully-declarative--no-hidden-defaults)).
+- **Parallel test runner support** out of the box — `clones: auto`
+  detects worker counts from phpunit.xml, pytest-xdist
+  `addopts`, Jest `maxWorkers`, vitest `pool.threads`,
+  paratest defaults, etc.
 - **File watcher** (fsnotify + MySQL binlog tail) for live
-  rebuild-or-delta updates as migrations or seed dumps change
+  rebuild-or-delta updates as migrations or seed dumps change.
 - **`wt switch` / `wt back`** path-printing subcommands so shell
-  functions can `cd "$(treeman wt switch foo)"`
+  functions can `cd "$(treeman wt switch foo)"`.
 - **JSON Schema generated** from the Go config types via
   `treeman schema dump` — `.treeman.yaml` autocompletes correctly
-  in any editor with the YAML language server
+  in any editor with the YAML language server.
 - **Single static binary** per platform — no CGo, no system
-  libraries; CI cross-builds `{linux,darwin}` × `{amd64,arm64}`
+  libraries; CI cross-builds `{linux,darwin}` × `{amd64,arm64}`.
 - **Daemon init parity** — `treeman daemon install` writes a
   systemd-user unit on Linux and a launchd LaunchAgent plist on
-  macOS; `start`/`stop`/`status` route to whichever is present
+  macOS; `start`/`stop`/`status` route to whichever is present.
 
 ---
 
@@ -115,9 +122,10 @@ treeman daemon start        # idempotent — uses systemctl/launchctl when insta
 treeman wt create proj-123
 #   ↳ git worktree add .worktrees/proj-123 -b proj-123 origin/HEAD
 #   ↳ symlinks .env (and any worktrees.links targets)
-#   ↳ patches .env.testing's DB_DATABASE → my_app_testing_proj_123
+#   ↳ patches env_scoping.files entries (.env.testing, settings.py,
+#     phpunit.xml, etc.) to point at per-worktree DB names
 #   ↳ runs postcreate hooks (parallel groups, detached)
-#   ↳ prepare: ensure_db → load dump → migrate → snapshot → N paratest clones
+#   ↳ prepare: ensure_db → load dump → migrate → snapshot → N test clones
 
 # 4. Get the path of an existing worktree for `cd` integration:
 cd "$(treeman wt switch proj-123)"
@@ -233,8 +241,8 @@ databases:
       lockfiles: ["composer.lock"]
       hash_mode: filename                  # "filename" (cheap) | "checksum" (mutable migrations)
       on_modify: rebuild                   # "rebuild" | "delta"
-    paratest:
-      clones: auto                         # auto = detect from phpunit.xml / pyproject / etc.
+    test_clones:                           # parallel-test-runner fan-out
+      clones: auto                         # auto = detect from phpunit.xml / pyproject / Jest config
       name_template: "myapp_testing_{slug}_test_{n}"
 
 hooks:
@@ -299,6 +307,78 @@ hooks:
 order in the foreground and a non-zero exit aborts the worktree
 creation. Useful for `git pull`, `git lfs fetch`, etc.
 
+### Example: per-stack `databases:` blocks
+
+`treeman init` writes these for you when it detects the matching
+framework. Copy + paste into the `databases:` array of an existing
+`.treeman.yaml` to add a stack.
+
+**Rails + Postgres** (db/migrate, Gemfile.lock invalidates):
+
+```yaml
+- engine: postgres
+  name_template: "myapp_test_{slug}"
+  migrations:
+    framework: rails
+    migration_dirs: ["db/migrate"]
+    file_globs: ["*.rb"]
+    lockfiles: ["Gemfile.lock"]
+    hash_mode: filename
+    on_modify: rebuild
+  test_clones:
+    clones: auto          # reads parallel_workers from config/test.rb / spec_helper
+    name_template: "myapp_test_{slug}_w{n}"
+```
+
+**Django + Postgres** (auto-discovered app `migrations/` dirs):
+
+```yaml
+- engine: postgres
+  name_template: "myapp_test_{slug}"
+  migrations:
+    framework: django
+    migration_dirs: ["**/migrations"]
+    file_globs: ["[0-9]*_*.py"]
+    lockfiles: ["poetry.lock", "Pipfile.lock", "requirements.txt"]
+    hash_mode: filename
+  test_clones:
+    clones: auto          # reads pytest -n / pytest-xdist config
+    name_template: "myapp_test_{slug}_w{n}"
+```
+
+**golang-migrate + MySQL**:
+
+```yaml
+- engine: mysql
+  name_template: "svc_test_{slug}"
+  migrations:
+    framework: golang-migrate
+    migration_dirs: ["migrations", "services/*/migrations"]
+    file_globs: ["*.up.sql"]
+    lockfiles: ["go.sum"]
+    hash_mode: filename
+  test_clones:
+    clones: 4             # explicit count; Go's `-parallel` is per-package
+    name_template: "svc_test_{slug}_w{n}"
+```
+
+**sqlx-cli + Postgres** (migrations are mutable — checksum hash):
+
+```yaml
+- engine: postgres
+  name_template: "app_test_{slug}"
+  migrations:
+    framework: sqlx-cli
+    migration_dirs: ["migrations", "crates/*/migrations"]
+    file_globs: ["*.sql"]
+    lockfiles: ["Cargo.lock"]
+    hash_mode: checksum   # contents hash, not just filenames
+    on_modify: delta      # try binlog/diff replay before rebuild
+  test_clones:
+    clones: auto          # reads cargo nextest config
+    name_template: "app_test_{slug}_w{n}"
+```
+
 ### Templated names
 
 Several config fields are template strings rendered with the
@@ -310,7 +390,7 @@ worktree's slug:
 | `{slug_dash}` | `proj-123` |
 | `{slug_upper}` | `PROJ_123` |
 | `{slug_redis_index}` | `7` (deterministic 0–15 hash of slug) |
-| `{n}` | paratest clone index (1-based) |
+| `{n}` | test-clone index (1-based) |
 
 ### Snapshot cache + GC
 
@@ -319,7 +399,7 @@ source_db, framework, migrations_hash, dump_hash, lockfile_hashes)`
 into a SHA-256 key. If a row with that key already exists in the
 SQLite `snapshots` table AND the template DB still exists on the
 engine, treeman skips the cold rebuild and `CREATE DATABASE …
-TEMPLATE` / `INSERT … SELECT`s into the paratest clones directly.
+TEMPLATE` / `INSERT … SELECT`s into the test clones directly.
 
 `snapshots.retention.cap_per_repo` (default `8`) hard-caps how
 many cached templates per repo treeman will retain. When the
@@ -364,7 +444,7 @@ rebuilding from the dump every time a migration runs.
 
 - **DDL** replay (default on, `apply_ddl: true`): every CREATE /
   ALTER / DROP that lands on the source DB is mirrored to every
-  cached template + paratest clone, with the schema cache for the
+  cached template + test clone, with the schema cache for the
   source invalidated so subsequent DML events re-resolve columns.
 - **DML** replay (default off, `apply_dml: true`): WriteRows /
   UpdateRows / DeleteRows events are reconstructed as parameterised

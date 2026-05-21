@@ -178,7 +178,7 @@ func prepareMySQL(
 					"template":    rec.TemplateName,
 					"fingerprint": key.Fingerprint(),
 				})
-			clones, err := resolveCloneNames(d.Paratest, tplCtx, mainRepoRoot)
+			clones, err := resolveCloneNames(d.TestClones, tplCtx, mainRepoRoot)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -264,7 +264,7 @@ func prepareMySQL(
 	// logged inside EvictExcess.
 	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
 
-	clones, err := resolveCloneNames(d.Paratest, tplCtx, mainRepoRoot)
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, mainRepoRoot)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -376,7 +376,7 @@ func preparePostgres(
 					"template":    rec.TemplateName,
 					"fingerprint": key.Fingerprint(),
 				})
-			clones, err := resolveCloneNames(d.Paratest, tplCtx, mainRepoRoot)
+			clones, err := resolveCloneNames(d.TestClones, tplCtx, mainRepoRoot)
 			if err != nil {
 				return Outcome{}, err
 			}
@@ -428,7 +428,7 @@ func preparePostgres(
 	})
 	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
 
-	clones, err := resolveCloneNames(d.Paratest, tplCtx, mainRepoRoot)
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, mainRepoRoot)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -587,16 +587,9 @@ func specFromYAML(m config.MigrationSpec) framework.Spec {
 	if onMod == "" {
 		onMod = framework.OnRebuild
 	}
-	// `migrations.dir` is the legacy single-value field; expand it
-	// into the slice form so the rest of the pipeline only deals
-	// with MigrationDirs.
-	dirs := append([]string(nil), m.MigrationDirs...)
-	if m.Dir != "" {
-		dirs = append(dirs, m.Dir)
-	}
 	return framework.Spec{
 		Name:          m.Framework,
-		MigrationDirs: dirs,
+		MigrationDirs: append([]string(nil), m.MigrationDirs...),
 		FileGlobs:     append([]string(nil), m.FileGlobs...),
 		Lockfiles:     append([]string(nil), m.Lockfiles...),
 		HashMode:      hash,
@@ -604,7 +597,7 @@ func specFromYAML(m config.MigrationSpec) framework.Spec {
 	}
 }
 
-func resolveCloneNames(p *config.ParatestSpec, tplCtx template.Context, repoRoot string) ([]string, error) {
+func resolveCloneNames(p *config.TestClonesSpec, tplCtx template.Context, repoRoot string) ([]string, error) {
 	if p == nil {
 		return nil, nil
 	}
