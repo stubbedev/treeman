@@ -37,11 +37,14 @@ being able to change anything.
 command:
 
 ```sh
-# User-scoped (available everywhere)
-claude mcp add treeman -- treeman mcp --allow-mutations --allow-shell
+# User-scoped (available across every project on this machine)
+claude mcp add --scope user treeman -- treeman mcp --allow-mutations --allow-shell
 
 # Project-scoped (committed to .mcp.json in the repo root)
 claude mcp add --scope project treeman -- treeman mcp --allow-mutations
+
+# Local-scoped (private to you in this project — `claude mcp add`'s default)
+claude mcp add treeman -- treeman mcp --allow-mutations
 ```
 
 Confirm it registered with `claude mcp list`. Inside a session,
