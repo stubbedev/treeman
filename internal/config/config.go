@@ -371,7 +371,12 @@ func applyDefaults(cfg *Config) {
 		cfg.Daemon.LogLevel = "info"
 	}
 	if cfg.Worktrees.Root == "" {
-		cfg.Worktrees.Root = "../worktrees"
+		// `<main>/.worktrees/` matches the dotfiles `gwt` zsh
+		// convention so a treeman-controlled repo is drop-in for
+		// the bash-hook flow. Override per-repo with e.g.
+		// `worktrees.root: ../foo-worktrees` for the sibling-dir
+		// convention.
+		cfg.Worktrees.Root = ".worktrees"
 	}
 	if cfg.Worktrees.AsyncCreate == nil {
 		t := true

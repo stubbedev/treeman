@@ -22,6 +22,7 @@ import (
 	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/slug"
@@ -107,19 +108,80 @@ func prepareMySQL(
 	migrationsHash := ""
 	dumpHash := ""
 	lockfileHashes := map[string]string{}
-	framework := ""
+	frameworkName := ""
 	hashMode := ""
+	var spec *framework.Spec
 	if d.Migrations != nil {
-		framework = d.Migrations.Framework
+		frameworkName = d.Migrations.Framework
+		if s, ok := lookupFrameworkSpec(frameworkName); ok {
+			spec = &s
+			hashMode = string(s.HashMode)
+			if h, err := framework.MigrationsHash(mainRepoRoot, s); err == nil {
+				migrationsHash = h
+			}
+			lockPaths := make([]string, 0, len(s.Lockfiles))
+			for _, lf := range s.Lockfiles {
+				lockPaths = append(lockPaths, filepath.Join(mainRepoRoot, lf))
+			}
+			if h, err := snapshot.LockfileHashesFor(lockPaths); err == nil {
+				lockfileHashes = h
+			}
+		}
 	}
+	_ = spec
 	if d.Dump != nil {
 		dp := filepath.Join(mainRepoRoot, d.Dump.Path)
 		hashes, _ := snapshot.LockfileHashesFor([]string{dp})
 		dumpHash = hashes[filepath.Base(dp)]
 	}
 
-	key := snapshot.New(d.Engine, version, sourceDB, framework, hashMode, migrationsHash, dumpHash, lockfileHashes)
+	key := snapshot.New(d.Engine, version, sourceDB, frameworkName, hashMode, migrationsHash, dumpHash, lockfileHashes)
 	templateName := key.TemplateName()
+
+	// Cache lookup: if SQLite knows a snapshot row for this
+	// fingerprint AND the template DB still exists in MySQL, skip
+	// the cold build and just clone the template into paratest DBs.
+	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
+			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+				fmt.Sprintf("template=%s", rec.TemplateName),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      d.Engine,
+					"source_db":   sourceDB,
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+				})
+			clones, err := resolveCloneNames(d.Paratest, tplCtx, mainRepoRoot)
+			if err != nil {
+				return Outcome{}, err
+			}
+			for _, c := range clones {
+				if err := drv.SnapshotRestore(ctx, rec.TemplateName, c); err != nil {
+					return Outcome{}, fmt.Errorf("restore %s → %s: %w", rec.TemplateName, c, err)
+				}
+			}
+			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+				fmt.Sprintf("cache_hit clones=%d", len(clones)),
+				repoID, worktreeID, "", 0, map[string]string{
+					"source_db":   sourceDB,
+					"template":    rec.TemplateName,
+					"clones":      fmt.Sprintf("%d", len(clones)),
+					"fingerprint": key.Fingerprint(),
+				})
+			return Outcome{
+				Engine:       d.Engine,
+				SourceDB:     sourceDB,
+				TemplateName: rec.TemplateName,
+				Fingerprint:  key.Fingerprint(),
+				CacheHit:     true,
+				Clones:       clones,
+			}, nil
+		}
+		// Row stale (template was dropped externally). Wipe so the
+		// cold-build path below overwrites it cleanly.
+		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	}
 
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
 		fmt.Sprintf("engine=mysql source=%s template=%s", sourceDB, templateName),
@@ -145,7 +207,7 @@ func prepareMySQL(
 		}
 	}
 	if d.Migrations != nil {
-		out, err := runner.Run(ctx, framework, mainRepoRoot, sourceDB, runner.ModeUp, nil, inheritedEnv)
+		out, err := runner.Run(ctx, frameworkName, mainRepoRoot, sourceDB, runner.ModeUp, nil, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
@@ -158,6 +220,16 @@ func prepareMySQL(
 	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
 		return Outcome{}, fmt.Errorf("snapshot create %s → %s: %w", sourceDB, templateName, err)
 	}
+	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
+		Fingerprint:    key.Fingerprint(),
+		Engine:         d.Engine,
+		EngineVersion:  version,
+		SourceDB:       sourceDB,
+		TemplateName:   templateName,
+		MigrationsHash: migrationsHash,
+		DumpHash:       dumpHash,
+		LockfileHashes: lockfileHashes,
+	})
 
 	clones, err := resolveCloneNames(d.Paratest, tplCtx, mainRepoRoot)
 	if err != nil {
@@ -185,6 +257,18 @@ func prepareMySQL(
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
+}
+
+// lookupFrameworkSpec returns the built-in detector spec by name
+// (case-insensitive). Used to compute migrations_hash without
+// re-detecting from filesystem markers.
+func lookupFrameworkSpec(name string) (framework.Spec, bool) {
+	for _, s := range framework.DefaultRegistry().Specs {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return framework.Spec{}, false
 }
 
 func resolveCloneNames(p *config.ParatestSpec, tplCtx template.Context, repoRoot string) ([]string, error) {

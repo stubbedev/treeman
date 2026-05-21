@@ -8,30 +8,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/stubbedev/treeman/internal/gitenv"
 )
 
-// DiscoverRepoRoot walks up from `start` until it finds a `.git`
-// directory or a `.treeman.yaml` file. Returns "" + error when
-// neither is present in any ancestor.
+// DiscoverRepoRoot returns the MAIN repo root for `start`. When
+// `start` is inside a linked worktree, `gitenv.MainRoot` resolves
+// the gitlink → `<main>/.git` → `<main>`, so callers always see
+// the checkout that owns `.treeman.yaml` and the seed dump.
 func DiscoverRepoRoot(start string) (string, error) {
-	dir, err := filepath.Abs(start)
+	root, err := gitenv.MainRoot(start)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("discover repo root from %s: %w", start, err)
 	}
-	for {
-		if fi, err := os.Stat(filepath.Join(dir, ".treeman.yaml")); err == nil && !fi.IsDir() {
-			return dir, nil
-		}
-		if fi, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			_ = fi
-			return dir, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", fmt.Errorf("no .git or .treeman.yaml in any ancestor of %s", start)
-		}
-		dir = parent
-	}
+	return root, nil
 }
 
 // CaptureInheritedEnv snapshots os.Environ() into a BTreeMap-shaped

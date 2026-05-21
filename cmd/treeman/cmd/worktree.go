@@ -10,6 +10,7 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -32,6 +33,8 @@ func WorktreeCmd() *cli.Command {
 			wtUnregister(),
 			wtList(),
 			wtFinalize(),
+			wtSwitch(),
+			wtBack(),
 		},
 	}
 }
@@ -467,7 +470,7 @@ func resolveRepo(override string) (string, error) {
 func resolveWorktreesRoot(cfg config.Config, repoRoot string) string {
 	raw := cfg.Worktrees.Root
 	if raw == "" {
-		raw = "../worktrees"
+		raw = ".worktrees"
 	}
 	if filepath.IsAbs(raw) {
 		return raw
@@ -490,6 +493,232 @@ func detectDefaultBranch(repoRoot string) string {
 		return trimSpace(string(out))
 	}
 	return "main"
+}
+
+// wtSwitch — `treeman wt switch [name]`. Prints the absolute path
+// of an existing worktree to stdout (so a shell shim can `cd
+// "$(treeman wt switch foo)"`). With `--create`, runs the full
+// create flow first when no match is found.
+//
+// Lookup order:
+//  1. SQLite active worktrees: exact basename match, exact slug
+//     match, then prefix match on either.
+//  2. Filesystem: `<worktrees-root>/<name>` exists.
+//
+// On ambiguous prefix matches, lists candidates on stderr and exits
+// non-zero. Status/warnings go to stderr; only the resolved path
+// goes to stdout — never mix the two streams.
+func wtSwitch() *cli.Command {
+	return &cli.Command{
+		Name:  "switch",
+		Usage: "print the path of a worktree (for shell `cd $(…)` use)",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo", Usage: "repo root override"},
+			&cli.BoolFlag{Name: "create", Usage: "create the worktree if no match", Value: false},
+			&cli.StringFlag{Name: "from", Usage: "base branch (with --create)"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			if c.NArg() < 1 {
+				return fmt.Errorf("usage: treeman wt switch <name> [--create]")
+			}
+			name := c.Args().First()
+			repoRoot, err := resolveRepo(c.String("repo"))
+			if err != nil {
+				return err
+			}
+			cfg, err := config.LoadLayered(repoRoot)
+			if err != nil {
+				return err
+			}
+
+			if path, ok := lookupWorktree(ctx, repoRoot, name); ok {
+				fmt.Println(path)
+				return nil
+			}
+
+			// Filesystem fallback.
+			fsCandidate := filepath.Join(resolveWorktreesRoot(cfg, repoRoot), name)
+			if fi, err := os.Stat(fsCandidate); err == nil && fi.IsDir() {
+				fmt.Println(fsCandidate)
+				return nil
+			}
+
+			if !c.Bool("create") {
+				return fmt.Errorf("no worktree matches %q (try `treeman wt switch %s --create`)", name, name)
+			}
+
+			// Delegate to the create flow, then print the resolved
+			// path. Reuse wtCreate's Action via a synthetic args
+			// vector keeps the codepath single-source.
+			createCmd := wtCreate()
+			argv := []string{"create", name}
+			if v := c.String("from"); v != "" {
+				argv = append(argv, "--from", v)
+			}
+			argv = append(argv, "--repo", repoRoot)
+			if err := createCmd.Run(ctx, argv); err != nil {
+				return err
+			}
+			// After create, wtPath is `<root>/<name>` by default.
+			fmt.Println(filepath.Join(resolveWorktreesRoot(cfg, repoRoot), name))
+			return nil
+		},
+	}
+}
+
+// lookupWorktree queries SQLite for active worktrees attached to
+// `repoRoot` and returns the path that best matches `name` (exact
+// basename, then exact slug, then unambiguous prefix).
+func lookupWorktree(ctx context.Context, repoRoot, name string) (string, bool) {
+	dbPath, err := store.DefaultDBPath()
+	if err != nil {
+		return "", false
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return "", false
+	}
+	defer st.Close()
+	rows, err := st.DB.QueryContext(ctx, `
+		SELECT w.path, w.slug, COALESCE(w.branch,'')
+		FROM worktrees w JOIN repos r ON r.id = w.repo_id
+		WHERE w.deleted_at IS NULL AND r.path = ?`, repoRoot)
+	if err != nil {
+		return "", false
+	}
+	defer rows.Close()
+	var exactBase, exactSlug, exactBranch string
+	var prefixHits []string
+	for rows.Next() {
+		var path, slug, branch string
+		if err := rows.Scan(&path, &slug, &branch); err != nil {
+			continue
+		}
+		base := filepath.Base(path)
+		switch {
+		case base == name:
+			exactBase = path
+		case slug == name:
+			exactSlug = path
+		case branch == name:
+			exactBranch = path
+		case len(name) >= 2 && (hasPrefix(base, name) || hasPrefix(slug, name) || hasPrefix(branch, name)):
+			prefixHits = append(prefixHits, path)
+		}
+	}
+	switch {
+	case exactBase != "":
+		return exactBase, true
+	case exactBranch != "":
+		return exactBranch, true
+	case exactSlug != "":
+		return exactSlug, true
+	case len(prefixHits) == 1:
+		return prefixHits[0], true
+	case len(prefixHits) > 1:
+		fmt.Fprintln(os.Stderr, "ambiguous prefix match — candidates:")
+		for _, p := range prefixHits {
+			fmt.Fprintln(os.Stderr, "  ", p)
+		}
+		return "", false
+	}
+	return "", false
+}
+
+func hasPrefix(s, p string) bool {
+	return len(s) >= len(p) && s[:len(p)] == p
+}
+
+// wtBack — `treeman wt back`. Prints the main repo root for the
+// current cwd. With `--remove`, also deletes the current linked
+// worktree if it is clean (`git status --porcelain` empty) and has
+// no commits ahead of upstream.
+//
+// Used by the zsh shim: `cd "$(treeman wt back)"`. The remove path
+// shells out to `treeman wt delete` so the standard teardown +
+// daemon RPC flow runs.
+func wtBack() *cli.Command {
+	return &cli.Command{
+		Name:  "back",
+		Usage: "print main repo path (with --remove, drop current worktree if clean)",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "remove", Usage: "delete current worktree if clean + no unpushed commits"},
+			&cli.BoolFlag{Name: "force", Usage: "with --remove: pass --force to delete"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			repoRoot, err := DiscoverRepoRoot(cwd)
+			if err != nil {
+				return err
+			}
+
+			if !c.Bool("remove") {
+				fmt.Println(repoRoot)
+				return nil
+			}
+
+			// Remove path. Determine the worktree to drop.
+			if !gitenv.IsLinkedWorktree(cwd) {
+				// Already in main repo — nothing to remove.
+				fmt.Fprintln(os.Stderr, "not in a linked worktree; --remove ignored")
+				fmt.Println(repoRoot)
+				return nil
+			}
+
+			// Resolve the worktree root (cwd may be a subdirectory).
+			wtRoot, err := gitWorktreeRoot(cwd)
+			if err != nil {
+				return err
+			}
+
+			clean, err := gitenv.IsWorktreeClean(wtRoot)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "git status failed: %v; --remove aborted\n", err)
+				fmt.Println(repoRoot)
+				return nil
+			}
+			if !clean && !c.Bool("force") {
+				fmt.Fprintln(os.Stderr, "worktree has uncommitted changes; refusing --remove (pass --force to override)")
+				fmt.Println(repoRoot)
+				return nil
+			}
+			unpushed, _ := gitenv.HasUnpushedCommits(wtRoot)
+			if unpushed && !c.Bool("force") {
+				fmt.Fprintln(os.Stderr, "worktree has commits ahead of upstream; refusing --remove (pass --force to override)")
+				fmt.Println(repoRoot)
+				return nil
+			}
+
+			// Print main repo path FIRST so the caller can `cd "$(…)"`
+			// even when the subsequent delete prints to stderr.
+			fmt.Println(repoRoot)
+
+			// Delegate to wt delete to keep teardown logic in one
+			// place. Errors are surfaced on stderr; we don't exit
+			// non-zero because the caller already changed directory.
+			argv := []string{"delete", wtRoot, "--repo", repoRoot}
+			if c.Bool("force") {
+				argv = append(argv, "--force")
+			}
+			if err := wtDelete().Run(ctx, argv); err != nil {
+				fmt.Fprintf(os.Stderr, "wt delete failed: %v\n", err)
+			}
+			return nil
+		},
+	}
+}
+
+// gitWorktreeRoot returns the top-level directory of the worktree
+// containing `start`. Wraps `git -C start rev-parse --show-toplevel`.
+func gitWorktreeRoot(start string) (string, error) {
+	out, err := exec.Command("git", "-C", start, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --show-toplevel: %w", err)
+	}
+	return trimSpace(string(out)), nil
 }
 
 func trimSpace(s string) string {

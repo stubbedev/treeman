@@ -492,8 +492,22 @@ func SlugCmd() *cli.Command {
 	}
 }
 
-// InitCmd — `treeman init` scaffolds a minimal .treeman.yaml. The
-// Rust impl had a Laravel preset; we re-use the same shape.
+// InitCmd — `treeman init` scaffolds a `.treeman.yaml` tailored to
+// what the cwd looks like:
+//
+//   - Markers (artisan, package.json, composer.json, go.mod, …)
+//     decide which framework block to emit.
+//   - Lockfiles (composer.lock, yarn.lock, pnpm-lock.yaml,
+//     package-lock.json, bun.lockb, deno.lock, go.sum) decide which
+//     package-manager + JS-runtime install lines go in the
+//     postcreate hook groups.
+//   - The `hooks.postcreate` block uses groups so installs run in
+//     parallel (e.g. composer + yarn root + yarn frontend three
+//     groups, each sequenced inside) — matches the "sequence-within-
+//     group, parallel-across-groups" contract.
+//
+// Errors only when `.treeman.yaml` already exists without `--force`.
+// Detection is best-effort: emit what we can, comment what we can't.
 func InitCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "init",
@@ -504,26 +518,7 @@ func InitCmd() *cli.Command {
 			if _, err := os.Stat(target); err == nil && !c.Bool("force") {
 				return fmt.Errorf("%s already exists (pass --force to overwrite)", target)
 			}
-			body := `repo:
-  name: ` + filepath.Base(cwd) + `
-worktrees:
-  root: .worktrees
-  links:
-    - .env
-env_scoping:
-  files: [".env.testing"]
-  skip_worktree: true
-  patches:
-    - { key: DB_TEST_DATABASE, template: "` + filepath.Base(cwd) + `_testing_{slug}" }
-databases:
-  - engine: mysql
-    name_template: "` + filepath.Base(cwd) + `_testing_{slug}"
-    paratest:
-      clones: auto
-      name_template: "` + filepath.Base(cwd) + `_testing_{slug}_test_{n}"
-hooks:
-  postcreate: []
-`
+			body := renderInitTemplate(cwd)
 			if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
 				return err
 			}
@@ -531,6 +526,114 @@ hooks:
 			return nil
 		},
 	}
+}
+
+// renderInitTemplate inspects `cwd` and emits a tailored YAML.
+// Pulled out into a pure function so it can be exercised in unit
+// tests against fixture trees.
+func renderInitTemplate(cwd string) string {
+	name := filepath.Base(cwd)
+	has := func(p string) bool {
+		_, err := os.Stat(filepath.Join(cwd, p))
+		return err == nil
+	}
+
+	isLaravel := has("artisan") && has("composer.json")
+	jsPkgMgr := detectJSPkgMgr(cwd)
+	hasGoMod := has("go.mod")
+	hasComposer := has("composer.json")
+	frontendDir := ""
+	for _, candidate := range []string{"frontend", "resources/js", "client", "ui"} {
+		if has(filepath.Join(candidate, "package.json")) {
+			frontendDir = candidate
+			break
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "# yaml-language-server: $schema=https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json\n")
+	fmt.Fprintf(&b, "repo:\n  name: %s\n", name)
+	b.WriteString("worktrees:\n  root: .worktrees\n  links:\n    - .env\n")
+	if isLaravel {
+		b.WriteString("env_scoping:\n  files: [\".env.testing\"]\n  skip_worktree: true\n  patches:\n")
+		fmt.Fprintf(&b, "    - { key: DB_TEST_DATABASE, template: \"%s_testing_{slug}\" }\n", name)
+		b.WriteString("databases:\n")
+		fmt.Fprintf(&b, "  - engine: mysql\n    name_template: \"%s_testing_{slug}\"\n", name)
+		b.WriteString("    migrations:\n      framework: laravel\n")
+		fmt.Fprintf(&b, "    paratest:\n      clones: auto\n      name_template: \"%s_testing_{slug}_test_{n}\"\n", name)
+	} else {
+		b.WriteString("# databases: []   # add an engine block when DB scaffolding is needed.\n")
+	}
+
+	b.WriteString("hooks:\n  postcreate:\n")
+	groupsEmitted := 0
+	if hasComposer {
+		b.WriteString("    - group:\n        - composer install --no-interaction --prefer-dist\n")
+		groupsEmitted++
+	}
+	if jsPkgMgr != "" {
+		fmt.Fprintf(&b, "    - group:\n        - %s\n", jsInstallCmd(jsPkgMgr))
+		groupsEmitted++
+	}
+	if frontendDir != "" && jsPkgMgr != "" {
+		fmt.Fprintf(&b, "    - group:\n        - cd %s && %s\n", frontendDir, jsInstallCmd(jsPkgMgr))
+		groupsEmitted++
+	}
+	if hasGoMod {
+		b.WriteString("    - group:\n        - go mod download\n")
+		groupsEmitted++
+	}
+	if groupsEmitted == 0 {
+		b.WriteString("    # add install commands here — each `group` runs in parallel;\n")
+		b.WriteString("    # entries within a group run in sequence.\n")
+		b.WriteString("    []\n")
+	}
+	return b.String()
+}
+
+// detectJSPkgMgr returns "yarn", "pnpm", "npm", "bun", or "deno"
+// based on lockfile presence — or "" when there's no package.json.
+// Precedence matches the lockfile that pins the toolchain version
+// (deno.lock first, then bun.lockb, then pnpm-lock.yaml, then
+// yarn.lock, then package-lock.json) so the highest-fidelity install
+// wins.
+func detectJSPkgMgr(cwd string) string {
+	has := func(p string) bool {
+		_, err := os.Stat(filepath.Join(cwd, p))
+		return err == nil
+	}
+	switch {
+	case has("deno.lock") || has("deno.json"):
+		return "deno"
+	case has("bun.lockb"):
+		return "bun"
+	case has("pnpm-lock.yaml"):
+		return "pnpm"
+	case has("yarn.lock"):
+		return "yarn"
+	case has("package-lock.json"):
+		return "npm"
+	case has("package.json"):
+		// package.json without a lockfile — fall back to npm.
+		return "npm"
+	}
+	return ""
+}
+
+func jsInstallCmd(mgr string) string {
+	switch mgr {
+	case "yarn":
+		return "yarn install --frozen-lockfile"
+	case "pnpm":
+		return "pnpm install --frozen-lockfile"
+	case "bun":
+		return "bun install --frozen-lockfile"
+	case "deno":
+		return "deno install --lock=deno.lock"
+	case "npm":
+		return "npm ci"
+	}
+	return "npm ci"
 }
 
 // detectBranchOfWorktree reads .git/HEAD (handles gitlink files for

@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-sql-driver/mysql v1.10.0 // indirect

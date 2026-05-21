@@ -124,6 +124,23 @@ func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, err
 	return out, rows.Err()
 }
 
+// DatabaseExists returns true iff `name` is present in
+// information_schema.SCHEMATA. Cheaper than ListMatching for an
+// exact-name lookup.
+func (d *Driver) DatabaseExists(ctx context.Context, name string) (bool, error) {
+	row := d.DB.QueryRowContext(ctx,
+		`SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?`, name)
+	var one int
+	err := row.Scan(&one)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // FlushDatabase drops + recreates `name`, leaving it empty.
 func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 	if _, err := d.DropMatching(ctx, name); err != nil {
