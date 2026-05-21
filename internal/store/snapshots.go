@@ -145,3 +145,67 @@ func (s *Store) DeleteSnapshot(ctx context.Context, fingerprint string) error {
 	_, err := s.DB.ExecContext(ctx, `DELETE FROM snapshots WHERE fingerprint = ?`, fingerprint)
 	return err
 }
+
+// ListSnapshotsOlderThan returns every snapshot whose
+// `last_used_at` is before `cutoffMillis`. Used by the
+// max-age sweep.
+func (s *Store) ListSnapshotsOlderThan(ctx context.Context, cutoffMillis int64) ([]SnapshotEvictionCandidate, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT fingerprint, engine, template_name, source_db
+		FROM snapshots
+		WHERE last_used_at < ?
+		ORDER BY last_used_at ASC`, cutoffMillis)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SnapshotEvictionCandidate
+	for rows.Next() {
+		var c SnapshotEvictionCandidate
+		if err := rows.Scan(&c.Fingerprint, &c.Engine, &c.TemplateName, &c.SourceDB); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// SumSnapshotBytes returns COALESCE(SUM(size_bytes),0) across the
+// table — used by the total-size sweep to decide whether eviction
+// is needed.
+func (s *Store) SumSnapshotBytes(ctx context.Context) (int64, error) {
+	var sum int64
+	row := s.DB.QueryRowContext(ctx, `SELECT COALESCE(SUM(size_bytes),0) FROM snapshots`)
+	if err := row.Scan(&sum); err != nil {
+		return 0, err
+	}
+	return sum, nil
+}
+
+// ListSnapshotsLargestLRU returns every snapshot ordered by
+// (size_bytes DESC, last_used_at ASC). The size-sweep iterates and
+// drops from the top until total falls below the cap.
+func (s *Store) ListSnapshotsLargestLRU(ctx context.Context) ([]SnapshotEvictionCandidate, []int64, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT fingerprint, engine, template_name, source_db, COALESCE(size_bytes,0)
+		FROM snapshots
+		ORDER BY COALESCE(size_bytes,0) DESC, last_used_at ASC`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var (
+		cands []SnapshotEvictionCandidate
+		sizes []int64
+	)
+	for rows.Next() {
+		var c SnapshotEvictionCandidate
+		var sz int64
+		if err := rows.Scan(&c.Fingerprint, &c.Engine, &c.TemplateName, &c.SourceDB, &sz); err != nil {
+			return nil, nil, err
+		}
+		cands = append(cands, c)
+		sizes = append(sizes, sz)
+	}
+	return cands, sizes, rows.Err()
+}

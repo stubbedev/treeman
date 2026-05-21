@@ -76,12 +76,30 @@ func Run(
 				return outcomes, err
 			}
 			outcomes = append(outcomes, o)
+		case "mongodb":
+			o, err := prepareMongo(ctx, cfg, d, tplCtx, st, repoID, worktreeID)
+			if err != nil {
+				return outcomes, err
+			}
+			outcomes = append(outcomes, o)
+		case "redis":
+			o, err := prepareRedis(ctx, cfg, d, tplCtx, st, repoID, worktreeID)
+			if err != nil {
+				return outcomes, err
+			}
+			outcomes = append(outcomes, o)
+		case "elasticsearch", "opensearch":
+			o, err := prepareES(ctx, cfg, d, tplCtx, st, repoID, worktreeID)
+			if err != nil {
+				return outcomes, err
+			}
+			outcomes = append(outcomes, o)
 		default:
-			// Mongo/redis/es don't need a source DB build — they're
-			// scoped purely by name on prepare and dropped on
-			// teardown. Bringup for those engines is a future patch
-			// (mongo via mongorestore, redis is essentially a no-op,
-			// es indices are created on first write).
+			// Engine not recognised. Surface via event so the user
+			// notices, but don't fail the whole prepare run.
+			_ = st.WriteEvent(ctx, store.LevelWarn, "prepare_unsupported_engine",
+				fmt.Sprintf("engine=%s not recognised", d.Engine),
+				repoID, worktreeID, "", 0, nil)
 		}
 	}
 	return outcomes, nil
@@ -426,6 +444,124 @@ func preparePostgres(
 		Engine: d.Engine, SourceDB: sourceDB, TemplateName: templateName,
 		Fingerprint: key.Fingerprint(), CacheHit: false, Clones: clones,
 	}, nil
+}
+
+// prepareMongo readies the per-worktree MongoDB database namespace.
+// Mongo has no template/clone primitive worth caching for typical
+// dev workloads (the snapshot story for mongo is `mongorestore`
+// which is comparable to a cold re-load anyway), so the bringup
+// path is a "drop-if-exists + ready for first write".
+//
+// Future: if d.Dump.Path is set, treeman could `mongorestore` from
+// it. Skipped for now — most apps using mongo seed via app code.
+func prepareMongo(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+) (Outcome, error) {
+	if cfg.Connections.Mongodb == nil {
+		return Outcome{}, fmt.Errorf("connections.mongodb not configured")
+	}
+	name, err := template.Render(d.NameTemplate, tplCtx)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("render name_template: %w", err)
+	}
+	drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer drv.Close(ctx)
+	if _, err := drv.DropMatching(ctx, name); err != nil {
+		return Outcome{}, fmt.Errorf("mongo drop %s: %w", name, err)
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+		fmt.Sprintf("mongodb namespace %s ready", name),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine": "mongodb", "source_db": name,
+		})
+	return Outcome{Engine: d.Engine, SourceDB: name}, nil
+}
+
+// prepareRedis FLUSHDBs the per-worktree Redis logical DB index so
+// the worktree starts with an empty namespace. Redis "databases"
+// are just 0–15 integer indices, so the slug template renders to a
+// number (typically via `{slug_redis_index}`).
+func prepareRedis(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+) (Outcome, error) {
+	if cfg.Connections.Redis == nil {
+		return Outcome{}, fmt.Errorf("connections.redis not configured")
+	}
+	if d.Namespaces == nil || d.Namespaces.DbIndexTemplate == "" {
+		return Outcome{}, fmt.Errorf("redis: missing namespaces.db_index_template")
+	}
+	idxStr, err := template.Render(d.Namespaces.DbIndexTemplate, tplCtx)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("render db_index_template: %w", err)
+	}
+	var idx uint8
+	if _, err := fmt.Sscanf(idxStr, "%d", &idx); err != nil {
+		return Outcome{}, fmt.Errorf("redis db index parse %q: %w", idxStr, err)
+	}
+	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer drv.Close()
+	if err := drv.FlushDB(ctx, idx); err != nil {
+		return Outcome{}, fmt.Errorf("redis flushdb %d: %w", idx, err)
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+		fmt.Sprintf("redis db%d flushed", idx),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine": "redis", "source_db": fmt.Sprintf("db%d", idx),
+		})
+	return Outcome{Engine: d.Engine, SourceDB: fmt.Sprintf("db%d", idx)}, nil
+}
+
+// prepareES drops every Elasticsearch / OpenSearch index whose
+// name starts with the per-worktree prefix, so the worktree starts
+// with no stale indices. Index creation is left to the application
+// (ES typically auto-creates on first write).
+func prepareES(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+) (Outcome, error) {
+	if cfg.Connections.Elasticsearch == nil {
+		return Outcome{}, fmt.Errorf("connections.elasticsearch not configured")
+	}
+	if d.Namespaces == nil || d.Namespaces.IndexPrefixTemplate == "" {
+		return Outcome{}, fmt.Errorf("elasticsearch: missing namespaces.index_prefix_template")
+	}
+	prefix, err := template.Render(d.Namespaces.IndexPrefixTemplate, tplCtx)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("render index_prefix_template: %w", err)
+	}
+	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if _, err := drv.DropMatching(ctx, prefix); err != nil {
+		return Outcome{}, fmt.Errorf("es drop %s*: %w", prefix, err)
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+		fmt.Sprintf("es prefix %s cleared", prefix),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine": "elasticsearch", "source_db": prefix,
+		})
+	return Outcome{Engine: d.Engine, SourceDB: prefix}, nil
 }
 
 // lookupFrameworkSpec returns the built-in detector spec by name

@@ -39,10 +39,13 @@ SQLite event log records every step in a queryable way.
 ## Features
 
 - **Per-worktree DBs** for MySQL/MariaDB/TiDB, PostgreSQL, MongoDB,
-  Redis (DB-index scoping), Elasticsearch / OpenSearch
-- **Snapshot cache** with LRU eviction — repeated `wt create` for
-  the same migrations + dump hits a cached template database and
-  skips the cold rebuild
+  Redis (DB-index scoping), Elasticsearch / OpenSearch — bringup
+  cache for the RDBMS engines, teardown for everything
+- **Snapshot cache** with LRU eviction (`cap_per_repo`) — repeated
+  `wt create` for the same migrations + dump hits a cached template
+  and skips the cold rebuild. Native template-copy primitives:
+  `CREATE DATABASE … TEMPLATE` on Postgres, table-by-table `INSERT
+  … SELECT` on MySQL
 - **Hook groups** — declarative DAG of postcreate / predelete
   commands. Inside a group: sequence. Across groups: parallel.
   Drivers run detached via `setsid` so the CLI returns instantly.
@@ -55,8 +58,14 @@ SQLite event log records every step in a queryable way.
   rebuild-or-delta updates as migrations or seed dumps change
 - **`wt switch` / `wt back`** path-printing subcommands so shell
   functions can `cd "$(treeman wt switch foo)"`
+- **JSON Schema generated** from the Go config types via
+  `treeman schema dump` — `.treeman.yaml` autocompletes correctly
+  in any editor with the YAML language server
 - **Single static binary** per platform — no CGo, no system
   libraries; CI cross-builds `{linux,darwin}` × `{amd64,arm64}`
+- **Daemon init parity** — `treeman daemon install` writes a
+  systemd-user unit on Linux and a launchd LaunchAgent plist on
+  macOS; `start`/`stop`/`status` route to whichever is present
 
 ---
 
@@ -99,8 +108,8 @@ cd ~/code/my-app
 treeman init
 
 # 2. Install + start the user-mode daemon (one-time).
-treeman daemon install      # writes a systemd --user unit
-systemctl --user start treemand
+treeman daemon install      # systemd --user on Linux, launchd on macOS
+treeman daemon start        # idempotent — uses systemctl/launchctl when installed
 
 # 3. Spin up a worktree end-to-end.
 treeman wt create proj-123
@@ -354,8 +363,10 @@ full rebuild; anything else replays the binlog.
 | `~/.local/share/treeman/treeman.db` | SQLite event log + worktree registry + snapshots table |
 | `~/.local/share/treeman/treemand.log` | Daemon stderr |
 | `$XDG_RUNTIME_DIR/treeman.sock` | JSON-line RPC socket (SO_PEERCRED on Linux, stat-based owner check elsewhere) |
-| `~/.config/systemd/user/treemand.service` | systemd-user unit |
+| `~/.config/systemd/user/treemand.service` | systemd-user unit (Linux) |
+| `~/Library/LaunchAgents/dev.stubbe.treemand.plist` | launchd LaunchAgent (macOS) |
 | `<worktree>/.treeman-hooks/<phase>-<n>.log` | Per-hook driver stdout/stderr |
+| `<repo>/schemas/treeman.schema.json` | JSON Schema (only present after `treeman schema install`) |
 
 The store schema lives at `internal/store/migrations/0001_init.sql`
 and is shipped embedded into the binary, so a fresh `treeman.db`
@@ -380,6 +391,19 @@ client that round-trips JSON over the unix socket. Why a daemon:
 The daemon's socket is 0600 and ownership-checked on every
 accept; on Linux via `SO_PEERCRED`, on other platforms via
 `stat()` of the socket file.
+
+### Init parity
+
+| Platform | Unit file | Boot helper |
+|---|---|---|
+| Linux | `~/.config/systemd/user/treemand.service` | `systemctl --user enable --now treemand` |
+| macOS | `~/Library/LaunchAgents/dev.stubbe.treemand.plist` | `launchctl bootstrap gui/$UID …` |
+
+`treeman daemon install` writes whichever fits the host and runs
+the boot helper. `treeman daemon start` / `stop` / `status` route
+through the same init. The CLI falls back to spawning `treemand`
+directly when no unit is installed, so transient use without
+install also works.
 
 ---
 

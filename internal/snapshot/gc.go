@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
@@ -87,5 +88,81 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		// hot path yet — when they land, their engine-specific drop
 		// calls go here.
 		return fmt.Errorf("eviction: unsupported engine %q", c.Engine)
+	}
+}
+
+// SweepByAge drops every cached template whose `last_used_at` is
+// older than `cfg.Snapshots.Retention.MaxAgeDays` days. Runs as
+// part of the daemon's periodic GC tick. Cheap on small tables;
+// keep an eye on it if the snapshots table grows past a few thousand
+// rows.
+func SweepByAge(ctx context.Context, cfg *config.Config, st *store.Store) {
+	days := cfg.Snapshots.Retention.MaxAgeDays
+	if days == 0 {
+		return
+	}
+	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
+	cands, err := st.ListSnapshotsOlderThan(ctx, cutoff)
+	if err != nil {
+		slog.Warn("snapshot age sweep query", "err", err)
+		return
+	}
+	for _, c := range cands {
+		if err := dropTemplate(ctx, cfg, c); err != nil {
+			slog.Warn("snapshot age sweep drop", "template", c.TemplateName, "err", err)
+			continue
+		}
+		_ = st.DeleteSnapshot(ctx, c.Fingerprint)
+		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_age_evict",
+			fmt.Sprintf("evicted %s (older than %dd)", c.TemplateName, days),
+			0, 0, "", 0, map[string]string{
+				"engine":      c.Engine,
+				"template":    c.TemplateName,
+				"fingerprint": c.Fingerprint,
+			})
+	}
+}
+
+// SweepBySize evicts the largest cached templates until total
+// `size_bytes` falls below `cfg.Snapshots.Retention.MaxTotalGb`.
+// Snapshots with size_bytes = NULL (never recorded) are evicted
+// last — they're treated as size 0 by the ORDER BY in the store
+// query.
+func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
+	gb := cfg.Snapshots.Retention.MaxTotalGb
+	if gb == 0 {
+		return
+	}
+	cap := int64(gb) * 1024 * 1024 * 1024
+	total, err := st.SumSnapshotBytes(ctx)
+	if err != nil {
+		slog.Warn("snapshot size sweep sum", "err", err)
+		return
+	}
+	if total <= cap {
+		return
+	}
+	cands, sizes, err := st.ListSnapshotsLargestLRU(ctx)
+	if err != nil {
+		slog.Warn("snapshot size sweep query", "err", err)
+		return
+	}
+	for i, c := range cands {
+		if total <= cap {
+			break
+		}
+		if err := dropTemplate(ctx, cfg, c); err != nil {
+			slog.Warn("snapshot size sweep drop", "template", c.TemplateName, "err", err)
+			continue
+		}
+		_ = st.DeleteSnapshot(ctx, c.Fingerprint)
+		total -= sizes[i]
+		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_size_evict",
+			fmt.Sprintf("evicted %s (size=%d)", c.TemplateName, sizes[i]),
+			0, 0, "", 0, map[string]string{
+				"engine":      c.Engine,
+				"template":    c.TemplateName,
+				"fingerprint": c.Fingerprint,
+			})
 	}
 }

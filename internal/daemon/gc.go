@@ -51,6 +51,9 @@ func runGCSweep(ctx context.Context, st *State) {
 		slog.Warn("snapshot_gc enumerate repos", "err", err)
 		return
 	}
+	// Per-repo cap eviction first — keeps the cache shape sane
+	// regardless of size / age. Errors are logged and continued so
+	// one bad repo doesn't block GC for the rest.
 	for _, p := range paths {
 		cfg, err := config.LoadLayered(p)
 		if err != nil {
@@ -63,6 +66,15 @@ func runGCSweep(ctx context.Context, st *State) {
 		}
 		snapshot.EvictExcess(ctx, &cfg, st.Store, repoID)
 	}
+	// Global age + size sweeps — driven by the global config so the
+	// limits are user-wide, not per-repo.
+	globalCfg, err := config.LoadLayered("")
+	if err != nil {
+		slog.Warn("snapshot_gc load global", "err", err)
+		return
+	}
+	snapshot.SweepByAge(ctx, &globalCfg, st.Store)
+	snapshot.SweepBySize(ctx, &globalCfg, st.Store)
 }
 
 // filepathBase mirrors filepath.Base but lives here to keep this
