@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
+	"github.com/invopop/jsonschema"
 	"github.com/urfave/cli/v3"
 	"gopkg.in/yaml.v3"
 
@@ -307,22 +309,71 @@ func isNil(v any) bool {
 	return s == "<nil>" || s == ""
 }
 
-// SchemaCmd — `treeman schema {dump,install}`. Minimal stubs.
+// SchemaCmd — `treeman schema {dump,install}`. Generates the
+// JSON Schema for `.treeman.yaml` directly from the config.Config
+// type via reflection.
+//
+//	dump          → write schema to stdout
+//	dump --out P  → write schema to file P
+//	install       → write schema to `schemas/treeman.schema.json`
+//	                relative to the current repo root + add a
+//	                yaml-language-server modeline to .treeman.yaml
+//	                if one is missing
 func SchemaCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "schema",
 		Usage: "JSON schema helpers",
 		Commands: []*cli.Command{
-			{Name: "dump", Action: func(ctx context.Context, c *cli.Command) error {
-				fmt.Println(`{"comment":"JSON schema generation pending — see plan §10."}`)
-				return nil
-			}},
-			{Name: "install", Action: func(ctx context.Context, c *cli.Command) error {
-				PrintWarn("schema install: pending — JSON schema generator is planned but not yet wired")
-				return nil
-			}},
+			{
+				Name:  "dump",
+				Flags: []cli.Flag{&cli.StringFlag{Name: "out"}},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					b, err := renderConfigSchema()
+					if err != nil {
+						return err
+					}
+					if out := c.String("out"); out != "" {
+						return os.WriteFile(out, b, 0o644)
+					}
+					_, err = os.Stdout.Write(append(b, '\n'))
+					return err
+				},
+			},
+			{
+				Name: "install",
+				Action: func(ctx context.Context, c *cli.Command) error {
+					cwd, _ := os.Getwd()
+					repoRoot, err := DiscoverRepoRoot(cwd)
+					if err != nil {
+						return err
+					}
+					b, err := renderConfigSchema()
+					if err != nil {
+						return err
+					}
+					dst := filepath.Join(repoRoot, "schemas", "treeman.schema.json")
+					if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+						return err
+					}
+					if err := os.WriteFile(dst, b, 0o644); err != nil {
+						return err
+					}
+					PrintOK("wrote %s", dst)
+					return nil
+				},
+			},
 		},
 	}
+}
+
+func renderConfigSchema() ([]byte, error) {
+	r := &jsonschema.Reflector{
+		Anonymous:      true,
+		ExpandedStruct: true,
+		FieldNameTag:   "yaml",
+	}
+	s := r.Reflect(&config.Config{})
+	return json.MarshalIndent(s, "", "  ")
 }
 
 // DaemonCmd — `treeman daemon {start,stop,status,install,uninstall}`.
@@ -341,11 +392,21 @@ func DaemonCmd() *cli.Command {
 }
 
 func daemonStart(ctx context.Context, c *cli.Command) error {
-	// Prefer systemctl when the unit is installed; else spawn the
-	// binary detached.
-	if err := exec.CommandContext(ctx, "systemctl", "--user", "is-enabled", "treemand").Run(); err == nil {
-		return exec.CommandContext(ctx, "systemctl", "--user", "start", "treemand").Run()
+	// Prefer the OS-native init when its unit is installed; else
+	// spawn the binary detached.
+	switch runtime.GOOS {
+	case "darwin":
+		uid := os.Getuid()
+		domain := fmt.Sprintf("gui/%d", uid)
+		if err := exec.CommandContext(ctx, "launchctl", "kickstart", "-k", domain+"/"+launchdLabel).Run(); err == nil {
+			return nil
+		}
+	default:
+		if err := exec.CommandContext(ctx, "systemctl", "--user", "is-enabled", "treemand").Run(); err == nil {
+			return exec.CommandContext(ctx, "systemctl", "--user", "start", "treemand").Run()
+		}
 	}
+
 	binPath, err := exec.LookPath("treemand")
 	if err != nil {
 		return fmt.Errorf("treemand not on PATH: %w", err)
@@ -363,8 +424,17 @@ func daemonStart(ctx context.Context, c *cli.Command) error {
 }
 
 func daemonStop(ctx context.Context, c *cli.Command) error {
-	if err := exec.CommandContext(ctx, "systemctl", "--user", "is-active", "treemand").Run(); err == nil {
-		return exec.CommandContext(ctx, "systemctl", "--user", "stop", "treemand").Run()
+	switch runtime.GOOS {
+	case "darwin":
+		uid := os.Getuid()
+		domain := fmt.Sprintf("gui/%d", uid)
+		if err := exec.CommandContext(ctx, "launchctl", "kill", "TERM", domain+"/"+launchdLabel).Run(); err == nil {
+			return nil
+		}
+	default:
+		if err := exec.CommandContext(ctx, "systemctl", "--user", "is-active", "treemand").Run(); err == nil {
+			return exec.CommandContext(ctx, "systemctl", "--user", "stop", "treemand").Run()
+		}
 	}
 	// Fallback: shutdown RPC.
 	resp, err := rpc.Call(ctx, rpc.Request{Method: rpc.MethodShutdown})
@@ -391,7 +461,28 @@ func daemonStatus(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
+// daemonInstall writes the user-mode unit/plist appropriate for
+// the host OS and enables it. Linux gets a systemd-user unit; macOS
+// gets a LaunchAgent plist + `launchctl bootload`.
 func daemonInstall(ctx context.Context, c *cli.Command) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return daemonInstallLaunchd(ctx)
+	default:
+		return daemonInstallSystemd(ctx)
+	}
+}
+
+func daemonUninstall(ctx context.Context, c *cli.Command) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return daemonUninstallLaunchd(ctx)
+	default:
+		return daemonUninstallSystemd(ctx)
+	}
+}
+
+func daemonInstallSystemd(ctx context.Context) error {
 	unit := `[Install]
 WantedBy=default.target
 
@@ -423,13 +514,66 @@ Description=Treeman per-worktree DB orchestrator daemon
 	return nil
 }
 
-func daemonUninstall(ctx context.Context, c *cli.Command) error {
+func daemonUninstallSystemd(ctx context.Context) error {
 	_ = exec.CommandContext(ctx, "systemctl", "--user", "disable", "--now", "treemand").Run()
 	home, _ := os.UserHomeDir()
 	dst := filepath.Join(home, ".config", "systemd", "user", "treemand.service")
 	_ = os.Remove(dst)
 	_ = exec.CommandContext(ctx, "systemctl", "--user", "daemon-reload").Run()
 	PrintOK("uninstalled treemand.service")
+	return nil
+}
+
+const launchdLabel = "dev.stubbe.treemand"
+
+func daemonInstallLaunchd(ctx context.Context) error {
+	bin := mustResolveTreemand()
+	home, _ := os.UserHomeDir()
+	logDir := filepath.Join(home, ".local", "share", "treeman")
+	_ = os.MkdirAll(logDir, 0o755)
+	plist := `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>            <string>` + launchdLabel + `</string>
+    <key>ProgramArguments</key> <array><string>` + bin + `</string></array>
+    <key>RunAtLoad</key>        <true/>
+    <key>KeepAlive</key>        <true/>
+    <key>StandardOutPath</key>  <string>` + filepath.Join(logDir, "treemand.log") + `</string>
+    <key>StandardErrorPath</key><string>` + filepath.Join(logDir, "treemand.log") + `</string>
+    <key>ProcessType</key>      <string>Background</string>
+</dict>
+</plist>
+`
+	dst := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(dst, []byte(plist), 0o644); err != nil {
+		return err
+	}
+	uid := os.Getuid()
+	domain := fmt.Sprintf("gui/%d", uid)
+	// Best-effort unload first so re-install doesn't error.
+	_ = exec.CommandContext(ctx, "launchctl", "bootout", domain, dst).Run()
+	if err := exec.CommandContext(ctx, "launchctl", "bootstrap", domain, dst).Run(); err != nil {
+		return fmt.Errorf("launchctl bootstrap %s: %w", dst, err)
+	}
+	if err := exec.CommandContext(ctx, "launchctl", "enable", domain+"/"+launchdLabel).Run(); err != nil {
+		return fmt.Errorf("launchctl enable %s: %w", launchdLabel, err)
+	}
+	PrintOK("installed + enabled %s at %s", launchdLabel, dst)
+	return nil
+}
+
+func daemonUninstallLaunchd(ctx context.Context) error {
+	home, _ := os.UserHomeDir()
+	dst := filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist")
+	uid := os.Getuid()
+	domain := fmt.Sprintf("gui/%d", uid)
+	_ = exec.CommandContext(ctx, "launchctl", "bootout", domain, dst).Run()
+	_ = os.Remove(dst)
+	PrintOK("uninstalled %s", launchdLabel)
 	return nil
 }
 

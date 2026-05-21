@@ -21,6 +21,7 @@ import (
 	dbes "github.com/stubbedev/treeman/internal/db/es"
 	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
+	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
@@ -69,10 +70,18 @@ func Run(
 				return outcomes, err
 			}
 			outcomes = append(outcomes, o)
+		case "postgres", "postgresql":
+			o, err := preparePostgres(ctx, cfg, d, tplCtx, mainRepoRoot, st, repoID, worktreeID, inheritedEnv)
+			if err != nil {
+				return outcomes, err
+			}
+			outcomes = append(outcomes, o)
 		default:
 			// Mongo/redis/es don't need a source DB build — they're
 			// scoped purely by name on prepare and dropped on
-			// teardown. Skip for now.
+			// teardown. Bringup for those engines is a future patch
+			// (mongo via mongorestore, redis is essentially a no-op,
+			// es indices are created on first write).
 		}
 	}
 	return outcomes, nil
@@ -265,6 +274,160 @@ func prepareMySQL(
 	}, nil
 }
 
+// preparePostgres mirrors prepareMySQL for the PostgreSQL engine.
+// Uses `CREATE DATABASE … TEMPLATE` as the snapshot-and-fan-out
+// primitive — fast because pg copies on-disk files instead of
+// replaying SQL. Cache hit path identical to MySQL: SQLite
+// fingerprint lookup + pg_database existence check.
+func preparePostgres(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	mainRepoRoot string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	inheritedEnv map[string]string,
+) (Outcome, error) {
+	if cfg.Connections.Postgres == nil {
+		return Outcome{}, fmt.Errorf("connections.postgres not configured")
+	}
+	sourceDB, err := template.Render(d.NameTemplate, tplCtx)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("render name_template: %w", err)
+	}
+
+	drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer drv.Close()
+
+	version, _ := drv.EngineVersion(ctx)
+
+	migrationsHash := ""
+	dumpHash := ""
+	lockfileHashes := map[string]string{}
+	frameworkName := ""
+	hashMode := ""
+	if d.Migrations != nil {
+		frameworkName = d.Migrations.Framework
+		if s, ok := lookupFrameworkSpec(frameworkName); ok {
+			hashMode = string(s.HashMode)
+			if h, err := framework.MigrationsHash(mainRepoRoot, s); err == nil {
+				migrationsHash = h
+			}
+			lockPaths := make([]string, 0, len(s.Lockfiles))
+			for _, lf := range s.Lockfiles {
+				lockPaths = append(lockPaths, filepath.Join(mainRepoRoot, lf))
+			}
+			if h, err := snapshot.LockfileHashesFor(lockPaths); err == nil {
+				lockfileHashes = h
+			}
+		}
+	}
+	if d.Dump != nil {
+		dp := filepath.Join(mainRepoRoot, d.Dump.Path)
+		hashes, _ := snapshot.LockfileHashesFor([]string{dp})
+		dumpHash = hashes[filepath.Base(dp)]
+	}
+
+	key := snapshot.New(d.Engine, version, sourceDB, frameworkName, hashMode, migrationsHash, dumpHash, lockfileHashes)
+	templateName := key.TemplateName()
+
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
+		fmt.Sprintf("engine=postgres source=%s template=%s", sourceDB, templateName),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine":      "postgres",
+			"source_db":   sourceDB,
+			"template":    templateName,
+			"fingerprint": key.Fingerprint(),
+		})
+
+	// Cache hit?
+	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
+			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+				fmt.Sprintf("template=%s", rec.TemplateName),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "postgres",
+					"source_db":   sourceDB,
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+				})
+			clones, err := resolveCloneNames(d.Paratest, tplCtx, mainRepoRoot)
+			if err != nil {
+				return Outcome{}, err
+			}
+			for _, c := range clones {
+				if err := drv.SnapshotRestore(ctx, rec.TemplateName, c); err != nil {
+					return Outcome{}, fmt.Errorf("restore %s → %s: %w", rec.TemplateName, c, err)
+				}
+			}
+			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			return Outcome{
+				Engine: d.Engine, SourceDB: sourceDB,
+				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
+				CacheHit: true, Clones: clones,
+			}, nil
+		}
+		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	}
+
+	// Cold build.
+	if _, err := drv.DropMatching(ctx, sourceDB); err != nil {
+		return Outcome{}, err
+	}
+	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
+		return Outcome{}, err
+	}
+	if d.Dump != nil {
+		dp := filepath.Join(mainRepoRoot, d.Dump.Path)
+		if _, err := dumpload.LoadPostgres(ctx, drv.DB, sourceDB, dp); err != nil {
+			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
+		}
+	}
+	if d.Migrations != nil {
+		out, err := runner.Run(ctx, frameworkName, mainRepoRoot, sourceDB, runner.ModeUp, nil, inheritedEnv)
+		if err != nil {
+			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
+		}
+		if out.ExitCode != 0 {
+			return Outcome{}, fmt.Errorf("migrate source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
+		}
+	}
+	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
+		return Outcome{}, fmt.Errorf("snapshot create %s → %s: %w", sourceDB, templateName, err)
+	}
+	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
+		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
+		SourceDB: sourceDB, TemplateName: templateName,
+		MigrationsHash: migrationsHash, DumpHash: dumpHash, LockfileHashes: lockfileHashes,
+		RepoID: repoID,
+	})
+	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+
+	clones, err := resolveCloneNames(d.Paratest, tplCtx, mainRepoRoot)
+	if err != nil {
+		return Outcome{}, err
+	}
+	for _, c := range clones {
+		if err := drv.SnapshotRestore(ctx, templateName, c); err != nil {
+			return Outcome{}, fmt.Errorf("restore %s → %s: %w", templateName, c, err)
+		}
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+		fmt.Sprintf("clones=%d", len(clones)),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine": "postgres", "source_db": sourceDB,
+			"template": templateName, "clones": fmt.Sprintf("%d", len(clones)),
+		})
+	return Outcome{
+		Engine: d.Engine, SourceDB: sourceDB, TemplateName: templateName,
+		Fingerprint: key.Fingerprint(), CacheHit: false, Clones: clones,
+	}, nil
+}
+
 // lookupFrameworkSpec returns the built-in detector spec by name
 // (case-insensitive). Used to compute migrations_hash without
 // re-detecting from filesystem markers.
@@ -359,6 +522,29 @@ func teardownOne(
 			fmt.Sprintf("mysql: %s (%d)", name, len(dropped)),
 			repoID, worktreeID, "", 0, map[string]any{
 				"engine": "mysql", "slug": sl, "target": name, "count": len(dropped),
+			})
+		return nil
+	case "postgres", "postgresql":
+		if cfg.Connections.Postgres == nil {
+			return fmt.Errorf("connections.postgres not configured")
+		}
+		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
+		if err != nil {
+			return err
+		}
+		defer drv.Close()
+		name, err := template.Render(d.NameTemplate, tplCtx)
+		if err != nil {
+			return err
+		}
+		dropped, err := drv.DropMatching(ctx, name)
+		if err != nil {
+			return err
+		}
+		_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+			fmt.Sprintf("postgres: %s (%d)", name, len(dropped)),
+			repoID, worktreeID, "", 0, map[string]any{
+				"engine": "postgres", "slug": sl, "target": name, "count": len(dropped),
 			})
 		return nil
 	case "mongodb":

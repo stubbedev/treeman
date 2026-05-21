@@ -78,14 +78,31 @@ func run() error {
 	_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_started", "treemand listening",
 		0, 0, "", 0, map[string]string{"socket": sockPath})
 
-	// Auto-resume per-repo watchers on boot. The Rust daemon's
-	// state.rs has the full fsnotify wiring; Phase 10 lights that
-	// up. For now we just log the repos we'd resume.
+	// Auto-resume per-repo watchers on boot. Each known repo gets
+	// its fsnotify watcher + binlog replicators re-spawned via the
+	// same path the watcher_start RPC takes. Failures per-repo are
+	// logged + skipped — a missing or moved repo dir shouldn't
+	// abort daemon startup.
 	if paths, err := s.ListRepoPaths(ctx); err == nil {
 		for _, p := range paths {
-			slog.Info("would resume watcher (phase 10 wires fsnotify)", "repo", p)
+			if _, err := os.Stat(p); err != nil {
+				slog.Warn("resume watcher skipped (path missing)", "repo", p, "err", err)
+				continue
+			}
+			if err := daemon.ResumeRepoWatcher(ctx, st, p); err != nil {
+				slog.Warn("resume watcher failed", "repo", p, "err", err)
+				continue
+			}
+			slog.Info("resumed watcher", "repo", p)
 		}
 	}
+
+	// Periodic snapshot GC sweep. Runs at the cadence declared by
+	// `snapshots.retention.gc_interval_minutes` (default 60); each
+	// tick walks every registered repo and evicts cached templates
+	// above `cap_per_repo`. Bare-bones for now — age/size sweeps
+	// (MaxAgeDays, MaxTotalGb) land here later.
+	go daemon.SnapshotGCLoop(ctx, st)
 
 	shutdown := make(chan struct{}, 1)
 	go acceptLoop(ctx, ln, st, shutdown)

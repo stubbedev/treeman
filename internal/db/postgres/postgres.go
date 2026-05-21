@@ -166,6 +166,13 @@ func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
 	return err
 }
 
+// DatabaseExists returns true iff the named DB is present in
+// pg_database. Mirrors the MySQL driver's same-named method so the
+// snapshot cache hit path is engine-agnostic at the call-site.
+func (d *Driver) DatabaseExists(ctx context.Context, name string) (bool, error) {
+	return d.dbExists(ctx, name)
+}
+
 func (d *Driver) dbExists(ctx context.Context, name string) (bool, error) {
 	var n int
 	row := d.DB.QueryRowContext(ctx, "SELECT 1 FROM pg_database WHERE datname = $1", name)

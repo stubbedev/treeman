@@ -7,6 +7,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
+	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -71,10 +72,20 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		}
 		defer drv.Close()
 		return drv.DropSnapshot(ctx, c.TemplateName)
+	case "postgres", "postgresql":
+		if cfg.Connections.Postgres == nil {
+			return fmt.Errorf("connections.postgres not configured")
+		}
+		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
+		if err != nil {
+			return err
+		}
+		defer drv.Close()
+		return drv.DropSnapshot(ctx, c.TemplateName)
 	default:
-		// Postgres/Mongo template snapshots aren't on the cache hot
-		// path yet — when they land, the engine-specific drop calls
-		// go here.
+		// Mongo/redis/es don't keep template snapshots on the cache
+		// hot path yet — when they land, their engine-specific drop
+		// calls go here.
 		return fmt.Errorf("eviction: unsupported engine %q", c.Engine)
 	}
 }
