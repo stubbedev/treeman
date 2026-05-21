@@ -132,6 +132,7 @@ func wtCreate() *cli.Command {
 				}
 				pairs = append(pairs, patcher.Pair{Key: p.Key, Value: v})
 			}
+			skipWT := cfg.EnvScoping.SkipWorktree == nil || *cfg.EnvScoping.SkipWorktree
 			for _, f := range cfg.EnvScoping.Files {
 				abs := filepath.Join(wtPath, f)
 				var outcome patcher.Outcome
@@ -145,9 +146,14 @@ func wtCreate() *cli.Command {
 				}
 				if outcome == patcher.Updated {
 					fmt.Printf("patched %s\n", abs)
-					if cfg.EnvScoping.SkipWorktree == nil || *cfg.EnvScoping.SkipWorktree {
-						_, _ = patcher.SkipWorktree(repoRoot, abs)
-					}
+				}
+				// Apply skip-worktree regardless of patch outcome: a
+				// re-run of `wt create` (or finalize) on an already-
+				// patched file must still enforce the bit, otherwise
+				// the second run silently drops it. `SkipWorktree`
+				// is a no-op when the file isn't tracked.
+				if skipWT {
+					_, _ = patcher.SkipWorktree(wtPath, abs)
 				}
 			}
 

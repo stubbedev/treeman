@@ -102,22 +102,27 @@ func patchPhpunitOne(content, key, value string) string {
 }
 
 // SkipWorktree shells out to `git update-index --skip-worktree
-// <file>` from `repoRoot`. Returns false (no error) if the file is
-// not tracked by git — typical for `.env.testing` which is usually
+// <file>` from `gitDir`. Returns false (no error) if the file is
+// not tracked by git — typical for `.env.testing` which is
 // gitignored.
 //
-// We shell out instead of pulling in a libgit2 binding because the
-// Rust implementation's go-git2 import was the heaviest dep in the
-// whole workspace. `git` is already required by treeman anyway.
-func SkipWorktree(repoRoot, file string) (bool, error) {
+// `gitDir` MUST be the worktree the file lives in, not the main
+// repo. Linked worktrees have a per-worktree index; running git
+// from the main repo would update the wrong index (and `ls-files`
+// from there wouldn't even find the file). Idempotent: re-running
+// against an already-skipped file exits 0 with no change.
+//
+// We shell out instead of pulling in a libgit2 binding because git
+// is already required by treeman anyway.
+func SkipWorktree(gitDir, file string) (bool, error) {
 	// Probe first: `git ls-files --error-unmatch <file>` exits 0
 	// when the path is tracked, non-zero otherwise.
-	probe := exec.Command("git", "-C", repoRoot, "ls-files", "--error-unmatch", file)
+	probe := exec.Command("git", "-C", gitDir, "ls-files", "--error-unmatch", file)
 	probe.Stdout, probe.Stderr = nil, nil
 	if err := probe.Run(); err != nil {
 		return false, nil
 	}
-	cmd := exec.Command("git", "-C", repoRoot, "update-index", "--skip-worktree", file)
+	cmd := exec.Command("git", "-C", gitDir, "update-index", "--skip-worktree", file)
 	if err := cmd.Run(); err != nil {
 		return false, fmt.Errorf("git update-index --skip-worktree %s: %w", file, err)
 	}
