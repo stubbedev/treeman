@@ -114,23 +114,27 @@ func HookCmd() *cli.Command {
 					}
 					fmt.Printf("precreate: exit=%d (%d steps)\n", out.AggregateExitCode, len(out.Groups))
 				case "postcreate":
-					_, err := hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env)
+					// `treeman hook run <phase>` blocks on completion
+					// so the operator sees the real status, not a
+					// "spawned" message that fires before the work
+					// has happened.
+					_, err := hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
 					if err != nil {
 						return err
 					}
-					fmt.Printf("%s: %d group(s) spawned\n", phase, len(cfg.Hooks.Postcreate))
+					fmt.Printf("%s: %d group(s) complete\n", phase, len(cfg.Hooks.Postcreate))
 				case "predelete":
-					_, err := hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env)
+					_, err := hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
 					if err != nil {
 						return err
 					}
-					fmt.Printf("%s: %d group(s) spawned\n", phase, len(cfg.Hooks.Predelete))
+					fmt.Printf("%s: %d group(s) complete\n", phase, len(cfg.Hooks.Predelete))
 				case "postdelete":
-					_, err := hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env)
+					_, err := hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
 					if err != nil {
 						return err
 					}
-					fmt.Printf("%s: %d group(s) spawned\n", phase, len(cfg.Hooks.Postdelete))
+					fmt.Printf("%s: %d group(s) complete\n", phase, len(cfg.Hooks.Postdelete))
 				default:
 					return fmt.Errorf("unknown phase: %s", phase)
 				}

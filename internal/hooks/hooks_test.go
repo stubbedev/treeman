@@ -32,7 +32,7 @@ func TestGroupRunsSequenceWithin(t *testing.T) {
 			{Run: "touch b"},
 		}},
 	}
-	out, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv())
+	out, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestGroupsRunParallelAcross(t *testing.T) {
 		{Steps: []config.SingleStep{{Run: "sleep 0.5 && touch one"}}},
 		{Steps: []config.SingleStep{{Run: "sleep 0.5 && touch two"}}},
 	}
-	_, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv())
+	_, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,12 +85,75 @@ func TestRunHooksReturnsFastRegardlessOfCommandDuration(t *testing.T) {
 	wt := t.TempDir()
 	entries := []config.HookEntry{{Steps: []config.SingleStep{{Run: "sleep 10"}}}}
 	started := time.Now()
-	_, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv())
+	_, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
 		t.Errorf("RunHooks blocked for %v", elapsed)
+	}
+}
+
+// TestRunHooksWaitBlocksUntilGroupsExit proves the wait=true contract
+// the daemon's FinalizeWorktree depends on: when a downstream phase
+// (prepare) needs the postcreate work done first, RunHooks must not
+// return until every group has actually completed.
+func TestRunHooksWaitBlocksUntilGroupsExit(t *testing.T) {
+	wt := t.TempDir()
+	entries := []config.HookEntry{
+		{Steps: []config.SingleStep{{Run: "sleep 0.3 && touch a"}}},
+		{Steps: []config.SingleStep{{Run: "sleep 0.3 && touch b"}}},
+	}
+	started := time.Now()
+	out, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	// Both files must exist when RunHooks returns — no waitUntil.
+	if _, err := os.Stat(filepath.Join(wt, "a")); err != nil {
+		t.Errorf("a missing after wait=true return: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "b")); err != nil {
+		t.Errorf("b missing after wait=true return: %v", err)
+	}
+	// Groups run in parallel — wall time should track one sleep, not
+	// the sum. Allow generous slack for slow runners.
+	if elapsed < 250*time.Millisecond {
+		t.Errorf("returned before group sleep finished: %v", elapsed)
+	}
+	if elapsed > 700*time.Millisecond {
+		t.Errorf("groups didn't parallelise (took %v)", elapsed)
+	}
+	for i, g := range out.Groups {
+		if g.ExitCode != 0 {
+			t.Errorf("group %d exit %d", i, g.ExitCode)
+		}
+	}
+}
+
+// TestRunHooksWaitSurfacesNonZeroExit confirms a failing group's exit
+// code lands on the returned outcome instead of aborting the whole
+// phase. The downstream code (prepare, db teardown) can then decide
+// whether to proceed.
+func TestRunHooksWaitSurfacesNonZeroExit(t *testing.T) {
+	wt := t.TempDir()
+	entries := []config.HookEntry{
+		{Steps: []config.SingleStep{{Run: "true"}}},
+		{Steps: []config.SingleStep{{Run: "exit 7"}}},
+	}
+	out, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Groups) != 2 {
+		t.Fatalf("groups=%d", len(out.Groups))
+	}
+	if out.Groups[0].ExitCode != 0 {
+		t.Errorf("group 0 exit %d, want 0", out.Groups[0].ExitCode)
+	}
+	if out.Groups[1].ExitCode != 7 {
+		t.Errorf("group 1 exit %d, want 7", out.Groups[1].ExitCode)
 	}
 }
 
@@ -101,7 +164,7 @@ func TestInheritedEnvReachesSubprocess(t *testing.T) {
 	entries := []config.HookEntry{
 		{Steps: []config.SingleStep{{Run: "printenv TREEMAN_TEST_PATH_PROBE > probe.out"}}},
 	}
-	_, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", env)
+	_, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", env, false)
 	if err != nil {
 		t.Fatal(err)
 	}

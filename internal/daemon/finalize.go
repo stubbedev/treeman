@@ -49,8 +49,17 @@ func FinalizeWorktree(
 		repoID, wtID, "", 0, nil)
 
 	if len(cfg.Hooks.Postcreate) > 0 {
+		// Block until every postcreate group exits before kicking off
+		// prepare. Framework migrate commands (Laravel artisan, Rails
+		// rake, Django manage.py) read `vendor/` / `node_modules/` /
+		// the venv that a postcreate `composer install` / `yarn
+		// install` / `pip install` populates. Firing prepare in
+		// parallel with hooks races against an empty vendor dir and
+		// blows up with `migrate exit 255`. Hook groups still run in
+		// parallel with each other; only the phase-to-phase
+		// transition is gated.
 		_, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate,
-			repoRoot, wtRoot, sl.Value, inheritedEnv)
+			repoRoot, wtRoot, sl.Value, inheritedEnv, true)
 		if err != nil {
 			return fmt.Errorf("postcreate hooks: %w", err)
 		}
@@ -111,8 +120,12 @@ func TeardownWorktree(
 	st.UnregisterWtWatcher(wtRoot)
 
 	if len(cfg.Hooks.Predelete) > 0 {
+		// Same await rationale as postcreate above: predelete teardown
+		// (drop external resources, kill watchers) must finish before
+		// `TeardownDatabases` blows away the SQL state they may still
+		// be using.
 		_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete,
-			repoRoot, wtRoot, sl.Value, inheritedEnv)
+			repoRoot, wtRoot, sl.Value, inheritedEnv, true)
 	}
 
 	if err := prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st.Store); err != nil {

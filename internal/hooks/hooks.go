@@ -47,14 +47,24 @@ type GroupOutcome struct {
 }
 
 // RunHooks spawns one detached setsid driver per group, in parallel.
-// Returns once all drivers have been forked. Logs go to
-// `<worktree>/.treeman-hooks/<phase>-<group-idx>.log`.
+// Logs go to `<worktree>/.treeman-hooks/<phase>-<group-idx>.log`.
+//
+// When `wait` is false (legacy callers, tests, fire-and-forget
+// dispatch), returns as soon as every group is spawned — groups
+// continue running under the new session and are reaped by a
+// detached goroutine. When `wait` is true, blocks until every
+// group exits, so the caller can rely on the phase being complete
+// before invoking work that depends on it (e.g. `prepare.Run`
+// reading vendor/ that a postcreate `composer install` populated).
+// Groups still run in parallel under either flag; `wait` only
+// changes whether RunHooks itself blocks on their completion.
 func RunHooks(
 	ctx context.Context,
 	phase string,
 	entries []config.HookEntry,
 	repoRoot, worktreePath, slug string,
 	inheritedEnv map[string]string,
+	wait bool,
 ) (RunOutcome, error) {
 	out := RunOutcome{}
 	if len(entries) == 0 {
@@ -65,21 +75,38 @@ func RunHooks(
 		return out, fmt.Errorf("create %s: %w", logDir, err)
 	}
 	out.Groups = make([]GroupOutcome, 0, len(entries))
+	cmds := make([]*exec.Cmd, 0, len(entries))
 	for i, entry := range entries {
 		if len(entry.Steps) == 0 {
 			continue
 		}
 		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
 		cmdStr := renderGroup(entry.Steps, worktreePath)
-		pid, err := spawnDetached(cmdStr, worktreePath, repoRoot, slug, logPath, inheritedEnv)
+		c, err := spawnDetached(cmdStr, worktreePath, repoRoot, slug, logPath, inheritedEnv, wait)
 		if err != nil {
 			return out, err
 		}
+		cmds = append(cmds, c)
 		out.Groups = append(out.Groups, GroupOutcome{
 			Command: cmdStr,
-			PID:     pid,
+			PID:     c.Process.Pid,
 			LogPath: logPath,
 		})
+	}
+	if wait {
+		for idx, c := range cmds {
+			if err := c.Wait(); err != nil {
+				// Don't abort the whole phase — surface the
+				// exit code on the outcome and let the caller
+				// decide. The same group's stdout/stderr are
+				// already in its log file.
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					out.Groups[idx].ExitCode = exitErr.ExitCode()
+				} else {
+					out.Groups[idx].ExitCode = -1
+				}
+			}
+		}
 	}
 	return out, nil
 }
@@ -152,11 +179,13 @@ func shellSingleQuote(s string) string {
 // spawnDetached forks a `setsid /bin/sh -c <cmd>` child with
 // stdout+stderr redirected to logPath. Env is cleared then layered
 // with the caller's inheritedEnv plus the three standard overlay
-// vars (GWT_MAIN, GWT_WT, TREEMAN_SLUG).
-func spawnDetached(cmdStr, worktreePath, repoRoot, slug, logPath string, inheritedEnv map[string]string) (int, error) {
+// vars (GWT_MAIN, GWT_WT, TREEMAN_SLUG). Returns the *exec.Cmd so
+// the caller can either reap it inline (`Wait()` on the wait=true
+// path) or fire-and-forget via a detached goroutine.
+func spawnDetached(cmdStr, worktreePath, repoRoot, slug, logPath string, inheritedEnv map[string]string, wait bool) (*exec.Cmd, error) {
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return 0, fmt.Errorf("open hook log %s: %w", logPath, err)
+		return nil, fmt.Errorf("open hook log %s: %w", logPath, err)
 	}
 	defer logFile.Close()
 
@@ -169,12 +198,15 @@ func spawnDetached(cmdStr, worktreePath, repoRoot, slug, logPath string, inherit
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := c.Start(); err != nil {
-		return 0, fmt.Errorf("setsid spawn `%s`: %w", cmdStr, err)
+		return nil, fmt.Errorf("setsid spawn `%s`: %w", cmdStr, err)
 	}
-	// Detach — let the daemon reap us when the child finishes via
-	// SIGCHLD ignore at process start. We don't `Wait()` here.
-	go func() { _ = c.Wait() }()
-	return c.Process.Pid, nil
+	if !wait {
+		// Caller doesn't want to block on completion. Reap the child
+		// asynchronously so zombies don't pile up against this
+		// daemon process.
+		go func() { _ = c.Wait() }()
+	}
+	return c, nil
 }
 
 // runForeground runs one step synchronously, captures tails, returns

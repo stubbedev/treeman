@@ -362,7 +362,10 @@ func wtDelete() *cli.Command {
 			repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 			wtID, _ := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, "")
 			if len(cfg.Hooks.Predelete) > 0 {
-				_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete, repoRoot, wtPath, sl.Value, env)
+				// Await predelete groups so external cleanup
+				// (kill watchers, drop sibling DBs) finishes
+				// before TeardownDatabases blows away SQL state.
+				_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete, repoRoot, wtPath, sl.Value, env, true)
 			}
 			_ = prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st)
 			args := []string{"-C", repoRoot, "worktree", "remove"}
@@ -595,10 +598,14 @@ func runLocalFinalize(
 	skipPrepare bool,
 ) error {
 	if len(cfg.Hooks.Postcreate) > 0 {
-		if _, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate, repoRoot, wtPath, sl.Value, env); err != nil {
+		// Block on postcreate completion before prepare so e.g.
+		// `composer install` finishes populating vendor/ before
+		// artisan migrate runs. Same rationale as the daemon's
+		// FinalizeWorktree path.
+		if _, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate, repoRoot, wtPath, sl.Value, env, true); err != nil {
 			return err
 		}
-		fmt.Printf("postcreate: %d group(s) spawned (logs in %s/.treeman-hooks/)\n",
+		fmt.Printf("postcreate: %d group(s) complete (logs in %s/.treeman-hooks/)\n",
 			len(cfg.Hooks.Postcreate), wtPath)
 	}
 	if skipPrepare || len(cfg.Databases) == 0 {
