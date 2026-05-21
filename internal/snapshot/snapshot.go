@@ -100,10 +100,20 @@ func (k Key) Fingerprint() string {
 }
 
 // TemplateName returns the synthesized template-DB name used by the
-// prepare path: `_tm_tmpl_<engine>_<fingerprint[0:16]>`. Hyphen-free
-// + stable so identifier-validation rules never reject it.
+// prepare path: `_tm_<fingerprint[0:16]>`. Short, hyphen-free + stable
+// so identifier-validation rules never reject it.
+//
+// Only used at template *creation* time — the SQLite snapshots table
+// stores the resulting name in `template_name` and every read path
+// (cache hit lookup, GC eviction, restore) reads from there. The
+// engine kind isn't encoded in the name because `snapshots.engine`
+// already carries it, and the `_tmpl_` token was redundant with the
+// `_tm_` namespace marker. Old `_tm_tmpl_<engine>_*` names from
+// earlier builds stay valid: existing rows continue to round-trip
+// through `template_name`, and only newly built templates get the
+// shorter form.
 func (k Key) TemplateName() string {
-	return fmt.Sprintf("_tm_tmpl_%s_%s", k.Engine, k.Fingerprint()[:16])
+	return fmt.Sprintf("_tm_%s", k.Fingerprint()[:16])
 }
 
 // LockfileHashesFor blake-shas a list of files. Missing files are
