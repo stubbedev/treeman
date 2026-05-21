@@ -17,9 +17,9 @@ type State struct {
 	StartedAtUnix int64
 	PID           uint32
 
-	mu          sync.Mutex
-	watchers    map[string]*WatcherEntry
-	wtWatchers  map[string]*WatcherEntry
+	mu         sync.Mutex
+	watchers   map[string]*WatcherEntry
+	wtWatchers map[string]*WatcherEntry
 }
 
 // WatcherEntry — per-repo watcher placeholder. Phase 10 fills in the
