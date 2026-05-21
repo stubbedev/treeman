@@ -39,6 +39,13 @@ func TestRepairRegistersMissingWorktrees(t *testing.T) {
 	if out, err := exec.Command("git", "-C", repo, "worktree", "add", wt, "-b", "feature").CombinedOutput(); err != nil {
 		t.Fatalf("worktree add: %v: %s", err, out)
 	}
+	// macOS resolves /var → /private/var when git writes the gitdir
+	// pointer, so the path our parser reports back is the realpath
+	// form. Resolve `wt` the same way to compare apples-to-apples.
+	wtResolved, err := filepath.EvalSymlinks(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	st, err := store.Open(ctx, filepath.Join(tmp, "treeman.db"))
 	if err != nil {
@@ -50,8 +57,8 @@ func TestRepairRegistersMissingWorktrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Registered) != 1 || res.Registered[0] != wt {
-		t.Errorf("Registered = %+v, want [%s]", res.Registered, wt)
+	if len(res.Registered) != 1 || res.Registered[0] != wtResolved {
+		t.Errorf("Registered = %+v, want [%s]", res.Registered, wtResolved)
 	}
 
 	// Second call should be a no-op.
