@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -16,6 +18,13 @@ type State struct {
 	Store         *store.Store
 	StartedAtUnix int64
 	PID           uint32
+
+	// BgCtx is the daemon-lifetime context. Async work spawned by
+	// RPC handlers (finalize, teardown, watcher dispatch) must use
+	// this — not the per-request ctx, which dies when the client
+	// connection closes, and not context.Background(), which
+	// orphans the work on shutdown.
+	BgCtx context.Context
 
 	mu         sync.Mutex
 	watchers   map[string]*WatcherEntry
@@ -40,16 +49,37 @@ type WatcherEntry struct {
 	Cancel        context.CancelFunc
 }
 
-// NewState constructs a fresh daemon state.
-func NewState(s *store.Store) *State {
+// NewState constructs a fresh daemon state. `bg` is the
+// daemon-lifetime context — cancelled on signal/shutdown — that
+// background goroutines should derive from.
+func NewState(bg context.Context, s *store.Store) *State {
+	if bg == nil {
+		bg = context.Background()
+	}
 	return &State{
 		Store:         s,
 		StartedAtUnix: time.Now().Unix(),
 		PID:           uint32(syscallPid()),
+		BgCtx:         bg,
 		watchers:      map[string]*WatcherEntry{},
 		wtWatchers:    map[string]*WatcherEntry{},
 		teardownLks:   map[string]*sync.Mutex{},
 	}
+}
+
+// safeGo runs fn in a new goroutine, recovering any panic so a
+// runtime error in one async task can't kill the whole daemon.
+// The panic is logged with the caller-supplied label.
+func safeGo(label string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("daemon goroutine panic",
+					"label", label, "panic", fmt.Sprint(r))
+			}
+		}()
+		fn()
+	}()
 }
 
 // LockRepoTeardown returns the per-repo teardown mutex, creating it

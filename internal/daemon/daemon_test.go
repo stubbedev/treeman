@@ -16,7 +16,7 @@ func setup(t *testing.T) (*State, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := NewState(s)
+	st := NewState(ctx, s)
 	return st, func() { _ = s.Close() }
 }
 

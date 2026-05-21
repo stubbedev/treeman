@@ -456,6 +456,10 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 	if err != nil {
 		return nil, logsQueryOut{}, err
 	}
+	for i := range events {
+		events[i].Message = redactSecrets(events[i].Message)
+		events[i].PayloadJSON = redactSecrets(events[i].PayloadJSON)
+	}
 	return nil, logsQueryOut{Events: events}, nil
 }
 
@@ -532,6 +536,10 @@ func logsHooksTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsHooksI
 	runs, err := st.QueryHookRuns(ctx, wid, limit)
 	if err != nil {
 		return nil, logsHooksOut{}, err
+	}
+	for i := range runs {
+		runs[i].StdoutTail = redactSecrets(runs[i].StdoutTail)
+		runs[i].StderrTail = redactSecrets(runs[i].StderrTail)
 	}
 	return nil, logsHooksOut{Runs: runs}, nil
 }

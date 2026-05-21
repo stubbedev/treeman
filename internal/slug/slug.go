@@ -86,7 +86,13 @@ func extractTicket(s string) (string, bool) {
 	num := caps[2]
 	out := prefix + "_" + num
 	if len(out) > 32 {
-		out = out[:32]
+		// Naive truncation can collide two distinct tickets
+		// (proj_looong_12345 vs proj_looong_12346). Append a short
+		// hash of the full ticket so the 32-char budget still
+		// distinguishes them.
+		sum := blake3.Sum256([]byte(out))
+		tag := hexEncode(sum[:])[:6]
+		out = out[:32-1-len(tag)] + "_" + tag
 	}
 	return out, true
 }

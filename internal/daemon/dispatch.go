@@ -64,15 +64,16 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 			return errResp("worktree_finalize: missing args")
 		}
 		args := *req.WorktreeFinalize
-		go func() {
-			err := FinalizeWorktree(context.Background(), st, args.RepoPath, args.WorktreePath, args.InheritedEnv)
+		safeGo("wt_finalize", func() {
+			bg := st.BgCtx
+			err := FinalizeWorktree(bg, st, args.RepoPath, args.WorktreePath, args.InheritedEnv)
 			if err != nil {
-				_ = st.Store.WriteEvent(context.Background(), "error", "wt_finalize", err.Error(),
+				_ = st.Store.WriteEvent(bg, "error", "wt_finalize", err.Error(),
 					0, 0, "", 0, map[string]string{
 						"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
 					})
 			}
-		}()
+		})
 		return rpc.Response{Kind: rpc.KindWorktreeFinalizeQueued, WorktreePath: args.WorktreePath}
 
 	case rpc.MethodWorktreeTeardown:
@@ -80,15 +81,16 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 			return errResp("worktree_teardown: missing args")
 		}
 		args := *req.WorktreeTeardown
-		go func() {
-			err := TeardownWorktree(context.Background(), st, args.RepoPath, args.WorktreePath, args.Force, args.InheritedEnv)
+		safeGo("wt_teardown", func() {
+			bg := st.BgCtx
+			err := TeardownWorktree(bg, st, args.RepoPath, args.WorktreePath, args.Force, args.InheritedEnv)
 			if err != nil {
-				_ = st.Store.WriteEvent(context.Background(), "error", "wt_teardown", err.Error(),
+				_ = st.Store.WriteEvent(bg, "error", "wt_teardown", err.Error(),
 					0, 0, "", 0, map[string]string{
 						"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
 					})
 			}
-		}()
+		})
 		return rpc.Response{Kind: rpc.KindWorktreeTeardownQueued, WorktreePath: args.WorktreePath}
 
 	case rpc.MethodWatcherStart:
@@ -215,7 +217,7 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 		return fmt.Errorf("ensure repo: %w", err)
 	}
 
-	wctx, cancel := context.WithCancel(context.Background())
+	wctx, cancel := context.WithCancel(st.BgCtx)
 	entry := &WatcherEntry{
 		RepoPath:      repoPath,
 		WorktreeCount: 0,
@@ -244,12 +246,13 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 				slog.Warn("binlog replicator init", "repo", repoPath, "source_db", sourceDB, "err", err)
 				continue
 			}
-			go func(rep *binlog.Replicator, src string) {
-				defer rep.Stop()
-				if err := rep.Start(wctx); err != nil {
+			r, src := r, sourceDB
+			safeGo("binlog_replicator:"+repoPath+":"+src, func() {
+				defer r.Stop()
+				if err := r.Start(wctx); err != nil {
 					slog.Warn("binlog replicator exit", "repo", repoPath, "source_db", src, "err", err)
 				}
-			}(r, sourceDB)
+			})
 			binlogReps++
 		}
 	}
@@ -283,7 +286,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		return fmt.Errorf("ensure repo: %w", err)
 	}
 
-	wctx, cancel := context.WithCancel(context.Background())
+	wctx, cancel := context.WithCancel(st.BgCtx)
 	entry := &WatcherEntry{
 		RepoPath: repoPath,
 		Cancel:   cancel,
@@ -296,11 +299,11 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		return fmt.Errorf("fsnotify watcher init: %w", err)
 	}
 	st.RegisterWtWatcher(wtPath, entry)
-	go func() {
+	safeGo("wt_fs_watcher:"+wtPath, func() {
 		if err := w.Start(wctx); err != nil {
 			slog.Warn("fsnotify watcher exit", "wt", wtPath, "err", err)
 		}
-	}()
+	})
 	slog.Info("worktree watcher started", "repo", repoPath, "wt", wtPath)
 	return nil
 }
@@ -315,11 +318,11 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 			repoID, 0, "", 0, map[string]string{
 				"path": ev.Path, "mode": string(ev.Mode), "wt": wtPath,
 			})
-		go func() {
-			if err := FinalizeWorktree(context.Background(), st, repoPath, wtPath, nil); err != nil {
+		safeGo("watcher_finalize:"+wtPath, func() {
+			if err := FinalizeWorktree(st.BgCtx, st, repoPath, wtPath, nil); err != nil {
 				slog.Warn("watcher-triggered finalize", "wt", wtPath, "err", err)
 			}
-		}()
+		})
 		return nil
 	}
 }

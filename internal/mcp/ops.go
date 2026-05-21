@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/gitenv"
@@ -14,6 +15,43 @@ import (
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
+
+// secretPatterns matches common credential shapes that may leak into
+// hook stdout/stderr or event payloads. Anything matched is replaced
+// with `***REDACTED***` before being returned to MCP clients (which
+// forward the value to an LLM).
+//
+// Conservative by design — false positives just hide a token; false
+// negatives leak it. Project-specific patterns can be appended here.
+var secretPatterns = []*regexp.Regexp{
+	// URI userinfo: scheme://user:password@host
+	regexp.MustCompile(`([a-z][a-z0-9+.-]*://)([^:/@\s]+):([^@\s]+)@`),
+	// KEY=VALUE for common secret-bearing variable names
+	regexp.MustCompile(`(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth)[\s]*[:=][\s]*['"]?([^\s'"\n]+)`),
+	// AWS access key id
+	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
+	// GitHub PATs
+	regexp.MustCompile(`\bghp_[A-Za-z0-9]{36,}\b`),
+	regexp.MustCompile(`\bgho_[A-Za-z0-9]{36,}\b`),
+	regexp.MustCompile(`\bghs_[A-Za-z0-9]{36,}\b`),
+	// Generic JWT
+	regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`),
+}
+
+// redactSecrets scrubs known-shaped credentials from a string. Safe
+// to call on already-redacted values; idempotent.
+func redactSecrets(s string) string {
+	if s == "" {
+		return s
+	}
+	out := s
+	out = secretPatterns[0].ReplaceAllString(out, "$1$2:***REDACTED***@")
+	out = secretPatterns[1].ReplaceAllString(out, "$1=***REDACTED***")
+	for _, re := range secretPatterns[2:] {
+		out = re.ReplaceAllString(out, "***REDACTED***")
+	}
+	return out
+}
 
 // resolveRepo returns the absolute repo root inferred from an
 // explicit override or the cwd. Mirrors cmd's resolveRepo so this

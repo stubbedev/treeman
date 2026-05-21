@@ -57,17 +57,20 @@ func run() error {
 	}
 	daemon.RemoveStale(sockPath)
 	if dir := filepath.Dir(sockPath); dir != "" {
-		_ = os.MkdirAll(dir, 0o755)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, err)
+		}
 	}
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return fmt.Errorf("bind %s: %w", sockPath, err)
 	}
 	if err := daemon.Lockdown(sockPath); err != nil {
+		_ = ln.Close()
 		return err
 	}
 
-	st := daemon.NewState(s)
+	st := daemon.NewState(ctx, s)
 	slog.Info("treemand listening",
 		"event_type", "daemon_started",
 		"socket", sockPath,

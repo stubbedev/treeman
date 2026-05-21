@@ -116,13 +116,17 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
-			tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+				return fmt.Errorf("apply migration %s: %w (rollback: %v)", e.Name(), err, rbErr)
+			}
 			return fmt.Errorf("apply migration %s: %w", e.Name(), err)
 		}
 		if _, err := tx.ExecContext(ctx,
 			"INSERT INTO _treeman_migrations(version, filename, applied_at) VALUES (?,?,?)",
 			version, e.Name(), nowMillis()); err != nil {
-			tx.Rollback()
+			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+				return fmt.Errorf("%w (rollback: %v)", err, rbErr)
+			}
 			return err
 		}
 		if err := tx.Commit(); err != nil {
@@ -308,7 +312,7 @@ func (s *Store) WriteEvent(ctx context.Context,
 ) error {
 	pj, err := json.Marshal(payload)
 	if err != nil {
-		pj = []byte("{}")
+		return fmt.Errorf("encode event payload: %w", err)
 	}
 	var (
 		rid interface{}

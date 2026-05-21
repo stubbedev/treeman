@@ -3,7 +3,9 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"syscall"
@@ -33,9 +35,26 @@ func CheckPeerUID(c net.Conn) error {
 		return fmt.Errorf("peer uid check: nil LocalAddr")
 	}
 	path := addr.String()
-	fi, err := os.Stat(path)
+	fi, err := os.Lstat(path)
 	if err != nil {
+		// TOCTOU hardening: if the socket file vanished between bind
+		// and now (ENOENT), an attacker may have unlinked it and
+		// rebound under another uid. Refuse — there's no way left to
+		// verify the owner. Any other stat error is also a refuse.
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("socket %s missing — refusing connection", path)
+		}
 		return fmt.Errorf("stat socket %s: %w", path, err)
+	}
+	// Reject anything that isn't a unix-domain socket file (someone
+	// swapped a regular file or symlink into place).
+	if fi.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("socket %s: not a socket (mode %s)", path, fi.Mode())
+	}
+	// Permissions must remain 0600 — Lockdown set them; if they've
+	// loosened, something else touched the file.
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		return fmt.Errorf("socket %s: unexpected perms %o (want 0600)", path, perm)
 	}
 	sysStat, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {

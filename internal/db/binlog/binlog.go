@@ -304,7 +304,7 @@ func (r *Replicator) applyDDL(ctx context.Context, query string) error {
 		return fmt.Errorf("enumerate targets: %w", err)
 	}
 	for _, t := range targets {
-		if _, err := drv.DB.ExecContext(ctx, "USE `"+t+"`"); err != nil {
+		if _, err := drv.DB.ExecContext(ctx, "USE "+quoteIdent(t)); err != nil {
 			slog.Warn("binlog ddl USE failed", "target", t, "err", err)
 			continue
 		}

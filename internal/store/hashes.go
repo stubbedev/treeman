@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -57,7 +58,7 @@ func (s *Store) HashedFile(ctx context.Context, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	_, _ = s.DB.ExecContext(ctx,
+	if _, err := s.DB.ExecContext(ctx,
 		`INSERT INTO file_hashes(path, size, mtime_ns, hash, cached_at)
 		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(path) DO UPDATE SET
@@ -65,7 +66,12 @@ func (s *Store) HashedFile(ctx context.Context, path string) (string, error) {
 		     mtime_ns  = excluded.mtime_ns,
 		     hash      = excluded.hash,
 		     cached_at = excluded.cached_at`,
-		path, size, mtime, hash, nowMillis())
+		path, size, mtime, hash, nowMillis()); err != nil {
+		// Cache write is advisory — the hash itself is still valid.
+		// Log so disk-full / lock contention is visible instead of
+		// silently degrading every subsequent prepare.
+		slog.Warn("file_hashes cache update failed", "path", path, "err", err)
+	}
 	return hash, nil
 }
 

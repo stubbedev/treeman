@@ -135,13 +135,19 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 }
 
 // atomicWrite writes data to <path>.tmp then renames over <path> so
-// readers never see a partial config.
+// readers never see a partial config. The tmp file is created 0o600
+// so config contents (potentially including connection strings) are
+// not briefly world-readable on shared hosts before the rename.
 func atomicWrite(path string, data []byte) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // ─── shell-out helpers ────────────────────────────────────────────
@@ -164,8 +170,14 @@ func runTreeman(ctx context.Context, cwd string, args ...string) (shellOut, erro
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
-	stdout, _ := cmd.StdoutPipe()
-	stderr, _ := cmd.StderrPipe()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return shellOut{}, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return shellOut{}, fmt.Errorf("stderr pipe: %w", err)
+	}
 	if err := cmd.Start(); err != nil {
 		return shellOut{}, err
 	}
@@ -220,7 +232,10 @@ func initRepoTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*m
 	if in.Force {
 		args = append(args, "--force")
 	}
-	cwd, _ := resolveRepo(in.Repo)
+	cwd, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+	}
 	out, err := runTreeman(ctx, cwd, args...)
 	return nil, out, err
 }
@@ -230,7 +245,10 @@ type schemaInstallIn struct {
 }
 
 func schemaInstallTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in schemaInstallIn) (*mcpsdk.CallToolResult, shellOut, error) {
-	cwd, _ := resolveRepo(in.Repo)
+	cwd, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+	}
 	out, err := runTreeman(ctx, cwd, "schema", "install")
 	return nil, out, err
 }
@@ -259,7 +277,10 @@ func worktreeCreateTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in workt
 	if in.NoFetch {
 		args = append(args, "--no-fetch")
 	}
-	cwd, _ := resolveRepo(in.Repo)
+	cwd, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+	}
 	out, err := runTreeman(ctx, cwd, args...)
 	return nil, out, err
 }
@@ -278,7 +299,10 @@ func worktreeDeleteTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in workt
 	if in.Force {
 		args = append(args, "--force")
 	}
-	cwd, _ := resolveRepo(in.Repo)
+	cwd, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+	}
 	out, err := runTreeman(ctx, cwd, args...)
 	return nil, out, err
 }

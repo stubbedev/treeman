@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 )
 
 // SnapshotRecord mirrors a row in the `snapshots` table.
@@ -43,7 +44,11 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 	if err != nil {
 		return nil, err
 	}
-	_ = json.Unmarshal([]byte(lockJSON), &r.LockfileHashes)
+	if lockJSON != "" {
+		if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
+			return nil, fmt.Errorf("decode lockfile_hashes_json for %s: %w", fingerprint, err)
+		}
+	}
 	return &r, nil
 }
 
@@ -53,7 +58,10 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	if r.LockfileHashes == nil {
 		r.LockfileHashes = map[string]string{}
 	}
-	lockJSON, _ := json.Marshal(r.LockfileHashes)
+	lockJSON, err := json.Marshal(r.LockfileHashes)
+	if err != nil {
+		return fmt.Errorf("encode lockfile_hashes: %w", err)
+	}
 	now := nowMillis()
 	if r.CreatedAt == 0 {
 		r.CreatedAt = now
@@ -65,7 +73,7 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	if r.RepoID > 0 {
 		repoID = r.RepoID
 	}
-	_, err := s.DB.ExecContext(ctx, `
+	_, err = s.DB.ExecContext(ctx, `
 		INSERT INTO snapshots(fingerprint, engine, engine_version, source_db,
 		                      template_name, migrations_hash, dump_hash,
 		                      lockfile_hashes_json, size_bytes, created_at,

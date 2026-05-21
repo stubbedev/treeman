@@ -9,12 +9,22 @@
 package patcher
 
 import (
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 )
+
+// xmlAttrEscape returns `value` escaped for use inside an XML
+// attribute value. encoding/xml exposes the canonical escaper via
+// xml.EscapeText, which writes both `&` and `<`/`>`/`"` correctly.
+func xmlAttrEscape(value string) string {
+	var b strings.Builder
+	_ = xml.EscapeText(&b, []byte(value))
+	return b.String()
+}
 
 // Outcome reports what the patch call did.
 type Outcome int
@@ -57,8 +67,11 @@ func PatchEnvFile(path string, pairs []Pair) (Outcome, error) {
 
 func patchEnvOne(content, key, value string) string {
 	re := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `\s*=.*$`)
+	// regexp's Replace expands `$1`, `${name}`, `$$`, etc. in the
+	// replacement string. Use ReplaceAllLiteralString so a slug or
+	// value containing `$` doesn't accidentally pull in match groups.
 	if re.MatchString(content) {
-		return re.ReplaceAllString(content, key+"="+value)
+		return re.ReplaceAllLiteralString(content, key+"="+value)
 	}
 	out := content
 	if out != "" && !strings.HasSuffix(out, "\n") {
@@ -92,9 +105,10 @@ func PatchPhpunitFile(path string, pairs []Pair) (Outcome, error) {
 
 func patchPhpunitOne(content, key, value string) string {
 	re := regexp.MustCompile(`<env name="` + regexp.QuoteMeta(key) + `"[^/]*/>`)
-	replacement := fmt.Sprintf(`<env name="%s" value="%s" force="true"/>`, key, value)
+	replacement := fmt.Sprintf(`<env name="%s" value="%s" force="true"/>`,
+		xmlAttrEscape(key), xmlAttrEscape(value))
 	if re.MatchString(content) {
-		return re.ReplaceAllString(content, replacement)
+		return re.ReplaceAllLiteralString(content, replacement)
 	}
 	inject := "\t" + replacement + "\n\t</php>"
 	return strings.Replace(content, "</php>", inject, 1)
