@@ -13,7 +13,7 @@
 
         treeman = pkgs.buildGoModule {
           pname = "treeman";
-          version = "2.1.0";
+          version = "2.2.0";
           src = ./.;
           # buildGoModule fetches Go deps through the module proxy and
           # hashes the resulting vendor tree; `vendorHash` pins that
@@ -26,7 +26,7 @@
           ldflags = [
             "-s"
             "-w"
-            "-X github.com/stubbedev/treeman/internal/version.Version=2.1.0"
+            "-X github.com/stubbedev/treeman/internal/version.Version=2.2.0"
           ];
           doCheck = true;
         };
