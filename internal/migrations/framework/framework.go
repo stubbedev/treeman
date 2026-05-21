@@ -83,6 +83,24 @@ func DefaultRegistry() *Registry {
 	return &Registry{Specs: builtins()}
 }
 
+// LookupBuiltin returns the built-in Spec for `name` (e.g. "laravel",
+// "rails") and reports whether one exists. Callers use this to merge
+// user-supplied YAML overrides onto the framework's defaults so a
+// minimal `migrations: { framework: laravel }` block still picks up
+// the canonical migration_dirs / file_globs / lockfiles without
+// requiring users to retype the boilerplate.
+func LookupBuiltin(name string) (Spec, bool) {
+	if name == "" {
+		return Spec{}, false
+	}
+	for _, s := range builtins() {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return Spec{}, false
+}
+
 // DetectAll returns every Spec whose markers match.
 func (r *Registry) DetectAll(repoRoot string) []Spec {
 	var out []Spec

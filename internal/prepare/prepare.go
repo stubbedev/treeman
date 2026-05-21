@@ -647,34 +647,73 @@ func prepareES(
 	return Outcome{Engine: d.Engine, SourceDB: prefix}, nil
 }
 
-// specFromYAML builds a framework.Spec directly from the
-// migrations: block in `.treeman.yaml`. Runtime never falls back to
-// the built-in registry — every input the snapshot fingerprint
-// depends on is declared in the user's yaml. This makes the
-// hashing surface auditable: `git log .treeman.yaml` shows exactly
-// which migrations / lockfiles invalidate the cache, no hidden
-// per-framework defaults.
+// specFromYAML builds a framework.Spec from the migrations: block in
+// `.treeman.yaml`, merged with the built-in defaults for the named
+// framework (if any). The merge rules:
 //
-// `treeman init` is responsible for emitting these fields when it
-// detects a known framework; `treeman fw detect` exposes the
-// built-in presets so users can copy them in by hand.
+//   - MigrationDirs / FileGlobs / Lockfiles are the dedup'd union of
+//     the framework's defaults and the user's explicit entries (the
+//     framework's defaults come first; user entries extend the set).
+//   - HashMode and OnModify take the user's explicit value when set,
+//     otherwise the framework default, otherwise the global default
+//     (filename / rebuild).
+//
+// This lets `migrations: { framework: laravel }` work standalone —
+// the snapshot fingerprint still picks up Laravel's canonical
+// migration dirs, file globs, and lockfile — while a user who
+// supplies extra dirs simply adds to the set instead of having to
+// retype the framework boilerplate.
 func specFromYAML(m config.MigrationSpec) framework.Spec {
+	base, _ := framework.LookupBuiltin(m.Framework)
 	hash := framework.HashMode(m.HashMode)
+	if hash == "" {
+		hash = base.HashMode
+	}
 	if hash == "" {
 		hash = framework.HashFilename
 	}
 	onMod := framework.OnModify(m.OnModify)
 	if onMod == "" {
+		onMod = base.OnModify
+	}
+	if onMod == "" {
 		onMod = framework.OnRebuild
 	}
 	return framework.Spec{
 		Name:          m.Framework,
-		MigrationDirs: append([]string(nil), m.MigrationDirs...),
-		FileGlobs:     append([]string(nil), m.FileGlobs...),
-		Lockfiles:     append([]string(nil), m.Lockfiles...),
+		MigrationDirs: mergeStringSets(base.MigrationDirs, m.MigrationDirs),
+		FileGlobs:     mergeStringSets(base.FileGlobs, m.FileGlobs),
+		Lockfiles:     mergeStringSets(base.Lockfiles, m.Lockfiles),
 		HashMode:      hash,
 		OnModify:      onMod,
 	}
+}
+
+// mergeStringSets returns the order-preserving dedup'd union of the
+// argument slices. `base` entries come first so the framework's
+// canonical patterns lead the list, then `extra` entries that aren't
+// already present.
+func mergeStringSets(base, extra []string) []string {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(base)+len(extra))
+	seen := make(map[string]struct{}, len(base)+len(extra))
+	for _, s := range base {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	for _, s := range extra {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 func resolveCloneNames(p *config.TestClonesSpec, tplCtx template.Context, repoRoot string) ([]string, error) {
