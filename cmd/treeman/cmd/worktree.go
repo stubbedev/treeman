@@ -42,9 +42,10 @@ func WorktreeCmd() *cli.Command {
 
 func wtCreate() *cli.Command {
 	return &cli.Command{
-		Name:    "create",
-		Aliases: []string{"new"},
-		Usage:   "create a worktree end-to-end",
+		Name:      "create",
+		Aliases:   []string{"new"},
+		Usage:     "create a worktree end-to-end",
+		ArgsUsage: "<branch>",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "from", Usage: "base branch"},
 			&cli.StringFlag{Name: "path", Usage: "explicit worktree path"},
@@ -239,9 +240,10 @@ func wtCreate() *cli.Command {
 
 func wtDelete() *cli.Command {
 	return &cli.Command{
-		Name:    "delete",
-		Aliases: []string{"rm"},
-		Usage:   "delete a worktree end-to-end",
+		Name:      "delete",
+		Aliases:   []string{"rm"},
+		Usage:     "delete a worktree end-to-end",
+		ArgsUsage: "<path-or-branch>",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo"},
 			&cli.BoolFlag{Name: "force", Aliases: []string{"f"}},
@@ -252,17 +254,37 @@ func wtDelete() *cli.Command {
 				return fmt.Errorf("usage: treeman wt delete <path-or-branch>")
 			}
 			target := c.Args().First()
-			wtPath := MustAbs(target)
 
+			// Resolve the repo root first (--repo flag > cwd walk-up >
+			// fall back to target-as-path). Needed before the branch /
+			// slug lookup below so the SQLite query is scoped correctly.
 			repoRoot, err := resolveRepo(c.String("repo"))
-			if err == nil {
-				_ = repoRoot
-			} else {
-				repoRoot, err = DiscoverRepoRoot(wtPath)
+			if err != nil {
+				repoRoot, err = DiscoverRepoRoot(MustAbs(target))
 				if err != nil {
 					return err
 				}
 			}
+
+			// Resolve target → worktree path. Branch / slug / basename
+			// lookup wins over the literal `MustAbs(target)`
+			// interpretation: `treeman wt delete feature/foo` used to
+			// silently register a phantom worktree at $PWD/feature/foo
+			// because MustAbs was applied unconditionally. Now we
+			// consult the registry first, only falling back to
+			// path-as-typed when no match is found. With --force we
+			// allow the path-as-typed fallback even when the directory
+			// is gone (cleaning up a stale registry entry).
+			var wtPath string
+			if p, ok := lookupWorktree(ctx, repoRoot, target); ok {
+				wtPath = p
+			} else {
+				wtPath = MustAbs(target)
+				if _, statErr := os.Stat(wtPath); statErr != nil && !c.Bool("force") {
+					return fmt.Errorf("no worktree matches %q in %s (use --force to remove a stale registry entry)", target, repoRoot)
+				}
+			}
+
 			cfg, err := resolve.LoadResolved(repoRoot)
 			if err != nil {
 				return err
@@ -517,8 +539,9 @@ func detectDefaultBranch(repoRoot string) string {
 // goes to stdout — never mix the two streams.
 func wtSwitch() *cli.Command {
 	return &cli.Command{
-		Name:  "switch",
-		Usage: "print the path of a worktree (for shell `cd $(…)` use)",
+		Name:      "switch",
+		Usage:     "print the path of a worktree (for shell `cd $(…)` use)",
+		ArgsUsage: "<name>",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo", Usage: "repo root override"},
 			&cli.BoolFlag{Name: "create", Usage: "create the worktree if no match", Value: false},
