@@ -26,7 +26,7 @@ func TestFanOutClonesParallel(t *testing.T) {
 	}
 	clones := []string{"a", "b", "c", "d", "e"}
 	start := time.Now()
-	if err := fanOutClones(context.Background(), restore, "tmpl", clones, "postgres", 0); err != nil {
+	if err := fanOutClones(context.Background(), nil, 0, 0, restore, "tmpl", clones, "postgres", 0); err != nil {
 		t.Fatal(err)
 	}
 	elapsed := time.Since(start)
@@ -52,7 +52,7 @@ func TestFanOutClonesPropagatesErrors(t *testing.T) {
 			return ctx.Err()
 		}
 	}
-	err := fanOutClones(context.Background(), restore, "tmpl", []string{"a", "b", "c"}, "postgres", 0)
+	err := fanOutClones(context.Background(), nil, 0, 0, restore, "tmpl", []string{"a", "b", "c"}, "postgres", 0)
 	if err == nil || !contains(err.Error(), "boom") {
 		t.Errorf("expected boom-wrapped error, got %v", err)
 	}
@@ -69,7 +69,7 @@ func TestFanOutClonesEmpty(t *testing.T) {
 		called = true
 		return nil
 	}
-	if err := fanOutClones(context.Background(), restore, "tmpl", nil, "postgres", 0); err != nil {
+	if err := fanOutClones(context.Background(), nil, 0, 0, restore, "tmpl", nil, "postgres", 0); err != nil {
 		t.Fatal(err)
 	}
 	if called {
@@ -99,7 +99,7 @@ func TestFanOutClonesRespectsLimit(t *testing.T) {
 	for i := range clones {
 		clones[i] = string(rune('a' + i%26))
 	}
-	if err := fanOutClones(context.Background(), restore, "tmpl", clones, "postgres", 0); err != nil {
+	if err := fanOutClones(context.Background(), nil, 0, 0, restore, "tmpl", clones, "postgres", 0); err != nil {
 		t.Fatal(err)
 	}
 	if peak.Load() > 64 {

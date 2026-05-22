@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -14,6 +15,8 @@ import (
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
+
+func nowMillis() int64 { return time.Now().UnixMilli() }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
 // goroutine) tail of `treeman wt create` when
@@ -72,8 +75,10 @@ func FinalizeWorktree(
 		// blows up with `migrate exit 255`. Hook groups still run in
 		// parallel with each other; only the phase-to-phase
 		// transition is gated.
-		_, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate,
+		started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, "postcreate", len(cfg.Hooks.Postcreate))
+		out, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate,
 			repoRoot, wtRoot, sl.Value, inheritedEnv, true)
+		hooks.PersistOutcome(ctx, st.Store, repoID, wtID, "postcreate", started, nowMillis(), out)
 		if err != nil {
 			return fmt.Errorf("postcreate hooks: %w", err)
 		}
@@ -190,8 +195,10 @@ func TeardownWorktree(
 		// databases — same rationale as the postcreate await: a hook
 		// that closes app connections must finish before DROP
 		// DATABASE, or the DB server rejects the drop.
-		_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete,
+		started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, "predelete", len(cfg.Hooks.Predelete))
+		out, _ := hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete,
 			repoRoot, wtRoot, slugVal, inheritedEnv, true)
+		hooks.PersistOutcome(ctx, st.Store, repoID, wtID, "predelete", started, nowMillis(), out)
 	}
 
 	if len(cfg.Databases) > 0 {

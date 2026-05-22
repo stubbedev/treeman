@@ -163,6 +163,8 @@ type HookRun struct {
 	ID         int64
 	WorktreeID int64
 	Phase      string
+	GroupIdx   int64
+	Command    string
 	StartedAt  int64 // unix-ms
 	FinishedAt sql.NullInt64
 	ExitCode   sql.NullInt64
@@ -173,9 +175,10 @@ type HookRun struct {
 // QueryHookRuns returns the most recent hook executions for a
 // worktree, newest first. Pass limit=0 for "no LIMIT".
 func (s *Store) QueryHookRuns(ctx context.Context, worktreeID int64, limit int) ([]HookRun, error) {
-	q := `SELECT id, worktree_id, phase, started_at, finished_at, exit_code,
+	q := `SELECT id, worktree_id, phase, group_idx, COALESCE(command,''),
+		started_at, finished_at, exit_code,
 		COALESCE(stdout_tail,''), COALESCE(stderr_tail,'')
-		FROM hook_runs WHERE worktree_id = ? ORDER BY started_at DESC`
+		FROM hook_runs WHERE worktree_id = ? ORDER BY started_at DESC, id DESC`
 	args := []any{worktreeID}
 	if limit > 0 {
 		q += " LIMIT ?"
@@ -189,12 +192,47 @@ func (s *Store) QueryHookRuns(ctx context.Context, worktreeID int64, limit int) 
 	var out []HookRun
 	for rows.Next() {
 		var h HookRun
-		if err := rows.Scan(&h.ID, &h.WorktreeID, &h.Phase, &h.StartedAt, &h.FinishedAt, &h.ExitCode, &h.StdoutTail, &h.StderrTail); err != nil {
+		if err := rows.Scan(&h.ID, &h.WorktreeID, &h.Phase, &h.GroupIdx, &h.Command, &h.StartedAt, &h.FinishedAt, &h.ExitCode, &h.StdoutTail, &h.StderrTail); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// WriteHookRun records one hook-group execution. exitCode<0 / finishedMs==0
+// indicate the row is for a still-running async group; the caller can
+// follow up with UpdateHookRun once the driver exits, but for the
+// current synchronous code paths every call here passes a final state.
+func (s *Store) WriteHookRun(ctx context.Context,
+	worktreeID int64,
+	phase string,
+	groupIdx int,
+	command string,
+	startedMs, finishedMs int64,
+	exitCode int,
+	stdoutTail, stderrTail string,
+) error {
+	if worktreeID <= 0 {
+		return nil
+	}
+	var fin sql.NullInt64
+	if finishedMs > 0 {
+		fin = sql.NullInt64{Int64: finishedMs, Valid: true}
+	}
+	var exit sql.NullInt64
+	if finishedMs > 0 {
+		exit = sql.NullInt64{Int64: int64(exitCode), Valid: true}
+	}
+	_, err := s.DB.ExecContext(ctx,
+		`INSERT INTO hook_runs(worktree_id, phase, group_idx, command,
+			started_at, finished_at, exit_code, stdout_tail, stderr_tail)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		worktreeID, phase, groupIdx, command, startedMs, fin, exit, stdoutTail, stderrTail)
+	if err != nil {
+		return fmt.Errorf("insert hook_run: %w", err)
+	}
+	return nil
 }
 
 // placeholders returns "?, ?, ?" repeated n times.

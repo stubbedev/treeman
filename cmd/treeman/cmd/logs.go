@@ -41,6 +41,7 @@ func filterFlags() []cli.Flag {
 		&cli.BoolFlag{Name: "follow", Aliases: []string{"f"}, Usage: "stream new events as they arrive"},
 		&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}, Usage: "filter by worktree (slug, branch, or basename)"},
 		&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "repo root override"},
+		&cli.BoolFlag{Name: "all", Aliases: []string{"A"}, Usage: "show events from every worktree (defeats the cwd auto-filter)"},
 		&cli.StringSliceFlag{Name: "level", Aliases: []string{"l"}, Usage: "filter by level (debug|info|warn|error); repeatable"},
 		&cli.StringSliceFlag{Name: "event-type", Aliases: []string{"t"}, Usage: "filter by exact event_type; repeatable"},
 		&cli.StringSliceFlag{Name: "phase", Aliases: []string{"p"}, Usage: "filter by phase (precreate|postcreate|...); repeatable"},
@@ -68,10 +69,11 @@ TREEMAN_NO_PAGER=1 to disable.`,
 			&cli.BoolFlag{Name: "no-pager", Usage: "disable the pager even when stdout is a TTY"},
 		),
 		Action: func(ctx context.Context, c *cli.Command) error {
-			f, err := buildFilter(ctx, c)
+			scope, err := buildFilterWithScope(ctx, c)
 			if err != nil {
 				return err
 			}
+			f := scope.Filter
 			f.Limit = int(c.Int("n"))
 			st, closer, err := openLogStore(ctx)
 			if err != nil {
@@ -87,6 +89,7 @@ TREEMAN_NO_PAGER=1 to disable.`,
 			reverseEvents(rows)
 			follow := c.Bool("follow")
 			asJSON := c.Bool("json")
+			printScopePreamble(scope, asJSON)
 			pager := newPagerIfEligible(c, follow, asJSON)
 			if pager != nil {
 				_ = pager.Start()
@@ -126,10 +129,11 @@ func logsGrep() *cli.Command {
 				return fmt.Errorf("usage: treeman logs grep <pattern>")
 			}
 			pattern := c.Args().First()
-			f, err := buildFilter(ctx, c)
+			scope, err := buildFilterWithScope(ctx, c)
 			if err != nil {
 				return err
 			}
+			f := scope.Filter
 			if c.Int("n") > 0 {
 				f.Limit = int(c.Int("n"))
 			} else {
@@ -163,6 +167,7 @@ func logsGrep() *cli.Command {
 			}
 			reverseEvents(rows)
 			asJSON := c.Bool("json")
+			printScopePreamble(scope, asJSON)
 			pager := newPagerIfEligible(c, false, asJSON)
 			if pager != nil {
 				_ = pager.Start()
@@ -210,18 +215,21 @@ func newPagerIfEligible(c *cli.Command, follow, asJSON bool) *ui.Pager {
 func logsHooks() *cli.Command {
 	return &cli.Command{
 		Name:      "hooks",
-		Usage:     "show recent hook_runs (precreate/postcreate/predelete) for a worktree",
-		ArgsUsage: "<worktree>",
+		Usage:     "show recent hook_runs (precreate/postcreate/predelete/postdelete) for a worktree",
+		ArgsUsage: "[worktree]",
+		Description: `Examples:
+  treeman logs hooks                # cwd-resolved worktree
+  treeman logs hooks PROJ-1234
+  treeman logs hooks --json | jq .
+
+The worktree argument is optional — when omitted, the worktree
+containing the current working directory is used.`,
 		Flags: []cli.Flag{
 			&cli.IntFlag{Name: "n", Value: 20, Usage: "max rows"},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "repo root override"},
 			&cli.BoolFlag{Name: "json"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman logs hooks <worktree>")
-			}
-			name := c.Args().First()
 			st, closer, err := openLogStore(ctx)
 			if err != nil {
 				return err
@@ -235,10 +243,31 @@ func logsHooks() *cli.Command {
 					repoID, _ = lookupRepoID(ctx, st, root)
 				}
 			}
-			wtID, _ := st.LookupWorktreeID(ctx, repoID, name)
-			if wtID == 0 {
-				return fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
+
+			var wtID int64
+			var name string
+			if c.NArg() >= 1 {
+				name = c.Args().First()
+				wtID, _ = st.LookupWorktreeID(ctx, repoID, name)
+				if wtID == 0 {
+					return fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
+				}
+			} else {
+				cwd, _ := os.Getwd()
+				row := lookupWorktreeContainingCwd(ctx, st, MustAbs(cwd))
+				if row.ID == 0 {
+					return fmt.Errorf("usage: treeman logs hooks [worktree] (cwd is not inside a registered worktree)")
+				}
+				wtID = row.ID
+				name = row.Slug
+				if name == "" {
+					name = row.Branch
+				}
+				if !c.Bool("json") {
+					fmt.Fprintf(os.Stderr, "# scope: worktree=%s (--all not honoured here; pass a name to override)\n", name)
+				}
 			}
+
 			runs, err := st.QueryHookRuns(ctx, wtID, int(c.Int("n")))
 			if err != nil {
 				return err
@@ -250,7 +279,7 @@ func logsHooks() *cli.Command {
 				ui.Info("no hook runs recorded for %s", name)
 				return nil
 			}
-			tbl := ui.NewTable("STARTED", "PHASE", "EXIT", "DURATION", "STDERR_TAIL")
+			tbl := ui.NewTable("STARTED", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND")
 			for _, h := range runs {
 				exit := "—"
 				if h.ExitCode.Valid {
@@ -268,12 +297,19 @@ func logsHooks() *cli.Command {
 					d := time.Duration(h.FinishedAt.Int64-h.StartedAt) * time.Millisecond
 					dur = ui.Dim(d.String())
 				}
-				tail := h.StderrTail
-				if tail == "" {
-					tail = h.StdoutTail
+				cmd := h.Command
+				if cmd == "" {
+					// Older rows (pre-0008) won't have command; fall
+					// back to the captured tails so the column isn't
+					// empty.
+					cmd = h.StderrTail
+					if cmd == "" {
+						cmd = h.StdoutTail
+					}
 				}
-				tail = singleLine(tail, 80)
-				tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), exit, dur, tail)
+				cmd = singleLine(cmd, 80)
+				group := fmt.Sprintf("%d", h.GroupIdx)
+				tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
 			}
 			tbl.Render(nil)
 			return nil
@@ -281,47 +317,138 @@ func logsHooks() *cli.Command {
 	}
 }
 
-// buildFilter assembles an EventFilter from the urfave/cli flag set.
-// Worktree + repo flags resolve to integer IDs via SQLite lookups so
-// the downstream query is index-friendly.
-func buildFilter(ctx context.Context, c *cli.Command) (store.EventFilter, error) {
-	f := store.EventFilter{
-		Levels:      validateLevels(c.StringSlice("level")),
-		EventTypes:  c.StringSlice("event-type"),
-		Phases:      c.StringSlice("phase"),
-		PayloadLike: c.String("payload"),
-		HydrateWT:   true,
+// filterScope carries the EventFilter plus the resolved worktree
+// metadata used to print a one-line preamble explaining why the
+// filter is what it is.
+type filterScope struct {
+	Filter       store.EventFilter
+	WorktreeName string // empty when not scoped to a worktree
+	WorktreePath string // empty when not scoped to a worktree
+	AutoResolved bool   // true when --worktree was not passed but cwd matched a row
+}
+
+func buildFilterWithScope(ctx context.Context, c *cli.Command) (filterScope, error) {
+	scope := filterScope{
+		Filter: store.EventFilter{
+			Levels:      validateLevels(c.StringSlice("level")),
+			EventTypes:  c.StringSlice("event-type"),
+			Phases:      c.StringSlice("phase"),
+			PayloadLike: c.String("payload"),
+			HydrateWT:   true,
+		},
 	}
 	if s := c.String("since"); s != "" {
 		t, err := parseSince(s)
 		if err != nil {
-			return f, err
+			return scope, err
 		}
-		f.SinceMs = t.UnixMilli()
+		scope.Filter.SinceMs = t.UnixMilli()
 	}
-	if r := c.String("repo"); r != "" || c.String("worktree") != "" {
-		st, closer, err := openLogStore(ctx)
-		if err != nil {
-			return f, err
-		}
-		defer closer()
-		repoRoot := c.String("repo")
-		if repoRoot == "" {
-			cwd, _ := os.Getwd()
+
+	st, closer, err := openLogStore(ctx)
+	if err != nil {
+		return scope, err
+	}
+	defer closer()
+
+	all := c.Bool("all")
+	repoOverride := c.String("repo")
+	wantWT := c.String("worktree")
+
+	// Resolve repo ID from --repo or cwd (cwd is also how the auto-
+	// worktree resolver locates its row).
+	repoRoot := repoOverride
+	if repoRoot == "" {
+		cwd, _ := os.Getwd()
+		if cwd != "" {
 			repoRoot, _ = DiscoverRepoRoot(cwd)
 		}
-		if repoRoot != "" {
-			f.RepoID, _ = lookupRepoID(ctx, st, MustAbs(repoRoot))
+	}
+	if repoRoot != "" {
+		scope.Filter.RepoID, _ = lookupRepoID(ctx, st, MustAbs(repoRoot))
+	}
+
+	// Explicit --worktree wins over cwd auto-resolve.
+	if wantWT != "" {
+		id, _ := st.LookupWorktreeID(ctx, scope.Filter.RepoID, wantWT)
+		if id == 0 {
+			return scope, fmt.Errorf("no worktree matches %q (try `treeman wt list`)", wantWT)
 		}
-		if w := c.String("worktree"); w != "" {
-			id, _ := st.LookupWorktreeID(ctx, f.RepoID, w)
-			if id == 0 {
-				return f, fmt.Errorf("no worktree matches %q (try `treeman wt list`)", w)
-			}
-			f.WorktreeID = id
+		scope.Filter.WorktreeID = id
+		scope.WorktreeName = wantWT
+		return scope, nil
+	}
+
+	if all {
+		return scope, nil
+	}
+
+	// Auto-resolve: cwd → worktree row.
+	cwd, _ := os.Getwd()
+	if cwd == "" {
+		return scope, nil
+	}
+	row := lookupWorktreeContainingCwd(ctx, st, MustAbs(cwd))
+	if row.ID == 0 {
+		return scope, nil
+	}
+	scope.Filter.WorktreeID = row.ID
+	if row.RepoID > 0 {
+		scope.Filter.RepoID = row.RepoID
+	}
+	scope.WorktreeName = row.Slug
+	if scope.WorktreeName == "" {
+		scope.WorktreeName = row.Branch
+	}
+	scope.WorktreePath = row.Path
+	scope.AutoResolved = true
+	return scope, nil
+}
+
+// lookupWorktreeContainingCwd finds the worktree row whose `path`
+// is a prefix of (or equal to) cwd. The longest prefix wins so
+// nested worktrees resolve to the most specific row. Returns the
+// zero value when no row matches — callers treat that as
+// "logs scope = all worktrees".
+func lookupWorktreeContainingCwd(ctx context.Context, st *store.Store, cwd string) store.WorktreeRow {
+	if cwd == "" {
+		return store.WorktreeRow{}
+	}
+	// Try exact match first — cheapest path. Most invocations happen
+	// at the root of a worktree, not somewhere nested.
+	if row, err := st.LookupActiveWorktreeByPath(ctx, cwd); err == nil && row.ID != 0 {
+		return row
+	}
+	// Fall back to prefix match. SQL handles this cheaply with `?
+	// LIKE path || '/%'` which `path UNIQUE` keeps short.
+	rows, err := st.DB.QueryContext(ctx, `
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), 0
+		FROM worktrees
+		WHERE deleted_at IS NULL AND ? LIKE path || '/%'
+		ORDER BY length(path) DESC
+		LIMIT 1`, cwd)
+	if err != nil {
+		return store.WorktreeRow{}
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var w store.WorktreeRow
+		var deleted int
+		if err := rows.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &deleted); err == nil {
+			return w
 		}
 	}
-	return f, nil
+	return store.WorktreeRow{}
+}
+
+// printScopePreamble writes a one-line scope hint to stderr when the
+// cwd auto-resolver picked a worktree. Skipped for --json + --all to
+// keep machine output and explicit "show everything" runs quiet.
+func printScopePreamble(s filterScope, asJSON bool) {
+	if asJSON || !s.AutoResolved || s.WorktreeName == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "# scope: worktree=%s (--all to widen)\n", s.WorktreeName)
 }
 
 // validateLevels normalises and rejects unknown level tokens early

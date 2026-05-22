@@ -16,6 +16,9 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -105,14 +108,28 @@ var fanOutLimits = map[string]int{
 // max_connections (or who run a beefier PG that doesn't contend on
 // pg_database) can opt into higher concurrency without recompiling.
 //
+// Events emitted: `fanout_start` (info) at entry, per-clone
+// `clone_restore_done` (debug) / `clone_restore_fail` (warn) inside
+// each restore, and `fanout_done` (info / error on failure) at exit
+// with the slowest-clone duration so the user can spot stragglers
+// without trawling the per-clone debug stream.
+//
 // Returns the first error seen. errgroup's ctx cancellation
 // propagates so peer restores abort instead of hammering a server
 // that already refused the first one.
-func fanOutClones(ctx context.Context, restore cloneRestorer, template string, clones []string, engine string, override uint32) error {
+func fanOutClones(
+	ctx context.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+	restore cloneRestorer,
+	template string,
+	clones []string,
+	engine string,
+	override uint32,
+) error {
 	if len(clones) == 0 {
 		return nil
 	}
-	g, gctx := errgroup.WithContext(ctx)
 	limit := 0
 	if override > 0 {
 		limit = int(override)
@@ -128,17 +145,94 @@ func fanOutClones(ctx context.Context, restore cloneRestorer, template string, c
 	if limit > len(clones) {
 		limit = len(clones)
 	}
+
+	startedMs := time.Now().UnixMilli()
+	if st != nil {
+		_ = st.WriteEvent(ctx, store.LevelInfo, "fanout_start",
+			fmt.Sprintf("engine=%s template=%s clones=%d limit=%d", engine, template, len(clones), limit),
+			repoID, worktreeID, "", 0, map[string]any{
+				"engine":   engine,
+				"template": template,
+				"clones":   len(clones),
+				"limit":    limit,
+			})
+	}
+
+	var (
+		okCount   atomic.Uint32
+		failCount atomic.Uint32
+		slowestMs atomic.Int64
+		slowestMu sync.Mutex
+		slowestDB string
+	)
+
+	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(limit)
 	for _, c := range clones {
 		c := c
 		g.Go(func() error {
-			if err := restore(gctx, template, c); err != nil {
+			cloneStart := time.Now()
+			err := restore(gctx, template, c)
+			dur := time.Since(cloneStart).Milliseconds()
+			if err != nil {
+				failCount.Add(1)
+				if st != nil {
+					_ = st.WriteEvent(gctx, store.LevelWarn, "clone_restore_fail",
+						fmt.Sprintf("engine=%s db=%s err=%v", engine, c, err),
+						repoID, worktreeID, "", dur, map[string]any{
+							"engine":   engine,
+							"template": template,
+							"db":       c,
+							"error":    err.Error(),
+						})
+				}
 				return fmt.Errorf("restore %s → %s: %w", template, c, err)
+			}
+			okCount.Add(1)
+			if st != nil {
+				_ = st.WriteEvent(gctx, store.LevelDebug, "clone_restore_done",
+					fmt.Sprintf("engine=%s db=%s", engine, c),
+					repoID, worktreeID, "", dur, map[string]any{
+						"engine":   engine,
+						"template": template,
+						"db":       c,
+					})
+			}
+			if cur := slowestMs.Load(); dur > cur {
+				slowestMu.Lock()
+				if dur > slowestMs.Load() {
+					slowestMs.Store(dur)
+					slowestDB = c
+				}
+				slowestMu.Unlock()
 			}
 			return nil
 		})
 	}
-	return g.Wait()
+	gErr := g.Wait()
+
+	totalMs := time.Now().UnixMilli() - startedMs
+	if st != nil {
+		level := store.LevelInfo
+		if failCount.Load() > 0 {
+			level = store.LevelError
+		}
+		slowestMu.Lock()
+		slowDB := slowestDB
+		slowestMu.Unlock()
+		_ = st.WriteEvent(ctx, level, "fanout_done",
+			fmt.Sprintf("engine=%s ok=%d fail=%d slowest=%dms",
+				engine, okCount.Load(), failCount.Load(), slowestMs.Load()),
+			repoID, worktreeID, "", totalMs, map[string]any{
+				"engine":     engine,
+				"template":   template,
+				"ok":         okCount.Load(),
+				"fail":       failCount.Load(),
+				"slowest_ms": slowestMs.Load(),
+				"slowest_db": slowDB,
+			})
+	}
+	return gErr
 }
 
 // Run drives prepare for every database declared by cfg.Databases.
@@ -298,7 +392,7 @@ func prepareMySQL(
 			if err != nil {
 				return Outcome{}, err
 			}
-			if err := fanOutClones(ctx, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout); err != nil {
+			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout); err != nil {
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
@@ -382,7 +476,7 @@ func prepareMySQL(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout); err != nil {
+	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout); err != nil {
 		return Outcome{}, err
 	}
 
@@ -492,7 +586,7 @@ func preparePostgres(
 			if err != nil {
 				return Outcome{}, err
 			}
-			if err := fanOutClones(ctx, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout); err != nil {
+			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout); err != nil {
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
@@ -542,7 +636,7 @@ func preparePostgres(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout); err != nil {
+	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout); err != nil {
 		return Outcome{}, err
 	}
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",

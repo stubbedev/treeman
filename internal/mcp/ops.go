@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/hooks"
@@ -189,15 +190,44 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	}
 	sl := slug.For(wt, branch)
 	env := captureEnv()
+
+	st, dbErr := openStore(ctx)
+	var repoID, wtID int64
+	if dbErr == nil {
+		defer st.Close()
+		repoID, _ = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+		wtID, _ = st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
+	}
+
+	var entries int
 	switch phase {
 	case "precreate":
-		return hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wt, sl.Value, env)
+		entries = len(cfg.Hooks.Precreate)
 	case "postcreate":
-		return hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
+		entries = len(cfg.Hooks.Postcreate)
 	case "predelete":
-		return hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
+		entries = len(cfg.Hooks.Predelete)
 	case "postdelete":
-		return hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
+		entries = len(cfg.Hooks.Postdelete)
+	default:
+		return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want precreate|postcreate|predelete|postdelete)", phase)
 	}
-	return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want precreate|postcreate|predelete|postdelete)", phase)
+
+	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, entries)
+	var (
+		out  hooks.RunOutcome
+		rErr error
+	)
+	switch phase {
+	case "precreate":
+		out, rErr = hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wt, sl.Value, env)
+	case "postcreate":
+		out, rErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
+	case "predelete":
+		out, rErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
+	case "postdelete":
+		out, rErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
+	}
+	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, started, time.Now().UnixMilli(), out)
+	return out, rErr
 }

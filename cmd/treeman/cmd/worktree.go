@@ -258,7 +258,9 @@ Examples:
 
 			// precreate is the sync phase.
 			if len(cfg.Hooks.Precreate) > 0 {
+				started := hooks.EmitHookStart(ctx, st, repoID, wtID, "precreate", len(cfg.Hooks.Precreate))
 				out, err := hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wtPath, sl.Value, env)
+				hooks.PersistOutcome(ctx, st, repoID, wtID, "precreate", started, time.Now().UnixMilli(), out)
 				if err != nil {
 					return err
 				}
@@ -458,7 +460,9 @@ Examples:
 				// Await predelete groups so external cleanup
 				// (kill watchers, drop sibling DBs) finishes
 				// before TeardownDatabases blows away SQL state.
-				_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete, repoRoot, wtPath, sl.Value, env, true)
+				started := hooks.EmitHookStart(ctx, st, repoID, wtID, "predelete", len(cfg.Hooks.Predelete))
+				out, _ := hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete, repoRoot, wtPath, sl.Value, env, true)
+				hooks.PersistOutcome(ctx, st, repoID, wtID, "predelete", started, time.Now().UnixMilli(), out)
 			}
 			_ = prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st)
 			// Mark deleted BEFORE `git worktree remove`. The remove
@@ -1015,7 +1019,10 @@ func runLocalFinalize(
 		// `composer install` finishes populating vendor/ before
 		// artisan migrate runs. Same rationale as the daemon's
 		// FinalizeWorktree path.
-		if _, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate, repoRoot, wtPath, sl.Value, env, true); err != nil {
+		started := hooks.EmitHookStart(ctx, st, repoID, wtID, "postcreate", len(cfg.Hooks.Postcreate))
+		out, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate, repoRoot, wtPath, sl.Value, env, true)
+		hooks.PersistOutcome(ctx, st, repoID, wtID, "postcreate", started, time.Now().UnixMilli(), out)
+		if err != nil {
 			return err
 		}
 		fmt.Printf("postcreate: %d group(s) complete (logs in %s/.treeman-hooks/)\n",

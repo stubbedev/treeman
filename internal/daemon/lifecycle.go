@@ -371,8 +371,10 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 
 	if len(cfg.Hooks.Postdelete) > 0 {
 		logDir := orphanLogDir(repoPath, row.Slug)
-		_, _ = hooks.RunHooksOrphan(ctx, "postdelete", cfg.Hooks.Postdelete,
+		started := hooks.EmitHookStart(ctx, st.Store, repoID, row.ID, "postdelete", len(cfg.Hooks.Postdelete))
+		out, _ := hooks.RunHooksOrphan(ctx, "postdelete", cfg.Hooks.Postdelete,
 			repoPath, wtPath, row.Slug, logDir, map[string]string{}, true)
+		hooks.PersistOutcome(ctx, st.Store, repoID, row.ID, "postdelete", started, nowMillis(), out)
 	}
 
 	if len(cfg.Databases) > 0 {

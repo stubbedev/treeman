@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/urfave/cli/v3"
 	"gopkg.in/yaml.v3"
@@ -132,7 +133,9 @@ func HookCmd() *cli.Command {
 // RunHookPhase is the shared core for `treeman hook run <phase>`
 // and the MCP `hook_run` tool. Resolves cfg, runs the phase
 // synchronously, and returns the hooks.RunOutcome so callers can
-// inspect group exit codes / tails.
+// inspect group exit codes / tails. Each run also persists a
+// hook_runs row + emits hook_start/hook_done events so the operation
+// is later searchable from `treeman logs`.
 func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome, error) {
 	wt := worktree
 	if wt == "" {
@@ -151,17 +154,51 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	branch := detectBranchOfWorktree(wt)
 	sl := slug.For(wt, branch)
 	env := CaptureInheritedEnv()
+
+	var (
+		st             *store.Store
+		repoID, wtID   int64
+		entries        int
+		startedMs      int64
+		out            hooks.RunOutcome
+		runErr         error
+	)
+	dbPath, _ := store.DefaultDBPath()
+	if dbPath != "" {
+		if s, oerr := store.Open(ctx, dbPath); oerr == nil {
+			st = s
+			defer st.Close()
+			repoID, _ = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+			wtID, _ = st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
+		}
+	}
+
 	switch phase {
 	case "precreate":
-		return hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wt, sl.Value, env)
+		entries = len(cfg.Hooks.Precreate)
 	case "postcreate":
-		return hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
+		entries = len(cfg.Hooks.Postcreate)
 	case "predelete":
-		return hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
+		entries = len(cfg.Hooks.Predelete)
 	case "postdelete":
-		return hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
+		entries = len(cfg.Hooks.Postdelete)
+	default:
+		return hooks.RunOutcome{}, fmt.Errorf("unknown phase: %s", phase)
 	}
-	return hooks.RunOutcome{}, fmt.Errorf("unknown phase: %s", phase)
+
+	startedMs = hooks.EmitHookStart(ctx, st, repoID, wtID, phase, entries)
+	switch phase {
+	case "precreate":
+		out, runErr = hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wt, sl.Value, env)
+	case "postcreate":
+		out, runErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
+	case "predelete":
+		out, runErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
+	case "postdelete":
+		out, runErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
+	}
+	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, startedMs, time.Now().UnixMilli(), out)
+	return out, runErr
 }
 
 // padRight pads a possibly-ANSI-colored cell with trailing spaces.
