@@ -27,10 +27,10 @@ type State struct {
 	// orphans the work on shutdown.
 	BgCtx context.Context
 
-	mu                 sync.Mutex
-	watchers           map[string]*WatcherEntry
-	wtWatchers         map[string]*WatcherEntry
-	lifecycleWatchers  map[string]*WatcherEntry
+	mu                sync.Mutex
+	watchers          map[string]*WatcherEntry
+	wtWatchers        map[string]*WatcherEntry
+	lifecycleWatchers map[string]*WatcherEntry
 
 	// teardownMu serialises wt-teardown goroutines per repo so two
 	// fast-fire teardowns on the same repo can't run concurrent

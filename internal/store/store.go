@@ -57,13 +57,13 @@ type Store struct {
 	// CLI invocations don't call StartEventBatcher and continue to
 	// write synchronously — short-lived processes don't benefit from
 	// batching and the sync path keeps the existing error semantics.
-	batchMu        sync.Mutex
-	batchBuf       []pendingEvent
-	batchSignal    chan struct{}
-	batchCtx       context.Context
-	batchCancel    context.CancelFunc
-	batchDone      chan struct{}
-	batchActive    bool
+	batchMu     sync.Mutex
+	batchBuf    []pendingEvent
+	batchSignal chan struct{}
+	batchCtx    context.Context
+	batchCancel context.CancelFunc
+	batchDone   chan struct{}
+	batchActive bool
 }
 
 // pendingEvent is one buffered events-table row awaiting flush.
