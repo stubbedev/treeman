@@ -76,3 +76,95 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+  bump-tap:
+    name: bump homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    # Skip prereleases — only stable tags update the tap formula.
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - name: Read sha256 files from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p sha
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern '*.sha256' \
+            --dir sha
+          extract() {
+            awk '{print $1}' "sha/treeman-${VERSION}-$1.tar.gz.sha256"
+          }
+          {
+            echo "VERSION=${VERSION}"
+            echo "SHA_DARWIN_ARM64=$(extract darwin-arm64)"
+            echo "SHA_DARWIN_AMD64=$(extract darwin-amd64)"
+            echo "SHA_LINUX_ARM64=$(extract linux-arm64)"
+            echo "SHA_LINUX_AMD64=$(extract linux-amd64)"
+          } >> "$GITHUB_ENV"
+
+      - name: Check out homebrew tap
+        uses: actions/checkout@v6
+        with:
+          repository: stubbedev/homebrew-treeman
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Regenerate formula
+        run: |
+          set -euo pipefail
+          cat > tap/Formula/treeman.rb <<EOF
+          class Treeman < Formula
+            desc "Per-worktree development environment helper (DBs, hooks, test clones)"
+            homepage "https://github.com/stubbedev/treeman"
+            version "${VERSION}"
+            license "Apache-2.0 OR MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/stubbedev/treeman/releases/download/v#{version}/treeman-#{version}-darwin-arm64.tar.gz"
+                sha256 "${SHA_DARWIN_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/stubbedev/treeman/releases/download/v#{version}/treeman-#{version}-darwin-amd64.tar.gz"
+                sha256 "${SHA_DARWIN_AMD64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/stubbedev/treeman/releases/download/v#{version}/treeman-#{version}-linux-arm64.tar.gz"
+                sha256 "${SHA_LINUX_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/stubbedev/treeman/releases/download/v#{version}/treeman-#{version}-linux-amd64.tar.gz"
+                sha256 "${SHA_LINUX_AMD64}"
+              end
+            end
+
+            def install
+              bin.install "treeman", "treemand"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/treeman --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Formula/treeman.rb; then
+            echo "Formula already up to date for ${VERSION}; nothing to do."
+            exit 0
+          fi
+          git add Formula/treeman.rb
+          git commit -m "treeman ${VERSION}"
+          git push

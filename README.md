@@ -82,6 +82,12 @@ language-specific tooling required.
 
 ## Install
 
+Via Homebrew (macOS + Linux):
+
+```sh
+brew install stubbedev/treeman/treeman
+```
+
 Prebuilt tarballs for every tagged release:
 
 ```sh
