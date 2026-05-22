@@ -82,18 +82,86 @@ type Outcome struct {
 // to a concrete driver type.
 type cloneRestorer func(ctx context.Context, template, target string) error
 
-// fanOutLimits caps the outer concurrency of fanOutClones per
-// engine. MySQL's SnapshotRestore itself uses up to ~6 inner
-// connections (parallel table copy), so the outer fan-out is held
-// to 4 to keep the total under a typical 100-conn ceiling. Postgres
-// SnapshotRestore is a single `CREATE DATABASE … TEMPLATE`
-// statement, so the outer fan-out can use the whole CPU budget.
+// fanOutLimits is the conservative-default outer-concurrency cap per
+// engine, used when neither an explicit `databases[].fanout` nor a
+// connection-budget probe is available.
+//
+// MySQL's SnapshotRestore uses up to ~6 inner connections (parallel
+// table copy), so the outer fan-out is held to 4 to stay under a
+// typical 100-conn ceiling. Postgres SnapshotRestore is a single
+// `CREATE DATABASE … TEMPLATE` statement; the bottleneck is disk
+// throughput (block-copy of template files), so an outer wider than
+// 8 just thrashes seeks without improving wall-clock — cap there.
 var fanOutLimits = map[string]int{
 	"mysql":      4,
 	"mariadb":    4,
 	"tidb":       4,
-	"postgres":   0, // 0 = GOMAXPROCS
-	"postgresql": 0,
+	"postgres":   8,
+	"postgresql": 8,
+}
+
+// innerConnsPerRestore models how many backend connections one
+// SnapshotRestore holds open in parallel. The auto-tuner divides the
+// server's available connection budget by this number to find a safe
+// outer fan-out. MySQL's parallel-table-copy worker count is the
+// dominant term; Postgres only needs the one CREATE DATABASE
+// session. Unknown engines collapse to 1 (no inner parallelism
+// assumed).
+var innerConnsPerRestore = map[string]int{
+	"mysql":      mysqlInnerPerRestore,
+	"mariadb":    mysqlInnerPerRestore,
+	"tidb":       mysqlInnerPerRestore,
+	"postgres":   1,
+	"postgresql": 1,
+}
+
+// mysqlInnerPerRestore mirrors mysqlCloneFanout in the mysql driver.
+// Duplicated here as a constant so the prepare package doesn't drag
+// in a driver import for one int.
+const mysqlInnerPerRestore = 6
+
+// autoTuneOuter computes a connection-budget-aware outer fanout when
+// no operator override is provided. The formula keeps a 10% (or 5-
+// connection, whichever is bigger) headroom for the rest of the
+// system, then divides the remainder by the engine's per-restore
+// connection cost.
+//
+// Returned value is also bounded by [2, fanOutLimits[engine] * 2] so
+// a misconfigured `max_connections=10000` doesn't spawn thousands of
+// restorer goroutines. Per-call `len(clones)` clamping happens at
+// the use site.
+func autoTuneOuter(engine string, maxConns int) int {
+	inner := innerConnsPerRestore[engine]
+	if inner < 1 {
+		inner = 1
+	}
+	defaultCap := fanOutLimits[engine]
+	if defaultCap < 2 {
+		defaultCap = 4
+	}
+	if maxConns <= 0 {
+		return defaultCap
+	}
+	reserved := maxConns / 10
+	if reserved < 5 {
+		reserved = 5
+	}
+	available := maxConns - reserved
+	if available < inner {
+		return 2
+	}
+	outer := available / inner
+	if outer < 2 {
+		outer = 2
+	}
+	// Ceiling is 2× the conservative default — beyond that we hit
+	// engine-side serialization (Postgres template I/O, MySQL ROW
+	// lock contention) and gain nothing.
+	hardCap := defaultCap * 2
+	if outer > hardCap {
+		outer = hardCap
+	}
+	return outer
 }
 
 // fanOutClones restores `template` into each of `clones` in
@@ -126,13 +194,18 @@ func fanOutClones(
 	clones []string,
 	engine string,
 	override uint32,
+	maxConns int,
 ) error {
 	if len(clones) == 0 {
 		return nil
 	}
+	autoTuned := false
 	limit := 0
 	if override > 0 {
 		limit = int(override)
+	} else if maxConns > 0 {
+		limit = autoTuneOuter(engine, maxConns)
+		autoTuned = true
 	} else {
 		limit = fanOutLimits[engine]
 		if limit == 0 {
@@ -145,16 +218,19 @@ func fanOutClones(
 	if limit > len(clones) {
 		limit = len(clones)
 	}
+	_ = autoTuned // surfaced via the fanout_start payload below
 
 	startedMs := time.Now().UnixMilli()
 	if st != nil {
 		_ = st.WriteEvent(ctx, store.LevelInfo, "fanout_start",
 			fmt.Sprintf("engine=%s template=%s clones=%d limit=%d", engine, template, len(clones), limit),
 			repoID, worktreeID, "", 0, map[string]any{
-				"engine":   engine,
-				"template": template,
-				"clones":   len(clones),
-				"limit":    limit,
+				"engine":     engine,
+				"template":   template,
+				"clones":     len(clones),
+				"limit":      limit,
+				"auto_tuned": autoTuned,
+				"max_conns":  maxConns,
 			})
 	}
 
@@ -340,6 +416,7 @@ func prepareMySQL(
 	defer drv.Close()
 
 	version, _ := drv.EngineVersion(ctx)
+	maxConns, _ := drv.MaxConnections(ctx)
 
 	// Build fingerprint inputs.
 	migrationsHash := ""
@@ -392,7 +469,7 @@ func prepareMySQL(
 			if err != nil {
 				return Outcome{}, err
 			}
-			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout); err != nil {
+			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
@@ -476,7 +553,7 @@ func prepareMySQL(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout); err != nil {
+	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
 		return Outcome{}, err
 	}
 
@@ -528,6 +605,7 @@ func preparePostgres(
 	defer drv.Close()
 
 	version, _ := drv.EngineVersion(ctx)
+	maxConns, _ := drv.MaxConnections(ctx)
 
 	migrationsHash := ""
 	dumpHash := ""
@@ -586,7 +664,7 @@ func preparePostgres(
 			if err != nil {
 				return Outcome{}, err
 			}
-			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout); err != nil {
+			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
@@ -636,7 +714,7 @@ func preparePostgres(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout); err != nil {
+	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
 		return Outcome{}, err
 	}
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",

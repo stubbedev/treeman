@@ -89,4 +89,3 @@ func EmitHookStart(ctx context.Context, st *store.Store, repoID, wtID int64, pha
 		map[string]any{"groups": entryCount})
 	return now
 }
-

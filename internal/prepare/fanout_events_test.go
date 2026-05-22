@@ -26,7 +26,7 @@ func TestFanOutClonesEmitsLifecycleEvents(t *testing.T) {
 
 	restore := func(ctx context.Context, template, target string) error { return nil }
 	clones := []string{"a", "b", "c"}
-	if err := fanOutClones(ctx, s, repoID, wtID, restore, "tmpl", clones, "postgres", 0); err != nil {
+	if err := fanOutClones(ctx, s, repoID, wtID, restore, "tmpl", clones, "postgres", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -78,7 +78,7 @@ func TestFanOutClonesEmitsErrorEventOnFailure(t *testing.T) {
 		return nil
 	}
 	gErr := fanOutClones(ctx, s, repoID, wtID, restore, "tmpl",
-		[]string{"good", "bad", "also-good"}, "postgres", 0)
+		[]string{"good", "bad", "also-good"}, "postgres", 0, 0)
 	if gErr == nil || !strings.Contains(gErr.Error(), "boom") {
 		t.Fatalf("expected boom-wrapped error, got %v", gErr)
 	}

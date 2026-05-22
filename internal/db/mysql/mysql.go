@@ -104,6 +104,18 @@ func (d *Driver) EngineVersion(ctx context.Context) (string, error) {
 	return v, nil
 }
 
+// MaxConnections returns the server's @@max_connections setting.
+// Used by the fanout auto-tuner to compute a safe outer-concurrency
+// cap from the connection budget. Returns 0 + error on probe failure
+// so callers can fall back to a conservative hardcoded default.
+func (d *Driver) MaxConnections(ctx context.Context) (int, error) {
+	var v int
+	if err := d.DB.QueryRowContext(ctx, "SELECT @@max_connections").Scan(&v); err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
 // EnsureDB idempotently creates `name` with utf8mb4 / unicode_ci.
 func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 	if err := validateIdent(name); err != nil {

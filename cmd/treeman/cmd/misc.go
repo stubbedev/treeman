@@ -156,12 +156,12 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	env := CaptureInheritedEnv()
 
 	var (
-		st             *store.Store
-		repoID, wtID   int64
-		entries        int
-		startedMs      int64
-		out            hooks.RunOutcome
-		runErr         error
+		st           *store.Store
+		repoID, wtID int64
+		entries      int
+		startedMs    int64
+		out          hooks.RunOutcome
+		runErr       error
 	)
 	dbPath, _ := store.DefaultDBPath()
 	if dbPath != "" {

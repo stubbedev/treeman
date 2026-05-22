@@ -139,6 +139,7 @@ tail events scoped to a worktree (shorthand for `logs tail --worktree`)
 | `-f`, `--follow` | stream new events as they arrive |
 | `-w`, `--worktree` | filter by worktree (slug, branch, or basename) |
 | `-r`, `--repo` | repo root override |
+| `-A`, `--all` | show events from every worktree (defeats the cwd auto-filter) |
 | `-l`, `--level` | filter by level (debug\|info\|warn\|error); repeatable |
 | `-t`, `--event-type` | filter by exact event_type; repeatable |
 | `-p`, `--phase` | filter by phase (precreate\|postcreate\|...); repeatable |
@@ -277,6 +278,7 @@ TREEMAN_NO_PAGER=1 to disable.
 | `-f`, `--follow` | stream new events as they arrive |
 | `-w`, `--worktree` | filter by worktree (slug, branch, or basename) |
 | `-r`, `--repo` | repo root override |
+| `-A`, `--all` | show events from every worktree (defeats the cwd auto-filter) |
 | `-l`, `--level` | filter by level (debug\|info\|warn\|error); repeatable |
 | `-t`, `--event-type` | filter by exact event_type; repeatable |
 | `-p`, `--phase` | filter by phase (precreate\|postcreate\|...); repeatable |
@@ -302,6 +304,7 @@ Examples:
 | `-f`, `--follow` | stream new events as they arrive |
 | `-w`, `--worktree` | filter by worktree (slug, branch, or basename) |
 | `-r`, `--repo` | repo root override |
+| `-A`, `--all` | show events from every worktree (defeats the cwd auto-filter) |
 | `-l`, `--level` | filter by level (debug\|info\|warn\|error); repeatable |
 | `-t`, `--event-type` | filter by exact event_type; repeatable |
 | `-p`, `--phase` | filter by phase (precreate\|postcreate\|...); repeatable |
@@ -314,7 +317,17 @@ Examples:
 
 ### `treeman logs hooks`
 
-show recent hook_runs (precreate/postcreate/predelete) for a worktree
+show recent hook_runs (precreate/postcreate/predelete/postdelete) for a worktree
+
+```
+Examples:
+  treeman logs hooks                # cwd-resolved worktree
+  treeman logs hooks PROJ-1234
+  treeman logs hooks --json | jq .
+
+The worktree argument is optional — when omitted, the worktree
+containing the current working directory is used.
+```
 
 | Flag | Usage |
 |---|---|
@@ -410,6 +423,14 @@ daemon lifecycle
 
 ### `treeman daemon stop`
 
+### `treeman daemon reload`
+
+ask the daemon to re-read config + restart watchers (no process restart)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | limit reload to one repo path; defaults to all |
+
 ### `treeman daemon status`
 
 | Flag | Usage |
@@ -471,6 +492,30 @@ reconcile the SQLite registry with `git worktree list` (register drift / mark mi
 | Flag | Usage |
 |---|---|
 | `-r`, `--repo` |  |
+| `--json` |  |
+
+### `treeman registry remove`
+
+drop a repo from the SQLite registry (stops watchers, removes tracking rows; leaves external state alone)
+
+```
+Refuses by default when any worktree row under the repo is still
+active (deleted_at IS NULL) — that almost always means running
+services, on-disk checkouts, or per-worktree databases. Pass --force
+to remove anyway; this only deletes registry rows and never destroys
+external resources.
+
+Examples:
+  treeman registry remove --repo /abs/path
+  treeman registry remove --repo /abs/path --force
+  treeman registry remove --repo /abs/path --yes
+```
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | repo path; defaults to current cwd's repo root |
+| `-f`, `--force` | remove even when active worktrees exist |
+| `-y`, `--yes` | skip the confirmation prompt |
 | `--json` |  |
 
 ### `treeman snapshots`

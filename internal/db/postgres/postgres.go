@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"strconv"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -92,6 +93,22 @@ func (d *Driver) EngineVersion(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return v, nil
+}
+
+// MaxConnections returns the server's max_connections GUC. SHOW
+// returns text; parse it with strconv. Same role as the mysql
+// driver's MaxConnections — the fanout auto-tuner reads it to size
+// the outer goroutine pool against the available connection budget.
+func (d *Driver) MaxConnections(ctx context.Context) (int, error) {
+	var v string
+	if err := d.DB.QueryRowContext(ctx, "SHOW max_connections").Scan(&v); err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("parse max_connections %q: %w", v, err)
+	}
+	return n, nil
 }
 
 func (d *Driver) EnsureDB(ctx context.Context, name string) error {
