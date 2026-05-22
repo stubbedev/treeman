@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/stubbedev/treeman/internal/resolve"
 )
 
 // trashDirName is the subdirectory under worktreesRoot where deleted
@@ -74,17 +76,87 @@ func runGitPrune(ctx context.Context, repoRoot string) error {
 		[]string{"-C", repoRoot, "worktree", "prune", "--expire=now"}).Run()
 }
 
-// scheduleBackgroundReap detaches a goroutine that deletes trashPath
-// at idle priority. The teardown RPC has already returned to the
-// caller by this point; the reaper runs on the daemon's lifetime
-// context so it survives the originating RPC but dies with the
-// daemon.
-func scheduleBackgroundReap(st *State, trashPath string) {
-	safeGo("wt_reap:"+trashPath, func() {
-		if err := parallelRemoveAll(st.BgCtx, trashPath, 4); err != nil {
-			slog.Warn("background reap", "trash", trashPath, "err", err)
+// scheduleBackgroundReap enqueues trashPath onto repoPath's reap
+// queue. Each repo has a single drain goroutine — bursty deletes
+// (five `gwtd`s back-to-back) queue serially instead of spawning
+// five parallel reapers competing for the same disk. The drain
+// worker uses parallelRemoveAll which fans the top-level dir entries
+// across its own bounded worker pool, so individual rms still
+// overlap inside one trash. Worker runs on st.BgCtx (daemon
+// lifetime) — survives the originating RPC but dies with the daemon.
+func scheduleBackgroundReap(st *State, repoPath, trashPath string) {
+	queue := st.reapQueueFor(repoPath)
+	select {
+	case queue <- trashPath:
+	default:
+		// Queue full (highly unlikely with a 64-slot buffer): fall
+		// back to a one-shot reaper so we never lose the trash entry.
+		safeGo("wt_reap:"+trashPath, func() {
+			if err := parallelRemoveAll(st.BgCtx, trashPath, 4); err != nil {
+				slog.Warn("background reap", "trash", trashPath, "err", err)
+			}
+		})
+	}
+}
+
+// reapQueueFor returns (or lazily creates) the per-repo reap queue.
+// The drain goroutine launches on first creation and lives for the
+// daemon's lifetime.
+func (st *State) reapQueueFor(repoPath string) chan string {
+	st.reapQueuesMu.Lock()
+	defer st.reapQueuesMu.Unlock()
+	if q, ok := st.reapQueues[repoPath]; ok {
+		return q
+	}
+	q := make(chan string, 64)
+	st.reapQueues[repoPath] = q
+	safeGo("wt_reap_drain:"+repoPath, func() {
+		for {
+			select {
+			case <-st.BgCtx.Done():
+				return
+			case trash, ok := <-q:
+				if !ok {
+					return
+				}
+				if err := parallelRemoveAll(st.BgCtx, trash, 4); err != nil {
+					slog.Warn("background reap", "trash", trash, "err", err)
+				}
+			}
 		}
 	})
+	return q
+}
+
+// SweepTrashDirs scans every registered repo's `<worktreesRoot>/
+// .treeman-trash/` for leftover entries (from a daemon that died
+// mid-reap) and queues them for background reaping. Called once on
+// daemon boot. Per-repo failures are logged + skipped — a moved or
+// deleted repo dir shouldn't abort startup.
+func SweepTrashDirs(ctx context.Context, st *State, repoPaths []string) {
+	for _, p := range repoPaths {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		cfg, err := resolve.LoadResolved(p)
+		if err != nil {
+			slog.Debug("trash sweep: load config", "repo", p, "err", err)
+			continue
+		}
+		trashRoot := filepath.Join(worktreesRootOf(cfg.Worktrees.Root, p), trashDirName)
+		entries, err := os.ReadDir(trashRoot)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				slog.Debug("trash sweep: read dir", "trash", trashRoot, "err", err)
+			}
+			continue
+		}
+		for _, e := range entries {
+			leftover := filepath.Join(trashRoot, e.Name())
+			slog.Info("trash sweep: reaping leftover", "path", leftover)
+			scheduleBackgroundReap(st, p, leftover)
+		}
+	}
 }
 
 // parallelRemoveAll splits the top-level entries of root across up to

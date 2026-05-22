@@ -167,9 +167,18 @@ func TeardownWorktree(
 	}
 
 	if len(cfg.Databases) > 0 {
-		if err := prepare.TeardownDatabases(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
-			return err
-		}
+		// DROP DATABASE is the second source of "wt delete locks the
+		// host" complaints — on MySQL+InnoDB the ibd unlinks for a
+		// large schema can stall the server for seconds. Same pattern
+		// as the file reaper: queue the drop on a per-repo worker so
+		// the RPC caller returns immediately and concurrent gwtds on
+		// the same repo serialise drops instead of fanning out.
+		ScheduleDBDrop(st, repoRoot, DBDropJob{
+			Cfg:        cfg,
+			Slug:       slugVal,
+			RepoID:     repoID,
+			WorktreeID: wtID,
+		})
 	}
 
 	// Acquire the per-repo mutex only for the git operations — they
@@ -191,7 +200,7 @@ func TeardownWorktree(
 		repoID, wtID, "", 0, nil)
 
 	if trashPath != "" {
-		scheduleBackgroundReap(st, trashPath)
+		scheduleBackgroundReap(st, repoRoot, trashPath)
 	}
 	return nil
 }

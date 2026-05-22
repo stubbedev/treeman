@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	"github.com/stubbedev/treeman/internal/daemon"
@@ -49,6 +50,7 @@ func run() error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer s.Close()
+	s.StartEventBatcher(ctx)
 	slog.Info("treemand starting", "db", dbPath)
 
 	sockPath, err := rpc.SocketPath()
@@ -82,37 +84,49 @@ func run() error {
 	// its binlog replicators re-spawned via the same path the
 	// watcher_start RPC takes. Failures per-repo are logged + skipped
 	// — a missing or moved repo dir shouldn't abort daemon startup.
-	if paths, err := s.ListRepoPaths(ctx); err == nil {
-		for _, p := range paths {
-			if _, err := os.Stat(p); err != nil {
-				slog.Warn("resume watcher skipped (path missing)", "repo", p, "err", err)
-				continue
-			}
-			if err := daemon.ResumeRepoWatcher(ctx, st, p); err != nil {
-				slog.Warn("resume watcher failed", "repo", p, "err", err)
-				continue
-			}
-			slog.Info("resumed watcher", "repo", p)
+	//
+	// Parallelised with a bounded worker pool: each repo load reads
+	// the layered config from disk and opens binlog connections,
+	// both of which dominate boot time on hosts with many registered
+	// repos. 8 concurrent resumes keeps the host responsive while
+	// cutting boot wall-time roughly proportionally.
+	repoPaths, _ := s.ListRepoPaths(ctx)
+	parallelFor(repoPaths, 8, func(p string) {
+		if _, err := os.Stat(p); err != nil {
+			slog.Warn("resume watcher skipped (path missing)", "repo", p, "err", err)
+			return
 		}
-	}
+		if err := daemon.ResumeRepoWatcher(ctx, st, p); err != nil {
+			slog.Warn("resume watcher failed", "repo", p, "err", err)
+			return
+		}
+		slog.Info("resumed watcher", "repo", p)
+	})
+
+	// Reap any `.treeman-trash/` leftovers from a previously crashed
+	// daemon. The background reaper runs on st.BgCtx so it survives
+	// the originating RPC but dies with the daemon — meaning a hard
+	// host crash mid-reap orphans the trash entries until next boot.
+	// Sweep on startup so they don't accumulate indefinitely.
+	daemon.SweepTrashDirs(ctx, st, repoPaths)
 
 	// Auto-resume per-worktree fsnotify watchers. Migrations and
 	// dumps live in the worktree (each linked worktree has its own
 	// branch checkout), so the file watcher is rooted there.
 	if wts, err := s.ListActiveWorktrees(ctx); err == nil {
-		for _, w := range wts {
+		parallelFor(wts, 8, func(w store.ActiveWorktree) {
 			if _, err := os.Stat(w.WorktreePath); err != nil {
 				slog.Warn("resume wt watcher skipped (path missing)",
 					"wt", w.WorktreePath, "err", err)
-				continue
+				return
 			}
 			if err := daemon.ResumeWorktreeWatcher(ctx, st, w.RepoPath, w.WorktreePath); err != nil {
 				slog.Warn("resume wt watcher failed",
 					"wt", w.WorktreePath, "err", err)
-				continue
+				return
 			}
 			slog.Info("resumed wt watcher", "wt", w.WorktreePath)
-		}
+		})
 	}
 
 	// Auto-resume lifecycle watchers for repos that opted in via
@@ -146,6 +160,7 @@ func run() error {
 	// above `cap_per_repo`. Bare-bones for now — age/size sweeps
 	// (MaxAgeDays, MaxTotalGb) land here later.
 	go daemon.SnapshotGCLoop(ctx, st)
+	go daemon.WALCheckpointLoop(ctx, st)
 
 	shutdown := make(chan struct{}, 1)
 	go acceptLoop(ctx, ln, st, shutdown)
@@ -196,4 +211,31 @@ func handleConn(ctx context.Context, conn net.Conn, st *daemon.State, shutdown c
 			return
 		}
 	}
+}
+
+// parallelFor runs fn over every element of items concurrently with
+// at most `workers` in flight. Bounded so a host with hundreds of
+// registered repos doesn't fork-bomb itself during boot.
+func parallelFor[T any](items []T, workers int, fn func(T)) {
+	if len(items) == 0 {
+		return
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(items) {
+		workers = len(items)
+	}
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for _, it := range items {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(v T) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fn(v)
+		}(it)
+	}
+	wg.Wait()
 }

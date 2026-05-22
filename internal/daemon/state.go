@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -47,6 +48,32 @@ type State struct {
 	// behind the primary's mutex.
 	inFlightMu        sync.Mutex
 	inFlightTeardowns map[string]struct{}
+
+	// reapQueuesMu guards reapQueues. Each repo gets a single worker
+	// goroutine draining a buffered channel of trash paths — bursty
+	// `gwtd` runs that delete five worktrees at once don't spawn five
+	// parallel reapers competing for the same disk. The worker runs
+	// for the daemon's lifetime; entries are append-only.
+	reapQueuesMu sync.Mutex
+	reapQueues   map[string]chan string
+
+	// dropQueues mirrors reapQueues for DROP DATABASE work. Each repo
+	// has a single drain goroutine — sequential DROP per repo avoids
+	// hammering the DB server when five worktrees are torn down at
+	// once, while different repos can still drop in parallel.
+	dropQueuesMu sync.Mutex
+	dropQueues   map[string]chan DBDropJob
+}
+
+// DBDropJob is one queued `prepare.TeardownDatabases` invocation,
+// scheduled by TeardownWorktree to run in the background after
+// predelete hooks complete. The cfg field is a value copy — the
+// caller's mutation cannot race the drain worker.
+type DBDropJob struct {
+	Cfg        config.Config
+	Slug       string
+	RepoID     int64
+	WorktreeID int64
 }
 
 // WatcherEntry — per-repo watcher placeholder. Phase 10 fills in the
@@ -75,6 +102,8 @@ func NewState(bg context.Context, s *store.Store) *State {
 		lifecycleWatchers: map[string]*WatcherEntry{},
 		teardownLks:       map[string]*sync.Mutex{},
 		inFlightTeardowns: map[string]struct{}{},
+		reapQueues:        map[string]chan string{},
+		dropQueues:        map[string]chan DBDropJob{},
 	}
 }
 

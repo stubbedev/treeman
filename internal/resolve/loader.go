@@ -20,12 +20,14 @@ import (
 // Call this instead of `config.LoadLayered` outside of debug /
 // inspection contexts (e.g. `treeman config show`).
 func LoadResolved(repoRoot string) (config.Config, error) {
-	cfg, err := config.LoadLayered(repoRoot)
-	if err != nil {
-		return cfg, err
-	}
-	ApplyEnvCredentials(&cfg, repoRoot)
-	return cfg, nil
+	return loadResolvedCached(repoRoot, "", func() (config.Config, error) {
+		cfg, err := config.LoadLayered(repoRoot)
+		if err != nil {
+			return cfg, err
+		}
+		ApplyEnvCredentials(&cfg, repoRoot)
+		return cfg, nil
+	})
 }
 
 // LoadResolvedForWorktree mirrors LoadResolved but uses the
@@ -33,14 +35,16 @@ func LoadResolved(repoRoot string) (config.Config, error) {
 // `.env.testing` (post env-scoping patches) override the main
 // repo's defaults.
 func LoadResolvedForWorktree(mainRoot, wtRoot string) (config.Config, error) {
-	cfg, err := config.LoadLayeredForWorktree(mainRoot, wtRoot)
-	if err != nil {
-		return cfg, err
-	}
-	if wtRoot != "" {
-		ApplyEnvCredentials(&cfg, wtRoot)
-	} else {
-		ApplyEnvCredentials(&cfg, mainRoot)
-	}
-	return cfg, nil
+	return loadResolvedCached(mainRoot, wtRoot, func() (config.Config, error) {
+		cfg, err := config.LoadLayeredForWorktree(mainRoot, wtRoot)
+		if err != nil {
+			return cfg, err
+		}
+		if wtRoot != "" {
+			ApplyEnvCredentials(&cfg, wtRoot)
+		} else {
+			ApplyEnvCredentials(&cfg, mainRoot)
+		}
+		return cfg, nil
+	})
 }

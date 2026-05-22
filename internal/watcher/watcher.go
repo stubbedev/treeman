@@ -157,6 +157,28 @@ func (w *Watcher) Start(ctx context.Context) error {
 // Stop closes the underlying fsnotify.Watcher; Start unblocks.
 func (w *Watcher) Stop() { _ = w.fsw.Close() }
 
+// noiseDirNames is the set of directory basenames we refuse to
+// recurse into during addAllDirs. fsnotify is non-recursive on Linux
+// but the WalkDir below would still descend node_modules/ and
+// vendor/ if a glob's static prefix happened to enclose them — and
+// even one inotify watch on a deep node_modules generates wakeups
+// every time webpack or composer touches it. Filtering at subscribe
+// time means the kernel never delivers the events at all.
+var noiseDirNames = map[string]struct{}{
+	".git":         {},
+	"node_modules": {},
+	"vendor":       {},
+	".idea":        {},
+	".vscode":      {},
+	"dist":         {},
+	"build":        {},
+	"target":       {},
+	".next":        {},
+	".turbo":       {},
+	".cache":       {},
+	".direnv":      {},
+}
+
 // addAllDirs walks each glob's longest static prefix and adds every
 // existing directory to fsnotify. Globs are matched lazily on
 // emit. We add the parent dirs only — fsnotify reports events on
@@ -174,6 +196,16 @@ func (w *Watcher) addAllDirs() error {
 			}
 			if !d.IsDir() {
 				return nil
+			}
+			// Skip noise dirs entirely — never subscribe inside them.
+			// Check by basename so the filter works regardless of how
+			// deep the static prefix nested. The base of the walk
+			// itself is always added (a user who points a glob
+			// directly at `node_modules/**` knows what they want).
+			if path != base {
+				if _, noisy := noiseDirNames[d.Name()]; noisy {
+					return filepath.SkipDir
+				}
 			}
 			if _, seen := added[path]; seen {
 				return nil

@@ -15,7 +15,6 @@ import (
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/stubbedev/treeman/internal/hooks"
-	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -350,8 +349,13 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 			repoPath, wtPath, row.Slug, logDir, map[string]string{}, true)
 	}
 
-	if err := prepare.TeardownDatabases(ctx, &cfg, row.Slug, repoID, row.ID, st.Store); err != nil {
-		return err
+	if len(cfg.Databases) > 0 {
+		ScheduleDBDrop(st, repoPath, DBDropJob{
+			Cfg:        cfg,
+			Slug:       row.Slug,
+			RepoID:     repoID,
+			WorktreeID: row.ID,
+		})
 	}
 
 	if err := st.Store.MarkWorktreeDeleted(ctx, row.ID); err != nil {

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -46,7 +47,49 @@ func DefaultDBPath() (string, error) {
 // Store wraps the *sql.DB plus a few prepared-stmt helpers.
 type Store struct {
 	DB *sql.DB
+
+	// Event batching state. When StartEventBatcher has been called
+	// (typically by the daemon), WriteEvent enqueues rows instead of
+	// firing one INSERT per call. The flusher goroutine commits the
+	// buffer every batchFlushInterval or when it hits
+	// batchFlushThreshold rows, whichever comes first.
+	//
+	// CLI invocations don't call StartEventBatcher and continue to
+	// write synchronously — short-lived processes don't benefit from
+	// batching and the sync path keeps the existing error semantics.
+	batchMu        sync.Mutex
+	batchBuf       []pendingEvent
+	batchSignal    chan struct{}
+	batchCtx       context.Context
+	batchCancel    context.CancelFunc
+	batchDone      chan struct{}
+	batchActive    bool
 }
+
+// pendingEvent is one buffered events-table row awaiting flush.
+type pendingEvent struct {
+	tsMillis   int64
+	level      string
+	repoID     interface{}
+	worktreeID interface{}
+	eventType  string
+	phase      interface{}
+	message    interface{}
+	payload    string
+	durationMs interface{}
+}
+
+// batchFlushInterval bounds the worst-case latency between a
+// WriteEvent call and the row hitting disk. 100 ms is short enough
+// to keep `treeman logs tail --follow` snappy while letting the
+// burst-write case (a teardown that emits 3-5 events in <10 ms)
+// coalesce into one transaction.
+const batchFlushInterval = 100 * time.Millisecond
+
+// batchFlushThreshold forces a flush before the timer when a single
+// burst exceeds this many rows. Prevents the buffer from growing
+// without bound under a watcher storm.
+const batchFlushThreshold = 200
 
 // Open opens (or creates) the SQLite file, applies pragmas + the
 // embedded migrations, and returns a usable Store.
@@ -69,8 +112,140 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	return &Store{DB: db}, nil
 }
 
-// Close shuts down the underlying pool.
-func (s *Store) Close() error { return s.DB.Close() }
+// Close shuts down the underlying pool. If the event batcher is
+// running it is drained synchronously first so no in-flight rows
+// are lost.
+func (s *Store) Close() error {
+	s.StopEventBatcher()
+	return s.DB.Close()
+}
+
+// StartEventBatcher turns on async batched WriteEvent flushing. The
+// flusher goroutine lives until ctx cancels or StopEventBatcher is
+// called. Subsequent calls are no-ops — only the first call wins,
+// so the daemon can invoke this once at boot without worrying about
+// concurrent callers.
+func (s *Store) StartEventBatcher(ctx context.Context) {
+	s.batchMu.Lock()
+	if s.batchActive {
+		s.batchMu.Unlock()
+		return
+	}
+	bctx, cancel := context.WithCancel(ctx)
+	s.batchCtx = bctx
+	s.batchCancel = cancel
+	s.batchSignal = make(chan struct{}, 1)
+	s.batchDone = make(chan struct{})
+	s.batchActive = true
+	s.batchMu.Unlock()
+	go s.eventBatchLoop()
+}
+
+// StopEventBatcher cancels the flusher and synchronously drains any
+// remaining buffered events. Safe to call multiple times.
+func (s *Store) StopEventBatcher() {
+	s.batchMu.Lock()
+	if !s.batchActive {
+		s.batchMu.Unlock()
+		return
+	}
+	s.batchActive = false
+	cancel := s.batchCancel
+	done := s.batchDone
+	s.batchMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+	// Final drain: anything that arrived after the cancel but before
+	// the goroutine observed it.
+	s.flushEvents(context.Background())
+}
+
+// eventBatchLoop runs in its own goroutine when batching is active.
+// Flushes either when batchSignal fires (threshold hit) or every
+// batchFlushInterval.
+func (s *Store) eventBatchLoop() {
+	defer close(s.batchDone)
+	ticker := time.NewTicker(batchFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.batchCtx.Done():
+			s.flushEvents(context.Background())
+			return
+		case <-ticker.C:
+			s.flushEvents(s.batchCtx)
+		case <-s.batchSignal:
+			s.flushEvents(s.batchCtx)
+		}
+	}
+}
+
+// flushEvents commits every buffered row in one transaction. Errors
+// are logged via the database driver path but never returned — the
+// batch path is fire-and-forget by design (callers used `_ =
+// WriteEvent(...)` everywhere). One bad row poisoning a whole batch
+// would lose unrelated events, so we fall back to a per-row insert
+// when the transaction fails.
+func (s *Store) flushEvents(ctx context.Context) {
+	s.batchMu.Lock()
+	if len(s.batchBuf) == 0 {
+		s.batchMu.Unlock()
+		return
+	}
+	batch := s.batchBuf
+	s.batchBuf = nil
+	s.batchMu.Unlock()
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		s.flushEventsFallback(ctx, batch)
+		return
+	}
+	const stmt = `INSERT INTO events(ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	for _, e := range batch {
+		if _, err := tx.ExecContext(ctx, stmt,
+			e.tsMillis, e.level, e.repoID, e.worktreeID, e.eventType,
+			e.phase, e.message, e.payload, e.durationMs); err != nil {
+			_ = tx.Rollback()
+			s.flushEventsFallback(ctx, batch)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		s.flushEventsFallback(ctx, batch)
+	}
+}
+
+// flushEventsFallback re-inserts a batch one row at a time when the
+// batched transaction fails. Slower but resilient: a single
+// constraint violation can't lose the rest of the buffer.
+func (s *Store) flushEventsFallback(ctx context.Context, batch []pendingEvent) {
+	const stmt = `INSERT INTO events(ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	for _, e := range batch {
+		_, _ = s.DB.ExecContext(ctx, stmt,
+			e.tsMillis, e.level, e.repoID, e.worktreeID, e.eventType,
+			e.phase, e.message, e.payload, e.durationMs)
+	}
+}
+
+// CheckpointWAL forces a TRUNCATE checkpoint on the SQLite WAL. The
+// daemon calls this on a cron to keep `~/.local/share/treeman/
+// treeman.db-wal` from growing without bound under sustained write
+// churn (every `treeman wt finalize`/`teardown` writes several
+// events plus a `MarkWorktreeDeleted`/`MarkVisited`). With WAL on
+// + synchronous=NORMAL, automatic passive checkpoints only fire
+// when the WAL hits ~1000 pages; TRUNCATE on a fixed schedule
+// resets the file to zero bytes whenever no reader is mid-txn.
+func (s *Store) CheckpointWAL(ctx context.Context) error {
+	_, err := s.DB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+	return err
+}
 
 // migrate creates the `_treeman_migrations` bookkeeping table if
 // missing and applies any embedded SQL files that haven't run yet.
@@ -437,6 +612,12 @@ const (
 
 // WriteEvent inserts a row into `events`. Any of repoID/worktreeID/
 // phase may be zero / empty.
+//
+// When the event batcher is active (daemon path) the row is
+// enqueued for async flush; the returned error is always nil since
+// the write happens asynchronously. The CLI path runs sync — the
+// short-lived process doesn't benefit from batching and the sync
+// error report stays useful for diagnostics.
 func (s *Store) WriteEvent(ctx context.Context,
 	level, eventType string,
 	message string,
@@ -449,31 +630,47 @@ func (s *Store) WriteEvent(ctx context.Context,
 	if err != nil {
 		return fmt.Errorf("encode event payload: %w", err)
 	}
-	var (
-		rid interface{}
-		wid interface{}
-		ph  interface{}
-		dur interface{}
-		msg interface{}
-	)
+	row := pendingEvent{
+		tsMillis:  nowMillis(),
+		level:     level,
+		eventType: eventType,
+		payload:   string(pj),
+	}
 	if repoID > 0 {
-		rid = repoID
+		row.repoID = repoID
 	}
 	if worktreeID > 0 {
-		wid = worktreeID
+		row.worktreeID = worktreeID
 	}
 	if phase != "" {
-		ph = phase
+		row.phase = phase
 	}
 	if durationMs > 0 {
-		dur = durationMs
+		row.durationMs = durationMs
 	}
 	if message != "" {
-		msg = message
+		row.message = message
 	}
+
+	s.batchMu.Lock()
+	if s.batchActive {
+		s.batchBuf = append(s.batchBuf, row)
+		shouldSignal := len(s.batchBuf) >= batchFlushThreshold
+		s.batchMu.Unlock()
+		if shouldSignal {
+			select {
+			case s.batchSignal <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}
+	s.batchMu.Unlock()
+
 	_, err = s.DB.ExecContext(ctx,
 		`INSERT INTO events(ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		nowMillis(), level, rid, wid, eventType, ph, msg, string(pj), dur)
+		row.tsMillis, row.level, row.repoID, row.worktreeID,
+		row.eventType, row.phase, row.message, row.payload, row.durationMs)
 	return err
 }
