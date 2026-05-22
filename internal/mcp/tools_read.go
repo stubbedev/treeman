@@ -143,27 +143,26 @@ func checkConfig(repoRoot string) doctorResult {
 
 func checkSchema(repoRoot string) doctorResult {
 	ref := schema.ReadModeline(repoRoot)
+	modelineDetail := ""
 	if ref != "" {
-		if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
-			return doctorResult{Name: "schema", Status: "ok", Detail: "modeline → " + ref}
+		if ok, detail := schema.ProbeRef(repoRoot, ref); ok {
+			return doctorResult{Name: "schema", Status: "ok", Detail: "modeline → " + detail}
+		} else {
+			modelineDetail = detail
 		}
-		p := ref
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(repoRoot, p)
+	}
+
+	if gp, err := schema.GlobalPath(); err == nil {
+		if _, err := os.Stat(gp); err == nil {
+			return doctorResult{Name: "schema", Status: "ok", Detail: "global install → " + gp}
 		}
-		if _, err := os.Stat(p); err == nil {
-			return doctorResult{Name: "schema", Status: "ok", Detail: "modeline → " + p}
-		}
-		return doctorResult{Name: "schema", Status: "warn", Detail: "modeline points to missing file: " + p, Hint: "schema_install"}
 	}
 	repoPath := filepath.Join(repoRoot, "schemas", "treeman.schema.json")
 	if _, err := os.Stat(repoPath); err == nil {
-		return doctorResult{Name: "schema", Status: "warn", Detail: repoPath + " (no modeline)", Hint: "schema_install"}
+		return doctorResult{Name: "schema", Status: "ok", Detail: "repo file → " + repoPath}
 	}
-	if gp, err := schema.GlobalPath(); err == nil {
-		if _, err := os.Stat(gp); err == nil {
-			return doctorResult{Name: "schema", Status: "warn", Detail: gp + " (no modeline)", Hint: "schema_install target=global"}
-		}
+	if modelineDetail != "" {
+		return doctorResult{Name: "schema", Status: "warn", Detail: "modeline unresolved: " + modelineDetail, Hint: "schema_install"}
 	}
 	return doctorResult{Name: "schema", Status: "warn", Detail: "no schema installed", Hint: "schema_install"}
 }

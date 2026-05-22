@@ -12,9 +12,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/invopop/jsonschema"
 
@@ -33,6 +36,7 @@ func Render() ([]byte, error) {
 		Anonymous:      true,
 		ExpandedStruct: true,
 		FieldNameTag:   "yaml",
+		CommentMap:     config.CommentMap(),
 	}
 	return json.MarshalIndent(r.Reflect(&config.Config{}), "", "  ")
 }
@@ -95,6 +99,49 @@ func Install(repoRoot string, t Target) (resolved string, modelineChanged bool, 
 	}
 	modelineChanged, err = SetModeline(repoRoot, resolved)
 	return resolved, modelineChanged, err
+}
+
+// ProbeRef resolves a yaml-language-server modeline target (URL or
+// path) and reports whether it's reachable. Both http(s) URLs and
+// file paths are accepted; `file://` URLs are normalised to their
+// underlying path before stat. http(s) URLs are HEAD-checked with a
+// short timeout so doctor doesn't hang offline.
+//
+// Returns (true, <resolved-detail>) when the target resolves, or
+// (false, <reason>) when it doesn't. `repoRoot` is used to resolve
+// relative file paths; pass "" if the ref is already absolute.
+func ProbeRef(repoRoot, ref string) (bool, string) {
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		client := &http.Client{Timeout: 3 * time.Second}
+		req, err := http.NewRequest(http.MethodHead, ref, nil)
+		if err != nil {
+			return false, fmt.Sprintf("invalid URL: %v", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false, fmt.Sprintf("unreachable: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			return true, ref
+		}
+		return false, fmt.Sprintf("HTTP %d at %s", resp.StatusCode, ref)
+	}
+	p := ref
+	if strings.HasPrefix(ref, "file://") {
+		u, err := url.Parse(ref)
+		if err != nil {
+			return false, fmt.Sprintf("invalid file URL: %v", err)
+		}
+		p = u.Path
+	}
+	if !filepath.IsAbs(p) && repoRoot != "" {
+		p = filepath.Join(repoRoot, p)
+	}
+	if _, err := os.Stat(p); err == nil {
+		return true, p
+	}
+	return false, "missing file: " + p
 }
 
 // ReadModeline returns the `$schema=` target declared by the first

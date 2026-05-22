@@ -249,50 +249,42 @@ func checkConfig(repoRoot string) doctorResult {
 // hinting even if the modeline was hand-removed.
 func checkSchema(repoRoot string) doctorResult {
 	ref := schema.ReadModeline(repoRoot)
+	modelineDetail := ""
 	if ref != "" {
-		if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		if ok, detail := schema.ProbeRef(repoRoot, ref); ok {
 			return doctorResult{
 				Name:   "schema",
 				Status: "ok",
-				Detail: "modeline → " + ref,
+				Detail: "modeline → " + detail,
 			}
-		}
-		p := ref
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(repoRoot, p)
-		}
-		if _, err := os.Stat(p); err == nil {
-			return doctorResult{
-				Name:   "schema",
-				Status: "ok",
-				Detail: "modeline → " + p,
-			}
-		}
-		return doctorResult{
-			Name:   "schema",
-			Status: "warn",
-			Detail: "modeline points to missing file: " + p,
-			Hint:   "regenerate with: treeman schema install [--global|--url]",
+		} else {
+			modelineDetail = detail
 		}
 	}
 
-	repoPath := filepath.Join(repoRoot, "schemas", "treeman.schema.json")
-	if _, err := os.Stat(repoPath); err == nil {
-		return doctorResult{
-			Name:   "schema",
-			Status: "warn",
-			Detail: repoPath + " (no modeline in .treeman.yaml)",
-			Hint:   "wire it up: treeman schema install",
-		}
-	}
 	if gp, err := schema.GlobalPath(); err == nil {
 		if _, err := os.Stat(gp); err == nil {
 			return doctorResult{
 				Name:   "schema",
-				Status: "warn",
-				Detail: gp + " (no modeline in .treeman.yaml)",
-				Hint:   "wire it up: treeman schema install --global",
+				Status: "ok",
+				Detail: "global install → " + gp,
 			}
+		}
+	}
+	repoPath := filepath.Join(repoRoot, "schemas", "treeman.schema.json")
+	if _, err := os.Stat(repoPath); err == nil {
+		return doctorResult{
+			Name:   "schema",
+			Status: "ok",
+			Detail: "repo file → " + repoPath,
+		}
+	}
+	if modelineDetail != "" {
+		return doctorResult{
+			Name:   "schema",
+			Status: "warn",
+			Detail: "modeline unresolved: " + modelineDetail,
+			Hint:   "regenerate with: treeman schema install [--global|--url]",
 		}
 	}
 	return doctorResult{
