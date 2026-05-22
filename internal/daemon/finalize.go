@@ -84,24 +84,28 @@ func FinalizeWorktree(
 }
 
 // TeardownWorktree mirrors FinalizeWorktree for `treeman wt delete`.
-// Runs predelete hooks + DB teardown + `git worktree remove`. All
-// in the daemon's runtime so the CLI returns immediately.
+// Runs predelete hooks + DB teardown + worktree removal. All in the
+// daemon's runtime so the CLI returns immediately.
 //
-// Serialised per repo via st.LockRepoTeardown — two fast-fire
-// teardown invocations on the same repo queue instead of running
-// concurrent `git worktree remove --force` + DROP DATABASE storms.
-// The mutex is held for the entire goroutine; this is intentional. A
-// single teardown on a Laravel vendor+node_modules tree is heavy
-// enough on its own; doubling it can lock the host.
+// Mutex scope: the per-repo teardown mutex is held ONLY across the
+// git operations that touch the shared <common>/worktrees/ admin
+// directory. Predelete hooks and DROP DATABASE are per-worktree
+// work — running them in parallel for two simultaneous teardowns of
+// the same repo is fine, and shrinking the mutex window lets a
+// second `gwtd` start its predelete/DB drops without waiting for the
+// first's rm to finish.
+//
+// Heavy rm-rf is offloaded to a background reaper: the worktree is
+// atomically renamed into a trash directory on the same filesystem
+// (O(1)), then `git worktree prune` unregisters the admin entry,
+// then a detached goroutine deletes the trashed tree at SCHED_IDLE +
+// ionice idle class. The user-visible teardown finishes in
+// milliseconds even on a Laravel vendor+node_modules checkout.
 //
 // Watchers die FIRST — before the per-repo mutex, before any config
-// load. `git worktree remove --force` rm -rf's the checkout; if the
-// per-worktree fsnotify watcher is still draining events from that
-// rm storm, each match queues a dispatch that fires FinalizeWorktree
-// for the worktree being deleted (re-creating DB resources mid-
-// teardown). The in-flight marker also tells the lifecycle watcher
-// to skip spawning an orphan teardown when its admin-dir REMOVE
-// event fires.
+// load. The in-flight marker tells the lifecycle watcher to skip
+// spawning an orphan teardown when its admin-dir REMOVE event fires
+// during the git prune step.
 func TeardownWorktree(
 	ctx context.Context,
 	st *State,
@@ -117,10 +121,6 @@ func TeardownWorktree(
 		return nil
 	}
 	defer st.UnmarkTeardownInFlight(wtRoot)
-
-	mu := st.LockRepoTeardown(repoPath)
-	mu.Lock()
-	defer mu.Unlock()
 
 	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
 	if err != nil {
@@ -140,47 +140,59 @@ func TeardownWorktree(
 		// from treeman's side. Still honour --force by letting git
 		// reap a stale checkout if one happens to remain on disk.
 		if force {
+			mu := st.LockRepoTeardown(repoPath)
+			mu.Lock()
 			gitArgs := []string{"-C", repoRoot, "worktree", "remove", "--force", wtRoot}
 			_ = lowPriorityCommand(ctx, "git", gitArgs).Run()
 			pruneEmptyParentsBelow(wtRoot, worktreesRootOf(cfg.Worktrees.Root, repoRoot))
+			mu.Unlock()
 		}
 		return nil
 	}
 	wtID := row.ID
 	slugVal := row.Slug
+	worktreesRoot := worktreesRootOf(cfg.Worktrees.Root, repoRoot)
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_start",
 		"daemon-detached predelete + db teardown + git remove beginning",
 		repoID, wtID, "", 0, nil)
 
 	if len(cfg.Hooks.Predelete) > 0 {
-		// Same await rationale as postcreate above: predelete teardown
-		// (drop external resources, kill watchers) must finish before
-		// `TeardownDatabases` blows away the SQL state they may still
-		// be using.
+		// Block until every predelete group exits before dropping
+		// databases — same rationale as the postcreate await: a hook
+		// that closes app connections must finish before DROP
+		// DATABASE, or the DB server rejects the drop.
 		_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete,
 			repoRoot, wtRoot, slugVal, inheritedEnv, true)
 	}
 
-	if err := prepare.TeardownDatabases(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
-		return err
+	if len(cfg.Databases) > 0 {
+		if err := prepare.TeardownDatabases(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
+			return err
+		}
 	}
 
-	gitArgs := []string{"-C", repoRoot, "worktree", "remove"}
-	if force {
-		gitArgs = append(gitArgs, "--force")
-	}
-	gitArgs = append(gitArgs, wtRoot)
-	cmd := lowPriorityCommand(ctx, "git", gitArgs)
-	if err := cmd.Run(); err != nil && !force {
-		return fmt.Errorf("git worktree remove: %w (pass --force to override)", err)
+	// Acquire the per-repo mutex only for the git operations — they
+	// touch the shared <common>/worktrees/ admin tree and aren't
+	// parallel-safe.
+	mu := st.LockRepoTeardown(repoPath)
+	mu.Lock()
+	trashPath, removeErr := removeWorktreeViaTrash(ctx, repoRoot, wtRoot, worktreesRoot, force)
+	pruneEmptyParentsBelow(wtRoot, worktreesRoot)
+	mu.Unlock()
+
+	if removeErr != nil && !force {
+		return fmt.Errorf("worktree remove: %w (pass --force to override)", removeErr)
 	}
 
 	_ = st.Store.MarkWorktreeDeleted(ctx, wtID)
-	pruneEmptyParentsBelow(wtRoot, worktreesRootOf(cfg.Worktrees.Root, repoRoot))
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_done",
 		"daemon-detached teardown complete",
 		repoID, wtID, "", 0, nil)
+
+	if trashPath != "" {
+		scheduleBackgroundReap(st, trashPath)
+	}
 	return nil
 }
 
@@ -220,31 +232,44 @@ func pruneEmptyParentsBelow(start, wtRoot string) {
 }
 
 // lowPriorityCommand wraps an exec.CommandContext invocation so the
-// child runs at low CPU + I/O priority. Used for `git worktree
-// remove` because `--force` rm -rf's vendor/ + node_modules/ — on a
-// Laravel checkout that's ~250k inode unlinks back-to-back. Without
-// nice/ionice that storm starves foreground apps for I/O and CPU
+// child runs at low CPU + I/O + scheduler priority. Used for the
+// background rm reaper and the rare git-worktree-remove fallback —
+// `rm -rf` of vendor/ + node_modules/ is ~250k inode unlinks back-
+// to-back, which without these wrappers can starve foreground apps
 // long enough to look like a system freeze.
 //
-// Layering: `ionice -c 3 nice -n 19 <cmd>`. `ionice -c 3` is the
-// idle class — the child only gets disk bandwidth when nothing else
-// wants it. `nice -n 19` is the lowest CPU priority. Both are
-// best-effort: when either binary is missing we fall back to the
-// next layer, and finally to plain exec.Command. macOS shells
-// usually carry `nice` but not `ionice`, so the nice-only fallback
-// still gives partial relief.
+// Layering, outermost first: `chrt -i 0 ionice -c 3 nice -n 19 <cmd>`.
+//   - `chrt -i 0` puts the process in SCHED_IDLE — Linux only,
+//     deeper than `nice -n 19` (SCHED_IDLE only runs when *nothing*
+//     else wants CPU, including other niced processes).
+//   - `ionice -c 3` is the idle I/O class — disk bandwidth only when
+//     nothing else wants it.
+//   - `nice -n 19` is the lowest CPU priority (used as a fallback on
+//     systems without chrt).
+//
+// Each layer is optional: when the binary is missing we drop it and
+// keep the rest. macOS shells usually carry `nice` but not `ionice`
+// or `chrt`, so the nice-only fallback still gives partial relief.
 func lowPriorityCommand(ctx context.Context, name string, args []string) *exec.Cmd {
-	if _, err := exec.LookPath("ionice"); err == nil {
-		ioArgs := append([]string{"-c", "3"}, "nice")
-		ioArgs = append(ioArgs, "-n", "19", name)
-		ioArgs = append(ioArgs, args...)
-		return exec.CommandContext(ctx, "ionice", ioArgs...)
+	var prefix []string
+	if p, err := exec.LookPath("chrt"); err == nil {
+		prefix = append(prefix, p, "-i", "0")
 	}
-	if _, err := exec.LookPath("nice"); err == nil {
-		niceArgs := append([]string{"-n", "19", name}, args...)
-		return exec.CommandContext(ctx, "nice", niceArgs...)
+	if p, err := exec.LookPath("ionice"); err == nil {
+		prefix = append(prefix, p, "-c", "3")
 	}
-	return exec.CommandContext(ctx, name, args...)
+	if p, err := exec.LookPath("nice"); err == nil {
+		prefix = append(prefix, p, "-n", "19")
+	}
+	if len(prefix) == 0 {
+		return exec.CommandContext(ctx, name, args...)
+	}
+	// First prefix element becomes the executable; the rest of the
+	// prefix + the original (name, args) become its arguments.
+	cmdArgs := append([]string{}, prefix[1:]...)
+	cmdArgs = append(cmdArgs, name)
+	cmdArgs = append(cmdArgs, args...)
+	return exec.CommandContext(ctx, prefix[0], cmdArgs...)
 }
 
 // detectBranch reads `.git/HEAD` (or the gitlink-resolved file) and

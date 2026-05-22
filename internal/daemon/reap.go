@@ -1,0 +1,132 @@
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// trashDirName is the subdirectory under worktreesRoot where deleted
+// working trees are renamed for background reaping. Chosen to (a) be
+// hidden, (b) carry the treeman prefix so accidental ls reveals
+// origin, and (c) live inside the worktrees root so the rename stays
+// on the same filesystem.
+const trashDirName = ".treeman-trash"
+
+// removeWorktreeViaTrash atomically moves wtRoot into a trash dir on
+// the same filesystem and then runs `git worktree prune` to unregister
+// the now-orphaned admin directory. Returns the trash path so the
+// caller can hand it to scheduleBackgroundReap.
+//
+// On any failure (cross-FS rename, missing dir, permission), falls
+// back to inline `git worktree remove [--force] wtRoot`. The fallback
+// path returns trashPath="" so the caller skips background reaping.
+//
+// Caller must hold the per-repo teardown mutex — this touches the
+// shared <common>/worktrees/ admin tree via `git worktree prune`.
+func removeWorktreeViaTrash(
+	ctx context.Context,
+	repoRoot, wtRoot, worktreesRoot string,
+	force bool,
+) (trashPath string, err error) {
+	if _, statErr := os.Stat(wtRoot); statErr != nil {
+		// Working tree already gone — just prune git's view of it.
+		_ = runGitPrune(ctx, repoRoot)
+		return "", nil
+	}
+
+	trashRoot := filepath.Join(worktreesRoot, trashDirName)
+	if mkErr := os.MkdirAll(trashRoot, 0o700); mkErr == nil {
+		name := fmt.Sprintf("%d-%s", time.Now().UnixNano(), filepath.Base(wtRoot))
+		dest := filepath.Join(trashRoot, name)
+		if renameErr := os.Rename(wtRoot, dest); renameErr == nil {
+			// Rename succeeded: working tree is now under trash.
+			// Tell git its admin dir is orphaned.
+			_ = runGitPrune(ctx, repoRoot)
+			return dest, nil
+		}
+		// Common failure: cross-filesystem rename (EXDEV) when the
+		// user gave an absolute wtRoot outside worktreesRoot. Fall
+		// through to git worktree remove.
+	}
+
+	gitArgs := []string{"-C", repoRoot, "worktree", "remove"}
+	if force {
+		gitArgs = append(gitArgs, "--force")
+	}
+	gitArgs = append(gitArgs, wtRoot)
+	if runErr := lowPriorityCommand(ctx, "git", gitArgs).Run(); runErr != nil {
+		return "", runErr
+	}
+	return "", nil
+}
+
+// runGitPrune invokes `git worktree prune --expire=now`. The
+// --expire=now is essential: git's default prune horizon is
+// `gc.worktreePruneExpire` which is typically 3 months, so a plain
+// prune would leave the just-orphaned admin dir behind.
+func runGitPrune(ctx context.Context, repoRoot string) error {
+	return lowPriorityCommand(ctx, "git",
+		[]string{"-C", repoRoot, "worktree", "prune", "--expire=now"}).Run()
+}
+
+// scheduleBackgroundReap detaches a goroutine that deletes trashPath
+// at idle priority. The teardown RPC has already returned to the
+// caller by this point; the reaper runs on the daemon's lifetime
+// context so it survives the originating RPC but dies with the
+// daemon.
+func scheduleBackgroundReap(st *State, trashPath string) {
+	safeGo("wt_reap:"+trashPath, func() {
+		if err := parallelRemoveAll(st.BgCtx, trashPath, 4); err != nil {
+			slog.Warn("background reap", "trash", trashPath, "err", err)
+		}
+	})
+}
+
+// parallelRemoveAll splits the top-level entries of root across up to
+// `workers` concurrent `rm -rf` children, each wrapped in
+// lowPriorityCommand (chrt -i 0 / ionice / nice). After all entries
+// drain, removes root itself.
+//
+// Why shell out to `rm` instead of os.RemoveAll: rm honours the
+// scheduler/IO niceness wrappers; an in-process Go RemoveAll would
+// run at the daemon's own priority (typically nice 0), which is
+// exactly what we're trying to avoid. Parallelism is by top-level
+// child so node_modules/ and vendor/ get their own worker each.
+func parallelRemoveAll(ctx context.Context, root string, workers int) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if len(entries) < workers {
+		workers = len(entries)
+	}
+	if workers > 0 {
+		sem := make(chan struct{}, workers)
+		var wg sync.WaitGroup
+		for _, e := range entries {
+			target := filepath.Join(root, e.Name())
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(t string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if runErr := lowPriorityCommand(ctx, "rm", []string{"-rf", t}).Run(); runErr != nil {
+					slog.Debug("reap rm", "path", t, "err", runErr)
+				}
+			}(target)
+		}
+		wg.Wait()
+	}
+	return os.RemoveAll(root)
+}
