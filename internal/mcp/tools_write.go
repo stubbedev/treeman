@@ -20,6 +20,7 @@ import (
 	"github.com/stubbedev/treeman/internal/initgen"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/snapshot"
@@ -70,6 +71,11 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 		Name:        "registry_repair",
 		Description: "Reconcile the SQLite registry with `git worktree list` for the current (or specified) repo: register paths git knows that SQLite doesn't, and mark deleted those SQLite knows that git doesn't. Returns per-action counts.",
 	}, registryRepairTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "registry_remove",
+		Description: "Drop a repo from the SQLite registry. Stops any live daemon watchers attached to the repo and deletes child rows (worktrees, events, snapshots, binlog_checkpoints, hook_runs). External resources (databases, on-disk worktree dirs, dump caches) are NOT touched. Refuses by default if active worktrees still exist — pass force=true to override.",
+	}, registryRemoveTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_watch",
@@ -445,6 +451,72 @@ func registryUnregisterTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in r
 		"name": in.Name,
 	})
 	return nil, registryUnregisterOut{WorktreeID: wtID, Path: path}, nil
+}
+
+type registryRemoveIn struct {
+	Repo  string `json:"repo,omitempty"`
+	Force bool   `json:"force,omitempty" jsonschema:"remove even when active worktrees exist"`
+}
+type registryRemoveOut struct {
+	RepoPath string `json:"repo"`
+	Via      string `json:"via" jsonschema:"daemon|sqlite — which path performed the delete"`
+}
+
+func registryRemoveTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in registryRemoveIn) (*mcpsdk.CallToolResult, registryRemoveOut, error) {
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, registryRemoveOut{}, err
+	}
+	// Prefer the daemon RPC so live watchers stop in-process; fall
+	// back to direct SQLite when the daemon isn't running.
+	if sock, _ := rpc.SocketPath(); sock != "" {
+		if _, statErr := os.Stat(sock); statErr == nil {
+			resp, callErr := rpc.Call(ctx, rpc.Request{
+				Method:     rpc.MethodRepoRemove,
+				RepoRemove: &rpc.RepoRemoveArgs{RepoPath: repoRoot, Force: in.Force},
+			})
+			if callErr == nil {
+				if resp.Kind == rpc.KindError {
+					return nil, registryRemoveOut{}, fmt.Errorf("daemon: %s", resp.Message)
+				}
+				writeMCPEvent(context.Background(), "registry_remove", "removed "+repoRoot, 0, map[string]string{
+					"repo": repoRoot,
+					"via":  "daemon",
+				})
+				return nil, registryRemoveOut{RepoPath: repoRoot, Via: "daemon"}, nil
+			}
+		}
+	}
+
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, registryRemoveOut{}, err
+	}
+	defer st.Close()
+	repoID, err := st.LookupRepoID(ctx, repoRoot)
+	if err != nil {
+		return nil, registryRemoveOut{}, err
+	}
+	if repoID == 0 {
+		return nil, registryRemoveOut{}, fmt.Errorf("repo not enrolled: %s", repoRoot)
+	}
+	if !in.Force {
+		n, err := st.CountActiveWorktreesForRepo(ctx, repoID)
+		if err != nil {
+			return nil, registryRemoveOut{}, err
+		}
+		if n > 0 {
+			return nil, registryRemoveOut{}, fmt.Errorf("repo has %d active worktree(s); pass force=true to override", n)
+		}
+	}
+	if err := st.RemoveRepo(ctx, repoID); err != nil {
+		return nil, registryRemoveOut{}, err
+	}
+	writeMCPEvent(context.Background(), "registry_remove", "removed "+repoRoot, 0, map[string]string{
+		"repo": repoRoot,
+		"via":  "sqlite",
+	})
+	return nil, registryRemoveOut{RepoPath: repoRoot, Via: "sqlite"}, nil
 }
 
 type registryRepairIn struct {

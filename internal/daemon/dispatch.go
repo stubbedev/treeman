@@ -109,6 +109,30 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 		st.UnregisterWatcher(req.WatcherStop.RepoPath)
 		return rpc.Response{Kind: rpc.KindOk}
 
+	case rpc.MethodConfigReload:
+		repoPath := ""
+		if req.ConfigReload != nil {
+			repoPath = req.ConfigReload.RepoPath
+		}
+		if st.ConfigReloader == nil {
+			return errResp("config_reload: reloader not initialised")
+		}
+		if repoPath == "" {
+			st.ConfigReloader.ReloadAll(st.BgCtx)
+		} else {
+			st.ConfigReloader.ReloadRepo(st.BgCtx, repoPath)
+		}
+		return rpc.Response{Kind: rpc.KindOk}
+
+	case rpc.MethodRepoRemove:
+		if req.RepoRemove == nil || req.RepoRemove.RepoPath == "" {
+			return errResp("repo_remove: missing repo_path")
+		}
+		if err := removeRepoFromRegistry(ctx, st, req.RepoRemove.RepoPath, req.RepoRemove.Force); err != nil {
+			return errResp(err.Error())
+		}
+		return rpc.Response{Kind: rpc.KindOk}
+
 	case rpc.MethodWorktreeList:
 		if req.WorktreeList == nil {
 			return errResp("worktree_list: missing args")
@@ -216,6 +240,9 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 	if err != nil {
 		return fmt.Errorf("ensure repo: %w", err)
 	}
+	// Subscribe the config reloader to this repo's YAML files so a
+	// live edit will trigger a watcher restart for this repo.
+	st.ConfigReloader.AddRepo(repoPath)
 
 	wctx, cancel := context.WithCancel(st.BgCtx)
 	entry := &WatcherEntry{

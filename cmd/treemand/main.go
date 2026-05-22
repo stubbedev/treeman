@@ -41,6 +41,14 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// SIGHUP is a deliberate operator-driven reload trigger; we want
+	// it routed to the reloader, NOT folded into the shutdown signal
+	// set above. Register it independently so the default Go handler
+	// (which would terminate the process) is overridden.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+
 	dbPath, err := store.DefaultDBPath()
 	if err != nil {
 		return fmt.Errorf("db path: %w", err)
@@ -79,6 +87,18 @@ func run() error {
 		"pid", os.Getpid())
 	_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_started", "treemand listening",
 		0, 0, "", 0, map[string]string{"socket": sockPath})
+
+	// Config reloader. Subscribes to the global config dir
+	// `~/.config/treeman/` immediately; per-repo dirs are added below
+	// as we resume watchers (and by `startRepoWatcher` for new repos
+	// enrolled at runtime).
+	cr, err := daemon.NewConfigReloader(st)
+	if err != nil {
+		slog.Warn("config reloader init failed (continuing without hot-reload)", "err", err)
+	} else {
+		st.ConfigReloader = cr
+		cr.Start(ctx)
+	}
 
 	// Auto-resume per-repo watchers on boot. Each known repo gets
 	// its binlog replicators re-spawned via the same path the
@@ -161,6 +181,23 @@ func run() error {
 	// (MaxAgeDays, MaxTotalGb) land here later.
 	go daemon.SnapshotGCLoop(ctx, st)
 	go daemon.WALCheckpointLoop(ctx, st)
+
+	// SIGHUP → full reload. Independent of the shutdown signal set so
+	// `kill -HUP $(pgrep treemand)` is a deterministic operator knob
+	// and matches Unix daemon convention.
+	if cr != nil {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-hupCh:
+					slog.Info("SIGHUP received — reloading config")
+					cr.ReloadAll(st.BgCtx)
+				}
+			}
+		}()
+	}
 
 	shutdown := make(chan struct{}, 1)
 	go acceptLoop(ctx, ln, st, shutdown)

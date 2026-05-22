@@ -64,6 +64,12 @@ type State struct {
 	// once, while different repos can still drop in parallel.
 	dropQueuesMu sync.Mutex
 	dropQueues   map[string]chan DBDropJob
+
+	// ConfigReloader watches `.treeman.yaml` + layered config files
+	// and restarts per-repo watchers when they change. Initialised by
+	// `treemand` main; nil in unit tests that exercise dispatch
+	// without booting the full daemon.
+	ConfigReloader *ConfigReloader
 }
 
 // DBDropJob is one queued `prepare.TeardownDatabases` invocation,

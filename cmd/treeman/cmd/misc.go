@@ -385,7 +385,7 @@ func schemaInstall(ctx context.Context, c *cli.Command) error {
 	return nil
 }
 
-// DaemonCmd — `treeman daemon {start,stop,status,install,uninstall}`.
+// DaemonCmd — `treeman daemon {start,stop,reload,status,install,uninstall}`.
 func DaemonCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "daemon",
@@ -393,6 +393,14 @@ func DaemonCmd() *cli.Command {
 		Commands: []*cli.Command{
 			{Name: "start", Action: daemonStart},
 			{Name: "stop", Action: daemonStop},
+			{
+				Name:  "reload",
+				Usage: "ask the daemon to re-read config + restart watchers (no process restart)",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "limit reload to one repo path; defaults to all"},
+				},
+				Action: daemonReload,
+			},
 			{
 				Name:   "status",
 				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json"}},
@@ -408,6 +416,33 @@ func DaemonCmd() *cli.Command {
 			},
 		},
 	}
+}
+
+func daemonReload(ctx context.Context, c *cli.Command) error {
+	repoPath := c.String("repo")
+	if repoPath != "" {
+		var err error
+		repoPath, err = resolveRepo(repoPath)
+		if err != nil {
+			return err
+		}
+	}
+	resp, err := rpc.Call(ctx, rpc.Request{
+		Method:       rpc.MethodConfigReload,
+		ConfigReload: &rpc.ConfigReloadArgs{RepoPath: repoPath},
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Kind == rpc.KindError {
+		return fmt.Errorf("daemon: %s", resp.Message)
+	}
+	if repoPath == "" {
+		PrintOK("config reload requested (all repos)")
+	} else {
+		PrintOK("config reload requested (%s)", repoPath)
+	}
+	return nil
 }
 
 func daemonStart(ctx context.Context, c *cli.Command) error {

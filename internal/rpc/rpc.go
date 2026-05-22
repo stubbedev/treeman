@@ -60,6 +60,8 @@ const (
 	MethodWorktreeList     = "worktree_list"
 	MethodWorktreeFinalize = "worktree_finalize"
 	MethodWorktreeTeardown = "worktree_teardown"
+	MethodConfigReload     = "config_reload"
+	MethodRepoRemove       = "repo_remove"
 	MethodShutdown         = "shutdown"
 )
 
@@ -73,6 +75,8 @@ type Request struct {
 	WorktreeList     *WorktreeListArgs     `json:",omitempty"`
 	WorktreeFinalize *WorktreeFinalizeArgs `json:",omitempty"`
 	WorktreeTeardown *WorktreeTeardownArgs `json:",omitempty"`
+	ConfigReload     *ConfigReloadArgs     `json:",omitempty"`
+	RepoRemove       *RepoRemoveArgs       `json:",omitempty"`
 }
 
 // MarshalJSON flattens the discriminator + the matching args struct
@@ -110,6 +114,15 @@ func (r Request) MarshalJSON() ([]byte, error) {
 			wrapper["worktree_path"] = r.WorktreeTeardown.WorktreePath
 			wrapper["force"] = r.WorktreeTeardown.Force
 			wrapper["inherited_env"] = r.WorktreeTeardown.InheritedEnv
+		}
+	case MethodConfigReload:
+		if r.ConfigReload != nil {
+			wrapper["repo_path"] = r.ConfigReload.RepoPath
+		}
+	case MethodRepoRemove:
+		if r.RepoRemove != nil {
+			wrapper["repo_path"] = r.RepoRemove.RepoPath
+			wrapper["force"] = r.RepoRemove.Force
 		}
 	}
 	return json.Marshal(wrapper)
@@ -162,6 +175,15 @@ func (r *Request) UnmarshalJSON(data []byte) error {
 			"force":         &r.WorktreeTeardown.Force,
 			"inherited_env": &r.WorktreeTeardown.InheritedEnv,
 		})
+	case MethodConfigReload:
+		r.ConfigReload = &ConfigReloadArgs{}
+		return decodeFields(raw, map[string]any{"repo_path": &r.ConfigReload.RepoPath})
+	case MethodRepoRemove:
+		r.RepoRemove = &RepoRemoveArgs{}
+		return decodeFields(raw, map[string]any{
+			"repo_path": &r.RepoRemove.RepoPath,
+			"force":     &r.RepoRemove.Force,
+		})
 	default:
 		return fmt.Errorf("rpc: unknown method %q", r.Method)
 	}
@@ -206,6 +228,23 @@ type WorktreeTeardownArgs struct {
 	WorktreePath string
 	Force        bool
 	InheritedEnv map[string]string
+}
+
+// ConfigReloadArgs — tells the daemon to invalidate its config cache
+// and restart watchers. Empty RepoPath reloads every registered repo.
+type ConfigReloadArgs struct {
+	RepoPath string
+}
+
+// RepoRemoveArgs — drop a repo from the SQLite registry. Daemon stops
+// every watcher attached to the repo first. Force=false refuses the
+// removal when active (`deleted_at IS NULL`) worktrees still exist.
+// External resources (databases, on-disk worktree dirs) are never
+// touched — callers wanting a destructive purge run `treeman wt delete`
+// first.
+type RepoRemoveArgs struct {
+	RepoPath string
+	Force    bool
 }
 
 // ─────────────────────────── Response ───────────────────────────

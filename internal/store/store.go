@@ -477,6 +477,60 @@ func (s *Store) ListWorktreesForRepo(ctx context.Context, repoID int64) ([]Workt
 	return out, rows.Err()
 }
 
+// CountActiveWorktreesForRepo returns the number of `deleted_at IS NULL`
+// worktree rows under `repoID`. Used by `registry remove` to refuse a
+// non-forced removal while live worktrees still exist.
+func (s *Store) CountActiveWorktreesForRepo(ctx context.Context, repoID int64) (int, error) {
+	row := s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM worktrees WHERE repo_id = ? AND deleted_at IS NULL`, repoID)
+	var n int
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// RemoveRepo deletes the repo row and every child row that would
+// otherwise block the FK constraint or hang around as orphan tracking
+// data: hook_runs, events, snapshots, binlog_checkpoints, worktrees.
+// Wrapped in a transaction so a mid-delete failure leaves the
+// registry intact.
+//
+// External resources (per-worktree databases, on-disk git worktree
+// dirs, dump caches under `.treeman-snapshots/`, advisory hash caches
+// keyed by path) are NOT touched — callers that want a destructive
+// clean-up must tear down the worktrees first via `treeman wt delete`.
+func (s *Store) RemoveRepo(ctx context.Context, repoID int64) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`DELETE FROM hook_runs WHERE worktree_id IN (SELECT id FROM worktrees WHERE repo_id = ?)`,
+		`DELETE FROM events    WHERE repo_id = ? OR worktree_id IN (SELECT id FROM worktrees WHERE repo_id = ?)`,
+		`DELETE FROM snapshots WHERE repo_id = ?`,
+		`DELETE FROM binlog_checkpoints WHERE repo_id = ?`,
+		`DELETE FROM worktrees WHERE repo_id = ?`,
+		`DELETE FROM repos     WHERE id = ?`,
+	}
+	args := [][]any{
+		{repoID},
+		{repoID, repoID},
+		{repoID},
+		{repoID},
+		{repoID},
+		{repoID},
+	}
+	for i, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q, args[i]...); err != nil {
+			return fmt.Errorf("registry remove step %d: %w", i, err)
+		}
+	}
+	return tx.Commit()
+}
+
 // SetRepoWatchLifecycle toggles the per-repo lifecycle-watcher opt-in
 // flag. The watcher only acts on repos where this is 1 AND the global
 // `worktrees.hook_lifecycle` config bool is true.

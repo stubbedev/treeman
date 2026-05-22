@@ -13,6 +13,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/ui"
@@ -20,9 +21,10 @@ import (
 	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
 
-// RegistryCmd — `treeman registry {repair}` exposes the SQLite-side
-// reconciliation primitives that doctor's `registry` check reports.
-// (Per-worktree register/unregister already live under `treeman wt`.)
+// RegistryCmd — `treeman registry {repair, remove}` exposes the
+// SQLite-side reconciliation primitives that doctor's `registry`
+// check reports. (Per-worktree register/unregister already live
+// under `treeman wt`.)
 func RegistryCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "registry",
@@ -67,8 +69,113 @@ func RegistryCmd() *cli.Command {
 					return nil
 				},
 			},
+			registryRemove(),
 		},
 	}
+}
+
+// registryRemove implements `treeman registry remove --repo R` —
+// drops the repo from the SQLite registry plus every child row
+// (worktrees, events, snapshots, binlog_checkpoints, hook_runs). Does
+// NOT touch databases, on-disk worktree directories, or dump caches.
+//
+// When the daemon is running, the work is delegated via RPC so live
+// watchers are stopped in the same process; otherwise we fall back to
+// direct SQLite manipulation and any stale watchers will be GC'd at
+// the next daemon restart.
+func registryRemove() *cli.Command {
+	return &cli.Command{
+		Name:  "remove",
+		Usage: "drop a repo from the SQLite registry (stops watchers, removes tracking rows; leaves external state alone)",
+		Description: `Refuses by default when any worktree row under the repo is still
+active (deleted_at IS NULL) — that almost always means running
+services, on-disk checkouts, or per-worktree databases. Pass --force
+to remove anyway; this only deletes registry rows and never destroys
+external resources.
+
+Examples:
+  treeman registry remove --repo /abs/path
+  treeman registry remove --repo /abs/path --force
+  treeman registry remove --repo /abs/path --yes`,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "repo path; defaults to current cwd's repo root"},
+			&cli.BoolFlag{Name: "force", Aliases: []string{"f"}, Usage: "remove even when active worktrees exist"},
+			&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip the confirmation prompt"},
+			&cli.BoolFlag{Name: "json"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			repoRoot, err := resolveRepo(c.String("repo"))
+			if err != nil {
+				return err
+			}
+			force := c.Bool("force")
+			if !c.Bool("yes") && !c.Bool("json") {
+				if !ui.Confirm(fmt.Sprintf("remove %s from the treeman registry?", repoRoot)) {
+					return fmt.Errorf("aborted")
+				}
+			}
+
+			// Daemon path first — preferred so live watchers stop in
+			// the same process. Falls back to direct SQLite when the
+			// daemon socket isn't there.
+			if _, dialErr := os.Stat(mustSocketPath()); dialErr == nil {
+				resp, err := rpcCall(ctx, repoRoot, force)
+				if err == nil {
+					if resp.Kind == rpc.KindError {
+						return fmt.Errorf("daemon: %s", resp.Message)
+					}
+					if c.Bool("json") {
+						return jsonStream(map[string]any{"repo": repoRoot, "removed": true, "via": "daemon"})
+					}
+					PrintOK("removed %s from registry (via daemon)", repoRoot)
+					return nil
+				}
+				PrintWarn("daemon RPC failed (%v) — falling back to direct SQLite", err)
+			}
+
+			st, err := openDefaultStore(ctx)
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			repoID, err := st.LookupRepoID(ctx, repoRoot)
+			if err != nil {
+				return err
+			}
+			if repoID == 0 {
+				return fmt.Errorf("repo not enrolled: %s", repoRoot)
+			}
+			if !force {
+				n, err := st.CountActiveWorktreesForRepo(ctx, repoID)
+				if err != nil {
+					return err
+				}
+				if n > 0 {
+					return fmt.Errorf("repo has %d active worktree(s); run `treeman wt delete` first or re-run with --force", n)
+				}
+			}
+			if err := st.RemoveRepo(ctx, repoID); err != nil {
+				return err
+			}
+			if c.Bool("json") {
+				return jsonStream(map[string]any{"repo": repoRoot, "removed": true, "via": "sqlite"})
+			}
+			PrintOK("removed %s from registry (direct SQLite)", repoRoot)
+			return nil
+		},
+	}
+}
+
+func mustSocketPath() string {
+	p, _ := rpc.SocketPath()
+	return p
+}
+
+func rpcCall(ctx context.Context, repoPath string, force bool) (rpc.Response, error) {
+	return rpc.Call(ctx, rpc.Request{
+		Method:     rpc.MethodRepoRemove,
+		RepoRemove: &rpc.RepoRemoveArgs{RepoPath: repoPath, Force: force},
+	})
 }
 
 // SnapshotsCmd — `treeman snapshots {list,purge}` exposes the cache
