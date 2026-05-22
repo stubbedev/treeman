@@ -208,8 +208,8 @@ type MysqlConn struct {
 	// Maximum open connections in the daemon's pool to this server.
 	// Defaults to a per-engine safe value. Raise only if the server
 	// is provisioned for it (max_connections raised, etc.).
-	PoolMax       uint32 `yaml:"pool_max,omitempty"`
-	ContainerRef  `yaml:",inline"`
+	PoolMax      uint32 `yaml:"pool_max,omitempty"`
+	ContainerRef `yaml:",inline"`
 }
 
 // PostgresConn — same shape as MysqlConn.
@@ -233,8 +233,8 @@ type PostgresConn struct {
 	Password string `yaml:"-"`
 
 	// Maximum open connections in the daemon's pool.
-	PoolMax       uint32 `yaml:"pool_max,omitempty"`
-	ContainerRef  `yaml:",inline"`
+	PoolMax      uint32 `yaml:"pool_max,omitempty"`
+	ContainerRef `yaml:",inline"`
 }
 
 // MongoConn — `mongodb://…` URI. When a ContainerRef is set, the

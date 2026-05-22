@@ -351,4 +351,3 @@ func hashFileBLAKE3(path string) (string, error) {
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
-
