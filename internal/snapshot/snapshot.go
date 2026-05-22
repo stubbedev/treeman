@@ -9,8 +9,8 @@ package snapshot
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -23,9 +23,10 @@ import (
 // FormatVersion bumps any time the SnapshotKey layout changes in a
 // way that invalidates existing fingerprints. v2 swapped sha256 →
 // blake3 across both the fingerprint hash and the per-file content
-// hashes that feed it, so every existing _tm_… template rebuilds
-// once after upgrade.
-const FormatVersion uint32 = 2
+// hashes that feed it. v3 hashes the canonical field stream directly
+// into blake3 (no JSON intermediate). Every existing _tm_… template
+// rebuilds once after each bump.
+const FormatVersion uint32 = 3
 
 // Key fingerprints a snapshot. Two prepare runs that share every
 // field can reuse the same template DB.
@@ -59,49 +60,55 @@ func New(engine, engineVersion, sourceDB, framework, hashMode, migrationsHash, d
 	}
 }
 
-// Fingerprint returns a stable hex-encoded hash of the key. sha256
-// is fine here — the fingerprint is consumed only by treeman itself
-// (the SQLite store keys on whatever the binary writes), so the
-// choice of hash never crosses a compatibility boundary.
+// Fingerprint returns a stable hex-encoded blake3 digest of the
+// key. The hash input is a canonical, NUL-delimited stream of the
+// fields in declaration order — no JSON marshal, no intermediate
+// allocations beyond the lockfile-name sort.
+//
+// Per-field encoding:
+//
+//	uint32 FormatVersion  : 4 bytes little-endian, then '\x00'
+//	strings               : raw bytes, terminated by '\x00'
+//	lockfile_hashes       : uint32 count LE, then for each entry in
+//	                        sorted-key order:  name '\x00' value '\x00'
+//
+// The choice of separator is irrelevant for collision resistance
+// (blake3 isn't length-extension vulnerable), but the NUL keeps the
+// input unambiguously parseable for debug/audit dumps.
 func (k Key) Fingerprint() string {
-	// Sort lockfile keys so JSON encoding is canonical.
-	type stableKey struct {
-		FormatVersion     uint32      `json:"format_version"`
-		Engine            string      `json:"engine"`
-		EngineVersion     string      `json:"engine_version"`
-		SourceDBName      string      `json:"source_db_name"`
-		Framework         string      `json:"framework"`
-		HashMode          string      `json:"hash_mode"`
-		MigrationsHashHex string      `json:"migrations_hash_hex"`
-		DumpHashHex       string      `json:"dump_hash_hex,omitempty"`
-		LockfileHashes    [][2]string `json:"lockfile_hashes"`
-	}
-	sk := stableKey{
-		FormatVersion:     k.FormatVersion,
-		Engine:            k.Engine,
-		EngineVersion:     k.EngineVersion,
-		SourceDBName:      k.SourceDBName,
-		Framework:         k.Framework,
-		HashMode:          k.HashMode,
-		MigrationsHashHex: k.MigrationsHashHex,
-		DumpHashHex:       k.DumpHashHex,
+	h := blake3.New(32, nil)
+	var vbuf [4]byte
+	binary.LittleEndian.PutUint32(vbuf[:], k.FormatVersion)
+	_, _ = h.Write(vbuf[:])
+	_, _ = h.Write([]byte{0})
+	for _, s := range []string{
+		k.Engine,
+		k.EngineVersion,
+		k.SourceDBName,
+		k.Framework,
+		k.HashMode,
+		k.MigrationsHashHex,
+		k.DumpHashHex,
+	} {
+		_, _ = h.Write([]byte(s))
+		_, _ = h.Write([]byte{0})
 	}
 	keys := make([]string, 0, len(k.LockfileHashes))
 	for name := range k.LockfileHashes {
 		keys = append(keys, name)
 	}
 	sort.Strings(keys)
+	var cbuf [4]byte
+	binary.LittleEndian.PutUint32(cbuf[:], uint32(len(keys)))
+	_, _ = h.Write(cbuf[:])
+	_, _ = h.Write([]byte{0})
 	for _, name := range keys {
-		sk.LockfileHashes = append(sk.LockfileHashes, [2]string{name, k.LockfileHashes[name]})
+		_, _ = h.Write([]byte(name))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(k.LockfileHashes[name]))
+		_, _ = h.Write([]byte{0})
 	}
-	b, err := json.Marshal(sk)
-	if err != nil {
-		// Inputs are trivially encodable; panic surfaces a
-		// programming error.
-		panic(fmt.Sprintf("snapshot key: %v", err))
-	}
-	sum := blake3.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // TemplateName returns the synthesized template-DB name used by the
@@ -128,6 +135,7 @@ func (k Key) TemplateName() string {
 // want to import snapshot).
 type HashCache interface {
 	HashedFile(ctx context.Context, path string) (string, error)
+	BatchHashedFiles(ctx context.Context, paths []string) (map[string]string, error)
 }
 
 // LockfileHashesFor hashes a list of files. Missing files are
@@ -143,22 +151,42 @@ func LockfileHashesFor(paths []string) (map[string]string, error) {
 }
 
 // LockfileHashesForWithCache is the cache-aware variant. See
-// LockfileHashesFor for semantics.
+// LockfileHashesFor for semantics. With a non-nil cache, all paths
+// fold into a single SELECT IN(?,?,…) round-trip; misses hash in
+// parallel and back-fill the cache before returning.
 func LockfileHashesForWithCache(ctx context.Context, cache HashCache, paths []string) (map[string]string, error) {
 	out := map[string]string{}
+	if cache != nil {
+		absPaths := make([]string, 0, len(paths))
+		baseOf := make(map[string]string, len(paths))
+		for _, p := range paths {
+			info, err := os.Stat(p)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			abs, err := filepath.Abs(p)
+			if err != nil {
+				continue
+			}
+			absPaths = append(absPaths, abs)
+			baseOf[abs] = filepath.Base(p)
+		}
+		hashes, err := cache.BatchHashedFiles(ctx, absPaths)
+		if err == nil {
+			for abs, h := range hashes {
+				if name, ok := baseOf[abs]; ok {
+					out[name] = h
+				}
+			}
+			return out, nil
+		}
+		// Cache failure — fall through to uncached path so the prepare
+		// keeps moving even on transient SQLite errors.
+	}
 	for _, p := range paths {
 		info, err := os.Stat(p)
 		if err != nil || info.IsDir() {
 			continue
-		}
-		if cache != nil {
-			abs, err := filepath.Abs(p)
-			if err == nil {
-				if h, err := cache.HashedFile(ctx, abs); err == nil {
-					out[filepath.Base(p)] = h
-					continue
-				}
-			}
 		}
 		h, err := hashFile(p)
 		if err != nil {

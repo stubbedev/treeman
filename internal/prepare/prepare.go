@@ -35,6 +35,34 @@ import (
 	"github.com/stubbedev/treeman/internal/template"
 )
 
+// frameworkHashCache adapts *store.Store to framework.HashCache.
+// store.BatchDirHashes / UpsertDirHashes use store-defined types
+// (DirHashRecord, DirHashKey) that the framework package can't
+// import (store depends on framework's caller chain, not the other
+// way round). Field shapes match exactly, so a single struct
+// conversion bridges the boundary at zero allocation cost.
+type frameworkHashCache struct{ *store.Store }
+
+func (f frameworkHashCache) BatchDirHashes(ctx context.Context, dirs []string, specName, hashMode string) (map[string]framework.DirHashCacheRecord, error) {
+	raw, err := f.Store.BatchDirHashes(ctx, dirs, specName, hashMode)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]framework.DirHashCacheRecord, len(raw))
+	for k, v := range raw {
+		out[k] = framework.DirHashCacheRecord(v)
+	}
+	return out, nil
+}
+
+func (f frameworkHashCache) UpsertDirHashes(ctx context.Context, entries []framework.DirHashCacheKey, hashes map[string]string) error {
+	se := make([]store.DirHashKey, len(entries))
+	for i, e := range entries {
+		se[i] = store.DirHashKey(e)
+	}
+	return f.Store.UpsertDirHashes(ctx, se, hashes)
+}
+
 // Outcome — one row per database the orchestrator handled.
 type Outcome struct {
 	Engine       string
@@ -230,7 +258,7 @@ func prepareMySQL(
 		s := specFromYAML(*d.Migrations)
 		hashMode = string(s.HashMode)
 		if len(s.MigrationDirs) > 0 || len(s.FileGlobs) > 0 {
-			if h, err := framework.MigrationsHashWithCache(ctx, st, worktreePath, s); err == nil {
+			if h, err := framework.MigrationsHashWithCache(ctx, frameworkHashCache{st}, worktreePath, s); err == nil {
 				migrationsHash = h
 			}
 		}
@@ -417,7 +445,7 @@ func preparePostgres(
 		s := specFromYAML(*d.Migrations)
 		hashMode = string(s.HashMode)
 		if len(s.MigrationDirs) > 0 || len(s.FileGlobs) > 0 {
-			if h, err := framework.MigrationsHashWithCache(ctx, st, worktreePath, s); err == nil {
+			if h, err := framework.MigrationsHashWithCache(ctx, frameworkHashCache{st}, worktreePath, s); err == nil {
 				migrationsHash = h
 			}
 		}
