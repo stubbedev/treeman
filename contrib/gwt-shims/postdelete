@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# Drop-in replacement for .gwt-postdelete. Delegates to treeman.
-set -euo pipefail
-exec treeman hook run postdelete --worktree "$GWT_WT"

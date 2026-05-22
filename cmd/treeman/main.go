@@ -1,7 +1,7 @@
 // Command treeman is the CLI for the treeman per-worktree DB
 // orchestrator. The subcommand tree is treated as a stable user-
-// facing contract so existing scripts (gwt zsh integration, CI
-// flows) keep working across releases.
+// facing contract so existing scripts (shell shims, CI flows) keep
+// working across releases.
 package main
 
 import (

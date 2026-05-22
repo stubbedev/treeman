@@ -336,8 +336,7 @@ type SlugRules struct {
 // WorktreesConfig — `worktrees:` block.
 type WorktreesConfig struct {
 	// Path (relative to the main worktree) where new worktrees are
-	// created. Defaults to `.worktrees` to match the
-	// `dotfiles gwt` zsh convention. Override with e.g.
+	// created. Defaults to `.worktrees`. Override with e.g.
 	// `../foo-worktrees` for the sibling-dir convention.
 	Root string `yaml:"root,omitempty"`
 
@@ -355,6 +354,15 @@ type WorktreesConfig struct {
 
 	// When true (default), predelete + postdelete hooks run async.
 	AsyncDelete *bool `yaml:"async_delete,omitempty"`
+
+	// When true, the daemon watches `<common-dir>/worktrees/` via
+	// fsnotify and fires `postcreate` / `postdelete` automatically
+	// when `git worktree add`/`remove` runs outside the treeman CLI.
+	// Default false. Even when true globally, a repo must be
+	// opted in via `treeman wt watch on` (see `repos.watch_lifecycle`
+	// in the daemon store) — both gates must be set for the watcher
+	// to act on a given repo.
+	HookLifecycle *bool `yaml:"hook_lifecycle,omitempty"`
 }
 
 // EnvScoping — `env_scoping:` block.
@@ -1048,11 +1056,9 @@ func applyDefaults(cfg *Config) {
 		cfg.Daemon.LogLevel = "info"
 	}
 	if cfg.Worktrees.Root == "" {
-		// `<main>/.worktrees/` matches the dotfiles `gwt` zsh
-		// convention so a treeman-controlled repo is drop-in for
-		// the bash-hook flow. Override per-repo with e.g.
-		// `worktrees.root: ../foo-worktrees` for the sibling-dir
-		// convention.
+		// `<main>/.worktrees/` is the default sibling-style layout.
+		// Override per-repo with e.g. `worktrees.root: ../foo-worktrees`
+		// for the parent-dir convention.
 		cfg.Worktrees.Root = ".worktrees"
 	}
 	if cfg.Worktrees.AsyncCreate == nil {

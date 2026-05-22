@@ -115,6 +115,31 @@ func run() error {
 		}
 	}
 
+	// Auto-resume lifecycle watchers for repos that opted in via
+	// `treeman wt watch on`. The lifecycle watcher tails
+	// `<common-dir>/worktrees/` so `git worktree add`/`remove` run
+	// outside the treeman CLI still fire postcreate / postdelete.
+	// Gated on both the per-repo opt-in row and the resolved config
+	// bool `worktrees.hook_lifecycle`.
+	if repos, err := s.ListLifecycleWatchedRepos(ctx); err == nil {
+		for _, r := range repos {
+			if _, err := os.Stat(r.Path); err != nil {
+				slog.Warn("resume lifecycle watcher skipped (path missing)",
+					"repo", r.Path, "err", err)
+				continue
+			}
+			if !daemon.LifecycleEnabledForRepo(r.Path) {
+				slog.Info("lifecycle watcher skipped (config disabled)", "repo", r.Path)
+				continue
+			}
+			if _, err := daemon.StartLifecycleWatcher(ctx, st, r.ID, r.Path); err != nil {
+				slog.Warn("resume lifecycle watcher failed",
+					"repo", r.Path, "err", err)
+				continue
+			}
+		}
+	}
+
 	// Periodic snapshot GC sweep. Runs at the cadence declared by
 	// `snapshots.retention.gc_interval_minutes` (default 60); each
 	// tick walks every registered repo and evicts cached templates

@@ -257,6 +257,17 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 		}
 	}
 
+	// Lifecycle watcher: gated on both per-repo opt-in
+	// (`repos.watch_lifecycle = 1`) and resolved config
+	// (`worktrees.hook_lifecycle: true`).
+	if optIn, _ := st.Store.GetRepoWatchLifecycle(ctx, repoID); optIn && LifecycleEnabledForRepo(repoPath) {
+		if !st.HasLifecycleWatcher(repoPath) {
+			if _, err := StartLifecycleWatcher(ctx, st, repoID, repoPath); err != nil {
+				slog.Warn("lifecycle watcher start failed", "repo", repoPath, "err", err)
+			}
+		}
+	}
+
 	slog.Info("repo watcher started",
 		"repo", repoPath, "binlog_replicators", binlogReps)
 	return nil
@@ -274,6 +285,12 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 	if st.HasWtWatcher(wtPath) {
 		return nil
 	}
+	// A teardown in flight will rm -rf this checkout shortly; starting
+	// a watcher now just feeds the dispatcher REMOVE events that
+	// re-spawn FinalizeWorktree against a dying tree.
+	if st.IsTeardownInFlight(wtPath) {
+		return nil
+	}
 	cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -287,16 +304,25 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 	}
 
 	wctx, cancel := context.WithCancel(st.BgCtx)
-	entry := &WatcherEntry{
-		RepoPath: repoPath,
-		Cancel:   cancel,
-	}
-
 	dispatch := makeWtFSDispatcher(st, repoPath, repoID, wtPath)
 	w, err := watcher.New(wtPath, cfg.Watcher, dispatch)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("fsnotify watcher init: %w", err)
+	}
+	// Close fsw directly on cancel — the watcher's Start loop selects
+	// against both ctx.Done() and the fsnotify event channel. With a
+	// backlog of REMOVE events (`git worktree remove --force` rm -rf'ing
+	// vendor/, node_modules/) the Go runtime can keep picking events
+	// many times before ctx.Done() wins the select. Closing fsw drains
+	// the channel and forces the loop out immediately. Mirrors
+	// LifecycleWatcher's cancel.
+	entry := &WatcherEntry{
+		RepoPath: repoPath,
+		Cancel: func() {
+			cancel()
+			w.Stop()
+		},
 	}
 	st.RegisterWtWatcher(wtPath, entry)
 	safeGo("wt_fs_watcher:"+wtPath, func() {
@@ -313,6 +339,13 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 // for that worktree.
 func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string) watcher.Dispatcher {
 	return func(ctx context.Context, ev watcher.Event) error {
+		// Drop events while a teardown is in flight — finalising a
+		// worktree the user just asked to delete is a feedback loop
+		// (DB writes against a dying tree, watcher re-registration,
+		// etc.).
+		if st.IsTeardownInFlight(wtPath) {
+			return nil
+		}
 		_ = st.Store.WriteEvent(ctx, "info", "watcher_fired",
 			fmt.Sprintf("%s (%s)", ev.Path, ev.Mode),
 			repoID, 0, "", 0, map[string]string{

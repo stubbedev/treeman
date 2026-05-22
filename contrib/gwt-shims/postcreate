@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-# Drop-in replacement for .gwt-postcreate. Delegates to treeman.
-# Env from gwt: GWT_MAIN (main repo root), GWT_WT (this worktree path).
-set -euo pipefail
-exec treeman hook run postcreate --worktree "$GWT_WT"

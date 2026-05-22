@@ -84,7 +84,7 @@ func IsLinkedWorktree(path string) bool {
 
 // IsWorktreeClean returns true when `git status --porcelain` in the
 // worktree is empty — no uncommitted changes, no untracked files.
-// Used by `wt back --remove-if-clean` and equivalent gwt safety
+// Used by `wt back --remove-if-clean` and equivalent safety
 // checks.
 func IsWorktreeClean(path string) (bool, error) {
 	// `git status` is read-only from treeman's POV but updates the

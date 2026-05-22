@@ -159,9 +159,24 @@ func (s *Store) EnsureRepo(ctx context.Context, path, name string) (int64, error
 // EnsureWorktree upserts a (path, repo_id, slug, branch) and returns
 // the worktree id.
 func (s *Store) EnsureWorktree(ctx context.Context, repoID int64, path, slug, branch string) (int64, error) {
+	return s.EnsureWorktreeWithAdmin(ctx, repoID, path, slug, branch, "")
+}
+
+// EnsureWorktreeWithAdmin is EnsureWorktree plus an `admin_dir`
+// argument — the absolute path of git's per-worktree administrative
+// directory (`<common-dir>/worktrees/<name>/`). The watcher needs
+// this to map a REMOVE event back to the worktree row after the
+// working tree has been deleted. Empty admin_dir is allowed and
+// leaves the column NULL.
+func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path, slug, branch, adminDir string) (int64, error) {
 	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ?", path)
 	var id int64
 	if err := row.Scan(&id); err == nil {
+		if adminDir != "" {
+			_, _ = s.DB.ExecContext(ctx,
+				"UPDATE worktrees SET admin_dir = ? WHERE id = ? AND (admin_dir IS NULL OR admin_dir != ?)",
+				adminDir, id, adminDir)
+		}
 		return id, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
@@ -170,13 +185,133 @@ func (s *Store) EnsureWorktree(ctx context.Context, repoID int64, path, slug, br
 	if branch != "" {
 		br = branch
 	}
+	var ad interface{}
+	if adminDir != "" {
+		ad = adminDir
+	}
 	res, err := s.DB.ExecContext(ctx,
-		"INSERT INTO worktrees(repo_id, path, slug, branch, created_at) VALUES (?, ?, ?, ?, ?)",
-		repoID, path, slug, br, nowMillis())
+		"INSERT INTO worktrees(repo_id, path, slug, branch, admin_dir, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		repoID, path, slug, br, ad, nowMillis())
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// SetWorktreeAdminDir stamps the per-worktree git administrative
+// directory on an existing row. Used by the lifecycle reconcile pass
+// to backfill rows that were created before the column existed.
+func (s *Store) SetWorktreeAdminDir(ctx context.Context, id int64, adminDir string) error {
+	if id <= 0 || adminDir == "" {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx,
+		"UPDATE worktrees SET admin_dir = ? WHERE id = ?", adminDir, id)
+	return err
+}
+
+// LookupWorktreeByAdminDir resolves an admin_dir back to the worktree
+// row. Returns 0 + nil when no row matches.
+func (s *Store) LookupWorktreeByAdminDir(ctx context.Context, adminDir string) (WorktreeRow, error) {
+	row := s.DB.QueryRowContext(ctx, `
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL
+		FROM worktrees WHERE admin_dir = ? ORDER BY id DESC LIMIT 1`, adminDir)
+	var w WorktreeRow
+	var deleted bool
+	if err := row.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &deleted); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WorktreeRow{}, nil
+		}
+		return WorktreeRow{}, err
+	}
+	w.Deleted = deleted
+	return w, nil
+}
+
+// WorktreeRow is the lifecycle-watcher view of a worktrees row.
+type WorktreeRow struct {
+	ID       int64
+	RepoID   int64
+	Path     string
+	Slug     string
+	Branch   string
+	AdminDir string
+	Deleted  bool
+}
+
+// ListWorktreesForRepo returns every worktree row attached to repoID,
+// including deleted ones. Used by the lifecycle reconcile pass to
+// diff the DB against the filesystem.
+func (s *Store) ListWorktreesForRepo(ctx context.Context, repoID int64) ([]WorktreeRow, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL
+		FROM worktrees WHERE repo_id = ? ORDER BY id`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WorktreeRow
+	for rows.Next() {
+		var w WorktreeRow
+		if err := rows.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &w.Deleted); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// SetRepoWatchLifecycle toggles the per-repo lifecycle-watcher opt-in
+// flag. The watcher only acts on repos where this is 1 AND the global
+// `worktrees.hook_lifecycle` config bool is true.
+func (s *Store) SetRepoWatchLifecycle(ctx context.Context, repoID int64, on bool) error {
+	v := 0
+	if on {
+		v = 1
+	}
+	_, err := s.DB.ExecContext(ctx,
+		"UPDATE repos SET watch_lifecycle = ? WHERE id = ?", v, repoID)
+	return err
+}
+
+// GetRepoWatchLifecycle returns the current opt-in flag for repoID.
+func (s *Store) GetRepoWatchLifecycle(ctx context.Context, repoID int64) (bool, error) {
+	row := s.DB.QueryRowContext(ctx, "SELECT watch_lifecycle FROM repos WHERE id = ?", repoID)
+	var v int
+	if err := row.Scan(&v); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return v != 0, nil
+}
+
+// ListLifecycleWatchedRepos returns every repo (path + id) where
+// watch_lifecycle = 1. Used by the daemon at boot to subscribe.
+func (s *Store) ListLifecycleWatchedRepos(ctx context.Context) ([]RepoRef, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		"SELECT id, path FROM repos WHERE watch_lifecycle = 1 ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RepoRef
+	for rows.Next() {
+		var r RepoRef
+		if err := rows.Scan(&r.ID, &r.Path); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RepoRef is the minimal (id, path) view used by the daemon to
+// subscribe lifecycle watchers without loading the whole repo row.
+type RepoRef struct {
+	ID   int64
+	Path string
 }
 
 // MarkWorktreeDeleted sets the worktree's `deleted_at` to now.

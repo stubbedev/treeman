@@ -1,26 +1,26 @@
-# treeman gwt-compatible zsh shim.
+# treeman zsh shim — `tm` shell wrapper around `treeman wt`.
 #
 # `treeman wt switch` + `treeman wt back` print resolved paths on
-# stdout; this function wraps them so `gwt foo` and `gwt -` change
+# stdout; this function wraps them so `tm foo` and `tm -` change
 # directory in the parent shell.
 #
 # Install: source this file from your .zshrc (or symlink into
 # ~/.config/zsh/functions and `autoload`):
 #
-#     source /path/to/treeman/contrib/shim.zsh
+#     source /path/to/treeman/contrib/tm.zsh
 #
 # Usage:
-#     gwt PROJ-1234         # cd to existing worktree, or report missing
-#     gwt PROJ-1234 -c      # create + cd to a new worktree
-#     gwt -                 # cd back to main repo
-#     gwt - --remove        # cd back + drop current wt (if clean)
-#     gwt list              # passthrough to `treeman wt list`
-#     gwt new FOO           # passthrough; useful when --create needs flags
+#     tm PROJ-1234         # cd to existing worktree, or report missing
+#     tm PROJ-1234 -c      # create + cd to a new worktree
+#     tm -                 # cd back to main repo
+#     tm - --remove        # cd back + drop current wt (if clean)
+#     tm list              # passthrough to `treeman wt list`
+#     tm new FOO           # passthrough; useful when --create needs flags
 #
 # All flags after the target name are forwarded to the underlying
 # `treeman wt switch`/`treeman wt back` invocation.
 
-gwt() {
+tm() {
   emulate -L zsh
   if (( $# == 0 )); then
     treeman wt list
@@ -44,8 +44,8 @@ gwt() {
       ;;
     new|create)
       shift
-      # `gwt new BRANCH [...]` → forward to switch --create so the
-      # cd-after-create UX is the same as the bare `gwt BRANCH -c`
+      # `tm new BRANCH [...]` → forward to switch --create so the
+      # cd-after-create UX is the same as the bare `tm BRANCH -c`
       # form.
       local branch="$1"
       shift || true
@@ -58,12 +58,12 @@ gwt() {
       ;;
     -h|--help|help)
       cat <<'USAGE'
-gwt — treeman shim
-  gwt <name>           cd to existing worktree
-  gwt <name> -c        create + cd to new worktree
-  gwt new <name>       same as `gwt <name> -c`
-  gwt - [--remove]     cd back to main repo (with --remove: drop current wt if clean)
-  gwt list             list active worktrees
+tm — treeman shim
+  tm <name>           cd to existing worktree
+  tm <name> -c        create + cd to new worktree
+  tm new <name>       same as `tm <name> -c`
+  tm - [--remove]     cd back to main repo (with --remove: drop current wt if clean)
+  tm list             list active worktrees
 USAGE
       return 0
       ;;
@@ -95,9 +95,9 @@ USAGE
 
 # Completion: complete worktree names from `treeman wt list`.
 # NO_COLOR=1 suppresses ANSI escapes so the SLUG column parses cleanly.
-_gwt_complete() {
+_tm_complete() {
   local -a names
   names=("${(@f)$(NO_COLOR=1 treeman wt list 2>/dev/null | awk 'NR>1 {print $2}')}")
   _describe 'worktree' names
 }
-compdef _gwt_complete gwt 2>/dev/null || true
+compdef _tm_complete tm 2>/dev/null || true

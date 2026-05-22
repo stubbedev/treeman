@@ -36,6 +36,7 @@ func WorktreeCmd() *cli.Command {
 			wtDelete(),
 			wtRegister(),
 			wtUnregister(),
+			wtWatch(),
 			wtList(),
 			wtShow(),
 			wtLogs(),
@@ -128,8 +129,7 @@ Examples:
 			// Git worktree add. Default base = origin/HEAD if -b
 			// missing. Pre-fetch + prefer origin/<base> so a stale
 			// local ref doesn't silently base the new branch on
-			// yesterday's commit (parity with the gwt
-			// `_resolve_base` heuristic; opt-out via --no-fetch).
+			// yesterday's commit (opt-out via --no-fetch).
 			base := c.String("from")
 			if base == "" {
 				base = detectDefaultBranch(repoRoot)
@@ -479,10 +479,9 @@ Examples:
 
 // pruneEmptyParents walks up from `start` removing now-empty
 // directories until we leave `wtRoot` (the configured worktrees
-// root). Mirrors the zsh `gwtd`/`gwtc` cleanup so an empty
-// `.worktrees/feature/` doesn't linger after deleting
-// `.worktrees/feature/foo`. Best-effort: any rmdir error stops
-// the walk (e.g. parent is not empty, or permissions).
+// root). Prevents an empty `.worktrees/feature/` from lingering
+// after deleting `.worktrees/feature/foo`. Best-effort: any rmdir
+// error stops the walk (e.g. parent is not empty, or permissions).
 func pruneEmptyParents(start, wtRoot string) {
 	if start == "" || wtRoot == "" {
 		return
@@ -566,6 +565,100 @@ func wtUnregister() *cli.Command {
 				return fmt.Errorf("worktree not found: %s", path)
 			}
 			return st.MarkWorktreeDeleted(ctx, id)
+		},
+	}
+}
+
+// wtWatch — `treeman wt watch [on|off|status]` toggles the per-repo
+// opt-in flag for the daemon's lifecycle watcher. When ON (and the
+// resolved config has `worktrees.hook_lifecycle: true`), the daemon
+// tails `<common-dir>/worktrees/` and fires postcreate / postdelete
+// for `git worktree add`/`remove` runs that bypass the treeman CLI.
+//
+// Two gates must be set for the watcher to act on a repo:
+//   - config bool (default false; layered global + per-repo)
+//   - this DB opt-in (set via `treeman wt watch on`)
+func wtWatch() *cli.Command {
+	return &cli.Command{
+		Name:      "watch",
+		Usage:     "toggle lifecycle-watcher opt-in (on|off|status)",
+		ArgsUsage: "<on|off|status>",
+		Description: `Marks the current repo as opted-in (or out) of the daemon's
+lifecycle watcher. With opt-in ON, the daemon fires postcreate /
+postdelete hooks automatically when 'git worktree add' or
+'git worktree remove' is invoked outside the treeman CLI.
+
+Both this opt-in AND the resolved config bool
+'worktrees.hook_lifecycle: true' must be set for the watcher to
+activate. Default config is OFF.
+
+Examples:
+  treeman wt watch on
+  treeman wt watch off
+  treeman wt watch status`,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			action := "status"
+			if c.NArg() >= 1 {
+				action = strings.ToLower(c.Args().First())
+			}
+			repoRoot, err := resolveRepo(c.String("repo"))
+			if err != nil {
+				return err
+			}
+			cfg, err := resolve.LoadResolved(repoRoot)
+			if err != nil {
+				return err
+			}
+			dbPath, _ := store.DefaultDBPath()
+			st, err := store.Open(ctx, dbPath)
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+			if err != nil {
+				return err
+			}
+			configEnabled := cfg.Worktrees.HookLifecycle != nil && *cfg.Worktrees.HookLifecycle
+			switch action {
+			case "on", "enable":
+				if err := st.SetRepoWatchLifecycle(ctx, repoID, true); err != nil {
+					return err
+				}
+				PrintOK("lifecycle watcher: opted IN for %s", repoRoot)
+				if !configEnabled {
+					PrintWarn("config gate is OFF — set `worktrees.hook_lifecycle: true` in .treeman.yaml or your global config to activate")
+				}
+				// Notify the daemon to (re)start the watcher pipeline
+				// for this repo. The watcher_start path picks up the
+				// opt-in via the new DB column.
+				if resp, err := rpc.Call(ctx, rpc.Request{
+					Method:       rpc.MethodWatcherStart,
+					WatcherStart: &rpc.WatcherStartArgs{RepoPath: repoRoot},
+				}); err == nil && resp.Kind == rpc.KindError {
+					PrintWarn("daemon: %s", resp.Message)
+				}
+				return nil
+			case "off", "disable":
+				if err := st.SetRepoWatchLifecycle(ctx, repoID, false); err != nil {
+					return err
+				}
+				PrintOK("lifecycle watcher: opted OUT for %s", repoRoot)
+				PrintInfo("the daemon-side watcher stops on the next watcher_stop or daemon restart")
+				return nil
+			case "status", "":
+				on, _ := st.GetRepoWatchLifecycle(ctx, repoID)
+				fmt.Printf("repo:           %s\n", repoRoot)
+				fmt.Printf("opt-in (db):    %v\n", on)
+				fmt.Printf("config gate:    %v\n", configEnabled)
+				active := on && configEnabled
+				fmt.Printf("watcher active: %v\n", active)
+				return nil
+			}
+			return fmt.Errorf("usage: treeman wt watch <on|off|status>")
 		},
 	}
 }
@@ -1236,8 +1329,8 @@ func wtResolve() *cli.Command {
 
 // wtPrev — `treeman wt prev`. Prints the path of the previously-
 // visited worktree for the current repo (most recent
-// last_visited_at, excluding cwd). Beats `$_GWT_LAST` because the
-// timestamp lives in SQLite — toggling works across shells.
+// last_visited_at, excluding cwd). The timestamp lives in SQLite so
+// toggling works across shells.
 func wtPrev() *cli.Command {
 	return &cli.Command{
 		Name:  "prev",

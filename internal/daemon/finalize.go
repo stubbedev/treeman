@@ -87,12 +87,21 @@ func FinalizeWorktree(
 // Runs predelete hooks + DB teardown + `git worktree remove`. All
 // in the daemon's runtime so the CLI returns immediately.
 //
-// Serialised per repo via st.LockRepoTeardown — two fast-fire gwtd
-// invocations on the same repo queue instead of running concurrent
-// `git worktree remove --force` + DROP DATABASE storms. The mutex
-// is held for the entire goroutine; this is intentional. A single
-// teardown on a Laravel vendor+node_modules tree is heavy enough on
-// its own; doubling it can lock the host.
+// Serialised per repo via st.LockRepoTeardown — two fast-fire
+// teardown invocations on the same repo queue instead of running
+// concurrent `git worktree remove --force` + DROP DATABASE storms.
+// The mutex is held for the entire goroutine; this is intentional. A
+// single teardown on a Laravel vendor+node_modules tree is heavy
+// enough on its own; doubling it can lock the host.
+//
+// Watchers die FIRST — before the per-repo mutex, before any config
+// load. `git worktree remove --force` rm -rf's the checkout; if the
+// per-worktree fsnotify watcher is still draining events from that
+// rm storm, each match queues a dispatch that fires FinalizeWorktree
+// for the worktree being deleted (re-creating DB resources mid-
+// teardown). The in-flight marker also tells the lifecycle watcher
+// to skip spawning an orphan teardown when its admin-dir REMOVE
+// event fires.
 func TeardownWorktree(
 	ctx context.Context,
 	st *State,
@@ -100,35 +109,49 @@ func TeardownWorktree(
 	force bool,
 	inheritedEnv map[string]string,
 ) error {
+	repoRoot := repoPath
+	wtRoot := worktreePath
+
+	st.UnregisterWtWatcher(wtRoot)
+	if !st.MarkTeardownInFlight(wtRoot) {
+		return nil
+	}
+	defer st.UnmarkTeardownInFlight(wtRoot)
+
 	mu := st.LockRepoTeardown(repoPath)
 	mu.Lock()
 	defer mu.Unlock()
 
-	repoRoot := repoPath
-	wtRoot := worktreePath
 	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
 	if err != nil {
 		return err
 	}
-	branch := detectBranch(wtRoot)
-	sl := slug.For(wtRoot, branch)
-	repoName := filepath.Base(repoRoot)
-	repoID, err := st.Store.EnsureRepo(ctx, repoRoot, repoName)
+
+	repoID, err := st.Store.LookupRepoID(ctx, repoRoot)
 	if err != nil {
 		return err
 	}
-	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wtRoot, sl.Value, branch)
+	row, err := lookupWorktreeByPath(ctx, st.Store, wtRoot)
 	if err != nil {
 		return err
 	}
+	if row.ID == 0 || row.Deleted {
+		// Unregistered / already-deleted row — nothing to tear down
+		// from treeman's side. Still honour --force by letting git
+		// reap a stale checkout if one happens to remain on disk.
+		if force {
+			gitArgs := []string{"-C", repoRoot, "worktree", "remove", "--force", wtRoot}
+			_ = lowPriorityCommand(ctx, "git", gitArgs).Run()
+			pruneEmptyParentsBelow(wtRoot, worktreesRootOf(cfg.Worktrees.Root, repoRoot))
+		}
+		return nil
+	}
+	wtID := row.ID
+	slugVal := row.Slug
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_start",
 		"daemon-detached predelete + db teardown + git remove beginning",
 		repoID, wtID, "", 0, nil)
-
-	// Stop the per-worktree fsnotify watcher before the checkout is
-	// removed — otherwise it would log "no such file" on shutdown.
-	st.UnregisterWtWatcher(wtRoot)
 
 	if len(cfg.Hooks.Predelete) > 0 {
 		// Same await rationale as postcreate above: predelete teardown
@@ -136,10 +159,10 @@ func TeardownWorktree(
 		// `TeardownDatabases` blows away the SQL state they may still
 		// be using.
 		_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete,
-			repoRoot, wtRoot, sl.Value, inheritedEnv, true)
+			repoRoot, wtRoot, slugVal, inheritedEnv, true)
 	}
 
-	if err := prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st.Store); err != nil {
+	if err := prepare.TeardownDatabases(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
 		return err
 	}
 

@@ -887,7 +887,7 @@
       "properties": {
         "root": {
           "type": "string",
-          "description": "Path (relative to the main worktree) where new worktrees are\ncreated. Defaults to `.worktrees` to match the\n`dotfiles gwt` zsh convention. Override with e.g.\n`../foo-worktrees` for the sibling-dir convention."
+          "description": "Path (relative to the main worktree) where new worktrees are\ncreated. Defaults to `.worktrees`. Override with e.g.\n`../foo-worktrees` for the parent-dir convention."
         },
         "links": {
           "items": {
@@ -903,6 +903,10 @@
         "async_delete": {
           "type": "boolean",
           "description": "When true (default), predelete + postdelete hooks run async."
+        },
+        "hook_lifecycle": {
+          "type": "boolean",
+          "description": "When true, the daemon watches `<common-dir>/worktrees/` via\nfsnotify and fires `postcreate` / `postdelete` automatically\nwhen `git worktree add`/`remove` runs outside the treeman CLI.\nDefault false. Even when true globally, a repo must be opted\nin via `treeman wt watch on` — both gates must be set for the\nwatcher to act on a given repo."
         }
       },
       "additionalProperties": false,

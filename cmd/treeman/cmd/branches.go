@@ -14,9 +14,9 @@ import (
 
 // BranchesCmd — `treeman branches`. Unified local + remote-only
 // branch list with a per-branch occupancy column (which live
-// worktree, if any, has it checked out). Replaces the shell-side
-// `_list_git_branches` + occupied-set subtraction that gwt does on
-// every invocation; lets gwt's fzf picker work from one JSON call.
+// worktree, if any, has it checked out). Lets an fzf picker work
+// from one JSON call instead of forking `git for-each-ref` plus a
+// per-branch `git worktree list` filter.
 func BranchesCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "branches",
@@ -118,9 +118,8 @@ func BranchesCmd() *cli.Command {
 
 // listGitBranches returns local branch names (or origin-remote
 // branches with the `origin/` prefix stripped + HEAD pseudo-ref
-// dropped). One git fork per call — same approach as gwt's
-// `_list_git_branches` but driven by `%(refname)` so no markers /
-// colors leak into the output.
+// dropped). One git fork per call, driven by `%(refname)` so no
+// markers / colors leak into the output.
 func listGitBranches(repoRoot string, remote bool) []string {
 	var args []string
 	if remote {
@@ -153,8 +152,8 @@ func listGitBranches(repoRoot string, remote bool) []string {
 }
 
 // branchOccupancy returns branch → worktree-path for every live
-// worktree of `repoRoot`. One SQLite round-trip — way cheaper than
-// gwt's per-worktree `git worktree list --porcelain` parse.
+// worktree of `repoRoot`. One SQLite round-trip — cheaper than a
+// per-worktree `git worktree list --porcelain` parse.
 func branchOccupancy(ctx context.Context, repoRoot string) map[string]string {
 	dbPath, err := store.DefaultDBPath()
 	if err != nil {

@@ -3,8 +3,8 @@
 // their per-engine namespace across treeman upgrades.
 //
 // The SysV cksum reimplementation matches POSIX `cksum` byte-for-
-// byte so existing `.gwt-postcreate` shell hooks that compute the
-// same redis indices agree with treeman's slugs.
+// byte so external shell hooks that compute the same redis indices
+// agree with treeman's slugs.
 package slug
 
 import (
@@ -42,8 +42,7 @@ func (s Slug) Dashed() string {
 }
 
 // RedisIndices returns (queue_db, cache_db), each in 6..15, derived
-// deterministically from the slug via POSIX `cksum`. Matches the
-// bash `.gwt-postcreate` hook's algorithm exactly.
+// deterministically from the slug via POSIX `cksum`.
 func (s Slug) RedisIndices() (queueDB, cacheDB uint8) {
 	h := sysvCksum([]byte(s.Value))
 	queueDB = uint8(h%10 + 6)

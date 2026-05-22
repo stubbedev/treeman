@@ -47,6 +47,75 @@ type GroupOutcome struct {
 	StderrTail string
 }
 
+// RunHooksOrphan is the lifecycle-watcher variant of RunHooks. The
+// working tree at `worktreePath` no longer exists (a `git worktree
+// remove` outside the treeman CLI already deleted it), so:
+//
+//   - log files cannot live under the working tree — they are written
+//     to `logDir` instead (the daemon owns a per-repo path under
+//     XDG_STATE_HOME for this).
+//   - drivers cwd into `repoRoot` instead of `worktreePath`. User
+//     scripts that want the deleted-tree path read it from the
+//     `TREEMAN_WORKTREE` env var.
+//
+// Otherwise identical to RunHooks: each group spawns one detached
+// setsid driver; when `wait` is true the call blocks until they all
+// exit.
+func RunHooksOrphan(
+	ctx context.Context,
+	phase string,
+	entries []config.HookEntry,
+	repoRoot, worktreePath, slug, logDir string,
+	inheritedEnv map[string]string,
+	wait bool,
+) (RunOutcome, error) {
+	out := RunOutcome{}
+	if len(entries) == 0 {
+		return out, nil
+	}
+	if logDir == "" {
+		return out, fmt.Errorf("RunHooksOrphan: empty logDir")
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return out, fmt.Errorf("create %s: %w", logDir, err)
+	}
+	out.Groups = make([]GroupOutcome, 0, len(entries))
+	cmds := make([]*exec.Cmd, 0, len(entries))
+	for i, entry := range entries {
+		if len(entry.Steps) == 0 {
+			continue
+		}
+		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
+		// Default cwd is the repo root, not the (deleted) worktree.
+		cmdStr, err := renderGroupForEntry(entry, repoRoot)
+		if err != nil {
+			return out, err
+		}
+		c, err := spawnDetached(cmdStr, repoRoot, worktreePath, repoRoot, slug, logPath, inheritedEnv, wait)
+		if err != nil {
+			return out, err
+		}
+		cmds = append(cmds, c)
+		out.Groups = append(out.Groups, GroupOutcome{
+			Command: cmdStr,
+			PID:     c.Process.Pid,
+			LogPath: logPath,
+		})
+	}
+	if wait {
+		for idx, c := range cmds {
+			if err := c.Wait(); err != nil {
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					out.Groups[idx].ExitCode = exitErr.ExitCode()
+				} else {
+					out.Groups[idx].ExitCode = -1
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
 // RunHooks spawns one detached setsid driver per group, in parallel.
 // Logs go to `<worktree>/.treeman-hooks/<phase>-<group-idx>.log`.
 //
@@ -86,7 +155,7 @@ func RunHooks(
 		if err != nil {
 			return out, err
 		}
-		c, err := spawnDetached(cmdStr, worktreePath, repoRoot, slug, logPath, inheritedEnv, wait)
+		c, err := spawnDetached(cmdStr, worktreePath, worktreePath, repoRoot, slug, logPath, inheritedEnv, wait)
 		if err != nil {
 			return out, err
 		}
@@ -227,10 +296,16 @@ func shellSingleQuote(s string) string {
 // spawnDetached forks a `setsid /bin/sh -c <cmd>` child with
 // stdout+stderr redirected to logPath. Env is cleared then layered
 // with the caller's inheritedEnv plus the three standard overlay
-// vars (GWT_MAIN, GWT_WT, TREEMAN_SLUG). Returns the *exec.Cmd so
-// the caller can either reap it inline (`Wait()` on the wait=true
-// path) or fire-and-forget via a detached goroutine.
-func spawnDetached(cmdStr, worktreePath, repoRoot, slug, logPath string, inheritedEnv map[string]string, wait bool) (*exec.Cmd, error) {
+// vars (TREEMAN_MAIN_ROOT, TREEMAN_WORKTREE, TREEMAN_SLUG). Returns
+// the *exec.Cmd so the caller can either reap it inline (`Wait()`
+// on the wait=true path) or fire-and-forget via a detached goroutine.
+//
+// `cwd` is the child's working directory. For the normal flow this
+// equals `worktreePath`; for the lifecycle-orphan flow (worktree
+// already deleted) it is the repo root, while `worktreePath` is the
+// deleted absolute path — surfaced in the env so user scripts can
+// still reference it.
+func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug, logPath string, inheritedEnv map[string]string, wait bool) (*exec.Cmd, error) {
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open hook log %s: %w", logPath, err)
@@ -238,7 +313,7 @@ func spawnDetached(cmdStr, worktreePath, repoRoot, slug, logPath string, inherit
 	defer logFile.Close()
 
 	c := exec.Command("/bin/sh", "-c", cmdStr)
-	c.Dir = worktreePath
+	c.Dir = cwd
 	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug)
 	c.Stdout = logFile
 	c.Stderr = logFile
@@ -297,8 +372,8 @@ func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug strin
 		out = append(out, k+"="+v)
 	}
 	out = append(out,
-		"GWT_MAIN="+repoRoot,
-		"GWT_WT="+worktreePath,
+		"TREEMAN_MAIN_ROOT="+repoRoot,
+		"TREEMAN_WORKTREE="+worktreePath,
 		"TREEMAN_SLUG="+slug,
 	)
 	return out
