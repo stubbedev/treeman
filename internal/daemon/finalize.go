@@ -135,10 +135,10 @@ func TeardownWorktree(
 	if err != nil {
 		return err
 	}
-	if row.ID == 0 || row.Deleted {
-		// Unregistered / already-deleted row — nothing to tear down
-		// from treeman's side. Still honour --force by letting git
-		// reap a stale checkout if one happens to remain on disk.
+	if row.ID == 0 {
+		// No DB row at all — nothing to tear down from treeman's
+		// side. Still honour --force by letting git reap a stale
+		// checkout if one happens to remain on disk.
 		if force {
 			mu := st.LockRepoTeardown(repoPath)
 			mu.Lock()
@@ -148,6 +148,20 @@ func TeardownWorktree(
 			mu.Unlock()
 		}
 		return nil
+	}
+	if row.Deleted {
+		// Row already marked deleted. Two sub-cases:
+		//   - working tree gone too → fully cleaned up, no-op.
+		//   - working tree still on disk → orphan from an earlier
+		//     aborted teardown (or from before the EnsureWorktree
+		//     resurrection fix). Run the full sequence anyway —
+		//     every step below is idempotent so the second pass
+		//     just finishes what the first one didn't.
+		if _, statErr := os.Stat(wtRoot); statErr != nil {
+			return nil
+		}
+		slog.Info("teardown: orphan recovery — row deleted but working tree on disk",
+			"wt", wtRoot, "id", row.ID)
 	}
 	wtID := row.ID
 	slugVal := row.Slug

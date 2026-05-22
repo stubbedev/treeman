@@ -347,10 +347,29 @@ func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path,
 	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ?", path)
 	var id int64
 	if err := row.Scan(&id); err == nil {
+		// Resurrect: when a worktree is re-created at the path of a
+		// previously-deleted row we MUST clear deleted_at and refresh
+		// slug/branch. Without this the row stays marked deleted, and
+		// the next TeardownWorktree short-circuits on the
+		// `row.Deleted` check so predelete + db drop + git remove
+		// never run and the working tree lingers on disk forever.
+		// Also keep admin_dir current.
+		var br interface{}
+		if branch != "" {
+			br = branch
+		}
+		var ad interface{}
 		if adminDir != "" {
-			_, _ = s.DB.ExecContext(ctx,
-				"UPDATE worktrees SET admin_dir = ? WHERE id = ? AND (admin_dir IS NULL OR admin_dir != ?)",
-				adminDir, id, adminDir)
+			ad = adminDir
+		}
+		if _, err := s.DB.ExecContext(ctx, `
+			UPDATE worktrees
+			SET slug = ?,
+			    branch = COALESCE(?, branch),
+			    admin_dir = COALESCE(?, admin_dir),
+			    deleted_at = NULL
+			WHERE id = ?`, slug, br, ad, id); err != nil {
+			return 0, err
 		}
 		return id, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
