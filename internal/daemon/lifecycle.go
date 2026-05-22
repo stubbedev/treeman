@@ -190,6 +190,32 @@ func (lw *LifecycleWatcher) onCreate(ctx context.Context, adminDir string) {
 	lw.seen[adminDir] = wtPath
 	lw.mu.Unlock()
 
+	// CLI coexistence guards. `treeman wt create` shells out to
+	// `git worktree add` which fires the same fsnotify CREATE event
+	// we're handling here — without these checks the CLI flow and
+	// the lifecycle flow both register the worktree and both run
+	// postcreate hooks, fighting on file locks (composer install
+	// twice, npm install twice).
+	//
+	// Two-layer dedup:
+	//   1. Active DB row at wtPath → CLI's EnsureWorktree got here
+	//      first. CLI is taking responsibility; skip.
+	//   2. FinalizeWorktree already in flight for wtPath → another
+	//      caller is already running the hooks; skip.
+	//
+	// True external `git worktree add` (no CLI) trips neither guard:
+	// the row doesn't exist yet, no finalize is in flight, so the
+	// watcher proceeds to register + finalize.
+	if existing, err := lw.st.Store.LookupActiveWorktreeByPath(ctx, wtPath); err == nil && existing.ID != 0 {
+		slog.Debug("lifecycle: skip postcreate (CLI already registered)",
+			"wt", wtPath, "id", existing.ID)
+		return
+	}
+	if lw.st.IsFinalizeInFlight(wtPath) {
+		slog.Debug("lifecycle: skip postcreate (finalize already in flight)", "wt", wtPath)
+		return
+	}
+
 	branch := detectBranch(wtPath)
 	sl := slug.For(wtPath, branch)
 	if _, err := lw.st.Store.EnsureWorktreeWithAdmin(ctx, lw.repoID, wtPath, sl.Value, branch, adminDir); err != nil {

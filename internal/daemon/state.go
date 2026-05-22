@@ -48,6 +48,7 @@ type State struct {
 	// behind the primary's mutex.
 	inFlightMu        sync.Mutex
 	inFlightTeardowns map[string]struct{}
+	inFlightFinalizes map[string]struct{}
 
 	// reapQueuesMu guards reapQueues. Each repo gets a single worker
 	// goroutine draining a buffered channel of trash paths — bursty
@@ -102,6 +103,7 @@ func NewState(bg context.Context, s *store.Store) *State {
 		lifecycleWatchers: map[string]*WatcherEntry{},
 		teardownLks:       map[string]*sync.Mutex{},
 		inFlightTeardowns: map[string]struct{}{},
+		inFlightFinalizes: map[string]struct{}{},
 		reapQueues:        map[string]chan string{},
 		dropQueues:        map[string]chan DBDropJob{},
 	}
@@ -134,6 +136,48 @@ func (st *State) UnmarkTeardownInFlight(wtPath string) {
 func (st *State) IsTeardownInFlight(wtPath string) bool {
 	st.inFlightMu.Lock()
 	_, ok := st.inFlightTeardowns[wtPath]
+	st.inFlightMu.Unlock()
+	return ok
+}
+
+// MarkFinalizeInFlight records that a FinalizeWorktree goroutine is
+// running for wtPath. Returns false when another finalize is
+// already in flight for the same wtPath — caller should return
+// early to avoid double-firing postcreate hooks. The caller MUST
+// invoke UnmarkFinalizeInFlight on exit.
+//
+// Why this exists: when the lifecycle watcher is enabled, the
+// `git worktree add` shelled out by `treeman wt create` itself
+// generates an fsnotify CREATE event that the watcher debounces
+// and then dispatches FinalizeWorktree against. Without dedup, the
+// CLI-initiated finalize and the watcher-initiated finalize run in
+// parallel — both fire postcreate hooks (composer install, npm
+// install, …) and both call prepare, fighting each other on file
+// locks.
+func (st *State) MarkFinalizeInFlight(wtPath string) bool {
+	st.inFlightMu.Lock()
+	defer st.inFlightMu.Unlock()
+	if _, exists := st.inFlightFinalizes[wtPath]; exists {
+		return false
+	}
+	st.inFlightFinalizes[wtPath] = struct{}{}
+	return true
+}
+
+// UnmarkFinalizeInFlight clears the in-flight marker for wtPath.
+func (st *State) UnmarkFinalizeInFlight(wtPath string) {
+	st.inFlightMu.Lock()
+	delete(st.inFlightFinalizes, wtPath)
+	st.inFlightMu.Unlock()
+}
+
+// IsFinalizeInFlight reports whether a FinalizeWorktree is
+// currently running for wtPath. The lifecycle watcher uses this
+// (alongside the active-row check) to suppress its own dispatch
+// when the CLI is already handling the create.
+func (st *State) IsFinalizeInFlight(wtPath string) bool {
+	st.inFlightMu.Lock()
+	_, ok := st.inFlightFinalizes[wtPath]
 	st.inFlightMu.Unlock()
 	return ok
 }

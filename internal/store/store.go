@@ -404,6 +404,28 @@ func (s *Store) SetWorktreeAdminDir(ctx context.Context, id int64, adminDir stri
 	return err
 }
 
+// LookupActiveWorktreeByPath returns the non-deleted worktree row
+// for `path`, or a zero-value row when nothing matches. Used by the
+// lifecycle watcher to detect when the CLI's wt-create flow has
+// already registered a worktree at the same path — in which case
+// the watcher must NOT spawn its own duplicate postcreate /
+// FinalizeWorktree, or composer install / npm install fight on
+// file locks.
+func (s *Store) LookupActiveWorktreeByPath(ctx context.Context, path string) (WorktreeRow, error) {
+	row := s.DB.QueryRowContext(ctx, `
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), 0
+		FROM worktrees WHERE path = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`, path)
+	var w WorktreeRow
+	var deleted int
+	if err := row.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &deleted); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WorktreeRow{}, nil
+		}
+		return WorktreeRow{}, err
+	}
+	return w, nil
+}
+
 // LookupWorktreeByAdminDir resolves an admin_dir back to the worktree
 // row. Returns 0 + nil when no row matches.
 func (s *Store) LookupWorktreeByAdminDir(ctx context.Context, adminDir string) (WorktreeRow, error) {

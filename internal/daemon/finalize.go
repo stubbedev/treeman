@@ -27,6 +27,20 @@ func FinalizeWorktree(
 ) error {
 	repoRoot := repoPath
 	wtRoot := worktreePath
+
+	// Dedup against concurrent finalize attempts on the same wtPath
+	// — both the CLI's wt-create dispatch AND the lifecycle watcher
+	// can race to call this for the same worktree when the watcher
+	// is enabled. The watcher already gates on the active-row check,
+	// but this is the belt to that braces: even if a second caller
+	// slips through (e.g. an explicit `treeman wt finalize` while
+	// one is still running), it returns immediately instead of
+	// re-running postcreate hooks in parallel.
+	if !st.MarkFinalizeInFlight(wtRoot) {
+		return nil
+	}
+	defer st.UnmarkFinalizeInFlight(wtRoot)
+
 	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
 	if err != nil {
 		return err
