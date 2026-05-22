@@ -27,9 +27,18 @@ install:
 fmt:
     gofmt -w ./cmd ./internal
 
-# Strict gofmt check — fails CI if anything is unformatted.
-# Prints the diff on failure so the file + change is obvious.
-lint:
+# Auto-fix formatting drift, then vet. Same dev contract as the
+# sync-schema / sync-docs / sync-flake recipes: anything that *can*
+# be regenerated *is* regenerated, and the release flow commits the
+# diff. CI uses a separate read-only gofmt check (in ci.yml) as the
+# strict gate so a broken `just lint` never silently re-fixes the
+# CI workspace.
+lint: fmt
+    go vet ./...
+
+# Strict read-only gofmt check — same logic CI runs, exposed for
+# local pre-push verification.
+lint-check:
     #!/usr/bin/env bash
     set -euo pipefail
     out=$(gofmt -l ./cmd ./internal)
