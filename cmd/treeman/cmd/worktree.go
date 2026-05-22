@@ -461,6 +461,18 @@ Examples:
 				_, _ = hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete, repoRoot, wtPath, sl.Value, env, true)
 			}
 			_ = prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st)
+			// Mark deleted BEFORE `git worktree remove`. The remove
+			// fires the fsnotify REMOVE event the daemon's lifecycle
+			// watcher subscribes to; if the row isn't already marked
+			// deleted by the time onRemove looks it up, the watcher
+			// spawns a duplicate teardownOrphan that re-runs
+			// postdelete + DB drop. Marking deleted first closes the
+			// window — onRemove's deleted-check short-circuits. If
+			// the git remove subsequently fails, the row is left
+			// falsely marked deleted; a re-run of `treeman wt delete`
+			// resurrects it via EnsureWorktree (deleted_at cleared)
+			// before retrying.
+			_ = st.MarkWorktreeDeleted(ctx, wtID)
 			args := []string{"worktree", "remove"}
 			if c.Bool("force") {
 				args = append(args, "--force")
@@ -469,7 +481,6 @@ Examples:
 			if err := gitcmd.RunPiped(ctx, repoRoot, os.Stdout, os.Stderr, args...); err != nil && !c.Bool("force") {
 				return fmt.Errorf("git worktree remove: %w", err)
 			}
-			_ = st.MarkWorktreeDeleted(ctx, wtID)
 			pruneEmptyParents(wtPath, resolveWorktreesRoot(cfg, repoRoot))
 			PrintOK("deleted worktree #%d (%s)", wtID, wtPath)
 			return nil
