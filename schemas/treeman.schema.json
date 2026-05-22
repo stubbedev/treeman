@@ -887,7 +887,7 @@
       "properties": {
         "root": {
           "type": "string",
-          "description": "Path (relative to the main worktree) where new worktrees are\ncreated. Defaults to `.worktrees`. Override with e.g.\n`../foo-worktrees` for the parent-dir convention."
+          "description": "Path (relative to the main worktree) where new worktrees are\ncreated. Defaults to `.worktrees`. Override with e.g.\n`../foo-worktrees` for the sibling-dir convention."
         },
         "links": {
           "items": {
@@ -906,7 +906,7 @@
         },
         "hook_lifecycle": {
           "type": "boolean",
-          "description": "When true, the daemon watches `<common-dir>/worktrees/` via\nfsnotify and fires `postcreate` / `postdelete` automatically\nwhen `git worktree add`/`remove` runs outside the treeman CLI.\nDefault false. Even when true globally, a repo must be opted\nin via `treeman wt watch on` — both gates must be set for the\nwatcher to act on a given repo."
+          "description": "When true, the daemon watches `\u003ccommon-dir\u003e/worktrees/` via\nfsnotify and fires `postcreate` / `postdelete` automatically\nwhen `git worktree add`/`remove` runs outside the treeman CLI.\nDefault false. Even when true globally, a repo must be\nopted in via `treeman wt watch on` (see `repos.watch_lifecycle`\nin the daemon store) — both gates must be set for the watcher\nto act on a given repo."
         }
       },
       "additionalProperties": false,
