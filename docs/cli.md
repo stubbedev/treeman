@@ -78,6 +78,30 @@ register a worktree path (metadata only)
 
 mark a worktree deleted in SQLite without touching git
 
+### `treeman worktree watch`
+
+toggle lifecycle-watcher opt-in (on|off|status)
+
+```
+Marks the current repo as opted-in (or out) of the daemon's
+lifecycle watcher. With opt-in ON, the daemon fires postcreate /
+postdelete hooks automatically when 'git worktree add' or
+'git worktree remove' is invoked outside the treeman CLI.
+
+Both this opt-in AND the resolved config bool
+'worktrees.hook_lifecycle: true' must be set for the watcher to
+activate. Default config is OFF.
+
+Examples:
+  treeman wt watch on
+  treeman wt watch off
+  treeman wt watch status
+```
+
+| Flag | Usage |
+|---|---|
+| `--repo` |  |
+
 ### `treeman worktree list`
 
 Aliases: `ls`
