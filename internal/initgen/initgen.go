@@ -144,25 +144,25 @@ func RenderTemplate(cwd string) string {
 		}
 	}
 
-	// hooks: postcreate:
-	postcreate := seqNode()
+	// hooks: setup-before-engines:
+	actions := seqNode()
 	if hasComposer {
-		postcreate.Content = append(postcreate.Content, hookGroup("composer install --no-interaction --prefer-dist"))
+		actions.Content = append(actions.Content, hookGroup("composer install --no-interaction --prefer-dist"))
 	}
 	if jsPkgMgr != "" {
-		postcreate.Content = append(postcreate.Content, hookGroup(jsInstallCmd(jsPkgMgr)))
+		actions.Content = append(actions.Content, hookGroup(jsInstallCmd(jsPkgMgr)))
 	}
 	if frontendDir != "" && jsPkgMgr != "" {
-		postcreate.Content = append(postcreate.Content, hookGroup("cd "+frontendDir+" && "+jsInstallCmd(jsPkgMgr)))
+		actions.Content = append(actions.Content, hookGroup("cd "+frontendDir+" && "+jsInstallCmd(jsPkgMgr)))
 	}
 	if hasGoMod {
-		postcreate.Content = append(postcreate.Content, hookGroup("go mod download"))
+		actions.Content = append(actions.Content, hookGroup("go mod download"))
 	}
-	if len(postcreate.Content) == 0 {
-		postcreate.Style = yaml.FlowStyle
-		postcreate.HeadComment = "add install commands here — each `group` runs in parallel;\nentries within a group run in sequence."
+	if len(actions.Content) == 0 {
+		actions.Style = yaml.FlowStyle
+		actions.HeadComment = "add install commands here — each action is one parallel group;\nuse run: [step1, step2] for sequenced commands inside one group."
 	}
-	hooks := mapNode("postcreate", postcreate)
+	hooks := mapNode("setup-before-engines", actions)
 	mapSet(root, "hooks", hooks)
 	if len(detected) == 0 {
 		// Attach the "no databases yet" hint as a HeadComment on the
@@ -301,10 +301,10 @@ func stringSeq(items []string) *yaml.Node {
 	return n
 }
 
-// hookGroup wraps a shell command in the `{group: [cmd]}` shape the
-// hooks runner expects.
+// hookGroup wraps a shell command in the `{run: "<cmd>"}` Action
+// shape the hooks runner expects.
 func hookGroup(cmd string) *yaml.Node {
-	return mapNode("group", seqNode(scalar(cmd)))
+	return mapNode("run", scalar(cmd))
 }
 
 // mapKeyNode returns the key scalar node matching `name` inside a

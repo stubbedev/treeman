@@ -23,6 +23,71 @@ func TestOpenAndMigrate(t *testing.T) {
 	s2.Close()
 }
 
+func TestInheritedEnvRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	repoID, _ := s.EnsureRepo(ctx, "/repos/x", "x")
+	wtID, _ := s.EnsureWorktree(ctx, repoID, "/wt/feat", "feat", "feat")
+
+	// Empty load before any save.
+	env, err := s.LoadInheritedEnv(ctx, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env != nil {
+		t.Errorf("expected nil env before save, got %#v", env)
+	}
+
+	// Save + reload via id.
+	want := map[string]string{
+		"PATH":   "/usr/bin:/usr/local/bin:/home/me/.asdf/shims",
+		"NVM":    "v18.19.0",
+		"LANG":   "en_US.UTF-8",
+		"AWKARD": `tab	and "quotes"`,
+	}
+	if err := s.SaveInheritedEnv(ctx, wtID, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LoadInheritedEnv(ctx, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Errorf("len mismatch: got %d, want %d", len(got), len(want))
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("env[%s] = %q, want %q", k, got[k], v)
+		}
+	}
+
+	// LoadByPath should match.
+	gotByPath, err := s.LoadInheritedEnvByPath(ctx, "/wt/feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotByPath["PATH"] != want["PATH"] {
+		t.Errorf("by-path PATH mismatch: %q", gotByPath["PATH"])
+	}
+
+	// Empty map clears to NULL.
+	if err := s.SaveInheritedEnv(ctx, wtID, nil); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := s.LoadInheritedEnv(ctx, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared != nil {
+		t.Errorf("expected nil after clearing, got %#v", cleared)
+	}
+}
+
 func TestEnsureRepoAndWorktree(t *testing.T) {
 	ctx := context.Background()
 	s, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))

@@ -152,7 +152,7 @@ func run() error {
 	// Auto-resume lifecycle watchers for every registered repo. The
 	// lifecycle watcher tails `<common-dir>/worktrees/` so
 	// `git worktree add`/`remove` runs outside the treeman CLI still
-	// fire postcreate / postdelete. Unconditional — worktree
+	// fire setup / teardown. Unconditional — worktree
 	// lifecycle is infrastructure, not user policy.
 	if repos, err := s.ListRepoRefs(ctx); err == nil {
 		for _, r := range repos {

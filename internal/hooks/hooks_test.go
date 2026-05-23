@@ -10,8 +10,19 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 )
 
+// emptyEnv returns the minimum env needed for `sh -c <cmd>` to
+// resolve coreutils (`touch`, `sleep`, `printenv`, etc.). PATH is
+// inherited from the test runner's own env so the tests work on any
+// host — NixOS (where coreutils live under /nix/store/.../bin), Mac
+// (/usr/bin), Alpine containers (/usr/sbin), etc. The
+// `TREEMAN_TEST_PATH_PROBE` value is set by one specific test and
+// passes through unchanged for any others.
 func emptyEnv() map[string]string {
-	return map[string]string{"PATH": "/usr/bin:/bin"}
+	env := map[string]string{}
+	if p := os.Getenv("PATH"); p != "" {
+		env["PATH"] = p
+	}
+	return env
 }
 
 func waitUntil(cond func() bool, maxMs int) {
@@ -26,13 +37,13 @@ func waitUntil(cond func() bool, maxMs int) {
 
 func TestGroupRunsSequenceWithin(t *testing.T) {
 	wt := t.TempDir()
-	entries := []config.HookEntry{
-		{Steps: []config.SingleStep{
-			{Run: "touch a"},
-			{Run: "touch b"},
+	entries := []config.Action{
+		{Run: []string{
+			"touch a",
+			"touch b",
 		}},
 	}
-	out, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), false)
+	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,11 +70,11 @@ func TestGroupRunsSequenceWithin(t *testing.T) {
 func TestGroupsRunParallelAcross(t *testing.T) {
 	wt := t.TempDir()
 	started := time.Now()
-	entries := []config.HookEntry{
-		{Steps: []config.SingleStep{{Run: "sleep 0.5 && touch one"}}},
-		{Steps: []config.SingleStep{{Run: "sleep 0.5 && touch two"}}},
+	entries := []config.Action{
+		{Run: []string{"sleep 0.5 && touch one"}},
+		{Run: []string{"sleep 0.5 && touch two"}},
 	}
-	_, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), false)
+	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,9 +94,9 @@ func TestGroupsRunParallelAcross(t *testing.T) {
 
 func TestRunHooksReturnsFastRegardlessOfCommandDuration(t *testing.T) {
 	wt := t.TempDir()
-	entries := []config.HookEntry{{Steps: []config.SingleStep{{Run: "sleep 10"}}}}
+	entries := []config.Action{{Run: []string{"sleep 10"}}}
 	started := time.Now()
-	_, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), false)
+	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,16 +107,16 @@ func TestRunHooksReturnsFastRegardlessOfCommandDuration(t *testing.T) {
 
 // TestRunHooksWaitBlocksUntilGroupsExit proves the wait=true contract
 // the daemon's FinalizeWorktree depends on: when a downstream phase
-// (prepare) needs the postcreate work done first, RunHooks must not
+// (prepare) needs the setup work done first, RunHooks must not
 // return until every group has actually completed.
 func TestRunHooksWaitBlocksUntilGroupsExit(t *testing.T) {
 	wt := t.TempDir()
-	entries := []config.HookEntry{
-		{Steps: []config.SingleStep{{Run: "sleep 0.3 && touch a"}}},
-		{Steps: []config.SingleStep{{Run: "sleep 0.3 && touch b"}}},
+	entries := []config.Action{
+		{Run: []string{"sleep 0.3 && touch a"}},
+		{Run: []string{"sleep 0.3 && touch b"}},
 	}
 	started := time.Now()
-	out, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), true)
+	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,11 +149,11 @@ func TestRunHooksWaitBlocksUntilGroupsExit(t *testing.T) {
 // whether to proceed.
 func TestRunHooksWaitSurfacesNonZeroExit(t *testing.T) {
 	wt := t.TempDir()
-	entries := []config.HookEntry{
-		{Steps: []config.SingleStep{{Run: "true"}}},
-		{Steps: []config.SingleStep{{Run: "exit 7"}}},
+	entries := []config.Action{
+		{Run: []string{"true"}},
+		{Run: []string{"exit 7"}},
 	}
-	out, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", emptyEnv(), true)
+	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,10 +172,10 @@ func TestInheritedEnvReachesSubprocess(t *testing.T) {
 	wt := t.TempDir()
 	env := emptyEnv()
 	env["TREEMAN_TEST_PATH_PROBE"] = "xyz123"
-	entries := []config.HookEntry{
-		{Steps: []config.SingleStep{{Run: "printenv TREEMAN_TEST_PATH_PROBE > probe.out"}}},
+	entries := []config.Action{
+		{Run: []string{"printenv TREEMAN_TEST_PATH_PROBE > probe.out"}},
 	}
-	_, err := RunHooks(context.Background(), "postcreate", entries, wt, wt, "slug", env, false)
+	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", env, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,64 +195,58 @@ func TestInheritedEnvReachesSubprocess(t *testing.T) {
 	}
 }
 
-func TestPrecreateShortCircuitsOnFailure(t *testing.T) {
-	wt := t.TempDir()
-	steps := []config.SingleStep{
-		{Run: "touch ran-first"},
-		{Run: "false"},
-		{Run: "touch ran-third"},
-	}
-	out, err := RunPrecreateHooks(context.Background(), steps, wt, wt, "slug", emptyEnv())
+func TestRenderActionChainsWithAnd(t *testing.T) {
+	a := config.Action{Run: []string{"echo a", "echo b"}}
+	got, err := renderAction(a, "/tmp/x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.AggregateExitCode != 1 {
-		t.Errorf("aggregate=%d want 1", out.AggregateExitCode)
-	}
-	if _, err := os.Stat(filepath.Join(wt, "ran-first")); err != nil {
-		t.Error("ran-first missing")
-	}
-	if _, err := os.Stat(filepath.Join(wt, "ran-third")); err == nil {
-		t.Error("ran-third should have been skipped")
-	}
-}
-
-func TestRenderGroupChainsWithAnd(t *testing.T) {
-	steps := []config.SingleStep{
-		{Run: "echo a"},
-		{Run: "echo b", Cwd: "/tmp/sub"},
-	}
-	got := renderGroup(steps, "/tmp/x")
 	if !contains(got, " && ") {
 		t.Errorf("missing &&: %s", got)
 	}
+	// Both steps share the action's cwd (defaulted to /tmp/x here).
 	if !contains(got, "cd '/tmp/x' && echo a") {
 		t.Errorf("missing first clause: %s", got)
 	}
-	if !contains(got, "cd '/tmp/sub' && echo b") {
+	if !contains(got, "cd '/tmp/x' && echo b") {
 		t.Errorf("missing second clause: %s", got)
 	}
 }
 
-func TestRenderGroupForEntryWrapsInDockerExec(t *testing.T) {
-	entry := config.HookEntry{
-		Container: "myapp",
-		Engine:    "docker",
-		Steps: []config.SingleStep{
-			{Run: "composer install"},
-			{Run: "php artisan migrate", Cwd: "/var/www/html"},
-		},
-	}
-	got, err := renderGroupForEntry(entry, "/host/wt")
+func TestRenderActionGroupLevelCwd(t *testing.T) {
+	// Explicit cwd on the Action applies to every step.
+	a := config.Action{Run: []string{"yarn install", "yarn build"}, Cwd: "frontend"}
+	got, err := renderAction(a, "/tmp/x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// No host-side cd: the container's WORKDIR controls cwd unless
-	// the user passes a step.Cwd, which becomes `-w`.
+	if contains(got, "cd '/tmp/x'") {
+		t.Errorf("default cwd leaked when action.Cwd was set: %s", got)
+	}
+	if !contains(got, "cd 'frontend' && yarn install") {
+		t.Errorf("missing first clause: %s", got)
+	}
+	if !contains(got, "cd 'frontend' && yarn build") {
+		t.Errorf("missing second clause: %s", got)
+	}
+}
+
+func TestRenderActionWrapsInDockerExec(t *testing.T) {
+	a := config.Action{
+		Container: "myapp",
+		Engine:    "docker",
+		Run:       []string{"composer install", "php artisan migrate"},
+		Cwd:       "/var/www/html",
+	}
+	got, err := renderAction(a, "/host/wt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No host-side cd: container WORKDIR / `-w` control cwd.
 	if contains(got, "cd '/host/wt'") {
 		t.Errorf("host cd leaked into container exec: %s", got)
 	}
-	if !contains(got, "'docker' 'exec' 'myapp' 'sh' '-c' 'composer install'") {
+	if !contains(got, "'docker' 'exec' '-w' '/var/www/html' 'myapp' 'sh' '-c' 'composer install'") {
 		t.Errorf("first wrap wrong: %s", got)
 	}
 	if !contains(got, "'docker' 'exec' '-w' '/var/www/html' 'myapp' 'sh' '-c' 'php artisan migrate'") {
@@ -252,14 +257,53 @@ func TestRenderGroupForEntryWrapsInDockerExec(t *testing.T) {
 	}
 }
 
-func TestRenderGroupForEntryNoContainerPassesThrough(t *testing.T) {
-	entry := config.HookEntry{Steps: []config.SingleStep{{Run: "echo hi"}}}
-	got, err := renderGroupForEntry(entry, "/host/wt")
+func TestRenderActionNoContainerPassesThrough(t *testing.T) {
+	entry := config.Action{Run: []string{"echo hi"}}
+	got, err := renderAction(entry, "/host/wt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !contains(got, "cd '/host/wt' && echo hi") {
 		t.Errorf("expected legacy render, got: %s", got)
+	}
+}
+
+// TestBuildEnvUserPathWins asserts the user's PATH from
+// inheritedEnv is preserved verbatim — no merge with the daemon's
+// PATH, no override. The user's PATH is authoritative because it
+// carries their version-manager shims (asdf, nvm, mise, …).
+func TestBuildEnvUserPathWins(t *testing.T) {
+	env := buildEnv(map[string]string{"PATH": "/user/shims:/user/bin"}, "/repo", "/wt", "slug")
+	pathLine := ""
+	for _, kv := range env {
+		if len(kv) > 5 && kv[:5] == "PATH=" {
+			pathLine = kv
+		}
+	}
+	if pathLine != "PATH=/user/shims:/user/bin" {
+		t.Errorf("user PATH not preserved: %q", pathLine)
+	}
+}
+
+// TestBuildEnvFallsBackToDaemonPath asserts that when the user's
+// cached env has no PATH (lifecycle watcher firing for a first-time
+// external `git worktree add`, before any wt finalize), we fall back
+// to the daemon process's own PATH so coreutils still resolve.
+func TestBuildEnvFallsBackToDaemonPath(t *testing.T) {
+	// Sanity: this test only makes sense when the daemon-process
+	// env (the test runner's env) actually has PATH set.
+	if os.Getenv("PATH") == "" {
+		t.Skip("test runner has no PATH set; skipping fallback assertion")
+	}
+	env := buildEnv(nil, "/repo", "/wt", "slug") // no inheritedEnv, no PATH
+	foundPath := false
+	for _, kv := range env {
+		if len(kv) > 5 && kv[:5] == "PATH=" {
+			foundPath = true
+		}
+	}
+	if !foundPath {
+		t.Error("buildEnv should fall back to os.Getenv(PATH) when inheritedEnv has none")
 	}
 }
 

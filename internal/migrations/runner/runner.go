@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -62,9 +63,21 @@ func Run(
 	c := exec.CommandContext(ctx, "sh", "-c", spec.Run)
 	c.Dir = repoRoot
 
-	env := make([]string, 0, len(inheritedEnv)+len(spec.Env)+1)
+	// Build the subprocess env. User's cached env wins; fall back to
+	// the daemon's PATH only when the user's env has none (rare —
+	// see hooks.buildEnv doc-comment for the rationale).
+	env := make([]string, 0, len(inheritedEnv)+len(spec.Env)+2)
+	havePath := false
 	for k, v := range inheritedEnv {
+		if k == "PATH" {
+			havePath = true
+		}
 		env = append(env, k+"="+v)
+	}
+	if !havePath {
+		if p := os.Getenv("PATH"); p != "" {
+			env = append(env, "PATH="+p)
+		}
 	}
 	env = append(env, "TREEMAN_TARGET_DB="+targetDB)
 	for k, tmpl := range spec.Env {

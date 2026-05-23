@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -199,35 +200,26 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 		wtID, _ = st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
 	}
 
-	var entries int
+	var entries []config.Action
 	switch phase {
-	case "precreate":
-		entries = len(cfg.Hooks.Precreate)
-	case "postcreate":
-		entries = len(cfg.Hooks.Postcreate)
-	case "predelete":
-		entries = len(cfg.Hooks.Predelete)
-	case "postdelete":
-		entries = len(cfg.Hooks.Postdelete)
+	case "setup-before-engines":
+		entries = cfg.Hooks.SetupBeforeEngines
+	case "setup-after-engines":
+		entries = cfg.Hooks.SetupAfterEngines
+	case "teardown-before-engines":
+		entries = cfg.Hooks.TeardownBeforeEngines
+	case "teardown-after-engines":
+		entries = cfg.Hooks.TeardownAfterEngines
+	case "on-head-change":
+		entries = cfg.Hooks.OnHeadChange
+	case "on-watch":
+		entries = cfg.Hooks.OnWatch
 	default:
-		return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want precreate|postcreate|predelete|postdelete)", phase)
+		return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want setup-before-engines|setup-after-engines|teardown-before-engines|teardown-after-engines|on-head-change|on-watch)", phase)
 	}
 
-	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, entries)
-	var (
-		out  hooks.RunOutcome
-		rErr error
-	)
-	switch phase {
-	case "precreate":
-		out, rErr = hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wt, sl.Value, env)
-	case "postcreate":
-		out, rErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
-	case "predelete":
-		out, rErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
-	case "postdelete":
-		out, rErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
-	}
+	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, len(entries))
+	out, rErr := hooks.RunHooks(ctx, phase, entries, repoRoot, wt, sl.Value, env, true)
 	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, started, time.Now().UnixMilli(), out)
 	return out, rErr
 }

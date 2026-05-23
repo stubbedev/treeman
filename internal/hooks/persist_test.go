@@ -27,7 +27,7 @@ func TestPersistOutcomeWritesRowsAndEvent(t *testing.T) {
 			{Command: "false", ExitCode: 1, StderrTail: "exit 1\n"},
 		},
 	}
-	PersistOutcome(ctx, s, repoID, wtID, "postcreate", 1000, 1500, out)
+	PersistOutcome(ctx, s, repoID, wtID, "setup", 1000, 1500, out)
 
 	runs, err := s.QueryHookRuns(ctx, wtID, 0)
 	if err != nil {
@@ -46,7 +46,7 @@ func TestPersistOutcomeWritesRowsAndEvent(t *testing.T) {
 	if events[0].Level != store.LevelError {
 		t.Errorf("expected error level (one group failed); got %s", events[0].Level)
 	}
-	if events[0].Phase != "postcreate" {
+	if events[0].Phase != "setup" {
 		t.Errorf("phase mismatch: %s", events[0].Phase)
 	}
 }
@@ -55,7 +55,7 @@ func TestPersistOutcomeWritesRowsAndEvent(t *testing.T) {
 // no SQLite at hand (e.g. the daemon before store wiring landed) can
 // pass nil safely.
 func TestPersistOutcomeNoopWhenStoreMissing(t *testing.T) {
-	PersistOutcome(context.Background(), nil, 0, 0, "postcreate", 1, 2,
+	PersistOutcome(context.Background(), nil, 0, 0, "setup", 1, 2,
 		RunOutcome{Groups: []GroupOutcome{{Command: "noop"}}})
 }
 
@@ -71,7 +71,7 @@ func TestPersistOutcomeAllZerosWritesInfoLevel(t *testing.T) {
 	defer s.Close()
 	repoID, _ := s.EnsureRepo(ctx, "/r/bar", "bar")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/r/bar/.wt/a", "a", "main")
-	PersistOutcome(ctx, s, repoID, wtID, "precreate", 0, 10,
+	PersistOutcome(ctx, s, repoID, wtID, "setup", 0, 10,
 		RunOutcome{Groups: []GroupOutcome{{Command: "ok", ExitCode: 0}}})
 
 	events, err := s.QueryEvents(ctx, store.EventFilter{WorktreeID: wtID, EventTypes: []string{"hook_done"}})

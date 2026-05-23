@@ -1,6 +1,60 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$defs": {
+    "Action": {
+      "properties": {
+        "run": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single shell command executed via `sh -c`."
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "description": "Ordered list of shell commands chained with `\u0026\u0026`."
+            }
+          ],
+          "description": "Shell work for this action. String = single step; list = sequenced steps chained with `\u0026\u0026`. Required."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory for every step in this action. Relative paths resolve against the worktree root (host) or container WORKDIR (when wrapped)."
+        },
+        "container": {
+          "type": "string",
+          "description": "Container name or ID. When set, every step is wrapped in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
+        },
+        "in_container": {
+          "type": "string",
+          "description": "Alias for `container`."
+        },
+        "compose_service": {
+          "type": "string",
+          "description": "Docker Compose service name. Wraps every step in `\u003cengine\u003e compose exec`. Mutually exclusive with `container`."
+        },
+        "compose_project": {
+          "type": "string",
+          "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or parent dir name. Only meaningful with `compose_service`."
+        },
+        "container_engine": {
+          "type": "string",
+          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
+        },
+        "engine": {
+          "type": "string",
+          "description": "Alias for `container_engine`."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "description": "One action: a `run` (string or list of strings) plus optional cwd + container wrapping."
+    },
     "BinlogConfig": {
       "properties": {
         "enabled": {
@@ -280,187 +334,54 @@
       ],
       "description": "EsConn — Elasticsearch / OpenSearch HTTP URL. Same ContainerRef\nsemantics as MongoConn."
     },
-    "HookEntry": {
-      "oneOf": [
-        {
-          "type": "string",
-          "description": "Bare command shorthand. Group of one step. No container wrapping possible in this form."
-        },
-        {
-          "properties": {
-            "run": {
-              "type": "string",
-              "description": "Shell command executed via `sh -c`. Wrapped in `\u003cengine\u003e exec` when container/compose metadata is set on this entry."
-            },
-            "cwd": {
-              "type": "string",
-              "description": "Working directory for the command. Relative paths resolve inside the worktree (host) or inside the container WORKDIR (when wrapped)."
-            },
-            "in_container": {
-              "type": "string",
-              "description": "Container name or ID to wrap every step in `\u003cengine\u003e exec`. Alias for `container`. Mutually exclusive with `compose_service`."
-            },
-            "container": {
-              "type": "string",
-              "description": "Container name or ID to wrap every step in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
-            },
-            "compose_service": {
-              "type": "string",
-              "description": "Docker Compose service name. Treeman finds the running container by the standard compose labels and wraps every step in `\u003cengine\u003e compose exec`."
-            },
-            "compose_project": {
-              "type": "string",
-              "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME / parent directory name. Only meaningful with `compose_service`."
-            },
-            "container_engine": {
-              "type": "string",
-              "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
-            },
-            "engine": {
-              "type": "string",
-              "description": "Alias for `container_engine`."
-            }
-          },
-          "additionalProperties": false,
-          "type": "object",
-          "required": [
-            "run"
-          ],
-          "description": "Single-step mapping with optional container/compose metadata. Use when you want one command wrapped in `\u003cengine\u003e exec`."
-        },
-        {
-          "properties": {
-            "steps": {
-              "items": {
-                "oneOf": [
-                  {
-                    "type": "string",
-                    "description": "Bare command form. Equivalent to `{ run: \"\u003cthis string\u003e\" }`. Executed via `sh -c` in the worktree root."
-                  },
-                  {
-                    "properties": {
-                      "run": {
-                        "type": "string",
-                        "description": "Shell command to execute via `sh -c`. Required. Inherits the daemon's environment plus any EnvScoping patches."
-                      },
-                      "cwd": {
-                        "type": "string",
-                        "description": "Working directory (relative to the worktree root, or absolute). Defaults to the worktree root."
-                      }
-                    },
-                    "additionalProperties": false,
-                    "type": "object",
-                    "required": [
-                      "run"
-                    ],
-                    "description": "Mapping form. Set `cwd` when the command needs to run in a subdirectory of the worktree."
-                  }
-                ],
-                "description": "A single command. Either a bare string (shorthand for `{ run: \"\u003ccmd\u003e\" }`) or a `{ run, cwd }` mapping."
-              },
-              "type": "array",
-              "description": "Ordered list of single-step commands chained with `\u0026\u0026`. All steps share the entry's container/compose metadata."
-            },
-            "in_container": {
-              "type": "string",
-              "description": "Container name or ID to wrap every step in `\u003cengine\u003e exec`. Alias for `container`. Mutually exclusive with `compose_service`."
-            },
-            "container": {
-              "type": "string",
-              "description": "Container name or ID to wrap every step in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
-            },
-            "compose_service": {
-              "type": "string",
-              "description": "Docker Compose service name. Treeman finds the running container by the standard compose labels and wraps every step in `\u003cengine\u003e compose exec`."
-            },
-            "compose_project": {
-              "type": "string",
-              "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME / parent directory name. Only meaningful with `compose_service`."
-            },
-            "container_engine": {
-              "type": "string",
-              "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
-            },
-            "engine": {
-              "type": "string",
-              "description": "Alias for `container_engine`."
-            }
-          },
-          "additionalProperties": false,
-          "type": "object",
-          "required": [
-            "steps"
-          ],
-          "description": "Group form: explicit step list with shared container/compose metadata. All listed steps are wrapped in the same `\u003cengine\u003e exec` context."
-        },
-        {
-          "items": {
-            "oneOf": [
-              {
-                "type": "string",
-                "description": "Bare command form. Equivalent to `{ run: \"\u003cthis string\u003e\" }`. Executed via `sh -c` in the worktree root."
-              },
-              {
-                "properties": {
-                  "run": {
-                    "type": "string",
-                    "description": "Shell command to execute via `sh -c`. Required. Inherits the daemon's environment plus any EnvScoping patches."
-                  },
-                  "cwd": {
-                    "type": "string",
-                    "description": "Working directory (relative to the worktree root, or absolute). Defaults to the worktree root."
-                  }
-                },
-                "additionalProperties": false,
-                "type": "object",
-                "required": [
-                  "run"
-                ],
-                "description": "Mapping form. Set `cwd` when the command needs to run in a subdirectory of the worktree."
-              }
-            ],
-            "description": "A single command. Either a bare string (shorthand for `{ run: \"\u003ccmd\u003e\" }`) or a `{ run, cwd }` mapping."
-          },
-          "type": "array",
-          "description": "Sequence shorthand: list of single steps chained with `\u0026\u0026`. No container wrapping in this form — use the `{ steps, ... }` mapping if you need that."
-        }
-      ],
-      "description": "One hook group. Groups run in parallel; steps within a group run sequentially. Four shapes accepted: bare command string, `{ run, cwd, ...meta }` single-step mapping, `{ steps, ...meta }` group mapping, or a sequence of single-step children."
-    },
     "HooksConfig": {
       "properties": {
-        "precreate": {
+        "setup-before-engines": {
           "items": {
-            "$ref": "#/$defs/SingleStep"
+            "$ref": "#/$defs/Action"
           },
           "type": "array",
-          "description": "Sync phase: runs before the worktree is created. A non-zero\nexit from any step aborts creation. Steps are list-shaped\nsingle commands (no grouping, no container wrapping); use this\nfor cheap host-side checks (e.g. `command -v node`)."
+          "description": "SetupBeforeEngines — actions fire after worktree create +\npatches + bring-in, before engine prepare."
         },
-        "postcreate": {
+        "setup-after-engines": {
           "items": {
-            "$ref": "#/$defs/HookEntry"
+            "$ref": "#/$defs/Action"
           },
           "type": "array",
-          "description": "Async phase: runs after worktree create. Each entry is one\ngroup; steps within a group run sequentially, groups run in\nparallel. Groups can be wrapped in `\u003cengine\u003e exec` via\ncontainer/compose metadata."
+          "description": "SetupAfterEngines — actions fire after engine prepare completes."
         },
-        "predelete": {
+        "teardown-before-engines": {
           "items": {
-            "$ref": "#/$defs/HookEntry"
+            "$ref": "#/$defs/Action"
           },
           "type": "array",
-          "description": "Async phase: runs before worktree delete. Same grouping\nsemantics as postcreate. Use for graceful shutdown\n(`docker compose stop`, draining queues)."
+          "description": "TeardownBeforeEngines — actions fire before DB drop on delete."
         },
-        "postdelete": {
+        "teardown-after-engines": {
           "items": {
-            "$ref": "#/$defs/HookEntry"
+            "$ref": "#/$defs/Action"
           },
           "type": "array",
-          "description": "Async phase: runs after worktree delete. Same grouping\nsemantics. Use for cleanup of resources outside the worktree\n(CDN purges, Slack notifications)."
+          "description": "TeardownAfterEngines — actions fire after DB drop + worktree\nremove on delete."
+        },
+        "on-head-change": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnHeadChange — actions fire when the HEAD watcher detects a\nbranch switch inside an existing worktree."
+        },
+        "on-watch": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnWatch — actions fire when any watcher.paths /\ndatabases[].watch glob matches an event."
         }
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "HooksConfig — `hooks:` block."
+      "description": "HooksConfig — `hooks:` block. A flat map keyed by trigger name.\nEach key's value is a list of Actions that fire when that trigger\nhappens. Actions in the same list run in parallel; the trigger\nkey itself encodes BOTH the lifecycle phase AND the timing point,\nso there's no separate `when:` field anywhere.\n\nTriggers (all optional — omit any you don't need):\n\n  • setup-before-engines — during `wt create`, after patches +\n    bring-in (copies/links), BEFORE engine prepare. Standard\n    home of dependency installs (composer/yarn/pip) so migrate\n    can find vendor/.\n  • setup-after-engines — during `wt create`, after engine\n    prepare. Use when actions need a populated database\n    (cache warming, seed verification).\n  • teardown-before-engines — during `wt delete`, BEFORE DB\n    drop. Graceful shutdown: drain queues, docker compose stop.\n  • teardown-after-engines — during `wt delete`, AFTER DB drop +\n    git worktree remove. External notifications (Slack, CDN\n    purge) that should announce only once the data is gone.\n  • on-head-change — fires when the HEAD watcher sees a branch\n    switch inside an existing worktree. Re-runs in addition to\n    the regular finalize-on-HEAD-change behaviour.\n  • on-watch — fires when any `watcher.paths` or\n    `databases[].watch` glob matches a filesystem event. Runs\n    alongside the engine re-prep.\n\nThe map shape lets new triggers be added without touching every\nexisting config. Daemon execution is always non-blocking from the\nCLI's perspective — each list of actions dispatches in parallel."
     },
     "MigrationMigrate": {
       "properties": {
@@ -817,33 +738,6 @@
       ],
       "description": "SeedSpec — `databases[].seed:` sub-block. Declares the shell\ncommand treeman runs to populate a database's template state with\nnon-migration data (fixtures, ES index mappings, Mongo seed\ndocuments, Redis warm-cache keys, etc.). Same shape as\n`migrations.migrate` so the same runner can execute both."
     },
-    "SingleStep": {
-      "oneOf": [
-        {
-          "type": "string",
-          "description": "Bare command form. Equivalent to `{ run: \"\u003cthis string\u003e\" }`. Executed via `sh -c` in the worktree root."
-        },
-        {
-          "properties": {
-            "run": {
-              "type": "string",
-              "description": "Shell command to execute via `sh -c`. Required. Inherits the daemon's environment plus any EnvScoping patches."
-            },
-            "cwd": {
-              "type": "string",
-              "description": "Working directory (relative to the worktree root, or absolute). Defaults to the worktree root."
-            }
-          },
-          "additionalProperties": false,
-          "type": "object",
-          "required": [
-            "run"
-          ],
-          "description": "Mapping form. Set `cwd` when the command needs to run in a subdirectory of the worktree."
-        }
-      ],
-      "description": "A single command. Either a bare string (shorthand for `{ run: \"\u003ccmd\u003e\" }`) or a `{ run, cwd }` mapping."
-    },
     "SlugRules": {
       "properties": {
         "override": {
@@ -952,14 +846,6 @@
           },
           "type": "array",
           "description": "Paths (relative to the main worktree) to *copy* into each new\nworktree on create. Use for gitignored files that the worktree\nneeds in its own copy so it can be patched per-branch without\naffecting the main worktree's copy — e.g. `.env`, `.env.local`.\nGlob meta-characters expand against the main worktree root.\nDirectories are recursed; existing destinations are left alone\n(idempotent re-runs)."
-        },
-        "async_create": {
-          "type": "boolean",
-          "description": "When true (default), postcreate hooks run asynchronously: the\n`worktree create` command returns immediately and the daemon\ndrives the hooks in the background. Set false for CI where you\nwant a synchronous failure if a hook breaks."
-        },
-        "async_delete": {
-          "type": "boolean",
-          "description": "When true (default), predelete + postdelete hooks run async."
         }
       },
       "additionalProperties": false,
@@ -1012,7 +898,7 @@
     },
     "hooks": {
       "$ref": "#/$defs/HooksConfig",
-      "description": "Lifecycle hooks fired around worktree create/delete. `precreate`\nruns sync (and can abort the operation); the other three phases\nrun async."
+      "description": "Lifecycle hooks fired around worktree create/delete. Two phases:\n`setup` (after create) and `teardown` (before delete). Run\nasync by default; `worktrees.async_create` / `async_delete`\ncontrol whether the CLI blocks on completion."
     },
     "watcher": {
       "$ref": "#/$defs/WatcherConfig",

@@ -74,7 +74,7 @@ type State struct {
 
 // DBDropJob is one queued `prepare.TeardownDatabases` invocation,
 // scheduled by TeardownWorktree to run in the background after
-// predelete hooks complete. The cfg field is a value copy — the
+// teardown hooks complete. The cfg field is a value copy — the
 // caller's mutation cannot race the drain worker.
 type DBDropJob struct {
 	Cfg        config.Config
@@ -149,7 +149,7 @@ func (st *State) IsTeardownInFlight(wtPath string) bool {
 // MarkFinalizeInFlight records that a FinalizeWorktree goroutine is
 // running for wtPath. Returns false when another finalize is
 // already in flight for the same wtPath — caller should return
-// early to avoid double-firing postcreate hooks. The caller MUST
+// early to avoid double-firing setup hooks. The caller MUST
 // invoke UnmarkFinalizeInFlight on exit.
 //
 // Why this exists: when the lifecycle watcher is enabled, the
@@ -157,7 +157,7 @@ func (st *State) IsTeardownInFlight(wtPath string) bool {
 // generates an fsnotify CREATE event that the watcher debounces
 // and then dispatches FinalizeWorktree against. Without dedup, the
 // CLI-initiated finalize and the watcher-initiated finalize run in
-// parallel — both fire postcreate hooks (composer install, npm
+// parallel — both fire setup hooks (composer install, npm
 // install, …) and both call prepare, fighting each other on file
 // locks.
 func (st *State) MarkFinalizeInFlight(wtPath string) bool {

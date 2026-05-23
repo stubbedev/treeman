@@ -72,9 +72,10 @@ type Config struct {
 	// and optional namespace template.
 	Databases []DatabaseConfig `yaml:"databases,omitempty"`
 
-	// Lifecycle hooks fired around worktree create/delete. `precreate`
-	// runs sync (and can abort the operation); the other three phases
-	// run async.
+	// Lifecycle hooks fired around worktree create/delete. Two phases:
+	// `setup` (after create) and `teardown` (before delete). Run
+	// async by default; `worktrees.async_create` / `async_delete`
+	// control whether the CLI blocks on completion.
 	Hooks HooksConfig `yaml:"hooks,omitempty"`
 
 	// File-system + binlog watcher settings. The watcher invalidates
@@ -370,14 +371,6 @@ type WorktreesConfig struct {
 	// (idempotent re-runs).
 	Copies []string `yaml:"copies,omitempty"`
 
-	// When true (default), postcreate hooks run asynchronously: the
-	// `worktree create` command returns immediately and the daemon
-	// drives the hooks in the background. Set false for CI where you
-	// want a synchronous failure if a hook breaks.
-	AsyncCreate *bool `yaml:"async_create,omitempty"`
-
-	// When true (default), predelete + postdelete hooks run async.
-	AsyncDelete *bool `yaml:"async_delete,omitempty"`
 }
 
 // EnvScoping — `env_scoping:` block. After the patches-block
@@ -448,268 +441,212 @@ type Patch struct {
 	Set map[string]string `yaml:"set,omitempty"`
 }
 
-// HooksConfig — `hooks:` block.
+// HooksConfig — `hooks:` block. A flat map keyed by trigger name.
+// Each key's value is a list of Actions that fire when that trigger
+// happens. Actions in the same list run in parallel; the trigger
+// key itself encodes BOTH the lifecycle phase AND the timing point,
+// so there's no separate `when:` field anywhere.
+//
+// Triggers (all optional — omit any you don't need):
+//
+//   • setup-before-engines — during `wt create`, after patches +
+//     bring-in (copies/links), BEFORE engine prepare. Standard
+//     home of dependency installs (composer/yarn/pip) so migrate
+//     can find vendor/.
+//   • setup-after-engines — during `wt create`, after engine
+//     prepare. Use when actions need a populated database
+//     (cache warming, seed verification).
+//   • teardown-before-engines — during `wt delete`, BEFORE DB
+//     drop. Graceful shutdown: drain queues, docker compose stop.
+//   • teardown-after-engines — during `wt delete`, AFTER DB drop +
+//     git worktree remove. External notifications (Slack, CDN
+//     purge) that should announce only once the data is gone.
+//   • on-head-change — fires when the HEAD watcher sees a branch
+//     switch inside an existing worktree. Re-runs in addition to
+//     the regular finalize-on-HEAD-change behaviour.
+//   • on-watch — fires when any `watcher.paths` or
+//     `databases[].watch` glob matches a filesystem event. Runs
+//     alongside the engine re-prep.
+//
+// The map shape lets new triggers be added without touching every
+// existing config. Daemon execution is always non-blocking from the
+// CLI's perspective — each list of actions dispatches in parallel.
 type HooksConfig struct {
-	// Sync phase: runs before the worktree is created. A non-zero
-	// exit from any step aborts creation. Steps are list-shaped
-	// single commands (no grouping, no container wrapping); use this
-	// for cheap host-side checks (e.g. `command -v node`).
-	Precreate []SingleStep `yaml:"precreate,omitempty"`
+	// SetupBeforeEngines — actions fire after worktree create +
+	// patches + bring-in, before engine prepare.
+	SetupBeforeEngines []Action `yaml:"setup-before-engines,omitempty"`
 
-	// Async phase: runs after worktree create. Each entry is one
-	// group; steps within a group run sequentially, groups run in
-	// parallel. Groups can be wrapped in `<engine> exec` via
-	// container/compose metadata.
-	Postcreate []HookEntry `yaml:"postcreate,omitempty"`
+	// SetupAfterEngines — actions fire after engine prepare completes.
+	SetupAfterEngines []Action `yaml:"setup-after-engines,omitempty"`
 
-	// Async phase: runs before worktree delete. Same grouping
-	// semantics as postcreate. Use for graceful shutdown
-	// (`docker compose stop`, draining queues).
-	Predelete []HookEntry `yaml:"predelete,omitempty"`
+	// TeardownBeforeEngines — actions fire before DB drop on delete.
+	TeardownBeforeEngines []Action `yaml:"teardown-before-engines,omitempty"`
 
-	// Async phase: runs after worktree delete. Same grouping
-	// semantics. Use for cleanup of resources outside the worktree
-	// (CDN purges, Slack notifications).
-	Postdelete []HookEntry `yaml:"postdelete,omitempty"`
+	// TeardownAfterEngines — actions fire after DB drop + worktree
+	// remove on delete.
+	TeardownAfterEngines []Action `yaml:"teardown-after-engines,omitempty"`
+
+	// OnHeadChange — actions fire when the HEAD watcher detects a
+	// branch switch inside an existing worktree.
+	OnHeadChange []Action `yaml:"on-head-change,omitempty"`
+
+	// OnWatch — actions fire when any watcher.paths /
+	// databases[].watch glob matches an event.
+	OnWatch []Action `yaml:"on-watch,omitempty"`
 }
 
-// SingleStep — `{ run: "...", cwd: "..." }`. The bare-string YAML
-// shorthand is decoded into one of these too.
-type SingleStep struct {
-	// Shell command to execute via `sh -c`. Required. Inherits the
-	// daemon's environment plus any patches applied by EnvScoping.
-	Run string `yaml:"run"`
+// Action — one entry under `hooks.{setup,teardown}.actions`. Every
+// action is a mapping; there are no shorthand forms.
+//
+//   • `run` is the work, as either a single shell string (one
+//     command) or a list of shell strings (sequenced steps chained
+//     with `&&`).
+//   • `cwd` is the group-level working directory; all steps in the
+//     action share it. Use multiple actions if you need different
+//     cwds.
+//   • `container` / `compose_service` (mutually exclusive) wrap the
+//     whole action in `<engine> exec` / `<engine> compose exec` so
+//     it runs inside the named container. `in_container` is an
+//     accepted alias for `container`. `engine` is an alias for
+//     `container_engine`.
+//
+// Actions in the same `actions:` list run in parallel; steps within
+// one action run sequentially.
+type Action struct {
+	// Run is the shell command(s) for this action. The YAML accepts
+	// either a single string or a list of strings; either way the
+	// in-memory form is the list. Required.
+	Run []string `yaml:"run"`
 
-	// Working directory (relative to the worktree root, or absolute).
-	// Defaults to the worktree root when unset.
+	// Cwd is the working directory for every step in this action.
+	// Relative paths resolve against the worktree root (host) or
+	// against the container's WORKDIR (when wrapped). Optional.
 	Cwd string `yaml:"cwd,omitempty"`
+
+	// Container name or ID. When set, every step runs via
+	// `<engine> exec <id> sh -c '<cmd>'`. Mutually exclusive with
+	// ComposeService.
+	Container string `yaml:"container,omitempty"`
+
+	// ComposeService is the docker-compose service name. Treeman
+	// resolves the running container via the standard compose
+	// labels and wraps every step in `<engine> compose exec`.
+	// Mutually exclusive with Container.
+	ComposeService string `yaml:"compose_service,omitempty"`
+
+	// ComposeProject is the docker-compose project (`-p` flag).
+	// Defaults to $COMPOSE_PROJECT_NAME / parent directory name.
+	// Only meaningful with ComposeService.
+	ComposeProject string `yaml:"compose_project,omitempty"`
+
+	// Engine is the container engine binary: `docker` (default),
+	// `podman`, `nerdctl`, `finch`, `orbctl`.
+	Engine string `yaml:"container_engine,omitempty"`
 }
 
-// JSONSchema overrides the reflection-generated schema so editor
-// hinting accepts both YAML shapes the UnmarshalYAML below decodes:
-// a bare scalar string or a `{ run, cwd }` mapping.
-func (SingleStep) JSONSchema() *jsonschema.Schema {
+// JSONSchema describes the YAML shape — one map per action, with
+// `run` accepting string OR []string.
+func (Action) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
 	props.Set("run", &jsonschema.Schema{
-		Type:        "string",
-		Description: "Shell command to execute via `sh -c`. Required. Inherits the daemon's environment plus any EnvScoping patches.",
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "Single shell command executed via `sh -c`."},
+			{Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "Ordered list of shell commands chained with `&&`."},
+		},
+		Description: "Shell work for this action. String = single step; list = sequenced steps chained with `&&`. Required.",
 	})
 	props.Set("cwd", &jsonschema.Schema{
 		Type:        "string",
-		Description: "Working directory (relative to the worktree root, or absolute). Defaults to the worktree root.",
+		Description: "Working directory for every step in this action. Relative paths resolve against the worktree root (host) or container WORKDIR (when wrapped).",
+	})
+	props.Set("container", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Container name or ID. When set, every step is wrapped in `<engine> exec`. Mutually exclusive with `compose_service`.",
+	})
+	props.Set("in_container", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Alias for `container`.",
+	})
+	props.Set("compose_service", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Docker Compose service name. Wraps every step in `<engine> compose exec`. Mutually exclusive with `container`.",
+	})
+	props.Set("compose_project", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or parent dir name. Only meaningful with `compose_service`.",
+	})
+	props.Set("container_engine", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.",
+	})
+	props.Set("engine", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Alias for `container_engine`.",
 	})
 	return &jsonschema.Schema{
-		Description: "A single command. Either a bare string (shorthand for `{ run: \"<cmd>\" }`) or a `{ run, cwd }` mapping.",
-		OneOf: []*jsonschema.Schema{
-			{
-				Type:        "string",
-				Description: "Bare command form. Equivalent to `{ run: \"<this string>\" }`. Executed via `sh -c` in the worktree root.",
-			},
-			{
-				Type:                 "object",
-				Properties:           props,
-				Required:             []string{"run"},
-				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Mapping form. Set `cwd` when the command needs to run in a subdirectory of the worktree.",
-			},
-		},
+		Type:                 "object",
+		Properties:           props,
+		Required:             []string{"run"},
+		AdditionalProperties: jsonschema.FalseSchema,
+		Description:          "One action: a `run` (string or list of strings) plus optional cwd + container wrapping.",
 	}
 }
 
-// UnmarshalYAML accepts either a bare scalar (`"command"`) or a
-// mapping (`{ run: ..., cwd: ... }`).
-func (s *SingleStep) UnmarshalYAML(node *yaml.Node) error {
-	switch node.Kind {
+// UnmarshalYAML decodes one action map. Accepts both `run: string`
+// and `run: [string, ...]`. Also accepts the `in_container` /
+// `engine` aliases and rejects the legacy `background:` field +
+// the obsolete `steps:` keyword loudly so old configs surface a
+// clear error rather than silently mis-parse.
+func (a *Action) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("action (line %d): want a mapping; bare strings + list shorthands have been removed — wrap each action in `{ run: ... }`", node.Line)
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		switch node.Content[i].Value {
+		case "background":
+			return fmt.Errorf("action: `background:` is no longer supported — hooks are always async (line %d)", node.Content[i].Line)
+		case "steps":
+			return fmt.Errorf("action: `steps:` is no longer supported — use `run:` with a list of strings (line %d)", node.Content[i].Line)
+		}
+	}
+	var raw struct {
+		Run            yaml.Node `yaml:"run"`
+		Cwd            string    `yaml:"cwd"`
+		Container      string    `yaml:"container"`
+		ContainerAlt   string    `yaml:"in_container"`
+		ComposeService string    `yaml:"compose_service"`
+		ComposeProject string    `yaml:"compose_project"`
+		Engine         string    `yaml:"container_engine"`
+		EngineAlt      string    `yaml:"engine"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	switch raw.Run.Kind {
 	case yaml.ScalarNode:
-		s.Run = node.Value
-		return nil
-	case yaml.MappingNode:
-		type alias SingleStep
-		return node.Decode((*alias)(s))
-	default:
-		return fmt.Errorf("step: want scalar or mapping, got node kind %d", node.Kind)
-	}
-}
-
-// HookEntry — one of:
-//   - bare command string  → group of one
-//   - mapping with `run:`  → group of one with cwd
-//   - mapping with `steps:` → explicit group; metadata fields
-//     (container, compose_service, container_engine, ...) wrap all
-//     steps in `docker exec` (or compose exec) at runtime.
-//   - sequence of children → group sequence (chained with `&&`)
-//
-// `Container` / `ComposeService` are mutually exclusive. When set,
-// every step in the group is wrapped in
-// `<engine> exec [-w cwd] <id> sh -c '<cmd>'` so the work runs
-// inside the named container instead of on the host. Use this to
-// run install/migrate/seed commands inside the app dev container.
-type HookEntry struct {
-	Steps          []SingleStep
-	Container      string
-	ComposeService string
-	ComposeProject string
-	Engine         string
-}
-
-// JSONSchema overrides the reflection-generated schema so editor
-// hinting accepts every shape UnmarshalYAML below decodes: bare
-// command string, `{ run, cwd, ... }` mapping, `{ steps, ... }`
-// group mapping, or a sequence of single-step children.
-func (HookEntry) JSONSchema() *jsonschema.Schema {
-	metaDescs := map[string]string{
-		"in_container":     "Container name or ID to wrap every step in `<engine> exec`. Alias for `container`. Mutually exclusive with `compose_service`.",
-		"container":        "Container name or ID to wrap every step in `<engine> exec`. Mutually exclusive with `compose_service`.",
-		"compose_service":  "Docker Compose service name. Treeman finds the running container by the standard compose labels and wraps every step in `<engine> compose exec`.",
-		"compose_project":  "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME / parent directory name. Only meaningful with `compose_service`.",
-		"container_engine": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.",
-		"engine":           "Alias for `container_engine`.",
-	}
-	addMeta := func(p *orderedmap.OrderedMap[string, *jsonschema.Schema]) {
-		for _, k := range []string{
-			"in_container", "container",
-			"compose_service", "compose_project",
-			"container_engine", "engine",
-		} {
-			p.Set(k, &jsonschema.Schema{Type: "string", Description: metaDescs[k]})
-		}
-	}
-
-	runProps := orderedmap.New[string, *jsonschema.Schema]()
-	runProps.Set("run", &jsonschema.Schema{
-		Type:        "string",
-		Description: "Shell command executed via `sh -c`. Wrapped in `<engine> exec` when container/compose metadata is set on this entry.",
-	})
-	runProps.Set("cwd", &jsonschema.Schema{
-		Type:        "string",
-		Description: "Working directory for the command. Relative paths resolve inside the worktree (host) or inside the container WORKDIR (when wrapped).",
-	})
-	addMeta(runProps)
-
-	step := SingleStep{}.JSONSchema()
-	stepsProps := orderedmap.New[string, *jsonschema.Schema]()
-	stepsProps.Set("steps", &jsonschema.Schema{
-		Type:        "array",
-		Items:       step,
-		Description: "Ordered list of single-step commands chained with `&&`. All steps share the entry's container/compose metadata.",
-	})
-	addMeta(stepsProps)
-
-	return &jsonschema.Schema{
-		Description: "One hook group. Groups run in parallel; steps within a group run sequentially. " +
-			"Four shapes accepted: bare command string, `{ run, cwd, ...meta }` single-step mapping, " +
-			"`{ steps, ...meta }` group mapping, or a sequence of single-step children.",
-		OneOf: []*jsonschema.Schema{
-			{
-				Type:        "string",
-				Description: "Bare command shorthand. Group of one step. No container wrapping possible in this form.",
-			},
-			{
-				Type:                 "object",
-				Properties:           runProps,
-				Required:             []string{"run"},
-				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Single-step mapping with optional container/compose metadata. Use when you want one command wrapped in `<engine> exec`.",
-			},
-			{
-				Type:                 "object",
-				Properties:           stepsProps,
-				Required:             []string{"steps"},
-				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Group form: explicit step list with shared container/compose metadata. All listed steps are wrapped in the same `<engine> exec` context.",
-			},
-			{
-				Type:        "array",
-				Items:       step,
-				Description: "Sequence shorthand: list of single steps chained with `&&`. No container wrapping in this form — use the `{ steps, ... }` mapping if you need that.",
-			},
-		},
-	}
-}
-
-// UnmarshalYAML decides which of the shapes applies based on the
-// node kind. Strict: anything else is a typo we want to surface
-// instead of silently coalesce.
-func (h *HookEntry) UnmarshalYAML(node *yaml.Node) error {
-	switch node.Kind {
-	case yaml.ScalarNode:
-		h.Steps = []SingleStep{{Run: node.Value}}
-		return nil
-	case yaml.MappingNode:
-		// Reject the legacy `background:` field loudly. Hooks are
-		// always async in v1.0+; if a YAML still carries that field
-		// we want the user to see why their config no longer
-		// parses.
-		hasSteps := false
-		for i := 0; i < len(node.Content); i += 2 {
-			switch node.Content[i].Value {
-			case "background":
-				return fmt.Errorf("hook entry: `background` is no longer supported — hooks are always async; group commands by nesting them in a list to express sequencing (line %d)", node.Content[i].Line)
-			case "steps":
-				hasSteps = true
-			}
-		}
-		if hasSteps {
-			// Group form: { in_container/compose_service/..., steps: [...] }.
-			var raw struct {
-				Container      string       `yaml:"in_container"`
-				ContainerAlt   string       `yaml:"container"`
-				ComposeService string       `yaml:"compose_service"`
-				ComposeProject string       `yaml:"compose_project"`
-				Engine         string       `yaml:"container_engine"`
-				EngineAlt      string       `yaml:"engine"`
-				Steps          []SingleStep `yaml:"steps"`
-			}
-			if err := node.Decode(&raw); err != nil {
-				return err
-			}
-			h.Container = firstNonEmpty(raw.Container, raw.ContainerAlt)
-			h.ComposeService = raw.ComposeService
-			h.ComposeProject = raw.ComposeProject
-			h.Engine = firstNonEmpty(raw.Engine, raw.EngineAlt)
-			h.Steps = raw.Steps
-			if h.Container != "" && h.ComposeService != "" {
-				return fmt.Errorf("hook entry (line %d): set either `in_container:` or `compose_service:`, not both", node.Line)
-			}
-			return nil
-		}
-		// Single-step form (existing): { run: ..., cwd: ..., [in_container/compose_service/...] }.
-		var s SingleStep
-		if err := node.Decode(&s); err != nil {
-			return err
-		}
-		var meta struct {
-			Container      string `yaml:"in_container"`
-			ContainerAlt   string `yaml:"container"`
-			ComposeService string `yaml:"compose_service"`
-			ComposeProject string `yaml:"compose_project"`
-			Engine         string `yaml:"container_engine"`
-			EngineAlt      string `yaml:"engine"`
-		}
-		_ = node.Decode(&meta)
-		h.Container = firstNonEmpty(meta.Container, meta.ContainerAlt)
-		h.ComposeService = meta.ComposeService
-		h.ComposeProject = meta.ComposeProject
-		h.Engine = firstNonEmpty(meta.Engine, meta.EngineAlt)
-		if h.Container != "" && h.ComposeService != "" {
-			return fmt.Errorf("hook entry (line %d): set either `in_container:` or `compose_service:`, not both", node.Line)
-		}
-		h.Steps = []SingleStep{s}
-		return nil
+		a.Run = []string{raw.Run.Value}
 	case yaml.SequenceNode:
-		var children []SingleStep
-		for _, child := range node.Content {
-			var s SingleStep
-			if err := s.UnmarshalYAML(child); err != nil {
-				return err
+		a.Run = make([]string, 0, len(raw.Run.Content))
+		for _, child := range raw.Run.Content {
+			if child.Kind != yaml.ScalarNode {
+				return fmt.Errorf("action (line %d): every entry in `run:` must be a string", child.Line)
 			}
-			children = append(children, s)
+			a.Run = append(a.Run, child.Value)
 		}
-		h.Steps = children
-		return nil
+	case 0:
+		return fmt.Errorf("action (line %d): `run:` is required", node.Line)
 	default:
-		return fmt.Errorf("hook entry: unsupported node kind %d", node.Kind)
+		return fmt.Errorf("action (line %d): `run:` must be a string or list of strings", node.Line)
 	}
+	a.Cwd = raw.Cwd
+	a.Container = firstNonEmpty(raw.Container, raw.ContainerAlt)
+	a.ComposeService = raw.ComposeService
+	a.ComposeProject = raw.ComposeProject
+	a.Engine = firstNonEmpty(raw.Engine, raw.EngineAlt)
+	if a.Container != "" && a.ComposeService != "" {
+		return fmt.Errorf("action (line %d): set either `container:` or `compose_service:`, not both", node.Line)
+	}
+	return nil
 }
 
 func firstNonEmpty(a, b string) string {
@@ -1160,7 +1097,7 @@ func mergeYAMLFile(cfg *Config, path string) error {
 }
 
 // applyDefaults fills in the canonical defaults: async_create +
-// async_delete true, skip_worktree true, retention defaults.
+// skip_worktree true, retention defaults.
 func applyDefaults(cfg *Config) {
 	if cfg.Daemon.LogLevel == "" {
 		cfg.Daemon.LogLevel = "info"
@@ -1170,14 +1107,6 @@ func applyDefaults(cfg *Config) {
 		// Override per-repo with e.g. `worktrees.root: ../foo-worktrees`
 		// for the parent-dir convention.
 		cfg.Worktrees.Root = ".worktrees"
-	}
-	if cfg.Worktrees.AsyncCreate == nil {
-		t := true
-		cfg.Worktrees.AsyncCreate = &t
-	}
-	if cfg.Worktrees.AsyncDelete == nil {
-		t := true
-		cfg.Worktrees.AsyncDelete = &t
 	}
 	if cfg.Snapshots.Retention.CapPerRepo == 0 {
 		cfg.Snapshots.Retention.CapPerRepo = 8

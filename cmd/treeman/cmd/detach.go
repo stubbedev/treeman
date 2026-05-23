@@ -75,12 +75,14 @@ func detachLocalFinalize(wtPath, repoRoot string) (string, error) {
 	)
 }
 
-// detachLocalDelete spawns `treeman wt delete --foreground <wtPath>`
-// (with --force when requested) under a new session so the slow
-// predelete + db-teardown + git-remove sequence runs without
-// blocking the calling shell.
+// detachLocalDelete spawns `treeman wt delete --detached <wtPath>`
+// (with --force / --yes when needed) under a new session so the slow
+// teardown + db-drop + git-remove sequence runs without blocking the
+// calling shell. The `--detached` flag is internal — it tells the
+// child to run the teardown inline instead of trying to dispatch
+// back to the (unreachable) daemon.
 func detachLocalDelete(wtPath, repoRoot string, force bool) (string, error) {
-	args := []string{"wt", "delete", "--foreground", "--repo", repoRoot}
+	args := []string{"wt", "delete", "--detached", "--yes", "--repo", repoRoot}
 	if force {
 		args = append(args, "--force")
 	}

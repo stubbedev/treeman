@@ -565,6 +565,70 @@ func (s *Store) MarkWorktreeDeleted(ctx context.Context, id int64) error {
 	return err
 }
 
+// SaveInheritedEnv caches the user's shell env per worktree so the
+// daemon's HEAD-watcher and file-watcher paths can rehydrate it
+// when re-running hooks/prepare. Empty maps are stored as NULL so
+// the caller can tell "never set" from "set to empty".
+func (s *Store) SaveInheritedEnv(ctx context.Context, worktreeID int64, env map[string]string) error {
+	if len(env) == 0 {
+		_, err := s.DB.ExecContext(ctx,
+			"UPDATE worktrees SET inherited_env_json = NULL WHERE id = ?", worktreeID)
+		return err
+	}
+	b, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("marshal inherited env: %w", err)
+	}
+	_, err = s.DB.ExecContext(ctx,
+		"UPDATE worktrees SET inherited_env_json = ? WHERE id = ?", string(b), worktreeID)
+	return err
+}
+
+// LoadInheritedEnv returns the cached env captured at the last
+// SaveInheritedEnv call. Returns nil + nil-error when the column is
+// NULL (no env ever cached for this worktree).
+func (s *Store) LoadInheritedEnv(ctx context.Context, worktreeID int64) (map[string]string, error) {
+	row := s.DB.QueryRowContext(ctx,
+		"SELECT inherited_env_json FROM worktrees WHERE id = ?", worktreeID)
+	var raw sql.NullString
+	if err := row.Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !raw.Valid || raw.String == "" {
+		return nil, nil
+	}
+	var env map[string]string
+	if err := json.Unmarshal([]byte(raw.String), &env); err != nil {
+		return nil, fmt.Errorf("unmarshal inherited env: %w", err)
+	}
+	return env, nil
+}
+
+// LoadInheritedEnvByPath looks up the cached env by worktree path,
+// for callers that have the path but not the ID.
+func (s *Store) LoadInheritedEnvByPath(ctx context.Context, worktreePath string) (map[string]string, error) {
+	row := s.DB.QueryRowContext(ctx,
+		"SELECT inherited_env_json FROM worktrees WHERE path = ?", worktreePath)
+	var raw sql.NullString
+	if err := row.Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !raw.Valid || raw.String == "" {
+		return nil, nil
+	}
+	var env map[string]string
+	if err := json.Unmarshal([]byte(raw.String), &env); err != nil {
+		return nil, fmt.Errorf("unmarshal inherited env: %w", err)
+	}
+	return env, nil
+}
+
 // TouchWorktreeVisited stamps `last_visited_at = now` on the worktree
 // row. Called by `wt switch`, `wt go`, and any other path that
 // represents a user-driven move into a worktree. Used by `wt prev`

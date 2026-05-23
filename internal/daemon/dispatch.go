@@ -11,6 +11,7 @@ import (
 	"github.com/stubbedev/treeman/internal/db/binlog"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/version"
 	"github.com/stubbedev/treeman/internal/watcher"
@@ -344,8 +345,19 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 				"wt":  wtPath,
 				"ref": newRef,
 			})
+		// Rehydrate the user's env captured at the last `wt create` /
+		// `wt finalize` so PATH-sensitive scripts work in this
+		// daemon-driven re-run.
+		env, _ := st.Store.LoadInheritedEnvByPath(st.BgCtx, wtPath)
+		// Fire user-defined on-head-change actions in parallel with
+		// the regular finalize re-run (no ordering — both react to
+		// the same event independently).
+		safeGo("head_actions:"+wtPath, func() {
+			fireTriggerActions(st.BgCtx, st, repoPath, wtPath, "on-head-change", env,
+				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnHeadChange })
+		})
 		safeGo("head_finalize:"+wtPath, func() {
-			if err := FinalizeWorktree(st.BgCtx, st, repoPath, wtPath, nil); err != nil {
+			if err := FinalizeWorktree(st.BgCtx, st, repoPath, wtPath, env); err != nil {
 				slog.Warn("head-triggered finalize", "wt", wtPath, "err", err)
 			}
 		})
@@ -439,11 +451,52 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 				"wt":      wtPath,
 			})
 		mode, dbIdx := ev.Mode, ev.DBIndex
+		env, _ := st.Store.LoadInheritedEnvByPath(st.BgCtx, wtPath)
+		// Fire user-defined on-watch actions in parallel with the
+		// regular re-prep — both react to the same event.
+		safeGo("watch_actions:"+wtPath, func() {
+			fireTriggerActions(st.BgCtx, st, repoPath, wtPath, "on-watch", env,
+				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnWatch })
+		})
 		safeGo("watcher_finalize:"+wtPath, func() {
-			if err := FinalizeWorktreeForWatch(st.BgCtx, st, repoPath, wtPath, dbIdx, mode, nil); err != nil {
+			if err := FinalizeWorktreeForWatch(st.BgCtx, st, repoPath, wtPath, dbIdx, mode, env); err != nil {
 				slog.Warn("watcher-triggered finalize", "wt", wtPath, "err", err)
 			}
 		})
 		return nil
 	}
+}
+
+// fireTriggerActions loads the resolved config for a worktree and
+// runs the selected hooks trigger's actions. Used by the on-head-
+// change and on-watch dispatch paths so user-defined hooks can
+// react to those events without sharing the regular finalize logic.
+// Errors are swallowed + logged; this path is best-effort.
+func fireTriggerActions(
+	ctx context.Context,
+	st *State,
+	repoPath, wtPath, trigger string,
+	inheritedEnv map[string]string,
+	pick func(*config.Config) []config.Action,
+) {
+	cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
+	if err != nil {
+		slog.Warn("trigger actions: load config", "trigger", trigger, "wt", wtPath, "err", err)
+		return
+	}
+	actions := pick(&cfg)
+	if len(actions) == 0 {
+		return
+	}
+	branch := detectBranch(wtPath)
+	sl := slug.For(wtPath, branch)
+	repoID, err := st.Store.EnsureRepo(ctx, repoPath, filepath.Base(repoPath))
+	if err != nil {
+		return
+	}
+	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wtPath, sl.Value, branch)
+	if err != nil {
+		return
+	}
+	_ = runTriggerActions(ctx, st, trigger, actions, repoPath, wtPath, sl.Value, repoID, wtID, inheritedEnv)
 }

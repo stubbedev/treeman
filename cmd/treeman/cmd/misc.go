@@ -14,6 +14,7 @@ import (
 	"github.com/urfave/cli/v3"
 	"gopkg.in/yaml.v3"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemonctl"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/initgen"
@@ -105,7 +106,7 @@ func HookCmd() *cli.Command {
 			},
 			Action: func(ctx context.Context, c *cli.Command) error {
 				if c.NArg() < 1 {
-					return fmt.Errorf("usage: treeman hook run <precreate|postcreate|predelete|postdelete>")
+					return fmt.Errorf("usage: treeman hook run <setup|teardown>")
 				}
 				phase := c.Args().First()
 				out, err := RunHookPhase(ctx, phase, c.String("worktree"))
@@ -118,12 +119,7 @@ func HookCmd() *cli.Command {
 						"outcome": out,
 					})
 				}
-				switch phase {
-				case "precreate":
-					fmt.Printf("precreate: exit=%d (%d steps)\n", out.AggregateExitCode, len(out.Groups))
-				default:
-					fmt.Printf("%s: %d group(s) complete\n", phase, len(out.Groups))
-				}
+				fmt.Printf("%s: %d action(s) complete\n", phase, len(out.Groups))
 				return nil
 			},
 		}},
@@ -173,30 +169,27 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 		}
 	}
 
+	var hookEntries []config.Action
 	switch phase {
-	case "precreate":
-		entries = len(cfg.Hooks.Precreate)
-	case "postcreate":
-		entries = len(cfg.Hooks.Postcreate)
-	case "predelete":
-		entries = len(cfg.Hooks.Predelete)
-	case "postdelete":
-		entries = len(cfg.Hooks.Postdelete)
+	case "setup-before-engines":
+		hookEntries = cfg.Hooks.SetupBeforeEngines
+	case "setup-after-engines":
+		hookEntries = cfg.Hooks.SetupAfterEngines
+	case "teardown-before-engines":
+		hookEntries = cfg.Hooks.TeardownBeforeEngines
+	case "teardown-after-engines":
+		hookEntries = cfg.Hooks.TeardownAfterEngines
+	case "on-head-change":
+		hookEntries = cfg.Hooks.OnHeadChange
+	case "on-watch":
+		hookEntries = cfg.Hooks.OnWatch
 	default:
-		return hooks.RunOutcome{}, fmt.Errorf("unknown phase: %s", phase)
+		return hooks.RunOutcome{}, fmt.Errorf("unknown phase: %s (want setup-before-engines|setup-after-engines|teardown-before-engines|teardown-after-engines|on-head-change|on-watch)", phase)
 	}
+	entries = len(hookEntries)
 
 	startedMs = hooks.EmitHookStart(ctx, st, repoID, wtID, phase, entries)
-	switch phase {
-	case "precreate":
-		out, runErr = hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wt, sl.Value, env)
-	case "postcreate":
-		out, runErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
-	case "predelete":
-		out, runErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
-	case "postdelete":
-		out, runErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
-	}
+	out, runErr = hooks.RunHooks(ctx, phase, hookEntries, repoRoot, wt, sl.Value, env, true)
 	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, startedMs, time.Now().UnixMilli(), out)
 	return out, runErr
 }

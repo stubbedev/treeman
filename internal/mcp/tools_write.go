@@ -41,7 +41,7 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "hook_run",
-		Description: "Run one configured hook phase synchronously. Accepts precreate|postcreate|predelete|postdelete. Returns per-group exit codes and stdout/stderr tails.",
+		Description: "Run one configured hook phase synchronously. Accepts setup|teardown. Returns per-group exit codes and stdout/stderr tails.",
 	}, hookTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -108,12 +108,12 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_create",
-		Description: "Create a new git worktree under .worktrees/<branch> and dispatch postcreate hooks + prepare via the daemon. Shells to `treeman wt create`. Long-running. Returns the captured stdout/stderr and exit code.",
+		Description: "Create a new git worktree under .worktrees/<branch> and dispatch setup hooks + prepare via the daemon. Shells to `treeman wt create`. Long-running. Returns the captured stdout/stderr and exit code.",
 	}, worktreeCreateTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_delete",
-		Description: "Tear down a worktree: predelete hooks → DB teardown → git worktree remove. Shells to `treeman wt delete`. Returns the captured stdout/stderr and exit code.",
+		Description: "Tear down a worktree: teardown hooks → DB teardown → git worktree remove. Shells to `treeman wt delete`. Returns the captured stdout/stderr and exit code.",
 	}, worktreeDeleteTool)
 }
 
@@ -138,7 +138,7 @@ func prepareTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in prepareIn) (
 // ─── hook_run ─────────────────────────────────────────────────────
 
 type hookIn struct {
-	Phase    string `json:"phase" jsonschema:"precreate|postcreate|predelete|postdelete"`
+	Phase    string `json:"phase" jsonschema:"setup|teardown"`
 	Worktree string `json:"worktree,omitempty"`
 }
 type hookOut struct {
