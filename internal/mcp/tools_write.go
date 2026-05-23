@@ -78,11 +78,6 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 	}, registryRemoveTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "worktree_watch",
-		Description: "Toggle the per-repo opt-in for the daemon's lifecycle watcher. With opt-in ON, the daemon tails `<common-dir>/worktrees/` and fires postcreate / postdelete hooks automatically when `git worktree add`/`remove` runs outside the treeman CLI. Action must be one of: on, off, status. Both this opt-in AND the resolved config bool `worktrees.hook_lifecycle: true` must be set for the watcher to activate.",
-	}, worktreeWatchTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshots_purge",
 		Description: "Drop every cached snapshot (template DB) belonging to the current (or specified) repo. Frees engine-side storage and forces the next prepare to rebuild from scratch. Returns counts + any per-engine errors.",
 	}, snapshotsPurgeTool)
@@ -540,76 +535,6 @@ func registryRepairTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in regis
 			0, map[string]string{"repo": repoRoot})
 	}
 	return nil, res, err
-}
-
-// ─── worktree_watch ───────────────────────────────────────────────
-
-type worktreeWatchIn struct {
-	Repo   string `json:"repo,omitempty"`
-	Action string `json:"action" jsonschema:"on|off|status"`
-}
-type worktreeWatchOut struct {
-	Repo          string `json:"repo"`
-	OptIn         bool   `json:"opt_in"`
-	ConfigEnabled bool   `json:"config_enabled"`
-	Active        bool   `json:"active"`
-}
-
-func worktreeWatchTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeWatchIn) (*mcpsdk.CallToolResult, worktreeWatchOut, error) {
-	action := strings.ToLower(strings.TrimSpace(in.Action))
-	if action == "" {
-		action = "status"
-	}
-	repoRoot, err := resolveRepo(in.Repo)
-	if err != nil {
-		return nil, worktreeWatchOut{}, err
-	}
-	cfg, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
-		return nil, worktreeWatchOut{}, fmt.Errorf("load config: %w", err)
-	}
-	st, err := openStore(ctx)
-	if err != nil {
-		return nil, worktreeWatchOut{}, err
-	}
-	defer st.Close()
-	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	if err != nil {
-		return nil, worktreeWatchOut{}, fmt.Errorf("ensure repo: %w", err)
-	}
-
-	configEnabled := cfg.Worktrees.HookLifecycle != nil && *cfg.Worktrees.HookLifecycle
-
-	switch action {
-	case "on", "enable":
-		if err := st.SetRepoWatchLifecycle(ctx, repoID, true); err != nil {
-			return nil, worktreeWatchOut{}, err
-		}
-		writeMCPEvent(context.Background(), "worktree_watch", "opted in "+repoRoot, repoID, map[string]string{
-			"repo":   repoRoot,
-			"action": "on",
-		})
-	case "off", "disable":
-		if err := st.SetRepoWatchLifecycle(ctx, repoID, false); err != nil {
-			return nil, worktreeWatchOut{}, err
-		}
-		writeMCPEvent(context.Background(), "worktree_watch", "opted out "+repoRoot, repoID, map[string]string{
-			"repo":   repoRoot,
-			"action": "off",
-		})
-	case "status":
-		// read-only
-	default:
-		return nil, worktreeWatchOut{}, fmt.Errorf("unknown action %q (want on|off|status)", in.Action)
-	}
-
-	on, _ := st.GetRepoWatchLifecycle(ctx, repoID)
-	return nil, worktreeWatchOut{
-		Repo:          repoRoot,
-		OptIn:         on,
-		ConfigEnabled: configEnabled,
-		Active:        on && configEnabled,
-	}, nil
 }
 
 // ─── snapshots_purge ──────────────────────────────────────────────

@@ -49,10 +49,23 @@ type Config struct {
 	// async vs sync semantics for hooks.
 	Worktrees WorktreesConfig `yaml:"worktrees,omitempty"`
 
-	// .env file scoping rules. Controls which env files get rewritten
-	// with the worktree slug, which are read as credential sources,
-	// and any user-defined key/template patches.
+	// Env-file credential resolution. Controls which `.env*` files
+	// the resolver consults when looking up DB passwords and other
+	// secrets. Patching of env / yaml / json / phpunit.xml files for
+	// per-worktree scoping lives in the top-level `patches:` block.
 	EnvScoping EnvScoping `yaml:"env_scoping,omitempty"`
+
+	// Files to rewrite inside each worktree with per-worktree values
+	// (slug-substituted DB names, cache prefixes, etc.). Supports
+	// dotenv key=value files, phpunit.xml `<env>` blocks, generic
+	// YAML, and generic JSON. When `skip_worktree: true` (default)
+	// each patched file gets `git update-index --skip-worktree`
+	// applied so the rewrite doesn't show up as a dirty file.
+	//
+	// Re-applied on every `treeman wt finalize` so a branch switch
+	// inside an existing worktree re-evaluates each patch against
+	// the new HEAD's slug.
+	Patches []Patch `yaml:"patches,omitempty"`
 
 	// One entry per database the project owns. Each entry pairs an
 	// engine with a dump path, migration source, test-clone fanout,
@@ -340,11 +353,22 @@ type WorktreesConfig struct {
 	// `../foo-worktrees` for the sibling-dir convention.
 	Root string `yaml:"root,omitempty"`
 
-	// Files/directories from the main worktree to symlink into each
-	// new worktree on create. Useful for committed-in-main-only
-	// caches (e.g. `node_modules`, `vendor`) and tool configs that
-	// shouldn't be duplicated.
+	// Paths (relative to the main worktree) to *symlink* into each
+	// new worktree on create. Use for committed-in-main-only caches
+	// that the worktree should read but never mutate per-branch —
+	// e.g. `node_modules`, `vendor`. The symlink points at the main
+	// worktree's copy so all worktrees share one on-disk cache.
+	// Glob meta-characters expand against the main worktree root.
 	Links []string `yaml:"links,omitempty"`
+
+	// Paths (relative to the main worktree) to *copy* into each new
+	// worktree on create. Use for gitignored files that the worktree
+	// needs in its own copy so it can be patched per-branch without
+	// affecting the main worktree's copy — e.g. `.env`, `.env.local`.
+	// Glob meta-characters expand against the main worktree root.
+	// Directories are recursed; existing destinations are left alone
+	// (idempotent re-runs).
+	Copies []string `yaml:"copies,omitempty"`
 
 	// When true (default), postcreate hooks run asynchronously: the
 	// `worktree create` command returns immediately and the daemon
@@ -354,35 +378,21 @@ type WorktreesConfig struct {
 
 	// When true (default), predelete + postdelete hooks run async.
 	AsyncDelete *bool `yaml:"async_delete,omitempty"`
-
-	// When true, the daemon watches `<common-dir>/worktrees/` via
-	// fsnotify and fires `postcreate` / `postdelete` automatically
-	// when `git worktree add`/`remove` runs outside the treeman CLI.
-	// Default false. Even when true globally, a repo must be
-	// opted in via `treeman wt watch on` (see `repos.watch_lifecycle`
-	// in the daemon store) — both gates must be set for the watcher
-	// to act on a given repo.
-	HookLifecycle *bool `yaml:"hook_lifecycle,omitempty"`
 }
 
-// EnvScoping — `env_scoping:` block.
+// EnvScoping — `env_scoping:` block. After the patches-block
+// refactor, this carries only the credential resolver's READ list.
+// `.env*` rewriting lives in the top-level `patches:` block.
 //
-// `Files` is the WRITE list — `.env*` files that get patched with
-// the per-worktree slug. `Sources` is the READ list used by the
-// credential resolver: every path is read in order and later layers
+// `Sources` is the ordered list the credential resolver consults
+// when looking up DB passwords and other secrets. Later layers
 // override earlier ones (so a `.env.testing.local` override beats
-// the committed `.env.testing` baseline). When `Sources` is empty,
-// the resolver falls back to the default search order:
+// the committed `.env.testing` baseline). When empty, the resolver
+// falls back to the default search order:
 //
 //	.env  →  .env.local  →  .env.test  →  .env.testing
 //	     →  .env.test.local  →  .env.testing.local
 type EnvScoping struct {
-	// WRITE list — `.env*` files that get rewritten in each new
-	// worktree to embed the per-worktree slug (so DB_NAME, REDIS_DB,
-	// etc. point at the cloned resources instead of the shared
-	// ones). Each entry is a path relative to the worktree root.
-	Files []string `yaml:"files,omitempty"`
-
 	// READ list — paths the credential resolver consults in order
 	// when looking up DB passwords and other secrets. Later layers
 	// override earlier ones. When empty, the resolver falls back to
@@ -390,30 +400,52 @@ type EnvScoping struct {
 	// `.env` → `.env.local` → `.env.test` → `.env.testing` →
 	// `.env.test.local` → `.env.testing.local`.
 	Sources []string `yaml:"sources,omitempty"`
-
-	// When true (default), treeman skips writing into the main
-	// worktree's env files — only the per-worktree copies get
-	// patched. Set false to also apply patches to the main worktree
-	// (rare; mostly for single-worktree projects).
-	SkipWorktree *bool `yaml:"skip_worktree,omitempty"`
-
-	// Extra key/template pairs to apply on top of the default
-	// slug-substitution patches. Use this for env keys treeman
-	// doesn't know about by default (e.g. queue names, S3 prefixes).
-	Patches []EnvPatch `yaml:"patches,omitempty"`
 }
 
-// EnvPatch — one `(key, template)` pair.
-type EnvPatch struct {
-	// Env variable key to overwrite, e.g. `DB_NAME`, `REDIS_DB`,
-	// `S3_BUCKET_PREFIX`.
-	Key string `yaml:"key"`
+// Patch — one entry in the top-level `patches:` block. Each entry
+// targets one file under the worktree root and rewrites it with
+// per-worktree values via the `set:` map. Values are template
+// strings that accept `{slug}`, `{slug_dash}`, `{slug_upper}`,
+// `{slug_redis_queue}`, `{slug_redis_cache}`, `{repo}`, `{branch}`.
+//
+// The driver is picked from `format:` when set, otherwise auto-
+// detected from the file extension:
+//
+//	dotenv  — `.env`, `.env.*`
+//	phpunit — `.xml`, `.xml.dist` (phpunit.xml `<env>` blocks)
+//	yaml    — `.yaml`, `.yml`
+//	json    — `.json`
+//	toml    — `.toml`
+//	ini     — `.ini`, `.cfg`
+//
+// Path syntax inside `set:` is uniform across drivers:
+//
+//	dotenv / phpunit  — flat key (e.g. `DB_DATABASE`)
+//	ini               — `section.key` (top-level keys allowed too)
+//	yaml / json / toml — dotted path, optionally with `[N]` indices
+//	                    (e.g. `services[0].host`)
+//
+// When `skip_worktree` is true (default), treeman calls
+// `git update-index --skip-worktree` on the patched file so the
+// rewrite doesn't show up as a dirty file. The file must be tracked
+// by git for the skip-worktree call to do anything; gitignored
+// files are patched in-place without any git interaction.
+type Patch struct {
+	// File path relative to the worktree root. Required.
+	File string `yaml:"file"`
 
-	// Template for the new value. Supports `{slug}` (the
-	// per-worktree slug), `{repo}`, and `{branch}` placeholders.
-	// Example: `app_{slug}` produces `app_feature-x` for a slug of
-	// `feature-x`.
-	Template string `yaml:"template"`
+	// When true (default), apply `git update-index --skip-worktree`
+	// after patching so the file doesn't show in `git status`.
+	SkipWorktree *bool `yaml:"skip_worktree,omitempty"`
+
+	// Driver name. Optional — leave unset to auto-detect from the
+	// file extension. Explicit when the extension is ambiguous
+	// (e.g. `phpunit` for a `.xml` that isn't standard XML).
+	Format string `yaml:"format,omitempty" jsonschema:"enum=dotenv,enum=phpunit,enum=yaml,enum=json,enum=toml,enum=ini"`
+
+	// Key → value-template map. Path syntax depends on the driver
+	// (see the type doc-comment).
+	Set map[string]string `yaml:"set,omitempty"`
 }
 
 // HooksConfig — `hooks:` block.
@@ -732,6 +764,43 @@ type DatabaseConfig struct {
 	// Range 0–64. Raise only if the server is provisioned
 	// (max_connections, PG pg_database lock contention, etc.).
 	Fanout uint32 `yaml:"fanout,omitempty" jsonschema:"minimum=0,maximum=64"`
+
+	// Per-database watch list. When a file matching one of these
+	// globs changes, the daemon re-prepares THIS database only. With
+	// `on: rebuild` the cache-hit shortcut is skipped and the
+	// template rebuilds from scratch; with `on: auto` (default) the
+	// usual `migrations.on_modify` logic applies. Top-level
+	// `watcher.paths` still works and applies to every database.
+	Watch []WatcherPath `yaml:"watch,omitempty"`
+
+	// Shell command run AFTER dump-load + migrations as the final
+	// step of the cold-build path, BEFORE treeman snapshots the
+	// populated database into its fingerprint-keyed template. Use
+	// for engines that don't have a dump primitive (Mongo, Redis,
+	// Elasticsearch) — declare seed scripts here and they run once
+	// per fingerprint, then their output is cached + cloned for
+	// every worktree.
+	//
+	// Same env-substitution shape as `migrations.migrate.env`:
+	// `{target_db}` expands to the per-run database/namespace name.
+	Seed *SeedSpec `yaml:"seed,omitempty"`
+}
+
+// SeedSpec — `databases[].seed:` sub-block. Declares the shell
+// command treeman runs to populate a database's template state with
+// non-migration data (fixtures, ES index mappings, Mongo seed
+// documents, Redis warm-cache keys, etc.). Same shape as
+// `migrations.migrate` so the same runner can execute both.
+type SeedSpec struct {
+	// Run is the shell command treeman invokes via `sh -c`. Example:
+	// `node scripts/seed.js`. Required.
+	Run string `yaml:"run"`
+
+	// Env is a map of env-var names to value templates. Each entry
+	// is set on the seed subprocess. `{target_db}` is substituted
+	// with the resolved per-run database name; literal values pass
+	// through unchanged.
+	Env map[string]string `yaml:"env,omitempty"`
 }
 
 // DumpSpec — `dump:` sub-block of a DatabaseConfig.
@@ -749,23 +818,22 @@ type DumpSpec struct {
 }
 
 // MigrationSpec — `migrations:` sub-block. Fully declarative: every
-// input the runtime needs (migration directories, file globs,
-// lockfiles, hash mode, on-modify policy) is read from this struct,
-// never inferred at runtime from `framework`. `framework` is a free-
-// form label for logs + downstream tooling.
+// input the runtime needs (the migrate command, its env overrides,
+// migration directories, file globs, lockfiles, hash mode, on-modify
+// policy) is read verbatim from this struct. There is no implicit
+// fallback — leaving e.g. MigrationDirs empty means treeman has no
+// migration source for the hash, so the snapshot key won't change
+// when files do; leaving Migrate.Run empty makes `prepare` error.
 //
-// `treeman init` emits these fields populated from the matching
-// built-in preset; `treeman fw detect` lists the presets so you can
-// copy fields in by hand. There is no implicit fallback — leaving
-// e.g. MigrationDirs empty means treeman has no migration source
-// for the hash, so the snapshot key won't change when files do.
+// `treeman init` populates these fields from the framework presets
+// in internal/migrations/framework; `treeman fw detect` lists the
+// presets so you can hand-copy fields in. After scaffolding the YAML
+// is the only source of truth.
 type MigrationSpec struct {
-	// Free-form label identifying the migration tool (`laravel`,
-	// `flyway`, `golang-migrate`, `alembic`, etc.). Logged and
-	// surfaced in `treeman fw detect`; never inspected by runtime
-	// dispatch logic — every behavior is driven by the explicit
-	// fields below.
-	Framework string `yaml:"framework"`
+	// Migrate is the shell command treeman runs to apply migrations
+	// against a target database, plus the env-var overrides that
+	// redirect the framework's CLI at that database. Required.
+	Migrate *MigrationMigrate `yaml:"migrate,omitempty"`
 
 	// Glob patterns (relative to repo root) for directories
 	// containing migration files. Required for any behavior beyond
@@ -793,6 +861,34 @@ type MigrationSpec struct {
 	// dump. `delta` runs only the new migrations on top of the
 	// existing template — faster but assumes append-only history.
 	OnModify string `yaml:"on_modify,omitempty" jsonschema:"enum=rebuild,enum=delta"`
+}
+
+// MigrationMigrate — `migrations.migrate:` sub-block. Declares the
+// shell command treeman invokes to apply migrations and the env-var
+// overrides that point the framework's CLI at the per-run template
+// database.
+//
+// The framework's migrate command reads its target DB from the
+// framework's own config (Laravel: `DB_DATABASE` in `.env`; Rails:
+// `DATABASE`; Django: `DJANGO_DB_NAME`; etc.). Treeman builds
+// per-worktree template databases with names like
+// `myapp_template_feature-x` and needs to redirect the migrate
+// command at *that* DB, not the one the committed `.env` references.
+// The `Env` map says which env-var names to override; the value
+// template `{target_db}` is substituted at runtime with the resolved
+// database name. No other placeholders are supported.
+type MigrationMigrate struct {
+	// Run is the shell command treeman invokes via `sh -c`. Example:
+	// `php artisan migrate --force`. Required; an empty Run aborts
+	// `prepare` with a clear error rather than falling back to a
+	// hardcoded default.
+	Run string `yaml:"run"`
+
+	// Env is a map of env-var names to value templates. Each entry
+	// is set on the migrate subprocess (overriding the framework's
+	// config file). `{target_db}` is substituted with the resolved
+	// per-run database name; literal values pass through unchanged.
+	Env map[string]string `yaml:"env,omitempty"`
 }
 
 // TestClonesSpec — `test_clones:` sub-block. Used by every parallel
@@ -858,23 +954,28 @@ func (c *ClonesSetting) UnmarshalYAML(node *yaml.Node) error {
 	return fmt.Errorf("clones: want scalar")
 }
 
-// Namespaces — engine-specific namespacing (redis db-index,
-// elasticsearch index prefix, etc.).
+// Namespaces — engine-specific namespacing.
 type Namespaces struct {
-	// Redis-specific: template producing a numeric DB index per
-	// worktree. Must evaluate to an integer in 0–15 (default Redis
-	// config). Example: `{slug_hash16}` produces a stable hash in
-	// the valid range.
+	// Redis: legacy per-worktree DB index. Template must render to
+	// an integer in 0-15. No template caching and no test_clones
+	// fanout in this mode — kept for backward compat. Prefer
+	// `prefix_template` for new configs.
 	DbIndexTemplate string `yaml:"db_index_template,omitempty"`
 
-	// Elasticsearch/OpenSearch-specific: template producing the
-	// index-name prefix. All indexes the app creates are scoped by
+	// Elasticsearch / OpenSearch: template producing the index-
+	// name prefix. All indexes the app creates are scoped under
 	// this prefix per worktree. Example: `app_{slug}_`.
 	IndexPrefixTemplate string `yaml:"index_prefix_template,omitempty"`
 
-	// Generic key-prefix template for engines that scope by key
-	// prefix rather than db/index (e.g. Redis key namespacing when
-	// db-index isolation isn't enough).
+	// Redis (preferred) and other prefix-isolated engines: template
+	// producing the key prefix every worktree key lives under. One
+	// Redis logical DB (0) holds every worktree's data, isolated
+	// by prefix — lifts the 16-DB cap, works on cluster mode, and
+	// enables full template caching + parallel fanout. The app must
+	// honour the prefix (Laravel's `CACHE_PREFIX`, Rails
+	// `Rails.cache.options[:namespace]`, ioredis `keyPrefix`).
+	// Example: `{slug}:` produces `feature-x:` and the app reads
+	// keys as `feature-x:cache:foo`.
 	PrefixTemplate string `yaml:"prefix_template,omitempty"`
 }
 
@@ -921,7 +1022,7 @@ type BinlogConfig struct {
 	ApplyDML *bool `yaml:"apply_dml,omitempty"`
 }
 
-// WatcherPath — one `paths:` entry.
+// WatcherPath — one `paths:` entry under `watcher:` or `databases[].watch`.
 type WatcherPath struct {
 	// Filesystem glob (relative to repo root) the watcher monitors.
 	// Supports `**` recursion. Example:
@@ -931,9 +1032,18 @@ type WatcherPath struct {
 	// Invalidation strategy when a matching file changes:
 	//   `auto`    — defer to the matching DatabaseConfig's `on_modify`.
 	//   `delta`   — keep the cached template, replay only new files.
-	//   `rebuild` — drop the template, replay everything from the dump.
+	//   `rebuild` — drop the template AND skip the cache-hit shortcut,
+	//               rebuilding from the dump no matter what the
+	//               database's `on_modify` says.
 	// Default: `auto`.
 	On string `yaml:"on,omitempty" jsonschema:"enum=auto,enum=delta,enum=rebuild"`
+
+	// DBIndex is the index of the database in cfg.Databases this watch
+	// belongs to. Populated by the daemon at watcher-start time when
+	// aggregating top-level watcher.paths (DBIndex = -1, "applies to
+	// every DB") with per-DB watches (DBIndex = i for databases[i]).
+	// Not serialised — users only ever set Glob + On in YAML.
+	DBIndex int `yaml:"-" json:"-"`
 }
 
 // CustomFramework — `frameworks:` entry, lets users declare
@@ -1068,10 +1178,6 @@ func applyDefaults(cfg *Config) {
 	if cfg.Worktrees.AsyncDelete == nil {
 		t := true
 		cfg.Worktrees.AsyncDelete = &t
-	}
-	if cfg.EnvScoping.SkipWorktree == nil {
-		t := true
-		cfg.EnvScoping.SkipWorktree = &t
 	}
 	if cfg.Snapshots.Retention.CapPerRepo == 0 {
 		cfg.Snapshots.Retention.CapPerRepo = 8

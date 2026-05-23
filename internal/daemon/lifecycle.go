@@ -24,15 +24,9 @@ import (
 // `<common-dir>/worktrees/` of one repo and fires hook phases when
 // worktrees appear/disappear outside of the treeman CLI.
 //
-// Gating: the daemon only spawns a LifecycleWatcher for a repo when
-// BOTH of the following are true:
-//
-//  1. The repo's effective config has `worktrees.hook_lifecycle: true`
-//     (default false; layered global + per-repo, most specific wins).
-//  2. The `repos.watch_lifecycle` column in the daemon store is set
-//     to 1 (toggled via `treeman wt watch on`).
-//
-// Either gate flipping false stops the watcher at the next reconcile.
+// Always on: the daemon spawns a LifecycleWatcher for every
+// registered repo unconditionally. Worktree add/remove is
+// infrastructure (not user policy), so there's no opt-in toggle.
 type LifecycleWatcher struct {
 	repoID    int64
 	repoPath  string
@@ -47,20 +41,6 @@ type LifecycleWatcher struct {
 
 	pendingMu     sync.Mutex
 	pendingCreate map[string]*time.Timer
-}
-
-// LifecycleEnabledForRepo resolves the effective config for repoPath
-// and returns the value of `worktrees.hook_lifecycle`. Defaults to
-// false when the field is unset at every layer.
-func LifecycleEnabledForRepo(repoPath string) bool {
-	cfg, err := resolve.LoadResolved(repoPath)
-	if err != nil {
-		return false
-	}
-	if cfg.Worktrees.HookLifecycle == nil {
-		return false
-	}
-	return *cfg.Worktrees.HookLifecycle
 }
 
 // StartLifecycleWatcher subscribes to a repo's `<common-dir>/worktrees/`
@@ -265,7 +245,7 @@ func (lw *LifecycleWatcher) onRemove(ctx context.Context, adminDir string) {
 }
 
 // reconcile diffs the filesystem state against the DB rows for this
-// repo at boot (or whenever a watch_lifecycle toggle flips on):
+// repo at boot:
 //
 //   - admin_dir present on disk but no DB row → postcreate dispatch.
 //   - DB row with admin_dir but the dir is gone → postdelete dispatch.

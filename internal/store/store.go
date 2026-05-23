@@ -531,37 +531,11 @@ func (s *Store) RemoveRepo(ctx context.Context, repoID int64) error {
 	return tx.Commit()
 }
 
-// SetRepoWatchLifecycle toggles the per-repo lifecycle-watcher opt-in
-// flag. The watcher only acts on repos where this is 1 AND the global
-// `worktrees.hook_lifecycle` config bool is true.
-func (s *Store) SetRepoWatchLifecycle(ctx context.Context, repoID int64, on bool) error {
-	v := 0
-	if on {
-		v = 1
-	}
-	_, err := s.DB.ExecContext(ctx,
-		"UPDATE repos SET watch_lifecycle = ? WHERE id = ?", v, repoID)
-	return err
-}
-
-// GetRepoWatchLifecycle returns the current opt-in flag for repoID.
-func (s *Store) GetRepoWatchLifecycle(ctx context.Context, repoID int64) (bool, error) {
-	row := s.DB.QueryRowContext(ctx, "SELECT watch_lifecycle FROM repos WHERE id = ?", repoID)
-	var v int
-	if err := row.Scan(&v); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	return v != 0, nil
-}
-
-// ListLifecycleWatchedRepos returns every repo (path + id) where
-// watch_lifecycle = 1. Used by the daemon at boot to subscribe.
-func (s *Store) ListLifecycleWatchedRepos(ctx context.Context) ([]RepoRef, error) {
-	rows, err := s.DB.QueryContext(ctx,
-		"SELECT id, path FROM repos WHERE watch_lifecycle = 1 ORDER BY id")
+// ListRepoRefs returns (id, path) for every registered repo in
+// insertion order. Used by the daemon at boot to subscribe the
+// always-on lifecycle watcher to every known repo.
+func (s *Store) ListRepoRefs(ctx context.Context) ([]RepoRef, error) {
+	rows, err := s.DB.QueryContext(ctx, "SELECT id, path FROM repos ORDER BY id")
 	if err != nil {
 		return nil, err
 	}

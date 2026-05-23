@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"gopkg.in/yaml.v3"
 
@@ -78,10 +79,11 @@ func RenderTemplate(cwd string) string {
 	// worktrees:
 	mapSet(root, "worktrees", mapNode(
 		"root", scalar(".worktrees"),
-		"links", seqNode(scalar(".env")),
+		"copies", seqNode(scalar(".env")),
 	))
 
-	// env_scoping:
+	// env_scoping (read-list only — patches live in the top-level
+	// `patches:` block now).
 	envSources := defaultEnvSourcesFor(detected, has)
 	if len(envSources) > 0 {
 		sources := seqNode()
@@ -89,23 +91,23 @@ func RenderTemplate(cwd string) string {
 			sources.Content = append(sources.Content, scalar(s))
 		}
 		envBlock := mapNode("sources", sources)
-		// LineComment on the `sources` key node prints next to
-		// `sources:` and explains the precedence rule. mapKeyNode
-		// returns the key scalar inside envBlock.
 		mapKeyNode(envBlock, "sources").LineComment = "files read in order, last wins"
-		if hasFrameworkNamed(detected, "laravel") {
-			files := seqNode(scalar(".env.testing"))
-			files.Style = yaml.FlowStyle
-			mapSet(envBlock, "files", files)
-			mapSet(envBlock, "skip_worktree", scalarBool(true))
-			patch := mapNode(
-				"key", scalar("DB_TEST_DATABASE"),
-				"template", scalar(name+"_testing_{slug}"),
-			)
-			patch.Style = yaml.FlowStyle
-			mapSet(envBlock, "patches", seqNode(patch))
-		}
 		mapSet(root, "env_scoping", envBlock)
+	}
+
+	// patches: — generic file-rewriting block. For Laravel projects
+	// the canonical patch is `.env.testing` → DB_TEST_DATABASE, with
+	// skip-worktree so it doesn't appear dirty in git. Driver is
+	// auto-detected from the `.env` extension.
+	if hasFrameworkNamed(detected, "laravel") {
+		setMap := mapNode(
+			"DB_TEST_DATABASE", scalar(name+"_testing_{slug}"),
+		)
+		patch := mapNode(
+			"file", scalar(".env.testing"),
+			"set", setMap,
+		)
+		mapSet(root, "patches", seqNode(patch))
 	}
 
 	// databases:
@@ -115,16 +117,13 @@ func RenderTemplate(cwd string) string {
 		if engine == "" {
 			engine = "mysql"
 		}
-		frameworkVal := scalar(spec.Name)
-		frameworkVal.LineComment = "label only — runtime uses the fields below"
-		mig := mapNode(
-			"framework", frameworkVal,
-		)
+		mig := mapNode()
 		mapSet(mig, "migration_dirs", stringSeq(spec.MigrationDirs))
 		mapSet(mig, "file_globs", stringSeq(spec.FileGlobs))
 		mapSet(mig, "lockfiles", stringSeq(spec.Lockfiles))
 		mapSet(mig, "hash_mode", scalar(string(spec.HashMode)))
 		mapSet(mig, "on_modify", scalar(string(spec.OnModify)))
+		mapSet(mig, "migrate", migrateBlock(spec))
 
 		db := mapNode(
 			"engine", scalar(engine),
@@ -136,6 +135,13 @@ func RenderTemplate(cwd string) string {
 			),
 		)
 		mapSet(root, "databases", seqNode(db))
+
+		// watcher.paths: derived from the framework's migration_dirs ×
+		// file_globs + one entry per lockfile. Written explicitly so
+		// the user can see (and tune) what's watched.
+		if paths := watcherPathNodes(spec); paths != nil {
+			mapSet(root, "watcher", mapNode("paths", paths))
+		}
 	}
 
 	// hooks: postcreate:
@@ -174,6 +180,69 @@ func RenderTemplate(cwd string) string {
 		return "repo:\n  name: " + name + "\n"
 	}
 	return string(body)
+}
+
+// migrateBlock renders the `migrations.migrate:` mapping for a
+// scaffolded framework — the shell command and the env-var overrides
+// that point the framework's migrate CLI at the per-run template DB.
+// Env keys are sorted so the emitted YAML is deterministic.
+func migrateBlock(spec framework.Spec) *yaml.Node {
+	out := mapNode("run", scalar(spec.MigrateRun))
+	if len(spec.MigrateEnv) > 0 {
+		envKeys := make([]string, 0, len(spec.MigrateEnv))
+		for k := range spec.MigrateEnv {
+			envKeys = append(envKeys, k)
+		}
+		sort.Strings(envKeys)
+		env := mapNode()
+		for _, k := range envKeys {
+			mapSet(env, k, scalar(spec.MigrateEnv[k]))
+		}
+		mapSet(out, "env", env)
+	}
+	return out
+}
+
+// watcherPathNodes builds the `watcher.paths` sequence from a
+// detected framework. Each (migration_dir, file_glob) pair produces
+// one entry with the framework's OnModify policy; each lockfile
+// produces an entry with `on: rebuild` (a lockfile bump means the
+// framework version moved, which always warrants a full rebuild).
+// Returns nil when the spec has nothing to watch — the caller skips
+// emitting the watcher block in that case.
+func watcherPathNodes(spec framework.Spec) *yaml.Node {
+	type entry struct{ glob, on string }
+	var entries []entry
+	seen := map[string]struct{}{}
+	add := func(glob, on string) {
+		key := glob + "\x00" + on
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		entries = append(entries, entry{glob: glob, on: on})
+	}
+	onMod := string(spec.OnModify)
+	if onMod == "" {
+		onMod = string(framework.OnRebuild)
+	}
+	for _, dir := range spec.MigrationDirs {
+		for _, pat := range spec.FileGlobs {
+			add(dir+"/**/"+pat, onMod)
+		}
+	}
+	for _, lf := range spec.Lockfiles {
+		add(lf, string(framework.OnRebuild))
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	seq := seqNode()
+	for _, e := range entries {
+		seq.Content = append(seq.Content,
+			mapNode("glob", scalar(e.glob), "on", scalar(e.on)))
+	}
+	return seq
 }
 
 // DetectFrameworkNames returns the names of every migration framework

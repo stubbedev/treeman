@@ -5,6 +5,7 @@ package redis
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/redis/go-redis/v9"
 
@@ -17,6 +18,13 @@ import (
 // FlushDB can dial a per-index sub-client.
 type Driver struct {
 	url string
+
+	// Lazy-resolved COPY-command support flag. Redis 6.2+ supports
+	// the server-side `COPY` command (fast, single round-trip per
+	// key); older versions need the DUMP+RESTORE fallback. The
+	// detection runs once on the first snapshot op and caches.
+	copyOnce      sync.Once
+	copySupported bool
 }
 
 // Connect probes TCP reachability + returns a Driver. The actual

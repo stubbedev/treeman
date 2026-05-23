@@ -49,6 +49,11 @@ type Event struct {
 	RepoPath string
 	Path     string
 	Mode     DispatchMode
+	// DBIndex is the index into cfg.Databases that this event scopes
+	// to: copied from the matched WatcherPath.DBIndex. -1 means the
+	// event came from a top-level `watcher.paths` entry and applies
+	// to every database.
+	DBIndex int
 }
 
 // Dispatcher is the callback invoked once per debounced event. The
@@ -132,13 +137,13 @@ func (w *Watcher) Start(ctx context.Context) error {
 					_ = w.fsw.Add(ev.Name)
 				}
 			}
-			mode, matched := w.classify(ev.Name)
+			mode, dbIdx, matched := w.classify(ev.Name)
 			if !matched {
 				continue
 			}
 			w.mu.Lock()
 			w.pending[ev.Name+"\x00"+string(mode)] = Event{
-				RepoPath: w.repoPath, Path: ev.Name, Mode: mode,
+				RepoPath: w.repoPath, Path: ev.Name, Mode: mode, DBIndex: dbIdx,
 			}
 			w.mu.Unlock()
 
@@ -221,13 +226,13 @@ func (w *Watcher) addAllDirs() error {
 }
 
 // classify resolves an event path against the configured globs and
-// returns the first matching mode. Unmatched paths drop on the
-// floor (`auto` for everything would be too noisy — `.git`,
+// returns the first matching mode + DB index. Unmatched paths drop
+// on the floor (`auto` for everything would be too noisy — `.git`,
 // `node_modules` etc.).
-func (w *Watcher) classify(path string) (DispatchMode, bool) {
+func (w *Watcher) classify(path string) (DispatchMode, int, bool) {
 	rel, err := filepath.Rel(w.repoPath, path)
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
 	rel = filepath.ToSlash(rel)
 	for _, p := range w.cfg.Paths {
@@ -244,9 +249,9 @@ func (w *Watcher) classify(path string) (DispatchMode, bool) {
 		case "", "auto":
 			mode = ModeAuto
 		}
-		return mode, true
+		return mode, p.DBIndex, true
 	}
-	return "", false
+	return "", 0, false
 }
 
 // flush dispatches every pending event then clears the buffer.

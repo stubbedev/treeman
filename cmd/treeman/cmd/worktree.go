@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"os"
 	"path/filepath"
@@ -36,7 +37,6 @@ func WorktreeCmd() *cli.Command {
 			wtDelete(),
 			wtRegister(),
 			wtUnregister(),
-			wtWatch(),
 			wtList(),
 			wtShow(),
 			wtLogs(),
@@ -152,81 +152,31 @@ Examples:
 			}
 			wtPath = MustAbs(wtPath)
 
-			// worktrees.links — symlinks from main into the new
-			// worktree. Entries containing glob meta-characters
-			// (`*`, `?`, `[`) expand against repoRoot via
-			// filepath.Glob — `.env.*.local` should pick up
-			// `.env.dev.local`, `.env.staging.local`, etc. without
-			// the user having to enumerate each. Glob entries that
-			// match nothing are silent (typical for optional dev
-			// overrides); literal entries that miss still warn.
-			for _, rel := range cfg.Worktrees.Links {
-				var matches []string
-				if strings.ContainsAny(rel, "*?[") {
-					m, _ := filepath.Glob(filepath.Join(repoRoot, rel))
-					matches = m
-				} else {
-					matches = []string{filepath.Join(repoRoot, rel)}
-				}
-				if len(matches) == 0 {
-					continue
-				}
-				for _, src := range matches {
-					if _, err := os.Stat(src); err != nil {
-						if !strings.ContainsAny(rel, "*?[") {
-							PrintWarn("link source missing, skipping: %s", src)
-						}
-						continue
-					}
-					relToRepo, err := filepath.Rel(repoRoot, src)
-					if err != nil {
-						relToRepo = filepath.Base(src)
-					}
-					dst := filepath.Join(wtPath, relToRepo)
-					if _, err := os.Stat(dst); err == nil {
-						continue
-					}
-					_ = os.MkdirAll(filepath.Dir(dst), 0o755)
-					if err := os.Symlink(src, dst); err != nil {
-						return fmt.Errorf("symlink %s → %s: %w", dst, src, err)
-					}
-				}
+			// worktrees.links — read-only symlinks from main into the
+			// new worktree (vendor, node_modules, …). Glob meta-chars
+			// expand against repoRoot. Idempotent: existing dst is skipped.
+			if err := bringInFiles(repoRoot, wtPath, cfg.Worktrees.Links, "link"); err != nil {
+				return err
+			}
+			// worktrees.copies — per-worktree copies so patches can
+			// mutate per-branch without affecting main.
+			if err := bringInFiles(repoRoot, wtPath, cfg.Worktrees.Copies, "copy"); err != nil {
+				return err
 			}
 
 			sl := slug.For(wtPath, branch)
 			tplCtx := template.FromSlug(sl)
 
-			// env_scoping patches.
-			pairs := make([]patcher.Pair, 0, len(cfg.EnvScoping.Patches))
-			for _, p := range cfg.EnvScoping.Patches {
-				v, err := template.Render(p.Template, tplCtx)
-				if err != nil {
-					return fmt.Errorf("render env_scoping patch %s: %w", p.Key, err)
-				}
-				pairs = append(pairs, patcher.Pair{Key: p.Key, Value: v})
-			}
-			skipWT := cfg.EnvScoping.SkipWorktree == nil || *cfg.EnvScoping.SkipWorktree
-			for _, f := range cfg.EnvScoping.Files {
-				abs := filepath.Join(wtPath, f)
-				var outcome patcher.Outcome
-				if filepath.Ext(abs) == ".xml" {
-					outcome, err = patcher.PatchPhpunitFile(abs, pairs)
-				} else {
-					outcome, err = patcher.PatchEnvFile(abs, pairs)
-				}
+			// Top-level `patches:` block — dotenv, phpunit.xml, yaml,
+			// or json rewrites with per-worktree values + optional
+			// git skip-worktree so the rewrite stays out of git status.
+			for _, p := range cfg.Patches {
+				res, err := patcher.Apply(p, wtPath, tplCtx)
 				if err != nil {
 					return err
 				}
-				if outcome == patcher.Updated {
-					fmt.Printf("patched %s\n", abs)
-				}
-				// Apply skip-worktree regardless of patch outcome: a
-				// re-run of `wt create` (or finalize) on an already-
-				// patched file must still enforce the bit, otherwise
-				// the second run silently drops it. `SkipWorktree`
-				// is a no-op when the file isn't tracked.
-				if skipWT {
-					_, _ = patcher.SkipWorktree(wtPath, abs)
+				if res.Outcome == patcher.Updated {
+					fmt.Printf("patched %s (%s)\n", filepath.Join(wtPath, res.File), res.Driver)
 				}
 			}
 
@@ -580,100 +530,6 @@ func wtUnregister() *cli.Command {
 				return fmt.Errorf("worktree not found: %s", path)
 			}
 			return st.MarkWorktreeDeleted(ctx, id)
-		},
-	}
-}
-
-// wtWatch — `treeman wt watch [on|off|status]` toggles the per-repo
-// opt-in flag for the daemon's lifecycle watcher. When ON (and the
-// resolved config has `worktrees.hook_lifecycle: true`), the daemon
-// tails `<common-dir>/worktrees/` and fires postcreate / postdelete
-// for `git worktree add`/`remove` runs that bypass the treeman CLI.
-//
-// Two gates must be set for the watcher to act on a repo:
-//   - config bool (default false; layered global + per-repo)
-//   - this DB opt-in (set via `treeman wt watch on`)
-func wtWatch() *cli.Command {
-	return &cli.Command{
-		Name:      "watch",
-		Usage:     "toggle lifecycle-watcher opt-in (on|off|status)",
-		ArgsUsage: "<on|off|status>",
-		Description: `Marks the current repo as opted-in (or out) of the daemon's
-lifecycle watcher. With opt-in ON, the daemon fires postcreate /
-postdelete hooks automatically when 'git worktree add' or
-'git worktree remove' is invoked outside the treeman CLI.
-
-Both this opt-in AND the resolved config bool
-'worktrees.hook_lifecycle: true' must be set for the watcher to
-activate. Default config is OFF.
-
-Examples:
-  treeman wt watch on
-  treeman wt watch off
-  treeman wt watch status`,
-		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "repo"},
-		},
-		Action: func(ctx context.Context, c *cli.Command) error {
-			action := "status"
-			if c.NArg() >= 1 {
-				action = strings.ToLower(c.Args().First())
-			}
-			repoRoot, err := resolveRepo(c.String("repo"))
-			if err != nil {
-				return err
-			}
-			cfg, err := resolve.LoadResolved(repoRoot)
-			if err != nil {
-				return err
-			}
-			dbPath, _ := store.DefaultDBPath()
-			st, err := store.Open(ctx, dbPath)
-			if err != nil {
-				return err
-			}
-			defer st.Close()
-			repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			if err != nil {
-				return err
-			}
-			configEnabled := cfg.Worktrees.HookLifecycle != nil && *cfg.Worktrees.HookLifecycle
-			switch action {
-			case "on", "enable":
-				if err := st.SetRepoWatchLifecycle(ctx, repoID, true); err != nil {
-					return err
-				}
-				PrintOK("lifecycle watcher: opted IN for %s", repoRoot)
-				if !configEnabled {
-					PrintWarn("config gate is OFF — set `worktrees.hook_lifecycle: true` in .treeman.yaml or your global config to activate")
-				}
-				// Notify the daemon to (re)start the watcher pipeline
-				// for this repo. The watcher_start path picks up the
-				// opt-in via the new DB column.
-				if resp, err := rpc.Call(ctx, rpc.Request{
-					Method:       rpc.MethodWatcherStart,
-					WatcherStart: &rpc.WatcherStartArgs{RepoPath: repoRoot},
-				}); err == nil && resp.Kind == rpc.KindError {
-					PrintWarn("daemon: %s", resp.Message)
-				}
-				return nil
-			case "off", "disable":
-				if err := st.SetRepoWatchLifecycle(ctx, repoID, false); err != nil {
-					return err
-				}
-				PrintOK("lifecycle watcher: opted OUT for %s", repoRoot)
-				PrintInfo("the daemon-side watcher stops on the next watcher_stop or daemon restart")
-				return nil
-			case "status", "":
-				on, _ := st.GetRepoWatchLifecycle(ctx, repoID)
-				fmt.Printf("repo:           %s\n", repoRoot)
-				fmt.Printf("opt-in (db):    %v\n", on)
-				fmt.Printf("config gate:    %v\n", configEnabled)
-				active := on && configEnabled
-				fmt.Printf("watcher active: %v\n", active)
-				return nil
-			}
-			return fmt.Errorf("usage: treeman wt watch <on|off|status>")
 		},
 	}
 }
@@ -1617,4 +1473,112 @@ func trimSpace(s string) string {
 		s = s[:len(s)-1]
 	}
 	return s
+}
+
+// bringInFiles brings each entry in `paths` from repoRoot into wtPath
+// via either symlink (mode="link") or recursive copy (mode="copy").
+// Glob meta-characters (`*?[`) expand against repoRoot. Idempotent —
+// if the destination already exists the entry is skipped.
+func bringInFiles(repoRoot, wtPath string, paths []string, mode string) error {
+	for _, rel := range paths {
+		var matches []string
+		if strings.ContainsAny(rel, "*?[") {
+			m, _ := filepath.Glob(filepath.Join(repoRoot, rel))
+			matches = m
+		} else {
+			matches = []string{filepath.Join(repoRoot, rel)}
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		for _, src := range matches {
+			info, err := os.Stat(src)
+			if err != nil {
+				if !strings.ContainsAny(rel, "*?[") {
+					PrintWarn("%s source missing, skipping: %s", mode, src)
+				}
+				continue
+			}
+			relToRepo, err := filepath.Rel(repoRoot, src)
+			if err != nil {
+				relToRepo = filepath.Base(src)
+			}
+			dst := filepath.Join(wtPath, relToRepo)
+			if _, err := os.Stat(dst); err == nil {
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
+			}
+			switch mode {
+			case "link":
+				if err := os.Symlink(src, dst); err != nil {
+					return fmt.Errorf("symlink %s → %s: %w", dst, src, err)
+				}
+			case "copy":
+				if err := copyPath(src, dst, info); err != nil {
+					return fmt.Errorf("copy %s → %s: %w", src, dst, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// copyPath copies src → dst. Regular files are copied byte-for-byte
+// with the source's mode preserved; directories are recursed; symlinks
+// in the source tree are recreated as symlinks pointing at the same
+// target (so a `.env` symlink in main becomes a `.env` symlink in the
+// worktree, not a copy of the symlinked file).
+func copyPath(src, dst string, info os.FileInfo) error {
+	mode := info.Mode()
+	switch {
+	case mode&os.ModeSymlink != 0:
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(target, dst)
+	case mode.IsDir():
+		if err := os.MkdirAll(dst, mode.Perm()); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			childSrc := filepath.Join(src, e.Name())
+			childDst := filepath.Join(dst, e.Name())
+			childInfo, err := os.Lstat(childSrc)
+			if err != nil {
+				return err
+			}
+			if err := copyPath(childSrc, childDst, childInfo); err != nil {
+				return err
+			}
+		}
+		return nil
+	case mode.IsRegular():
+		return copyRegularFile(src, dst, mode.Perm())
+	default:
+		return fmt.Errorf("unsupported file type for %s (mode=%v)", src, mode)
+	}
+}
+
+func copyRegularFile(src, dst string, perm os.FileMode) error {
+	sf, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sf.Close()
+	df, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	defer df.Close()
+	if _, err := io.Copy(df, sf); err != nil {
+		return err
+	}
+	return nil
 }

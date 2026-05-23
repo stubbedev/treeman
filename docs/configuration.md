@@ -58,13 +58,17 @@ databases:
     fanout: 0                              # 0 = safe per-engine default (mysql 4, pg GOMAXPROCS, mongo 6, es 8).
                                            # raise only if the server is provisioned (max_connections bumped, etc.).
     migrations:                            # fully declarative; runtime never re-detects
-      framework: laravel                   # label only — fields below are what treeman reads
       migration_dirs:
         - "database/migrations"
       file_globs: ["*.php"]
       lockfiles: ["composer.lock"]
       hash_mode: filename                  # "filename" (cheap) | "checksum" (mutable migrations)
       on_modify: rebuild                   # "rebuild" | "delta"
+      migrate:                             # shell command + env-var redirects (point the CLI at the per-run template DB)
+        run: "php artisan migrate --force"
+        env:
+          DB_DATABASE: "{target_db}"
+          DB_TEST_DATABASE: "{target_db}"
     test_clones:                           # parallel-test-runner fan-out
       clones: auto                         # auto = detect from phpunit.xml / pyproject / Jest config
       name_template: "myapp_testing_{slug}_test_{n}"
@@ -198,12 +202,14 @@ framework. Copy + paste into the `databases:` array of an existing
 - engine: postgres
   name_template: "myapp_test_{slug}"
   migrations:
-    framework: rails
     migration_dirs: ["db/migrate"]
     file_globs: ["*.rb"]
     lockfiles: ["Gemfile.lock"]
     hash_mode: filename
     on_modify: rebuild
+    migrate:
+      run: "bin/rails db:migrate"
+      env: { DATABASE: "{target_db}" }
   test_clones:
     clones: auto          # reads parallel_workers from config/test.rb / spec_helper
     name_template: "myapp_test_{slug}_w{n}"
@@ -215,11 +221,13 @@ framework. Copy + paste into the `databases:` array of an existing
 - engine: postgres
   name_template: "myapp_test_{slug}"
   migrations:
-    framework: django
     migration_dirs: ["**/migrations"]
     file_globs: ["[0-9]*_*.py"]
     lockfiles: ["poetry.lock", "Pipfile.lock", "requirements.txt"]
     hash_mode: filename
+    migrate:
+      run: "python manage.py migrate --noinput"
+      env: { DJANGO_DB_NAME: "{target_db}" }
   test_clones:
     clones: auto          # reads pytest -n / pytest-xdist config
     name_template: "myapp_test_{slug}_w{n}"
@@ -231,11 +239,13 @@ framework. Copy + paste into the `databases:` array of an existing
 - engine: mysql
   name_template: "svc_test_{slug}"
   migrations:
-    framework: golang-migrate
     migration_dirs: ["migrations", "services/*/migrations"]
     file_globs: ["*.up.sql"]
     lockfiles: ["go.sum"]
     hash_mode: filename
+    migrate:
+      run: "migrate up"
+      env: { MIGRATE_DATABASE_NAME: "{target_db}" }
   test_clones:
     clones: 4             # explicit count; Go's `-parallel` is per-package
     name_template: "svc_test_{slug}_w{n}"
@@ -247,12 +257,14 @@ framework. Copy + paste into the `databases:` array of an existing
 - engine: postgres
   name_template: "app_test_{slug}"
   migrations:
-    framework: sqlx-cli
     migration_dirs: ["migrations", "crates/*/migrations"]
     file_globs: ["*.sql"]
     lockfiles: ["Cargo.lock"]
     hash_mode: checksum   # contents hash, not just filenames
     on_modify: delta      # try binlog/diff replay before rebuild
+    migrate:
+      run: "sqlx migrate run"
+      env: { DATABASE_URL_NAME: "{target_db}" }
   test_clones:
     clones: auto          # reads cargo nextest config
     name_template: "app_test_{slug}_w{n}"

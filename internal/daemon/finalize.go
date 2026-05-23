@@ -10,10 +10,13 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/hooks"
+	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/template"
+	"github.com/stubbedev/treeman/internal/watcher"
 )
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
@@ -65,6 +68,31 @@ func FinalizeWorktree(
 		"daemon-detached postcreate + prepare beginning",
 		repoID, wtID, "", 0, nil)
 
+	// Re-apply top-level patches: every finalize evaluates them
+	// against the current HEAD's slug. Idempotent — Unchanged is a
+	// no-op write, and the skip-worktree bit is re-asserted whether
+	// or not the content changed (re-run after `git pull` must
+	// re-enforce). Failures are logged but non-fatal so a broken
+	// patch driver doesn't block the rest of finalize.
+	if len(cfg.Patches) > 0 {
+		tplCtx := template.FromSlug(sl)
+		for _, p := range cfg.Patches {
+			res, err := patcher.Apply(p, wtRoot, tplCtx)
+			if err != nil {
+				slog.Warn("patch failed", "wt", wtRoot, "file", p.File, "err", err)
+				continue
+			}
+			if res.Outcome == patcher.Updated {
+				_ = st.Store.WriteEvent(ctx, store.LevelInfo, "patch_applied",
+					fmt.Sprintf("driver=%s file=%s", res.Driver, res.File),
+					repoID, wtID, "", 0, map[string]string{
+						"driver": res.Driver,
+						"file":   res.File,
+					})
+			}
+		}
+	}
+
 	if len(cfg.Hooks.Postcreate) > 0 {
 		// Block until every postcreate group exits before kicking off
 		// prepare. Framework migrate commands (Laravel artisan, Rails
@@ -99,6 +127,77 @@ func FinalizeWorktree(
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done",
 		"daemon-detached postcreate + prepare complete",
 		repoID, wtID, "", 0, nil)
+	return nil
+}
+
+// FinalizeWorktreeForWatch is the watcher-driven re-prepare path.
+// Called when a file matching either a top-level `watcher.paths`
+// glob or a `databases[i].watch` glob changes. Re-applies patches
+// (cheap, idempotent) and re-runs prepare scoped to the matched
+// database — forcing a full rebuild when `mode == rebuild`.
+//
+// `dbIdx == -1` means the matched glob was top-level / applies to
+// every database; in that case every DB re-prepares.
+//
+// Postcreate hooks are NOT re-run by this path — they're for
+// initial worktree setup, not edit-driven re-prep. Use the regular
+// `FinalizeWorktree` (e.g. `treeman wt finalize`) when hooks need
+// to fire.
+func FinalizeWorktreeForWatch(
+	ctx context.Context,
+	st *State,
+	repoPath, worktreePath string,
+	dbIdx int,
+	mode watcher.DispatchMode,
+	inheritedEnv map[string]string,
+) error {
+	repoRoot := repoPath
+	wtRoot := worktreePath
+
+	if !st.MarkFinalizeInFlight(wtRoot) {
+		return nil
+	}
+	defer st.UnmarkFinalizeInFlight(wtRoot)
+
+	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
+	if err != nil {
+		return err
+	}
+	branch := detectBranch(wtRoot)
+	sl := slug.For(wtRoot, branch)
+	repoName := filepath.Base(repoRoot)
+	repoID, err := st.Store.EnsureRepo(ctx, repoRoot, repoName)
+	if err != nil {
+		return err
+	}
+	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wtRoot, sl.Value, branch)
+	if err != nil {
+		return err
+	}
+
+	// Re-apply patches. Cheap; idempotent for unchanged content.
+	if len(cfg.Patches) > 0 {
+		tplCtx := template.FromSlug(sl)
+		for _, p := range cfg.Patches {
+			if _, err := patcher.Apply(p, wtRoot, tplCtx); err != nil {
+				slog.Warn("patch failed (watch-trigger)", "wt", wtRoot, "file", p.File, "err", err)
+			}
+		}
+	}
+
+	if len(cfg.Databases) == 0 {
+		return nil
+	}
+	opts := prepare.RunOptions{
+		ForceRebuild: mode == watcher.ModeRebuild,
+	}
+	if dbIdx >= 0 && dbIdx < len(cfg.Databases) {
+		opts.FilterDBs = true
+		opts.OnlyDBIndex = dbIdx
+	}
+	if _, err := prepare.RunFiltered(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv, opts); err != nil {
+		return fmt.Errorf("prepare (watch-trigger): %w", err)
+	}
 	return nil
 }
 

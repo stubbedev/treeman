@@ -34,7 +34,10 @@ const (
 	OnDelta   OnModify = "delta"
 )
 
-// Spec describes one migration framework.
+// Spec describes one migration framework. Consumed only by
+// `treeman init` (scaffolding) and `treeman fw detect` (diagnostic) —
+// nothing at runtime dispatches off a Spec, so these fields are pure
+// templating data.
 type Spec struct {
 	Name          string
 	Markers       []string // each entry may be `a|b|c` (any-of)
@@ -44,6 +47,16 @@ type Spec struct {
 	HashMode      HashMode
 	OnModify      OnModify
 	EngineHint    string // "mysql", "postgres", "" if unknown
+	// MigrateRun is the shell command `treeman init` writes into the
+	// scaffolded `migrations.migrate.run` field. Example:
+	// `php artisan migrate --force`.
+	MigrateRun string
+	// MigrateEnv is the env-var override map `treeman init` writes
+	// into `migrations.migrate.env`. Each value uses the
+	// `{target_db}` placeholder so the runtime substitutes the
+	// per-run template DB name. Empty for frameworks that read the
+	// target DB from their own config rather than env.
+	MigrateEnv map[string]string
 }
 
 // Detect returns true iff every marker group in spec.Markers has at
@@ -84,11 +97,9 @@ func DefaultRegistry() *Registry {
 }
 
 // LookupBuiltin returns the built-in Spec for `name` (e.g. "laravel",
-// "rails") and reports whether one exists. Callers use this to merge
-// user-supplied YAML overrides onto the framework's defaults so a
-// minimal `migrations: { framework: laravel }` block still picks up
-// the canonical migration_dirs / file_globs / lockfiles without
-// requiring users to retype the boilerplate.
+// "rails") and reports whether one exists. Used by scaffolding paths
+// (`treeman init`, `treeman fw detect`) to fetch a preset by name.
+// No runtime caller — runtime behavior is driven entirely by the YAML.
 func LookupBuiltin(name string) (Spec, bool) {
 	if name == "" {
 		return Spec{}, false
@@ -113,6 +124,9 @@ func (r *Registry) DetectAll(repoRoot string) []Spec {
 }
 
 func builtins() []Spec {
+	genericDBNameEnv := func() map[string]string {
+		return map[string]string{"DATABASE_NAME": "{target_db}"}
+	}
 	return []Spec{
 		{
 			Name:    "laravel",
@@ -129,6 +143,11 @@ func builtins() []Spec {
 			HashMode:   HashFilename,
 			OnModify:   OnRebuild,
 			EngineHint: "mysql",
+			MigrateRun: "php artisan migrate --force",
+			MigrateEnv: map[string]string{
+				"DB_DATABASE":      "{target_db}",
+				"DB_TEST_DATABASE": "{target_db}",
+			},
 		},
 		{
 			Name:          "rails",
@@ -138,6 +157,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"Gemfile.lock"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
+			MigrateRun:    "bin/rails db:migrate",
+			MigrateEnv:    map[string]string{"DATABASE": "{target_db}"},
 		},
 		{
 			Name:          "django",
@@ -147,6 +168,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"Pipfile.lock", "poetry.lock", "requirements.txt"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
+			MigrateRun:    "python manage.py migrate --noinput",
+			MigrateEnv:    map[string]string{"DJANGO_DB_NAME": "{target_db}"},
 		},
 		{
 			Name:          "golang-migrate",
@@ -156,6 +179,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"go.sum"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
+			MigrateRun:    "migrate up",
+			MigrateEnv:    map[string]string{"MIGRATE_DATABASE_NAME": "{target_db}"},
 		},
 		{
 			Name:          "sqlx-cli",
@@ -165,6 +190,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"Cargo.lock"},
 			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
+			MigrateRun:    "sqlx migrate run",
+			MigrateEnv:    map[string]string{"DATABASE_URL_NAME": "{target_db}"},
 		},
 		{
 			Name:          "diesel",
@@ -174,6 +201,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"Cargo.lock"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
+			MigrateRun:    "diesel migration run",
+			MigrateEnv:    genericDBNameEnv(),
 		},
 		{
 			Name:    "prisma",
@@ -183,10 +212,12 @@ func builtins() []Spec {
 				"apps/*/prisma/migrations",
 				"packages/*/prisma/migrations",
 			},
-			FileGlobs: []string{"migration.sql"},
-			Lockfiles: []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:  HashChecksum,
-			OnModify:  OnDelta,
+			FileGlobs:  []string{"migration.sql"},
+			Lockfiles:  []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
+			HashMode:   HashChecksum,
+			OnModify:   OnDelta,
+			MigrateRun: "npx prisma migrate deploy",
+			MigrateEnv: genericDBNameEnv(),
 		},
 		{
 			Name:          "knex",
@@ -196,6 +227,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
+			MigrateRun:    "npx knex migrate:latest",
+			MigrateEnv:    genericDBNameEnv(),
 		},
 		{
 			Name:          "alembic",
@@ -205,6 +238,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"poetry.lock", "Pipfile.lock", "requirements.txt"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
+			MigrateRun:    "alembic upgrade head",
+			MigrateEnv:    genericDBNameEnv(),
 		},
 		{
 			Name:          "flyway",
@@ -213,6 +248,8 @@ func builtins() []Spec {
 			FileGlobs:     []string{"[VRU]*.sql"},
 			HashMode:      HashChecksum,
 			OnModify:      OnRebuild,
+			MigrateRun:    "flyway migrate",
+			MigrateEnv:    genericDBNameEnv(),
 		},
 		{
 			Name: "typeorm",
@@ -226,10 +263,12 @@ func builtins() []Spec {
 				"apps/*/src/migrations",
 				"packages/*/src/migrations",
 			},
-			FileGlobs: []string{"*.ts", "*.js"},
-			Lockfiles: []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:  HashFilename,
-			OnModify:  OnRebuild,
+			FileGlobs:  []string{"*.ts", "*.js"},
+			Lockfiles:  []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
+			HashMode:   HashFilename,
+			OnModify:   OnRebuild,
+			MigrateRun: "npx typeorm migration:run",
+			MigrateEnv: genericDBNameEnv(),
 		},
 		{
 			Name: "drizzle",
@@ -241,6 +280,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
 			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
+			MigrateRun:    "npx drizzle-kit migrate",
+			MigrateEnv:    genericDBNameEnv(),
 		},
 		{
 			Name:          "sequelize",
@@ -250,6 +291,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
+			MigrateRun:    "npx sequelize db:migrate",
+			MigrateEnv:    genericDBNameEnv(),
 		},
 		{
 			Name:          "mikro-orm",
@@ -259,6 +302,8 @@ func builtins() []Spec {
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
+			MigrateRun:    "npx mikro-orm migration:up",
+			MigrateEnv:    genericDBNameEnv(),
 		},
 	}
 }
