@@ -137,14 +137,14 @@
             "type": "string"
           },
           "type": "array",
-          "description": "Files (relative to repo root) whose presence indicates this\nframework is in use. Used by `treeman fw detect` to pick the\nframework when no explicit MigrationSpec is configured.\nExample: `[\"alembic.ini\", \"migrations/env.py\"]`."
+          "description": "Files (relative to repo root) whose presence indicates this\nframework is in use. Used by `treeman fw detect` to pick the\nframework when scaffolding a new config.\nExample: `[\"alembic.ini\", \"migrations/env.py\"]`."
         },
         "migration_dirs": {
           "items": {
             "type": "string"
           },
           "type": "array",
-          "description": "Glob patterns for the directories holding migration files.\nCopied into the MigrationSpec when detection picks this\nframework."
+          "description": "Glob patterns for the directories holding migration files.\nEmitted as `inputs[]` entries during `treeman init`."
         },
         "file_pattern": {
           "type": "string",
@@ -156,7 +156,7 @@
             "filename",
             "checksum"
           ],
-          "description": "Hash strategy applied to the migration files: `filename`\n(default) or `checksum`. Same semantics as\nMigrationSpec.HashMode."
+          "description": "Hash strategy applied to the migration files: `filename`\n(default) or `checksum`. Maps to the `hash:` field on each\nemitted Input."
         },
         "on_modify": {
           "type": "string",
@@ -164,14 +164,14 @@
             "rebuild",
             "delta"
           ],
-          "description": "Change-handling policy: `rebuild` (default) or `delta`. Same\nsemantics as MigrationSpec.OnModify."
+          "description": "Change-handling policy. Retained for compatibility with the\nold `treeman fw detect` table output; the runtime no longer\nreads it (all watches are best-effort cache-hit-or-rebuild)."
         },
         "lockfiles": {
           "items": {
             "type": "string"
           },
           "type": "array",
-          "description": "Lockfiles whose contents are folded into the snapshot hash\n(e.g. `requirements.txt`, `pyproject.toml`,\n`composer.lock`)."
+          "description": "Lockfiles whose contents are folded into the snapshot hash\n(e.g. `requirements.txt`, `pyproject.toml`, `composer.lock`).\nEmitted as `inputs[]` entries with label `lockfile`."
         },
         "engine_hint": {
           "type": "string",
@@ -185,7 +185,7 @@
         "migration_dirs",
         "file_pattern"
       ],
-      "description": "CustomFramework — `frameworks:` entry, lets users declare\nmigration frameworks treeman doesn't know about natively."
+      "description": "CustomFramework — `frameworks:` entry, lets users declare\nmigration frameworks treeman doesn't know about natively. Consumed\nonly by `treeman fw detect` and `treeman init` for scaffolding; at\nruntime treeman reads `databases[].inputs[]` directly."
     },
     "DaemonConfig": {
       "properties": {
@@ -231,9 +231,20 @@
           "$ref": "#/$defs/DumpSpec",
           "description": "Source dump used to seed clones. Path is relative to the repo\nroot. Treeman hashes this file into the snapshot key, so\nchanges invalidate the cache."
         },
-        "migrations": {
-          "$ref": "#/$defs/MigrationSpec",
-          "description": "Migration source declaration. Treeman hashes the listed files\nto decide whether a cached snapshot is still valid and replays\nmigrations into the template before cloning."
+        "migrate": {
+          "$ref": "#/$defs/MigrationMigrate",
+          "description": "Migrate is the shell command that brings a freshly-loaded\nsource DB up to the current schema. Required when any input\nglob matches migration files; optional otherwise (e.g. a DB\nthat's purely seed-driven)."
+        },
+        "seed": {
+          "$ref": "#/$defs/SeedSpec",
+          "description": "Seed is the shell command that populates non-migration data\n(fixtures, ES mappings, Redis warm-cache keys, etc.). Runs\nAFTER dump-load + migrate as the final cold-build step,\nbefore treeman snapshots the populated state into the\ntemplate DB."
+        },
+        "inputs": {
+          "items": {
+            "$ref": "#/$defs/Input"
+          },
+          "type": "array",
+          "description": "Inputs declare every file that determines this database's\ntemplate state. Each entry:\n  1. Contributes a hash to the snapshot fingerprint (so any\n     change auto-invalidates the cached template).\n  2. Subscribes fsnotify so changes trigger a re-prep.\n  3. Carries an optional `label:` that `hooks.on-file-change`\n     actions can match against.\n\nGlob patterns are repo-root-relative. Hash mode is per-entry:\n`filename` for append-only files (Laravel migrations, …),\n`checksum` for files edited in place (seeders, lockfiles).\nDefault is checksum.\n\nCache-hit vs cold-build is derived purely from the input\nhashes — there's no separate `on: rebuild` knob. If you want\nto force a rebuild, change an input."
         },
         "test_clones": {
           "$ref": "#/$defs/TestClonesSpec",
@@ -248,17 +259,6 @@
           "maximum": 64,
           "minimum": 0,
           "description": "Outer concurrency cap for clone restore + DropMatching.\nDefaults to the per-engine safe value from internal/prepare.\nRange 0–64. Raise only if the server is provisioned\n(max_connections, PG pg_database lock contention, etc.)."
-        },
-        "watch": {
-          "items": {
-            "$ref": "#/$defs/WatcherPath"
-          },
-          "type": "array",
-          "description": "Per-database watch list. When a file matching one of these\nglobs changes, the daemon re-prepares THIS database only. With\n`on: rebuild` the cache-hit shortcut is skipped and the\ntemplate rebuilds from scratch; with `on: auto` (default) the\nusual `migrations.on_modify` logic applies. Top-level\n`watcher.paths` still works and applies to every database."
-        },
-        "seed": {
-          "$ref": "#/$defs/SeedSpec",
-          "description": "Shell command run AFTER dump-load + migrations as the final\nstep of the cold-build path, BEFORE treeman snapshots the\npopulated database into its fingerprint-keyed template. Use\nfor engines that don't have a dump primitive (Mongo, Redis,\nElasticsearch) — declare seed scripts here and they run once\nper fingerprint, then their output is cached + cloned for\nevery worktree.\n\nSame env-substitution shape as `migrations.migrate.env`:\n`{target_db}` expands to the per-run database/namespace name."
         }
       },
       "additionalProperties": false,
@@ -334,54 +334,159 @@
       ],
       "description": "EsConn — Elasticsearch / OpenSearch HTTP URL. Same ContainerRef\nsemantics as MongoConn."
     },
-    "HooksConfig": {
+    "FilteredAction": {
       "properties": {
-        "setup-before-engines": {
-          "items": {
-            "$ref": "#/$defs/Action"
-          },
-          "type": "array",
-          "description": "SetupBeforeEngines — actions fire after worktree create +\npatches + bring-in, before engine prepare."
+        "run": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single shell command executed via `sh -c`."
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "description": "Ordered list of shell commands chained with `\u0026\u0026`."
+            }
+          ],
+          "description": "Shell work for this action. String = single step; list = sequenced steps chained with `\u0026\u0026`. Required."
         },
-        "setup-after-engines": {
-          "items": {
-            "$ref": "#/$defs/Action"
-          },
-          "type": "array",
-          "description": "SetupAfterEngines — actions fire after engine prepare completes."
+        "cwd": {
+          "type": "string",
+          "description": "Working directory for every step in this action. Relative paths resolve against the worktree root (host) or container WORKDIR (when wrapped)."
         },
-        "teardown-before-engines": {
-          "items": {
-            "$ref": "#/$defs/Action"
-          },
-          "type": "array",
-          "description": "TeardownBeforeEngines — actions fire before DB drop on delete."
+        "container": {
+          "type": "string",
+          "description": "Container name or ID. When set, every step is wrapped in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
         },
-        "teardown-after-engines": {
-          "items": {
-            "$ref": "#/$defs/Action"
-          },
-          "type": "array",
-          "description": "TeardownAfterEngines — actions fire after DB drop + worktree\nremove on delete."
+        "in_container": {
+          "type": "string",
+          "description": "Alias for `container`."
         },
-        "on-head-change": {
-          "items": {
-            "$ref": "#/$defs/Action"
-          },
-          "type": "array",
-          "description": "OnHeadChange — actions fire when the HEAD watcher detects a\nbranch switch inside an existing worktree."
+        "compose_service": {
+          "type": "string",
+          "description": "Docker Compose service name. Wraps every step in `\u003cengine\u003e compose exec`. Mutually exclusive with `container`."
         },
-        "on-watch": {
-          "items": {
-            "$ref": "#/$defs/Action"
-          },
-          "type": "array",
-          "description": "OnWatch — actions fire when any watcher.paths /\ndatabases[].watch glob matches an event."
+        "compose_project": {
+          "type": "string",
+          "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or parent dir name. Only meaningful with `compose_service`."
+        },
+        "container_engine": {
+          "type": "string",
+          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
+        },
+        "engine": {
+          "type": "string",
+          "description": "Alias for `container_engine`."
+        },
+        "match": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single watch label to match."
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "description": "Set of watch labels; the action fires when any of them matches."
+            }
+          ],
+          "description": "Restrict this action to watch events carrying one of the named labels. Omit to fire for every event."
         }
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "HooksConfig — `hooks:` block. A flat map keyed by trigger name.\nEach key's value is a list of Actions that fire when that trigger\nhappens. Actions in the same list run in parallel; the trigger\nkey itself encodes BOTH the lifecycle phase AND the timing point,\nso there's no separate `when:` field anywhere.\n\nTriggers (all optional — omit any you don't need):\n\n  • setup-before-engines — during `wt create`, after patches +\n    bring-in (copies/links), BEFORE engine prepare. Standard\n    home of dependency installs (composer/yarn/pip) so migrate\n    can find vendor/.\n  • setup-after-engines — during `wt create`, after engine\n    prepare. Use when actions need a populated database\n    (cache warming, seed verification).\n  • teardown-before-engines — during `wt delete`, BEFORE DB\n    drop. Graceful shutdown: drain queues, docker compose stop.\n  • teardown-after-engines — during `wt delete`, AFTER DB drop +\n    git worktree remove. External notifications (Slack, CDN\n    purge) that should announce only once the data is gone.\n  • on-head-change — fires when the HEAD watcher sees a branch\n    switch inside an existing worktree. Re-runs in addition to\n    the regular finalize-on-HEAD-change behaviour.\n  • on-watch — fires when any `watcher.paths` or\n    `databases[].watch` glob matches a filesystem event. Runs\n    alongside the engine re-prep.\n\nThe map shape lets new triggers be added without touching every\nexisting config. Daemon execution is always non-blocking from the\nCLI's perspective — each list of actions dispatches in parallel."
+      "required": [
+        "run"
+      ],
+      "description": "On-file-change action with optional label filter. Same shape as a hook Action plus a `match:` field (string or list)."
+    },
+    "HooksConfig": {
+      "properties": {
+        "on-create-before-engines": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnCreateBeforeEngines — actions fire after worktree create +\npatches + bring-in, before engine prepare."
+        },
+        "on-create-after-engines": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnCreateAfterEngines — actions fire after engine prepare completes."
+        },
+        "on-delete-before-engines": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnDeleteBeforeEngines — actions fire before DB drop on delete."
+        },
+        "on-delete-after-engines": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnDeleteAfterEngines — actions fire after DB drop + worktree\nremove on delete."
+        },
+        "on-checkout": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnCheckout — actions fire when the HEAD watcher detects a\nbranch switch inside an existing worktree."
+        },
+        "on-file-change": {
+          "items": {
+            "$ref": "#/$defs/FilteredAction"
+          },
+          "type": "array",
+          "description": "OnFileChange — actions fire when any `databases[].inputs[]`\nglob matches a filesystem event. Each action can optionally\n`match: \u003clabel\u003e` to fire only when the matched input entry\ncarries that label; actions without `match:` fire for every\ninput event (any engine, any label).\n\nThe subprocess receives extra env vars naming the trigger:\n  TREEMAN_WATCH_PATH   — absolute path that fired\n  TREEMAN_WATCH_MODE   — auto | delta | rebuild\n  TREEMAN_WATCH_LABEL  — the label on the matched watch entry (or \"\")\n  TREEMAN_WATCH_ENGINE — engine of the owning database (mysql, postgres, …)\n  TREEMAN_WATCH_DB_NAME — rendered name_template of the owning database"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "HooksConfig — `hooks:` block. A flat map keyed by trigger name.\nEach key's value is a list of Actions that fire when that trigger\nhappens. Actions in the same list run in parallel; the trigger\nkey itself encodes BOTH the lifecycle phase AND the timing point,\nso there's no separate `when:` field anywhere.\n\nTriggers (all optional — omit any you don't need):\n\n  • on-create-before-engines — during `wt create`, after patches +\n    bring-in (copies/links), BEFORE engine prepare. Standard\n    home of dependency installs (composer/yarn/pip) so migrate\n    can find vendor/.\n  • on-create-after-engines — during `wt create`, after engine\n    prepare. Use when actions need a populated database\n    (cache warming, seed verification).\n  • on-delete-before-engines — during `wt delete`, BEFORE DB\n    drop. Graceful shutdown: drain queues, docker compose stop.\n  • on-delete-after-engines — during `wt delete`, AFTER DB drop +\n    git worktree remove. External notifications (Slack, CDN\n    purge) that should announce only once the data is gone.\n  • on-checkout — fires when the HEAD watcher sees a branch\n    switch inside an existing worktree. Re-runs in addition to\n    the regular finalize-on-HEAD-change behaviour.\n  • on-file-change — fires when any `databases[].inputs[]` glob\n    matches a filesystem event. Each action can optionally\n    `match: \u003clabel\u003e` to filter by the input entry's label.\n\nThe map shape lets new triggers be added without touching every\nexisting config. Daemon execution is always non-blocking from the\nCLI's perspective — each list of actions dispatches in parallel."
+    },
+    "Input": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Bare glob string. Equivalent to `{glob: \u003cthis string\u003e}` with default hash mode."
+        },
+        {
+          "properties": {
+            "glob": {
+              "type": "string",
+              "description": "Glob pattern (repo-root-relative). Required."
+            },
+            "label": {
+              "type": "string",
+              "description": "Optional label for `hooks.on-file-change` matchers."
+            },
+            "hash": {
+              "type": "string",
+              "enum": [
+                "checksum",
+                "filename"
+              ],
+              "description": "Hash mode: checksum (default) or filename (append-only files)."
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "glob"
+          ],
+          "description": "Full input mapping with optional label + hash mode."
+        }
+      ],
+      "description": "One source of file state for the template fingerprint. Bare string OR full mapping."
     },
     "MigrationMigrate": {
       "properties": {
@@ -402,55 +507,7 @@
       "required": [
         "run"
       ],
-      "description": "MigrationMigrate — `migrations.migrate:` sub-block. Declares the\nshell command treeman invokes to apply migrations and the env-var\noverrides that point the framework's CLI at the per-run template\ndatabase.\n\nThe framework's migrate command reads its target DB from the\nframework's own config (Laravel: `DB_DATABASE` in `.env`; Rails:\n`DATABASE`; Django: `DJANGO_DB_NAME`; etc.). Treeman builds\nper-worktree template databases with names like\n`myapp_template_feature-x` and needs to redirect the migrate\ncommand at *that* DB, not the one the committed `.env` references.\nThe `Env` map says which env-var names to override; the value\ntemplate `{target_db}` is substituted at runtime with the resolved\ndatabase name. No other placeholders are supported."
-    },
-    "MigrationSpec": {
-      "properties": {
-        "migrate": {
-          "$ref": "#/$defs/MigrationMigrate",
-          "description": "Migrate is the shell command treeman runs to apply migrations\nagainst a target database, plus the env-var overrides that\nredirect the framework's CLI at that database. Required."
-        },
-        "migration_dirs": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "description": "Glob patterns (relative to repo root) for directories\ncontaining migration files. Required for any behavior beyond\npure-dump templates."
-        },
-        "file_globs": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "description": "Glob patterns for migration filenames within `migration_dirs`.\nExample: `*.sql`, `*_*.up.sql`, `[0-9]*-*.sql`."
-        },
-        "lockfiles": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "description": "Extra files whose contents are folded into the snapshot hash\n(typically lockfiles like `composer.lock`, `package-lock.json`,\n`go.sum`). Use when migrations are framework-managed and the\ninstalled framework version itself affects schema."
-        },
-        "hash_mode": {
-          "type": "string",
-          "enum": [
-            "filename",
-            "checksum"
-          ],
-          "description": "Hash strategy. `filename` (default) hashes only the migration\nfilenames — fast, works when migrations are append-only.\n`checksum` hashes file contents — required when migrations are\nedited in-place during development."
-        },
-        "on_modify": {
-          "type": "string",
-          "enum": [
-            "rebuild",
-            "delta"
-          ],
-          "description": "What to do when a migration file changes. `rebuild` (default)\ndrops the cached template and re-runs migrations from the\ndump. `delta` runs only the new migrations on top of the\nexisting template — faster but assumes append-only history."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "MigrationSpec — `migrations:` sub-block. Fully declarative: every\ninput the runtime needs (the migrate command, its env overrides,\nmigration directories, file globs, lockfiles, hash mode, on-modify\npolicy) is read verbatim from this struct. There is no implicit\nfallback — leaving e.g. MigrationDirs empty means treeman has no\nmigration source for the hash, so the snapshot key won't change\nwhen files do; leaving Migrate.Run empty makes `prepare` error.\n\n`treeman init` populates these fields from the framework presets\nin internal/migrations/framework; `treeman fw detect` lists the\npresets so you can hand-copy fields in. After scaffolding the YAML\nis the only source of truth."
+      "description": "MigrationMigrate — `databases[].migrate:` sub-block. Declares the\nshell command treeman invokes to apply migrations and the env-var\noverrides that point the framework's CLI at the per-run template\ndatabase.\n\nThe framework's migrate command reads its target DB from the\nframework's own config (Laravel: `DB_DATABASE` in `.env`; Rails:\n`DATABASE`; Django: `DJANGO_DB_NAME`; etc.). Treeman builds\nper-worktree template databases with names like\n`myapp_template_feature-x` and needs to redirect the migrate\ncommand at *that* DB, not the one the committed `.env` references.\nThe `Env` map says which env-var names to override; the value\ntemplate `{target_db}` is substituted at runtime with the resolved\ndatabase name. No other placeholders are supported."
     },
     "MongoConn": {
       "properties": {
@@ -751,10 +808,6 @@
     },
     "SnapshotsConfig": {
       "properties": {
-        "cache_dir": {
-          "type": "string",
-          "description": "Directory where cached template snapshots (dumps, lockfiles,\nhash manifests) live. Defaults to\n`$XDG_CACHE_HOME/treeman/snapshots`. Should be on the same\nfilesystem as the worktrees root for fast hardlink-based\nrestores."
-        },
         "retention": {
           "$ref": "#/$defs/RetentionConfig",
           "description": "Retention/eviction policies controlling how many snapshots\nper repo are kept and how aggressively they're pruned."
@@ -762,7 +815,7 @@
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "SnapshotsConfig — `snapshots:` block."
+      "description": "SnapshotsConfig — `snapshots:` block. Holds the retention/eviction\npolicies for cached engine templates. Snapshot state lives\nentirely in SQLite + the engines themselves (template DBs); no\non-disk cache directory needs configuring."
     },
     "TestClonesSpec": {
       "properties": {
@@ -784,13 +837,6 @@
     },
     "WatcherConfig": {
       "properties": {
-        "paths": {
-          "items": {
-            "$ref": "#/$defs/WatcherPath"
-          },
-          "type": "array",
-          "description": "File-system globs the watcher monitors. When a matching file\nchanges the watcher invalidates affected snapshots (per the\nglob's `on:` policy) so the next `prepare` rebuilds the\ntemplate."
-        },
         "debounce_ms": {
           "type": "integer",
           "description": "Debounce window in milliseconds. The watcher coalesces events\narriving within this window before invalidating snapshots,\nwhich prevents thrashing when an editor saves many files at\nonce. Default 500."
@@ -802,30 +848,7 @@
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "WatcherConfig — `watcher:` block."
-    },
-    "WatcherPath": {
-      "properties": {
-        "glob": {
-          "type": "string",
-          "description": "Filesystem glob (relative to repo root) the watcher monitors.\nSupports `**` recursion. Example:\n`database/migrations/**/*.sql`."
-        },
-        "on": {
-          "type": "string",
-          "enum": [
-            "auto",
-            "delta",
-            "rebuild"
-          ],
-          "description": "Invalidation strategy when a matching file changes:\n  `auto`    — defer to the matching DatabaseConfig's `on_modify`.\n  `delta`   — keep the cached template, replay only new files.\n  `rebuild` — drop the template AND skip the cache-hit shortcut,\n              rebuilding from the dump no matter what the\n              database's `on_modify` says.\nDefault: `auto`."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "glob"
-      ],
-      "description": "WatcherPath — one `paths:` entry under `watcher:` or `databases[].watch`."
+      "description": "WatcherConfig — `watcher:` block. The set of watched paths is\nderived from each database's `inputs:` list; this block carries\nonly global tuning knobs (debounce, binlog)."
     },
     "WorktreesConfig": {
       "properties": {

@@ -373,10 +373,10 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 			repoPath, wtPath, row.Slug, logDir, map[string]string{}, true)
 		hooks.PersistOutcome(ctx, st.Store, repoID, row.ID, trigger, started, nowMillis(), out)
 	}
-	runOrphan("teardown-before-engines", cfg.Hooks.TeardownBeforeEngines)
+	runOrphan("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
 
 	if len(cfg.Databases) > 0 {
-		// Inline drop so teardown-after-engines actions observe a
+		// Inline drop so on-delete-after-engines actions observe a
 		// fully-dropped state. The lifecycle goroutine already runs
 		// detached from the originating fsnotify event, so the cost
 		// stays off the user's CLI hot path.
@@ -384,7 +384,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 			slog.Warn("lifecycle teardown DB drop", "wt", wtPath, "err", err)
 		}
 	}
-	runOrphan("teardown-after-engines", cfg.Hooks.TeardownAfterEngines)
+	runOrphan("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
 
 	if err := st.Store.MarkWorktreeDeleted(ctx, row.ID); err != nil {
 		return err

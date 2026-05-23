@@ -171,20 +171,18 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 
 	var hookEntries []config.Action
 	switch phase {
-	case "setup-before-engines":
-		hookEntries = cfg.Hooks.SetupBeforeEngines
-	case "setup-after-engines":
-		hookEntries = cfg.Hooks.SetupAfterEngines
-	case "teardown-before-engines":
-		hookEntries = cfg.Hooks.TeardownBeforeEngines
-	case "teardown-after-engines":
-		hookEntries = cfg.Hooks.TeardownAfterEngines
-	case "on-head-change":
-		hookEntries = cfg.Hooks.OnHeadChange
-	case "on-watch":
-		hookEntries = cfg.Hooks.OnWatch
+	case "on-create-before-engines":
+		hookEntries = cfg.Hooks.OnCreateBeforeEngines
+	case "on-create-after-engines":
+		hookEntries = cfg.Hooks.OnCreateAfterEngines
+	case "on-delete-before-engines":
+		hookEntries = cfg.Hooks.OnDeleteBeforeEngines
+	case "on-delete-after-engines":
+		hookEntries = cfg.Hooks.OnDeleteAfterEngines
+	case "on-checkout":
+		hookEntries = cfg.Hooks.OnCheckout
 	default:
-		return hooks.RunOutcome{}, fmt.Errorf("unknown phase: %s (want setup-before-engines|setup-after-engines|teardown-before-engines|teardown-after-engines|on-head-change|on-watch)", phase)
+		return hooks.RunOutcome{}, fmt.Errorf("unknown phase: %s (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)", phase)
 	}
 	entries = len(hookEntries)
 

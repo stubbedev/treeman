@@ -349,12 +349,12 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		// `wt finalize` so PATH-sensitive scripts work in this
 		// daemon-driven re-run.
 		env, _ := st.Store.LoadInheritedEnvByPath(st.BgCtx, wtPath)
-		// Fire user-defined on-head-change actions in parallel with
+		// Fire user-defined on-checkout actions in parallel with
 		// the regular finalize re-run (no ordering — both react to
 		// the same event independently).
 		safeGo("head_actions:"+wtPath, func() {
-			fireTriggerActions(st.BgCtx, st, repoPath, wtPath, "on-head-change", env,
-				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnHeadChange })
+			fireTriggerActions(st.BgCtx, st, repoPath, wtPath, "on-checkout", env,
+				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnCheckout })
 		})
 		safeGo("head_finalize:"+wtPath, func() {
 			if err := FinalizeWorktree(st.BgCtx, st, repoPath, wtPath, env); err != nil {
@@ -373,14 +373,14 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		})
 	}
 
-	// FS watcher — aggregate top-level `watcher.paths` (DBIndex = -1,
-	// applies to every DB) and per-DB `databases[i].watch` entries
-	// (DBIndex = i) into a single WatcherConfig consumed by the
-	// fsnotify driver. Only spawn when at least one glob is declared.
-	aggregated := aggregateWatches(&cfg)
-	if len(aggregated.Paths) > 0 {
+	// FS watcher — aggregate every per-DB `databases[i].watch[]`
+	// entry (tagged with i = DBIndex) into a single list the fsnotify
+	// driver subscribes to. Only spawn when at least one glob is
+	// declared across the whole config.
+	aggregatedPaths := aggregateWatches(&cfg)
+	if len(aggregatedPaths) > 0 {
 		dispatch := makeWtFSDispatcher(st, repoPath, repoID, wtPath)
-		w, err := watcher.New(wtPath, aggregated, dispatch)
+		w, err := watcher.New(wtPath, aggregatedPaths, cfg.Watcher, dispatch)
 		if err != nil {
 			cancel()
 			return fmt.Errorf("fsnotify watcher init: %w", err)
@@ -408,31 +408,34 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 	return nil
 }
 
-// aggregateWatches builds the WatcherConfig the fsnotify driver
-// actually subscribes to: every top-level `watcher.paths` entry
-// (tagged DBIndex = -1, applies to all DBs) plus every per-DB
-// `databases[i].watch` entry (tagged DBIndex = i). Top-level globs
-// retain their position so a user-declared order is preserved.
-func aggregateWatches(cfg *config.Config) config.WatcherConfig {
-	out := cfg.Watcher
-	out.Paths = make([]config.WatcherPath, 0, len(cfg.Watcher.Paths))
-	for _, p := range cfg.Watcher.Paths {
-		p.DBIndex = -1
-		out.Paths = append(out.Paths, p)
+// aggregateWatches walks every `databases[i].inputs[]` block and
+// returns the flat list of paths the fsnotify driver subscribes
+// to. Each entry is tagged with its DBIndex so the dispatcher can
+// route the event back to its owning database. The optional
+// `label:` on each input passes through for filtered hook dispatch.
+func aggregateWatches(cfg *config.Config) []config.WatcherPath {
+	total := 0
+	for _, db := range cfg.Databases {
+		total += len(db.Inputs)
 	}
+	out := make([]config.WatcherPath, 0, total)
 	for i, db := range cfg.Databases {
-		for _, p := range db.Watch {
-			p.DBIndex = i
-			out.Paths = append(out.Paths, p)
+		for _, in := range db.Inputs {
+			out = append(out, config.WatcherPath{
+				Glob:    in.Glob,
+				Label:   in.Label,
+				DBIndex: i,
+			})
 		}
 	}
 	return out
 }
 
 // makeWtFSDispatcher builds a watcher.Dispatcher bound to a single
-// worktree. Each event re-runs finalize, scoped to one database
-// when the matched glob came from `databases[i].watch`, and forcing
-// a full rebuild when the matched glob's `on:` is `rebuild`.
+// worktree. Each event re-runs finalize, scoped to one database via
+// the matched input's DBIndex. The cache-hit / cold-build decision
+// is derived purely from the input fingerprint — no force-rebuild
+// override.
 func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string) watcher.Dispatcher {
 	return func(ctx context.Context, ev watcher.Event) error {
 		// Drop events while a teardown is in flight — finalising a
@@ -443,28 +446,97 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 			return nil
 		}
 		_ = st.Store.WriteEvent(ctx, "info", "watcher_fired",
-			fmt.Sprintf("%s (%s db_idx=%d)", ev.Path, ev.Mode, ev.DBIndex),
+			fmt.Sprintf("%s (db_idx=%d label=%s)", ev.Path, ev.DBIndex, ev.Label),
 			repoID, 0, "", 0, map[string]string{
-				"path":    ev.Path,
-				"mode":    string(ev.Mode),
-				"db_idx":  fmt.Sprintf("%d", ev.DBIndex),
-				"wt":      wtPath,
+				"path":   ev.Path,
+				"db_idx": fmt.Sprintf("%d", ev.DBIndex),
+				"label":  ev.Label,
+				"wt":     wtPath,
 			})
-		mode, dbIdx := ev.Mode, ev.DBIndex
+		dbIdx, path, label := ev.DBIndex, ev.Path, ev.Label
 		env, _ := st.Store.LoadInheritedEnvByPath(st.BgCtx, wtPath)
-		// Fire user-defined on-watch actions in parallel with the
-		// regular re-prep — both react to the same event.
+		// Fire the on-file-change actions in parallel with the
+		// re-prep — both react to the same event independently.
 		safeGo("watch_actions:"+wtPath, func() {
-			fireTriggerActions(st.BgCtx, st, repoPath, wtPath, "on-watch", env,
-				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnWatch })
+			fireOnFileChange(st.BgCtx, st, repoPath, wtPath, dbIdx, path, label, env)
 		})
 		safeGo("watcher_finalize:"+wtPath, func() {
-			if err := FinalizeWorktreeForWatch(st.BgCtx, st, repoPath, wtPath, dbIdx, mode, env); err != nil {
+			if err := FinalizeWorktreeForWatch(st.BgCtx, st, repoPath, wtPath, dbIdx, env); err != nil {
 				slog.Warn("watcher-triggered finalize", "wt", wtPath, "err", err)
 			}
 		})
 		return nil
 	}
+}
+
+// fireOnFileChange runs the global `hooks.on-file-change` actions,
+// filtered by the watch event's label. Actions with an empty
+// `match:` fire for any watch event (any engine, any label);
+// actions with `match: <label>` only fire when the event's label
+// matches.
+//
+// The subprocess receives watch context as env vars so user scripts
+// can branch on the trigger details: TREEMAN_WATCH_PATH,
+// TREEMAN_WATCH_LABEL, TREEMAN_WATCH_ENGINE, TREEMAN_WATCH_DB_NAME.
+func fireOnFileChange(
+	ctx context.Context,
+	st *State,
+	repoPath, wtPath string,
+	dbIdx int,
+	eventPath, label string,
+	inheritedEnv map[string]string,
+) {
+	cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
+	if err != nil {
+		slog.Warn("on-file-change: load config", "wt", wtPath, "err", err)
+		return
+	}
+	all := cfg.Hooks.OnFileChange
+	if len(all) == 0 {
+		return
+	}
+	// Filter by label match (empty Match list = wildcard).
+	matched := make([]config.Action, 0, len(all))
+	for _, fa := range all {
+		if fa.Matches(label) {
+			matched = append(matched, fa.Action)
+		}
+	}
+	if len(matched) == 0 {
+		return
+	}
+	// Resolve the owning database's engine + rendered name so the
+	// hook can branch on engine without re-parsing config.
+	var engine, dbName string
+	if dbIdx >= 0 && dbIdx < len(cfg.Databases) {
+		d := cfg.Databases[dbIdx]
+		engine = d.Engine
+		branch := detectBranch(wtPath)
+		sl := slug.For(wtPath, branch)
+		if rendered, err := template.Render(d.NameTemplate, template.FromSlug(sl)); err == nil {
+			dbName = rendered
+		}
+	}
+	branch := detectBranch(wtPath)
+	sl := slug.For(wtPath, branch)
+	repoID, err := st.Store.EnsureRepo(ctx, repoPath, filepath.Base(repoPath))
+	if err != nil {
+		return
+	}
+	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wtPath, sl.Value, branch)
+	if err != nil {
+		return
+	}
+	// Layer the watch-context env on top of the user's cached env.
+	env := make(map[string]string, len(inheritedEnv)+4)
+	for k, v := range inheritedEnv {
+		env[k] = v
+	}
+	env["TREEMAN_WATCH_PATH"] = eventPath
+	env["TREEMAN_WATCH_LABEL"] = label
+	env["TREEMAN_WATCH_ENGINE"] = engine
+	env["TREEMAN_WATCH_DB_NAME"] = dbName
+	_ = runTriggerActions(ctx, st, "on-file-change", matched, repoPath, wtPath, sl.Value, repoID, wtID, env)
 }
 
 // fireTriggerActions loads the resolved config for a worktree and

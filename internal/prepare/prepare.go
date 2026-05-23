@@ -13,14 +13,17 @@ package prepare
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"lukechampine.com/blake3"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/dumpload"
@@ -346,10 +349,6 @@ type RunOptions struct {
 	OnlyDBIndex int
 	// FilterDBs is true when OnlyDBIndex should be honoured.
 	FilterDBs bool
-	// ForceRebuild skips the cache-hit shortcut so the engine
-	// rebuilds the template from dump + migrations even when the
-	// SQLite snapshot row would otherwise have been valid.
-	ForceRebuild bool
 }
 
 // RunFiltered prepares the configured databases, optionally
@@ -384,15 +383,15 @@ func RunFiltered(
 			)
 			switch d.Engine {
 			case "mysql", "mariadb", "tidb":
-				o, err = prepareMySQL(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts.ForceRebuild)
+				o, err = prepareMySQL(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "postgres", "postgresql":
-				o, err = preparePostgres(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts.ForceRebuild)
+				o, err = preparePostgres(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "mongodb":
-				o, err = prepareMongo(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts.ForceRebuild)
+				o, err = prepareMongo(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "redis":
 				o, err = prepareRedis(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "elasticsearch", "opensearch":
-				o, err = prepareES(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts.ForceRebuild)
+				o, err = prepareES(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			default:
 				// Engine not recognised. Surface via event so the
 				// user notices, but don't fail the whole prepare run.
@@ -438,7 +437,6 @@ func prepareMySQL(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
-	forceRebuild bool,
 ) (Outcome, error) {
 	if cfg.Connections.Mysql == nil {
 		return Outcome{}, fmt.Errorf("connections.mysql not configured")
@@ -463,56 +461,46 @@ func prepareMySQL(
 	// Cache lookup: if SQLite knows a snapshot row for this
 	// fingerprint AND the template DB still exists in MySQL, skip
 	// the cold build and just clone the template into paratest DBs.
-	// Skipped entirely when the caller asked for forceRebuild — the
-	// watcher dispatch path passes this so `on: rebuild` actually
-	// rebuilds.
-	if !forceRebuild {
-		if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-			if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
-				_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-					fmt.Sprintf("template=%s", rec.TemplateName),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      d.Engine,
-						"source_db":   sourceDB,
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-					})
-				clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-				if err != nil {
-					return Outcome{}, err
-				}
-				if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
-					return Outcome{}, err
-				}
-				_ = st.TouchSnapshot(ctx, key.Fingerprint())
-				_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-					fmt.Sprintf("cache_hit clones=%d", len(clones)),
-					repoID, worktreeID, "", 0, map[string]string{
-						"source_db":   sourceDB,
-						"template":    rec.TemplateName,
-						"clones":      fmt.Sprintf("%d", len(clones)),
-						"fingerprint": key.Fingerprint(),
-					})
-				return Outcome{
-					Engine:       d.Engine,
-					SourceDB:     sourceDB,
-					TemplateName: rec.TemplateName,
-					Fingerprint:  key.Fingerprint(),
-					CacheHit:     true,
-					Clones:       clones,
-				}, nil
+	// Inputs feed the fingerprint, so any user-meaningful change
+	// invalidates the cache naturally — no force-rebuild knob.
+	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
+			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+				fmt.Sprintf("template=%s", rec.TemplateName),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      d.Engine,
+					"source_db":   sourceDB,
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+				})
+			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+			if err != nil {
+				return Outcome{}, err
 			}
-			// Row stale (template was dropped externally). Wipe so the
-			// cold-build path below overwrites it cleanly.
-			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
+				return Outcome{}, err
+			}
+			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+				fmt.Sprintf("cache_hit clones=%d", len(clones)),
+				repoID, worktreeID, "", 0, map[string]string{
+					"source_db":   sourceDB,
+					"template":    rec.TemplateName,
+					"clones":      fmt.Sprintf("%d", len(clones)),
+					"fingerprint": key.Fingerprint(),
+				})
+			return Outcome{
+				Engine:       d.Engine,
+				SourceDB:     sourceDB,
+				TemplateName: rec.TemplateName,
+				Fingerprint:  key.Fingerprint(),
+				CacheHit:     true,
+				Clones:       clones,
+			}, nil
 		}
-	} else {
-		// Force rebuild: drop any existing snapshot row + template DB
-		// up-front so the cold-build path below has clean ground.
-		if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-			_, _ = drv.DropMatching(ctx, rec.TemplateName)
-			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-		}
+		// Row stale (template was dropped externally). Wipe so the
+		// cold-build path below overwrites it cleanly.
+		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
@@ -538,11 +526,11 @@ func prepareMySQL(
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
 	}
-	if d.Migrations != nil {
-		if d.Migrations.Migrate == nil {
+	if d.Migrate != nil {
+		if d.Migrate == nil {
 			return Outcome{}, fmt.Errorf("migrations.migrate is required when migrations: is set (source=%s)", sourceDB)
 		}
-		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrations.Migrate), worktreePath, sourceDB, inheritedEnv)
+		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
@@ -621,7 +609,6 @@ func preparePostgres(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
-	forceRebuild bool,
 ) (Outcome, error) {
 	if cfg.Connections.Postgres == nil {
 		return Outcome{}, fmt.Errorf("connections.postgres not configured")
@@ -652,40 +639,32 @@ func preparePostgres(
 			"fingerprint": key.Fingerprint(),
 		})
 
-	// Cache hit? Skipped when forceRebuild is set (watcher dispatch
-	// path uses this for `on: rebuild` events).
-	if !forceRebuild {
-		if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-			if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
-				_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-					fmt.Sprintf("template=%s", rec.TemplateName),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      "postgres",
-						"source_db":   sourceDB,
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-					})
-				clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-				if err != nil {
-					return Outcome{}, err
-				}
-				if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
-					return Outcome{}, err
-				}
-				_ = st.TouchSnapshot(ctx, key.Fingerprint())
-				return Outcome{
-					Engine: d.Engine, SourceDB: sourceDB,
-					TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-					CacheHit: true, Clones: clones,
-				}, nil
+	// Cache hit? Fingerprint covers every declared input.
+	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
+			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+				fmt.Sprintf("template=%s", rec.TemplateName),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "postgres",
+					"source_db":   sourceDB,
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+				})
+			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+			if err != nil {
+				return Outcome{}, err
 			}
-			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
+				return Outcome{}, err
+			}
+			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			return Outcome{
+				Engine: d.Engine, SourceDB: sourceDB,
+				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
+				CacheHit: true, Clones: clones,
+			}, nil
 		}
-	} else {
-		if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-			_, _ = drv.DropMatching(ctx, rec.TemplateName)
-			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-		}
+		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
 	// Cold build.
@@ -701,11 +680,11 @@ func preparePostgres(
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
 	}
-	if d.Migrations != nil {
-		if d.Migrations.Migrate == nil {
+	if d.Migrate != nil {
+		if d.Migrate == nil {
 			return Outcome{}, fmt.Errorf("migrations.migrate is required when migrations: is set (source=%s)", sourceDB)
 		}
-		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrations.Migrate), worktreePath, sourceDB, inheritedEnv)
+		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
@@ -769,7 +748,6 @@ func prepareMongo(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
-	forceRebuild bool,
 ) (Outcome, error) {
 	if cfg.Connections.Mongodb == nil {
 		return Outcome{}, fmt.Errorf("connections.mongodb not configured")
@@ -798,38 +776,31 @@ func prepareMongo(
 		})
 
 	// Cache hit?
-	if !forceRebuild {
-		if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-			if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
-				_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-					fmt.Sprintf("template=%s", rec.TemplateName),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      "mongodb",
-						"source_db":   sourceDB,
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-					})
-				clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-				if err != nil {
-					return Outcome{}, err
-				}
-				if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); err != nil {
-					return Outcome{}, err
-				}
-				_ = st.TouchSnapshot(ctx, key.Fingerprint())
-				return Outcome{
-					Engine: d.Engine, SourceDB: sourceDB,
-					TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-					CacheHit: true, Clones: clones,
-				}, nil
+	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
+			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+				fmt.Sprintf("template=%s", rec.TemplateName),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "mongodb",
+					"source_db":   sourceDB,
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+				})
+			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+			if err != nil {
+				return Outcome{}, err
 			}
-			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); err != nil {
+				return Outcome{}, err
+			}
+			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			return Outcome{
+				Engine: d.Engine, SourceDB: sourceDB,
+				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
+				CacheHit: true, Clones: clones,
+			}, nil
 		}
-	} else {
-		if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-			_ = drv.DropSnapshot(ctx, rec.TemplateName)
-			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-		}
+		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
 	// Cold build: drop source, run seed (no dump/migrate in Mongo
@@ -1103,7 +1074,6 @@ func prepareES(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
-	forceRebuild bool,
 ) (Outcome, error) {
 	if cfg.Connections.Elasticsearch == nil {
 		return Outcome{}, fmt.Errorf("connections.elasticsearch not configured")
@@ -1134,39 +1104,32 @@ func prepareES(
 		})
 
 	// Cache hit? Verify by listing indices under the template prefix.
-	if !forceRebuild {
-		if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-			alive, _ := drv.ListMatching(ctx, rec.TemplateName)
-			if len(alive) > 0 {
-				_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-					fmt.Sprintf("template=%s indices=%d", rec.TemplateName, len(alive)),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      "elasticsearch",
-						"source_db":   sourcePrefix,
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-					})
-				clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-				if err != nil {
-					return Outcome{}, err
-				}
-				if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); err != nil {
-					return Outcome{}, err
-				}
-				_ = st.TouchSnapshot(ctx, key.Fingerprint())
-				return Outcome{
-					Engine: d.Engine, SourceDB: sourcePrefix,
-					TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-					CacheHit: true, Clones: clones,
-				}, nil
+	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		alive, _ := drv.ListMatching(ctx, rec.TemplateName)
+		if len(alive) > 0 {
+			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+				fmt.Sprintf("template=%s indices=%d", rec.TemplateName, len(alive)),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "elasticsearch",
+					"source_db":   sourcePrefix,
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+				})
+			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+			if err != nil {
+				return Outcome{}, err
 			}
-			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); err != nil {
+				return Outcome{}, err
+			}
+			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			return Outcome{
+				Engine: d.Engine, SourceDB: sourcePrefix,
+				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
+				CacheHit: true, Clones: clones,
+			}, nil
 		}
-	} else {
-		if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-			_ = drv.DropSnapshot(ctx, rec.TemplateName)
-			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-		}
+		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
 	// Cold build: drop source, run seed (no native dump for ES), snapshot, fanout.
@@ -1229,34 +1192,117 @@ func computeSnapshotKey(
 	d config.DatabaseConfig,
 	worktreePath, sourceDB, engineVersion string,
 ) snapshot.Key {
-	migrationsHash := ""
-	dumpHash := ""
-	lockfileHashes := map[string]string{}
-	hashMode := ""
-	if d.Migrations != nil {
-		s := frameworkSpecFromYAML(*d.Migrations)
-		hashMode = string(s.HashMode)
-		if len(s.MigrationDirs) > 0 || len(s.FileGlobs) > 0 {
-			if h, err := framework.MigrationsHashWithCache(ctx, frameworkHashCache{st}, worktreePath, s); err == nil {
-				migrationsHash = h
+	// 1. Hash every input under databases[].inputs[]. Per-entry hash
+	//    mode: `filename` for append-only directories (migrations),
+	//    `checksum` (default) for everything else.
+	inputHashes := map[string]string{}
+	for _, in := range d.Inputs {
+		mode := in.Hash
+		if mode == "" {
+			mode = "checksum"
+		}
+		switch mode {
+		case "filename":
+			spec := framework.Spec{
+				Name:          fmt.Sprintf("input:%s", in.Glob),
+				MigrationDirs: []string{staticGlobPrefix(in.Glob)},
+				FileGlobs:     []string{filepath.Base(in.Glob)},
+				HashMode:      framework.HashFilename,
 			}
-		}
-		lockPaths := make([]string, 0, len(s.Lockfiles))
-		for _, lf := range s.Lockfiles {
-			lockPaths = append(lockPaths, filepath.Join(worktreePath, lf))
-		}
-		if len(lockPaths) > 0 {
-			if h, err := snapshot.LockfileHashesForWithCache(ctx, st, lockPaths); err == nil {
-				lockfileHashes = h
+			if h, err := framework.MigrationsHashWithCache(ctx, frameworkHashCache{st}, worktreePath, spec); err == nil && h != "" {
+				inputHashes[in.Glob] = h
+			}
+		default: // checksum
+			matches, _ := filepath.Glob(filepath.Join(worktreePath, in.Glob))
+			if len(matches) == 0 {
+				continue
+			}
+			if hs, err := snapshot.LockfileHashesForWithCache(ctx, st, matches); err == nil {
+				// Fold per-file hashes into one entry per glob — keyed
+				// by the glob so the user can tell from the SQLite
+				// row what changed.
+				agg := ""
+				for _, k := range sortedKeys(hs) {
+					agg += k + ":" + hs[k] + "\n"
+				}
+				inputHashes[in.Glob] = agg
 			}
 		}
 	}
+
+	// 2. Hash the dump file (still a separate field — it's loaded
+	//    into the engine, not just hashed).
+	dumpHash := ""
 	if d.Dump != nil {
 		dp := filepath.Join(worktreePath, d.Dump.Path)
 		hashes, _ := snapshot.LockfileHashesForWithCache(ctx, st, []string{dp})
 		dumpHash = hashes[filepath.Base(dp)]
 	}
-	return snapshot.New(d.Engine, engineVersion, sourceDB, hashMode, migrationsHash, dumpHash, lockfileHashes)
+
+	// 3. Hash the migrate + seed run-strings + env maps. Changing
+	//    what the user told us to run is itself an input change.
+	cmdHash := commandsHash(d)
+
+	// Stash command hash + dump hash in lockfileHashes (the snapshot
+	// Key already has a string-map field for ancillary inputs).
+	if cmdHash != "" {
+		inputHashes["__commands__"] = cmdHash
+	}
+	return snapshot.New(d.Engine, engineVersion, sourceDB, "", "", dumpHash, inputHashes)
+}
+
+// staticGlobPrefix returns the longest leading directory of `glob`
+// without glob meta-characters. Used to point the hash subsystem at
+// the right tree to walk.
+func staticGlobPrefix(glob string) string {
+	out := ""
+	for i, c := range glob {
+		switch c {
+		case '*', '?', '[':
+			return out
+		case '/':
+			out = glob[:i]
+		}
+	}
+	return glob
+}
+
+// commandsHash digests the user-declared migrate/seed run strings
+// and env maps. If the user changes what gets run, the fingerprint
+// flips — even when the input files themselves don't change.
+func commandsHash(d config.DatabaseConfig) string {
+	parts := []string{}
+	if d.Migrate != nil {
+		parts = append(parts, "migrate.run="+d.Migrate.Run)
+		for _, k := range sortedKeys(d.Migrate.Env) {
+			parts = append(parts, "migrate.env."+k+"="+d.Migrate.Env[k])
+		}
+	}
+	if d.Seed != nil {
+		parts = append(parts, "seed.run="+d.Seed.Run)
+		for _, k := range sortedKeys(d.Seed.Env) {
+			parts = append(parts, "seed.env."+k+"="+d.Seed.Env[k])
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	h := blake3.New(32, nil)
+	for _, p := range parts {
+		_, _ = h.Write([]byte(p))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// sortedKeys returns the keys of `m` in sorted order.
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ── Template-cache design notes ─────────────────────────────────
@@ -1301,33 +1347,6 @@ func computeSnapshotKey(
 // `databases[].seed:` field could capture the one-time bootstrap
 // command — runs once into the template, never per worktree.
 //
-// frameworkSpecFromYAML projects a `migrations:` YAML block into the
-// in-memory framework.Spec consumed by the hash + watcher subsystems.
-// Pure passthrough — empty YAML fields flow through as empty slices
-// or strings; no builtin defaults are merged in. The user (or
-// `treeman init`) owns every value.
-//
-// HashMode and OnModify are normalized to filename/rebuild only when
-// the YAML field is empty *and* MigrationDirs/FileGlobs is populated,
-// since the hash subsystem needs a non-empty HashMode to do work.
-// A wholly empty migrations block still produces an empty spec.
-func frameworkSpecFromYAML(m config.MigrationSpec) framework.Spec {
-	hash := framework.HashMode(m.HashMode)
-	if hash == "" && (len(m.MigrationDirs) > 0 || len(m.FileGlobs) > 0) {
-		hash = framework.HashFilename
-	}
-	onMod := framework.OnModify(m.OnModify)
-	if onMod == "" && (len(m.MigrationDirs) > 0 || len(m.FileGlobs) > 0) {
-		onMod = framework.OnRebuild
-	}
-	return framework.Spec{
-		MigrationDirs: m.MigrationDirs,
-		FileGlobs:     m.FileGlobs,
-		Lockfiles:     m.Lockfiles,
-		HashMode:      hash,
-		OnModify:      onMod,
-	}
-}
 
 func resolveCloneNames(p *config.TestClonesSpec, tplCtx template.Context, repoRoot string) ([]string, error) {
 	if p == nil {

@@ -213,8 +213,8 @@ Examples:
 			//      --local <wt>` as a last resort — still returns
 			//      immediately to the user.
 			// All three are non-blocking from the user's CLI perspective.
-			needsWork := len(cfg.Hooks.SetupBeforeEngines) > 0 ||
-				len(cfg.Hooks.SetupAfterEngines) > 0 ||
+			needsWork := len(cfg.Hooks.OnCreateBeforeEngines) > 0 ||
+				len(cfg.Hooks.OnCreateAfterEngines) > 0 ||
 				(!c.Bool("skip-prepare") && len(cfg.Databases) > 0)
 			if needsWork {
 				if queued := dispatchFinalize(ctx, repoRoot, wtPath, env); queued {
@@ -392,9 +392,9 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 		out, _ := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, sl.Value, env, true)
 		hooks.PersistOutcome(ctx, st, repoID, wtID, trigger, started, time.Now().UnixMilli(), out)
 	}
-	runTrigger("teardown-before-engines", cfg.Hooks.TeardownBeforeEngines)
+	runTrigger("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
 	_ = prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st)
-	runTrigger("teardown-after-engines", cfg.Hooks.TeardownAfterEngines)
+	runTrigger("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
 	_ = st.MarkWorktreeDeleted(ctx, wtID)
 	args := []string{"worktree", "remove"}
 	if force {
@@ -850,11 +850,11 @@ func runLocalFinalize(
 			trigger, len(actions), wtPath)
 		return nil
 	}
-	if err := runTrigger("setup-before-engines", cfg.Hooks.SetupBeforeEngines); err != nil {
+	if err := runTrigger("on-create-before-engines", cfg.Hooks.OnCreateBeforeEngines); err != nil {
 		return err
 	}
 	if skipPrepare || len(cfg.Databases) == 0 {
-		return runTrigger("setup-after-engines", cfg.Hooks.SetupAfterEngines)
+		return runTrigger("on-create-after-engines", cfg.Hooks.OnCreateAfterEngines)
 	}
 	outs, err := prepare.Run(ctx, cfg, wtPath, sl, st, repoID, wtID, env)
 	if err != nil {
@@ -864,7 +864,7 @@ func runLocalFinalize(
 		fmt.Printf("prepare[%s] %s template=%s clones=%d\n",
 			o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
 	}
-	return runTrigger("setup-after-engines", cfg.Hooks.SetupAfterEngines)
+	return runTrigger("on-create-after-engines", cfg.Hooks.OnCreateAfterEngines)
 }
 
 // resolveRepo returns the explicit `--repo` if set, else discovers

@@ -117,34 +117,20 @@ func RenderTemplate(cwd string) string {
 		if engine == "" {
 			engine = "mysql"
 		}
-		mig := mapNode()
-		mapSet(mig, "migration_dirs", stringSeq(spec.MigrationDirs))
-		mapSet(mig, "file_globs", stringSeq(spec.FileGlobs))
-		mapSet(mig, "lockfiles", stringSeq(spec.Lockfiles))
-		mapSet(mig, "hash_mode", scalar(string(spec.HashMode)))
-		mapSet(mig, "on_modify", scalar(string(spec.OnModify)))
-		mapSet(mig, "migrate", migrateBlock(spec))
-
 		db := mapNode(
 			"engine", scalar(engine),
 			"name_template", scalar(name+"_testing_{slug}"),
-			"migrations", mig,
+			"migrate", migrateBlock(spec),
+			"inputs", inputNodes(spec),
 			"test_clones", mapNode(
 				"clones", scalar("auto"),
 				"name_template", scalar(name+"_testing_{slug}_test_{n}"),
 			),
 		)
 		mapSet(root, "databases", seqNode(db))
-
-		// watcher.paths: derived from the framework's migration_dirs ×
-		// file_globs + one entry per lockfile. Written explicitly so
-		// the user can see (and tune) what's watched.
-		if paths := watcherPathNodes(spec); paths != nil {
-			mapSet(root, "watcher", mapNode("paths", paths))
-		}
 	}
 
-	// hooks: setup-before-engines:
+	// hooks: on-create-before-engines:
 	actions := seqNode()
 	if hasComposer {
 		actions.Content = append(actions.Content, hookGroup("composer install --no-interaction --prefer-dist"))
@@ -162,7 +148,7 @@ func RenderTemplate(cwd string) string {
 		actions.Style = yaml.FlowStyle
 		actions.HeadComment = "add install commands here — each action is one parallel group;\nuse run: [step1, step2] for sequenced commands inside one group."
 	}
-	hooks := mapNode("setup-before-engines", actions)
+	hooks := mapNode("on-create-before-engines", actions)
 	mapSet(root, "hooks", hooks)
 	if len(detected) == 0 {
 		// Attach the "no databases yet" hint as a HeadComment on the
@@ -203,44 +189,42 @@ func migrateBlock(spec framework.Spec) *yaml.Node {
 	return out
 }
 
-// watcherPathNodes builds the `watcher.paths` sequence from a
-// detected framework. Each (migration_dir, file_glob) pair produces
-// one entry with the framework's OnModify policy; each lockfile
-// produces an entry with `on: rebuild` (a lockfile bump means the
-// framework version moved, which always warrants a full rebuild).
-// Returns nil when the spec has nothing to watch — the caller skips
-// emitting the watcher block in that case.
-func watcherPathNodes(spec framework.Spec) *yaml.Node {
-	type entry struct{ glob, on string }
+// inputNodes builds the `databases[].inputs:` sequence from a
+// detected framework. Each (migration_dir, file_glob) pair becomes
+// one entry with hash mode `filename` (migrations are append-only
+// in every framework we ship). Each lockfile becomes a bare-string
+// entry (default checksum hash).
+func inputNodes(spec framework.Spec) *yaml.Node {
+	type entry struct {
+		glob, label, hash string
+	}
 	var entries []entry
 	seen := map[string]struct{}{}
-	add := func(glob, on string) {
-		key := glob + "\x00" + on
-		if _, dup := seen[key]; dup {
+	add := func(glob, label, hash string) {
+		if _, dup := seen[glob]; dup {
 			return
 		}
-		seen[key] = struct{}{}
-		entries = append(entries, entry{glob: glob, on: on})
-	}
-	onMod := string(spec.OnModify)
-	if onMod == "" {
-		onMod = string(framework.OnRebuild)
+		seen[glob] = struct{}{}
+		entries = append(entries, entry{glob: glob, label: label, hash: hash})
 	}
 	for _, dir := range spec.MigrationDirs {
 		for _, pat := range spec.FileGlobs {
-			add(dir+"/**/"+pat, onMod)
+			add(dir+"/**/"+pat, "migrations", "filename")
 		}
 	}
 	for _, lf := range spec.Lockfiles {
-		add(lf, string(framework.OnRebuild))
-	}
-	if len(entries) == 0 {
-		return nil
+		add(lf, "lockfile", "")
 	}
 	seq := seqNode()
 	for _, e := range entries {
-		seq.Content = append(seq.Content,
-			mapNode("glob", scalar(e.glob), "on", scalar(e.on)))
+		m := mapNode("glob", scalar(e.glob))
+		if e.label != "" {
+			mapSet(m, "label", scalar(e.label))
+		}
+		if e.hash != "" {
+			mapSet(m, "hash", scalar(e.hash))
+		}
+		seq.Content = append(seq.Content, m)
 	}
 	return seq
 }

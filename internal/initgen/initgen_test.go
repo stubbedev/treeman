@@ -79,14 +79,13 @@ func TestWriteYAMLOverwritesWithForce(t *testing.T) {
 }
 
 // TestRenderTemplateLaravelEndToEnd is the integration check for the
-// "first step" refactor: against a minimal Laravel-shaped fixture
-// (artisan marker + composer.json + database/migrations dir), the
-// scaffold should emit a fully explicit migrate block, watcher.paths
-// derived from migration_dirs × file_globs (plus the composer.lock
-// rebuild entry), and NO `framework:` line under `migrations:`.
+// collapsed declarative schema: against a minimal Laravel-shaped fixture
+// (artisan marker + composer.json + database/migrations dir), the scaffold
+// should emit a top-level `migrate:` block on the db, an `inputs:` list
+// covering both migration globs and the lockfile, and no `framework:`,
+// `migrations:`, or `watcher:` blocks.
 func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 	dir := t.TempDir()
-	// Marker files that drive framework.Detect for the laravel preset.
 	must := func(p string, body string) {
 		t.Helper()
 		full := filepath.Join(dir, p)
@@ -100,20 +99,15 @@ func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 	must("artisan", "#!/usr/bin/env php\n")
 	must("composer.json", `{"name":"acme/app"}`)
 	must("composer.lock", `{"_readme": []}`)
-	// Optional but realistic: include one migration so the dir actually exists.
 	must("database/migrations/2024_01_01_000000_init.php", "<?php\n")
 
 	body := RenderTemplate(dir)
 
-	// Parse the body so we can assert on the structure rather than on
-	// brittle substring matches. The result is map-shaped under each
-	// top-level key.
 	var doc map[string]any
 	if err := yaml.Unmarshal([]byte(body), &doc); err != nil {
 		t.Fatalf("rendered template is not valid YAML: %v\n%s", err, body)
 	}
 
-	// ── migrations: ──
 	dbs, ok := doc["databases"].([]any)
 	if !ok || len(dbs) == 0 {
 		t.Fatalf("databases: missing or wrong type\n%s", body)
@@ -122,17 +116,16 @@ func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 	if got := db["engine"]; got != "mysql" {
 		t.Errorf("engine = %v, want mysql", got)
 	}
-	mig, ok := db["migrations"].(map[string]any)
-	if !ok {
-		t.Fatalf("databases[0].migrations: missing or wrong type\n%s", body)
+	if _, has := db["migrations"]; has {
+		t.Errorf("databases[0].migrations should not exist after collapse refactor; got %v", db["migrations"])
 	}
-	if _, has := mig["framework"]; has {
-		t.Errorf("migrations.framework should be absent after the refactor; got %v", mig["framework"])
+	if _, has := doc["watcher"]; has {
+		t.Errorf("top-level watcher: block should not exist after collapse refactor; got %v", doc["watcher"])
 	}
-	// migrate sub-block: run + env with {target_db} substitution targets.
-	migrate, ok := mig["migrate"].(map[string]any)
+
+	migrate, ok := db["migrate"].(map[string]any)
 	if !ok {
-		t.Fatalf("migrations.migrate: missing or wrong type\n%s", body)
+		t.Fatalf("databases[0].migrate: missing or wrong type\n%s", body)
 	}
 	if got := migrate["run"]; got != "php artisan migrate --force" {
 		t.Errorf("migrate.run = %v, want laravel default", got)
@@ -148,34 +141,35 @@ func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 		t.Errorf("migrate.env.DB_TEST_DATABASE = %v, want {target_db}", got)
 	}
 
-	// ── watcher.paths ── derived from migration_dirs × file_globs + lockfiles.
-	watcher, ok := doc["watcher"].(map[string]any)
-	if !ok {
-		t.Fatalf("watcher: missing or wrong type\n%s", body)
+	inputs, ok := db["inputs"].([]any)
+	if !ok || len(inputs) == 0 {
+		t.Fatalf("databases[0].inputs: missing or empty\n%s", body)
 	}
-	paths, ok := watcher["paths"].([]any)
-	if !ok || len(paths) == 0 {
-		t.Fatalf("watcher.paths: missing or empty\n%s", body)
+	type entry struct{ label, hash string }
+	wantInputs := map[string]entry{
+		"database/migrations/**/*.php":               {label: "migrations", hash: "filename"},
+		"app/Modules/*/Database/Migrations/**/*.php": {label: "migrations", hash: "filename"},
+		"app/Modules/*/Database/migrations/**/*.php": {label: "migrations", hash: "filename"},
+		"Modules/*/Database/Migrations/**/*.php":     {label: "migrations", hash: "filename"},
+		"Modules/*/Database/migrations/**/*.php":     {label: "migrations", hash: "filename"},
+		"composer.lock":                              {label: "lockfile", hash: ""},
 	}
-	// Expected: one glob per (migration_dir × file_glob) + one lockfile entry.
-	wantGlobs := map[string]string{
-		"database/migrations/**/*.php":                       "rebuild",
-		"app/Modules/*/Database/Migrations/**/*.php":         "rebuild",
-		"app/Modules/*/Database/migrations/**/*.php":         "rebuild",
-		"Modules/*/Database/Migrations/**/*.php":             "rebuild",
-		"Modules/*/Database/migrations/**/*.php":             "rebuild",
-		"composer.lock":                                      "rebuild",
-	}
-	gotGlobs := map[string]string{}
-	for _, p := range paths {
-		m, _ := p.(map[string]any)
+	gotInputs := map[string]entry{}
+	for _, in := range inputs {
+		m, _ := in.(map[string]any)
 		g, _ := m["glob"].(string)
-		on, _ := m["on"].(string)
-		gotGlobs[g] = on
+		lbl, _ := m["label"].(string)
+		h, _ := m["hash"].(string)
+		gotInputs[g] = entry{label: lbl, hash: h}
 	}
-	for g, on := range wantGlobs {
-		if gotGlobs[g] != on {
-			t.Errorf("watcher.paths[%q] = %q, want %q", g, gotGlobs[g], on)
+	for g, want := range wantInputs {
+		got, ok := gotInputs[g]
+		if !ok {
+			t.Errorf("inputs[%q]: missing", g)
+			continue
+		}
+		if got != want {
+			t.Errorf("inputs[%q] = %+v, want %+v", g, got, want)
 		}
 	}
 }

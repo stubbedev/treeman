@@ -279,15 +279,11 @@ type EsConn struct {
 	ContainerRef `yaml:",inline"`
 }
 
-// SnapshotsConfig — `snapshots:` block.
+// SnapshotsConfig — `snapshots:` block. Holds the retention/eviction
+// policies for cached engine templates. Snapshot state lives
+// entirely in SQLite + the engines themselves (template DBs); no
+// on-disk cache directory needs configuring.
 type SnapshotsConfig struct {
-	// Directory where cached template snapshots (dumps, lockfiles,
-	// hash manifests) live. Defaults to
-	// `$XDG_CACHE_HOME/treeman/snapshots`. Should be on the same
-	// filesystem as the worktrees root for fast hardlink-based
-	// restores.
-	CacheDir string `yaml:"cache_dir,omitempty"`
-
 	// Retention/eviction policies controlling how many snapshots
 	// per repo are kept and how aggressively they're pruned.
 	Retention RetentionConfig `yaml:"retention,omitempty"`
@@ -449,50 +445,60 @@ type Patch struct {
 //
 // Triggers (all optional — omit any you don't need):
 //
-//   • setup-before-engines — during `wt create`, after patches +
+//   • on-create-before-engines — during `wt create`, after patches +
 //     bring-in (copies/links), BEFORE engine prepare. Standard
 //     home of dependency installs (composer/yarn/pip) so migrate
 //     can find vendor/.
-//   • setup-after-engines — during `wt create`, after engine
+//   • on-create-after-engines — during `wt create`, after engine
 //     prepare. Use when actions need a populated database
 //     (cache warming, seed verification).
-//   • teardown-before-engines — during `wt delete`, BEFORE DB
+//   • on-delete-before-engines — during `wt delete`, BEFORE DB
 //     drop. Graceful shutdown: drain queues, docker compose stop.
-//   • teardown-after-engines — during `wt delete`, AFTER DB drop +
+//   • on-delete-after-engines — during `wt delete`, AFTER DB drop +
 //     git worktree remove. External notifications (Slack, CDN
 //     purge) that should announce only once the data is gone.
-//   • on-head-change — fires when the HEAD watcher sees a branch
+//   • on-checkout — fires when the HEAD watcher sees a branch
 //     switch inside an existing worktree. Re-runs in addition to
 //     the regular finalize-on-HEAD-change behaviour.
-//   • on-watch — fires when any `watcher.paths` or
-//     `databases[].watch` glob matches a filesystem event. Runs
-//     alongside the engine re-prep.
+//   • on-file-change — fires when any `databases[].inputs[]` glob
+//     matches a filesystem event. Each action can optionally
+//     `match: <label>` to filter by the input entry's label.
 //
 // The map shape lets new triggers be added without touching every
 // existing config. Daemon execution is always non-blocking from the
 // CLI's perspective — each list of actions dispatches in parallel.
 type HooksConfig struct {
-	// SetupBeforeEngines — actions fire after worktree create +
+	// OnCreateBeforeEngines — actions fire after worktree create +
 	// patches + bring-in, before engine prepare.
-	SetupBeforeEngines []Action `yaml:"setup-before-engines,omitempty"`
+	OnCreateBeforeEngines []Action `yaml:"on-create-before-engines,omitempty"`
 
-	// SetupAfterEngines — actions fire after engine prepare completes.
-	SetupAfterEngines []Action `yaml:"setup-after-engines,omitempty"`
+	// OnCreateAfterEngines — actions fire after engine prepare completes.
+	OnCreateAfterEngines []Action `yaml:"on-create-after-engines,omitempty"`
 
-	// TeardownBeforeEngines — actions fire before DB drop on delete.
-	TeardownBeforeEngines []Action `yaml:"teardown-before-engines,omitempty"`
+	// OnDeleteBeforeEngines — actions fire before DB drop on delete.
+	OnDeleteBeforeEngines []Action `yaml:"on-delete-before-engines,omitempty"`
 
-	// TeardownAfterEngines — actions fire after DB drop + worktree
+	// OnDeleteAfterEngines — actions fire after DB drop + worktree
 	// remove on delete.
-	TeardownAfterEngines []Action `yaml:"teardown-after-engines,omitempty"`
+	OnDeleteAfterEngines []Action `yaml:"on-delete-after-engines,omitempty"`
 
-	// OnHeadChange — actions fire when the HEAD watcher detects a
+	// OnCheckout — actions fire when the HEAD watcher detects a
 	// branch switch inside an existing worktree.
-	OnHeadChange []Action `yaml:"on-head-change,omitempty"`
+	OnCheckout []Action `yaml:"on-checkout,omitempty"`
 
-	// OnWatch — actions fire when any watcher.paths /
-	// databases[].watch glob matches an event.
-	OnWatch []Action `yaml:"on-watch,omitempty"`
+	// OnFileChange — actions fire when any `databases[].inputs[]`
+	// glob matches a filesystem event. Each action can optionally
+	// `match: <label>` to fire only when the matched input entry
+	// carries that label; actions without `match:` fire for every
+	// input event (any engine, any label).
+	//
+	// The subprocess receives extra env vars naming the trigger:
+	//   TREEMAN_WATCH_PATH   — absolute path that fired
+	//   TREEMAN_WATCH_MODE   — auto | delta | rebuild
+	//   TREEMAN_WATCH_LABEL  — the label on the matched watch entry (or "")
+	//   TREEMAN_WATCH_ENGINE — engine of the owning database (mysql, postgres, …)
+	//   TREEMAN_WATCH_DB_NAME — rendered name_template of the owning database
+	OnFileChange []FilteredAction `yaml:"on-file-change,omitempty"`
 }
 
 // Action — one entry under `hooks.{setup,teardown}.actions`. Every
@@ -682,10 +688,36 @@ type DatabaseConfig struct {
 	// changes invalidate the cache.
 	Dump *DumpSpec `yaml:"dump,omitempty"`
 
-	// Migration source declaration. Treeman hashes the listed files
-	// to decide whether a cached snapshot is still valid and replays
-	// migrations into the template before cloning.
-	Migrations *MigrationSpec `yaml:"migrations,omitempty"`
+	// Migrate is the shell command that brings a freshly-loaded
+	// source DB up to the current schema. Required when any input
+	// glob matches migration files; optional otherwise (e.g. a DB
+	// that's purely seed-driven).
+	Migrate *MigrationMigrate `yaml:"migrate,omitempty"`
+
+	// Seed is the shell command that populates non-migration data
+	// (fixtures, ES mappings, Redis warm-cache keys, etc.). Runs
+	// AFTER dump-load + migrate as the final cold-build step,
+	// before treeman snapshots the populated state into the
+	// template DB.
+	Seed *SeedSpec `yaml:"seed,omitempty"`
+
+	// Inputs declare every file that determines this database's
+	// template state. Each entry:
+	//   1. Contributes a hash to the snapshot fingerprint (so any
+	//      change auto-invalidates the cached template).
+	//   2. Subscribes fsnotify so changes trigger a re-prep.
+	//   3. Carries an optional `label:` that `hooks.on-file-change`
+	//      actions can match against.
+	//
+	// Glob patterns are repo-root-relative. Hash mode is per-entry:
+	// `filename` for append-only files (Laravel migrations, …),
+	// `checksum` for files edited in place (seeders, lockfiles).
+	// Default is checksum.
+	//
+	// Cache-hit vs cold-build is derived purely from the input
+	// hashes — there's no separate `on: rebuild` knob. If you want
+	// to force a rebuild, change an input.
+	Inputs []Input `yaml:"inputs,omitempty"`
 
 	// Test-clone fanout: how many parallel database clones to
 	// pre-warm for paratest/pytest-xdist/Jest workers/etc.
@@ -701,26 +733,154 @@ type DatabaseConfig struct {
 	// Range 0–64. Raise only if the server is provisioned
 	// (max_connections, PG pg_database lock contention, etc.).
 	Fanout uint32 `yaml:"fanout,omitempty" jsonschema:"minimum=0,maximum=64"`
+}
 
-	// Per-database watch list. When a file matching one of these
-	// globs changes, the daemon re-prepares THIS database only. With
-	// `on: rebuild` the cache-hit shortcut is skipped and the
-	// template rebuilds from scratch; with `on: auto` (default) the
-	// usual `migrations.on_modify` logic applies. Top-level
-	// `watcher.paths` still works and applies to every database.
-	Watch []WatcherPath `yaml:"watch,omitempty"`
+// Input declares one source of file state that contributes to the
+// template fingerprint AND triggers a re-prep when it changes.
+// Replaces the older split between `migrations.migration_dirs`,
+// `migrations.file_globs`, `migrations.lockfiles`, and
+// `databases[].watch[]`. Unifying makes the cache-key derivation
+// transparent: every input is hashed; nothing else is. Watches
+// always trigger best-effort re-prep — there's no separate
+// `on: rebuild` override.
+type Input struct {
+	// Glob pattern (relative to repo root). Supports `**` recursion.
+	// Required.
+	Glob string `yaml:"glob"`
 
-	// Shell command run AFTER dump-load + migrations as the final
-	// step of the cold-build path, BEFORE treeman snapshots the
-	// populated database into its fingerprint-keyed template. Use
-	// for engines that don't have a dump primitive (Mongo, Redis,
-	// Elasticsearch) — declare seed scripts here and they run once
-	// per fingerprint, then their output is cached + cloned for
-	// every worktree.
-	//
-	// Same env-substitution shape as `migrations.migrate.env`:
-	// `{target_db}` expands to the per-run database/namespace name.
-	Seed *SeedSpec `yaml:"seed,omitempty"`
+	// Optional label that `hooks.on-file-change` actions can match
+	// against via their `match:` field. Multiple entries can share a
+	// label so one action handles a logical group of file types.
+	Label string `yaml:"label,omitempty"`
+
+	// Hash mode for files matching this glob:
+	//   `checksum` (default) — full content hash. Detects edits.
+	//     Right for lockfiles, seeders, factories, fixtures.
+	//   `filename`            — hash of the filename only. Cheaper.
+	//     Right for append-only directories (Laravel/Rails/Django
+	//     migrations where existing files never change).
+	Hash string `yaml:"hash,omitempty" jsonschema:"enum=checksum,enum=filename"`
+}
+
+// JSONSchema documents the polymorphic shape: an Input is either a
+// bare glob string (shorthand for `{glob: <string>}`) or a full
+// `{glob, label, hash}` mapping.
+func (Input) JSONSchema() *jsonschema.Schema {
+	props := orderedmap.New[string, *jsonschema.Schema]()
+	props.Set("glob", &jsonschema.Schema{Type: "string", Description: "Glob pattern (repo-root-relative). Required."})
+	props.Set("label", &jsonschema.Schema{Type: "string", Description: "Optional label for `hooks.on-file-change` matchers."})
+	props.Set("hash", &jsonschema.Schema{Type: "string", Enum: []any{"checksum", "filename"}, Description: "Hash mode: checksum (default) or filename (append-only files)."})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "Bare glob string. Equivalent to `{glob: <this string>}` with default hash mode."},
+			{
+				Type:                 "object",
+				Properties:           props,
+				Required:             []string{"glob"},
+				AdditionalProperties: jsonschema.FalseSchema,
+				Description:          "Full input mapping with optional label + hash mode.",
+			},
+		},
+		Description: "One source of file state for the template fingerprint. Bare string OR full mapping.",
+	}
+}
+
+// UnmarshalYAML accepts either a bare glob string or a mapping.
+func (i *Input) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		i.Glob = node.Value
+		return nil
+	case yaml.MappingNode:
+		type alias Input
+		return node.Decode((*alias)(i))
+	default:
+		return fmt.Errorf("input (line %d): want a string or mapping", node.Line)
+	}
+}
+
+// FilteredAction is an Action with an optional `match:` that
+// filters which watch labels can trigger it. Used by
+// `hooks.on-file-change`.
+type FilteredAction struct {
+	// Match restricts the action to a set of watch labels. Accepts
+	// either a single string (`match: migrations`) or a list of
+	// strings (`match: [migrations, seeders]`). Empty/missing means
+	// the action fires for ANY watch event (any engine, any label).
+	Match []string `yaml:"match,omitempty"`
+
+	// Embedded Action: same shape as the universal hooks Action
+	// (run, cwd, container, …).
+	Action `yaml:",inline"`
+}
+
+// JSONSchema documents the string|[]string polymorphism for `match:`.
+func (FilteredAction) JSONSchema() *jsonschema.Schema {
+	// Pull in Action's schema for the base shape, then layer `match:`
+	// on top so editor hints describe the whole filtered action.
+	base := Action{}.JSONSchema()
+	if base.Properties != nil {
+		base.Properties.Set("match", &jsonschema.Schema{
+			OneOf: []*jsonschema.Schema{
+				{Type: "string", Description: "Single watch label to match."},
+				{Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "Set of watch labels; the action fires when any of them matches."},
+			},
+			Description: "Restrict this action to watch events carrying one of the named labels. Omit to fire for every event.",
+		})
+	}
+	base.Description = "On-file-change action with optional label filter. Same shape as a hook Action plus a `match:` field (string or list)."
+	return base
+}
+
+// UnmarshalYAML peels off the `match:` field (accepting either a
+// scalar or a sequence) and delegates the remaining keys to
+// Action's UnmarshalYAML.
+func (f *FilteredAction) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("on-file-change action (line %d): want a mapping", node.Line)
+	}
+	// Pull the `match:` value out separately so we can accept both
+	// scalar + sequence forms. Other keys are decoded by Action.
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value != "match" {
+			continue
+		}
+		v := node.Content[i+1]
+		switch v.Kind {
+		case yaml.ScalarNode:
+			if v.Value != "" {
+				f.Match = []string{v.Value}
+			}
+		case yaml.SequenceNode:
+			f.Match = make([]string, 0, len(v.Content))
+			for _, child := range v.Content {
+				if child.Kind != yaml.ScalarNode {
+					return fmt.Errorf("on-file-change (line %d): every `match` entry must be a string label", child.Line)
+				}
+				f.Match = append(f.Match, child.Value)
+			}
+		default:
+			return fmt.Errorf("on-file-change (line %d): `match` must be a string or list of strings", v.Line)
+		}
+		break
+	}
+	return f.Action.UnmarshalYAML(node)
+}
+
+// Matches reports whether this action's label filter accepts an
+// event carrying `label`. An empty Match list (wildcard) matches
+// everything; otherwise the label must equal one of the listed
+// strings.
+func (f FilteredAction) Matches(label string) bool {
+	if len(f.Match) == 0 {
+		return true
+	}
+	for _, m := range f.Match {
+		if m == label {
+			return true
+		}
+	}
+	return false
 }
 
 // SeedSpec — `databases[].seed:` sub-block. Declares the shell
@@ -754,53 +914,7 @@ type DumpSpec struct {
 	Optional bool `yaml:"optional,omitempty"`
 }
 
-// MigrationSpec — `migrations:` sub-block. Fully declarative: every
-// input the runtime needs (the migrate command, its env overrides,
-// migration directories, file globs, lockfiles, hash mode, on-modify
-// policy) is read verbatim from this struct. There is no implicit
-// fallback — leaving e.g. MigrationDirs empty means treeman has no
-// migration source for the hash, so the snapshot key won't change
-// when files do; leaving Migrate.Run empty makes `prepare` error.
-//
-// `treeman init` populates these fields from the framework presets
-// in internal/migrations/framework; `treeman fw detect` lists the
-// presets so you can hand-copy fields in. After scaffolding the YAML
-// is the only source of truth.
-type MigrationSpec struct {
-	// Migrate is the shell command treeman runs to apply migrations
-	// against a target database, plus the env-var overrides that
-	// redirect the framework's CLI at that database. Required.
-	Migrate *MigrationMigrate `yaml:"migrate,omitempty"`
-
-	// Glob patterns (relative to repo root) for directories
-	// containing migration files. Required for any behavior beyond
-	// pure-dump templates.
-	MigrationDirs []string `yaml:"migration_dirs,omitempty"`
-
-	// Glob patterns for migration filenames within `migration_dirs`.
-	// Example: `*.sql`, `*_*.up.sql`, `[0-9]*-*.sql`.
-	FileGlobs []string `yaml:"file_globs,omitempty"`
-
-	// Extra files whose contents are folded into the snapshot hash
-	// (typically lockfiles like `composer.lock`, `package-lock.json`,
-	// `go.sum`). Use when migrations are framework-managed and the
-	// installed framework version itself affects schema.
-	Lockfiles []string `yaml:"lockfiles,omitempty"`
-
-	// Hash strategy. `filename` (default) hashes only the migration
-	// filenames — fast, works when migrations are append-only.
-	// `checksum` hashes file contents — required when migrations are
-	// edited in-place during development.
-	HashMode string `yaml:"hash_mode,omitempty" jsonschema:"enum=filename,enum=checksum"`
-
-	// What to do when a migration file changes. `rebuild` (default)
-	// drops the cached template and re-runs migrations from the
-	// dump. `delta` runs only the new migrations on top of the
-	// existing template — faster but assumes append-only history.
-	OnModify string `yaml:"on_modify,omitempty" jsonschema:"enum=rebuild,enum=delta"`
-}
-
-// MigrationMigrate — `migrations.migrate:` sub-block. Declares the
+// MigrationMigrate — `databases[].migrate:` sub-block. Declares the
 // shell command treeman invokes to apply migrations and the env-var
 // overrides that point the framework's CLI at the per-run template
 // database.
@@ -916,14 +1030,10 @@ type Namespaces struct {
 	PrefixTemplate string `yaml:"prefix_template,omitempty"`
 }
 
-// WatcherConfig — `watcher:` block.
+// WatcherConfig — `watcher:` block. The set of watched paths is
+// derived from each database's `inputs:` list; this block carries
+// only global tuning knobs (debounce, binlog).
 type WatcherConfig struct {
-	// File-system globs the watcher monitors. When a matching file
-	// changes the watcher invalidates affected snapshots (per the
-	// glob's `on:` policy) so the next `prepare` rebuilds the
-	// template.
-	Paths []WatcherPath `yaml:"paths,omitempty"`
-
 	// Debounce window in milliseconds. The watcher coalesces events
 	// arriving within this window before invalidating snapshots,
 	// which prevents thrashing when an editor saves many files at
@@ -959,42 +1069,33 @@ type BinlogConfig struct {
 	ApplyDML *bool `yaml:"apply_dml,omitempty"`
 }
 
-// WatcherPath — one `paths:` entry under `watcher:` or `databases[].watch`.
+// WatcherPath is the internal projection of an Input that the
+// fsnotify driver subscribes to. Users never write this type
+// directly — they declare `databases[].inputs[]` and treeman
+// aggregates them into WatcherPaths at watcher-start time.
 type WatcherPath struct {
-	// Filesystem glob (relative to repo root) the watcher monitors.
-	// Supports `**` recursion. Example:
-	// `database/migrations/**/*.sql`.
-	Glob string `yaml:"glob"`
-
-	// Invalidation strategy when a matching file changes:
-	//   `auto`    — defer to the matching DatabaseConfig's `on_modify`.
-	//   `delta`   — keep the cached template, replay only new files.
-	//   `rebuild` — drop the template AND skip the cache-hit shortcut,
-	//               rebuilding from the dump no matter what the
-	//               database's `on_modify` says.
-	// Default: `auto`.
-	On string `yaml:"on,omitempty" jsonschema:"enum=auto,enum=delta,enum=rebuild"`
-
-	// DBIndex is the index of the database in cfg.Databases this watch
-	// belongs to. Populated by the daemon at watcher-start time when
-	// aggregating top-level watcher.paths (DBIndex = -1, "applies to
-	// every DB") with per-DB watches (DBIndex = i for databases[i]).
-	// Not serialised — users only ever set Glob + On in YAML.
+	// Filesystem glob (relative to repo root). Supports `**` recursion.
+	Glob string `yaml:"-" json:"-"`
+	// Label passes through from the originating Input so hook
+	// matchers can filter on it.
+	Label string `yaml:"-" json:"-"`
+	// DBIndex is the index of the originating database in cfg.Databases.
 	DBIndex int `yaml:"-" json:"-"`
 }
 
 // CustomFramework — `frameworks:` entry, lets users declare
-// migration frameworks treeman doesn't know about natively.
+// migration frameworks treeman doesn't know about natively. Consumed
+// only by `treeman fw detect` and `treeman init` for scaffolding; at
+// runtime treeman reads `databases[].inputs[]` directly.
 type CustomFramework struct {
 	// Files (relative to repo root) whose presence indicates this
 	// framework is in use. Used by `treeman fw detect` to pick the
-	// framework when no explicit MigrationSpec is configured.
+	// framework when scaffolding a new config.
 	// Example: `["alembic.ini", "migrations/env.py"]`.
 	Markers []string `yaml:"markers"`
 
 	// Glob patterns for the directories holding migration files.
-	// Copied into the MigrationSpec when detection picks this
-	// framework.
+	// Emitted as `inputs[]` entries during `treeman init`.
 	MigrationDirs []string `yaml:"migration_dirs"`
 
 	// Glob pattern for individual migration files within
@@ -1003,17 +1104,18 @@ type CustomFramework struct {
 	FilePattern string `yaml:"file_pattern"`
 
 	// Hash strategy applied to the migration files: `filename`
-	// (default) or `checksum`. Same semantics as
-	// MigrationSpec.HashMode.
+	// (default) or `checksum`. Maps to the `hash:` field on each
+	// emitted Input.
 	HashMode string `yaml:"hash_mode,omitempty" jsonschema:"enum=filename,enum=checksum"`
 
-	// Change-handling policy: `rebuild` (default) or `delta`. Same
-	// semantics as MigrationSpec.OnModify.
+	// Change-handling policy. Retained for compatibility with the
+	// old `treeman fw detect` table output; the runtime no longer
+	// reads it (all watches are best-effort cache-hit-or-rebuild).
 	OnModify string `yaml:"on_modify,omitempty" jsonschema:"enum=rebuild,enum=delta"`
 
 	// Lockfiles whose contents are folded into the snapshot hash
-	// (e.g. `requirements.txt`, `pyproject.toml`,
-	// `composer.lock`).
+	// (e.g. `requirements.txt`, `pyproject.toml`, `composer.lock`).
+	// Emitted as `inputs[]` entries with label `lockfile`.
 	Lockfiles []string `yaml:"lockfiles,omitempty"`
 
 	// Optional hint about the database engine this framework

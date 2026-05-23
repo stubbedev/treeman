@@ -17,7 +17,6 @@ import (
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
-	"github.com/stubbedev/treeman/internal/watcher"
 )
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
@@ -104,12 +103,12 @@ func FinalizeWorktree(
 		}
 	}
 
-	// Three-step setup pipeline: setup-before-engines actions →
-	// engine prepare → setup-after-engines actions. Each step waits
+	// Three-step setup pipeline: on-create-before-engines actions →
+	// engine prepare → on-create-after-engines actions. Each step waits
 	// for the previous on the daemon side; the CLI never sees this
 	// (it already returned).
-	if err := runTriggerActions(ctx, st, "setup-before-engines",
-		cfg.Hooks.SetupBeforeEngines, repoRoot, wtRoot, sl.Value,
+	if err := runTriggerActions(ctx, st, "on-create-before-engines",
+		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
 		repoID, wtID, inheritedEnv); err != nil {
 		return err
 	}
@@ -118,8 +117,8 @@ func FinalizeWorktree(
 			return fmt.Errorf("prepare: %w", err)
 		}
 	}
-	if err := runTriggerActions(ctx, st, "setup-after-engines",
-		cfg.Hooks.SetupAfterEngines, repoRoot, wtRoot, sl.Value,
+	if err := runTriggerActions(ctx, st, "on-create-after-engines",
+		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
 		repoID, wtID, inheritedEnv); err != nil {
 		return err
 	}
@@ -137,10 +136,11 @@ func FinalizeWorktree(
 }
 
 // FinalizeWorktreeForWatch is the watcher-driven re-prepare path.
-// Called when a file matching either a top-level `watcher.paths`
-// glob or a `databases[i].watch` glob changes. Re-applies patches
-// (cheap, idempotent) and re-runs prepare scoped to the matched
-// database — forcing a full rebuild when `mode == rebuild`.
+// Called when a file matching one of the owning database's
+// `inputs:` globs changes. Re-applies patches (cheap, idempotent)
+// and re-runs prepare scoped to the matched database. The cache-
+// hit / cold-build decision is derived purely from the input hash
+// fingerprint — no force-rebuild override.
 //
 // `dbIdx == -1` means the matched glob was top-level / applies to
 // every database; in that case every DB re-prepares.
@@ -154,7 +154,6 @@ func FinalizeWorktreeForWatch(
 	st *State,
 	repoPath, worktreePath string,
 	dbIdx int,
-	mode watcher.DispatchMode,
 	inheritedEnv map[string]string,
 ) error {
 	repoRoot := repoPath
@@ -194,9 +193,10 @@ func FinalizeWorktreeForWatch(
 	if len(cfg.Databases) == 0 {
 		return nil
 	}
-	opts := prepare.RunOptions{
-		ForceRebuild: mode == watcher.ModeRebuild,
-	}
+	// The fingerprint hashes every declared input + dump + the
+	// migrate/seed run-strings. If anything changed, prepare cold-
+	// builds; otherwise cache-hits. No separate force-rebuild knob.
+	opts := prepare.RunOptions{}
 	if dbIdx >= 0 && dbIdx < len(cfg.Databases) {
 		opts.FilterDBs = true
 		opts.OnlyDBIndex = dbIdx
@@ -295,20 +295,20 @@ func TeardownWorktree(
 		"daemon-detached teardown hooks + db teardown + git remove beginning",
 		repoID, wtID, "", 0, nil)
 
-	// Three-step teardown: teardown-before-engines actions →
+	// Three-step teardown: on-delete-before-engines actions →
 	// engine drop (inline + synchronous so post-engine actions can
-	// observe the drop) → teardown-after-engines actions. Drop
+	// observe the drop) → on-delete-after-engines actions. Drop
 	// failures are logged but don't abort the rest.
-	_ = runTriggerActions(ctx, st, "teardown-before-engines",
-		cfg.Hooks.TeardownBeforeEngines, repoRoot, wtRoot, slugVal,
+	_ = runTriggerActions(ctx, st, "on-delete-before-engines",
+		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, slugVal,
 		repoID, wtID, inheritedEnv)
 	if len(cfg.Databases) > 0 {
 		if err := prepare.TeardownDatabases(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
 			slog.Warn("teardown DB drop", "wt", wtRoot, "err", err)
 		}
 	}
-	_ = runTriggerActions(ctx, st, "teardown-after-engines",
-		cfg.Hooks.TeardownAfterEngines, repoRoot, wtRoot, slugVal,
+	_ = runTriggerActions(ctx, st, "on-delete-after-engines",
+		cfg.Hooks.OnDeleteAfterEngines, repoRoot, wtRoot, slugVal,
 		repoID, wtID, inheritedEnv)
 
 	// Acquire the per-repo mutex only for the git operations — they

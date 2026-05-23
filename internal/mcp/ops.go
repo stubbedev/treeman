@@ -202,20 +202,18 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 
 	var entries []config.Action
 	switch phase {
-	case "setup-before-engines":
-		entries = cfg.Hooks.SetupBeforeEngines
-	case "setup-after-engines":
-		entries = cfg.Hooks.SetupAfterEngines
-	case "teardown-before-engines":
-		entries = cfg.Hooks.TeardownBeforeEngines
-	case "teardown-after-engines":
-		entries = cfg.Hooks.TeardownAfterEngines
-	case "on-head-change":
-		entries = cfg.Hooks.OnHeadChange
-	case "on-watch":
-		entries = cfg.Hooks.OnWatch
+	case "on-create-before-engines":
+		entries = cfg.Hooks.OnCreateBeforeEngines
+	case "on-create-after-engines":
+		entries = cfg.Hooks.OnCreateAfterEngines
+	case "on-delete-before-engines":
+		entries = cfg.Hooks.OnDeleteBeforeEngines
+	case "on-delete-after-engines":
+		entries = cfg.Hooks.OnDeleteAfterEngines
+	case "on-checkout":
+		entries = cfg.Hooks.OnCheckout
 	default:
-		return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want setup-before-engines|setup-after-engines|teardown-before-engines|teardown-after-engines|on-head-change|on-watch)", phase)
+		return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)", phase)
 	}
 
 	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, len(entries))
