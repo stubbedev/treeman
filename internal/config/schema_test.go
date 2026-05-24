@@ -25,8 +25,8 @@ func TestSchemaCoversKnownYAMLKeys(t *testing.T) {
 	}
 	body := string(b)
 	for _, key := range []string{
-		`"repo"`, `"worktrees"`, `"connections"`, `"databases"`,
-		`"hooks"`, `"snapshots"`, `"watcher"`, `"env_scoping"`,
+		`"worktrees"`, `"connections"`, `"databases"`,
+		`"hooks"`, `"snapshots"`, `"debounce_ms"`, `"env_sources"`,
 	} {
 		if !strings.Contains(body, key) {
 			t.Errorf("schema missing top-level key %s", key)

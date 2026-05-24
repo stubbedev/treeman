@@ -17,19 +17,20 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
-	"os"
 )
 
 // LoadMySQL streams `dumpPath` into `targetDB` via the supplied
 // *sql.DB. Returns the number of statements applied.
 //
-// Uses streamStatements internally so a 10GB dump is bounded by the
-// largest statement size (typically ~64MB for mysqldump extended-
-// inserts), not the file size.
+// Compression (gzip/zstd/bzip2/xz) is auto-detected from the file's
+// magic bytes — extension is not consulted. Uses streamStatements
+// internally so a 10GB dump is bounded by the largest statement
+// size (typically ~64MB for mysqldump extended-inserts), not the
+// file size.
 func LoadMySQL(ctx context.Context, db *sql.DB, targetDB, dumpPath string) (uint64, error) {
-	f, err := os.Open(dumpPath)
+	f, _, err := OpenDump(dumpPath)
 	if err != nil {
-		return 0, fmt.Errorf("read dump %s: %w", dumpPath, err)
+		return 0, err
 	}
 	defer f.Close()
 	conn, err := db.Conn(ctx)
@@ -54,10 +55,11 @@ func LoadMySQL(ctx context.Context, db *sql.DB, targetDB, dumpPath string) (uint
 }
 
 // LoadPostgres mirrors LoadMySQL for pgx-backed databases.
+// Compression auto-detection works identically.
 func LoadPostgres(ctx context.Context, db *sql.DB, targetDB, dumpPath string) (uint64, error) {
-	f, err := os.Open(dumpPath)
+	f, _, err := OpenDump(dumpPath)
 	if err != nil {
-		return 0, fmt.Errorf("read dump %s: %w", dumpPath, err)
+		return 0, err
 	}
 	defer f.Close()
 	conn, err := db.Conn(ctx)

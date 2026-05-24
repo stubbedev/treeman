@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -27,50 +28,72 @@ type Driver struct {
 
 // Connect opens a server-level pool against `postgres` DB so we can
 // issue CREATE / DROP / TEMPLATE statements at the cluster level.
+// Three connection modes are auto-detected from cfg:
+//
+//   - Container/ComposeService set → containerip rewrites Host:Port
+//     to the published mapping (or bridge-network IP fallback), then
+//     dials TCP.
+//   - cfg.Host starts with "/" → unix-socket DSN
+//     (`postgres:///postgres?host=/var/run/postgresql`), TCP probe
+//     skipped.
+//   - Otherwise → plain TCP, probe-first.
 func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 5432
 	}
-	opts := containerip.Opts{
-		Container:      cfg.Container,
-		ComposeService: cfg.ComposeService,
-		ComposeProject: cfg.ComposeProject,
-		Engine:         cfg.ContainerEngine,
-		Network:        cfg.Network,
-		InternalPort:   cfg.Port,
-	}
-	if addr, err := containerip.ResolveAddr(opts); err != nil {
-		return nil, fmt.Errorf("resolve container: %w", err)
-	} else if addr != nil {
-		cfg.Host = addr.Host
-		if addr.Port != 0 {
-			cfg.Port = addr.Port
+	socketMode := strings.HasPrefix(cfg.Host, "/")
+	if !socketMode {
+		opts := containerip.Opts{
+			Container:      cfg.Container,
+			ComposeService: cfg.ComposeService,
+			ComposeProject: cfg.ComposeProject,
+			Engine:         cfg.ContainerEngine,
+			Network:        cfg.Network,
+			InternalPort:   cfg.Port,
 		}
-	}
-	if err := reachability.Probe("postgres", cfg.Host, cfg.Port); err != nil {
-		if cfg.Container != "" || cfg.ComposeService != "" {
-			containerip.RefreshOpts(opts)
-			if addr, e := containerip.ResolveAddr(opts); e == nil && addr != nil {
-				cfg.Host = addr.Host
-				if addr.Port != 0 {
-					cfg.Port = addr.Port
-				}
-				if err2 := reachability.Probe("postgres", cfg.Host, cfg.Port); err2 != nil {
-					return nil, err2
+		if addr, err := containerip.ResolveAddr(opts); err != nil {
+			return nil, fmt.Errorf("resolve container: %w", err)
+		} else if addr != nil {
+			cfg.Host = addr.Host
+			if addr.Port != 0 {
+				cfg.Port = addr.Port
+			}
+		}
+		if err := reachability.Probe("postgres", cfg.Host, cfg.Port); err != nil {
+			if cfg.Container != "" || cfg.ComposeService != "" {
+				containerip.RefreshOpts(opts)
+				if addr, e := containerip.ResolveAddr(opts); e == nil && addr != nil {
+					cfg.Host = addr.Host
+					if addr.Port != 0 {
+						cfg.Port = addr.Port
+					}
+					if err2 := reachability.Probe("postgres", cfg.Host, cfg.Port); err2 != nil {
+						return nil, err2
+					}
+				} else {
+					return nil, err
 				}
 			} else {
 				return nil, err
 			}
-		} else {
-			return nil, err
 		}
 	}
-	dsn := fmt.Sprintf(
-		"postgres://%s:%s@%s:%d/postgres?sslmode=disable",
-		url.QueryEscape(cfg.User),
-		url.QueryEscape(cfg.Password),
-		cfg.Host, cfg.Port,
-	)
+	var dsn string
+	if socketMode {
+		dsn = fmt.Sprintf(
+			"postgres://%s:%s@/postgres?sslmode=disable&host=%s",
+			url.QueryEscape(cfg.User),
+			url.QueryEscape(cfg.Password),
+			url.QueryEscape(cfg.Host),
+		)
+	} else {
+		dsn = fmt.Sprintf(
+			"postgres://%s:%s@%s:%d/postgres?sslmode=disable",
+			url.QueryEscape(cfg.User),
+			url.QueryEscape(cfg.Password),
+			cfg.Host, cfg.Port,
+		)
+	}
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)

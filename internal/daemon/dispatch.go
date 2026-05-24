@@ -256,7 +256,7 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 	st.RegisterWatcher(repoPath, entry)
 
 	binlogReps := 0
-	if cfg.Watcher.Binlog.Enabled {
+	if cfg.Connections.Mysql != nil && cfg.Connections.Mysql.Binlog != nil && cfg.Connections.Mysql.Binlog.Enabled {
 		for _, d := range cfg.Databases {
 			switch d.Engine {
 			case "mysql", "mariadb", "tidb":
@@ -337,8 +337,12 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 	// Compound stop: closes both watchers when the entry is unregistered.
 	stoppers := []func(){cancel}
 
-	// HEAD watcher — always-on.
-	hw, err := NewHeadWatcher(wtPath, 500*time.Millisecond, func(_ context.Context, newRef string) {
+	// HEAD watcher — always-on. 100ms debounce is plenty: git
+	// rewrites HEAD atomically (tmp file + rename = one fsnotify
+	// event), so we only need to coalesce against the rare ref-pack
+	// race. A tight window means `git checkout` → prefetch starts
+	// within ~100ms instead of ~500ms perceived latency.
+	hw, err := NewHeadWatcher(wtPath, 100*time.Millisecond, func(_ context.Context, newRef string) {
 		_ = st.Store.WriteEvent(st.BgCtx, "info", "head_changed",
 			fmt.Sprintf("HEAD → %s", newRef),
 			repoID, 0, "", 0, map[string]string{
@@ -380,7 +384,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 	aggregatedPaths := aggregateWatches(&cfg)
 	if len(aggregatedPaths) > 0 {
 		dispatch := makeWtFSDispatcher(st, repoPath, repoID, wtPath)
-		w, err := watcher.New(wtPath, aggregatedPaths, cfg.Watcher, dispatch)
+		w, err := watcher.New(wtPath, aggregatedPaths, cfg.DebounceMs, dispatch)
 		if err != nil {
 			cancel()
 			return fmt.Errorf("fsnotify watcher init: %w", err)

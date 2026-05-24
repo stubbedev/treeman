@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -67,6 +68,27 @@ func (f frameworkHashCache) UpsertDirHashes(ctx context.Context, entries []frame
 		se[i] = store.DirHashKey(e)
 	}
 	return f.Store.UpsertDirHashes(ctx, se, hashes)
+}
+
+// dumpReady resolves d.Dump against worktreePath and reports
+// whether the dump should be loaded. Returns (path, true, nil) when
+// the file exists; (path, false, nil) when the file is missing AND
+// d.Dump.Optional == true (caller should skip the load step);
+// (path, false, err) when the file is required but missing.
+// dump==nil short-circuits with ("", false, nil) so callers can
+// branch on the bool alone.
+func dumpReady(dump *config.DumpSpec, worktreePath string) (string, bool, error) {
+	if dump == nil {
+		return "", false, nil
+	}
+	p := filepath.Join(worktreePath, dump.Path)
+	if _, err := os.Stat(p); err != nil {
+		if dump.Optional {
+			return p, false, nil
+		}
+		return p, false, fmt.Errorf("dump %s: %w", p, err)
+	}
+	return p, true, nil
 }
 
 // Outcome — one row per database the orchestrator handled.
@@ -438,6 +460,7 @@ func prepareMySQL(
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
+	started := time.Now()
 	if cfg.Connections.Mysql == nil {
 		return Outcome{}, fmt.Errorf("connections.mysql not configured")
 	}
@@ -481,13 +504,16 @@ func prepareMySQL(
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			ms := time.Since(started).Milliseconds()
 			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-				fmt.Sprintf("cache_hit clones=%d", len(clones)),
+				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
 				repoID, worktreeID, "", 0, map[string]string{
 					"source_db":   sourceDB,
 					"template":    rec.TemplateName,
 					"clones":      fmt.Sprintf("%d", len(clones)),
 					"fingerprint": key.Fingerprint(),
+					"cache_hit":   "true",
+					"duration_ms": fmt.Sprintf("%d", ms),
 				})
 			return Outcome{
 				Engine:       d.Engine,
@@ -520,16 +546,14 @@ func prepareMySQL(
 	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
-	if d.Dump != nil {
-		dp := filepath.Join(worktreePath, d.Dump.Path)
+	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
+		return Outcome{}, err
+	} else if ok {
 		if _, err := dumpload.LoadMySQL(ctx, drv.DB, sourceDB, dp); err != nil {
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
 	}
 	if d.Migrate != nil {
-		if d.Migrate == nil {
-			return Outcome{}, fmt.Errorf("migrations.migrate is required when migrations: is set (source=%s)", sourceDB)
-		}
 		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
@@ -577,12 +601,15 @@ func prepareMySQL(
 		return Outcome{}, err
 	}
 
+	ms := time.Since(started).Milliseconds()
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-		fmt.Sprintf("clones=%d", len(clones)),
+		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
-			"source_db": sourceDB,
-			"template":  templateName,
-			"clones":    fmt.Sprintf("%d", len(clones)),
+			"source_db":   sourceDB,
+			"template":    templateName,
+			"clones":      fmt.Sprintf("%d", len(clones)),
+			"cache_hit":   "false",
+			"duration_ms": fmt.Sprintf("%d", ms),
 		})
 
 	return Outcome{
@@ -610,6 +637,7 @@ func preparePostgres(
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
+	started := time.Now()
 	if cfg.Connections.Postgres == nil {
 		return Outcome{}, fmt.Errorf("connections.postgres not configured")
 	}
@@ -658,6 +686,17 @@ func preparePostgres(
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			ms := time.Since(started).Milliseconds()
+			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+				repoID, worktreeID, "", 0, map[string]string{
+					"source_db":   sourceDB,
+					"template":    rec.TemplateName,
+					"clones":      fmt.Sprintf("%d", len(clones)),
+					"fingerprint": key.Fingerprint(),
+					"cache_hit":   "true",
+					"duration_ms": fmt.Sprintf("%d", ms),
+				})
 			return Outcome{
 				Engine: d.Engine, SourceDB: sourceDB,
 				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
@@ -674,16 +713,14 @@ func preparePostgres(
 	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
-	if d.Dump != nil {
-		dp := filepath.Join(worktreePath, d.Dump.Path)
+	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
+		return Outcome{}, err
+	} else if ok {
 		if _, err := dumpload.LoadPostgres(ctx, drv.DB, sourceDB, dp); err != nil {
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
 	}
 	if d.Migrate != nil {
-		if d.Migrate == nil {
-			return Outcome{}, fmt.Errorf("migrations.migrate is required when migrations: is set (source=%s)", sourceDB)
-		}
 		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
@@ -719,11 +756,16 @@ func preparePostgres(
 	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
 		return Outcome{}, err
 	}
+	ms := time.Since(started).Milliseconds()
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-		fmt.Sprintf("clones=%d", len(clones)),
+		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
-			"engine": "postgres", "source_db": sourceDB,
-			"template": templateName, "clones": fmt.Sprintf("%d", len(clones)),
+			"engine":      "postgres",
+			"source_db":   sourceDB,
+			"template":    templateName,
+			"clones":      fmt.Sprintf("%d", len(clones)),
+			"cache_hit":   "false",
+			"duration_ms": fmt.Sprintf("%d", ms),
 		})
 	return Outcome{
 		Engine: d.Engine, SourceDB: sourceDB, TemplateName: templateName,
@@ -731,14 +773,11 @@ func preparePostgres(
 	}, nil
 }
 
-// prepareMongo readies the per-worktree MongoDB database namespace.
-// Mongo has no template/clone primitive worth caching for typical
-// dev workloads (the snapshot story for mongo is `mongorestore`
-// which is comparable to a cold re-load anyway), so the bringup
-// path is a "drop-if-exists + ready for first write".
-//
-// Future: if d.Dump.Path is set, treeman could `mongorestore` from
-// it. Skipped for now — most apps using mongo seed via app code.
+// prepareMongo readies the per-worktree MongoDB database. Cold-build
+// order matches the SQL engines: drop, optionally `mongorestore` a
+// dump archive, run the seed step, snapshot the per-collection
+// template, fan clones out. Cache-hit short-circuits straight to
+// the per-collection $out clone.
 func prepareMongo(
 	ctx context.Context,
 	cfg *config.Config,
@@ -749,6 +788,7 @@ func prepareMongo(
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
+	started := time.Now()
 	if cfg.Connections.Mongodb == nil {
 		return Outcome{}, fmt.Errorf("connections.mongodb not configured")
 	}
@@ -794,6 +834,18 @@ func prepareMongo(
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			ms := time.Since(started).Milliseconds()
+			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "mongodb",
+					"source_db":   sourceDB,
+					"template":    rec.TemplateName,
+					"clones":      fmt.Sprintf("%d", len(clones)),
+					"fingerprint": key.Fingerprint(),
+					"cache_hit":   "true",
+					"duration_ms": fmt.Sprintf("%d", ms),
+				})
 			return Outcome{
 				Engine: d.Engine, SourceDB: sourceDB,
 				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
@@ -803,10 +855,18 @@ func prepareMongo(
 		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
-	// Cold build: drop source, run seed (no dump/migrate in Mongo
-	// today), snapshot template, fan out clones.
+	// Cold build: drop source, optionally mongorestore a dump
+	// archive, run the seed step, snapshot template, fan out
+	// clones.
 	if _, err := drv.DropMatching(ctx, sourceDB); err != nil {
 		return Outcome{}, fmt.Errorf("mongo drop %s: %w", sourceDB, err)
+	}
+	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
+		return Outcome{}, err
+	} else if ok {
+		if err := dbmongo.Restore(ctx, cfg.Connections.Mongodb.URI, sourceDB, dp); err != nil {
+			return Outcome{}, fmt.Errorf("mongo restore %s: %w", dp, err)
+		}
 	}
 	if d.Seed != nil {
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, inheritedEnv)
@@ -836,11 +896,16 @@ func prepareMongo(
 		return Outcome{}, err
 	}
 
+	ms := time.Since(started).Milliseconds()
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-		fmt.Sprintf("mongodb template %s ready, clones=%d", templateName, len(clones)),
+		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
-			"engine": "mongodb", "source_db": sourceDB,
-			"template": templateName, "clones": fmt.Sprintf("%d", len(clones)),
+			"engine":      "mongodb",
+			"source_db":   sourceDB,
+			"template":    templateName,
+			"clones":      fmt.Sprintf("%d", len(clones)),
+			"cache_hit":   "false",
+			"duration_ms": fmt.Sprintf("%d", ms),
 		})
 	return Outcome{
 		Engine:       d.Engine,
@@ -882,8 +947,8 @@ func prepareRedis(
 	if cfg.Connections.Redis == nil {
 		return Outcome{}, fmt.Errorf("connections.redis not configured")
 	}
-	if d.Namespaces == nil || (d.Namespaces.PrefixTemplate == "" && d.Namespaces.DbIndexTemplate == "") {
-		return Outcome{}, fmt.Errorf("redis: namespaces.prefix_template (preferred) or namespaces.db_index_template required")
+	if d.Namespaces == nil || d.Namespaces.KeyPrefixTemplate == "" {
+		return Outcome{}, fmt.Errorf("redis: namespaces.key_prefix_template required")
 	}
 	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 	if err != nil {
@@ -891,10 +956,7 @@ func prepareRedis(
 	}
 	defer drv.Close()
 
-	if d.Namespaces.PrefixTemplate != "" {
-		return prepareRedisPrefix(ctx, cfg, d, drv, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-	}
-	return prepareRedisDBIndex(ctx, d, drv, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+	return prepareRedisPrefix(ctx, cfg, d, drv, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 }
 
 // prepareRedisPrefix is the modern path — prefix-isolated keys in
@@ -910,9 +972,10 @@ func prepareRedisPrefix(
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
-	sourcePrefix, err := template.Render(d.Namespaces.PrefixTemplate, tplCtx)
+	started := time.Now()
+	sourcePrefix, err := template.Render(d.Namespaces.KeyPrefixTemplate, tplCtx)
 	if err != nil {
-		return Outcome{}, fmt.Errorf("render prefix_template: %w", err)
+		return Outcome{}, fmt.Errorf("render key_prefix_template: %w", err)
 	}
 	version, _ := drv.EngineVersion(ctx)
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourcePrefix, version)
@@ -951,6 +1014,18 @@ func prepareRedisPrefix(
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			ms := time.Since(started).Milliseconds()
+			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "redis",
+					"source_db":   sourcePrefix,
+					"template":    rec.TemplateName,
+					"clones":      fmt.Sprintf("%d", len(clones)),
+					"fingerprint": key.Fingerprint(),
+					"cache_hit":   "true",
+					"duration_ms": fmt.Sprintf("%d", ms),
+				})
 			return Outcome{
 				Engine: d.Engine, SourceDB: sourcePrefix,
 				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
@@ -992,11 +1067,16 @@ func prepareRedisPrefix(
 		return Outcome{}, err
 	}
 
+	ms := time.Since(started).Milliseconds()
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-		fmt.Sprintf("redis template %s ready, clones=%d", templatePrefix, len(clones)),
+		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
-			"engine": "redis", "source_db": sourcePrefix,
-			"template": templatePrefix, "clones": fmt.Sprintf("%d", len(clones)),
+			"engine":      "redis",
+			"source_db":   sourcePrefix,
+			"template":    templatePrefix,
+			"clones":      fmt.Sprintf("%d", len(clones)),
+			"cache_hit":   "false",
+			"duration_ms": fmt.Sprintf("%d", ms),
 		})
 	return Outcome{
 		Engine:       d.Engine,
@@ -1006,48 +1086,6 @@ func prepareRedisPrefix(
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
-}
-
-// prepareRedisDBIndex is the legacy path — FLUSHDB the worktree's
-// numeric DB index + run seed. No template caching, no fanout. Kept
-// for backward compat with configs that use `db_index_template`.
-func prepareRedisDBIndex(
-	ctx context.Context,
-	d config.DatabaseConfig,
-	drv *dbredis.Driver,
-	tplCtx template.Context,
-	worktreePath string,
-	st *store.Store,
-	repoID, worktreeID int64,
-	inheritedEnv map[string]string,
-) (Outcome, error) {
-	idxStr, err := template.Render(d.Namespaces.DbIndexTemplate, tplCtx)
-	if err != nil {
-		return Outcome{}, fmt.Errorf("render db_index_template: %w", err)
-	}
-	var idx uint8
-	if _, err := fmt.Sscanf(idxStr, "%d", &idx); err != nil {
-		return Outcome{}, fmt.Errorf("redis db index parse %q: %w", idxStr, err)
-	}
-	if err := drv.FlushDB(ctx, idx); err != nil {
-		return Outcome{}, fmt.Errorf("redis flushdb %d: %w", idx, err)
-	}
-	sourceDB := fmt.Sprintf("db%d", idx)
-	if d.Seed != nil {
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, inheritedEnv)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("seed redis %s: %w", sourceDB, err)
-		}
-		if out.ExitCode != 0 {
-			return Outcome{}, fmt.Errorf("seed redis %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
-		}
-	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-		fmt.Sprintf("redis db%d ready (legacy db-index mode)", idx),
-		repoID, worktreeID, "", 0, map[string]string{
-			"engine": "redis", "source_db": sourceDB,
-		})
-	return Outcome{Engine: d.Engine, SourceDB: sourceDB}, nil
 }
 
 // prepareES brings up a worktree's Elasticsearch / OpenSearch
@@ -1075,15 +1113,16 @@ func prepareES(
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
+	started := time.Now()
 	if cfg.Connections.Elasticsearch == nil {
 		return Outcome{}, fmt.Errorf("connections.elasticsearch not configured")
 	}
-	if d.Namespaces == nil || d.Namespaces.IndexPrefixTemplate == "" {
-		return Outcome{}, fmt.Errorf("elasticsearch: missing namespaces.index_prefix_template")
+	if d.Namespaces == nil || d.Namespaces.KeyPrefixTemplate == "" {
+		return Outcome{}, fmt.Errorf("elasticsearch: missing namespaces.key_prefix_template")
 	}
-	sourcePrefix, err := template.Render(d.Namespaces.IndexPrefixTemplate, tplCtx)
+	sourcePrefix, err := template.Render(d.Namespaces.KeyPrefixTemplate, tplCtx)
 	if err != nil {
-		return Outcome{}, fmt.Errorf("render index_prefix_template: %w", err)
+		return Outcome{}, fmt.Errorf("render key_prefix_template: %w", err)
 	}
 	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 	if err != nil {
@@ -1123,6 +1162,18 @@ func prepareES(
 				return Outcome{}, err
 			}
 			_ = st.TouchSnapshot(ctx, key.Fingerprint())
+			ms := time.Since(started).Milliseconds()
+			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "elasticsearch",
+					"source_db":   sourcePrefix,
+					"template":    rec.TemplateName,
+					"clones":      fmt.Sprintf("%d", len(clones)),
+					"fingerprint": key.Fingerprint(),
+					"cache_hit":   "true",
+					"duration_ms": fmt.Sprintf("%d", ms),
+				})
 			return Outcome{
 				Engine: d.Engine, SourceDB: sourcePrefix,
 				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
@@ -1132,9 +1183,17 @@ func prepareES(
 		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
-	// Cold build: drop source, run seed (no native dump for ES), snapshot, fanout.
+	// Cold build: drop, optionally bulk-load a dump NDJSON, run
+	// seed, snapshot, fanout.
 	if _, err := drv.DropMatching(ctx, sourcePrefix); err != nil {
 		return Outcome{}, fmt.Errorf("es drop %s*: %w", sourcePrefix, err)
+	}
+	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
+		return Outcome{}, err
+	} else if ok {
+		if err := drv.Restore(ctx, sourcePrefix, dp); err != nil {
+			return Outcome{}, fmt.Errorf("es restore %s: %w", dp, err)
+		}
 	}
 	if d.Seed != nil {
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, inheritedEnv)
@@ -1164,11 +1223,16 @@ func prepareES(
 		return Outcome{}, err
 	}
 
+	ms := time.Since(started).Milliseconds()
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-		fmt.Sprintf("es template %s ready, clones=%d", templatePrefix, len(clones)),
+		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
-			"engine": "elasticsearch", "source_db": sourcePrefix,
-			"template": templatePrefix, "clones": fmt.Sprintf("%d", len(clones)),
+			"engine":      "elasticsearch",
+			"source_db":   sourcePrefix,
+			"template":    templatePrefix,
+			"clones":      fmt.Sprintf("%d", len(clones)),
+			"cache_hit":   "false",
+			"duration_ms": fmt.Sprintf("%d", ms),
 		})
 	return Outcome{
 		Engine:       d.Engine,
@@ -1489,44 +1553,40 @@ func teardownOne(
 		if cfg.Connections.Redis == nil {
 			return fmt.Errorf("connections.redis not configured")
 		}
-		if d.Namespaces == nil {
-			return fmt.Errorf("redis: missing namespaces.db_index_template")
+		if d.Namespaces == nil || d.Namespaces.KeyPrefixTemplate == "" {
+			return fmt.Errorf("redis: missing namespaces.key_prefix_template")
 		}
 		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 		if err != nil {
 			return err
 		}
 		defer drv.Close()
-		idxStr, err := template.Render(d.Namespaces.DbIndexTemplate, tplCtx)
+		prefix, err := template.Render(d.Namespaces.KeyPrefixTemplate, tplCtx)
 		if err != nil {
 			return err
 		}
-		var idx uint8
-		_, err = fmt.Sscanf(idxStr, "%d", &idx)
+		dropped, err := drv.DropPrefix(ctx, prefix)
 		if err != nil {
-			return fmt.Errorf("redis db index parse %q: %w", idxStr, err)
-		}
-		if err := drv.FlushDB(ctx, idx); err != nil {
 			return err
 		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "db_flush",
-			fmt.Sprintf("redis: db%d", idx),
+		_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+			fmt.Sprintf("redis: %s (%d)", prefix, dropped),
 			repoID, worktreeID, "", 0, map[string]any{
-				"engine": "redis", "slug": sl, "target": fmt.Sprintf("db%d", idx),
+				"engine": "redis", "slug": sl, "target": prefix, "count": dropped,
 			})
 		return nil
 	case "elasticsearch", "opensearch":
 		if cfg.Connections.Elasticsearch == nil {
 			return fmt.Errorf("connections.elasticsearch not configured")
 		}
-		if d.Namespaces == nil {
-			return fmt.Errorf("es: missing namespaces.index_prefix_template")
+		if d.Namespaces == nil || d.Namespaces.KeyPrefixTemplate == "" {
+			return fmt.Errorf("es: missing namespaces.key_prefix_template")
 		}
 		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 		if err != nil {
 			return err
 		}
-		prefix, err := template.Render(d.Namespaces.IndexPrefixTemplate, tplCtx)
+		prefix, err := template.Render(d.Namespaces.KeyPrefixTemplate, tplCtx)
 		if err != nil {
 			return err
 		}

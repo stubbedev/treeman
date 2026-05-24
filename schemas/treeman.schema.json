@@ -27,10 +27,6 @@
           "type": "string",
           "description": "Container name or ID. When set, every step is wrapped in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
         },
-        "in_container": {
-          "type": "string",
-          "description": "Alias for `container`."
-        },
         "compose_service": {
           "type": "string",
           "description": "Docker Compose service name. Wraps every step in `\u003cengine\u003e compose exec`. Mutually exclusive with `container`."
@@ -42,10 +38,6 @@
         "container_engine": {
           "type": "string",
           "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
-        },
-        "engine": {
-          "type": "string",
-          "description": "Alias for `container_engine`."
         }
       },
       "additionalProperties": false,
@@ -158,14 +150,6 @@
           ],
           "description": "Hash strategy applied to the migration files: `filename`\n(default) or `checksum`. Maps to the `hash:` field on each\nemitted Input."
         },
-        "on_modify": {
-          "type": "string",
-          "enum": [
-            "rebuild",
-            "delta"
-          ],
-          "description": "Change-handling policy. Retained for compatibility with the\nold `treeman fw detect` table output; the runtime no longer\nreads it (all watches are best-effort cache-hit-or-rebuild)."
-        },
         "lockfiles": {
           "items": {
             "type": "string"
@@ -189,22 +173,14 @@
     },
     "DaemonConfig": {
       "properties": {
-        "socket": {
-          "type": "string",
-          "description": "Unix-socket path the daemon listens on. Defaults to\n`$XDG_RUNTIME_DIR/treeman.sock`. CLI clients dial the same\npath; override only if the runtime dir is unwritable (CI, some\ncontainers) or you want a per-project daemon."
-        },
         "log_level": {
           "type": "string",
-          "description": "Log level for daemon stderr: `trace`, `debug`, `info` (default),\n`warn`, `error`. Hook output is always captured regardless."
-        },
-        "db_log_path": {
-          "type": "string",
-          "description": "Path to the SQLite log database the daemon writes structured\nevents to. Defaults to `$XDG_STATE_HOME/treeman/logs.db`.\nInspected via `treeman logs query` / the `logs_query` MCP tool."
+          "description": "Log level for daemon stderr: `debug`, `info` (default),\n`warn`, `error`. Read once at startup; reload by restarting\nthe daemon. Hook output is always captured regardless."
         }
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "DaemonConfig — `daemon:` block."
+      "description": "DaemonConfig — `daemon:` block. Only `log_level` is user-tunable;\nthe socket path and event-log location are derived from\n$XDG_RUNTIME_DIR / $XDG_STATE_HOME respectively and are not\nconfigurable through YAML (one source of truth — the runtime\ndirs the OS already manages)."
     },
     "DatabaseConfig": {
       "properties": {
@@ -232,11 +208,11 @@
           "description": "Source dump used to seed clones. Path is relative to the repo\nroot. Treeman hashes this file into the snapshot key, so\nchanges invalidate the cache."
         },
         "migrate": {
-          "$ref": "#/$defs/MigrationMigrate",
+          "$ref": "#/$defs/Step",
           "description": "Migrate is the shell command that brings a freshly-loaded\nsource DB up to the current schema. Required when any input\nglob matches migration files; optional otherwise (e.g. a DB\nthat's purely seed-driven)."
         },
         "seed": {
-          "$ref": "#/$defs/SeedSpec",
+          "$ref": "#/$defs/Step",
           "description": "Seed is the shell command that populates non-migration data\n(fixtures, ES mappings, Redis warm-cache keys, etc.). Runs\nAFTER dump-load + migrate as the final cold-build step,\nbefore treeman snapshots the populated state into the\ntemplate DB."
         },
         "inputs": {
@@ -269,36 +245,31 @@
       "description": "DatabaseConfig — one `databases:` entry. The `engine` discriminator\ngates which sub-fields are valid.\n\n`Fanout` is the optional override for the outer concurrency cap\nduring clone restore + DropMatching. Leave unset (omitempty / 0)\nto use the safe per-engine default from internal/prepare. Raise\nonly if the server is provisioned for it (max_connections raised,\nPG pg_database lock contention acceptable, etc.)."
     },
     "DumpSpec": {
-      "properties": {
-        "path": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "Path to the dump file relative to the repo root. Format must\nmatch the engine — `.sql` for MySQL/Postgres, `.bson`/archive\nfor Mongo. The file is hashed into the snapshot key so changes\ninvalidate cached snapshots."
+          "description": "Bare path string. Equivalent to `{path: \u003cthis string\u003e}`."
         },
-        "optional": {
-          "type": "boolean",
-          "description": "When true, a missing dump file is not an error — treeman will\nbuild the template from migrations alone. Use for greenfield\nprojects that haven't created a baseline dump yet."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "path"
-      ],
-      "description": "DumpSpec — `dump:` sub-block of a DatabaseConfig."
-    },
-    "EnvScoping": {
-      "properties": {
-        "sources": {
-          "items": {
-            "type": "string"
+        {
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Dump file path, repo-root-relative. Required."
+            },
+            "optional": {
+              "type": "boolean",
+              "description": "When true, missing dump is not an error."
+            }
           },
-          "type": "array",
-          "description": "READ list — paths the credential resolver consults in order\nwhen looking up DB passwords and other secrets. Later layers\noverride earlier ones. When empty, the resolver falls back to\nthe default ordered search:\n`.env` → `.env.local` → `.env.test` → `.env.testing` →\n`.env.test.local` → `.env.testing.local`."
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "path"
+          ],
+          "description": "Full dump mapping with optional `optional` flag."
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "EnvScoping — `env_scoping:` block. After the patches-block\nrefactor, this carries only the credential resolver's READ list.\n`.env*` rewriting lives in the top-level `patches:` block.\n\n`Sources` is the ordered list the credential resolver consults\nwhen looking up DB passwords and other secrets. Later layers\noverride earlier ones (so a `.env.testing.local` override beats\nthe committed `.env.testing` baseline). When empty, the resolver\nfalls back to the default search order:\n\n\t.env  →  .env.local  →  .env.test  →  .env.testing\n\t     →  .env.test.local  →  .env.testing.local"
+      ],
+      "description": "Source dump file. Bare string OR `{path, optional}` mapping."
     },
     "EsConn": {
       "properties": {
@@ -360,10 +331,6 @@
           "type": "string",
           "description": "Container name or ID. When set, every step is wrapped in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
         },
-        "in_container": {
-          "type": "string",
-          "description": "Alias for `container`."
-        },
         "compose_service": {
           "type": "string",
           "description": "Docker Compose service name. Wraps every step in `\u003cengine\u003e compose exec`. Mutually exclusive with `container`."
@@ -375,10 +342,6 @@
         "container_engine": {
           "type": "string",
           "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
-        },
-        "engine": {
-          "type": "string",
-          "description": "Alias for `container_engine`."
         },
         "match": {
           "oneOf": [
@@ -488,27 +451,6 @@
       ],
       "description": "One source of file state for the template fingerprint. Bare string OR full mapping."
     },
-    "MigrationMigrate": {
-      "properties": {
-        "run": {
-          "type": "string",
-          "description": "Run is the shell command treeman invokes via `sh -c`. Example:\n`php artisan migrate --force`. Required; an empty Run aborts\n`prepare` with a clear error rather than falling back to a\nhardcoded default."
-        },
-        "env": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object",
-          "description": "Env is a map of env-var names to value templates. Each entry\nis set on the migrate subprocess (overriding the framework's\nconfig file). `{target_db}` is substituted with the resolved\nper-run database name; literal values pass through unchanged."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "run"
-      ],
-      "description": "MigrationMigrate — `databases[].migrate:` sub-block. Declares the\nshell command treeman invokes to apply migrations and the env-var\noverrides that point the framework's CLI at the per-run template\ndatabase.\n\nThe framework's migrate command reads its target DB from the\nframework's own config (Laravel: `DB_DATABASE` in `.env`; Rails:\n`DATABASE`; Django: `DJANGO_DB_NAME`; etc.). Treeman builds\nper-worktree template databases with names like\n`myapp_template_feature-x` and needs to redirect the migrate\ncommand at *that* DB, not the one the committed `.env` references.\nThe `Env` map says which env-var names to override; the value\ntemplate `{target_db}` is substituted at runtime with the resolved\ndatabase name. No other placeholders are supported."
-    },
     "MongoConn": {
       "properties": {
         "uri": {
@@ -565,6 +507,10 @@
           "type": "integer",
           "description": "Maximum open connections in the daemon's pool to this server.\nDefaults to a per-engine safe value. Raise only if the server\nis provisioned for it (max_connections raised, etc.)."
         },
+        "binlog": {
+          "$ref": "#/$defs/BinlogConfig",
+          "description": "Binlog tailer settings. Off by default. When enabled, treeman\nconnects as a fake replica and replays DDL (and optionally\nDML) from this server onto cached templates so the cache stays\nin sync without a re-prep."
+        },
         "container": {
           "type": "string",
           "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
@@ -595,17 +541,9 @@
     },
     "Namespaces": {
       "properties": {
-        "db_index_template": {
+        "key_prefix_template": {
           "type": "string",
-          "description": "Redis: legacy per-worktree DB index. Template must render to\nan integer in 0-15. No template caching and no test_clones\nfanout in this mode — kept for backward compat. Prefer\n`prefix_template` for new configs."
-        },
-        "index_prefix_template": {
-          "type": "string",
-          "description": "Elasticsearch / OpenSearch: template producing the index-\nname prefix. All indexes the app creates are scoped under\nthis prefix per worktree. Example: `app_{slug}_`."
-        },
-        "prefix_template": {
-          "type": "string",
-          "description": "Redis (preferred) and other prefix-isolated engines: template\nproducing the key prefix every worktree key lives under. One\nRedis logical DB (0) holds every worktree's data, isolated\nby prefix — lifts the 16-DB cap, works on cluster mode, and\nenables full template caching + parallel fanout. The app must\nhonour the prefix (Laravel's `CACHE_PREFIX`, Rails\n`Rails.cache.options[:namespace]`, ioredis `keyPrefix`).\nExample: `{slug}:` produces `feature-x:` and the app reads\nkeys as `feature-x:cache:foo`."
+          "description": "KeyPrefixTemplate scopes every key/index a worktree creates\nunder a per-worktree prefix. Used by both Redis (key prefix\nin DB 0) and Elasticsearch / OpenSearch (index-name prefix).\nExample: `{slug}:` produces `feature-x:`. The app must\nhonour the prefix — Laravel's `CACHE_PREFIX`, Rails\n`Rails.cache.options[:namespace]`, ioredis `keyPrefix`, etc.\nfor Redis; the ES client prefixes index names automatically\nin most frameworks."
         }
       },
       "additionalProperties": false,
@@ -733,20 +671,6 @@
       ],
       "description": "RedisConn — `redis://…` URL. Same ContainerRef semantics as MongoConn."
     },
-    "RepoBlock": {
-      "properties": {
-        "name": {
-          "type": "string",
-          "description": "Repository identifier. Used in registry keys, snapshot cache\npaths, slug templates, and database name templates. Defaults\nto the directory's basename when unset. Should be stable\nacross machines so snapshots cached by one developer are\nreusable by another."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "name"
-      ],
-      "description": "RepoBlock — `repo:` block."
-    },
     "RetentionConfig": {
       "properties": {
         "cap_per_repo": {
@@ -774,38 +698,6 @@
       "type": "object",
       "description": "RetentionConfig — `snapshots.retention:` policies.\n\n`CapPerRepo` is the hard cap that triggers eviction on every\n`RecordSnapshot`. LRU rows above the cap are dropped immediately\n(in a background goroutine) so a busy worktree workflow never\naccumulates unbounded cached templates per repo.\n\n`KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`\ndrive the periodic daemon-side sweep; they're not consulted by\nthe inline-on-write eviction path."
     },
-    "SeedSpec": {
-      "properties": {
-        "run": {
-          "type": "string",
-          "description": "Run is the shell command treeman invokes via `sh -c`. Example:\n`node scripts/seed.js`. Required."
-        },
-        "env": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object",
-          "description": "Env is a map of env-var names to value templates. Each entry\nis set on the seed subprocess. `{target_db}` is substituted\nwith the resolved per-run database name; literal values pass\nthrough unchanged."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "run"
-      ],
-      "description": "SeedSpec — `databases[].seed:` sub-block. Declares the shell\ncommand treeman runs to populate a database's template state with\nnon-migration data (fixtures, ES index mappings, Mongo seed\ndocuments, Redis warm-cache keys, etc.). Same shape as\n`migrations.migrate` so the same runner can execute both."
-    },
-    "SlugRules": {
-      "properties": {
-        "override": {
-          "type": "string",
-          "description": "Forced slug value, bypassing the branch-name derivation.\nMostly useful in CI where the branch name might be noisy\n(`HEAD`, detached, PR-merge ref) and you want a deterministic\nslug for the run."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "SlugRules — placeholder for future per-repo slug overrides."
-    },
     "SnapshotsConfig": {
       "properties": {
         "retention": {
@@ -816,6 +708,27 @@
       "additionalProperties": false,
       "type": "object",
       "description": "SnapshotsConfig — `snapshots:` block. Holds the retention/eviction\npolicies for cached engine templates. Snapshot state lives\nentirely in SQLite + the engines themselves (template DBs); no\non-disk cache directory needs configuring."
+    },
+    "Step": {
+      "properties": {
+        "run": {
+          "type": "string",
+          "description": "Run is the shell command treeman invokes via `sh -c`.\nRequired; an empty Run aborts `prepare` with a clear error."
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Env is a map of env-var names to value templates. Each entry\nis set on the subprocess (overriding the framework's config\nfile). `{target_db}` is substituted with the resolved per-run\ndatabase name; literal values pass through unchanged."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "description": "Step is one user-declared shell command executed against a target\ndatabase. Used by both `databases[].migrate:` and\n`databases[].seed:` — the same shape, different lifecycle slots.\n\nThe framework's CLI reads its target DB from its own config\n(Laravel: `DB_DATABASE` in `.env`; Rails: `DATABASE`; Django:\n`DJANGO_DB_NAME`; etc.). Treeman builds per-worktree template\ndatabases with names like `myapp_template_feature-x` and needs to\nredirect the command at *that* DB, not the one the committed\n`.env` references. The `Env` map says which env-var names to\noverride; the value template `{target_db}` is substituted at\nruntime with the resolved database name. No other placeholders\nare supported."
     },
     "TestClonesSpec": {
       "properties": {
@@ -834,21 +747,6 @@
         "name_template"
       ],
       "description": "TestClonesSpec — `test_clones:` sub-block. Used by every parallel\ntest runner (paratest, pest, pytest-xdist, Jest workers, Go\n`-parallel`, cargo nextest, …). `clones` is either `auto` (treeman\nreads the project's worker-count config) or an explicit integer."
-    },
-    "WatcherConfig": {
-      "properties": {
-        "debounce_ms": {
-          "type": "integer",
-          "description": "Debounce window in milliseconds. The watcher coalesces events\narriving within this window before invalidating snapshots,\nwhich prevents thrashing when an editor saves many files at\nonce. Default 500."
-        },
-        "binlog": {
-          "$ref": "#/$defs/BinlogConfig",
-          "description": "MySQL binary-log tailer settings. Disabled by default; enable\nto replay DDL events from the source database onto cached\ntemplates and test clones automatically."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "WatcherConfig — `watcher:` block. The set of watched paths is\nderived from each database's `inputs:` list; this block carries\nonly global tuning knobs (debounce, binlog)."
     },
     "WorktreesConfig": {
       "properties": {
@@ -889,21 +787,16 @@
       "$ref": "#/$defs/SnapshotsConfig",
       "description": "Snapshot cache settings: where post-migration template\nsnapshots are cached on disk, plus retention/eviction policy."
     },
-    "repo": {
-      "$ref": "#/$defs/RepoBlock",
-      "description": "Identifies this repository in the registry. The `name` field is\nused in registry keys, snapshot paths, and slug templates.\nDefaults to the directory's basename when unset."
-    },
-    "slug": {
-      "$ref": "#/$defs/SlugRules",
-      "description": "Per-repo slug-template overrides. Slugs are the short\nidentifier (typically derived from the branch name) used in\ndatabase names, container labels, and on-disk paths."
-    },
     "worktrees": {
       "$ref": "#/$defs/WorktreesConfig",
       "description": "Worktree creation/deletion behaviour: root path, symlink mirrors,\nasync vs sync semantics for hooks."
     },
-    "env_scoping": {
-      "$ref": "#/$defs/EnvScoping",
-      "description": "Env-file credential resolution. Controls which `.env*` files\nthe resolver consults when looking up DB passwords and other\nsecrets. Patching of env / yaml / json / phpunit.xml files for\nper-worktree scoping lives in the top-level `patches:` block."
+    "env_sources": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array",
+      "description": "EnvSources is the ordered list of `.env*` files the credential\nresolver consults when looking up DB passwords and other\nsecrets. Later entries override earlier ones. Empty falls back\nto the default search order:\n  .env → .env.local → .env.test → .env.testing →\n  .env.test.local → .env.testing.local\nPer-worktree rewriting of these files lives in `patches:`."
     },
     "patches": {
       "items": {
@@ -923,9 +816,9 @@
       "$ref": "#/$defs/HooksConfig",
       "description": "Lifecycle hooks fired around worktree create/delete. Two phases:\n`setup` (after create) and `teardown` (before delete). Run\nasync by default; `worktrees.async_create` / `async_delete`\ncontrol whether the CLI blocks on completion."
     },
-    "watcher": {
-      "$ref": "#/$defs/WatcherConfig",
-      "description": "File-system + binlog watcher settings. The watcher invalidates\ncached snapshots when migration files or DDL events change."
+    "debounce_ms": {
+      "type": "integer",
+      "description": "DebounceMs is the file-watcher debounce window in\nmilliseconds. Coalesces editor save bursts into one re-prep\ndispatch. Default 500. (Binlog tailer settings live under\n`connections.mysql.binlog:` since they're MySQL-specific.)"
     },
     "frameworks": {
       "additionalProperties": {

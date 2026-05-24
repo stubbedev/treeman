@@ -16,11 +16,30 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/version"
 )
+
+// slogLevel parses a daemon.log_level YAML value into a slog.Level.
+// Unknown values fall back to info with a stderr warning so a typo
+// doesn't silently degrade visibility.
+func slogLevel(raw string) slog.Level {
+	switch raw {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	case "", "info":
+		return slog.LevelInfo
+	}
+	fmt.Fprintf(os.Stderr, "treemand: unknown daemon.log_level %q, defaulting to info\n", raw)
+	return slog.LevelInfo
+}
 
 func main() {
 	if len(os.Args) >= 2 && (os.Args[1] == "--version" || os.Args[1] == "-V") {
@@ -28,7 +47,11 @@ func main() {
 		return
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	level := slog.LevelInfo
+	if gcfg, err := config.LoadGlobal(); err == nil {
+		level = slogLevel(gcfg.Daemon.LogLevel)
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 
 	if err := run(); err != nil {

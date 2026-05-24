@@ -25,13 +25,13 @@ type Spec struct {
 	Label string // e.g. "migrations.migrate" or "seed"
 }
 
-// FromMigrate converts a `migrations.migrate` block to a Spec.
-func FromMigrate(m config.MigrationMigrate) Spec {
-	return Spec{Run: m.Run, Env: m.Env, Label: "migrations.migrate"}
+// FromMigrate converts a `databases[].migrate` block to a Spec.
+func FromMigrate(s config.Step) Spec {
+	return Spec{Run: s.Run, Env: s.Env, Label: "migrate"}
 }
 
 // FromSeed converts a `databases[].seed` block to a Spec.
-func FromSeed(s config.SeedSpec) Spec {
+func FromSeed(s config.Step) Spec {
 	return Spec{Run: s.Run, Env: s.Env, Label: "seed"}
 }
 

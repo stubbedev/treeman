@@ -29,54 +29,74 @@ type Driver struct {
 }
 
 // Connect opens a pooled mysql connection at the server level (no
-// default DB scope so DDL like CREATE/DROP DATABASE works). TCP
-// probe runs first so unreachable services surface a clean error
-// before sqlx-style "connect refused" noise.
+// default DB scope so DDL like CREATE/DROP DATABASE works). Three
+// connection modes are auto-detected from cfg:
+//
+//   - Container/ComposeService set → containerip rewrites Host:Port
+//     to the published mapping (or bridge-network IP fallback), then
+//     dials TCP.
+//   - cfg.Host starts with "/" → unix-socket DSN
+//     (`unix(/var/run/mysqld/mysqld.sock)`), TCP probe skipped.
+//   - Otherwise → plain TCP. Probe runs first so unreachable
+//     services surface a clean error before sqlx-style noise.
 func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 3306
 	}
-	opts := containerip.Opts{
-		Container:      cfg.Container,
-		ComposeService: cfg.ComposeService,
-		ComposeProject: cfg.ComposeProject,
-		Engine:         cfg.ContainerEngine,
-		Network:        cfg.Network,
-		InternalPort:   cfg.Port,
-	}
-	if addr, err := containerip.ResolveAddr(opts); err != nil {
-		return nil, fmt.Errorf("resolve container: %w", err)
-	} else if addr != nil {
-		cfg.Host = addr.Host
-		if addr.Port != 0 {
-			cfg.Port = addr.Port
+	socketMode := strings.HasPrefix(cfg.Host, "/")
+	if !socketMode {
+		opts := containerip.Opts{
+			Container:      cfg.Container,
+			ComposeService: cfg.ComposeService,
+			ComposeProject: cfg.ComposeProject,
+			Engine:         cfg.ContainerEngine,
+			Network:        cfg.Network,
+			InternalPort:   cfg.Port,
 		}
-	}
-	if err := reachability.Probe("mysql", cfg.Host, cfg.Port); err != nil {
-		// Container IP/port may have changed (restart); evict + retry once.
-		if cfg.Container != "" || cfg.ComposeService != "" {
-			containerip.RefreshOpts(opts)
-			if addr, e := containerip.ResolveAddr(opts); e == nil && addr != nil {
-				cfg.Host = addr.Host
-				if addr.Port != 0 {
-					cfg.Port = addr.Port
-				}
-				if err2 := reachability.Probe("mysql", cfg.Host, cfg.Port); err2 != nil {
-					return nil, err2
+		if addr, err := containerip.ResolveAddr(opts); err != nil {
+			return nil, fmt.Errorf("resolve container: %w", err)
+		} else if addr != nil {
+			cfg.Host = addr.Host
+			if addr.Port != 0 {
+				cfg.Port = addr.Port
+			}
+		}
+		if err := reachability.Probe("mysql", cfg.Host, cfg.Port); err != nil {
+			// Container IP/port may have changed (restart); evict + retry once.
+			if cfg.Container != "" || cfg.ComposeService != "" {
+				containerip.RefreshOpts(opts)
+				if addr, e := containerip.ResolveAddr(opts); e == nil && addr != nil {
+					cfg.Host = addr.Host
+					if addr.Port != 0 {
+						cfg.Port = addr.Port
+					}
+					if err2 := reachability.Probe("mysql", cfg.Host, cfg.Port); err2 != nil {
+						return nil, err2
+					}
+				} else {
+					return nil, err
 				}
 			} else {
 				return nil, err
 			}
-		} else {
-			return nil, err
 		}
 	}
-	dsn := fmt.Sprintf(
-		"%s:%s@tcp(%s:%d)/?charset=utf8mb4,utf8&parseTime=true&multiStatements=true",
-		url.QueryEscape(cfg.User),
-		url.QueryEscape(cfg.Password),
-		cfg.Host, cfg.Port,
-	)
+	var dsn string
+	if socketMode {
+		dsn = fmt.Sprintf(
+			"%s:%s@unix(%s)/?charset=utf8mb4,utf8&parseTime=true&multiStatements=true",
+			url.QueryEscape(cfg.User),
+			url.QueryEscape(cfg.Password),
+			cfg.Host,
+		)
+	} else {
+		dsn = fmt.Sprintf(
+			"%s:%s@tcp(%s:%d)/?charset=utf8mb4,utf8&parseTime=true&multiStatements=true",
+			url.QueryEscape(cfg.User),
+			url.QueryEscape(cfg.Password),
+			cfg.Host, cfg.Port,
+		)
+	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open mysql: %w", err)

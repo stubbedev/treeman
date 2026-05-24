@@ -71,28 +71,22 @@ func RenderTemplate(cwd string) string {
 	// the yaml-language-server modeline that wires editor hinting.
 	root.HeadComment = "yaml-language-server: $schema=" + schema.URL
 
-	// repo:
-	mapSet(root, "repo", mapNode(
-		"name", scalar(name),
-	))
-
 	// worktrees:
 	mapSet(root, "worktrees", mapNode(
 		"root", scalar(".worktrees"),
 		"copies", seqNode(scalar(".env")),
 	))
 
-	// env_scoping (read-list only — patches live in the top-level
-	// `patches:` block now).
+	// env_sources: read-list for the credential resolver (patches
+	// live in the top-level `patches:` block).
 	envSources := defaultEnvSourcesFor(detected, has)
 	if len(envSources) > 0 {
 		sources := seqNode()
 		for _, s := range envSources {
 			sources.Content = append(sources.Content, scalar(s))
 		}
-		envBlock := mapNode("sources", sources)
-		mapKeyNode(envBlock, "sources").LineComment = "files read in order, last wins"
-		mapSet(root, "env_scoping", envBlock)
+		sources.LineComment = "files read in order, last wins"
+		mapSet(root, "env_sources", sources)
 	}
 
 	// patches: — generic file-rewriting block. For Laravel projects
@@ -163,7 +157,7 @@ func RenderTemplate(cwd string) string {
 		// Falls back to a minimal stub so callers always get something
 		// loadable. Should never trigger — the builders above only
 		// emit well-formed nodes.
-		return "repo:\n  name: " + name + "\n"
+		return "worktrees:\n  root: .worktrees\n"
 	}
 	return string(body)
 }

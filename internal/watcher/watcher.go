@@ -54,7 +54,6 @@ type Dispatcher func(ctx context.Context, ev Event) error
 type Watcher struct {
 	repoPath   string
 	paths      []config.WatcherPath
-	cfg        config.WatcherConfig
 	dispatch   Dispatcher
 	debounceMs time.Duration
 
@@ -68,9 +67,10 @@ type Watcher struct {
 
 // New constructs a Watcher. `paths` is the aggregated list of
 // WatcherPath entries (each one carries its DBIndex + optional
-// Label) the daemon collected by walking every database's `watch:`
-// block. `cfg` carries only the global knobs (debounce, binlog).
-func New(repoPath string, paths []config.WatcherPath, cfg config.WatcherConfig, dispatch Dispatcher) (*Watcher, error) {
+// Label) the daemon collected by walking every database's
+// `inputs:` block. `debounceMs` is the coalesce window in ms (0 →
+// 500 ms default).
+func New(repoPath string, paths []config.WatcherPath, debounceMs uint64, dispatch Dispatcher) (*Watcher, error) {
 	if dispatch == nil {
 		return nil, errors.New("watcher: nil dispatcher")
 	}
@@ -78,14 +78,13 @@ func New(repoPath string, paths []config.WatcherPath, cfg config.WatcherConfig, 
 	if err != nil {
 		return nil, fmt.Errorf("fsnotify new: %w", err)
 	}
-	debounce := time.Duration(cfg.DebounceMs) * time.Millisecond
+	debounce := time.Duration(debounceMs) * time.Millisecond
 	if debounce == 0 {
 		debounce = 500 * time.Millisecond
 	}
 	return &Watcher{
 		repoPath:   repoPath,
 		paths:      paths,
-		cfg:        cfg,
 		dispatch:   dispatch,
 		debounceMs: debounce,
 		fsw:        fsw,

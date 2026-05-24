@@ -23,13 +23,9 @@ worktrees:
   async_delete: true              # default
   skip_worktree: true             # mark .env.testing skip-worktree after patching
 
-env_scoping:
-  files: [".env.testing"]
-  skip_worktree: true
-  patches:
-    - { key: DB_DATABASE,      template: "myapp_testing_{slug}" }
-    - { key: DB_TEST_DATABASE, template: "myapp_testing_{slug}" }
-    - { key: REDIS_DB,         template: "{slug_redis_index}" }
+env_sources:                       # credential-resolver READ list
+  - .env
+  - .env.testing
 
 # The whole `connections:` block is optional — treeman auto-resolves
 # credentials from `.env` / `.env.testing` (Laravel `DB_*`,
@@ -92,10 +88,10 @@ snapshots:
     max_total_gb: 50
     gc_interval_minutes: 60                # daemon background sweep
 
-watcher:
-  debounce_ms: 500
-  binlog:
-    enabled: true                          # MySQL only — see Binlog section in advanced.md
+debounce_ms: 500                         # file-watcher coalesce window
+
+# Binlog tailing lives under the MySQL connection block:
+# connections.mysql.binlog: { enabled: true }   # see Binlog section in advanced.md
 
 daemon:
   socket: $XDG_RUNTIME_DIR/treeman.sock
@@ -124,7 +120,7 @@ YAML; once written, those fields are authoritative. If a migration
 glob lives somewhere unusual, change `inputs:` and the next prepare
 sees it — no recompile, no rebuild of treeman, no per-framework
 code path. The same applies to env files: only what
-`env_scoping.sources` lists is read.
+`env_sources:` lists is read.
 
 The built-in framework presets exist solely as init-time templates
 and are listed by `treeman fw detect`. Copy fields in by hand for
@@ -165,9 +161,9 @@ variants after.
 
 ### Running hooks inside a container
 
-Hook entries accept an `in_container:` (or `compose_service:`)
-directive that wraps every step in `<engine> exec` so the command
-runs inside the named container rather than on the host. Useful for
+Hook entries accept a `container:` (or `compose_service:`) directive
+that wraps every step in `<engine> exec` so the command runs inside
+the named container rather than on the host. Useful for
 `composer install`, `npm ci`, `php artisan migrate`,
 `bundle install`, … that depend on the dev container's toolchain.
 
@@ -175,7 +171,7 @@ runs inside the named container rather than on the host. Useful for
 hooks:
   on-create-after-engines:
     # Single-step group, in a named container.
-    - { run: "composer install", in_container: myapp-php }
+    - { run: "composer install", container: myapp-php }
 
     # Multi-step group, in a compose service.
     - compose_service: app
@@ -267,26 +263,26 @@ framework. Copy + paste into the `databases:` array of an existing
 
 ## Credential resolution from .env
 
-treeman reads env files **only when** `env_scoping.sources` is
-declared. There is no implicit default — the runtime never reads
-files you didn't list. `treeman init` writes a `sources:` block
-matching the framework it detected (Laravel → `.env.testing` etc.);
-edit the list to suit.
+treeman reads env files **only when** `env_sources:` is declared.
+There is no implicit default — the runtime never reads files you
+didn't list. `treeman init` writes an `env_sources:` block matching
+the framework it detected (Laravel → `.env.testing` etc.); edit the
+list to suit.
 
 ```yaml
-env_scoping:
-  sources:                # files read in order, last wins
-    - .env
-    - .env.testing        # baseline for tests
-    - .env.testing.local  # per-dev overrides
+env_sources:                # files read in order, last wins
+  - .env
+  - .env.testing        # baseline for tests
+  - .env.testing.local  # per-dev overrides
 ```
 
 Relative paths resolve against the repo root; absolute paths are
 honoured as-is so you can pull from outside the repo (e.g. a
 shared secret store).
 
-When `sources` resolves to a non-empty environment, the resolver
-fills any unset fields in the `connections:` block. Supported flavours per engine:
+When `env_sources:` resolves to a non-empty environment, the
+resolver fills any unset fields in the `connections:` block.
+Supported flavours per engine:
 
 | Engine | Env vars treeman reads (first non-empty wins) |
 |---|---|

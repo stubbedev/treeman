@@ -20,7 +20,7 @@ func TestActionSingleStringRun(t *testing.T) {
 	// `run: "..."` decodes to []string{"..."} so callers don't need
 	// to branch on shape.
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - run: "composer install"
@@ -40,7 +40,7 @@ hooks:
 
 func TestActionListRun(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - run:
@@ -59,7 +59,7 @@ hooks:
 
 func TestActionGroupLevelCwd(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - run:
@@ -83,7 +83,7 @@ func TestAllTriggersParseAndCarryActions(t *testing.T) {
 	// `on-file-change` trigger now lives per-database (covered by
 	// TestPerDBOnFileChange below).
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - run: "composer install"
@@ -127,7 +127,7 @@ hooks:
 // shapes: omitted (wildcard), single string, and list.
 func TestOnFileChangeGlobalWithLabels(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 databases:
   - engine: mysql
     name_template: "app_{slug}"
@@ -181,11 +181,11 @@ hooks:
 
 func TestActionContainerSingleStep(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - run: "composer install"
-      in_container: app
+      container: app
 `)
 	cfg, err := LoadLayered(d)
 	if err != nil {
@@ -197,9 +197,25 @@ hooks:
 	}
 }
 
+// TestActionInContainerAliasRejected asserts the removed `in_container:`
+// alias produces a clear error rather than silently mis-parsing.
+func TestActionInContainerAliasRejected(t *testing.T) {
+	d := writeTmp(t, `
+repo: x
+hooks:
+  on-create-before-engines:
+    - run: "composer install"
+      in_container: app
+`)
+	_, err := LoadLayered(d)
+	if err == nil {
+		t.Fatal("want error for removed in_container alias")
+	}
+}
+
 func TestActionComposeService(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - compose_service: app
@@ -224,7 +240,7 @@ hooks:
 
 func TestActionContainerAndComposeServiceMutuallyExclusive(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - container: app
@@ -238,7 +254,7 @@ hooks:
 
 func TestLegacyBackgroundFieldRejected(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - run: "yarn install"
@@ -255,7 +271,7 @@ hooks:
 
 func TestLegacyStepsKeywordRejected(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - steps:
@@ -273,7 +289,7 @@ hooks:
 
 func TestActionRejectsBareString(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
   on-create-before-engines:
     - "composer install"
@@ -292,14 +308,12 @@ func TestRealisticLaravelStyleConfig(t *testing.T) {
 	// expected shape — flat trigger-keyed hooks, patches block,
 	// databases with paratest fan-out.
 	d := writeTmp(t, `
-repo:
-  name: myapp
+repo: myapp
 worktrees:
   root: .worktrees
   copies: [.env]
   links: [vendor]
-env_scoping:
-  sources: [.env, .env.testing]
+env_sources: [.env, .env.testing]
 patches:
   - file: .env.testing
     set:
@@ -326,9 +340,6 @@ hooks:
 	cfg, err := LoadLayered(d)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if cfg.Repo == nil || cfg.Repo.Name != "myapp" {
-		t.Errorf("repo: %#v", cfg.Repo)
 	}
 	if len(cfg.Hooks.OnCreateBeforeEngines) != 3 {
 		t.Errorf("want 3 on-create-before-engines actions, got %d", len(cfg.Hooks.OnCreateBeforeEngines))

@@ -35,25 +35,18 @@ type Config struct {
 	// snapshots are cached on disk, plus retention/eviction policy.
 	Snapshots SnapshotsConfig `yaml:"snapshots,omitempty"`
 
-	// Identifies this repository in the registry. The `name` field is
-	// used in registry keys, snapshot paths, and slug templates.
-	// Defaults to the directory's basename when unset.
-	Repo *RepoBlock `yaml:"repo,omitempty"`
-
-	// Per-repo slug-template overrides. Slugs are the short
-	// identifier (typically derived from the branch name) used in
-	// database names, container labels, and on-disk paths.
-	Slug SlugRules `yaml:"slug,omitempty"`
-
 	// Worktree creation/deletion behaviour: root path, symlink mirrors,
 	// async vs sync semantics for hooks.
 	Worktrees WorktreesConfig `yaml:"worktrees,omitempty"`
 
-	// Env-file credential resolution. Controls which `.env*` files
-	// the resolver consults when looking up DB passwords and other
-	// secrets. Patching of env / yaml / json / phpunit.xml files for
-	// per-worktree scoping lives in the top-level `patches:` block.
-	EnvScoping EnvScoping `yaml:"env_scoping,omitempty"`
+	// EnvSources is the ordered list of `.env*` files the credential
+	// resolver consults when looking up DB passwords and other
+	// secrets. Later entries override earlier ones. Empty falls back
+	// to the default search order:
+	//   .env → .env.local → .env.test → .env.testing →
+	//   .env.test.local → .env.testing.local
+	// Per-worktree rewriting of these files lives in `patches:`.
+	EnvSources []string `yaml:"env_sources,omitempty"`
 
 	// Files to rewrite inside each worktree with per-worktree values
 	// (slug-substituted DB names, cache prefixes, etc.). Supports
@@ -78,9 +71,11 @@ type Config struct {
 	// control whether the CLI blocks on completion.
 	Hooks HooksConfig `yaml:"hooks,omitempty"`
 
-	// File-system + binlog watcher settings. The watcher invalidates
-	// cached snapshots when migration files or DDL events change.
-	Watcher WatcherConfig `yaml:"watcher,omitempty"`
+	// DebounceMs is the file-watcher debounce window in
+	// milliseconds. Coalesces editor save bursts into one re-prep
+	// dispatch. Default 500. (Binlog tailer settings live under
+	// `connections.mysql.binlog:` since they're MySQL-specific.)
+	DebounceMs uint64 `yaml:"debounce_ms,omitempty"`
 
 	// User-defined migration frameworks keyed by name. Use this when
 	// the built-in framework presets don't cover your tool — declare
@@ -89,22 +84,16 @@ type Config struct {
 	Frameworks map[string]CustomFramework `yaml:"frameworks,omitempty"`
 }
 
-// DaemonConfig — `daemon:` block.
+// DaemonConfig — `daemon:` block. Only `log_level` is user-tunable;
+// the socket path and event-log location are derived from
+// $XDG_RUNTIME_DIR / $XDG_STATE_HOME respectively and are not
+// configurable through YAML (one source of truth — the runtime
+// dirs the OS already manages).
 type DaemonConfig struct {
-	// Unix-socket path the daemon listens on. Defaults to
-	// `$XDG_RUNTIME_DIR/treeman.sock`. CLI clients dial the same
-	// path; override only if the runtime dir is unwritable (CI, some
-	// containers) or you want a per-project daemon.
-	Socket string `yaml:"socket,omitempty"`
-
-	// Log level for daemon stderr: `trace`, `debug`, `info` (default),
-	// `warn`, `error`. Hook output is always captured regardless.
+	// Log level for daemon stderr: `debug`, `info` (default),
+	// `warn`, `error`. Read once at startup; reload by restarting
+	// the daemon. Hook output is always captured regardless.
 	LogLevel string `yaml:"log_level,omitempty"`
-
-	// Path to the SQLite log database the daemon writes structured
-	// events to. Defaults to `$XDG_STATE_HOME/treeman/logs.db`.
-	// Inspected via `treeman logs query` / the `logs_query` MCP tool.
-	DbLogPath string `yaml:"db_log_path,omitempty"`
 }
 
 // ConnectionsConfig — `connections:` block.
@@ -222,7 +211,14 @@ type MysqlConn struct {
 	// Maximum open connections in the daemon's pool to this server.
 	// Defaults to a per-engine safe value. Raise only if the server
 	// is provisioned for it (max_connections raised, etc.).
-	PoolMax      uint32 `yaml:"pool_max,omitempty"`
+	PoolMax uint32 `yaml:"pool_max,omitempty"`
+
+	// Binlog tailer settings. Off by default. When enabled, treeman
+	// connects as a fake replica and replays DDL (and optionally
+	// DML) from this server onto cached templates so the cache stays
+	// in sync without a re-prep.
+	Binlog *BinlogConfig `yaml:"binlog,omitempty"`
+
 	ContainerRef `yaml:",inline"`
 }
 
@@ -324,25 +320,6 @@ type RetentionConfig struct {
 	GcIntervalMinutes uint32 `yaml:"gc_interval_minutes,omitempty"`
 }
 
-// RepoBlock — `repo:` block.
-type RepoBlock struct {
-	// Repository identifier. Used in registry keys, snapshot cache
-	// paths, slug templates, and database name templates. Defaults
-	// to the directory's basename when unset. Should be stable
-	// across machines so snapshots cached by one developer are
-	// reusable by another.
-	Name string `yaml:"name"`
-}
-
-// SlugRules — placeholder for future per-repo slug overrides.
-type SlugRules struct {
-	// Forced slug value, bypassing the branch-name derivation.
-	// Mostly useful in CI where the branch name might be noisy
-	// (`HEAD`, detached, PR-merge ref) and you want a deterministic
-	// slug for the run.
-	Override string `yaml:"override,omitempty"`
-}
-
 // WorktreesConfig — `worktrees:` block.
 type WorktreesConfig struct {
 	// Path (relative to the main worktree) where new worktrees are
@@ -367,28 +344,6 @@ type WorktreesConfig struct {
 	// (idempotent re-runs).
 	Copies []string `yaml:"copies,omitempty"`
 
-}
-
-// EnvScoping — `env_scoping:` block. After the patches-block
-// refactor, this carries only the credential resolver's READ list.
-// `.env*` rewriting lives in the top-level `patches:` block.
-//
-// `Sources` is the ordered list the credential resolver consults
-// when looking up DB passwords and other secrets. Later layers
-// override earlier ones (so a `.env.testing.local` override beats
-// the committed `.env.testing` baseline). When empty, the resolver
-// falls back to the default search order:
-//
-//	.env  →  .env.local  →  .env.test  →  .env.testing
-//	     →  .env.test.local  →  .env.testing.local
-type EnvScoping struct {
-	// READ list — paths the credential resolver consults in order
-	// when looking up DB passwords and other secrets. Later layers
-	// override earlier ones. When empty, the resolver falls back to
-	// the default ordered search:
-	// `.env` → `.env.local` → `.env.test` → `.env.testing` →
-	// `.env.test.local` → `.env.testing.local`.
-	Sources []string `yaml:"sources,omitempty"`
 }
 
 // Patch — one entry in the top-level `patches:` block. Each entry
@@ -569,10 +524,6 @@ func (Action) JSONSchema() *jsonschema.Schema {
 		Type:        "string",
 		Description: "Container name or ID. When set, every step is wrapped in `<engine> exec`. Mutually exclusive with `compose_service`.",
 	})
-	props.Set("in_container", &jsonschema.Schema{
-		Type:        "string",
-		Description: "Alias for `container`.",
-	})
 	props.Set("compose_service", &jsonschema.Schema{
 		Type:        "string",
 		Description: "Docker Compose service name. Wraps every step in `<engine> compose exec`. Mutually exclusive with `container`.",
@@ -585,10 +536,6 @@ func (Action) JSONSchema() *jsonschema.Schema {
 		Type:        "string",
 		Description: "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.",
 	})
-	props.Set("engine", &jsonschema.Schema{
-		Type:        "string",
-		Description: "Alias for `container_engine`.",
-	})
 	return &jsonschema.Schema{
 		Type:                 "object",
 		Properties:           props,
@@ -599,10 +546,9 @@ func (Action) JSONSchema() *jsonschema.Schema {
 }
 
 // UnmarshalYAML decodes one action map. Accepts both `run: string`
-// and `run: [string, ...]`. Also accepts the `in_container` /
-// `engine` aliases and rejects the legacy `background:` field +
-// the obsolete `steps:` keyword loudly so old configs surface a
-// clear error rather than silently mis-parse.
+// and `run: [string, ...]`. Rejects the legacy `background:`,
+// `steps:`, `in_container:`, and `engine:` keys loudly so old
+// configs surface a clear error rather than silently mis-parse.
 func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
 		return fmt.Errorf("action (line %d): want a mapping; bare strings + list shorthands have been removed — wrap each action in `{ run: ... }`", node.Line)
@@ -613,17 +559,19 @@ func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 			return fmt.Errorf("action: `background:` is no longer supported — hooks are always async (line %d)", node.Content[i].Line)
 		case "steps":
 			return fmt.Errorf("action: `steps:` is no longer supported — use `run:` with a list of strings (line %d)", node.Content[i].Line)
+		case "in_container":
+			return fmt.Errorf("action: `in_container:` alias removed — use `container:` (line %d)", node.Content[i].Line)
+		case "engine":
+			return fmt.Errorf("action: `engine:` alias removed — use `container_engine:` (line %d)", node.Content[i].Line)
 		}
 	}
 	var raw struct {
 		Run            yaml.Node `yaml:"run"`
 		Cwd            string    `yaml:"cwd"`
 		Container      string    `yaml:"container"`
-		ContainerAlt   string    `yaml:"in_container"`
 		ComposeService string    `yaml:"compose_service"`
 		ComposeProject string    `yaml:"compose_project"`
 		Engine         string    `yaml:"container_engine"`
-		EngineAlt      string    `yaml:"engine"`
 	}
 	if err := node.Decode(&raw); err != nil {
 		return err
@@ -645,21 +593,14 @@ func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 		return fmt.Errorf("action (line %d): `run:` must be a string or list of strings", node.Line)
 	}
 	a.Cwd = raw.Cwd
-	a.Container = firstNonEmpty(raw.Container, raw.ContainerAlt)
+	a.Container = raw.Container
 	a.ComposeService = raw.ComposeService
 	a.ComposeProject = raw.ComposeProject
-	a.Engine = firstNonEmpty(raw.Engine, raw.EngineAlt)
+	a.Engine = raw.Engine
 	if a.Container != "" && a.ComposeService != "" {
 		return fmt.Errorf("action (line %d): set either `container:` or `compose_service:`, not both", node.Line)
 	}
 	return nil
-}
-
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
 }
 
 // DatabaseConfig — one `databases:` entry. The `engine` discriminator
@@ -692,14 +633,14 @@ type DatabaseConfig struct {
 	// source DB up to the current schema. Required when any input
 	// glob matches migration files; optional otherwise (e.g. a DB
 	// that's purely seed-driven).
-	Migrate *MigrationMigrate `yaml:"migrate,omitempty"`
+	Migrate *Step `yaml:"migrate,omitempty"`
 
 	// Seed is the shell command that populates non-migration data
 	// (fixtures, ES mappings, Redis warm-cache keys, etc.). Runs
 	// AFTER dump-load + migrate as the final cold-build step,
 	// before treeman snapshots the populated state into the
 	// template DB.
-	Seed *SeedSpec `yaml:"seed,omitempty"`
+	Seed *Step `yaml:"seed,omitempty"`
 
 	// Inputs declare every file that determines this database's
 	// template state. Each entry:
@@ -883,63 +824,90 @@ func (f FilteredAction) Matches(label string) bool {
 	return false
 }
 
-// SeedSpec — `databases[].seed:` sub-block. Declares the shell
-// command treeman runs to populate a database's template state with
-// non-migration data (fixtures, ES index mappings, Mongo seed
-// documents, Redis warm-cache keys, etc.). Same shape as
-// `migrations.migrate` so the same runner can execute both.
-type SeedSpec struct {
-	// Run is the shell command treeman invokes via `sh -c`. Example:
-	// `node scripts/seed.js`. Required.
+// Step is one user-declared shell command executed against a target
+// database. Used by both `databases[].migrate:` and
+// `databases[].seed:` — the same shape, different lifecycle slots.
+//
+// The framework's CLI reads its target DB from its own config
+// (Laravel: `DB_DATABASE` in `.env`; Rails: `DATABASE`; Django:
+// `DJANGO_DB_NAME`; etc.). Treeman builds per-worktree template
+// databases with names like `myapp_template_feature-x` and needs to
+// redirect the command at *that* DB, not the one the committed
+// `.env` references. The `Env` map says which env-var names to
+// override; the value template `{target_db}` is substituted at
+// runtime with the resolved database name. No other placeholders
+// are supported.
+type Step struct {
+	// Run is the shell command treeman invokes via `sh -c`.
+	// Required; an empty Run aborts `prepare` with a clear error.
 	Run string `yaml:"run"`
 
 	// Env is a map of env-var names to value templates. Each entry
-	// is set on the seed subprocess. `{target_db}` is substituted
-	// with the resolved per-run database name; literal values pass
-	// through unchanged.
+	// is set on the subprocess (overriding the framework's config
+	// file). `{target_db}` is substituted with the resolved per-run
+	// database name; literal values pass through unchanged.
 	Env map[string]string `yaml:"env,omitempty"`
 }
 
-// DumpSpec — `dump:` sub-block of a DatabaseConfig.
+// DumpSpec — `dump:` sub-block of a DatabaseConfig. Accepts either
+// a bare string (`dump: storage/dumps/seed.sql.gz`) or a full
+// mapping (`dump: { path: ..., optional: true }`).
+//
+// Supported engines + formats:
+//
+//   - MySQL/MariaDB/TiDB: plain `.sql` text dumps (mysqldump output)
+//   - Postgres:            plain `.sql` text dumps (pg_dump --format=plain)
+//   - MongoDB:             `mongodump --archive` archives (binary)
+//   - Elasticsearch/OS:    `_bulk`-format NDJSON
+//
+// Compression (gzip / zstd / bzip2 / xz) is auto-detected from the
+// file's magic bytes — extension is not consulted. Same single
+// `dump:` field works for `seed.sql`, `seed.sql.gz`, `seed.sql.zst`,
+// `dump.archive.gz`, etc.
 type DumpSpec struct {
-	// Path to the dump file relative to the repo root. Format must
-	// match the engine — `.sql` for MySQL/Postgres, `.bson`/archive
-	// for Mongo. The file is hashed into the snapshot key so changes
-	// invalidate cached snapshots.
+	// Path to the dump file relative to the repo root. The file is
+	// hashed into the snapshot key so changes invalidate cached
+	// snapshots.
 	Path string `yaml:"path"`
 
 	// When true, a missing dump file is not an error — treeman will
-	// build the template from migrations alone. Use for greenfield
-	// projects that haven't created a baseline dump yet.
+	// build the template from migrations / seed alone. Use for
+	// greenfield projects that haven't created a baseline dump yet.
 	Optional bool `yaml:"optional,omitempty"`
 }
 
-// MigrationMigrate — `databases[].migrate:` sub-block. Declares the
-// shell command treeman invokes to apply migrations and the env-var
-// overrides that point the framework's CLI at the per-run template
-// database.
-//
-// The framework's migrate command reads its target DB from the
-// framework's own config (Laravel: `DB_DATABASE` in `.env`; Rails:
-// `DATABASE`; Django: `DJANGO_DB_NAME`; etc.). Treeman builds
-// per-worktree template databases with names like
-// `myapp_template_feature-x` and needs to redirect the migrate
-// command at *that* DB, not the one the committed `.env` references.
-// The `Env` map says which env-var names to override; the value
-// template `{target_db}` is substituted at runtime with the resolved
-// database name. No other placeholders are supported.
-type MigrationMigrate struct {
-	// Run is the shell command treeman invokes via `sh -c`. Example:
-	// `php artisan migrate --force`. Required; an empty Run aborts
-	// `prepare` with a clear error rather than falling back to a
-	// hardcoded default.
-	Run string `yaml:"run"`
+// JSONSchema documents the bare-string-or-mapping shape.
+func (DumpSpec) JSONSchema() *jsonschema.Schema {
+	props := orderedmap.New[string, *jsonschema.Schema]()
+	props.Set("path", &jsonschema.Schema{Type: "string", Description: "Dump file path, repo-root-relative. Required."})
+	props.Set("optional", &jsonschema.Schema{Type: "boolean", Description: "When true, missing dump is not an error."})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "Bare path string. Equivalent to `{path: <this string>}`."},
+			{
+				Type:                 "object",
+				Properties:           props,
+				Required:             []string{"path"},
+				AdditionalProperties: jsonschema.FalseSchema,
+				Description:          "Full dump mapping with optional `optional` flag.",
+			},
+		},
+		Description: "Source dump file. Bare string OR `{path, optional}` mapping.",
+	}
+}
 
-	// Env is a map of env-var names to value templates. Each entry
-	// is set on the migrate subprocess (overriding the framework's
-	// config file). `{target_db}` is substituted with the resolved
-	// per-run database name; literal values pass through unchanged.
-	Env map[string]string `yaml:"env,omitempty"`
+// UnmarshalYAML accepts either a bare path string or a mapping.
+func (d *DumpSpec) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		d.Path = node.Value
+		return nil
+	case yaml.MappingNode:
+		type alias DumpSpec
+		return node.Decode((*alias)(d))
+	default:
+		return fmt.Errorf("dump (line %d): want a string or mapping", node.Line)
+	}
 }
 
 // TestClonesSpec — `test_clones:` sub-block. Used by every parallel
@@ -1007,43 +975,15 @@ func (c *ClonesSetting) UnmarshalYAML(node *yaml.Node) error {
 
 // Namespaces — engine-specific namespacing.
 type Namespaces struct {
-	// Redis: legacy per-worktree DB index. Template must render to
-	// an integer in 0-15. No template caching and no test_clones
-	// fanout in this mode — kept for backward compat. Prefer
-	// `prefix_template` for new configs.
-	DbIndexTemplate string `yaml:"db_index_template,omitempty"`
-
-	// Elasticsearch / OpenSearch: template producing the index-
-	// name prefix. All indexes the app creates are scoped under
-	// this prefix per worktree. Example: `app_{slug}_`.
-	IndexPrefixTemplate string `yaml:"index_prefix_template,omitempty"`
-
-	// Redis (preferred) and other prefix-isolated engines: template
-	// producing the key prefix every worktree key lives under. One
-	// Redis logical DB (0) holds every worktree's data, isolated
-	// by prefix — lifts the 16-DB cap, works on cluster mode, and
-	// enables full template caching + parallel fanout. The app must
-	// honour the prefix (Laravel's `CACHE_PREFIX`, Rails
-	// `Rails.cache.options[:namespace]`, ioredis `keyPrefix`).
-	// Example: `{slug}:` produces `feature-x:` and the app reads
-	// keys as `feature-x:cache:foo`.
-	PrefixTemplate string `yaml:"prefix_template,omitempty"`
-}
-
-// WatcherConfig — `watcher:` block. The set of watched paths is
-// derived from each database's `inputs:` list; this block carries
-// only global tuning knobs (debounce, binlog).
-type WatcherConfig struct {
-	// Debounce window in milliseconds. The watcher coalesces events
-	// arriving within this window before invalidating snapshots,
-	// which prevents thrashing when an editor saves many files at
-	// once. Default 500.
-	DebounceMs uint64 `yaml:"debounce_ms,omitempty"`
-
-	// MySQL binary-log tailer settings. Disabled by default; enable
-	// to replay DDL events from the source database onto cached
-	// templates and test clones automatically.
-	Binlog BinlogConfig `yaml:"binlog,omitempty"`
+	// KeyPrefixTemplate scopes every key/index a worktree creates
+	// under a per-worktree prefix. Used by both Redis (key prefix
+	// in DB 0) and Elasticsearch / OpenSearch (index-name prefix).
+	// Example: `{slug}:` produces `feature-x:`. The app must
+	// honour the prefix — Laravel's `CACHE_PREFIX`, Rails
+	// `Rails.cache.options[:namespace]`, ioredis `keyPrefix`, etc.
+	// for Redis; the ES client prefixes index names automatically
+	// in most frameworks.
+	KeyPrefixTemplate string `yaml:"key_prefix_template,omitempty"`
 }
 
 // BinlogConfig — `watcher.binlog:` block. Controls the MySQL
@@ -1108,11 +1048,6 @@ type CustomFramework struct {
 	// emitted Input.
 	HashMode string `yaml:"hash_mode,omitempty" jsonschema:"enum=filename,enum=checksum"`
 
-	// Change-handling policy. Retained for compatibility with the
-	// old `treeman fw detect` table output; the runtime no longer
-	// reads it (all watches are best-effort cache-hit-or-rebuild).
-	OnModify string `yaml:"on_modify,omitempty" jsonschema:"enum=rebuild,enum=delta"`
-
 	// Lockfiles whose contents are folded into the snapshot hash
 	// (e.g. `requirements.txt`, `pyproject.toml`, `composer.lock`).
 	// Emitted as `inputs[]` entries with label `lockfile`.
@@ -1122,6 +1057,21 @@ type CustomFramework struct {
 	// targets — `mysql`, `postgres`, etc. Pre-fills the engine field
 	// in `treeman init` when this framework is detected.
 	EngineHint string `yaml:"engine_hint,omitempty"`
+}
+
+// LoadGlobal returns the user-global config alone (no repo or
+// repo-local overlay). Used by the daemon at startup to read fields
+// that need to be live before any repo is known — currently just
+// daemon.log_level. Missing global file → defaults-only Config.
+func LoadGlobal() (Config, error) {
+	var cfg Config
+	applyDefaults(&cfg)
+	if g, ok := globalConfigPath(); ok {
+		if err := mergeYAMLFile(&cfg, g); err != nil {
+			return cfg, err
+		}
+	}
+	return cfg, nil
 }
 
 // LoadLayered reads global + repo + repo-local YAML files into a
@@ -1225,31 +1175,34 @@ func applyDefaults(cfg *Config) {
 	if cfg.Snapshots.Retention.GcIntervalMinutes == 0 {
 		cfg.Snapshots.Retention.GcIntervalMinutes = 60
 	}
-	if cfg.Watcher.DebounceMs == 0 {
-		cfg.Watcher.DebounceMs = 500
+	if cfg.DebounceMs == 0 {
+		cfg.DebounceMs = 500
 	}
-	if cfg.Watcher.Binlog.Flavor == "" {
-		cfg.Watcher.Binlog.Flavor = "mysql"
-	}
-	if cfg.Watcher.Binlog.ApplyDDL == nil {
-		t := true
-		cfg.Watcher.Binlog.ApplyDDL = &t
-	}
-	if cfg.Watcher.Binlog.ApplyDML == nil {
-		f := false
-		cfg.Watcher.Binlog.ApplyDML = &f
-	}
-	if cfg.Watcher.Binlog.ServerID == 0 {
-		// Stable per host: hash the daemon's effective socket path
-		// (XDG_RUNTIME_DIR is per-user, so two users on one host get
-		// distinct IDs). Values are kept in the 1k–1M range to leave
-		// room for explicitly-numbered production replicas.
-		var h uint32 = 2166136261
-		for _, b := range []byte(os.Getenv("XDG_RUNTIME_DIR") + os.Getenv("USER")) {
-			h ^= uint32(b)
-			h *= 16777619
+	if cfg.Connections.Mysql != nil && cfg.Connections.Mysql.Binlog != nil {
+		bl := cfg.Connections.Mysql.Binlog
+		if bl.Flavor == "" {
+			bl.Flavor = "mysql"
 		}
-		cfg.Watcher.Binlog.ServerID = 1000 + (h % 999000)
+		if bl.ApplyDDL == nil {
+			t := true
+			bl.ApplyDDL = &t
+		}
+		if bl.ApplyDML == nil {
+			f := false
+			bl.ApplyDML = &f
+		}
+		if bl.ServerID == 0 {
+			// Stable per host: hash the daemon's effective socket path
+			// (XDG_RUNTIME_DIR is per-user, so two users on one host get
+			// distinct IDs). Values are kept in the 1k–1M range to leave
+			// room for explicitly-numbered production replicas.
+			var h uint32 = 2166136261
+			for _, b := range []byte(os.Getenv("XDG_RUNTIME_DIR") + os.Getenv("USER")) {
+				h ^= uint32(b)
+				h *= 16777619
+			}
+			bl.ServerID = 1000 + (h % 999000)
+		}
 	}
 }
 

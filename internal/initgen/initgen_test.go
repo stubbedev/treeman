@@ -11,16 +11,14 @@ import (
 	"github.com/stubbedev/treeman/internal/schema"
 )
 
-func TestRenderTemplateContainsModelineAndRepoName(t *testing.T) {
+func TestRenderTemplateContainsModeline(t *testing.T) {
 	dir := t.TempDir()
-	os.Rename(dir, dir) // no-op — just exercising the path
 	body := RenderTemplate(dir)
 	if !strings.Contains(body, "$schema="+schema.URL) {
 		t.Errorf("missing schema modeline:\n%s", body)
 	}
-	want := "name: " + filepath.Base(dir)
-	if !strings.Contains(body, want) {
-		t.Errorf("missing %q:\n%s", want, body)
+	if !strings.Contains(body, "worktrees:") {
+		t.Errorf("missing worktrees block:\n%s", body)
 	}
 }
 

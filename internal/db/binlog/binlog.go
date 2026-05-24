@@ -46,6 +46,7 @@ import (
 // pool through the driver.
 type Replicator struct {
 	cfg      *config.Config
+	mc       *config.MysqlConn
 	st       *store.Store
 	repoID   int64
 	sourceDB string
@@ -69,10 +70,10 @@ func New(cfg *config.Config, st *store.Store, repoID int64, sourceDB string) (*R
 	if cfg.Connections.Mysql == nil {
 		return nil, errors.New("connections.mysql not configured")
 	}
-	if !cfg.Watcher.Binlog.Enabled {
-		return nil, errors.New("watcher.binlog.enabled = false")
-	}
 	mc := cfg.Connections.Mysql
+	if mc.Binlog == nil || !mc.Binlog.Enabled {
+		return nil, errors.New("connections.mysql.binlog.enabled = false")
+	}
 	user := mc.User
 	host := mc.Host
 	port := uint16(mc.Port)
@@ -102,8 +103,8 @@ func New(cfg *config.Config, st *store.Store, repoID int64, sourceDB string) (*R
 		}
 	}
 	cfgSyncer := replication.BinlogSyncerConfig{
-		ServerID: cfg.Watcher.Binlog.ServerID,
-		Flavor:   cfg.Watcher.Binlog.Flavor,
+		ServerID: mc.Binlog.ServerID,
+		Flavor:   mc.Binlog.Flavor,
 		Host:     host,
 		Port:     port,
 		User:     user,
@@ -120,6 +121,7 @@ func New(cfg *config.Config, st *store.Store, repoID int64, sourceDB string) (*R
 	}
 	r := &Replicator{
 		cfg:       cfg,
+		mc:        mc,
 		st:        st,
 		repoID:    repoID,
 		sourceDB:  sourceDB,
@@ -138,7 +140,7 @@ func (r *Replicator) Start(ctx context.Context) error {
 	}
 	var streamer *replication.BinlogStreamer
 	if cp != nil && cp.GtidSet != "" {
-		gset, err := gomysql.ParseGTIDSet(r.cfg.Watcher.Binlog.Flavor, cp.GtidSet)
+		gset, err := gomysql.ParseGTIDSet(r.mc.Binlog.Flavor, cp.GtidSet)
 		if err != nil {
 			return fmt.Errorf("parse gtid set %q: %w", cp.GtidSet, err)
 		}
@@ -159,7 +161,7 @@ func (r *Replicator) Start(ctx context.Context) error {
 
 	slog.Info("binlog replicator started",
 		"repo_id", r.repoID, "source_db", r.sourceDB,
-		"server_id", r.cfg.Watcher.Binlog.ServerID)
+		"server_id", r.mc.Binlog.ServerID)
 
 	for {
 		ev, err := streamer.GetEvent(ctx)
@@ -189,13 +191,13 @@ func (r *Replicator) dispatch(ctx context.Context, ev *replication.BinlogEvent) 
 		if schema != "" && schema != r.sourceDB {
 			return nil
 		}
-		if !*r.cfg.Watcher.Binlog.ApplyDDL {
+		if !*r.mc.Binlog.ApplyDDL {
 			return nil
 		}
 		return r.applyDDL(ctx, string(e.Query))
 
 	case *replication.RowsEvent:
-		if !*r.cfg.Watcher.Binlog.ApplyDML {
+		if !*r.mc.Binlog.ApplyDML {
 			return nil
 		}
 		if string(e.Table.Schema) != r.sourceDB {
@@ -209,7 +211,7 @@ func (r *Replicator) dispatch(ctx context.Context, ev *replication.BinlogEvent) 
 		return r.st.SaveBinlogCheckpoint(ctx, store.BinlogCheckpoint{
 			RepoID:     r.repoID,
 			SourceDB:   r.sourceDB,
-			Flavor:     r.cfg.Watcher.Binlog.Flavor,
+			Flavor:     r.mc.Binlog.Flavor,
 			BinlogFile: string(e.NextLogName),
 			BinlogPos:  uint32(e.Position),
 			UpdatedAt:  int64(ev.Header.Timestamp) * 1000,
@@ -224,7 +226,7 @@ func (r *Replicator) dispatch(ctx context.Context, ev *replication.BinlogEvent) 
 			return r.st.SaveBinlogCheckpoint(ctx, store.BinlogCheckpoint{
 				RepoID:    r.repoID,
 				SourceDB:  r.sourceDB,
-				Flavor:    r.cfg.Watcher.Binlog.Flavor,
+				Flavor:    r.mc.Binlog.Flavor,
 				GtidSet:   u.String(),
 				UpdatedAt: int64(ev.Header.Timestamp) * 1000,
 			})

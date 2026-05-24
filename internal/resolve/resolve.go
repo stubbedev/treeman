@@ -71,11 +71,11 @@ type resolvedConn[T any] struct {
 }
 
 // Resolve walks the layers and returns every connection that has a
-// non-empty value. When `cfg.EnvScoping.Sources` is set, those
-// paths are read in order (last wins); otherwise the default
-// search order is used.
+// non-empty value. When `cfg.EnvSources` is set, those paths are
+// read in order (last wins); otherwise the default search order is
+// used.
 func Resolve(cfg *config.Config, repoRoot string) Resolved {
-	env := loadRepoEnv(repoRoot, cfg.EnvScoping.Sources)
+	env := loadRepoEnv(repoRoot, cfg.EnvSources)
 	return Resolved{
 		Mysql:         resolveMysql(cfg, env),
 		Postgres:      resolvePostgres(cfg, env),

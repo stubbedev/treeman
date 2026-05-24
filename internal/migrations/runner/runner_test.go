@@ -12,12 +12,12 @@ import (
 // TestRunErrorsWhenRunEmpty asserts that we fail loud instead of
 // silently falling back to a hardcoded migrate command.
 func TestRunErrorsWhenRunEmpty(t *testing.T) {
-	_, err := Run(context.Background(), FromMigrate(config.MigrationMigrate{}), t.TempDir(), "anydb", nil)
+	_, err := Run(context.Background(), FromMigrate(config.Step{}), t.TempDir(), "anydb", nil)
 	if err == nil {
 		t.Fatal("expected error for empty migrate.run, got nil")
 	}
-	if !strings.Contains(err.Error(), "migrations.migrate.run") {
-		t.Errorf("error should mention migrations.migrate.run, got: %v", err)
+	if !strings.Contains(err.Error(), "migrate.run") {
+		t.Errorf("error should mention migrate.run, got: %v", err)
 	}
 }
 
@@ -26,7 +26,7 @@ func TestRunErrorsWhenRunEmpty(t *testing.T) {
 // "migrations.migrate.run" error — the label routes the diagnostic
 // to whichever YAML block actually broke.
 func TestRunErrorMentionsSeedLabelWhenSeed(t *testing.T) {
-	_, err := Run(context.Background(), FromSeed(config.SeedSpec{}), t.TempDir(), "anydb", nil)
+	_, err := Run(context.Background(), FromSeed(config.Step{}), t.TempDir(), "anydb", nil)
 	if err == nil {
 		t.Fatal("expected error for empty seed.run, got nil")
 	}
@@ -41,7 +41,7 @@ func TestRunErrorMentionsSeedLabelWhenSeed(t *testing.T) {
 func TestRunSubstitutesTargetDB(t *testing.T) {
 	dir := t.TempDir()
 	out, err := Run(context.Background(),
-		FromMigrate(config.MigrationMigrate{
+		FromMigrate(config.Step{
 			Run: `echo "DB_DATABASE=$DB_DATABASE"; echo "DB_TEST_DATABASE=$DB_TEST_DATABASE"; echo "PLAIN=$PLAIN"; echo "TREEMAN_TARGET_DB=$TREEMAN_TARGET_DB"`,
 			Env: map[string]string{
 				"DB_DATABASE":      "{target_db}",
@@ -77,7 +77,7 @@ func TestRunSubstitutesTargetDB(t *testing.T) {
 func TestRunInheritsCwd(t *testing.T) {
 	dir := t.TempDir()
 	out, err := Run(context.Background(),
-		FromMigrate(config.MigrationMigrate{Run: "pwd"}),
+		FromMigrate(config.Step{Run: "pwd"}),
 		dir,
 		"anydb",
 		nil,

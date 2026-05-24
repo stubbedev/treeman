@@ -31,11 +31,11 @@ func TestDispatchesOnMatchingGlob(t *testing.T) {
 		return nil
 	}
 
-	cfg := config.WatcherConfig{DebounceMs: 100}
+	const debounceMs uint64 = 100
 	paths := []config.WatcherPath{
 		{Glob: "database/migrations/**"},
 	}
-	w, err := New(repoRoot, paths, cfg, dispatch)
+	w, err := New(repoRoot, paths, debounceMs, dispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,9 +84,9 @@ func TestIgnoresUnmatchedPaths(t *testing.T) {
 
 	var fired bool
 	dispatch := func(_ context.Context, _ Event) error { fired = true; return nil }
-	cfg := config.WatcherConfig{DebounceMs: 100}
+	const debounceMs uint64 = 100
 	paths := []config.WatcherPath{{Glob: "database/migrations/**"}}
-	w, err := New(repoRoot, paths, cfg, dispatch)
+	w, err := New(repoRoot, paths, debounceMs, dispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
