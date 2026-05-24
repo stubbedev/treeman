@@ -60,6 +60,10 @@ so you don't need `-p 1`.
 | `mongo_dump/` | Real `mongodump --archive` (uncompressed + gzip) → treeman's `mongorestore` path with `dump.source_db` rename |
 | `binlog/` | MySQL binlog tailer connects as fake replica → DDL on source replays onto cached template |
 | `misc/` | Reachability probe failure produces a clean, engine-tagged error |
+| `poolmax/` | `connections.mysql.pool_max: 2` actually caps concurrent connections under 8-goroutine load |
+| `ctrrestart/` | Container recreate → treeman reconnects cleanly (exercises cache-eviction path) |
+| `sighup/` | Daemon receives SIGHUP → reloads config → watchers respawn against new globs |
+| `mcp/` | `treeman mcp` stdio JSON-RPC: initialize handshake + tools/list returns registered tools |
 
 ### Framework suites — every detected framework through real migrate CLI
 

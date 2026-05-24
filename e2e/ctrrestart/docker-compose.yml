@@ -1,0 +1,14 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: treeman-e2e-ctrrestart-mysql
+    environment: { MYSQL_ROOT_PASSWORD: rootpw }
+    # No published port → treeman must use the container's bridge IP.
+    # Restarting the container reassigns the bridge IP (usually), so
+    # we exercise the cache eviction path.
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
