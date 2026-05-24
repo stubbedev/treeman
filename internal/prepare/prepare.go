@@ -872,7 +872,7 @@ func prepareMongo(
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
-		if err := dbmongo.Restore(ctx, cfg.Connections.Mongodb.URI, sourceDB, dp); err != nil {
+		if err := dbmongo.Restore(ctx, cfg.Connections.Mongodb.URI, sourceDB, d.Dump.SourceDB, dp); err != nil {
 			return Outcome{}, fmt.Errorf("mongo restore %s: %w", dp, err)
 		}
 	}

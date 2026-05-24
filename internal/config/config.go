@@ -874,6 +874,14 @@ type DumpSpec struct {
 	// build the template from migrations / seed alone. Use for
 	// greenfield projects that haven't created a baseline dump yet.
 	Optional bool `yaml:"optional,omitempty"`
+
+	// SourceDB names the database the archive was originally dumped
+	// from (e.g. `production` if you ran `mongodump --db=production`).
+	// MongoDB only — treeman remaps that DB's collections into the
+	// per-worktree target DB via mongorestore's --nsFrom/--nsTo.
+	// Leave empty to skip the rename (the archive must already use
+	// the target DB name). Ignored by MySQL/Postgres/ES drivers.
+	SourceDB string `yaml:"source_db,omitempty"`
 }
 
 // JSONSchema documents the bare-string-or-mapping shape.

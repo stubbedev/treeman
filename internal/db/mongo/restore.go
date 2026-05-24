@@ -19,13 +19,18 @@ import (
 //   - zstd/bzip2/xz: decompressed in-process and piped to
 //     mongorestore via stdin (`--archive` with no `=path`).
 //
-// Every collection from the archive is restored into targetDB
-// regardless of its original DB name (via `--nsFrom='*.*'` +
-// `--nsTo='<targetDB>.*'`). Multi-DB archives are flattened.
+// `sourceDB` names the DB the archive was made from (e.g. the
+// production DB the engineer ran `mongodump --db=` against).
+// Treeman remaps it to `targetDB` via mongorestore's `--nsFrom`/
+// `--nsTo` flags. mongorestore requires the asterisk count to
+// match between from/to, so we use `<source>.*` → `<target>.*`
+// (one star — collection names pass through). Pass sourceDB=""
+// to restore without renaming (archive must already use the
+// target name).
 //
 // Requires mongorestore on PATH. Returns a clear error if the
 // binary isn't installed.
-func Restore(ctx context.Context, uri, targetDB, dumpPath string) error {
+func Restore(ctx context.Context, uri, targetDB, sourceDB, dumpPath string) error {
 	if _, err := exec.LookPath("mongorestore"); err != nil {
 		return fmt.Errorf("mongorestore not found on PATH: %w", err)
 	}
@@ -37,10 +42,14 @@ func Restore(ctx context.Context, uri, targetDB, dumpPath string) error {
 
 	args := []string{
 		"--uri=" + uri,
-		"--nsFrom=*.*",
-		"--nsTo=" + targetDB + ".*",
 		"--drop",
 		"--quiet",
+	}
+	if sourceDB != "" && sourceDB != targetDB {
+		args = append(args,
+			"--nsFrom="+sourceDB+".*",
+			"--nsTo="+targetDB+".*",
+		)
 	}
 
 	var cmd *exec.Cmd

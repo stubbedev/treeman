@@ -48,10 +48,18 @@ so you don't need `-p 1`.
 | `deltawatch/` | Input edit → `FinalizeWorktreeForWatch` → new fingerprint persisted (MySQL) |
 | `lifecycle/` | `on-create-before-engines` → engine prepare → `on-create-after-engines` order; delete pair |
 | `headwatcher/` | `git checkout` between branches fires HEAD watcher with new ref |
+| `oncheckout/` | HEAD watcher fire → configured `on-checkout` action runs |
 | `onfilechange/` | Full daemon-managed watcher → `on-file-change` action with all env vars |
 | `fanout/` | `test_clones: 4` produces 4 populated clones; cache-hit on rerun |
 | `switchback/` | Worktree A → B → A → B cycle; revisits are cache hits, both fingerprints survive |
 | `teardown/` | `TeardownWorktree` drops source + clones, **preserves** the cached template |
+| `retention/` | `CapPerRepo: 3` inline LRU eviction — building 5 snapshots evicts the 2 oldest, keeps 3 newest |
+| `patches/` | All 6 patch drivers (dotenv / phpunit / yaml / json / toml / ini) rewrite + preserve unrelated keys |
+| `cli/` | Full `treeman` CLI binary → `treemand` socket RPC → real `git worktree add` → Links + Copies + Patches + engine prepare + `wt delete` end-to-end |
+| `extras/` | `Dump.Optional` skip, required-dump clean error, `Fanout` cap, `Action.Container` exec wrap inside container, `on-file-change match: [list]` filter |
+| `mongo_dump/` | Real `mongodump --archive` (uncompressed + gzip) → treeman's `mongorestore` path with `dump.source_db` rename |
+| `binlog/` | MySQL binlog tailer connects as fake replica → DDL on source replays onto cached template |
+| `misc/` | Reachability probe failure produces a clean, engine-tagged error |
 
 ### Framework suites — every detected framework through real migrate CLI
 
