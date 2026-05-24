@@ -13,7 +13,7 @@ import (
 )
 
 // EvictExcess drops every cached template DB above
-// `cfg.Snapshots.Retention.CapPerRepo` for the given repo, ordered
+// `cfg.Snapshots.CapPerRepo` for the given repo, ordered
 // by LRU (oldest `last_used_at` first). Called as a fire-and-forget
 // goroutine after every `RecordSnapshot` so the inline cost is just
 // a goroutine spawn — the engine-side DROP DATABASE runs in the
@@ -29,7 +29,7 @@ import (
 // running — the SQLite UPSERT on `RecordSnapshot` is idempotent and
 // `DROP DATABASE IF EXISTS` is engine-side idempotent.
 func EvictExcess(ctx context.Context, cfg *config.Config, st *store.Store, repoID int64) {
-	cap := cfg.Snapshots.Retention.CapPerRepo
+	cap := cfg.Snapshots.CapPerRepo
 	candidates, err := st.ListLRUEvictable(ctx, repoID, cap)
 	if err != nil {
 		slog.Warn("snapshot eviction lookup", "repo_id", repoID, "err", err)
@@ -128,12 +128,12 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 }
 
 // SweepByAge drops every cached template whose `last_used_at` is
-// older than `cfg.Snapshots.Retention.MaxAgeDays` days. Runs as
+// older than `cfg.Snapshots.MaxAgeDays` days. Runs as
 // part of the daemon's periodic GC tick. Cheap on small tables;
 // keep an eye on it if the snapshots table grows past a few thousand
 // rows.
 func SweepByAge(ctx context.Context, cfg *config.Config, st *store.Store) {
-	days := cfg.Snapshots.Retention.MaxAgeDays
+	days := cfg.Snapshots.MaxAgeDays
 	if days == 0 {
 		return
 	}
@@ -160,12 +160,12 @@ func SweepByAge(ctx context.Context, cfg *config.Config, st *store.Store) {
 }
 
 // SweepBySize evicts the largest cached templates until total
-// `size_bytes` falls below `cfg.Snapshots.Retention.MaxTotalGb`.
+// `size_bytes` falls below `cfg.Snapshots.MaxTotalGb`.
 // Snapshots with size_bytes = NULL (never recorded) are evicted
 // last — they're treated as size 0 by the ORDER BY in the store
 // query.
 func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
-	gb := cfg.Snapshots.Retention.MaxTotalGb
+	gb := cfg.Snapshots.MaxTotalGb
 	if gb == 0 {
 		return
 	}

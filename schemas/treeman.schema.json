@@ -47,37 +47,6 @@
       ],
       "description": "One action: a `run` (string or list of strings) plus optional cwd + container wrapping."
     },
-    "BinlogConfig": {
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Master switch. When false (default) the tailer is dormant —\nno replication connection is opened, no DDL is replayed."
-        },
-        "server_id": {
-          "type": "integer",
-          "description": "ServerID treeman registers as a fake replica. Must be unique\namong all replicas the upstream server sees. Defaults to a\ndeterministic hash of the daemon's socket path so two\ndevelopers on the same host don't clash."
-        },
-        "flavor": {
-          "type": "string",
-          "enum": [
-            "mysql",
-            "mariadb"
-          ],
-          "description": "Flavor — \"mysql\" (default) or \"mariadb\"."
-        },
-        "apply_ddl": {
-          "type": "boolean",
-          "description": "ApplyDDL toggles execution of DDL Query events. Default true."
-        },
-        "apply_dml": {
-          "type": "boolean",
-          "description": "ApplyDML toggles execution of ROW events. Default false (DDL\nreplay is the high-value path; DML is a follow-up)."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "BinlogConfig — `watcher.binlog:` block. Controls the MySQL\nbinary-log tailer that replays DDL + DML events from the source\ndatabase onto cached template + paratest clone databases. Off by\ndefault; enabling requires a server configured with\n`binlog_format=ROW` and a replication-privileged user."
-    },
     "ClonesSetting": {
       "oneOf": [
         {
@@ -226,9 +195,9 @@
           "$ref": "#/$defs/TestClonesSpec",
           "description": "Test-clone fanout: how many parallel database clones to\npre-warm for paratest/pytest-xdist/Jest workers/etc."
         },
-        "namespaces": {
-          "$ref": "#/$defs/Namespaces",
-          "description": "Engine-specific namespacing templates (Redis db index,\nElasticsearch index prefix). Use when the engine doesn't\nscope by database name."
+        "key_prefix": {
+          "type": "string",
+          "description": "KeyPrefix scopes every key/index a worktree creates under a\nper-worktree prefix. Used by engines that don't scope by\ndatabase name — Redis (key prefix in DB 0) and Elasticsearch\n/ OpenSearch (index-name prefix). Example: `{slug}:` →\n`feature-x:`. The app must honour the prefix — Laravel's\n`CACHE_PREFIX`, Rails `Rails.cache.options[:namespace]`,\nioredis `keyPrefix`, etc."
         },
         "fanout": {
           "type": "integer",
@@ -272,38 +241,40 @@
       "description": "Source dump file. Bare string OR `{path, optional}` mapping."
     },
     "EsConn": {
-      "properties": {
-        "url": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "Elasticsearch / OpenSearch HTTP URL\n(`http://host:9200` or `https://...`). Required.\nContainerRef rewrites host/port at dial time."
+          "description": "Bare URL/URI. Equivalent to `{url: \u003cthis string\u003e}`."
         },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
+        {
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "url"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "url"
       ],
-      "description": "EsConn — Elasticsearch / OpenSearch HTTP URL. Same ContainerRef\nsemantics as MongoConn."
+      "description": "elasticsearch connection — bare URL string OR structured object."
     },
     "FilteredAction": {
       "properties": {
@@ -452,103 +423,119 @@
       "description": "One source of file state for the template fingerprint. Bare string OR full mapping."
     },
     "MongoConn": {
-      "properties": {
-        "uri": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "MongoDB connection URI (`mongodb://[user:pass@]host:port/[...]`).\nRequired. When a ContainerRef is set, host/port are rewritten\nat dial time using the container's published mapping or IP."
+          "description": "Bare URL/URI. Equivalent to `{uri: \u003cthis string\u003e}`."
         },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
+        {
+          "properties": {
+            "uri": {
+              "type": "string"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "uri"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "uri"
       ],
-      "description": "MongoConn — `mongodb://…` URI. When a ContainerRef is set, the\nURI's host/port are rewritten at dial time."
+      "description": "mongodb connection — bare URL string OR structured object."
     },
     "MysqlConn": {
-      "properties": {
-        "host": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "Hostname or IP the daemon dials. Defaults to `127.0.0.1`.\nIgnored when `container` or `compose_service` is set and the\nengine socket is reachable — the container's published port or\nnetwork IP is used instead."
+          "description": "DSN: `mysql://user:pass@host:port/dbname`. Equivalent to the structured form below."
         },
-        "port": {
-          "type": "integer",
-          "description": "TCP port. Defaults to 3306. Same container-rewriting rules as\n`host`."
-        },
-        "user": {
-          "type": "string",
-          "description": "Database user. Required. Should have privileges to\nCREATE/DROP databases (for clones) and SHOW BINARY LOGS +\nREPLICATION SLAVE (when the binlog watcher is enabled)."
-        },
-        "password_env": {
-          "type": "string",
-          "description": "Environment variable name holding the password. The daemon\nreads it from the process env, the repo's `.env*` files, or\n(last resort) the container's own env vars when a ContainerRef\nis set."
-        },
-        "pool_max": {
-          "type": "integer",
-          "description": "Maximum open connections in the daemon's pool to this server.\nDefaults to a per-engine safe value. Raise only if the server\nis provisioned for it (max_connections raised, etc.)."
-        },
-        "binlog": {
-          "$ref": "#/$defs/BinlogConfig",
-          "description": "Binlog tailer settings. Off by default. When enabled, treeman\nconnects as a fake replica and replays DDL (and optionally\nDML) from this server onto cached templates so the cache stays\nin sync without a re-prep."
-        },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$defs": {
+            "BinlogConfig": {
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "server_id": {
+                  "type": "integer"
+                },
+                "flavor": {
+                  "type": "string",
+                  "enum": [
+                    "mysql",
+                    "mariadb"
+                  ]
+                },
+                "apply_ddl": {
+                  "type": "boolean"
+                },
+                "apply_dml": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false,
+              "type": "object"
+            }
+          },
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "user": {
+              "type": "string"
+            },
+            "password_env": {
+              "type": "string"
+            },
+            "pool_max": {
+              "type": "integer"
+            },
+            "binlog": {
+              "$ref": "#/$defs/BinlogConfig"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "user"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "user"
       ],
-      "description": "MysqlConn — host/port/user. `Password` is runtime-only; never\nserialised. The resolver fills it from the repo's `.env*` files\n+ process env (and finally the container's own env when a\nContainerRef is set)."
-    },
-    "Namespaces": {
-      "properties": {
-        "key_prefix_template": {
-          "type": "string",
-          "description": "KeyPrefixTemplate scopes every key/index a worktree creates\nunder a per-worktree prefix. Used by both Redis (key prefix\nin DB 0) and Elasticsearch / OpenSearch (index-name prefix).\nExample: `{slug}:` produces `feature-x:`. The app must\nhonour the prefix — Laravel's `CACHE_PREFIX`, Rails\n`Rails.cache.options[:namespace]`, ioredis `keyPrefix`, etc.\nfor Redis; the ES client prefixes index names automatically\nin most frameworks."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "Namespaces — engine-specific namespacing."
+      "description": "MySQL connection — bare DSN string OR structured object."
     },
     "Patch": {
       "properties": {
@@ -588,90 +575,91 @@
       "description": "Patch — one entry in the top-level `patches:` block. Each entry\ntargets one file under the worktree root and rewrites it with\nper-worktree values via the `set:` map. Values are template\nstrings that accept `{slug}`, `{slug_dash}`, `{slug_upper}`,\n`{slug_redis_queue}`, `{slug_redis_cache}`, `{repo}`, `{branch}`.\n\nThe driver is picked from `format:` when set, otherwise auto-\ndetected from the file extension:\n\n\tdotenv  — `.env`, `.env.*`\n\tphpunit — `.xml`, `.xml.dist` (phpunit.xml `\u003cenv\u003e` blocks)\n\tyaml    — `.yaml`, `.yml`\n\tjson    — `.json`\n\ttoml    — `.toml`\n\tini     — `.ini`, `.cfg`\n\nPath syntax inside `set:` is uniform across drivers:\n\n\tdotenv / phpunit  — flat key (e.g. `DB_DATABASE`)\n\tini               — `section.key` (top-level keys allowed too)\n\tyaml / json / toml — dotted path, optionally with `[N]` indices\n\t                    (e.g. `services[0].host`)\n\nWhen `skip_worktree` is true (default), treeman calls\n`git update-index --skip-worktree` on the patched file so the\nrewrite doesn't show up as a dirty file. The file must be tracked\nby git for the skip-worktree call to do anything; gitignored\nfiles are patched in-place without any git interaction."
     },
     "PostgresConn": {
-      "properties": {
-        "host": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "Hostname or IP. Defaults to `127.0.0.1`. ContainerRef overrides\nit at dial time when set."
+          "description": "DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below."
         },
-        "port": {
-          "type": "integer",
-          "description": "TCP port. Defaults to 5432."
-        },
-        "user": {
-          "type": "string",
-          "description": "Database role. Required. Needs CREATEDB to clone, and\nREPLICATION when wire-protocol replay is enabled."
-        },
-        "password_env": {
-          "type": "string",
-          "description": "Env var name holding the password. Same resolution order as\nMysqlConn.PasswordEnv."
-        },
-        "pool_max": {
-          "type": "integer",
-          "description": "Maximum open connections in the daemon's pool."
-        },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "user": {
+              "type": "string"
+            },
+            "password_env": {
+              "type": "string"
+            },
+            "pool_max": {
+              "type": "integer"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "user"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "user"
       ],
-      "description": "PostgresConn — same shape as MysqlConn."
+      "description": "Postgres connection — bare DSN string OR structured object."
     },
     "RedisConn": {
-      "properties": {
-        "url": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "Redis connection URL (`redis://[:pass@]host:port[/db]`).\nRequired. ContainerRef rewrites host/port at dial time."
+          "description": "Bare URL/URI. Equivalent to `{url: \u003cthis string\u003e}`."
         },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
+        {
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "url"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "url"
       ],
-      "description": "RedisConn — `redis://…` URL. Same ContainerRef semantics as MongoConn."
+      "description": "redis connection — bare URL string OR structured object."
     },
-    "RetentionConfig": {
+    "SnapshotsConfig": {
       "properties": {
         "cap_per_repo": {
           "type": "integer",
@@ -696,18 +684,7 @@
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "RetentionConfig — `snapshots.retention:` policies.\n\n`CapPerRepo` is the hard cap that triggers eviction on every\n`RecordSnapshot`. LRU rows above the cap are dropped immediately\n(in a background goroutine) so a busy worktree workflow never\naccumulates unbounded cached templates per repo.\n\n`KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`\ndrive the periodic daemon-side sweep; they're not consulted by\nthe inline-on-write eviction path."
-    },
-    "SnapshotsConfig": {
-      "properties": {
-        "retention": {
-          "$ref": "#/$defs/RetentionConfig",
-          "description": "Retention/eviction policies controlling how many snapshots\nper repo are kept and how aggressively they're pruned."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "SnapshotsConfig — `snapshots:` block. Holds the retention/eviction\npolicies for cached engine templates. Snapshot state lives\nentirely in SQLite + the engines themselves (template DBs); no\non-disk cache directory needs configuring."
+      "description": "SnapshotsConfig — `snapshots:` block. Carries the retention /\neviction policies for cached engine templates. Snapshot state\nlives entirely in SQLite + the engines themselves (template DBs);\nno on-disk cache directory needs configuring.\n\n`CapPerRepo` is the hard cap that triggers eviction on every\n`RecordSnapshot`. LRU rows above the cap are dropped immediately\n(in a background goroutine) so a busy worktree workflow never\naccumulates unbounded cached templates per repo.\n\n`KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`\ndrive the periodic daemon-side sweep; they're not consulted by\nthe inline-on-write eviction path."
     },
     "Step": {
       "properties": {

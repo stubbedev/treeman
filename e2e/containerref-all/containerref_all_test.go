@@ -160,7 +160,7 @@ func redisConfig(_ string, ref config.ContainerRef) *config.Config {
 			{
 				Engine:       "redis",
 				NameTemplate: sanitize(ref.Container) + "_{slug}",
-				Namespaces:   &config.Namespaces{KeyPrefixTemplate: "ctra:{slug}:"},
+				KeyPrefix:    "ctra:{slug}:",
 				// No seed — just confirms the dial+snapshot path works.
 			},
 		},
@@ -176,7 +176,7 @@ func esConfig(_ string, ref config.ContainerRef) *config.Config {
 			{
 				Engine:       "elasticsearch",
 				NameTemplate: sanitize(ref.Container) + "_{slug}",
-				Namespaces:   &config.Namespaces{KeyPrefixTemplate: "ctra_{slug}_"},
+				KeyPrefix:    "ctra_{slug}_",
 			},
 		},
 	}

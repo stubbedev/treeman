@@ -135,7 +135,7 @@ databases:
       - { glob: "db/migrations/**/*.sql", label: migrations, hash: filename }
       - { glob: "db/seeders/**/*.sql",    label: seeders }
   - engine: elasticsearch
-    namespaces: { index_prefix_template: "app_{slug}_" }
+    key_prefix: "app_{slug}_"
     inputs:
       - { glob: "es/mappings/**/*.json", label: es-mappings }
 hooks:

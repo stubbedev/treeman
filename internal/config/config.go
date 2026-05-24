@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/invopop/jsonschema"
 	orderedmap "github.com/pb33f/ordered-map/v2"
@@ -222,6 +224,75 @@ type MysqlConn struct {
 	ContainerRef `yaml:",inline"`
 }
 
+// UnmarshalYAML accepts either a bare DSN string
+// (`mysql://user:pass@host:port/db`) or the structured object.
+// DSN form is for the common dev case where one URL captures
+// everything. Use the structured form when you need fine-grained
+// fields like `password_env`, `container`, `pool_max`, or `binlog`.
+//
+// DSN trade-offs:
+//   - Password is embedded in the URL — fine for dev, never for prod.
+//     For prod use `password_env:` in the structured form.
+//   - Container/compose refs aren't expressible in a single URL —
+//     drop down to the structured form when you need them.
+func (c *MysqlConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return parseMysqlDSN(node.Value, c)
+	}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("mysql connection (line %d): want a DSN string or mapping", node.Line)
+	}
+	type alias MysqlConn
+	return node.Decode((*alias)(c))
+}
+
+// JSONSchema for MysqlConn: scalar DSN OR full structured object.
+func (MysqlConn) JSONSchema() *jsonschema.Schema {
+	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
+	obj := r.Reflect(&struct {
+		Host         string        `yaml:"host,omitempty"`
+		Port         uint16        `yaml:"port,omitempty"`
+		User         string        `yaml:"user"`
+		PasswordEnv  string        `yaml:"password_env,omitempty"`
+		PoolMax      uint32        `yaml:"pool_max,omitempty"`
+		Binlog       *BinlogConfig `yaml:"binlog,omitempty"`
+		ContainerRef ContainerRef  `yaml:",inline"`
+	}{})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "DSN: `mysql://user:pass@host:port/dbname`. Equivalent to the structured form below."},
+			obj,
+		},
+		Description: "MySQL connection — bare DSN string OR structured object.",
+	}
+}
+
+// parseMysqlDSN fills cfg from a URL-form DSN.
+func parseMysqlDSN(dsn string, cfg *MysqlConn) error {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return fmt.Errorf("parse mysql DSN: %w", err)
+	}
+	if u.Scheme != "mysql" && u.Scheme != "mariadb" {
+		return fmt.Errorf("mysql DSN: scheme must be mysql(:|maria:)//, got %q", u.Scheme)
+	}
+	cfg.Host = u.Hostname()
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return fmt.Errorf("mysql DSN port: %w", err)
+		}
+		cfg.Port = uint16(n)
+	}
+	if u.User != nil {
+		cfg.User = u.User.Username()
+		if pw, ok := u.User.Password(); ok {
+			cfg.Password = pw
+		}
+	}
+	return nil
+}
+
 // PostgresConn — same shape as MysqlConn.
 type PostgresConn struct {
 	// Hostname or IP. Defaults to `127.0.0.1`. ContainerRef overrides
@@ -247,6 +318,66 @@ type PostgresConn struct {
 	ContainerRef `yaml:",inline"`
 }
 
+// UnmarshalYAML accepts either a bare DSN string
+// (`postgres://user:pass@host:port/db`) or the structured object.
+// Mirrors MysqlConn — see its doc-comment for the trade-offs.
+func (c *PostgresConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return parsePostgresDSN(node.Value, c)
+	}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("postgres connection (line %d): want a DSN string or mapping", node.Line)
+	}
+	type alias PostgresConn
+	return node.Decode((*alias)(c))
+}
+
+// JSONSchema for PostgresConn: scalar DSN OR full structured object.
+func (PostgresConn) JSONSchema() *jsonschema.Schema {
+	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
+	obj := r.Reflect(&struct {
+		Host         string       `yaml:"host,omitempty"`
+		Port         uint16       `yaml:"port,omitempty"`
+		User         string       `yaml:"user"`
+		PasswordEnv  string       `yaml:"password_env,omitempty"`
+		PoolMax      uint32       `yaml:"pool_max,omitempty"`
+		ContainerRef ContainerRef `yaml:",inline"`
+	}{})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below."},
+			obj,
+		},
+		Description: "Postgres connection — bare DSN string OR structured object.",
+	}
+}
+
+// parsePostgresDSN fills cfg from a URL-form DSN.
+func parsePostgresDSN(dsn string, cfg *PostgresConn) error {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return fmt.Errorf("parse postgres DSN: %w", err)
+	}
+	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
+		return fmt.Errorf("postgres DSN: scheme must be postgres(ql)://, got %q", u.Scheme)
+	}
+	cfg.Host = u.Hostname()
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return fmt.Errorf("postgres DSN port: %w", err)
+		}
+		cfg.Port = uint16(n)
+	}
+	if u.User != nil {
+		cfg.User = u.User.Username()
+		if pw, ok := u.User.Password(); ok {
+			cfg.Password = pw
+		}
+	}
+	return nil
+}
+
 // MongoConn — `mongodb://…` URI. When a ContainerRef is set, the
 // URI's host/port are rewritten at dial time.
 type MongoConn struct {
@@ -257,6 +388,17 @@ type MongoConn struct {
 	ContainerRef `yaml:",inline"`
 }
 
+func (c *MongoConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		c.URI = node.Value
+		return nil
+	}
+	type alias MongoConn
+	return node.Decode((*alias)(c))
+}
+
+func (MongoConn) JSONSchema() *jsonschema.Schema { return uriOrMap("mongodb", "uri") }
+
 // RedisConn — `redis://…` URL. Same ContainerRef semantics as MongoConn.
 type RedisConn struct {
 	// Redis connection URL (`redis://[:pass@]host:port[/db]`).
@@ -264,6 +406,17 @@ type RedisConn struct {
 	URL          string `yaml:"url"`
 	ContainerRef `yaml:",inline"`
 }
+
+func (c *RedisConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		c.URL = node.Value
+		return nil
+	}
+	type alias RedisConn
+	return node.Decode((*alias)(c))
+}
+
+func (RedisConn) JSONSchema() *jsonschema.Schema { return uriOrMap("redis", "url") }
 
 // EsConn — Elasticsearch / OpenSearch HTTP URL. Same ContainerRef
 // semantics as MongoConn.
@@ -275,17 +428,41 @@ type EsConn struct {
 	ContainerRef `yaml:",inline"`
 }
 
-// SnapshotsConfig — `snapshots:` block. Holds the retention/eviction
-// policies for cached engine templates. Snapshot state lives
-// entirely in SQLite + the engines themselves (template DBs); no
-// on-disk cache directory needs configuring.
-type SnapshotsConfig struct {
-	// Retention/eviction policies controlling how many snapshots
-	// per repo are kept and how aggressively they're pruned.
-	Retention RetentionConfig `yaml:"retention,omitempty"`
+func (c *EsConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		c.URL = node.Value
+		return nil
+	}
+	type alias EsConn
+	return node.Decode((*alias)(c))
 }
 
-// RetentionConfig — `snapshots.retention:` policies.
+func (EsConn) JSONSchema() *jsonschema.Schema { return uriOrMap("elasticsearch", "url") }
+
+// uriOrMap builds a polymorphic schema for the Mongo/Redis/ES
+// connection blocks: scalar URI string OR a structured object that
+// pairs the URI field with the embedded ContainerRef.
+func uriOrMap(engine, urlField string) *jsonschema.Schema {
+	objProps := orderedmap.New[string, *jsonschema.Schema]()
+	objProps.Set(urlField, &jsonschema.Schema{Type: "string"})
+	objProps.Set("container", &jsonschema.Schema{Type: "string"})
+	objProps.Set("compose_service", &jsonschema.Schema{Type: "string"})
+	objProps.Set("compose_project", &jsonschema.Schema{Type: "string"})
+	objProps.Set("container_engine", &jsonschema.Schema{Type: "string"})
+	objProps.Set("container_network", &jsonschema.Schema{Type: "string"})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "Bare URL/URI. Equivalent to `{" + urlField + ": <this string>}`."},
+			{Type: "object", Properties: objProps, Required: []string{urlField}, AdditionalProperties: jsonschema.FalseSchema},
+		},
+		Description: engine + " connection — bare URL string OR structured object.",
+	}
+}
+
+// SnapshotsConfig — `snapshots:` block. Carries the retention /
+// eviction policies for cached engine templates. Snapshot state
+// lives entirely in SQLite + the engines themselves (template DBs);
+// no on-disk cache directory needs configuring.
 //
 // `CapPerRepo` is the hard cap that triggers eviction on every
 // `RecordSnapshot`. LRU rows above the cap are dropped immediately
@@ -295,7 +472,7 @@ type SnapshotsConfig struct {
 // `KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`
 // drive the periodic daemon-side sweep; they're not consulted by
 // the inline-on-write eviction path.
-type RetentionConfig struct {
+type SnapshotsConfig struct {
 	// Hard cap on cached snapshots per repository. Eviction runs
 	// inline on every `RecordSnapshot`: rows above the cap (LRU
 	// order) are dropped immediately in a background goroutine.
@@ -664,10 +841,14 @@ type DatabaseConfig struct {
 	// pre-warm for paratest/pytest-xdist/Jest workers/etc.
 	TestClones *TestClonesSpec `yaml:"test_clones,omitempty"`
 
-	// Engine-specific namespacing templates (Redis db index,
-	// Elasticsearch index prefix). Use when the engine doesn't
-	// scope by database name.
-	Namespaces *Namespaces `yaml:"namespaces,omitempty"`
+	// KeyPrefix scopes every key/index a worktree creates under a
+	// per-worktree prefix. Used by engines that don't scope by
+	// database name — Redis (key prefix in DB 0) and Elasticsearch
+	// / OpenSearch (index-name prefix). Example: `{slug}:` →
+	// `feature-x:`. The app must honour the prefix — Laravel's
+	// `CACHE_PREFIX`, Rails `Rails.cache.options[:namespace]`,
+	// ioredis `keyPrefix`, etc.
+	KeyPrefix string `yaml:"key_prefix,omitempty"`
 
 	// Outer concurrency cap for clone restore + DropMatching.
 	// Defaults to the per-engine safe value from internal/prepare.
@@ -981,19 +1162,6 @@ func (c *ClonesSetting) UnmarshalYAML(node *yaml.Node) error {
 	return fmt.Errorf("clones: want scalar")
 }
 
-// Namespaces — engine-specific namespacing.
-type Namespaces struct {
-	// KeyPrefixTemplate scopes every key/index a worktree creates
-	// under a per-worktree prefix. Used by both Redis (key prefix
-	// in DB 0) and Elasticsearch / OpenSearch (index-name prefix).
-	// Example: `{slug}:` produces `feature-x:`. The app must
-	// honour the prefix — Laravel's `CACHE_PREFIX`, Rails
-	// `Rails.cache.options[:namespace]`, ioredis `keyPrefix`, etc.
-	// for Redis; the ES client prefixes index names automatically
-	// in most frameworks.
-	KeyPrefixTemplate string `yaml:"key_prefix_template,omitempty"`
-}
-
 // BinlogConfig — `watcher.binlog:` block. Controls the MySQL
 // binary-log tailer that replays DDL + DML events from the source
 // database onto cached template + paratest clone databases. Off by
@@ -1168,20 +1336,20 @@ func applyDefaults(cfg *Config) {
 		// for the parent-dir convention.
 		cfg.Worktrees.Root = ".worktrees"
 	}
-	if cfg.Snapshots.Retention.CapPerRepo == 0 {
-		cfg.Snapshots.Retention.CapPerRepo = 8
+	if cfg.Snapshots.CapPerRepo == 0 {
+		cfg.Snapshots.CapPerRepo = 8
 	}
-	if cfg.Snapshots.Retention.KeepPerSource == 0 {
-		cfg.Snapshots.Retention.KeepPerSource = 500
+	if cfg.Snapshots.KeepPerSource == 0 {
+		cfg.Snapshots.KeepPerSource = 500
 	}
-	if cfg.Snapshots.Retention.MaxAgeDays == 0 {
-		cfg.Snapshots.Retention.MaxAgeDays = 30
+	if cfg.Snapshots.MaxAgeDays == 0 {
+		cfg.Snapshots.MaxAgeDays = 30
 	}
-	if cfg.Snapshots.Retention.MaxTotalGb == 0 {
-		cfg.Snapshots.Retention.MaxTotalGb = 50
+	if cfg.Snapshots.MaxTotalGb == 0 {
+		cfg.Snapshots.MaxTotalGb = 50
 	}
-	if cfg.Snapshots.Retention.GcIntervalMinutes == 0 {
-		cfg.Snapshots.Retention.GcIntervalMinutes = 60
+	if cfg.Snapshots.GcIntervalMinutes == 0 {
+		cfg.Snapshots.GcIntervalMinutes = 60
 	}
 	if cfg.DebounceMs == 0 {
 		cfg.DebounceMs = 500

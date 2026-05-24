@@ -955,8 +955,8 @@ func prepareRedis(
 	if cfg.Connections.Redis == nil {
 		return Outcome{}, fmt.Errorf("connections.redis not configured")
 	}
-	if d.Namespaces == nil || d.Namespaces.KeyPrefixTemplate == "" {
-		return Outcome{}, fmt.Errorf("redis: namespaces.key_prefix_template required")
+	if d.KeyPrefix == "" {
+		return Outcome{}, fmt.Errorf("redis: key_prefix required")
 	}
 	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 	if err != nil {
@@ -981,9 +981,9 @@ func prepareRedisPrefix(
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
 	started := time.Now()
-	sourcePrefix, err := template.Render(d.Namespaces.KeyPrefixTemplate, tplCtx)
+	sourcePrefix, err := template.Render(d.KeyPrefix, tplCtx)
 	if err != nil {
-		return Outcome{}, fmt.Errorf("render key_prefix_template: %w", err)
+		return Outcome{}, fmt.Errorf("render key_prefix: %w", err)
 	}
 	version, _ := drv.EngineVersion(ctx)
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourcePrefix, version)
@@ -1125,12 +1125,12 @@ func prepareES(
 	if cfg.Connections.Elasticsearch == nil {
 		return Outcome{}, fmt.Errorf("connections.elasticsearch not configured")
 	}
-	if d.Namespaces == nil || d.Namespaces.KeyPrefixTemplate == "" {
-		return Outcome{}, fmt.Errorf("elasticsearch: missing namespaces.key_prefix_template")
+	if d.KeyPrefix == "" {
+		return Outcome{}, fmt.Errorf("elasticsearch: missing key_prefix")
 	}
-	sourcePrefix, err := template.Render(d.Namespaces.KeyPrefixTemplate, tplCtx)
+	sourcePrefix, err := template.Render(d.KeyPrefix, tplCtx)
 	if err != nil {
-		return Outcome{}, fmt.Errorf("render key_prefix_template: %w", err)
+		return Outcome{}, fmt.Errorf("render key_prefix: %w", err)
 	}
 	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 	if err != nil {
@@ -1563,15 +1563,15 @@ func teardownOne(
 		if cfg.Connections.Redis == nil {
 			return fmt.Errorf("connections.redis not configured")
 		}
-		if d.Namespaces == nil || d.Namespaces.KeyPrefixTemplate == "" {
-			return fmt.Errorf("redis: missing namespaces.key_prefix_template")
+		if d.KeyPrefix == "" {
+			return fmt.Errorf("redis: missing key_prefix")
 		}
 		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 		if err != nil {
 			return err
 		}
 		defer drv.Close()
-		prefix, err := template.Render(d.Namespaces.KeyPrefixTemplate, tplCtx)
+		prefix, err := template.Render(d.KeyPrefix, tplCtx)
 		if err != nil {
 			return err
 		}
@@ -1589,14 +1589,14 @@ func teardownOne(
 		if cfg.Connections.Elasticsearch == nil {
 			return fmt.Errorf("connections.elasticsearch not configured")
 		}
-		if d.Namespaces == nil || d.Namespaces.KeyPrefixTemplate == "" {
-			return fmt.Errorf("es: missing namespaces.key_prefix_template")
+		if d.KeyPrefix == "" {
+			return fmt.Errorf("es: missing key_prefix")
 		}
 		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 		if err != nil {
 			return err
 		}
-		prefix, err := template.Render(d.Namespaces.KeyPrefixTemplate, tplCtx)
+		prefix, err := template.Render(d.KeyPrefix, tplCtx)
 		if err != nil {
 			return err
 		}

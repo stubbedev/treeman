@@ -66,9 +66,7 @@ func TestCapPerRepoEvictsOldSnapshots(t *testing.T) {
 			Connections: config.ConnectionsConfig{
 				Mysql: &config.MysqlConn{Host: "127.0.0.1", Port: 13436, User: "root", Password: "rootpw"},
 			},
-			Snapshots: config.SnapshotsConfig{
-				Retention: config.RetentionConfig{CapPerRepo: cap},
-			},
+			Snapshots: config.SnapshotsConfig{CapPerRepo: cap},
 			Databases: []config.DatabaseConfig{
 				{
 					Engine:       "mysql",

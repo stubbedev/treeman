@@ -80,9 +80,7 @@ func buildConfig() *config.Config {
 			{
 				Engine:       "elasticsearch",
 				NameTemplate: "treeman_e2e_{slug}",
-				Namespaces: &config.Namespaces{
-					KeyPrefixTemplate: "wte2e_{slug}_",
-				},
+				KeyPrefix: "wte2e_{slug}_",
 				Dump: &config.DumpSpec{Path: "fixtures/dump.ndjson"},
 			},
 		},
