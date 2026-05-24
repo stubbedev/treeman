@@ -492,9 +492,8 @@ func (s *Store) CountActiveWorktreesForRepo(ctx context.Context, repoID int64) (
 
 // RemoveRepo deletes the repo row and every child row that would
 // otherwise block the FK constraint or hang around as orphan tracking
-// data: hook_runs, events, snapshots, binlog_checkpoints, worktrees.
-// Wrapped in a transaction so a mid-delete failure leaves the
-// registry intact.
+// data: hook_runs, events, snapshots, worktrees. Wrapped in a
+// transaction so a mid-delete failure leaves the registry intact.
 //
 // External resources (per-worktree databases, on-disk git worktree
 // dirs, dump caches under `.treeman-snapshots/`, advisory hash caches
@@ -511,14 +510,12 @@ func (s *Store) RemoveRepo(ctx context.Context, repoID int64) error {
 		`DELETE FROM hook_runs WHERE worktree_id IN (SELECT id FROM worktrees WHERE repo_id = ?)`,
 		`DELETE FROM events    WHERE repo_id = ? OR worktree_id IN (SELECT id FROM worktrees WHERE repo_id = ?)`,
 		`DELETE FROM snapshots WHERE repo_id = ?`,
-		`DELETE FROM binlog_checkpoints WHERE repo_id = ?`,
 		`DELETE FROM worktrees WHERE repo_id = ?`,
 		`DELETE FROM repos     WHERE id = ?`,
 	}
 	args := [][]any{
 		{repoID},
 		{repoID, repoID},
-		{repoID},
 		{repoID},
 		{repoID},
 		{repoID},

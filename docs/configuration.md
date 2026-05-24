@@ -90,9 +90,6 @@ snapshots:
 
 debounce_ms: 500                         # file-watcher coalesce window
 
-# Binlog tailing lives under the MySQL connection block:
-# connections.mysql.binlog: { enabled: true }   # see Binlog section in advanced.md
-
 daemon:
   socket: $XDG_RUNTIME_DIR/treeman.sock
   log_level: info

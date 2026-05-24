@@ -17,7 +17,7 @@ import (
 // ConfigReloader watches the YAML files that feed `resolve.LoadResolved`
 // and reacts to edits by invalidating the resolved-config cache and
 // restarting the per-repo watchers that snapshotted their config at
-// boot (binlog replicators, worktree fsnotify watchers, lifecycle
+// boot (worktree fsnotify watchers, lifecycle
 // watcher).
 //
 // Two reload entry points:
@@ -229,8 +229,8 @@ func (cr *ConfigReloader) ReloadRepo(ctx context.Context, repoPath string) {
 }
 
 // reloadOne cancels every live watcher attached to `repoPath` and then
-// re-runs the boot-time spawn paths. The cancel order matters: binlog
-// + lifecycle live on the repo entry, the per-worktree fsnotify
+// re-runs the boot-time spawn paths. The cancel order matters: the
+// lifecycle watcher lives on the repo entry, the per-worktree fsnotify
 // watchers live on each worktree path. Killing them all first means
 // `startRepoWatcher` / `startWorktreeWatcher` can run their normal
 // "skip when already registered" guards without leaking goroutines.

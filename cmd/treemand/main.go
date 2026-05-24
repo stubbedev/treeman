@@ -124,12 +124,12 @@ func run() error {
 	}
 
 	// Auto-resume per-repo watchers on boot. Each known repo gets
-	// its binlog replicators re-spawned via the same path the
+	// its watchers re-spawned via the same path the
 	// watcher_start RPC takes. Failures per-repo are logged + skipped
 	// — a missing or moved repo dir shouldn't abort daemon startup.
 	//
 	// Parallelised with a bounded worker pool: each repo load reads
-	// the layered config from disk and opens binlog connections,
+	// the layered config from disk,
 	// both of which dominate boot time on hosts with many registered
 	// repos. 8 concurrent resumes keeps the host responsive while
 	// cutting boot wall-time roughly proportionally.

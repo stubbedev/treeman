@@ -58,7 +58,6 @@ so you don't need `-p 1`.
 | `cli/` | Full `treeman` CLI binary → `treemand` socket RPC → real `git worktree add` → Links + Copies + Patches + engine prepare + `wt delete` end-to-end |
 | `extras/` | `Dump.Optional` skip, required-dump clean error, `Fanout` cap, `Action.Container` exec wrap inside container, `on-file-change match: [list]` filter |
 | `mongo_dump/` | Real `mongodump --archive` (uncompressed + gzip) → treeman's `mongorestore` path with `dump.source_db` rename |
-| `binlog/` | MySQL binlog tailer connects as fake replica → DDL on source replays onto cached template |
 | `misc/` | Reachability probe failure produces a clean, engine-tagged error |
 | `poolmax/` | `connections.mysql.pool_max: 2` actually caps concurrent connections under 8-goroutine load |
 | `ctrrestart/` | Container recreate → treeman reconnects cleanly (exercises cache-eviction path) |

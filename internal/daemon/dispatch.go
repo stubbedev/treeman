@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
-	"github.com/stubbedev/treeman/internal/db/binlog"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/slug"
@@ -221,22 +220,21 @@ func ResumeWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath stri
 	return startWorktreeWatcher(ctx, st, repoPath, wtPath)
 }
 
-// startRepoWatcher boots one binlog.Replicator goroutine per MySQL
-// source database declared in the repo's .treeman.yaml — if
-// `watcher.binlog.enabled = true`. Filesystem-event watching now
-// lives in `startWorktreeWatcher` (rooted in each worktree's own
-// checkout) because migrations and dumps follow the worktree's
-// branch, not the main repo's.
+// startRepoWatcher attaches the per-repo background services that
+// don't live per-worktree: the config reloader subscription and the
+// lifecycle watcher (which observes `git worktree add/remove` events
+// fired outside the treeman CLI). Filesystem-event watching lives
+// per-worktree in `startWorktreeWatcher` because migrations and
+// dumps follow each worktree's branch checkout.
 //
-// Each replicator runs until the WatcherEntry's cancel is invoked
-// or the daemon shuts down. State tracking lets `watcher_list` /
-// `status` report the running count.
+// Runs until the WatcherEntry's cancel is invoked or the daemon
+// shuts down. State tracking lets `watcher_list` / `status` report
+// the running set.
 func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 	if repoPath == "" {
 		return fmt.Errorf("watcher_start: empty repo_path")
 	}
-	cfg, err := resolve.LoadResolved(repoPath)
-	if err != nil {
+	if _, err := resolve.LoadResolved(repoPath); err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 	repoID, err := st.Store.EnsureRepo(ctx, repoPath, filepath.Base(repoPath))
@@ -247,45 +245,13 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 	// live edit will trigger a watcher restart for this repo.
 	st.ConfigReloader.AddRepo(repoPath)
 
-	wctx, cancel := context.WithCancel(st.BgCtx)
+	_, cancel := context.WithCancel(st.BgCtx)
 	entry := &WatcherEntry{
 		RepoPath:      repoPath,
 		WorktreeCount: 0,
 		Cancel:        cancel,
 	}
 	st.RegisterWatcher(repoPath, entry)
-
-	binlogReps := 0
-	if cfg.Connections.Mysql != nil && cfg.Connections.Mysql.Binlog != nil && cfg.Connections.Mysql.Binlog.Enabled {
-		for _, d := range cfg.Databases {
-			switch d.Engine {
-			case "mysql", "mariadb", "tidb":
-			default:
-				continue
-			}
-			sourceDB, err := template.Render(d.NameTemplate, template.Context{})
-			if err != nil {
-				// Without a slug context the source name has
-				// unresolved {slug} placeholders — that's per-
-				// worktree, not a global source. Skip it; the binlog
-				// tail only follows non-templated source DBs.
-				continue
-			}
-			r, err := binlog.New(&cfg, st.Store, repoID, sourceDB)
-			if err != nil {
-				slog.Warn("binlog replicator init", "repo", repoPath, "source_db", sourceDB, "err", err)
-				continue
-			}
-			r, src := r, sourceDB
-			safeGo("binlog_replicator:"+repoPath+":"+src, func() {
-				defer r.Stop()
-				if err := r.Start(wctx); err != nil {
-					slog.Warn("binlog replicator exit", "repo", repoPath, "source_db", src, "err", err)
-				}
-			})
-			binlogReps++
-		}
-	}
 
 	// Lifecycle watcher: always on. Worktree add/remove events outside
 	// of the treeman CLI need the daemon to react regardless of any
@@ -296,8 +262,7 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 		}
 	}
 
-	slog.Info("repo watcher started",
-		"repo", repoPath, "binlog_replicators", binlogReps)
+	slog.Info("repo watcher started", "repo", repoPath)
 	return nil
 }
 

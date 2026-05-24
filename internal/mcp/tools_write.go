@@ -74,7 +74,7 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_remove",
-		Description: "Drop a repo from the SQLite registry. Stops any live daemon watchers attached to the repo and deletes child rows (worktrees, events, snapshots, binlog_checkpoints, hook_runs). External resources (databases, on-disk worktree dirs, dump caches) are NOT touched. Refuses by default if active worktrees still exist — pass force=true to override.",
+		Description: "Drop a repo from the SQLite registry. Stops any live daemon watchers attached to the repo and deletes child rows (worktrees, events, snapshots, hook_runs). External resources (databases, on-disk worktree dirs, dump caches) are NOT touched. Refuses by default if active worktrees still exist — pass force=true to override.",
 	}, registryRemoveTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{

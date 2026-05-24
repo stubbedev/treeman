@@ -9,12 +9,6 @@
 // per (worktree, mode) pair so a `git pull` that drops 40 migration
 // files at once collapses into one prepare run per worktree.
 //
-// The watcher coexists with the MySQL binlog tailer in
-// `internal/db/binlog`: the binlog handles DDL applied directly to
-// the source DB (e.g. someone running `php artisan migrate` in a
-// worktree), while this watcher handles edits to the migration
-// SOURCE files (someone adding a new migration to git). Both
-// pathways are needed because each catches the other's blind spot.
 package watcher
 
 import (

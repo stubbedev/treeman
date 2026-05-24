@@ -6,9 +6,6 @@ services:
       MYSQL_ROOT_PASSWORD: rootpw
     ports:
       - "13326:3306"
-    command:
-      - --log-bin=binlog
-      - --server-id=1
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
       interval: 2s

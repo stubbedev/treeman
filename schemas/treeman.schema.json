@@ -68,7 +68,7 @@
       "properties": {
         "mysql": {
           "$ref": "#/$defs/MysqlConn",
-          "description": "MySQL / MariaDB / TiDB connection. Set when any `databases:`\nentry uses one of those engines. Treeman dials this server to\ncreate clones, dump templates, and tail binlogs."
+          "description": "MySQL / MariaDB / TiDB connection. Set when any `databases:`\nentry uses one of those engines. Treeman dials this server to\ncreate clones, dump templates."
         },
         "postgres": {
           "$ref": "#/$defs/PostgresConn",
@@ -466,33 +466,6 @@
         },
         {
           "$schema": "https://json-schema.org/draft/2020-12/schema",
-          "$defs": {
-            "BinlogConfig": {
-              "properties": {
-                "enabled": {
-                  "type": "boolean"
-                },
-                "server_id": {
-                  "type": "integer"
-                },
-                "flavor": {
-                  "type": "string",
-                  "enum": [
-                    "mysql",
-                    "mariadb"
-                  ]
-                },
-                "apply_ddl": {
-                  "type": "boolean"
-                },
-                "apply_dml": {
-                  "type": "boolean"
-                }
-              },
-              "additionalProperties": false,
-              "type": "object"
-            }
-          },
           "properties": {
             "host": {
               "type": "string"
@@ -508,9 +481,6 @@
             },
             "pool_max": {
               "type": "integer"
-            },
-            "binlog": {
-              "$ref": "#/$defs/BinlogConfig"
             },
             "container": {
               "type": "string"
@@ -758,7 +728,7 @@
     },
     "connections": {
       "$ref": "#/$defs/ConnectionsConfig",
-      "description": "Connection blocks per supported engine (MySQL, Postgres,\nMongoDB, Redis, Elasticsearch). Treeman dials these to create\nper-worktree clone databases, run migrations, and tail binlogs."
+      "description": "Connection blocks per supported engine (MySQL, Postgres,\nMongoDB, Redis, Elasticsearch). Treeman dials these to create\nper-worktree clone databases, run migrations."
     },
     "snapshots": {
       "$ref": "#/$defs/SnapshotsConfig",
@@ -795,7 +765,7 @@
     },
     "debounce_ms": {
       "type": "integer",
-      "description": "DebounceMs is the file-watcher debounce window in\nmilliseconds. Coalesces editor save bursts into one re-prep\ndispatch. Default 500. (Binlog tailer settings live under\n`connections.mysql.binlog:` since they're MySQL-specific.)"
+      "description": "DebounceMs is the file-watcher debounce window in\nmilliseconds. Coalesces editor save bursts into one re-prep\ndispatch. Default 500."
     },
     "frameworks": {
       "additionalProperties": {

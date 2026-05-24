@@ -1,4 +1,4 @@
-# Advanced — snapshots, frameworks, binlog
+# Advanced — snapshots, frameworks
 
 [← back to README](../README.md)
 
@@ -43,27 +43,3 @@ the current repo. Built-in detectors:
 mutate migrations; new files alone change the hash). `HashChecksum`
 hashes contents (sqlx-cli/Flyway mutate in place).
 
-## Binlog (MySQL delta replay)
-
-When `watcher.binlog.enabled: true` and the MySQL server runs
-with `binlog_format=ROW`, `binlog_row_image=FULL`,
-`binlog_row_metadata=FULL` (5.7+/8.0+), the daemon tails the
-binary log from a checkpointed position and applies events to
-each cached template + clone in sequence, instead of cold-
-rebuilding from the dump every time a migration runs.
-
-- **DDL** replay (default on, `apply_ddl: true`): every CREATE /
-  ALTER / DROP that lands on the source DB is mirrored to every
-  cached template + test clone, with the schema cache for the
-  source invalidated so subsequent DML events re-resolve columns.
-- **DML** replay (default off, `apply_dml: true`): WriteRows /
-  UpdateRows / DeleteRows events are reconstructed as parameterised
-  INSERT / UPDATE / DELETE per target. PK-based WHERE when the
-  table has one; full-row NULL-safe (`<=>`) match as a fallback.
-  Off by default because wrong-row replay is recoverable only from
-  a cold rebuild — opt in only when the source DB is dev-only and
-  reseeding is cheap.
-
-The watcher dispatches `delta` vs `rebuild` per-framework: any
-`HashChecksum` framework or `on: rebuild` watcher path forces a
-full rebuild; anything else replays the binlog.

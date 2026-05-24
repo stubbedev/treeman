@@ -30,7 +30,7 @@ type Config struct {
 
 	// Connection blocks per supported engine (MySQL, Postgres,
 	// MongoDB, Redis, Elasticsearch). Treeman dials these to create
-	// per-worktree clone databases, run migrations, and tail binlogs.
+	// per-worktree clone databases, run migrations.
 	Connections ConnectionsConfig `yaml:"connections,omitempty"`
 
 	// Snapshot cache settings: where post-migration template
@@ -75,8 +75,7 @@ type Config struct {
 
 	// DebounceMs is the file-watcher debounce window in
 	// milliseconds. Coalesces editor save bursts into one re-prep
-	// dispatch. Default 500. (Binlog tailer settings live under
-	// `connections.mysql.binlog:` since they're MySQL-specific.)
+	// dispatch. Default 500.
 	DebounceMs uint64 `yaml:"debounce_ms,omitempty"`
 
 	// User-defined migration frameworks keyed by name. Use this when
@@ -102,7 +101,7 @@ type DaemonConfig struct {
 type ConnectionsConfig struct {
 	// MySQL / MariaDB / TiDB connection. Set when any `databases:`
 	// entry uses one of those engines. Treeman dials this server to
-	// create clones, dump templates, and tail binlogs.
+	// create clones, dump templates.
 	Mysql *MysqlConn `yaml:"mysql,omitempty"`
 
 	// PostgreSQL connection. Required when any `databases:` entry
@@ -196,8 +195,7 @@ type MysqlConn struct {
 	Port uint16 `yaml:"port,omitempty"`
 
 	// Database user. Required. Should have privileges to
-	// CREATE/DROP databases (for clones) and SHOW BINARY LOGS +
-	// REPLICATION SLAVE (when the binlog watcher is enabled).
+	// CREATE/DROP databases (for clones).
 	User string `yaml:"user"`
 
 	// Password is either a literal value or a `$NAME` / `${NAME}`
@@ -214,12 +212,6 @@ type MysqlConn struct {
 	// is provisioned for it (max_connections raised, etc.).
 	PoolMax uint32 `yaml:"pool_max,omitempty"`
 
-	// Binlog tailer settings. Off by default. When enabled, treeman
-	// connects as a fake replica and replays DDL (and optionally
-	// DML) from this server onto cached templates so the cache stays
-	// in sync without a re-prep.
-	Binlog *BinlogConfig `yaml:"binlog,omitempty"`
-
 	ContainerRef `yaml:",inline"`
 }
 
@@ -227,7 +219,7 @@ type MysqlConn struct {
 // (`mysql://user:pass@host:port/db`) or the structured object.
 // DSN form is for the common dev case where one URL captures
 // everything. Use the structured form when you need fine-grained
-// fields like `container`, `pool_max`, or `binlog`.
+// fields like `container`, `pool_max`, or container refs.
 //
 // DSN trade-offs:
 //   - Password is embedded in the URL — fine for dev, never for prod.
@@ -249,13 +241,12 @@ func (c *MysqlConn) UnmarshalYAML(node *yaml.Node) error {
 func (MysqlConn) JSONSchema() *jsonschema.Schema {
 	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
 	obj := r.Reflect(&struct {
-		Host         string        `yaml:"host,omitempty"`
-		Port         uint16        `yaml:"port,omitempty"`
-		User         string        `yaml:"user"`
-		Password     string        `yaml:"password,omitempty"`
-		PoolMax      uint32        `yaml:"pool_max,omitempty"`
-		Binlog       *BinlogConfig `yaml:"binlog,omitempty"`
-		ContainerRef ContainerRef  `yaml:",inline"`
+		Host         string       `yaml:"host,omitempty"`
+		Port         uint16       `yaml:"port,omitempty"`
+		User         string       `yaml:"user"`
+		Password     string       `yaml:"password,omitempty"`
+		PoolMax      uint32       `yaml:"pool_max,omitempty"`
+		ContainerRef ContainerRef `yaml:",inline"`
 	}{})
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
@@ -1159,29 +1150,6 @@ func (c *ClonesSetting) UnmarshalYAML(node *yaml.Node) error {
 	return fmt.Errorf("clones: want scalar")
 }
 
-// BinlogConfig — `watcher.binlog:` block. Controls the MySQL
-// binary-log tailer that replays DDL + DML events from the source
-// database onto cached template + paratest clone databases. Off by
-// default; enabling requires a server configured with
-// `binlog_format=ROW` and a replication-privileged user.
-type BinlogConfig struct {
-	// Master switch. When false (default) the tailer is dormant —
-	// no replication connection is opened, no DDL is replayed.
-	Enabled bool `yaml:"enabled,omitempty"`
-	// ServerID treeman registers as a fake replica. Must be unique
-	// among all replicas the upstream server sees. Defaults to a
-	// deterministic hash of the daemon's socket path so two
-	// developers on the same host don't clash.
-	ServerID uint32 `yaml:"server_id,omitempty"`
-	// Flavor — "mysql" (default) or "mariadb".
-	Flavor string `yaml:"flavor,omitempty" jsonschema:"enum=mysql,enum=mariadb"`
-	// ApplyDDL toggles execution of DDL Query events. Default true.
-	ApplyDDL *bool `yaml:"apply_ddl,omitempty"`
-	// ApplyDML toggles execution of ROW events. Default false (DDL
-	// replay is the high-value path; DML is a follow-up).
-	ApplyDML *bool `yaml:"apply_dml,omitempty"`
-}
-
 // WatcherPath is the internal projection of an Input that the
 // fsnotify driver subscribes to. Users never write this type
 // directly — they declare `databases[].inputs[]` and treeman
@@ -1350,32 +1318,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.DebounceMs == 0 {
 		cfg.DebounceMs = 500
-	}
-	if cfg.Connections.Mysql != nil && cfg.Connections.Mysql.Binlog != nil {
-		bl := cfg.Connections.Mysql.Binlog
-		if bl.Flavor == "" {
-			bl.Flavor = "mysql"
-		}
-		if bl.ApplyDDL == nil {
-			t := true
-			bl.ApplyDDL = &t
-		}
-		if bl.ApplyDML == nil {
-			f := false
-			bl.ApplyDML = &f
-		}
-		if bl.ServerID == 0 {
-			// Stable per host: hash the daemon's effective socket path
-			// (XDG_RUNTIME_DIR is per-user, so two users on one host get
-			// distinct IDs). Values are kept in the 1k–1M range to leave
-			// room for explicitly-numbered production replicas.
-			var h uint32 = 2166136261
-			for _, b := range []byte(os.Getenv("XDG_RUNTIME_DIR") + os.Getenv("USER")) {
-				h ^= uint32(b)
-				h *= 16777619
-			}
-			bl.ServerID = 1000 + (h % 999000)
-		}
 	}
 }
 
