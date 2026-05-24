@@ -29,11 +29,12 @@ import (
 	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
 
-// registerWriteTools binds tools that mutate state. Gated by
-// Options.AllowMutations in Serve. Tools that shell out to the
-// `treeman` binary (worktree_create, worktree_delete, init,
-// schema_install) are further gated by AllowShellOps.
-func registerWriteTools(srv *mcpsdk.Server, opts Options) {
+// registerWriteTools binds every tool that mutates state, including
+// the shell-spawning `treeman wt create` / `wt delete` wrappers.
+// No flag-gating: the MCP surface is the fully-qualified link to
+// treeman's functionality; clients restrict at the agent-policy
+// layer.
+func registerWriteTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "prepare_run",
 		Description: "Run the prepare pipeline for a worktree (ensure → dump → migrate → snapshot → replicate). Foreground; blocks until every engine returns an outcome.",
@@ -102,10 +103,6 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 		Description: "Start or stop treemand. Action must be one of: start, stop. Prefers the installed systemd/launchd unit when present; otherwise forks the treemand binary (start) or sends the shutdown RPC (stop). In-process — no shell-out.",
 	}, daemonControlTool)
 
-	if !opts.AllowShellOps {
-		return
-	}
-
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_create",
 		Description: "Create a new git worktree under .worktrees/<branch> and dispatch setup hooks + prepare via the daemon. Shells to `treeman wt create`. Long-running. Returns the captured stdout/stderr and exit code.",
@@ -115,6 +112,8 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 		Name:        "worktree_delete",
 		Description: "Tear down a worktree: teardown hooks → DB teardown → git worktree remove. Shells to `treeman wt delete`. Returns the captured stdout/stderr and exit code.",
 	}, worktreeDeleteTool)
+
+	registerEngineWriteTools(srv)
 }
 
 // ─── prepare_run ──────────────────────────────────────────────────

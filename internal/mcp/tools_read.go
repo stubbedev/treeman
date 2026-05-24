@@ -84,6 +84,8 @@ func registerReadTools(srv *mcpsdk.Server) {
 		Name:        "snapshots_list",
 		Description: "List cached snapshots (template DBs) for the current (or specified) repo. Read-only complement to snapshots_purge so agents can see what would be wiped before purging.",
 	}, snapshotsListTool)
+
+	registerEngineReadTools(srv)
 }
 
 // ─── doctor ───────────────────────────────────────────────────────

@@ -36,6 +36,7 @@ import (
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
+	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
@@ -68,6 +69,27 @@ func (f frameworkHashCache) UpsertDirHashes(ctx context.Context, entries []frame
 		se[i] = store.DirHashKey(e)
 	}
 	return f.Store.UpsertDirHashes(ctx, se, hashes)
+}
+
+// emitPhaseDone writes a `prepare_phase` event tagged with the step
+// name (dump-load, migrate, seed, snapshot-create) and the wall-clock
+// duration measured from `stepStart`. Used by every per-engine
+// prepare to give the user step-by-step visibility into where time
+// is spent during a cold build. The run_id (set on ctx in the
+// dispatch layer) is auto-injected into the payload by store.
+func emitPhaseDone(ctx context.Context, st *store.Store, repoID, worktreeID int64,
+	engine, sourceDB, phase string, stepStart time.Time) {
+	if st == nil {
+		return
+	}
+	durMs := time.Since(stepStart).Milliseconds()
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_phase",
+		fmt.Sprintf("%s/%s phase=%s duration=%dms", engine, sourceDB, phase, durMs),
+		repoID, worktreeID, phase, durMs, map[string]string{
+			"engine":      engine,
+			"source_db":   sourceDB,
+			"duration_ms": fmt.Sprintf("%d", durMs),
+		})
 }
 
 // dumpReady resolves d.Dump against worktreePath and reports
@@ -388,6 +410,9 @@ func RunFiltered(
 	inheritedEnv map[string]string,
 	opts RunOptions,
 ) ([]Outcome, error) {
+	if runid.From(ctx) == "" {
+		ctx = runid.With(ctx, runid.New())
+	}
 	tplCtx := template.FromSlug(sl)
 
 	results := make([]Outcome, len(cfg.Databases))
@@ -549,11 +574,14 @@ func prepareMySQL(
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
+		stepStart := time.Now()
 		if _, err := dumpload.LoadMySQL(ctx, drv.DB, sourceDB, dp); err != nil {
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
 	}
 	if d.Migrate != nil {
+		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
@@ -561,8 +589,10 @@ func prepareMySQL(
 		if out.ExitCode != 0 {
 			return Outcome{}, fmt.Errorf("migrate source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
 	}
 	if d.Seed != nil {
+		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
@@ -570,12 +600,15 @@ func prepareMySQL(
 		if out.ExitCode != 0 {
 			return Outcome{}, fmt.Errorf("seed source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
 
 	// Build the template snapshot, then clone it into paratest DBs.
+	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
 		return Outcome{}, fmt.Errorf("snapshot create %s → %s: %w", sourceDB, templateName, err)
 	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
 	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
 		Fingerprint:    key.Fingerprint(),
 		Engine:         d.Engine,
@@ -716,6 +749,7 @@ func preparePostgres(
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
+		stepStart := time.Now()
 		// Postgres has no USE, so dumpload needs a connection scoped
 		// to the target DB rather than the server-level pool.
 		scoped, err := drv.OpenScoped(ctx, sourceDB)
@@ -727,8 +761,10 @@ func preparePostgres(
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
 		scoped.Close()
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
 	}
 	if d.Migrate != nil {
+		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
@@ -736,8 +772,10 @@ func preparePostgres(
 		if out.ExitCode != 0 {
 			return Outcome{}, fmt.Errorf("migrate source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
 	}
 	if d.Seed != nil {
+		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
@@ -745,10 +783,13 @@ func preparePostgres(
 		if out.ExitCode != 0 {
 			return Outcome{}, fmt.Errorf("seed source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
+	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
 		return Outcome{}, fmt.Errorf("snapshot create %s → %s: %w", sourceDB, templateName, err)
 	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
 	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
 		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
 		SourceDB: sourceDB, TemplateName: templateName,
@@ -872,11 +913,14 @@ func prepareMongo(
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
+		stepStart := time.Now()
 		if err := dbmongo.Restore(ctx, cfg.Connections.Mongodb.URI, sourceDB, d.Dump.SourceDB, dp); err != nil {
 			return Outcome{}, fmt.Errorf("mongo restore %s: %w", dp, err)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
 	}
 	if d.Seed != nil {
+		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
@@ -884,10 +928,13 @@ func prepareMongo(
 		if out.ExitCode != 0 {
 			return Outcome{}, fmt.Errorf("seed source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
+	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
 		return Outcome{}, fmt.Errorf("mongo snapshot create %s → %s: %w", sourceDB, templateName, err)
 	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
 	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
 		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
 		SourceDB: sourceDB, TemplateName: templateName,
@@ -1048,6 +1095,7 @@ func prepareRedisPrefix(
 		return Outcome{}, fmt.Errorf("redis drop %s*: %w", sourcePrefix, err)
 	}
 	if d.Seed != nil {
+		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed redis %s: %w", sourcePrefix, err)
@@ -1055,10 +1103,13 @@ func prepareRedisPrefix(
 		if out.ExitCode != 0 {
 			return Outcome{}, fmt.Errorf("seed redis %s exit %d: %s", sourcePrefix, out.ExitCode, out.StderrTail)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "seed", stepStart)
 	}
+	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourcePrefix, templatePrefix); err != nil {
 		return Outcome{}, fmt.Errorf("redis snapshot create %s → %s: %w", sourcePrefix, templatePrefix, err)
 	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "snapshot-create", snapStart)
 	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
 		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
 		SourceDB: sourcePrefix, TemplateName: templatePrefix,
@@ -1201,11 +1252,14 @@ func prepareES(
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
+		stepStart := time.Now()
 		if err := drv.Restore(ctx, sourcePrefix, dp); err != nil {
 			return Outcome{}, fmt.Errorf("es restore %s: %w", dp, err)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "dump-load", stepStart)
 	}
 	if d.Seed != nil {
+		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed es %s: %w", sourcePrefix, err)
@@ -1213,10 +1267,13 @@ func prepareES(
 		if out.ExitCode != 0 {
 			return Outcome{}, fmt.Errorf("seed es %s exit %d: %s", sourcePrefix, out.ExitCode, out.StderrTail)
 		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "seed", stepStart)
 	}
+	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourcePrefix, templatePrefix); err != nil {
 		return Outcome{}, fmt.Errorf("es snapshot create %s → %s: %w", sourcePrefix, templatePrefix, err)
 	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "snapshot-create", snapStart)
 	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
 		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
 		SourceDB: sourcePrefix, TemplateName: templatePrefix,

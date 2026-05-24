@@ -313,3 +313,9 @@ func (d *Driver) client() *redis.Client {
 	opts.DB = DBIndex
 	return redis.NewClient(opts)
 }
+
+// Client is the exported entry point used by callers outside the
+// snapshot path (currently the MCP engine tools). Callers MUST
+// defer Close on the returned client — each invocation opens a
+// new connection pool.
+func (d *Driver) Client() *redis.Client { return d.client() }

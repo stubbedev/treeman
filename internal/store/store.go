@@ -17,6 +17,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/stubbedev/treeman/internal/runid"
 )
 
 //go:embed migrations/*.sql
@@ -756,6 +758,7 @@ func (s *Store) WriteEvent(ctx context.Context,
 	durationMs int64,
 	payload any,
 ) error {
+	payload = injectRunID(ctx, payload)
 	pj, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("encode event payload: %w", err)
@@ -803,4 +806,32 @@ func (s *Store) WriteEvent(ctx context.Context,
 		row.tsMillis, row.level, row.repoID, row.worktreeID,
 		row.eventType, row.phase, row.message, row.payload, row.durationMs)
 	return err
+}
+
+// injectRunID stamps the ctx-bound run_id into payload so every event
+// emitted by one flow shares a correlation key. Maps (the common
+// case) get the field in place; nil payloads become a fresh map;
+// anything else (rare) is wrapped under {run_id, payload}. The
+// run_id key is left alone if the caller already supplied one.
+func injectRunID(ctx context.Context, payload any) any {
+	id := runid.From(ctx)
+	if id == "" {
+		return payload
+	}
+	switch p := payload.(type) {
+	case nil:
+		return map[string]string{"run_id": id}
+	case map[string]any:
+		if _, ok := p["run_id"]; !ok {
+			p["run_id"] = id
+		}
+		return p
+	case map[string]string:
+		if _, ok := p["run_id"]; !ok {
+			p["run_id"] = id
+		}
+		return p
+	default:
+		return map[string]any{"run_id": id, "payload": p}
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/version"
@@ -67,7 +68,7 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 		}
 		args := *req.WorktreeFinalize
 		safeGo("wt_finalize", func() {
-			bg := st.BgCtx
+			bg := runid.With(st.BgCtx, runid.New())
 			err := FinalizeWorktree(bg, st, args.RepoPath, args.WorktreePath, args.InheritedEnv)
 			if err != nil {
 				_ = st.Store.WriteEvent(bg, "error", "wt_finalize", err.Error(),
@@ -84,7 +85,7 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 		}
 		args := *req.WorktreeTeardown
 		safeGo("wt_teardown", func() {
-			bg := st.BgCtx
+			bg := runid.With(st.BgCtx, runid.New())
 			err := TeardownWorktree(bg, st, args.RepoPath, args.WorktreePath, args.Force, args.InheritedEnv)
 			if err != nil {
 				_ = st.Store.WriteEvent(bg, "error", "wt_teardown", err.Error(),
@@ -308,7 +309,9 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 	// race. A tight window means `git checkout` → prefetch starts
 	// within ~100ms instead of ~500ms perceived latency.
 	hw, err := NewHeadWatcher(wtPath, 100*time.Millisecond, func(_ context.Context, newRef string) {
-		_ = st.Store.WriteEvent(st.BgCtx, "info", "head_changed",
+		rid := runid.New()
+		evCtx := runid.With(st.BgCtx, rid)
+		_ = st.Store.WriteEvent(evCtx, "info", "head_changed",
 			fmt.Sprintf("HEAD → %s", newRef),
 			repoID, 0, "", 0, map[string]string{
 				"wt":  wtPath,
@@ -322,11 +325,11 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		// the regular finalize re-run (no ordering — both react to
 		// the same event independently).
 		safeGo("head_actions:"+wtPath, func() {
-			fireTriggerActions(st.BgCtx, st, repoPath, wtPath, "on-checkout", env,
+			fireTriggerActions(runid.With(st.BgCtx, rid), st, repoPath, wtPath, "on-checkout", env,
 				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnCheckout })
 		})
 		safeGo("head_finalize:"+wtPath, func() {
-			if err := FinalizeWorktree(st.BgCtx, st, repoPath, wtPath, env); err != nil {
+			if err := FinalizeWorktree(runid.With(st.BgCtx, rid), st, repoPath, wtPath, env); err != nil {
 				slog.Warn("head-triggered finalize", "wt", wtPath, "err", err)
 			}
 		})
@@ -414,7 +417,13 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 		if st.IsTeardownInFlight(wtPath) {
 			return nil
 		}
-		_ = st.Store.WriteEvent(ctx, "info", "watcher_fired",
+		// One run_id covers the watcher_fired event + the actions and
+		// finalize fan-out that descend from it. The two safeGos use
+		// st.BgCtx (so they outlive the dispatcher), so we explicitly
+		// re-attach the id there too.
+		rid := runid.New()
+		evCtx := runid.With(ctx, rid)
+		_ = st.Store.WriteEvent(evCtx, "info", "watcher_fired",
 			fmt.Sprintf("%s (db_idx=%d label=%s)", ev.Path, ev.DBIndex, ev.Label),
 			repoID, 0, "", 0, map[string]string{
 				"path":   ev.Path,
@@ -427,10 +436,10 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 		// Fire the on-file-change actions in parallel with the
 		// re-prep — both react to the same event independently.
 		safeGo("watch_actions:"+wtPath, func() {
-			fireOnFileChange(st.BgCtx, st, repoPath, wtPath, dbIdx, path, label, env)
+			fireOnFileChange(runid.With(st.BgCtx, rid), st, repoPath, wtPath, dbIdx, path, label, env)
 		})
 		safeGo("watcher_finalize:"+wtPath, func() {
-			if err := FinalizeWorktreeForWatch(st.BgCtx, st, repoPath, wtPath, dbIdx, env); err != nil {
+			if err := FinalizeWorktreeForWatch(runid.With(st.BgCtx, rid), st, repoPath, wtPath, dbIdx, env); err != nil {
 				slog.Warn("watcher-triggered finalize", "wt", wtPath, "err", err)
 			}
 		})
