@@ -1,0 +1,10 @@
+{
+  "name": "treeman-e2e-drizzle",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "drizzle-orm": "^0.36.0",
+    "drizzle-kit": "^0.28.0",
+    "pg": "^8.13.0"
+  }
+}

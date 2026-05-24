@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: treeman-e2e-fw-rails-pg
+    environment: { POSTGRES_PASSWORD: pgpw }
+    ports: ["15482:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  ruby:
+    image: ruby:3.3-slim
+    container_name: treeman-e2e-fw-rails-ruby
+    command: ["sh", "-c", "apt-get update -qq && apt-get install -qq -y --no-install-recommends libpq-dev gcc make && gem install --silent activerecord pg standalone_migrations && sleep infinity"]
+    volumes:
+      - /tmp:/tmp
+    healthcheck:
+      test: ["CMD-SHELL", "ruby -r active_record -r pg -e ''"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy

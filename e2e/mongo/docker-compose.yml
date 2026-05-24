@@ -1,0 +1,12 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: treeman-e2e-mongo
+    ports:
+      - "27117:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping: 1}).ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s

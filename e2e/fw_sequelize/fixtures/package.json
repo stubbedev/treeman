@@ -1,0 +1,11 @@
+{
+  "name": "treeman-e2e-sequelize",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "sequelize": "^6.37.0",
+    "sequelize-cli": "^6.6.0",
+    "pg": "^8.13.0",
+    "pg-hstore": "^2.3.4"
+  }
+}

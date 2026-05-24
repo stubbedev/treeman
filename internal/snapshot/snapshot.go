@@ -127,6 +127,14 @@ func (k Key) TemplateName() string {
 	return fmt.Sprintf("_tm_%s", k.Fingerprint()[:16])
 }
 
+// IndexPrefix is the ES/OpenSearch variant of TemplateName: ES
+// forbids index names starting with `_`, so we drop the leading
+// namespace marker. Returns a stable, lowercase, hyphen-free prefix
+// without trailing punctuation; callers add their own separator.
+func (k Key) IndexPrefix() string {
+	return fmt.Sprintf("tm_%s", k.Fingerprint()[:16])
+}
+
 // HashCache is the subset of *store.Store that LockfileHashesFor +
 // MigrationsHash need: a stat-gated cache that returns hex digests
 // for absolute paths. Defined here so internal/snapshot doesn't

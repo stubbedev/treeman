@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: treeman-e2e-fw-diesel-pg
+    environment: { POSTGRES_PASSWORD: pgpw }
+    ports: ["15552:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  rust:
+    image: rust:1-slim
+    container_name: treeman-e2e-fw-diesel-rust
+    command: ["sh", "-c", "apt-get update -qq && apt-get install -qq -y --no-install-recommends libpq-dev libssl-dev pkg-config gcc && cargo install --quiet diesel_cli --no-default-features --features postgres && sleep infinity"]
+    volumes:
+      - /tmp:/tmp
+    healthcheck:
+      test: ["CMD-SHELL", "which diesel"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy

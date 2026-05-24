@@ -716,9 +716,17 @@ func preparePostgres(
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
-		if _, err := dumpload.LoadPostgres(ctx, drv.DB, sourceDB, dp); err != nil {
+		// Postgres has no USE, so dumpload needs a connection scoped
+		// to the target DB rather than the server-level pool.
+		scoped, err := drv.OpenScoped(ctx, sourceDB)
+		if err != nil {
+			return Outcome{}, err
+		}
+		if _, err := dumpload.LoadPostgres(ctx, scoped, sourceDB, dp); err != nil {
+			scoped.Close()
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
+		scoped.Close()
 	}
 	if d.Migrate != nil {
 		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, inheritedEnv)
@@ -1131,7 +1139,9 @@ func prepareES(
 
 	version, _ := drv.EngineVersion(ctx)
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourcePrefix, version)
-	templatePrefix := key.TemplateName() + "_" // trailing _ so the prefix is unambiguous
+	// ES forbids index names starting with `_`, so we use a
+	// dedicated prefix (tm_<fingerprint>_) for the template indices.
+	templatePrefix := key.IndexPrefix() + "_"
 
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
 		fmt.Sprintf("engine=elasticsearch source=%s template=%s", sourcePrefix, templatePrefix),

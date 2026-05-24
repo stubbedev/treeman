@@ -110,6 +110,40 @@ func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 
 func (d *Driver) Close() error { return d.DB.Close() }
 
+// OpenScoped returns a fresh *sql.DB scoped to `dbName`. Use when
+// you need to execute SQL that hits a specific database — Postgres
+// has no `USE`, so each target DB needs its own connection. The
+// returned DB owns its pool; the caller MUST Close it.
+func (d *Driver) OpenScoped(ctx context.Context, dbName string) (*sql.DB, error) {
+	var dsn string
+	if strings.HasPrefix(d.cfg.Host, "/") {
+		dsn = fmt.Sprintf(
+			"postgres://%s:%s@/%s?sslmode=disable&host=%s",
+			url.QueryEscape(d.cfg.User),
+			url.QueryEscape(d.cfg.Password),
+			url.QueryEscape(dbName),
+			url.QueryEscape(d.cfg.Host),
+		)
+	} else {
+		dsn = fmt.Sprintf(
+			"postgres://%s:%s@%s:%d/%s?sslmode=disable",
+			url.QueryEscape(d.cfg.User),
+			url.QueryEscape(d.cfg.Password),
+			d.cfg.Host, d.cfg.Port,
+			url.QueryEscape(dbName),
+		)
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open postgres %s: %w", dbName, err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping postgres %s: %w", dbName, err)
+	}
+	return db, nil
+}
+
 func (d *Driver) EngineVersion(ctx context.Context) (string, error) {
 	var v string
 	if err := d.DB.QueryRowContext(ctx, "SELECT version()").Scan(&v); err != nil {
