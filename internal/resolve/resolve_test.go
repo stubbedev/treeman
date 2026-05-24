@@ -32,14 +32,13 @@ func TestLaravelDbTestOverridesWin(t *testing.T) {
 }
 
 func TestYamlMysqlPicksUpPasswordFromEnvFile(t *testing.T) {
-	key := "DB_TEST_PASSWORD"
 	cfg := &config.Config{}
 	cfg.Connections.Mysql = &config.MysqlConn{
-		Host:        "127.0.0.1",
-		Port:        3306,
-		User:        "myapp",
-		PasswordEnv: &key,
-		PoolMax:     8,
+		Host:     "127.0.0.1",
+		Port:     3306,
+		User:     "myapp",
+		Password: "$DB_TEST_PASSWORD",
+		PoolMax:  8,
 	}
 	env := envfile.Parse("DB_TEST_PASSWORD=secret-pw\n")
 	r := resolveMysql(cfg, env)
@@ -125,14 +124,13 @@ func TestMongoUriComposedFromHostPort(t *testing.T) {
 }
 
 func TestNullPasswordInEnvYieldsNoPassword(t *testing.T) {
-	key := "DB_PASSWORD"
 	cfg := &config.Config{}
 	cfg.Connections.Mysql = &config.MysqlConn{
-		Host:        "h",
-		Port:        3306,
-		User:        "u",
-		PasswordEnv: &key,
-		PoolMax:     8,
+		Host:     "h",
+		Port:     3306,
+		User:     "u",
+		Password: "$DB_PASSWORD",
+		PoolMax:  8,
 	}
 	env := envfile.Parse("DB_PASSWORD=null\n")
 	r := resolveMysql(cfg, env)

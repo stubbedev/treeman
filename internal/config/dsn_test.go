@@ -53,11 +53,12 @@ connections:
     host: db.internal
     port: 3306
     user: app
-    password_env: APP_DB_PASS
+    password: $APP_DB_PASS
     pool_max: 32
   postgres:
     host: 10.0.0.1
     user: postgres
+    password: ${PG_PASS}
 `
 	var cfg Config
 	if err := yaml.Unmarshal([]byte(y), &cfg); err != nil {
@@ -69,8 +70,12 @@ connections:
 	if cfg.Connections.Mysql.PoolMax != 32 {
 		t.Errorf("mysql PoolMax = %d", cfg.Connections.Mysql.PoolMax)
 	}
-	if cfg.Connections.Mysql.PasswordEnv == nil || *cfg.Connections.Mysql.PasswordEnv != "APP_DB_PASS" {
-		t.Errorf("mysql password_env not set")
+	// Pre-resolve, the password field holds the raw `$NAME` ref.
+	if cfg.Connections.Mysql.Password != "$APP_DB_PASS" {
+		t.Errorf("mysql password literal = %q", cfg.Connections.Mysql.Password)
+	}
+	if cfg.Connections.Postgres.Password != "${PG_PASS}" {
+		t.Errorf("postgres password literal = %q", cfg.Connections.Postgres.Password)
 	}
 }
 

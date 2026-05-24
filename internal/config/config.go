@@ -200,15 +200,14 @@ type MysqlConn struct {
 	// REPLICATION SLAVE (when the binlog watcher is enabled).
 	User string `yaml:"user"`
 
-	// Environment variable name holding the password. The daemon
-	// reads it from the process env, the repo's `.env*` files, or
-	// (last resort) the container's own env vars when a ContainerRef
-	// is set.
-	PasswordEnv *string `yaml:"password_env,omitempty"`
-
-	// Resolved password — runtime-only. The `yaml:"-"` tag keeps it
-	// out of serialised YAML so secrets never leak into snapshots.
-	Password string `yaml:"-"`
+	// Password is either a literal value or a `$NAME` / `${NAME}`
+	// reference to an env var. Refs are resolved from
+	// `env_sources:` files + the process env + (last resort) the
+	// container's own env vars when a ContainerRef is set.
+	//
+	// Use a ref in any setup beyond local dev — embedding a literal
+	// password in committed YAML is a security anti-pattern.
+	Password string `yaml:"password,omitempty"`
 
 	// Maximum open connections in the daemon's pool to this server.
 	// Defaults to a per-engine safe value. Raise only if the server
@@ -228,11 +227,11 @@ type MysqlConn struct {
 // (`mysql://user:pass@host:port/db`) or the structured object.
 // DSN form is for the common dev case where one URL captures
 // everything. Use the structured form when you need fine-grained
-// fields like `password_env`, `container`, `pool_max`, or `binlog`.
+// fields like `container`, `pool_max`, or `binlog`.
 //
 // DSN trade-offs:
 //   - Password is embedded in the URL — fine for dev, never for prod.
-//     For prod use `password_env:` in the structured form.
+//     For prod use `password: $ENVNAME` in the structured form.
 //   - Container/compose refs aren't expressible in a single URL —
 //     drop down to the structured form when you need them.
 func (c *MysqlConn) UnmarshalYAML(node *yaml.Node) error {
@@ -253,7 +252,7 @@ func (MysqlConn) JSONSchema() *jsonschema.Schema {
 		Host         string        `yaml:"host,omitempty"`
 		Port         uint16        `yaml:"port,omitempty"`
 		User         string        `yaml:"user"`
-		PasswordEnv  string        `yaml:"password_env,omitempty"`
+		Password     string        `yaml:"password,omitempty"`
 		PoolMax      uint32        `yaml:"pool_max,omitempty"`
 		Binlog       *BinlogConfig `yaml:"binlog,omitempty"`
 		ContainerRef ContainerRef  `yaml:",inline"`
@@ -306,12 +305,10 @@ type PostgresConn struct {
 	// REPLICATION when wire-protocol replay is enabled.
 	User string `yaml:"user"`
 
-	// Env var name holding the password. Same resolution order as
-	// MysqlConn.PasswordEnv.
-	PasswordEnv *string `yaml:"password_env,omitempty"`
-
-	// Resolved password — runtime-only, never serialised.
-	Password string `yaml:"-"`
+	// Password is either a literal value or a `$NAME` / `${NAME}`
+	// env-var reference. See MysqlConn.Password for the resolution
+	// order and the security warning about literals.
+	Password string `yaml:"password,omitempty"`
 
 	// Maximum open connections in the daemon's pool.
 	PoolMax      uint32 `yaml:"pool_max,omitempty"`
@@ -339,7 +336,7 @@ func (PostgresConn) JSONSchema() *jsonschema.Schema {
 		Host         string       `yaml:"host,omitempty"`
 		Port         uint16       `yaml:"port,omitempty"`
 		User         string       `yaml:"user"`
-		PasswordEnv  string       `yaml:"password_env,omitempty"`
+		Password     string       `yaml:"password,omitempty"`
 		PoolMax      uint32       `yaml:"pool_max,omitempty"`
 		ContainerRef ContainerRef `yaml:",inline"`
 	}{})

@@ -182,7 +182,7 @@ func loadRepoEnv(repoRoot string, sources []string) envfile.EnvFile {
 func resolveMysql(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.MysqlConn] {
 	if cfg.Connections.Mysql != nil {
 		m := *cfg.Connections.Mysql
-		m.Password = resolveMysqlPassword(env, m.PasswordEnv)
+		m.Password = resolveMysqlPassword(env, m.Password)
 		return &resolvedConn[config.MysqlConn]{Conn: m, Source: Source{Kind: SourceYaml}}
 	}
 	// Spring Boot — SPRING_DATASOURCE_URL is JDBC-style; strip the
@@ -232,18 +232,16 @@ func resolveMysql(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.
 			Host:     host,
 			Port:     port,
 			User:     user,
-			Password: resolveMysqlPassword(env, nil),
+			Password: resolveMysqlPassword(env, ""),
 			PoolMax:  8,
 		},
 		Source: repoSrc(env),
 	}
 }
 
-func resolveMysqlPassword(env envfile.EnvFile, passwordEnv *string) string {
-	if passwordEnv != nil {
-		if v, ok := env.Get(*passwordEnv); ok && nonEmpty(v) {
-			return v
-		}
+func resolveMysqlPassword(env envfile.EnvFile, configured string) string {
+	if v := resolvePasswordValue(env, configured); v != "" {
+		return v
 	}
 	for _, k := range []string{"DB_TEST_PASSWORD", "DB_PASSWORD", "MYSQL_PASSWORD", "MYSQL_PWD"} {
 		if v, ok := env.Get(k); ok && nonEmpty(v) {
@@ -258,7 +256,7 @@ func resolveMysqlPassword(env envfile.EnvFile, passwordEnv *string) string {
 func resolvePostgres(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.PostgresConn] {
 	if cfg.Connections.Postgres != nil {
 		p := *cfg.Connections.Postgres
-		p.Password = resolvePostgresPassword(env, p.PasswordEnv)
+		p.Password = resolvePostgresPassword(env, p.Password)
 		return &resolvedConn[config.PostgresConn]{Conn: p, Source: Source{Kind: SourceYaml}}
 	}
 	if v, ok := env.Get("SPRING_DATASOURCE_URL"); ok {
@@ -298,11 +296,9 @@ func resolvePostgres(cfg *config.Config, env envfile.EnvFile) *resolvedConn[conf
 	return nil
 }
 
-func resolvePostgresPassword(env envfile.EnvFile, passwordEnv *string) string {
-	if passwordEnv != nil {
-		if v, ok := env.Get(*passwordEnv); ok && nonEmpty(v) {
-			return v
-		}
+func resolvePostgresPassword(env envfile.EnvFile, configured string) string {
+	if v := resolvePasswordValue(env, configured); v != "" {
+		return v
 	}
 	for _, k := range []string{"DB_TEST_PASSWORD", "DB_PASSWORD", "PGPASSWORD", "POSTGRES_PASSWORD"} {
 		if v, ok := env.Get(k); ok && nonEmpty(v) {
@@ -310,6 +306,72 @@ func resolvePostgresPassword(env envfile.EnvFile, passwordEnv *string) string {
 		}
 	}
 	return ""
+}
+
+// resolvePasswordValue accepts a YAML-configured password that's
+// either a literal value or an env-var reference. Recognised ref
+// forms:
+//
+//	$NAME      — env var lookup. NAME must start with [A-Za-z_] and
+//	             continue with [A-Za-z0-9_].
+//	${NAME}    — same, with explicit braces (useful when the literal
+//	             might continue with letters/digits).
+//
+// Empty input returns empty. Literal values (anything not matching
+// the ref grammar) pass through unchanged — including literals that
+// start with `$` but aren't a valid ref form (e.g. `$pass#word`).
+func resolvePasswordValue(env envfile.EnvFile, configured string) string {
+	if configured == "" {
+		return ""
+	}
+	name := parsePasswordRef(configured)
+	if name == "" {
+		return configured
+	}
+	if v, ok := env.Get(name); ok && nonEmpty(v) {
+		return v
+	}
+	return ""
+}
+
+// parsePasswordRef returns the env-var name if `s` is exactly
+// `$NAME` or `${NAME}`. Returns "" if `s` is a literal.
+func parsePasswordRef(s string) string {
+	if len(s) < 2 || s[0] != '$' {
+		return ""
+	}
+	if s[1] == '{' {
+		if s[len(s)-1] != '}' {
+			return ""
+		}
+		name := s[2 : len(s)-1]
+		if !isIdent(name) {
+			return ""
+		}
+		return name
+	}
+	name := s[1:]
+	if !isIdent(name) {
+		return ""
+	}
+	return name
+}
+
+func isIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r == '_':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ─────────────────────────── mongo ───────────────────────────

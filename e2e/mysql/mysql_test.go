@@ -77,16 +77,13 @@ func TestMySQLEndToEnd(t *testing.T) {
 }
 
 func buildConfig() *config.Config {
-	pwEnv := "MYSQL_E2E_PASSWORD"
-	_ = os.Setenv(pwEnv, "rootpw")
 	return &config.Config{
 		Connections: config.ConnectionsConfig{
 			Mysql: &config.MysqlConn{
-				Host:        "127.0.0.1",
-				Port:        13306,
-				User:        "root",
-				PasswordEnv: &pwEnv,
-				Password:    "rootpw",
+				Host:     "127.0.0.1",
+				Port:     13306,
+				User:     "root",
+				Password: "rootpw",
 			},
 		},
 		Databases: []config.DatabaseConfig{

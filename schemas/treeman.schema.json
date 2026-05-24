@@ -503,7 +503,7 @@
             "user": {
               "type": "string"
             },
-            "password_env": {
+            "password": {
               "type": "string"
             },
             "pool_max": {
@@ -592,7 +592,7 @@
             "user": {
               "type": "string"
             },
-            "password_env": {
+            "password": {
               "type": "string"
             },
             "pool_max": {

@@ -204,7 +204,7 @@ connections:
     host: 127.0.0.1
     port: 13416
     user: root
-    password_env: MYSQL_PW
+    password: $MYSQL_PW
 databases:
   - engine: mysql
     name_template: tm_xtr_ctr_{slug}
@@ -291,7 +291,7 @@ worktrees: { root: .worktrees }
 env_sources: [.env]
 debounce_ms: 200
 connections:
-  mysql: { host: 127.0.0.1, port: 13416, user: root, password_env: MYSQL_PW }
+  mysql: { host: 127.0.0.1, port: 13416, user: root, password: $MYSQL_PW }
 databases:
   - engine: mysql
     name_template: tm_xtr_mtch_{slug}

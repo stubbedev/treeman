@@ -56,7 +56,7 @@ func TestOnCheckoutHookFires(t *testing.T) {
 worktrees: { root: .worktrees }
 env_sources: [.env]
 connections:
-  mysql: { host: 127.0.0.1, port: 13426, user: root, password_env: MYSQL_PW }
+  mysql: { host: 127.0.0.1, port: 13426, user: root, password: $MYSQL_PW }
 databases:
   - engine: mysql
     name_template: tm_oc_{slug}

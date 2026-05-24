@@ -37,12 +37,12 @@ connections:
     host: 127.0.0.1
     port: 3306
     user: root
-    password_env: MYSQL_ROOT_PASSWORD     # overrides .env DB_PASSWORD
+    password: $MYSQL_ROOT_PASSWORD     # overrides .env DB_PASSWORD
   postgres:
     host: 127.0.0.1
     port: 5432
     user: postgres
-    password_env: PGPASSWORD
+    password: $PGPASSWORD
   mongodb: { uri: "mongodb://127.0.0.1:27017" }
   redis:   { url: "redis://127.0.0.1:6379" }
   elasticsearch: { url: "http://127.0.0.1:9200" }
@@ -329,7 +329,7 @@ connections:
     container_network: myapp_net  # optional: pin which network's IP to use
     port: 3306                    # internal port; defaults to engine default
     user: root
-    password_env: MYSQL_ROOT_PASSWORD   # or omit — see "Container env" below
+    password: $MYSQL_ROOT_PASSWORD   # or omit — see "Container env" below
 
   postgres:
     compose_service: db           # docker-compose service name (alternative to container:)
@@ -341,7 +341,7 @@ connections:
     uri: "mongodb://placeholder:27017"   # host:port rewritten at dial time
 ```
 
-**Container env autodiscovery.** When `password_env:` is unset and
+**Container env autodiscovery.** When `password:` is unset and
 the resolver still has no password from env files, treeman pulls
 `MYSQL_ROOT_PASSWORD` / `POSTGRES_PASSWORD` straight out of the
 container's `Config.Env`. Skip the password block when you've

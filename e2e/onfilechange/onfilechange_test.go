@@ -66,7 +66,7 @@ connections:
     host: 127.0.0.1
     port: 13336
     user: root
-    password_env: MYSQL_PW
+    password: $MYSQL_PW
 databases:
   - engine: mysql
     name_template: tm_ofc_{slug}

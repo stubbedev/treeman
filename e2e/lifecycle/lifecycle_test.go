@@ -68,7 +68,7 @@ connections:
     host: 127.0.0.1
     port: 13316
     user: root
-    password_env: MYSQL_E2E_PW
+    password: $MYSQL_E2E_PW
 
 databases:
   - engine: mysql
