@@ -48,13 +48,16 @@ const (
 
 // CreateResult is the structured outcome of a Create call. Status
 // is always set; LogPath is populated only when Status==CreatedDetached.
+//
+// JSON tags are snake_case to match the rest of the MCP tool surface
+// (callers parse this directly off MCP's structuredContent).
 type CreateResult struct {
-	WtPath     string
-	Slug       string
-	RepoID     int64
-	WorktreeID int64
-	Status     CreateStatus
-	LogPath    string
+	WtPath     string       `json:"wt_path"`
+	Slug       string       `json:"slug"`
+	RepoID     int64        `json:"repo_id"`
+	WorktreeID int64        `json:"worktree_id"`
+	Status     CreateStatus `json:"status"`
+	LogPath    string       `json:"log_path,omitempty"`
 }
 
 // Create runs the full worktree-create lifecycle: git worktree add,
@@ -121,7 +124,11 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 	} else {
 		gitArgs = []string{"worktree", "add", "-b", req.Branch, wtPath, base}
 	}
-	if err := gitcmd.RunPiped(ctx, req.RepoRoot, os.Stdout, os.Stderr, gitArgs...); err != nil {
+	// Route git's output to stderr (not stdout) so the --print-path
+	// shell idiom — `cd "$(treeman wt create x --print-path)"` —
+	// doesn't ingest "Preparing worktree …" / "HEAD is now at …"
+	// lines that git emits on its stdout.
+	if err := gitcmd.RunPiped(ctx, req.RepoRoot, os.Stderr, os.Stderr, gitArgs...); err != nil {
 		return CreateResult{}, fmt.Errorf("git worktree add: %w", err)
 	}
 	abs, err := filepath.Abs(wtPath)

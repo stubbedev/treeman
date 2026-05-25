@@ -224,6 +224,89 @@ databases:
 	}
 }
 
+// TestCLIPrintPathStreamDiscipline verifies the shell-shim contract:
+//
+//	cd "$(treeman wt create x --print-path)"
+//
+// must work. The worktree path is the ONLY line on stdout; every
+// status line ("created worktree #N …", "queued: …", patch
+// announcements, etc.) must go to stderr so the cd substitution
+// never picks up a non-path line. No engine needed — --skip-hooks
+// short-circuits the daemon dispatch.
+func TestCLIPrintPathStreamDiscipline(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoRoot = filepath.Dir(filepath.Dir(repoRoot))
+	binDir := t.TempDir()
+	buildBin(t, binDir, repoRoot, "treeman", "./cmd/treeman")
+
+	// Isolated state so we don't trip over the developer's daemon.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "treeman.db"))
+
+	mainRepo := filepath.Join(t.TempDir(), "main")
+	if err := os.MkdirAll(mainRepo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, mainRepo, "init", "-q", "-b", "main")
+	mustGit(t, mainRepo, "config", "user.email", "e2e@example.com")
+	mustGit(t, mainRepo, "config", "user.name", "e2e")
+	mustGit(t, mainRepo, "commit", "--allow-empty", "-q", "-m", "initial")
+
+	// Capture stdout + stderr separately so we can assert the split.
+	cmd := exec.Command(filepath.Join(binDir, "treeman"),
+		"wt", "create", "feature/printpath", "--skip-hooks", "--print-path")
+	cmd.Dir = mainRepo
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("treeman wt create: %v\nstdout:\n%s\nstderr:\n%s",
+			err, stdout.String(), stderr.String())
+	}
+
+	stdoutLines := splitNonEmpty(stdout.String())
+	if len(stdoutLines) != 1 {
+		t.Fatalf("stdout should be exactly one line (the path); got %d:\n%s",
+			len(stdoutLines), stdout.String())
+	}
+	wtPath := stdoutLines[0]
+	if !filepath.IsAbs(wtPath) {
+		t.Errorf("stdout line should be an absolute path, got %q", wtPath)
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Errorf("printed path does not exist: %v", err)
+	}
+
+	// Stream-discipline checks: stdout must NOT carry status text.
+	for _, marker := range []string{"created worktree", "queued:", "patched"} {
+		if strings.Contains(stdout.String(), marker) {
+			t.Errorf("stdout leaked status marker %q:\n%s", marker, stdout.String())
+		}
+	}
+	// And stderr SHOULD carry the success line.
+	if !strings.Contains(stderr.String(), "created worktree") {
+		t.Errorf("stderr missing 'created worktree' status line:\n%s", stderr.String())
+	}
+}
+
+func splitNonEmpty(s string) []string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
 func buildBin(t *testing.T, binDir, repoRoot, name, pkg string) {
 	t.Helper()
 	cmd := exec.Command("go", "build", "-o",

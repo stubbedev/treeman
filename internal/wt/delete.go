@@ -48,10 +48,12 @@ const (
 )
 
 // DeleteResult is the structured outcome of a Delete call.
+//
+// JSON tags are snake_case to match the rest of the MCP tool surface.
 type DeleteResult struct {
-	WtPath  string
-	Status  DeleteStatus
-	LogPath string
+	WtPath  string       `json:"wt_path"`
+	Status  DeleteStatus `json:"status"`
+	LogPath string       `json:"log_path,omitempty"`
 }
 
 // Delete resolves the target worktree and either dispatches the
@@ -140,7 +142,9 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 		args = append(args, "--force")
 	}
 	args = append(args, wtPath)
-	if err := gitcmd.RunPiped(ctx, repoRoot, os.Stdout, os.Stderr, args...); err != nil && !force {
+	// Same stdout-discipline rationale as Create's git invocation:
+	// route everything informational to stderr.
+	if err := gitcmd.RunPiped(ctx, repoRoot, os.Stderr, os.Stderr, args...); err != nil && !force {
 		return fmt.Errorf("git worktree remove: %w", err)
 	}
 	PruneEmptyParents(wtPath, WorktreesRoot(cfg, repoRoot))

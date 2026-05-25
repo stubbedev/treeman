@@ -49,6 +49,33 @@ func TestSnapshotCreateRejectsSameSrcDst(t *testing.T) {
 	}
 }
 
+// TestClientPoolReuse asserts that repeated client() calls return
+// the same pooled *redis.Client and that the pool isn't being
+// closed between calls. Regression guard for the bug where
+// snapshot.go held `defer c.Close()` after the pool refactor —
+// the first defer killed the pool and the second client() call
+// produced a dialable-but-immediately-closed client. The bug only
+// surfaces on the second back-to-back snapshot op on the same
+// Driver, which is exactly what e2e exercises but unit tests did
+// not.
+func TestClientPoolReuse(t *testing.T) {
+	d := newTestDriver(t)
+	c1 := d.client()
+	c2 := d.client()
+	if c1 != c2 {
+		t.Fatalf("client() returned a different instance on repeated call (%p vs %p)", c1, c2)
+	}
+	// Driver.Close shuts everything down; afterwards a fresh call
+	// must open a new client rather than handing back the dead one.
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	c3 := d.client()
+	if c3 == c1 {
+		t.Fatal("client() returned the closed instance after Close()")
+	}
+}
+
 // TestVersionAtLeast covers the parser used for the COPY-vs-
 // DUMP+RESTORE strategy pick. Edge cases the parser must handle:
 // trailing pre-release suffix, missing patch, non-numeric noise.
