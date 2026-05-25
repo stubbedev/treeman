@@ -522,8 +522,3 @@ drop every cached snapshot for this repo and force the next prepare to rebuild
 
 run the Model Context Protocol server (stdio transport)
 
-| Flag | Usage |
-|---|---|
-| `--allow-mutations` | enable tools that modify config, run hooks/prepare, or invoke `treeman wt create\|delete` |
-| `--allow-shell` | enable shell-out tools (worktree_create, worktree_delete). Implies --allow-mutations. |
-
