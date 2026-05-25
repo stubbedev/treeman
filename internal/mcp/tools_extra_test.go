@@ -17,10 +17,10 @@ import (
 // suffix, and wrong scheme.
 func TestParseWorktreeSlugURI(t *testing.T) {
 	cases := []struct {
-		uri          string
-		wantSlug     string
-		wantTail     string
-		wantOK       bool
+		uri      string
+		wantSlug string
+		wantTail string
+		wantOK   bool
 	}{
 		{"treeman://worktrees/feature-x/events", "feature-x", "events", true},
 		{"treeman://worktrees/feature-x/hooks", "feature-x", "hooks", true},
@@ -49,9 +49,9 @@ func TestDiffMaps(t *testing.T) {
 		"nested":      map[string]any{"a": 1, "changed": "old"},
 	}
 	b := map[string]any{
-		"engine":      "mysql",
-		"added_key":   "y",
-		"nested":      map[string]any{"a": 1, "changed": "new"},
+		"engine":    "mysql",
+		"added_key": "y",
+		"nested":    map[string]any{"a": 1, "changed": "new"},
 	}
 	got := diffMaps("", a, b)
 
@@ -60,9 +60,9 @@ func TestDiffMaps(t *testing.T) {
 		ops[c.Path] = c.Op
 	}
 	want := map[string]string{
-		"removed_key":     "remove",
-		"added_key":       "add",
-		"nested.changed":  "change",
+		"removed_key":    "remove",
+		"added_key":      "add",
+		"nested.changed": "change",
 	}
 	if !reflect.DeepEqual(ops, want) {
 		t.Errorf("diff changes = %v, want %v (full: %+v)", ops, want, got)

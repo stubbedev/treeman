@@ -628,7 +628,6 @@ func wtSwitch() *cli.Command {
 	}
 }
 
-
 // wtBack — `treeman wt back`. Prints the main repo root for the
 // current cwd. With `--remove`, also deletes the current linked
 // worktree if it is clean (`git status --porcelain` empty) and has
@@ -973,4 +972,3 @@ func touchVisitedByPath(ctx context.Context, path string) {
 	defer st.Close()
 	_ = st.TouchWorktreeVisitedByPath(ctx, path)
 }
-

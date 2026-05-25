@@ -8,7 +8,6 @@
 // dispatch mode (`auto` | `delta` | `rebuild`). Events are debounced
 // per (worktree, mode) pair so a `git pull` that drops 40 migration
 // files at once collapses into one prepare run per worktree.
-//
 package watcher
 
 import (

@@ -508,7 +508,6 @@ type WorktreesConfig struct {
 	// Directories are recursed; existing destinations are left alone
 	// (idempotent re-runs).
 	Copies []string `yaml:"copies,omitempty"`
-
 }
 
 // Patch — one entry in the top-level `patches:` block. Each entry
@@ -565,22 +564,22 @@ type Patch struct {
 //
 // Triggers (all optional — omit any you don't need):
 //
-//   • on-create-before-engines — during `wt create`, after patches +
+//   - on-create-before-engines — during `wt create`, after patches +
 //     bring-in (copies/links), BEFORE engine prepare. Standard
 //     home of dependency installs (composer/yarn/pip) so migrate
 //     can find vendor/.
-//   • on-create-after-engines — during `wt create`, after engine
+//   - on-create-after-engines — during `wt create`, after engine
 //     prepare. Use when actions need a populated database
 //     (cache warming, seed verification).
-//   • on-delete-before-engines — during `wt delete`, BEFORE DB
+//   - on-delete-before-engines — during `wt delete`, BEFORE DB
 //     drop. Graceful shutdown: drain queues, docker compose stop.
-//   • on-delete-after-engines — during `wt delete`, AFTER DB drop +
+//   - on-delete-after-engines — during `wt delete`, AFTER DB drop +
 //     git worktree remove. External notifications (Slack, CDN
 //     purge) that should announce only once the data is gone.
-//   • on-checkout — fires when the HEAD watcher sees a branch
+//   - on-checkout — fires when the HEAD watcher sees a branch
 //     switch inside an existing worktree. Re-runs in addition to
 //     the regular finalize-on-HEAD-change behaviour.
-//   • on-file-change — fires when any `databases[].inputs[]` glob
+//   - on-file-change — fires when any `databases[].inputs[]` glob
 //     matches a filesystem event. Each action can optionally
 //     `match: <label>` to filter by the input entry's label.
 //
@@ -624,13 +623,13 @@ type HooksConfig struct {
 // Action — one entry under `hooks.{setup,teardown}.actions`. Every
 // action is a mapping; there are no shorthand forms.
 //
-//   • `run` is the work, as either a single shell string (one
+//   - `run` is the work, as either a single shell string (one
 //     command) or a list of shell strings (sequenced steps chained
 //     with `&&`).
-//   • `cwd` is the group-level working directory; all steps in the
+//   - `cwd` is the group-level working directory; all steps in the
 //     action share it. Use multiple actions if you need different
 //     cwds.
-//   • `container` / `compose_service` (mutually exclusive) wrap the
+//   - `container` / `compose_service` (mutually exclusive) wrap the
 //     whole action in `<engine> exec` / `<engine> compose exec` so
 //     it runs inside the named container. `in_container` is an
 //     accepted alias for `container`. `engine` is an alias for

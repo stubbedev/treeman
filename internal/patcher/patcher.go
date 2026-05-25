@@ -4,7 +4,7 @@
 //
 //   - dotenv      : `KEY=value` lines (PatchEnvFile)
 //   - phpunit_env : `<env name="KEY" value="..."/>` inside `<php>`
-//                   (PatchPhpunitFile)
+//     (PatchPhpunitFile)
 //   - yaml        : dotted-path key set, preserving comments (PatchYAMLFile)
 //   - json        : dotted-path key set on a JSON document (PatchJSONFile)
 //

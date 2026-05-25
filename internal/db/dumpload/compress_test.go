@@ -21,8 +21,8 @@ func TestSniffFormatRecognisesAllSupported(t *testing.T) {
 	payload := []byte("INSERT INTO t VALUES (1, 'two', 3);\n\x00\xffend\n")
 
 	cases := []struct {
-		name    string
-		want    Format
+		name     string
+		want     Format
 		compress func(t *testing.T, in []byte) []byte
 	}{
 		{"none", FormatNone, func(t *testing.T, in []byte) []byte { return in }},

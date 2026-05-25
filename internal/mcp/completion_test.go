@@ -179,11 +179,11 @@ func TestCompletionHandler_UnknownArgReturnsEmpty(t *testing.T) {
 
 func TestExtractRunID(t *testing.T) {
 	cases := map[string]string{
-		`{"run_id":"abc","x":"y"}`:     "abc",
+		`{"run_id":"abc","x":"y"}`:      "abc",
 		`{"x":"y","run_id":"deadbeef"}`: "deadbeef",
-		`{"x":"y"}`:                    "",
-		``:                             "",
-		`{"run_id":"`:                  "", // no closing quote
+		`{"x":"y"}`:                     "",
+		``:                              "",
+		`{"run_id":"`:                   "", // no closing quote
 	}
 	for in, want := range cases {
 		if got := extractRunID(in); got != want {

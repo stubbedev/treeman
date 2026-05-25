@@ -31,11 +31,11 @@ type HeadWatcher struct {
 	headName     string // basename of headPath
 	onChange     func(ctx context.Context, newRef string)
 
-	debounce  time.Duration
-	mu        sync.Mutex
-	lastSeen  string
-	pending   *time.Timer
-	fsw       *fsnotify.Watcher
+	debounce time.Duration
+	mu       sync.Mutex
+	lastSeen string
+	pending  *time.Timer
+	fsw      *fsnotify.Watcher
 }
 
 // resolveHeadPath returns the absolute path of the HEAD file for

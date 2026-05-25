@@ -188,9 +188,9 @@ func RunHooks(
 // chain with ` && ` so a failure short-circuits the rest. The
 // action's cwd applies group-wide:
 //
-//   • Host execution:  `( cd <cwd> && <step1> && <step2> )`
-//   • Container exec:  `<engine> exec [-w cwd] <id> sh -c '<step1>'
-//                       && <engine> exec [-w cwd] <id> sh -c '<step2>'`
+//   - Host execution:  `( cd <cwd> && <step1> && <step2> )`
+//   - Container exec:  `<engine> exec [-w cwd] <id> sh -c '<step1>'
+//     && <engine> exec [-w cwd] <id> sh -c '<step2>'`
 //
 // `defaultCwd` is the worktree root — used when the action's `cwd`
 // is empty on the host path. In the container path the absence of

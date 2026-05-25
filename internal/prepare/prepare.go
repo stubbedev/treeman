@@ -980,12 +980,12 @@ func prepareMongo(
 // same cache-hit / cold-build / parallel-fanout flow as every other
 // engine. Two isolation modes:
 //
-//   • `namespaces.prefix_template` (preferred) — every key lives in
+//   - `namespaces.prefix_template` (preferred) — every key lives in
 //     DB 0 under a per-worktree prefix. No 16-DB limit, no FLUSHDB
 //     blast radius, works on cluster mode. Template caching via
 //     SCAN + server-side COPY with prefix rewrite. Fanout produces
 //     N independent prefixes from `test_clones.name_template`.
-//   • `namespaces.db_index_template` (legacy) — per-worktree
+//   - `namespaces.db_index_template` (legacy) — per-worktree
 //     logical DB (0-15). FLUSHDB clears the index; no template
 //     caching since the 16-slot space can't hold both. Kept for
 //     existing configs.
@@ -1391,16 +1391,16 @@ func computeSnapshotKey(
 // for one configured database, the inputs that fed it, and whether
 // a matching cached snapshot exists on disk.
 type FingerprintReport struct {
-	Engine        string            `json:"engine"`
-	EngineVersion string            `json:"engine_version"`
-	SourceDB      string            `json:"source_db"`
-	TemplateName  string            `json:"template_name"`
-	Fingerprint   string            `json:"fingerprint"`
-	DumpHash      string            `json:"dump_hash,omitempty"`
-	InputHashes   map[string]string `json:"input_hashes"`
-	CommandsHash  string            `json:"commands_hash,omitempty"`
-	CachedSnapshot *store.SnapshotRecord `json:"cached_snapshot,omitempty"`
-	CacheHitAvailable bool          `json:"cache_hit_available"`
+	Engine            string                `json:"engine"`
+	EngineVersion     string                `json:"engine_version"`
+	SourceDB          string                `json:"source_db"`
+	TemplateName      string                `json:"template_name"`
+	Fingerprint       string                `json:"fingerprint"`
+	DumpHash          string                `json:"dump_hash,omitempty"`
+	InputHashes       map[string]string     `json:"input_hashes"`
+	CommandsHash      string                `json:"commands_hash,omitempty"`
+	CachedSnapshot    *store.SnapshotRecord `json:"cached_snapshot,omitempty"`
+	CacheHitAvailable bool                  `json:"cache_hit_available"`
 }
 
 // InspectFingerprint computes the snapshot fingerprint for one

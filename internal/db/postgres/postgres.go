@@ -85,7 +85,6 @@ func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 	return &Driver{DB: db, cfg: cfg}, nil
 }
 
-
 func (d *Driver) Close() error { return d.DB.Close() }
 
 // OpenScoped returns a fresh *sql.DB scoped to `dbName`. Use when
@@ -320,4 +319,3 @@ func (d *Driver) execOutsideTx(ctx context.Context, stmt string) (sql.Result, er
 	defer conn.Close()
 	return conn.ExecContext(ctx, stmt)
 }
-

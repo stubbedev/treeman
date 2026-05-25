@@ -394,9 +394,9 @@ type inputsFingerprintIn struct {
 }
 
 type inputsFingerprintEntry struct {
-	DBIndex int                     `json:"db_index"`
+	DBIndex int                       `json:"db_index"`
 	Report  prepare.FingerprintReport `json:"report"`
-	Note    string                  `json:"note,omitempty" jsonschema:"e.g. \"engine_version skipped — pass probe_engine=true to match the cached fingerprint\""`
+	Note    string                    `json:"note,omitempty" jsonschema:"e.g. \"engine_version skipped — pass probe_engine=true to match the cached fingerprint\""`
 }
 
 type inputsFingerprintOut struct {

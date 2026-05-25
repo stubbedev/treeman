@@ -120,9 +120,9 @@ func (d *Driver) DropSnapshot(ctx context.Context, templatePrefix string) error 
 // copyByPrefix is the inner loop shared by SnapshotCreate /
 // SnapshotRestore. Dispatches between two strategies:
 //
-//   • Redis 6.2+ → server-side `COPY` (one round-trip per key,
+//   - Redis 6.2+ → server-side `COPY` (one round-trip per key,
 //     pipelined ≥100 keys per Exec). TTLs preserved automatically.
-//   • Redis < 6.2 → DUMP + RESTORE fallback (two round-trips per
+//   - Redis < 6.2 → DUMP + RESTORE fallback (two round-trips per
 //     batch: phase 1 DUMP+PTTL, phase 2 RESTORE REPLACE). RESTORE
 //     REPLACE requires Redis 3.0+, which is universally satisfied.
 //
@@ -221,8 +221,9 @@ func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix stri
 // copyByPrefixDumpRestore is the pre-6.2 fallback.
 //
 // Per batch of up to 100 keys:
-//   Phase 1: pipeline DUMP + PTTL on every source key (1 round-trip).
-//   Phase 2: pipeline RESTORE on every destination key (1 round-trip).
+//
+//	Phase 1: pipeline DUMP + PTTL on every source key (1 round-trip).
+//	Phase 2: pipeline RESTORE on every destination key (1 round-trip).
 //
 // Two round-trips per 100 keys is slower than COPY's one, but
 // network-cost-wise it's still ~50 keys per network hop. TTLs are

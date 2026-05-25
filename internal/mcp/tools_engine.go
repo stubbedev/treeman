@@ -213,9 +213,9 @@ type dbSchemaIn struct {
 	DB     string `json:"db"`
 }
 type dbSchemaOut struct {
-	Engine  string         `json:"engine"`
-	DB      string         `json:"db"`
-	Schema  map[string]any `json:"schema"`
+	Engine string         `json:"engine"`
+	DB     string         `json:"db"`
+	Schema map[string]any `json:"schema"`
 }
 
 func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchemaIn) (*mcpsdk.CallToolResult, dbSchemaOut, error) {
@@ -309,8 +309,8 @@ type dbQueryIn struct {
 	Limit      int    `json:"limit,omitempty" jsonschema:"max rows/docs returned (default 100)"`
 }
 type dbQueryOut struct {
-	Engine  string `json:"engine"`
-	Rows    []any  `json:"rows"`
+	Engine  string   `json:"engine"`
+	Rows    []any    `json:"rows"`
 	Columns []string `json:"columns,omitempty"`
 }
 
