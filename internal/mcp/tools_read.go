@@ -27,63 +27,78 @@ import (
 func registerReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "doctor",
-		Description: "Run treeman health checks: daemon reachability, .treeman.yaml load, JSON schema install, migration framework detection, and registry/git worktree drift. Returns one result per check.",
+		Description: "Run treeman health checks. Call this FIRST when investigating any \"why isn't treeman working\" question — covers daemon reachability, .treeman.yaml load, JSON schema install, migration framework detection, and registry/git worktree drift. Returns one result per check (status: ok|warn|fail|skip) plus a remediation hint.",
 	}, doctorTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_get",
-		Description: "Load and return the resolved .treeman.yaml for the current (or specified) repo. Set resolved=true to include resolved connection strings for every configured engine.",
+		Description: "Read the .treeman.yaml for the current (or specified) repo. Pass resolved=true to see the post-substitution config treeman will actually execute against (env vars expanded, connection strings rendered). Use this before any config_write/config_set to know the current state.",
 	}, configGetTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_validate",
-		Description: "Try to load .treeman.yaml and report success or the first parse/validation error.",
+		Description: "Parse and validate .treeman.yaml; report the first parse or validation error. Run this after every config_write to confirm the file still loads — config_write itself validates, but config_validate covers manual edits made outside MCP.",
 	}, configValidateTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_schema",
-		Description: "Return the JSON Schema for .treeman.yaml (generated via reflection from the config.Config type). Use this to drive autocomplete or to validate a proposed config diff before writing it.",
+		Description: "Return the JSON Schema for .treeman.yaml, generated via reflection from config.Config. Use this to drive autocomplete or validate a proposed config body before calling config_write.",
 	}, configSchemaTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_list",
-		Description: "List active worktrees registered in the SQLite store. Optionally filter to a single repo by path.",
+		Description: "List active worktrees from the SQLite registry. Optionally filter by repo path. Use this to discover slugs, branches, and paths before calling worktree_show, worktree_delete, or scoping a logs_query.",
 	}, worktreeListTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_show",
-		Description: "Return detail for one worktree: slug, branch, path, created-at timestamp, and the most recent finalize event.",
+		Description: "Show details for one worktree: slug, branch, path, created-at, and the most recent finalize event. Use this to confirm a worktree exists and reached finalize before driving prepare_run or hook_run against it.",
 	}, worktreeShowTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_query",
-		Description: "Query the SQLite event log. All filters are optional and AND-combined. Levels, event_types, and phases are slice matches; since accepts duration (10m, 2h) or RFC3339; payload_like is a substring against payload_json.",
+		Description: "Query the SQLite event log. The PRIMARY tool for diagnosing anything that happened in treeman — every prepare/finalize/teardown/hook/watcher action emits events. All filters are optional and AND-combined: levels, event_types, phases, since (10m|2h|RFC3339), payload_like, run_id (8-char correlation id stamped on every event from one flow). When watching a long-running prepare, prefer logs_wait over polling this.",
 	}, logsQueryTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_hooks",
-		Description: "Return the most recent hook_run rows for a worktree (resolved by slug, branch, or basename).",
+		Description: "List the most recent hook_run rows for one worktree (resolved by slug, branch, or basename). Each row carries the hook command, exit code, and stdout/stderr tails. Pair with hook_log_read when a tail isn't enough.",
 	}, logsHooksTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "fw_detect",
-		Description: "Detect migration and test frameworks for the current (or specified) repo. Returns the same data as `treeman fw detect --json`.",
+		Description: "Detect migration and test frameworks for the current (or specified) repo. Call this BEFORE init_repo to know which scaffold template will be used. Returns the same data as `treeman fw detect --json`.",
 	}, fwDetectTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "slug_compute",
-		Description: "Compute the slug treeman would derive for a worktree path. Useful before creating a worktree to know which Redis db / DB name it'll use.",
+		Description: "Compute the slug treeman would derive for a worktree path. Call this before worktree_create to know which database/redis prefix/index suffix the new worktree will get.",
 	}, slugComputeTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_status",
-		Description: "Ask the running treemand for its version, PID, and watcher count. Returns a structured object with status=running|not-running.",
+		Description: "Probe the running treemand for version, PID, and watcher count. Returns status=running when the socket answers, status=not-running when it doesn't. Use this before any daemon-backed action (prepare_run, worktree_create) to confirm the daemon is alive.",
 	}, daemonStatusTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshots_list",
-		Description: "List cached snapshots (template DBs) for the current (or specified) repo. Read-only complement to snapshots_purge so agents can see what would be wiped before purging.",
+		Description: "List cached snapshots (template DBs) for the current (or specified) repo. Use this BEFORE snapshots_purge to see what would be wiped. For per-snapshot drilldown, follow up with snapshot_inspect on each fingerprint.",
 	}, snapshotsListTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "logs_wait",
+		Description: "Block until at least min_count new events match the supplied filter, or timeout_seconds elapses. Use this instead of polling logs_query when you're watching a long prepare/finalize/teardown to surface its outcome — pair with run_id to scope the wait to one flow's events. Returns the matching events; on timeout returns whatever arrived plus a timed_out=true flag.",
+	}, logsWaitTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "branches_list",
+		Description: "List local + remote-only git branches for the current (or specified) repo, annotated with whether each branch occupies a live worktree. Call this before worktree_create to pick an unoccupied branch — the same data the CLI's `treeman branches` shows.",
+	}, branchesListTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "config_diff",
+		Description: "Diff a proposed .treeman.yaml body against the current resolved config. Returns added/removed/changed paths so you can preview the effect of config_write before committing. Body is parsed and validated first; a parse error short-circuits the diff.",
+	}, configDiffTool)
 
 	registerEngineReadTools(srv)
 }
@@ -427,6 +442,7 @@ type logsQueryIn struct {
 	Phases      []string `json:"phases,omitempty"`
 	Since       string   `json:"since,omitempty" jsonschema:"duration (10m, 2h) or RFC3339"`
 	PayloadLike string   `json:"payload_like,omitempty"`
+	RunID       string   `json:"run_id,omitempty" jsonschema:"exact correlation id (8-char hex stamped on every event from one prepare/finalize/teardown/watcher flow)"`
 	Limit       int      `json:"limit,omitempty" jsonschema:"default 50, max 1000"`
 }
 type logsQueryOut struct {
@@ -446,6 +462,7 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 		EventTypes:  in.EventTypes,
 		Phases:      in.Phases,
 		PayloadLike: in.PayloadLike,
+		RunID:       in.RunID,
 		HydrateWT:   true,
 		Limit:       limit,
 	}

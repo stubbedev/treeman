@@ -37,6 +37,7 @@ func Serve(ctx context.Context) error {
 	registerReadTools(srv)
 	registerResources(srv)
 	registerWriteTools(srv)
+	registerPrompts(srv)
 
 	if err := srv.Run(ctx, &mcpsdk.StdioTransport{}); err != nil {
 		return fmt.Errorf("mcp server: %w", err)

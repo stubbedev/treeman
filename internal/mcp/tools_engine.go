@@ -31,39 +31,39 @@ import (
 func registerEngineReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "engine_status",
-		Description: "Probe every engine configured in .treeman.yaml. For each: reachable? version? per-DB summary (databases for mysql/postgres/mongo; index list for ES; DBSIZE for redis). Use when you need to know whether a workflow's databases are healthy before driving prepare or wt create.",
+		Description: "Probe every engine declared in .treeman.yaml. For each: reachable? version? per-DB summary (database list for mysql/postgres/mongo; index list for ES; DBSIZE for redis). Call this when the user asks \"are my databases up?\" or before driving prepare_run/worktree_create against a fresh environment.",
 	}, engineStatusTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_schema_dump",
-		Description: "Return the schema for a database on a configured engine. For mysql/postgres: every table's CREATE TABLE statement. For mongodb: the collection list + the first document of each (as a structure sample). For elasticsearch: the index mapping JSON. For redis: a SCAN-driven key-pattern summary. Engine is the engine string from databases[].engine; db is the rendered database/prefix name (use snapshot_inspect to find them).",
+		Description: "Return the live schema for ONE database on a configured engine. mysql/postgres → every table's CREATE TABLE. mongodb → collection list + first-doc samples. elasticsearch → index mapping JSON. redis → SCAN-driven key-pattern summary. engine = the engine string from databases[].engine; db = the rendered per-worktree database/prefix name (use snapshot_inspect or worktree_show to find it). Use when reasoning about live shape vs. what migrations expect.",
 	}, dbSchemaDumpTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_query",
-		Description: "Run a read-only query against a configured engine. SQL engines (mysql/postgres) accept SELECT / SHOW / EXPLAIN / DESCRIBE only — any other statement is refused. MongoDB takes a find-style filter JSON against a named collection. Elasticsearch takes a JSON query against an index. Redis takes a single command (limited to GET/MGET/SMEMBERS/HGETALL/KEYS/SCAN/EXISTS/TYPE/TTL/LRANGE). Returns rows/documents/hits as JSON. Use for debugging or pulling values an agent needs to reason about.",
+		Description: "Run a READ-ONLY query against a configured engine. SQL engines (mysql/postgres) — only SELECT/SHOW/EXPLAIN/DESCRIBE/WITH accepted; mutations are REFUSED with an error. MongoDB → find-style filter JSON against a named collection. Elasticsearch → JSON _search body against an index. Redis → one command from {GET, MGET, SMEMBERS, HGETALL, KEYS, SCAN, EXISTS, TYPE, TTL, LRANGE, ZRANGE, HKEYS, HVALS, HGET, HMGET, DBSIZE, INFO, PING}. Returns rows/docs/hits as JSON. Use for inspecting live data or verifying a migration's effect.",
 	}, dbQueryTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_inspect",
-		Description: "Resolve a snapshot by fingerprint or by (engine + source_db) and return: the SQLite snapshot row, whether the template still exists on the engine, the template's size where the engine reports it, and the engine version recorded at snapshot time. Use to verify whether a cache-hit will actually clone (orphan SQLite rows can outlive the engine-side template).",
+		Description: "Resolve ONE snapshot (by fingerprint, or by engine+source_db) and report: SQLite row contents, whether the engine-side template still exists, template size, engine version at snapshot time. Call this BEFORE snapshot_drop to confirm you're dropping the right one — and routinely when diagnosing \"cache hit but prepare still failed\": template_exists=false on a fingerprint means the row is an orphan and the next prepare will (correctly) cold-build.",
 	}, snapshotInspectTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "hook_log_read",
-		Description: "Read the full hook log file (stdout + stderr) for a given (worktree, phase, group_idx). Hook logs land at <worktree>/.treeman-hooks/<phase>-<group>.log. The hook_runs table only stores 16KB tails; this tool returns the entire file when more context is needed.",
+		Description: "Read the FULL hook log file for one (worktree, phase, group_idx). Hook logs live at <worktree>/.treeman-hooks/<phase>-<group>.log. logs_hooks / hook_runs only stores 16KB tails — use this when you need more context than the tail. max_bytes=N returns just the trailing N bytes (and flags truncated=true).",
 	}, hookLogReadTool)
 }
 
 func registerEngineWriteTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_drop",
-		Description: "Delete one snapshot by fingerprint. Drops the template on the engine (DB / index-prefix / key-prefix / collection-set) AND removes the row from SQLite. The next prepare for that fingerprint will cold-rebuild. Use to evict a single stale cache entry without nuking the whole repo's cache.",
+		Description: "Delete ONE snapshot by fingerprint. Drops the engine-side template (DB / index-prefix / key-prefix / collection-set) AND removes the SQLite row. The next prepare for that fingerprint will cold-rebuild. Use for evicting one stale entry without nuking the rest of the cache; the cache-cleanup prompt drives this for known-orphan sweeps. Call snapshot_inspect first to confirm you're dropping the right fingerprint.",
 	}, snapshotDropTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_dump",
-		Description: "Generate a dump of a live engine database to disk. mysql → mysqldump (.sql); postgres → pg_dump (.sql); mongodb → mongodump --archive; elasticsearch → bulk-format NDJSON via _search/scroll. Returns the absolute path written + byte count. Output_dir defaults to <repo>/storage/dumps. Suitable for refreshing the dump treeman uses to seed cold builds.",
+		Description: "Generate a dump of a live engine database to disk. mysql → mysqldump; postgres → pg_dump --format=plain --clean --if-exists; mongodb → mongodump --archive; elasticsearch — not yet supported. output_dir defaults to <repo>/storage/dumps. Use this to refresh the seed dump treeman uses for cold builds (commit the new file then trigger prepare_run). Returns the absolute path + byte count.",
 	}, dbDumpTool)
 }
 

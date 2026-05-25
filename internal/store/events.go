@@ -37,6 +37,7 @@ type EventFilter struct {
 	Phases      []string // empty = any
 	MessageLike string   // SQL LIKE pattern (substring match)
 	PayloadLike string   // SQL LIKE pattern against payload_json
+	RunID       string   // exact match against the run_id field inside payload_json
 	SinceMs     int64    // ts >= SinceMs when non-zero
 	UntilMs     int64    // ts <= UntilMs when non-zero
 	AfterID     int64    // id > AfterID — for incremental follow
@@ -92,6 +93,14 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 	if f.PayloadLike != "" {
 		where = append(where, "e.payload_json LIKE ?")
 		args = append(args, "%"+f.PayloadLike+"%")
+	}
+	if f.RunID != "" {
+		// run_id lives inside payload_json as `"run_id":"<value>"`.
+		// Exact match on the JSON-quoted form sidesteps the cost of
+		// json_extract() and works on every SQLite build (json1 is
+		// usually but not always compiled in for embedded sqlite).
+		where = append(where, "e.payload_json LIKE ?")
+		args = append(args, `%"run_id":"`+f.RunID+`"%`)
 	}
 	if f.SinceMs > 0 {
 		where = append(where, "e.ts >= ?")
