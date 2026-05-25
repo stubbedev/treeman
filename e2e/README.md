@@ -63,6 +63,7 @@ so you don't need `-p 1`.
 | `ctrrestart/` | Container recreate → treeman reconnects cleanly (exercises cache-eviction path) |
 | `sighup/` | Daemon receives SIGHUP → reloads config → watchers respawn against new globs |
 | `mcp/` | `treeman mcp` stdio JSON-RPC: initialize handshake + tools/list returns registered tools |
+| `mcp_write/` | `treeman mcp` stdio JSON-RPC end-to-end: `worktree_create` (structured result shape, idempotent re-run returns `noop`) + `worktree_delete` against a real MySQL — guards the in-process MCP write tools |
 
 ### Framework suites — every detected framework through real migrate CLI
 
