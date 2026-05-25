@@ -525,6 +525,15 @@ func prepareMySQL(
 			if err != nil {
 				return Outcome{}, err
 			}
+			// Cache-hit skips the cold-build path that populates the
+			// source DB via dump+migrate. Restore source from the
+			// template so non-parallel runs (single `php artisan test`,
+			// dev shells, tinker — anything that reads DB_DATABASE
+			// without the `_test_N` suffix paratest appends) have a
+			// populated DB at the user-facing name_template.
+			if err := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); err != nil {
+				return Outcome{}, fmt.Errorf("restore source %s from template %s: %w", sourceDB, rec.TemplateName, err)
+			}
 			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
 				return Outcome{}, err
 			}
@@ -718,6 +727,15 @@ func preparePostgres(
 			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 			if err != nil {
 				return Outcome{}, err
+			}
+			// Cache-hit skips the cold-build path that populates the
+			// source DB via dump+migrate. Restore source from the
+			// template so non-parallel runs (single test command,
+			// dev shells — anything that reads the user-facing
+			// name_template without the per-worker suffix) have a
+			// populated DB.
+			if err := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); err != nil {
+				return Outcome{}, fmt.Errorf("restore source %s from template %s: %w", sourceDB, rec.TemplateName, err)
 			}
 			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
 				return Outcome{}, err

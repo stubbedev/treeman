@@ -334,45 +334,47 @@ func captureTail(r io.Reader, cap int) string {
 	return string(all)
 }
 
-// buildEnv assembles the env shipped to a hook subprocess. The
-// model:
+// buildEnv assembles the env shipped to a hook subprocess. The goal:
+// user commands declared in `.treeman.yaml` should see the same env
+// they would see if the user pasted them into their terminal.
 //
-//  1. Start from the user's CLI-captured env (`inheritedEnv`,
-//     ultimately os.Environ() at `treeman wt create` time). This is
-//     authoritative: it carries the user's PATH, language version
-//     manager shims (asdf, nvm, mise, rbenv, …), aliases-expanded
-//     binaries, and whatever they had loaded.
-//  2. Overlay the treeman scoping vars (TREEMAN_MAIN_ROOT, _WORKTREE,
-//     _SLUG) so user scripts can address them.
-//  3. SAFETY NET: if the user's env doesn't carry a PATH (rare —
-//     happens when the lifecycle watcher fires for a first-time
-//     `git worktree add` made outside the CLI, before any
-//     `wt finalize` has cached the user's env), fall back to the
-//     daemon process's own PATH so /bin/sh + coreutils still resolve.
-//     This is strictly additive: a user-set PATH always wins.
+// The model:
 //
-// Without the safety net a watcher-driven re-run could fail with
-// `command not found` for `cd`, `mkdir`, etc. — even though those
-// are always available on the host — purely because the cached env
-// was empty.
+//  1. Start from the daemon's own `os.Environ()`. This is the floor:
+//     HOME, USER, SHELL, LANG, XDG_*, PATH — every essential the OS
+//     gives any process its user owns. Without this, commands like
+//     `composer install` fail because they refuse to run when HOME is
+//     unset, even though every interactive shell on the host has HOME.
+//  2. Overlay the user's CLI-captured env (`inheritedEnv`, ultimately
+//     os.Environ() at `treeman wt create` time). The user's PATH,
+//     language version manager shims (asdf, nvm, mise, rbenv, …),
+//     and any session-specific overrides take precedence over the
+//     daemon's floor.
+//  3. Overlay the treeman scoping vars (TREEMAN_MAIN_ROOT, _WORKTREE,
+//     _SLUG) so user scripts can address them. These always win.
+//
+// Layering order means the lifecycle watcher's empty `inheritedEnv`
+// is still safe (the daemon's env fills the floor), and a user with a
+// rich shell setup still gets their PATH / shims propagated.
 func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug string) []string {
-	out := make([]string, 0, len(inheritedEnv)+4)
-	havePath := false
-	for k, v := range inheritedEnv {
-		if k == "PATH" {
-			havePath = true
+	merged := make(map[string]string, len(inheritedEnv)+32)
+	for _, kv := range os.Environ() {
+		for i := 0; i < len(kv); i++ {
+			if kv[i] == '=' {
+				merged[kv[:i]] = kv[i+1:]
+				break
+			}
 		}
+	}
+	for k, v := range inheritedEnv {
+		merged[k] = v
+	}
+	merged["TREEMAN_MAIN_ROOT"] = repoRoot
+	merged["TREEMAN_WORKTREE"] = worktreePath
+	merged["TREEMAN_SLUG"] = slug
+	out := make([]string, 0, len(merged))
+	for k, v := range merged {
 		out = append(out, k+"="+v)
 	}
-	if !havePath {
-		if p := os.Getenv("PATH"); p != "" {
-			out = append(out, "PATH="+p)
-		}
-	}
-	out = append(out,
-		"TREEMAN_MAIN_ROOT="+repoRoot,
-		"TREEMAN_WORKTREE="+worktreePath,
-		"TREEMAN_SLUG="+slug,
-	)
 	return out
 }
