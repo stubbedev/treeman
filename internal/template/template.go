@@ -35,7 +35,7 @@ type Context struct {
 	SlugDash       string
 	SlugRedisQueue string
 	SlugRedisCache string
-	N              int    // valid only when HasN is true
+	N              int // valid only when HasN is true
 	HasN           bool
 	TargetDB       string // valid only when HasTargetDB is true
 	HasTargetDB    bool
