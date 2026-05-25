@@ -299,16 +299,19 @@ show recent hook_runs (precreate/postcreate/predelete/postdelete) for a worktree
 Examples:
   treeman logs hooks                # cwd-resolved worktree
   treeman logs hooks PROJ-1234
+  treeman logs hooks --all          # every worktree
   treeman logs hooks --json | jq .
 
 The worktree argument is optional — when omitted, the worktree
-containing the current working directory is used.
+containing the current working directory is used. Pass --all to
+span every worktree (e.g. when running from outside any repo).
 ```
 
 | Flag | Usage |
 |---|---|
 | `-n` | max rows |
 | `-r`, `--repo` | repo root override |
+| `-A`, `--all` | show hook runs from every worktree (skips cwd auto-resolve) |
 | `--json` |  |
 
 ### `treeman logs purge`
