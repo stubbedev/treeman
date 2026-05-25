@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -134,7 +135,12 @@ func (d *Driver) cloneOneIndex(ctx context.Context, src, dst string) error {
 	defer func() {
 		// Always flip back — even on clone failure — or the app
 		// can't write to its data after a transient ES hiccup.
-		_ = d.setIndexBlock(context.Background(), src, false)
+		// Use a fresh, short-lived context so the unblock runs
+		// even when ctx has been cancelled mid-clone; otherwise
+		// the source index could stay read-only indefinitely.
+		bgctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = d.setIndexBlock(bgctx, src, false)
 	}()
 
 	// 2. POST /<src>/_clone/<dst>
@@ -160,7 +166,10 @@ func (d *Driver) cloneAPICall(ctx context.Context, src, dst string) error {
 		return fmt.Errorf("POST /%s/_clone/%s: %w", src, dst, err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("POST /%s/_clone/%s: read body: %w", src, dst, err)
+	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("POST /%s/_clone/%s → HTTP %d: %s", src, dst, resp.StatusCode, body)
 	}
@@ -186,7 +195,10 @@ func (d *Driver) setIndexBlock(ctx context.Context, name string, readOnly bool) 
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("PUT /%s/_settings: read body: %w", name, err)
+	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("PUT /%s/_settings → HTTP %d: %s", name, resp.StatusCode, body)
 	}

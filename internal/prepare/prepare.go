@@ -621,10 +621,14 @@ func prepareMySQL(
 		RepoID:         repoID,
 	})
 	// Fire-and-forget LRU eviction for this repo. Uses a fresh
-	// background context so the goroutine outlives the prepare call
-	// even when the foreground request is cancelled. Errors are
-	// logged inside EvictExcess.
-	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+	// background context with a hard deadline so a stalled DROP
+	// (e.g. lock contention) can't leak this goroutine forever.
+	// Errors are logged inside EvictExcess.
+	go func() {
+		evictCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		snapshot.EvictExcess(evictCtx, cfg, st, repoID)
+	}()
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {

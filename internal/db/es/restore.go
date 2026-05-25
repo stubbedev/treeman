@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -59,11 +60,23 @@ func (d *Driver) Restore(ctx context.Context, sourcePrefix, dumpPath string) err
 			return err
 		}
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("es _bulk: read body: %w", err)
+		}
 		if resp.StatusCode >= 400 {
 			return fmt.Errorf("es _bulk %s: %s", resp.Status, string(body))
 		}
-		if bytes.Contains(body, []byte(`"errors":true`)) {
+		// Parse the top-level "errors" field rather than substring-
+		// matching the body — a doc echoed back in `items` could
+		// otherwise produce a false positive.
+		var hdr struct {
+			Errors bool `json:"errors"`
+		}
+		if err := json.Unmarshal(body, &hdr); err != nil {
+			return fmt.Errorf("es _bulk: parse response: %w", err)
+		}
+		if hdr.Errors {
 			return fmt.Errorf("es _bulk reported per-item errors: %s", truncate(string(body), 1024))
 		}
 		buf.Reset()
@@ -110,7 +123,7 @@ func (d *Driver) refresh(ctx context.Context, pattern string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusNotFound {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body) // best-effort body for the error message
 		return fmt.Errorf("%s: %s", resp.Status, string(body))
 	}
 	return nil

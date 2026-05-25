@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -162,8 +163,11 @@ func (s *Store) StopEventBatcher() {
 		<-done
 	}
 	// Final drain: anything that arrived after the cancel but before
-	// the goroutine observed it.
-	s.flushEvents(context.Background())
+	// the goroutine observed it. Bounded so a wedged sqlite write
+	// can't block daemon shutdown forever.
+	ctx, cancelFinal := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFinal()
+	s.flushEvents(ctx)
 }
 
 // eventBatchLoop runs in its own goroutine when batching is active.
@@ -176,7 +180,12 @@ func (s *Store) eventBatchLoop() {
 	for {
 		select {
 		case <-s.batchCtx.Done():
-			s.flushEvents(context.Background())
+			// Don't reuse batchCtx (already cancelled). Use a
+			// bounded fresh ctx so the final drain can't block
+			// shutdown forever on a wedged sqlite write.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			s.flushEvents(ctx)
+			cancel()
 			return
 		case <-ticker.C:
 			s.flushEvents(s.batchCtx)
@@ -186,12 +195,12 @@ func (s *Store) eventBatchLoop() {
 	}
 }
 
-// flushEvents commits every buffered row in one transaction. Errors
-// are logged via the database driver path but never returned — the
-// batch path is fire-and-forget by design (callers used `_ =
-// WriteEvent(...)` everywhere). One bad row poisoning a whole batch
-// would lose unrelated events, so we fall back to a per-row insert
-// when the transaction fails.
+// flushEvents commits every buffered row in one transaction. The
+// batch path is fire-and-forget by design (callers use `_ =
+// WriteEvent(...)` everywhere) — so errors are logged via slog
+// instead of returned. One bad row poisoning a whole batch would
+// lose unrelated events, so we fall back to a per-row insert when
+// the transaction fails.
 func (s *Store) flushEvents(ctx context.Context) {
 	s.batchMu.Lock()
 	if len(s.batchBuf) == 0 {
@@ -204,6 +213,7 @@ func (s *Store) flushEvents(ctx context.Context) {
 
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
+		slog.Warn("event batch: begin tx failed, falling back to per-row", "err", err, "rows", len(batch))
 		s.flushEventsFallback(ctx, batch)
 		return
 	}
@@ -214,25 +224,36 @@ func (s *Store) flushEvents(ctx context.Context) {
 			e.tsMillis, e.level, e.repoID, e.worktreeID, e.eventType,
 			e.phase, e.message, e.payload, e.durationMs); err != nil {
 			_ = tx.Rollback()
+			slog.Warn("event batch: row insert failed, falling back to per-row", "err", err, "rows", len(batch))
 			s.flushEventsFallback(ctx, batch)
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		slog.Warn("event batch: commit failed, falling back to per-row", "err", err, "rows", len(batch))
 		s.flushEventsFallback(ctx, batch)
 	}
 }
 
 // flushEventsFallback re-inserts a batch one row at a time when the
 // batched transaction fails. Slower but resilient: a single
-// constraint violation can't lose the rest of the buffer.
+// constraint violation can't lose the rest of the buffer. Per-row
+// errors are surfaced via slog so a stuck disk / corrupted DB
+// doesn't silently vanish the event log.
 func (s *Store) flushEventsFallback(ctx context.Context, batch []pendingEvent) {
 	const stmt = `INSERT INTO events(ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	failed := 0
 	for _, e := range batch {
-		_, _ = s.DB.ExecContext(ctx, stmt,
+		if _, err := s.DB.ExecContext(ctx, stmt,
 			e.tsMillis, e.level, e.repoID, e.worktreeID, e.eventType,
-			e.phase, e.message, e.payload, e.durationMs)
+			e.phase, e.message, e.payload, e.durationMs); err != nil {
+			failed++
+			slog.Warn("event row insert failed", "err", err, "type", e.eventType)
+		}
+	}
+	if failed > 0 {
+		slog.Warn("event batch fallback: rows lost", "failed", failed, "total", len(batch))
 	}
 }
 
