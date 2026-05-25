@@ -169,26 +169,33 @@ func (s *Store) LookupWorktreeID(ctx context.Context, repoID int64, name string)
 
 // HookRun is one row from the `hook_runs` table.
 type HookRun struct {
-	ID         int64
-	WorktreeID int64
-	Phase      string
-	GroupIdx   int64
-	Command    string
-	StartedAt  int64 // unix-ms
-	FinishedAt sql.NullInt64
-	ExitCode   sql.NullInt64
-	StdoutTail string
-	StderrTail string
+	ID           int64
+	WorktreeID   int64
+	WorktreeSlug string // hydrated by QueryHookRuns via LEFT JOIN
+	Phase        string
+	GroupIdx     int64
+	Command      string
+	StartedAt    int64 // unix-ms
+	FinishedAt   sql.NullInt64
+	ExitCode     sql.NullInt64
+	StdoutTail   string
+	StderrTail   string
 }
 
-// QueryHookRuns returns the most recent hook executions for a
-// worktree, newest first. Pass limit=0 for "no LIMIT".
+// QueryHookRuns returns the most recent hook executions, newest
+// first. Pass worktreeID<=0 to span every worktree; pass limit=0
+// for "no LIMIT".
 func (s *Store) QueryHookRuns(ctx context.Context, worktreeID int64, limit int) ([]HookRun, error) {
-	q := `SELECT id, worktree_id, phase, group_idx, COALESCE(command,''),
-		started_at, finished_at, exit_code,
-		COALESCE(stdout_tail,''), COALESCE(stderr_tail,'')
-		FROM hook_runs WHERE worktree_id = ? ORDER BY started_at DESC, id DESC`
-	args := []any{worktreeID}
+	q := `SELECT h.id, h.worktree_id, COALESCE(w.slug,''), h.phase, h.group_idx, COALESCE(h.command,''),
+		h.started_at, h.finished_at, h.exit_code,
+		COALESCE(h.stdout_tail,''), COALESCE(h.stderr_tail,'')
+		FROM hook_runs h LEFT JOIN worktrees w ON w.id = h.worktree_id`
+	args := []any{}
+	if worktreeID > 0 {
+		q += " WHERE h.worktree_id = ?"
+		args = append(args, worktreeID)
+	}
+	q += " ORDER BY h.started_at DESC, h.id DESC"
 	if limit > 0 {
 		q += " LIMIT ?"
 		args = append(args, limit)
@@ -201,7 +208,7 @@ func (s *Store) QueryHookRuns(ctx context.Context, worktreeID int64, limit int) 
 	var out []HookRun
 	for rows.Next() {
 		var h HookRun
-		if err := rows.Scan(&h.ID, &h.WorktreeID, &h.Phase, &h.GroupIdx, &h.Command, &h.StartedAt, &h.FinishedAt, &h.ExitCode, &h.StdoutTail, &h.StderrTail); err != nil {
+		if err := rows.Scan(&h.ID, &h.WorktreeID, &h.WorktreeSlug, &h.Phase, &h.GroupIdx, &h.Command, &h.StartedAt, &h.FinishedAt, &h.ExitCode, &h.StdoutTail, &h.StderrTail); err != nil {
 			return nil, err
 		}
 		out = append(out, h)

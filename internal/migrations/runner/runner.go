@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/template"
 )
 
 // Spec is the shape the runner accepts: a shell command + env-var
@@ -44,13 +45,20 @@ type Outcome struct {
 
 // Run executes `spec.Run` via `sh -c` against `targetDB`.
 // `inheritedEnv` is the env captured at CLI invocation (the daemon's
-// PATH-aware env layered on top of its own); `spec.Env` entries are
-// templated with `{target_db}` and then set last so they win.
+// PATH-aware env layered on top of its own); `spec.Env` values are
+// rendered through `template.Render` with `tplCtx.WithTargetDB(targetDB)`
+// — the same template pass that already produced `targetDB` — so they
+// can reference every supported placeholder (`{target_db}`, `{slug}`,
+// `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`, `{n}`)
+// and a typo like `{target-db}` fails loud instead of being passed
+// through to the subprocess. Rendered env entries are appended last
+// so they win over the inherited base.
 func Run(
 	ctx context.Context,
 	spec Spec,
 	repoRoot string,
 	targetDB string,
+	tplCtx template.Context,
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
 	if strings.TrimSpace(spec.Run) == "" {
@@ -60,13 +68,23 @@ func Run(
 		}
 		return Outcome{ExitCode: -1}, fmt.Errorf("%s.run is required", label)
 	}
+	tplCtx = tplCtx.WithTargetDB(targetDB)
+	renderedEnv := make(map[string]string, len(spec.Env))
+	for k, tmpl := range spec.Env {
+		v, err := template.Render(tmpl, tplCtx)
+		if err != nil {
+			return Outcome{ExitCode: -1}, fmt.Errorf("%s.env[%s]: %w", spec.Label, k, err)
+		}
+		renderedEnv[k] = v
+	}
+
 	c := exec.CommandContext(ctx, "sh", "-c", spec.Run)
 	c.Dir = repoRoot
 
 	// Build the subprocess env. User's cached env wins; fall back to
 	// the daemon's PATH only when the user's env has none (rare —
 	// see hooks.buildEnv doc-comment for the rationale).
-	env := make([]string, 0, len(inheritedEnv)+len(spec.Env)+2)
+	env := make([]string, 0, len(inheritedEnv)+len(renderedEnv)+2)
 	havePath := false
 	for k, v := range inheritedEnv {
 		if k == "PATH" {
@@ -80,8 +98,8 @@ func Run(
 		}
 	}
 	env = append(env, "TREEMAN_TARGET_DB="+targetDB)
-	for k, tmpl := range spec.Env {
-		env = append(env, k+"="+strings.ReplaceAll(tmpl, "{target_db}", targetDB))
+	for k, v := range renderedEnv {
+		env = append(env, k+"="+v)
 	}
 	c.Env = env
 

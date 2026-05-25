@@ -7,12 +7,13 @@ import (
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/template"
 )
 
 // TestRunErrorsWhenRunEmpty asserts that we fail loud instead of
 // silently falling back to a hardcoded migrate command.
 func TestRunErrorsWhenRunEmpty(t *testing.T) {
-	_, err := Run(context.Background(), FromMigrate(config.Step{}), t.TempDir(), "anydb", nil)
+	_, err := Run(context.Background(), FromMigrate(config.Step{}), t.TempDir(), "anydb", template.Context{}, nil)
 	if err == nil {
 		t.Fatal("expected error for empty migrate.run, got nil")
 	}
@@ -26,7 +27,7 @@ func TestRunErrorsWhenRunEmpty(t *testing.T) {
 // "migrations.migrate.run" error — the label routes the diagnostic
 // to whichever YAML block actually broke.
 func TestRunErrorMentionsSeedLabelWhenSeed(t *testing.T) {
-	_, err := Run(context.Background(), FromSeed(config.Step{}), t.TempDir(), "anydb", nil)
+	_, err := Run(context.Background(), FromSeed(config.Step{}), t.TempDir(), "anydb", template.Context{}, nil)
 	if err == nil {
 		t.Fatal("expected error for empty seed.run, got nil")
 	}
@@ -51,6 +52,7 @@ func TestRunSubstitutesTargetDB(t *testing.T) {
 		}),
 		dir,
 		"myapp_template_feature-x",
+		template.Context{},
 		nil,
 	)
 	if err != nil {
@@ -80,6 +82,7 @@ func TestRunInheritsCwd(t *testing.T) {
 		FromMigrate(config.Step{Run: "pwd"}),
 		dir,
 		"anydb",
+		template.Context{},
 		nil,
 	)
 	if err != nil {

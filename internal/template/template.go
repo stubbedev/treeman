@@ -1,5 +1,7 @@
 // Package template renders the `{key}` placeholders used by
-// `.treeman.yaml`'s env_scoping.patches and database name_templates.
+// `.treeman.yaml`'s patches `set:` map, database `name_template:`
+// / `key_prefix:` strings, and `migrate.env:` / `seed.env:` value
+// templates.
 //
 // Known keys:
 //
@@ -9,6 +11,10 @@
 //	{slug_redis_cache}  — 6..15 (cksum-derived, distinct from queue)
 //	{n}                 — paratest replica index (only valid when
 //	                     `.WithN()` was used on the context)
+//	{target_db}         — resolved per-run database name / key prefix
+//	                     (only valid when `.WithTargetDB()` was used —
+//	                     i.e. inside `migrate.env:` / `seed.env:` values
+//	                     after `name_template` / `key_prefix` rendered)
 //
 // Unknown keys fail loudly (RenderError.UnknownKey) so a YAML typo
 // doesn't silently render as empty and quietly break some downstream
@@ -29,8 +35,10 @@ type Context struct {
 	SlugDash       string
 	SlugRedisQueue string
 	SlugRedisCache string
-	N              int // valid only when HasN is true
+	N              int    // valid only when HasN is true
 	HasN           bool
+	TargetDB       string // valid only when HasTargetDB is true
+	HasTargetDB    bool
 }
 
 // FromSlug builds a Context from a Slug. The `N` field stays unset
@@ -49,6 +57,16 @@ func FromSlug(s slug.Slug) Context {
 func (c Context) WithN(n int) Context {
 	c.N = n
 	c.HasN = true
+	return c
+}
+
+// WithTargetDB returns a copy with the resolved per-run database
+// name / key prefix set. Used by the migration runner so
+// `migrate.env:` / `seed.env:` values can reference `{target_db}`
+// after `name_template` / `key_prefix` already rendered.
+func (c Context) WithTargetDB(db string) Context {
+	c.TargetDB = db
+	c.HasTargetDB = true
 	return c
 }
 
@@ -94,6 +112,38 @@ func Render(tmpl string, ctx Context) (string, error) {
 	return b.String(), nil
 }
 
+// Scope enables optional keys at validation time. `name_template` /
+// `key_prefix` strings render before the per-run DB name exists, so
+// `{target_db}` is illegal there; `migrate.env:` / `seed.env:`
+// values render after, so it's legal. `{n}` is only valid in
+// templates the paratest fan-out renders per replica.
+type Scope struct {
+	AllowN        bool
+	AllowTargetDB bool
+}
+
+// Validate checks that `tmpl` only references known keys allowed by
+// `sc`. Returns nil when the template would render cleanly with the
+// matching `WithN` / `WithTargetDB` already applied. Use this at
+// config-load time so a YAML typo (`{target-db}`, `{slag}`) is
+// caught before a worktree create / prepare run trips over it.
+func Validate(tmpl string, sc Scope) error {
+	ctx := Context{
+		Slug:           "x",
+		SlugDash:       "x",
+		SlugRedisQueue: "0",
+		SlugRedisCache: "0",
+	}
+	if sc.AllowN {
+		ctx = ctx.WithN(0)
+	}
+	if sc.AllowTargetDB {
+		ctx = ctx.WithTargetDB("x")
+	}
+	_, err := Render(tmpl, ctx)
+	return err
+}
+
 func lookup(key string, ctx Context) (string, bool) {
 	switch key {
 	case "slug":
@@ -109,6 +159,11 @@ func lookup(key string, ctx Context) (string, bool) {
 			return "", false
 		}
 		return strconv.Itoa(ctx.N), true
+	case "target_db":
+		if !ctx.HasTargetDB {
+			return "", false
+		}
+		return ctx.TargetDB, true
 	default:
 		return "", false
 	}

@@ -220,13 +220,16 @@ func logsHooks() *cli.Command {
 		Description: `Examples:
   treeman logs hooks                # cwd-resolved worktree
   treeman logs hooks PROJ-1234
+  treeman logs hooks --all          # every worktree
   treeman logs hooks --json | jq .
 
 The worktree argument is optional — when omitted, the worktree
-containing the current working directory is used.`,
+containing the current working directory is used. Pass --all to
+span every worktree (e.g. when running from outside any repo).`,
 		Flags: []cli.Flag{
 			&cli.IntFlag{Name: "n", Value: 20, Usage: "max rows"},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "repo root override"},
+			&cli.BoolFlag{Name: "all", Aliases: []string{"A"}, Usage: "show hook runs from every worktree (skips cwd auto-resolve)"},
 			&cli.BoolFlag{Name: "json"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
@@ -235,12 +238,15 @@ containing the current working directory is used.`,
 				return err
 			}
 			defer closer()
+			all := c.Bool("all")
 			repoID := int64(0)
 			if r := c.String("repo"); r != "" {
 				repoID, _ = lookupRepoID(ctx, st, MustAbs(r))
-			} else if cwd, err := os.Getwd(); err == nil {
-				if root, err := DiscoverRepoRoot(cwd); err == nil {
-					repoID, _ = lookupRepoID(ctx, st, root)
+			} else if !all {
+				if cwd, err := os.Getwd(); err == nil {
+					if root, err := DiscoverRepoRoot(cwd); err == nil {
+						repoID, _ = lookupRepoID(ctx, st, root)
+					}
 				}
 			}
 
@@ -252,11 +258,11 @@ containing the current working directory is used.`,
 				if wtID == 0 {
 					return fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
 				}
-			} else {
+			} else if !all {
 				cwd, _ := os.Getwd()
 				row := lookupWorktreeContainingCwd(ctx, st, MustAbs(cwd))
 				if row.ID == 0 {
-					return fmt.Errorf("usage: treeman logs hooks [worktree] (cwd is not inside a registered worktree)")
+					return fmt.Errorf("usage: treeman logs hooks [worktree] (cwd is not inside a registered worktree; pass --all to span every worktree)")
 				}
 				wtID = row.ID
 				name = row.Slug
@@ -264,7 +270,7 @@ containing the current working directory is used.`,
 					name = row.Branch
 				}
 				if !c.Bool("json") {
-					fmt.Fprintf(os.Stderr, "# scope: worktree=%s (--all not honoured here; pass a name to override)\n", name)
+					fmt.Fprintf(os.Stderr, "# scope: worktree=%s (--all to widen)\n", name)
 				}
 			}
 
@@ -276,10 +282,18 @@ containing the current working directory is used.`,
 				return jsonStream(runs)
 			}
 			if len(runs) == 0 {
-				ui.Info("no hook runs recorded for %s", name)
+				if all {
+					ui.Info("no hook runs recorded")
+				} else {
+					ui.Info("no hook runs recorded for %s", name)
+				}
 				return nil
 			}
-			tbl := ui.NewTable("STARTED", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND")
+			cols := []string{"STARTED", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
+			if all {
+				cols = []string{"STARTED", "WORKTREE", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
+			}
+			tbl := ui.NewTable(cols...)
 			for _, h := range runs {
 				exit := "—"
 				if h.ExitCode.Valid {
@@ -309,7 +323,15 @@ containing the current working directory is used.`,
 				}
 				cmd = singleLine(cmd, 80)
 				group := fmt.Sprintf("%d", h.GroupIdx)
-				tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
+				if all {
+					slug := h.WorktreeSlug
+					if slug == "" {
+						slug = fmt.Sprintf("#%d", h.WorktreeID)
+					}
+					tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Magenta(slug), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
+				} else {
+					tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
+				}
 			}
 			tbl.Render(nil)
 			return nil
@@ -355,8 +377,17 @@ func buildFilterWithScope(ctx context.Context, c *cli.Command) (filterScope, err
 	repoOverride := c.String("repo")
 	wantWT := c.String("worktree")
 
-	// Resolve repo ID from --repo or cwd (cwd is also how the auto-
-	// worktree resolver locates its row).
+	// --all (with no narrower override) means "show everything" — skip
+	// cwd-based scoping entirely so the caller doesn't get silently
+	// filtered to the repo / worktree they happen to be standing in.
+	if all && repoOverride == "" && wantWT == "" {
+		return scope, nil
+	}
+
+	// Resolve repo ID from --repo or cwd. An explicit --repo is also a
+	// signal to skip the cwd→worktree auto-resolve below: the caller
+	// asked for "this repo's events", not "this repo's events filtered
+	// to whichever worktree my shell happens to be in".
 	repoRoot := repoOverride
 	if repoRoot == "" {
 		cwd, _ := os.Getwd()
@@ -379,7 +410,9 @@ func buildFilterWithScope(ctx context.Context, c *cli.Command) (filterScope, err
 		return scope, nil
 	}
 
-	if all {
+	// --all OR explicit --repo both short-circuit the cwd-worktree
+	// resolver: the user gave us a scope already.
+	if all || repoOverride != "" {
 		return scope, nil
 	}
 

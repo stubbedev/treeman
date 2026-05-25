@@ -3,6 +3,8 @@ package config
 import (
 	"errors"
 	"fmt"
+
+	"github.com/stubbedev/treeman/internal/template"
 )
 
 // Validate runs cross-field consistency checks that can't be
@@ -37,6 +39,28 @@ func (c *Config) Validate() error {
 		errs = appendIfErr(errs, c.Databases[i].validate(fmt.Sprintf("databases[%d]", i)))
 	}
 
+	for i := range c.Patches {
+		errs = appendIfErr(errs, validatePatch(c.Patches[i], fmt.Sprintf("patches[%d]", i)))
+	}
+
+	return errors.Join(errs...)
+}
+
+// validateTemplate wraps template.Validate with a path-prefixed error
+// so users see exactly which YAML field carries the typo.
+func validateTemplate(path, tmpl string, sc template.Scope) error {
+	if err := template.Validate(tmpl, sc); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
+
+func validatePatch(p Patch, path string) error {
+	var errs []error
+	for k, v := range p.Set {
+		errs = appendIfErr(errs, validateTemplate(
+			fmt.Sprintf("%s.set[%s]", path, k), v, template.Scope{}))
+	}
 	return errors.Join(errs...)
 }
 
@@ -57,9 +81,14 @@ func (r ContainerRef) validate(path string) error {
 	return nil
 }
 
-// validate enforces that Engine is present and recognized, and that
-// NameTemplate is set for engines that scope by database name.
+// validate enforces that Engine is present and recognized, that
+// NameTemplate is set for engines that scope by database name, and
+// that every template string only references placeholders the
+// rendering stage actually populates. The template checks catch
+// typos (`{target-db}`, `{slag}`, `{n}` outside test_clones) at
+// load time instead of at the first prepare run.
 func (d DatabaseConfig) validate(path string) error {
+	var errs []error
 	if d.Engine == "" {
 		return fmt.Errorf("%s: engine is required (one of: mysql, mariadb, tidb, postgres, postgresql, mongodb, redis, elasticsearch, opensearch)", path)
 	}
@@ -74,5 +103,31 @@ func (d DatabaseConfig) validate(path string) error {
 		return fmt.Errorf("%s: unknown engine %q (allowed: mysql, mariadb, tidb, postgres, postgresql, mongodb, redis, elasticsearch, opensearch)",
 			path, d.Engine)
 	}
-	return nil
+
+	if d.NameTemplate != "" {
+		errs = appendIfErr(errs, validateTemplate(path+".name_template", d.NameTemplate, template.Scope{}))
+	}
+	if d.KeyPrefix != "" {
+		errs = appendIfErr(errs, validateTemplate(path+".key_prefix", d.KeyPrefix, template.Scope{}))
+	}
+	if d.Migrate != nil {
+		for k, v := range d.Migrate.Env {
+			errs = appendIfErr(errs, validateTemplate(
+				fmt.Sprintf("%s.migrate.env[%s]", path, k), v,
+				template.Scope{AllowTargetDB: true}))
+		}
+	}
+	if d.Seed != nil {
+		for k, v := range d.Seed.Env {
+			errs = appendIfErr(errs, validateTemplate(
+				fmt.Sprintf("%s.seed.env[%s]", path, k), v,
+				template.Scope{AllowTargetDB: true}))
+		}
+	}
+	if d.TestClones != nil && d.TestClones.NameTemplate != "" {
+		errs = appendIfErr(errs, validateTemplate(
+			path+".test_clones.name_template", d.TestClones.NameTemplate,
+			template.Scope{AllowN: true}))
+	}
+	return errors.Join(errs...)
 }

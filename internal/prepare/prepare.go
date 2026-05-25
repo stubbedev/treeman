@@ -591,7 +591,7 @@ func prepareMySQL(
 	}
 	if d.Migrate != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, inheritedEnv)
+		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
@@ -602,7 +602,7 @@ func prepareMySQL(
 	}
 	if d.Seed != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, inheritedEnv)
+		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
 		}
@@ -787,7 +787,7 @@ func preparePostgres(
 	}
 	if d.Migrate != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, inheritedEnv)
+		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
@@ -798,7 +798,7 @@ func preparePostgres(
 	}
 	if d.Seed != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, inheritedEnv)
+		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
 		}
@@ -943,7 +943,7 @@ func prepareMongo(
 	}
 	if d.Seed != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, inheritedEnv)
+		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
 		}
@@ -1118,7 +1118,7 @@ func prepareRedisPrefix(
 	}
 	if d.Seed != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, inheritedEnv)
+		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed redis %s: %w", sourcePrefix, err)
 		}
@@ -1282,7 +1282,7 @@ func prepareES(
 	}
 	if d.Seed != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, inheritedEnv)
+		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed es %s: %w", sourcePrefix, err)
 		}

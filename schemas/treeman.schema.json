@@ -170,7 +170,7 @@
         },
         "name_template": {
           "type": "string",
-          "description": "Template for the per-worktree database/index name. Supports\n`{slug}`, `{repo}`, `{branch}` placeholders. Example:\n`app_{slug}` → `app_feature-x`. Required for engines that\nscope by database name (MySQL, Postgres, Mongo)."
+          "description": "Template for the per-worktree database/index name. Supports\n`{slug}`, `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`\n(see the `template` package for definitions). Example:\n`app_{slug}` → `app_feature-x`. Required for engines that\nscope by database name (MySQL, Postgres, Mongo). Validated at\nconfig-load time — typos fail loud."
         },
         "dump": {
           "$ref": "#/$defs/DumpSpec",
@@ -197,7 +197,7 @@
         },
         "key_prefix": {
           "type": "string",
-          "description": "KeyPrefix scopes every key/index a worktree creates under a\nper-worktree prefix. Used by engines that don't scope by\ndatabase name — Redis (key prefix in DB 0) and Elasticsearch\n/ OpenSearch (index-name prefix). Example: `{slug}:` →\n`feature-x:`. The app must honour the prefix — Laravel's\n`CACHE_PREFIX`, Rails `Rails.cache.options[:namespace]`,\nioredis `keyPrefix`, etc."
+          "description": "KeyPrefix scopes every key/index a worktree creates under a\nper-worktree prefix. Used by engines that don't scope by\ndatabase name — Redis (key prefix in DB 0) and Elasticsearch\n/ OpenSearch (index-name prefix). Example: `{slug}:` →\n`feature-x:`. The app must honour the prefix — Laravel's\n`CACHE_PREFIX`, Rails `Rails.cache.options[:namespace]`,\nioredis `keyPrefix`, etc.\n\nSupports the same placeholders as `name_template`: `{slug}`,\n`{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`.\nValidated at config-load time."
         },
         "fanout": {
           "type": "integer",
@@ -542,7 +542,7 @@
       "required": [
         "file"
       ],
-      "description": "Patch — one entry in the top-level `patches:` block. Each entry\ntargets one file under the worktree root and rewrites it with\nper-worktree values via the `set:` map. Values are template\nstrings that accept `{slug}`, `{slug_dash}`, `{slug_upper}`,\n`{slug_redis_queue}`, `{slug_redis_cache}`, `{repo}`, `{branch}`.\n\nThe driver is picked from `format:` when set, otherwise auto-\ndetected from the file extension:\n\n\tdotenv  — `.env`, `.env.*`\n\tphpunit — `.xml`, `.xml.dist` (phpunit.xml `\u003cenv\u003e` blocks)\n\tyaml    — `.yaml`, `.yml`\n\tjson    — `.json`\n\ttoml    — `.toml`\n\tini     — `.ini`, `.cfg`\n\nPath syntax inside `set:` is uniform across drivers:\n\n\tdotenv / phpunit  — flat key (e.g. `DB_DATABASE`)\n\tini               — `section.key` (top-level keys allowed too)\n\tyaml / json / toml — dotted path, optionally with `[N]` indices\n\t                    (e.g. `services[0].host`)\n\nWhen `skip_worktree` is true (default), treeman calls\n`git update-index --skip-worktree` on the patched file so the\nrewrite doesn't show up as a dirty file. The file must be tracked\nby git for the skip-worktree call to do anything; gitignored\nfiles are patched in-place without any git interaction."
+      "description": "Patch — one entry in the top-level `patches:` block. Each entry\ntargets one file under the worktree root and rewrites it with\nper-worktree values via the `set:` map. Values are template\nstrings that accept `{slug}`, `{slug_dash}`,\n`{slug_redis_queue}`, `{slug_redis_cache}`. Validated at\nconfig-load time — unknown keys fail loud.\n\nThe driver is picked from `format:` when set, otherwise auto-\ndetected from the file extension:\n\n\tdotenv  — `.env`, `.env.*`\n\tphpunit — `.xml`, `.xml.dist` (phpunit.xml `\u003cenv\u003e` blocks)\n\tyaml    — `.yaml`, `.yml`\n\tjson    — `.json`\n\ttoml    — `.toml`\n\tini     — `.ini`, `.cfg`\n\nPath syntax inside `set:` is uniform across drivers:\n\n\tdotenv / phpunit  — flat key (e.g. `DB_DATABASE`)\n\tini               — `section.key` (top-level keys allowed too)\n\tyaml / json / toml — dotted path, optionally with `[N]` indices\n\t                    (e.g. `services[0].host`)\n\nWhen `skip_worktree` is true (default), treeman calls\n`git update-index --skip-worktree` on the patched file so the\nrewrite doesn't show up as a dirty file. The file must be tracked\nby git for the skip-worktree call to do anything; gitignored\nfiles are patched in-place without any git interaction."
     },
     "PostgresConn": {
       "oneOf": [
@@ -667,7 +667,7 @@
             "type": "string"
           },
           "type": "object",
-          "description": "Env is a map of env-var names to value templates. Each entry\nis set on the subprocess (overriding the framework's config\nfile). `{target_db}` is substituted with the resolved per-run\ndatabase name; literal values pass through unchanged."
+          "description": "Env is a map of env-var names to value templates. Each entry\nis set on the subprocess (overriding the framework's config\nfile). See the type doc-comment for the full list of supported\n`{placeholder}` keys; literal values pass through unchanged."
         }
       },
       "additionalProperties": false,
@@ -675,7 +675,7 @@
       "required": [
         "run"
       ],
-      "description": "Step is one user-declared shell command executed against a target\ndatabase. Used by both `databases[].migrate:` and\n`databases[].seed:` — the same shape, different lifecycle slots.\n\nThe framework's CLI reads its target DB from its own config\n(Laravel: `DB_DATABASE` in `.env`; Rails: `DATABASE`; Django:\n`DJANGO_DB_NAME`; etc.). Treeman builds per-worktree template\ndatabases with names like `myapp_template_feature-x` and needs to\nredirect the command at *that* DB, not the one the committed\n`.env` references. The `Env` map says which env-var names to\noverride; the value template `{target_db}` is substituted at\nruntime with the resolved database name. No other placeholders\nare supported."
+      "description": "Step is one user-declared shell command executed against a target\ndatabase. Used by both `databases[].migrate:` and\n`databases[].seed:` — the same shape, different lifecycle slots.\n\nThe framework's CLI reads its target DB from its own config\n(Laravel: `DB_DATABASE` in `.env`; Rails: `DATABASE`; Django:\n`DJANGO_DB_NAME`; etc.). Treeman builds per-worktree template\ndatabases with names like `myapp_template_feature-x` and needs to\nredirect the command at *that* DB, not the one the committed\n`.env` references. The `Env` map says which env-var names to\noverride; values are rendered through the same `template` pass\nthat produces the per-run DB name, so they can reference any of:\n\n\t{target_db}         — resolved per-run database name / key prefix\n\t{slug}              — the slug value\n\t{slug_dash}         — slug with underscores → hyphens\n\t{slug_redis_queue}  — slug-derived Redis queue DB index (6..15)\n\t{slug_redis_cache}  — slug-derived Redis cache DB index (6..15)\n\nUnknown keys fail loud at config-load time. Treeman also exports\n`TREEMAN_TARGET_DB` to the subprocess unconditionally as a safety\nnet for tooling that wants the resolved name without a custom env\nmapping."
     },
     "TestClonesSpec": {
       "properties": {
@@ -685,7 +685,7 @@
         },
         "name_template": {
           "type": "string",
-          "description": "Template for clone database names. Supports `{slug}`,\n`{index}` (0-based clone index), `{repo}`. Required.\nExample: `app_{slug}_test_{index}`."
+          "description": "Template for clone database names. Supports the same\nplaceholders as `databases[].name_template` plus `{n}` —\nthe 0-based clone index (only valid here). Required.\nExample: `app_{slug}_test_{n}`."
         }
       },
       "additionalProperties": false,

@@ -513,8 +513,9 @@ type WorktreesConfig struct {
 // Patch — one entry in the top-level `patches:` block. Each entry
 // targets one file under the worktree root and rewrites it with
 // per-worktree values via the `set:` map. Values are template
-// strings that accept `{slug}`, `{slug_dash}`, `{slug_upper}`,
-// `{slug_redis_queue}`, `{slug_redis_cache}`, `{repo}`, `{branch}`.
+// strings that accept `{slug}`, `{slug_dash}`,
+// `{slug_redis_queue}`, `{slug_redis_cache}`. Validated at
+// config-load time — unknown keys fail loud.
 //
 // The driver is picked from `format:` when set, otherwise auto-
 // detected from the file extension:
@@ -783,9 +784,11 @@ type DatabaseConfig struct {
 	Engine string `yaml:"engine" jsonschema:"enum=mysql,enum=mariadb,enum=tidb,enum=postgres,enum=postgresql,enum=mongodb,enum=redis,enum=elasticsearch,enum=opensearch"`
 
 	// Template for the per-worktree database/index name. Supports
-	// `{slug}`, `{repo}`, `{branch}` placeholders. Example:
+	// `{slug}`, `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`
+	// (see the `template` package for definitions). Example:
 	// `app_{slug}` → `app_feature-x`. Required for engines that
-	// scope by database name (MySQL, Postgres, Mongo).
+	// scope by database name (MySQL, Postgres, Mongo). Validated at
+	// config-load time — typos fail loud.
 	NameTemplate string `yaml:"name_template,omitempty"`
 
 	// Source dump used to seed clones. Path is relative to the repo
@@ -835,6 +838,10 @@ type DatabaseConfig struct {
 	// `feature-x:`. The app must honour the prefix — Laravel's
 	// `CACHE_PREFIX`, Rails `Rails.cache.options[:namespace]`,
 	// ioredis `keyPrefix`, etc.
+	//
+	// Supports the same placeholders as `name_template`: `{slug}`,
+	// `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`.
+	// Validated at config-load time.
 	KeyPrefix string `yaml:"key_prefix,omitempty"`
 
 	// Outer concurrency cap for clone restore + DropMatching.
@@ -1002,9 +1009,19 @@ func (f FilteredAction) Matches(label string) bool {
 // databases with names like `myapp_template_feature-x` and needs to
 // redirect the command at *that* DB, not the one the committed
 // `.env` references. The `Env` map says which env-var names to
-// override; the value template `{target_db}` is substituted at
-// runtime with the resolved database name. No other placeholders
-// are supported.
+// override; values are rendered through the same `template` pass
+// that produces the per-run DB name, so they can reference any of:
+//
+//	{target_db}         — resolved per-run database name / key prefix
+//	{slug}              — the slug value
+//	{slug_dash}         — slug with underscores → hyphens
+//	{slug_redis_queue}  — slug-derived Redis queue DB index (6..15)
+//	{slug_redis_cache}  — slug-derived Redis cache DB index (6..15)
+//
+// Unknown keys fail loud at config-load time. Treeman also exports
+// `TREEMAN_TARGET_DB` to the subprocess unconditionally as a safety
+// net for tooling that wants the resolved name without a custom env
+// mapping.
 type Step struct {
 	// Run is the shell command treeman invokes via `sh -c`.
 	// Required; an empty Run aborts `prepare` with a clear error.
@@ -1012,8 +1029,8 @@ type Step struct {
 
 	// Env is a map of env-var names to value templates. Each entry
 	// is set on the subprocess (overriding the framework's config
-	// file). `{target_db}` is substituted with the resolved per-run
-	// database name; literal values pass through unchanged.
+	// file). See the type doc-comment for the full list of supported
+	// `{placeholder}` keys; literal values pass through unchanged.
 	Env map[string]string `yaml:"env,omitempty"`
 }
 
@@ -1097,9 +1114,10 @@ type TestClonesSpec struct {
 	// pre-warming entirely.
 	Clones ClonesSetting `yaml:"clones,omitempty"`
 
-	// Template for clone database names. Supports `{slug}`,
-	// `{index}` (0-based clone index), `{repo}`. Required.
-	// Example: `app_{slug}_test_{index}`.
+	// Template for clone database names. Supports the same
+	// placeholders as `databases[].name_template` plus `{n}` —
+	// the 0-based clone index (only valid here). Required.
+	// Example: `app_{slug}_test_{n}`.
 	NameTemplate string `yaml:"name_template"`
 }
 
