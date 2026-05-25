@@ -1,0 +1,51 @@
+#!/usr/bin/env php
+<?php
+// Minimal "artisan migrate" — reads DB credentials from env vars
+// using the same DB_HOST / DB_PORT / DB_USERNAME / DB_PASSWORD /
+// DB_DATABASE convention Laravel uses, applies every .php migration
+// in database/migrations/ in lexical order.
+//
+// treeman invokes us via the migrate.run shell command, with
+// DB_DATABASE substituted to the per-worktree template DB name.
+
+require __DIR__ . '/vendor/autoload.php';
+
+use Illuminate\Database\Capsule\Manager as DB;
+
+$capsule = new DB;
+$capsule->addConnection([
+    'driver'    => 'mysql',
+    'host'      => getenv('DB_HOST') ?: '127.0.0.1',
+    'port'      => (int)(getenv('DB_PORT') ?: 3306),
+    'database'  => getenv('DB_DATABASE') ?: '',
+    'username'  => getenv('DB_USERNAME') ?: 'root',
+    'password'  => getenv('DB_PASSWORD') ?: '',
+    'charset'   => 'utf8mb4',
+    'collation' => 'utf8mb4_unicode_ci',
+]);
+$capsule->setAsGlobal();
+$capsule->bootEloquent();
+
+$action = $argv[1] ?? 'help';
+if ($action !== 'migrate') {
+    fwrite(STDERR, "usage: artisan migrate\n");
+    exit(2);
+}
+
+$dir = __DIR__ . '/database/migrations';
+$files = glob("$dir/*.php");
+sort($files);
+foreach ($files as $f) {
+    fwrite(STDERR, "applying " . basename($f) . "\n");
+    $sql = require $f;
+    if (!is_string($sql)) {
+        fwrite(STDERR, "migration $f did not return a SQL string\n");
+        exit(3);
+    }
+    foreach (explode(';', $sql) as $stmt) {
+        $stmt = trim($stmt);
+        if ($stmt === '') continue;
+        DB::statement($stmt);
+    }
+}
+echo "ok\n";

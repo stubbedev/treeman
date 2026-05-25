@@ -1,14 +1,14 @@
 // Package hooks runs the configured hook entries for a worktree
 // phase.
 //
-// Model: every entry under postcreate / predelete / postdelete is a
+// Model: every entry under setup / teardown is a
 // "group". Each group spawns one detached driver via setsid; the
 // driver runs the group's commands chained with `&&` so a failure
 // short-circuits the rest of the group. Groups never wait for each
 // other — they all kick off in parallel and `RunHooks` returns as
 // soon as the drivers are spawned.
 //
-// `precreate` is the one synchronous phase via RunPrecreateHooks.
+// `setup` is the one synchronous phase via RunHooks.
 package hooks
 
 import (
@@ -28,7 +28,7 @@ import (
 // RunOutcome bundles every group's status.
 type RunOutcome struct {
 	Groups            []GroupOutcome
-	AggregateExitCode int // populated by RunPrecreateHooks; always 0 for the async runner
+	AggregateExitCode int // populated by RunHooks; always 0 for the async runner
 }
 
 // GroupOutcome — one row per group.
@@ -64,7 +64,7 @@ type GroupOutcome struct {
 func RunHooksOrphan(
 	ctx context.Context,
 	phase string,
-	entries []config.HookEntry,
+	entries []config.Action,
 	repoRoot, worktreePath, slug, logDir string,
 	inheritedEnv map[string]string,
 	wait bool,
@@ -82,12 +82,12 @@ func RunHooksOrphan(
 	out.Groups = make([]GroupOutcome, 0, len(entries))
 	cmds := make([]*exec.Cmd, 0, len(entries))
 	for i, entry := range entries {
-		if len(entry.Steps) == 0 {
+		if len(entry.Run) == 0 {
 			continue
 		}
 		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
 		// Default cwd is the repo root, not the (deleted) worktree.
-		cmdStr, err := renderGroupForEntry(entry, repoRoot)
+		cmdStr, err := renderAction(entry, repoRoot)
 		if err != nil {
 			return out, err
 		}
@@ -125,13 +125,13 @@ func RunHooksOrphan(
 // detached goroutine. When `wait` is true, blocks until every
 // group exits, so the caller can rely on the phase being complete
 // before invoking work that depends on it (e.g. `prepare.Run`
-// reading vendor/ that a postcreate `composer install` populated).
+// reading vendor/ that a setup `composer install` populated).
 // Groups still run in parallel under either flag; `wait` only
 // changes whether RunHooks itself blocks on their completion.
 func RunHooks(
 	ctx context.Context,
 	phase string,
-	entries []config.HookEntry,
+	entries []config.Action,
 	repoRoot, worktreePath, slug string,
 	inheritedEnv map[string]string,
 	wait bool,
@@ -147,11 +147,11 @@ func RunHooks(
 	out.Groups = make([]GroupOutcome, 0, len(entries))
 	cmds := make([]*exec.Cmd, 0, len(entries))
 	for i, entry := range entries {
-		if len(entry.Steps) == 0 {
+		if len(entry.Run) == 0 {
 			continue
 		}
 		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
-		cmdStr, err := renderGroupForEntry(entry, worktreePath)
+		cmdStr, err := renderAction(entry, worktreePath)
 		if err != nil {
 			return out, err
 		}
@@ -184,85 +184,53 @@ func RunHooks(
 	return out, nil
 }
 
-// RunPrecreateHooks is the synchronous variant. Each SingleStep
-// awaited in order; first non-zero exit aborts.
-func RunPrecreateHooks(
-	ctx context.Context,
-	steps []config.SingleStep,
-	repoRoot, worktreePath, slug string,
-	inheritedEnv map[string]string,
-) (RunOutcome, error) {
-	out := RunOutcome{Groups: make([]GroupOutcome, 0, len(steps))}
-	for _, step := range steps {
-		if out.AggregateExitCode != 0 {
-			out.Groups = append(out.Groups, GroupOutcome{
-				Command:    step.Run,
-				ExitCode:   -1,
-				StderrTail: "skipped (prior step failed)",
-			})
-			continue
-		}
-		cwd := step.Cwd
-		if cwd == "" {
-			cwd = worktreePath
-		}
-		g, err := runForeground(ctx, step.Run, cwd, repoRoot, worktreePath, slug, inheritedEnv)
-		if err != nil {
-			return out, err
-		}
-		if g.ExitCode != 0 && out.AggregateExitCode == 0 {
-			out.AggregateExitCode = g.ExitCode
-		}
-		out.Groups = append(out.Groups, g)
+// renderAction turns one Action into a single shell string. Steps
+// chain with ` && ` so a failure short-circuits the rest. The
+// action's cwd applies group-wide:
+//
+//   - Host execution:  `( cd <cwd> && <step1> && <step2> )`
+//   - Container exec:  `<engine> exec [-w cwd] <id> sh -c '<step1>'
+//     && <engine> exec [-w cwd] <id> sh -c '<step2>'`
+//
+// `defaultCwd` is the worktree root — used when the action's `cwd`
+// is empty on the host path. In the container path the absence of
+// `cwd` means "use the container's WORKDIR" (no `-w` flag).
+func renderAction(a config.Action, defaultCwd string) (string, error) {
+	if len(a.Run) == 0 {
+		return "", nil
 	}
-	return out, nil
-}
-
-// renderGroup chains `( cd <cwd> && <cmd> )` clauses with ` && ` so
-// a failure short-circuits the rest of the group.
-func renderGroup(steps []config.SingleStep, defaultCwd string) string {
-	parts := make([]string, 0, len(steps))
-	for _, s := range steps {
-		cwd := s.Cwd
+	if a.Container == "" && a.ComposeService == "" {
+		cwd := a.Cwd
 		if cwd == "" {
 			cwd = defaultCwd
 		}
-		parts = append(parts, "( cd "+shellSingleQuote(cwd)+" && "+s.Run+" )")
+		parts := make([]string, 0, len(a.Run))
+		for _, step := range a.Run {
+			parts = append(parts, "( cd "+shellSingleQuote(cwd)+" && "+step+" )")
+		}
+		return strings.Join(parts, " && "), nil
 	}
-	return strings.Join(parts, " && ")
-}
-
-// renderGroupForEntry handles the `in_container:` / `compose_service:`
-// directive on a HookEntry. When neither is set, the rendering is
-// identical to renderGroup. When set, each step is wrapped in
-// `<engine> exec [-w cwd] <id> sh -c '<cmd>'` so the work runs
-// inside the named container instead of on the host. Step.Cwd, when
-// present, is interpreted relative to the container's filesystem
-// and passed via `-w` (no host-side `cd` is emitted).
-func renderGroupForEntry(entry config.HookEntry, defaultCwd string) (string, error) {
-	if entry.Container == "" && entry.ComposeService == "" {
-		return renderGroup(entry.Steps, defaultCwd), nil
-	}
-	engine := entry.Engine
+	// Container exec path.
+	engine := a.Engine
 	if engine == "" {
 		engine = "docker"
 	}
 	id, err := containerip.ContainerID(containerip.Opts{
-		Container:      entry.Container,
-		ComposeService: entry.ComposeService,
-		ComposeProject: entry.ComposeProject,
+		Container:      a.Container,
+		ComposeService: a.ComposeService,
+		ComposeProject: a.ComposeProject,
 		Engine:         engine,
 	})
 	if err != nil {
-		return "", fmt.Errorf("hook in_container resolve: %w", err)
+		return "", fmt.Errorf("action container resolve: %w", err)
 	}
-	parts := make([]string, 0, len(entry.Steps))
-	for _, s := range entry.Steps {
+	parts := make([]string, 0, len(a.Run))
+	for _, step := range a.Run {
 		args := []string{"exec"}
-		if s.Cwd != "" {
-			args = append(args, "-w", s.Cwd)
+		if a.Cwd != "" {
+			args = append(args, "-w", a.Cwd)
 		}
-		args = append(args, id, "sh", "-c", s.Run)
+		args = append(args, id, "sh", "-c", step)
 		parts = append(parts, shellJoin(append([]string{engine}, args...)))
 	}
 	return strings.Join(parts, " && "), nil
@@ -366,10 +334,40 @@ func captureTail(r io.Reader, cap int) string {
 	return string(all)
 }
 
+// buildEnv assembles the env shipped to a hook subprocess. The
+// model:
+//
+//  1. Start from the user's CLI-captured env (`inheritedEnv`,
+//     ultimately os.Environ() at `treeman wt create` time). This is
+//     authoritative: it carries the user's PATH, language version
+//     manager shims (asdf, nvm, mise, rbenv, …), aliases-expanded
+//     binaries, and whatever they had loaded.
+//  2. Overlay the treeman scoping vars (TREEMAN_MAIN_ROOT, _WORKTREE,
+//     _SLUG) so user scripts can address them.
+//  3. SAFETY NET: if the user's env doesn't carry a PATH (rare —
+//     happens when the lifecycle watcher fires for a first-time
+//     `git worktree add` made outside the CLI, before any
+//     `wt finalize` has cached the user's env), fall back to the
+//     daemon process's own PATH so /bin/sh + coreutils still resolve.
+//     This is strictly additive: a user-set PATH always wins.
+//
+// Without the safety net a watcher-driven re-run could fail with
+// `command not found` for `cd`, `mkdir`, etc. — even though those
+// are always available on the host — purely because the cached env
+// was empty.
 func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug string) []string {
-	out := make([]string, 0, len(inheritedEnv)+3)
+	out := make([]string, 0, len(inheritedEnv)+4)
+	havePath := false
 	for k, v := range inheritedEnv {
+		if k == "PATH" {
+			havePath = true
+		}
 		out = append(out, k+"="+v)
+	}
+	if !havePath {
+		if p := os.Getenv("PATH"); p != "" {
+			out = append(out, "PATH="+p)
+		}
 	}
 	out = append(out,
 		"TREEMAN_MAIN_ROOT="+repoRoot,

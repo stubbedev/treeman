@@ -11,16 +11,14 @@ import (
 	"github.com/stubbedev/treeman/internal/schema"
 )
 
-func TestRenderTemplateContainsModelineAndRepoName(t *testing.T) {
+func TestRenderTemplateContainsModeline(t *testing.T) {
 	dir := t.TempDir()
-	os.Rename(dir, dir) // no-op — just exercising the path
 	body := RenderTemplate(dir)
 	if !strings.Contains(body, "$schema="+schema.URL) {
 		t.Errorf("missing schema modeline:\n%s", body)
 	}
-	want := "name: " + filepath.Base(dir)
-	if !strings.Contains(body, want) {
-		t.Errorf("missing %q:\n%s", want, body)
+	if !strings.Contains(body, "worktrees:") {
+		t.Errorf("missing worktrees block:\n%s", body)
 	}
 }
 
@@ -75,6 +73,102 @@ func TestWriteYAMLOverwritesWithForce(t *testing.T) {
 	}
 	if body == "existing\n" {
 		t.Error("file not overwritten")
+	}
+}
+
+// TestRenderTemplateLaravelEndToEnd is the integration check for the
+// collapsed declarative schema: against a minimal Laravel-shaped fixture
+// (artisan marker + composer.json + database/migrations dir), the scaffold
+// should emit a top-level `migrate:` block on the db, an `inputs:` list
+// covering both migration globs and the lockfile, and no `framework:`,
+// `migrations:`, or `watcher:` blocks.
+func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	must := func(p string, body string) {
+		t.Helper()
+		full := filepath.Join(dir, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must("artisan", "#!/usr/bin/env php\n")
+	must("composer.json", `{"name":"acme/app"}`)
+	must("composer.lock", `{"_readme": []}`)
+	must("database/migrations/2024_01_01_000000_init.php", "<?php\n")
+
+	body := RenderTemplate(dir)
+
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("rendered template is not valid YAML: %v\n%s", err, body)
+	}
+
+	dbs, ok := doc["databases"].([]any)
+	if !ok || len(dbs) == 0 {
+		t.Fatalf("databases: missing or wrong type\n%s", body)
+	}
+	db, _ := dbs[0].(map[string]any)
+	if got := db["engine"]; got != "mysql" {
+		t.Errorf("engine = %v, want mysql", got)
+	}
+	if _, has := db["migrations"]; has {
+		t.Errorf("databases[0].migrations should not exist after collapse refactor; got %v", db["migrations"])
+	}
+	if _, has := doc["watcher"]; has {
+		t.Errorf("top-level watcher: block should not exist after collapse refactor; got %v", doc["watcher"])
+	}
+
+	migrate, ok := db["migrate"].(map[string]any)
+	if !ok {
+		t.Fatalf("databases[0].migrate: missing or wrong type\n%s", body)
+	}
+	if got := migrate["run"]; got != "php artisan migrate --force" {
+		t.Errorf("migrate.run = %v, want laravel default", got)
+	}
+	env, ok := migrate["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("migrate.env: missing or wrong type\n%s", body)
+	}
+	if got := env["DB_DATABASE"]; got != "{target_db}" {
+		t.Errorf("migrate.env.DB_DATABASE = %v, want {target_db}", got)
+	}
+	if got := env["DB_TEST_DATABASE"]; got != "{target_db}" {
+		t.Errorf("migrate.env.DB_TEST_DATABASE = %v, want {target_db}", got)
+	}
+
+	inputs, ok := db["inputs"].([]any)
+	if !ok || len(inputs) == 0 {
+		t.Fatalf("databases[0].inputs: missing or empty\n%s", body)
+	}
+	type entry struct{ label, hash string }
+	wantInputs := map[string]entry{
+		"database/migrations/**/*.php":               {label: "migrations", hash: "filename"},
+		"app/Modules/*/Database/Migrations/**/*.php": {label: "migrations", hash: "filename"},
+		"app/Modules/*/Database/migrations/**/*.php": {label: "migrations", hash: "filename"},
+		"Modules/*/Database/Migrations/**/*.php":     {label: "migrations", hash: "filename"},
+		"Modules/*/Database/migrations/**/*.php":     {label: "migrations", hash: "filename"},
+		"composer.lock":                              {label: "lockfile", hash: ""},
+	}
+	gotInputs := map[string]entry{}
+	for _, in := range inputs {
+		m, _ := in.(map[string]any)
+		g, _ := m["glob"].(string)
+		lbl, _ := m["label"].(string)
+		h, _ := m["hash"].(string)
+		gotInputs[g] = entry{label: lbl, hash: h}
+	}
+	for g, want := range wantInputs {
+		got, ok := gotInputs[g]
+		if !ok {
+			t.Errorf("inputs[%q]: missing", g)
+			continue
+		}
+		if got != want {
+			t.Errorf("inputs[%q] = %+v, want %+v", g, got, want)
+		}
 	}
 }
 

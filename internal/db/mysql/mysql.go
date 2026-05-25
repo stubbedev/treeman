@@ -18,8 +18,9 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
-	"github.com/stubbedev/treeman/internal/db/reachability"
+	"github.com/stubbedev/treeman/internal/db/ident"
 )
 
 // Driver wraps a *sql.DB plus the connection config used to open it.
@@ -29,61 +30,55 @@ type Driver struct {
 }
 
 // Connect opens a pooled mysql connection at the server level (no
-// default DB scope so DDL like CREATE/DROP DATABASE works). TCP
-// probe runs first so unreachable services surface a clean error
-// before sqlx-style "connect refused" noise.
+// default DB scope so DDL like CREATE/DROP DATABASE works). Three
+// connection modes are auto-detected from cfg:
+//
+//   - Container/ComposeService set → containerip rewrites Host:Port
+//     to the published mapping (or bridge-network IP fallback), then
+//     dials TCP.
+//   - cfg.Host starts with "/" → unix-socket DSN
+//     (`unix(/var/run/mysqld/mysqld.sock)`), TCP probe skipped.
+//   - Otherwise → plain TCP. Probe runs first so unreachable
+//     services surface a clean error before sqlx-style noise.
 func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 3306
 	}
-	opts := containerip.Opts{
-		Container:      cfg.Container,
-		ComposeService: cfg.ComposeService,
-		ComposeProject: cfg.ComposeProject,
-		Engine:         cfg.ContainerEngine,
-		Network:        cfg.Network,
-		InternalPort:   cfg.Port,
-	}
-	if addr, err := containerip.ResolveAddr(opts); err != nil {
-		return nil, fmt.Errorf("resolve container: %w", err)
-	} else if addr != nil {
-		cfg.Host = addr.Host
-		if addr.Port != 0 {
-			cfg.Port = addr.Port
+	socketMode := strings.HasPrefix(cfg.Host, "/")
+	if !socketMode {
+		opts := containerip.Opts{
+			Container:      cfg.Container,
+			ComposeService: cfg.ComposeService,
+			ComposeProject: cfg.ComposeProject,
+			Engine:         cfg.ContainerEngine,
+			Network:        cfg.Network,
+			InternalPort:   cfg.Port,
 		}
-	}
-	if err := reachability.Probe("mysql", cfg.Host, cfg.Port); err != nil {
-		// Container IP/port may have changed (restart); evict + retry once.
-		if cfg.Container != "" || cfg.ComposeService != "" {
-			containerip.RefreshOpts(opts)
-			if addr, e := containerip.ResolveAddr(opts); e == nil && addr != nil {
-				cfg.Host = addr.Host
-				if addr.Port != 0 {
-					cfg.Port = addr.Port
-				}
-				if err2 := reachability.Probe("mysql", cfg.Host, cfg.Port); err2 != nil {
-					return nil, err2
-				}
-			} else {
-				return nil, err
-			}
-		} else {
+		if err := adapter.ResolveAndProbe(ctx, "mysql", opts, &cfg.Host, &cfg.Port); err != nil {
 			return nil, err
 		}
 	}
-	dsn := fmt.Sprintf(
-		"%s:%s@tcp(%s:%d)/?charset=utf8mb4,utf8&parseTime=true&multiStatements=true",
-		url.QueryEscape(cfg.User),
-		url.QueryEscape(cfg.Password),
-		cfg.Host, cfg.Port,
-	)
+	var dsn string
+	if socketMode {
+		dsn = fmt.Sprintf(
+			"%s:%s@unix(%s)/?charset=utf8mb4,utf8&parseTime=true&multiStatements=true",
+			url.QueryEscape(cfg.User),
+			url.QueryEscape(cfg.Password),
+			cfg.Host,
+		)
+	} else {
+		dsn = fmt.Sprintf(
+			"%s:%s@tcp(%s:%d)/?charset=utf8mb4,utf8&parseTime=true&multiStatements=true",
+			url.QueryEscape(cfg.User),
+			url.QueryEscape(cfg.Password),
+			cfg.Host, cfg.Port,
+		)
+	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open mysql: %w", err)
 	}
-	if cfg.PoolMax > 0 {
-		db.SetMaxOpenConns(int(cfg.PoolMax))
-	}
+	adapter.ConfigurePool(db, int(cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping mysql: %w", err)
@@ -118,15 +113,14 @@ func (d *Driver) MaxConnections(ctx context.Context) (int, error) {
 
 // EnsureDB idempotently creates `name` with utf8mb4 / unicode_ci.
 func (d *Driver) EnsureDB(ctx context.Context, name string) error {
-	if err := validateIdent(name); err != nil {
+	qname, err := ident.QuoteMySQL(name)
+	if err != nil {
 		return err
 	}
-	stmt := fmt.Sprintf(
-		"CREATE DATABASE IF NOT EXISTS `%s` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
-		name,
-	)
+	stmt := "CREATE DATABASE IF NOT EXISTS " + qname +
+		" DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
 	if _, err := d.DB.ExecContext(ctx, stmt); err != nil {
-		return fmt.Errorf("CREATE DATABASE `%s`: %w", name, err)
+		return fmt.Errorf("CREATE DATABASE %s: %w", qname, err)
 	}
 	return nil
 }
@@ -156,11 +150,12 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	for _, n := range matched {
 		n := n
 		g.Go(func() error {
-			if err := validateIdent(n); err != nil {
+			qn, err := ident.QuoteMySQL(n)
+			if err != nil {
 				return err
 			}
-			if _, err := d.DB.ExecContext(gctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", n)); err != nil {
-				return fmt.Errorf("DROP DATABASE `%s`: %w", n, err)
+			if _, err := d.DB.ExecContext(gctx, "DROP DATABASE IF EXISTS "+qn); err != nil {
+				return fmt.Errorf("DROP DATABASE %s: %w", qn, err)
 			}
 			return nil
 		})
@@ -239,18 +234,19 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 // other views / tables and engines reject CREATE VIEW against a
 // missing dependency.
 func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
-	if err := validateIdent(source); err != nil {
+	qsource, err := ident.QuoteMySQL(source)
+	if err != nil {
 		return err
 	}
-	if err := validateIdent(template); err != nil {
+	qtemplate, err := ident.QuoteMySQL(template)
+	if err != nil {
 		return err
 	}
-	if _, err := d.DB.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", template)); err != nil {
+	if _, err := d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtemplate); err != nil {
 		return err
 	}
-	if _, err := d.DB.ExecContext(ctx, fmt.Sprintf(
-		"CREATE DATABASE `%s` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
-		template)); err != nil {
+	if _, err := d.DB.ExecContext(ctx,
+		"CREATE DATABASE "+qtemplate+" DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"); err != nil {
 		return err
 	}
 
@@ -300,24 +296,25 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 		if err := applyCloneSession(ctx, conn); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf("USE `%s`", template)); err != nil {
-			return fmt.Errorf("USE `%s`: %w", template, err)
+		if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
+			return fmt.Errorf("USE %s: %w", qtemplate, err)
 		}
 		for _, tbl := range tables {
-			if err := validateIdent(tbl.name); err != nil {
+			qtbl, err := ident.QuoteMySQL(tbl.name)
+			if err != nil {
 				return err
 			}
-			row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", source, tbl.name))
+			row := conn.QueryRowContext(ctx, "SHOW CREATE TABLE "+qsource+"."+qtbl)
 			var gotName, createStmt string
 			if err := row.Scan(&gotName, &createStmt); err != nil {
-				return fmt.Errorf("SHOW CREATE TABLE `%s`.`%s`: %w", source, tbl.name, err)
+				return fmt.Errorf("SHOW CREATE TABLE %s.%s: %w", qsource, qtbl, err)
 			}
 			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-				return fmt.Errorf("recreate `%s`: %w", tbl.name, err)
+				return fmt.Errorf("recreate %s: %w", qtbl, err)
 			}
 			cols, err := nonGeneratedColumns(ctx, conn, source, tbl.name)
 			if err != nil {
-				return fmt.Errorf("list columns for `%s`: %w", tbl.name, err)
+				return fmt.Errorf("list columns for %s: %w", qtbl, err)
 			}
 			jobs = append(jobs, tableJob{name: tbl.name, cols: cols})
 		}
@@ -364,22 +361,23 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 			return err
 		}
 		for _, v := range views {
-			if err := validateIdent(v.name); err != nil {
+			qv, err := ident.QuoteMySQL(v.name)
+			if err != nil {
 				return err
 			}
-			row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE VIEW `%s`.`%s`", source, v.name))
+			row := conn.QueryRowContext(ctx, "SHOW CREATE VIEW "+qsource+"."+qv)
 			var name, createStmt string
 			// SHOW CREATE VIEW returns four columns; scan into
 			// dummies for the extras.
 			var charset, collation string
 			if err := row.Scan(&name, &createStmt, &charset, &collation); err != nil {
-				return fmt.Errorf("SHOW CREATE VIEW `%s`.`%s`: %w", source, v.name, err)
+				return fmt.Errorf("SHOW CREATE VIEW %s.%s: %w", qsource, qv, err)
 			}
-			if _, err := conn.ExecContext(ctx, fmt.Sprintf("USE `%s`", template)); err != nil {
-				return fmt.Errorf("USE `%s`: %w", template, err)
+			if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
+				return fmt.Errorf("USE %s: %w", qtemplate, err)
 			}
 			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-				return fmt.Errorf("recreate view `%s`: %w", v.name, err)
+				return fmt.Errorf("recreate view %s: %w", qv, err)
 			}
 		}
 	}
@@ -424,7 +422,20 @@ func applyCloneSession(ctx context.Context, conn *sql.Conn) error {
 // serial DDL pass, so this only issues the INSERT … SELECT against
 // pre-existing tables — no concurrent CREATEs to contend with.
 func copyOneTableData(ctx context.Context, db *sql.DB, source, template, name string, cols []string) error {
-	if err := validateIdent(name); err != nil {
+	qsource, err := ident.QuoteMySQL(source)
+	if err != nil {
+		return err
+	}
+	qtemplate, err := ident.QuoteMySQL(template)
+	if err != nil {
+		return err
+	}
+	qname, err := ident.QuoteMySQL(name)
+	if err != nil {
+		return err
+	}
+	colList, err := backtickJoin(cols)
+	if err != nil {
 		return err
 	}
 	conn, err := db.Conn(ctx)
@@ -435,12 +446,10 @@ func copyOneTableData(ctx context.Context, db *sql.DB, source, template, name st
 	if err := applyCloneSession(ctx, conn); err != nil {
 		return err
 	}
-	colList := backtickJoin(cols)
-	copyStmt := fmt.Sprintf(
-		"INSERT INTO `%s`.`%s` (%s) SELECT %s FROM `%s`.`%s`",
-		template, name, colList, colList, source, name)
+	copyStmt := "INSERT INTO " + qtemplate + "." + qname + " (" + colList +
+		") SELECT " + colList + " FROM " + qsource + "." + qname
 	if _, err := conn.ExecContext(ctx, copyStmt); err != nil {
-		return fmt.Errorf("copy data for `%s`: %w", name, err)
+		return fmt.Errorf("copy data for %s: %w", qname, err)
 	}
 	return nil
 }
@@ -471,9 +480,12 @@ func nonGeneratedColumns(ctx context.Context, conn *sql.Conn, schema, table stri
 	return out, rows.Err()
 }
 
-func backtickJoin(cols []string) string {
+func backtickJoin(cols []string) (string, error) {
 	var b strings.Builder
 	for i, c := range cols {
+		if err := ident.ValidateMySQL(c); err != nil {
+			return "", err
+		}
 		if i > 0 {
 			b.WriteByte(',')
 		}
@@ -481,19 +493,20 @@ func backtickJoin(cols []string) string {
 		b.WriteString(c)
 		b.WriteByte('`')
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // SnapshotRestore re-creates `target` from `template`. Symmetric to
 // SnapshotCreate.
 func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
-	if err := validateIdent(template); err != nil {
+	qtarget, err := ident.QuoteMySQL(target)
+	if err != nil {
 		return err
 	}
-	if err := validateIdent(target); err != nil {
+	if err := ident.ValidateMySQL(template); err != nil {
 		return err
 	}
-	if _, err := d.DB.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", target)); err != nil {
+	if _, err := d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
 		return err
 	}
 	return d.SnapshotCreate(ctx, template, target)
@@ -501,24 +514,10 @@ func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) e
 
 // DropSnapshot drops a template DB. Idempotent.
 func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
-	if err := validateIdent(template); err != nil {
+	qtemplate, err := ident.QuoteMySQL(template)
+	if err != nil {
 		return err
 	}
-	_, err := d.DB.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", template))
+	_, err = d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
 	return err
-}
-
-// validateIdent rejects anything that isn't `[A-Za-z0-9_]+` so we can
-// safely interpolate into backtick-quoted identifiers.
-func validateIdent(s string) error {
-	if s == "" {
-		return fmt.Errorf("empty mysql identifier")
-	}
-	for _, c := range s {
-		ok := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'
-		if !ok {
-			return fmt.Errorf("invalid mysql identifier: %q", s)
-		}
-	}
-	return nil
 }

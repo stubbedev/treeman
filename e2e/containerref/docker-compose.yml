@@ -1,0 +1,33 @@
+# Two MySQL containers for the containerip-resolution e2e:
+#   • `mysql-published` exposes 3306 → 13366 on the host. treeman
+#     should resolve `container: treeman-e2e-ctr-published` to
+#     127.0.0.1:13366 via the published-port path.
+#   • `mysql-internal` has NO `ports:` block. treeman should fall
+#     back to the container's bridge-network IP + internal port.
+services:
+  mysql-published:
+    image: mysql:8.4
+    container_name: treeman-e2e-ctr-published
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+    ports:
+      - "13366:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  mysql-internal:
+    image: mysql:8.4
+    container_name: treeman-e2e-ctr-internal
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+    # No ports: — only reachable from inside docker's bridge net.
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s

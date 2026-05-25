@@ -21,12 +21,13 @@ create a worktree end-to-end
 
 ```
 Creates a linked worktree, patches the env files, registers it
-in SQLite, then dispatches postcreate hooks + prepare to the daemon.
+in SQLite, then dispatches setup hooks + prepare to the daemon. The
+CLI always returns immediately — follow progress with
+'treeman logs tail --follow'.
 
 Examples:
   treeman wt create PROJ-1234
   treeman wt create feature/x --from origin/develop
-  treeman wt create hotfix --foreground   # block on hooks + prepare
   cd "$(treeman wt create feat --print-path)"
 ```
 
@@ -37,7 +38,6 @@ Examples:
 | `--repo` | repo root override |
 | `--skip-hooks` |  |
 | `--skip-prepare` |  |
-| `--foreground` | force fg execution of postcreate + prepare |
 | `--no-fetch` | skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits) |
 | `--print-path` | print only the new worktree path on stdout; status lines redirect to stderr (enables `cd "$(treeman wt create …)"`) |
 
@@ -48,22 +48,22 @@ Aliases: `rm`
 delete a worktree end-to-end
 
 ```
-Runs predelete hooks + DB teardown + git worktree remove, then
+Runs teardown hooks + DB teardown + git worktree remove, then
 removes the registry row. The teardown is dispatched to the daemon
-so the shell returns immediately; pass --foreground to block.
+(or a setsid child when the daemon is unreachable) — the CLI
+always returns immediately.
 
 Examples:
   treeman wt delete PROJ-1234
   treeman wt delete /path/to/wt --force      # remove stale registry entry
-  treeman wt delete feature/x --foreground   # block on teardown
 ```
 
 | Flag | Usage |
 |---|---|
 | `--repo` |  |
 | `-f`, `--force` |  |
-| `--foreground` | force fg execution of predelete + teardown + git remove |
 | `-y`, `--yes` | skip the confirmation prompt |
+| `--detached` |  |
 
 ### `treeman worktree register`
 
@@ -77,30 +77,6 @@ register a worktree path (metadata only)
 ### `treeman worktree unregister`
 
 mark a worktree deleted in SQLite without touching git
-
-### `treeman worktree watch`
-
-toggle lifecycle-watcher opt-in (on|off|status)
-
-```
-Marks the current repo as opted-in (or out) of the daemon's
-lifecycle watcher. With opt-in ON, the daemon fires postcreate /
-postdelete hooks automatically when 'git worktree add' or
-'git worktree remove' is invoked outside the treeman CLI.
-
-Both this opt-in AND the resolved config bool
-'worktrees.hook_lifecycle: true' must be set for the watcher to
-activate. Default config is OFF.
-
-Examples:
-  treeman wt watch on
-  treeman wt watch off
-  treeman wt watch status
-```
-
-| Flag | Usage |
-|---|---|
-| `--repo` |  |
 
 ### `treeman worktree list`
 
@@ -161,12 +137,12 @@ block until the daemon's finalize for a worktree completes
 
 ### `treeman worktree finalize`
 
-rerun postcreate + prepare for a worktree (default via daemon; --local runs inline)
+rerun setup + prepare for a worktree (default via daemon; --local runs inline)
 
 | Flag | Usage |
 |---|---|
 | `--repo` |  |
-| `--local` | run postcreate + prepare in this process instead of dispatching to the daemon |
+| `--local` | run setup + prepare in this process instead of dispatching to the daemon |
 
 ### `treeman worktree switch`
 

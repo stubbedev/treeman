@@ -76,7 +76,7 @@ func RegistryCmd() *cli.Command {
 
 // registryRemove implements `treeman registry remove --repo R` —
 // drops the repo from the SQLite registry plus every child row
-// (worktrees, events, snapshots, binlog_checkpoints, hook_runs). Does
+// (worktrees, events, snapshots, hook_runs). Does
 // NOT touch databases, on-disk worktree directories, or dump caches.
 //
 // When the daemon is running, the work is delegated via RPC so live

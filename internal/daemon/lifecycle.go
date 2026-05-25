@@ -14,7 +14,9 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/hooks"
+	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -24,15 +26,9 @@ import (
 // `<common-dir>/worktrees/` of one repo and fires hook phases when
 // worktrees appear/disappear outside of the treeman CLI.
 //
-// Gating: the daemon only spawns a LifecycleWatcher for a repo when
-// BOTH of the following are true:
-//
-//  1. The repo's effective config has `worktrees.hook_lifecycle: true`
-//     (default false; layered global + per-repo, most specific wins).
-//  2. The `repos.watch_lifecycle` column in the daemon store is set
-//     to 1 (toggled via `treeman wt watch on`).
-//
-// Either gate flipping false stops the watcher at the next reconcile.
+// Always on: the daemon spawns a LifecycleWatcher for every
+// registered repo unconditionally. Worktree add/remove is
+// infrastructure (not user policy), so there's no opt-in toggle.
 type LifecycleWatcher struct {
 	repoID    int64
 	repoPath  string
@@ -47,20 +43,6 @@ type LifecycleWatcher struct {
 
 	pendingMu     sync.Mutex
 	pendingCreate map[string]*time.Timer
-}
-
-// LifecycleEnabledForRepo resolves the effective config for repoPath
-// and returns the value of `worktrees.hook_lifecycle`. Defaults to
-// false when the field is unset at every layer.
-func LifecycleEnabledForRepo(repoPath string) bool {
-	cfg, err := resolve.LoadResolved(repoPath)
-	if err != nil {
-		return false
-	}
-	if cfg.Worktrees.HookLifecycle == nil {
-		return false
-	}
-	return *cfg.Worktrees.HookLifecycle
 }
 
 // StartLifecycleWatcher subscribes to a repo's `<common-dir>/worktrees/`
@@ -149,7 +131,7 @@ func (lw *LifecycleWatcher) loop(ctx context.Context) {
 
 // scheduleCreate debounces the CREATE — git writes the admin dir,
 // then a sequence of files (HEAD, commondir, gitdir) — so we don't
-// fire postcreate while the worktree is still being assembled. The
+// fire setup while the worktree is still being assembled. The
 // pending timer is cancellable if a REMOVE for the same path arrives
 // inside the window (handles `git worktree add` immediately followed
 // by `--force` cleanup, or test fixtures racing).
@@ -194,7 +176,7 @@ func (lw *LifecycleWatcher) onCreate(ctx context.Context, adminDir string) {
 	// `git worktree add` which fires the same fsnotify CREATE event
 	// we're handling here — without these checks the CLI flow and
 	// the lifecycle flow both register the worktree and both run
-	// postcreate hooks, fighting on file locks (composer install
+	// setup hooks, fighting on file locks (composer install
 	// twice, npm install twice).
 	//
 	// Two-layer dedup:
@@ -207,12 +189,12 @@ func (lw *LifecycleWatcher) onCreate(ctx context.Context, adminDir string) {
 	// the row doesn't exist yet, no finalize is in flight, so the
 	// watcher proceeds to register + finalize.
 	if existing, err := lw.st.Store.LookupActiveWorktreeByPath(ctx, wtPath); err == nil && existing.ID != 0 {
-		slog.Debug("lifecycle: skip postcreate (CLI already registered)",
+		slog.Debug("lifecycle: skip setup (CLI already registered)",
 			"wt", wtPath, "id", existing.ID)
 		return
 	}
 	if lw.st.IsFinalizeInFlight(wtPath) {
-		slog.Debug("lifecycle: skip postcreate (finalize already in flight)", "wt", wtPath)
+		slog.Debug("lifecycle: skip setup (finalize already in flight)", "wt", wtPath)
 		return
 	}
 
@@ -222,9 +204,18 @@ func (lw *LifecycleWatcher) onCreate(ctx context.Context, adminDir string) {
 		slog.Warn("lifecycle: ensure worktree", "wt", wtPath, "err", err)
 		return
 	}
-	slog.Info("lifecycle: postcreate dispatched", "repo", lw.repoPath, "wt", wtPath)
-	if err := FinalizeWorktree(ctx, lw.st, lw.repoPath, wtPath, map[string]string{}); err != nil {
-		slog.Warn("lifecycle: postcreate failed", "wt", wtPath, "err", err)
+	slog.Info("lifecycle: setup dispatched", "repo", lw.repoPath, "wt", wtPath)
+	// Best-effort env rehydration — when an external `git worktree
+	// add` runs without the CLI, there's no captured env yet, so
+	// LoadInheritedEnvByPath returns nil and FinalizeWorktree gets
+	// an empty env. The next user-driven `wt finalize` will populate
+	// the cache.
+	env, _ := lw.st.Store.LoadInheritedEnvByPath(ctx, wtPath)
+	if env == nil {
+		env = map[string]string{}
+	}
+	if err := FinalizeWorktree(ctx, lw.st, lw.repoPath, wtPath, env); err != nil {
+		slog.Warn("lifecycle: setup failed", "wt", wtPath, "err", err)
 	}
 }
 
@@ -250,7 +241,7 @@ func (lw *LifecycleWatcher) onRemove(ctx context.Context, adminDir string) {
 	}
 	// `treeman wt delete` removes the admin dir via `git worktree
 	// remove` near the end of its teardown — that REMOVE fsnotify
-	// event lands here. The primary teardown already runs postdelete
+	// event lands here. The primary teardown already runs teardown
 	// + DB teardown + marks the row deleted; spawning an orphan
 	// teardown behind the same per-repo mutex just blocks waiting for
 	// the primary to release, then no-ops on the deleted-row check.
@@ -258,21 +249,21 @@ func (lw *LifecycleWatcher) onRemove(ctx context.Context, adminDir string) {
 	if lw.st.IsTeardownInFlight(wtPath) {
 		return
 	}
-	slog.Info("lifecycle: postdelete dispatched", "repo", lw.repoPath, "wt", wtPath)
+	slog.Info("lifecycle: teardown dispatched", "repo", lw.repoPath, "wt", wtPath)
 	if err := teardownOrphan(ctx, lw.st, lw.repoPath, wtPath); err != nil {
-		slog.Warn("lifecycle: postdelete failed", "wt", wtPath, "err", err)
+		slog.Warn("lifecycle: teardown failed", "wt", wtPath, "err", err)
 	}
 }
 
 // reconcile diffs the filesystem state against the DB rows for this
-// repo at boot (or whenever a watch_lifecycle toggle flips on):
+// repo at boot:
 //
-//   - admin_dir present on disk but no DB row → postcreate dispatch.
-//   - DB row with admin_dir but the dir is gone → postdelete dispatch.
+//   - admin_dir present on disk but no DB row → setup dispatch.
+//   - DB row with admin_dir but the dir is gone → teardown dispatch.
 //
 // Closing the loop here covers the "daemon was down when the user ran
-// `git worktree add`/`remove`" case. Idempotent — postcreate logic
-// short-circuits when the worktree already has resources, postdelete
+// `git worktree add`/`remove`" case. Idempotent — setup logic
+// short-circuits when the worktree already has resources, teardown
 // is gated on `deleted_at IS NULL`.
 func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 	entries, err := os.ReadDir(lw.adminRoot)
@@ -303,13 +294,30 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 		}
 	}
 
+	// Fan out onCreate / onRemove across reconcileWorkers goroutines.
+	// Each onCreate calls FinalizeWorktree (db setup + hook chains),
+	// each onRemove calls teardownOrphan (db teardown + hook chains) —
+	// on boot of a daemon with N stale worktrees, the old serial loop
+	// stalled the constructor for N×finalize-time before the event
+	// loop could serve its first RPC.
+	const reconcileWorkers = 4
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, reconcileWorkers)
+
 	for admin, wtPath := range onDisk {
 		lw.mu.Lock()
 		lw.seen[admin] = wtPath
 		lw.mu.Unlock()
 		row, ok := dbByAdmin[admin]
 		if !ok || row.Deleted {
-			lw.onCreate(ctx, admin)
+			admin := admin
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				lw.onCreate(ctx, admin)
+			}()
 			continue
 		}
 		// Row exists and active — make sure admin_dir is stamped
@@ -327,13 +335,21 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 		if _, ok := onDisk[admin]; ok {
 			continue
 		}
-		lw.onRemove(ctx, admin)
+		admin := admin
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			lw.onRemove(ctx, admin)
+		}()
 	}
+	wg.Wait()
 	return nil
 }
 
 // teardownOrphan is the "working tree already gone" variant of
-// TeardownWorktree. Runs postdelete hooks (NOT predelete — the tree
+// TeardownWorktree. Runs teardown hooks (NOT teardown — the tree
 // is gone) cwd'd into the repo root, drops the per-worktree
 // databases, and marks the row deleted. Does NOT call `git worktree
 // remove` — git already did.
@@ -366,36 +382,45 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 	}
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_lifecycle_teardown_start",
-		"lifecycle watcher: postdelete + db teardown beginning",
+		"lifecycle watcher: teardown hooks + db teardown beginning",
 		repoID, row.ID, "", 0, nil)
 
-	if len(cfg.Hooks.Postdelete) > 0 {
-		logDir := orphanLogDir(repoPath, row.Slug)
-		started := hooks.EmitHookStart(ctx, st.Store, repoID, row.ID, "postdelete", len(cfg.Hooks.Postdelete))
-		out, _ := hooks.RunHooksOrphan(ctx, "postdelete", cfg.Hooks.Postdelete,
+	// Orphan teardown — the working tree is gone, so we run
+	// before-engines + after-engines hooks against a log dir under
+	// XDG_STATE_HOME instead of the (deleted) worktree.
+	logDir := orphanLogDir(repoPath, row.Slug)
+	runOrphan := func(trigger string, actions []config.Action) {
+		if len(actions) == 0 {
+			return
+		}
+		started := hooks.EmitHookStart(ctx, st.Store, repoID, row.ID, trigger, len(actions))
+		out, _ := hooks.RunHooksOrphan(ctx, trigger, actions,
 			repoPath, wtPath, row.Slug, logDir, map[string]string{}, true)
-		hooks.PersistOutcome(ctx, st.Store, repoID, row.ID, "postdelete", started, nowMillis(), out)
+		hooks.PersistOutcome(ctx, st.Store, repoID, row.ID, trigger, started, nowMillis(), out)
 	}
+	runOrphan("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
 
 	if len(cfg.Databases) > 0 {
-		ScheduleDBDrop(st, repoPath, DBDropJob{
-			Cfg:        cfg,
-			Slug:       row.Slug,
-			RepoID:     repoID,
-			WorktreeID: row.ID,
-		})
+		// Inline drop so on-delete-after-engines actions observe a
+		// fully-dropped state. The lifecycle goroutine already runs
+		// detached from the originating fsnotify event, so the cost
+		// stays off the user's CLI hot path.
+		if err := prepare.TeardownDatabases(ctx, &cfg, row.Slug, repoID, row.ID, st.Store); err != nil {
+			slog.Warn("lifecycle teardown DB drop", "wt", wtPath, "err", err)
+		}
 	}
+	runOrphan("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
 
 	if err := st.Store.MarkWorktreeDeleted(ctx, row.ID); err != nil {
 		return err
 	}
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_lifecycle_teardown_done",
-		"lifecycle watcher: postdelete + db teardown complete",
+		"lifecycle watcher: teardown + db teardown complete",
 		repoID, row.ID, "", 0, nil)
 	return nil
 }
 
-// orphanLogDir routes lifecycle postdelete logs to a daemon-managed
+// orphanLogDir routes lifecycle teardown logs to a daemon-managed
 // state path since the worktree dir (which would normally host
 // `.treeman-hooks/`) no longer exists.
 func orphanLogDir(repoPath, slug string) string {

@@ -1,0 +1,96 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestValidate(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+		want string // substring of error; empty = no error
+	}{
+		{
+			name: "empty config is valid",
+			cfg:  Config{},
+			want: "",
+		},
+		{
+			name: "container and compose_service mutually exclusive",
+			cfg: Config{
+				Connections: ConnectionsConfig{
+					Mysql: &MysqlConn{
+						ContainerRef: ContainerRef{
+							Container:      "db",
+							ComposeService: "mysql",
+						},
+					},
+				},
+			},
+			want: "mutually exclusive",
+		},
+		{
+			name: "database engine required",
+			cfg: Config{
+				Databases: []DatabaseConfig{{NameTemplate: "x_{slug}"}},
+			},
+			want: "engine is required",
+		},
+		{
+			name: "database engine unknown",
+			cfg: Config{
+				Databases: []DatabaseConfig{{Engine: "sqlite3", NameTemplate: "x_{slug}"}},
+			},
+			want: "unknown engine",
+		},
+		{
+			name: "name_template required for mysql",
+			cfg: Config{
+				Databases: []DatabaseConfig{{Engine: "mysql"}},
+			},
+			want: "name_template is required",
+		},
+		{
+			name: "redis without name_template ok",
+			cfg: Config{
+				Databases: []DatabaseConfig{{Engine: "redis"}},
+			},
+			want: "",
+		},
+		{
+			name: "elasticsearch without name_template ok",
+			cfg: Config{
+				Databases: []DatabaseConfig{{Engine: "elasticsearch"}},
+			},
+			want: "",
+		},
+		{
+			name: "valid config is valid",
+			cfg: Config{
+				Databases: []DatabaseConfig{
+					{Engine: "mysql", NameTemplate: "app_{slug}"},
+					{Engine: "redis"},
+				},
+			},
+			want: "",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := c.cfg.Validate()
+			if c.want == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error %q should contain %q", err, c.want)
+			}
+		})
+	}
+}

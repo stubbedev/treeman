@@ -1,0 +1,8 @@
+{
+  "name": "treeman-e2e-prisma",
+  "version": "0.0.0",
+  "private": true,
+  "devDependencies": {
+    "prisma": "^5.20.0"
+  }
+}

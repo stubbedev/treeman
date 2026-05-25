@@ -3,26 +3,21 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"github.com/stubbedev/treeman/internal/gitcmd"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/urfave/cli/v3"
 
-	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/gitenv"
-	"github.com/stubbedev/treeman/internal/hooks"
-	"github.com/stubbedev/treeman/internal/patcher"
-	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
-	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/ui"
+	"github.com/stubbedev/treeman/internal/wt"
 )
 
 // WorktreeCmd — `treeman wt {create,delete,register,unregister,list,finalize}`.
@@ -36,7 +31,6 @@ func WorktreeCmd() *cli.Command {
 			wtDelete(),
 			wtRegister(),
 			wtUnregister(),
-			wtWatch(),
 			wtList(),
 			wtShow(),
 			wtLogs(),
@@ -58,12 +52,13 @@ func wtCreate() *cli.Command {
 		Usage:     "create a worktree end-to-end",
 		ArgsUsage: "<branch>",
 		Description: `Creates a linked worktree, patches the env files, registers it
-in SQLite, then dispatches postcreate hooks + prepare to the daemon.
+in SQLite, then dispatches setup hooks + prepare to the daemon. The
+CLI always returns immediately — follow progress with
+'treeman logs tail --follow'.
 
 Examples:
   treeman wt create PROJ-1234
   treeman wt create feature/x --from origin/develop
-  treeman wt create hotfix --foreground   # block on hooks + prepare
   cd "$(treeman wt create feat --print-path)"`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "from", Usage: "base branch"},
@@ -71,7 +66,6 @@ Examples:
 			&cli.StringFlag{Name: "repo", Usage: "repo root override"},
 			&cli.BoolFlag{Name: "skip-hooks"},
 			&cli.BoolFlag{Name: "skip-prepare"},
-			&cli.BoolFlag{Name: "foreground", Usage: "force fg execution of postcreate + prepare"},
 			&cli.BoolFlag{Name: "no-fetch", Usage: "skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits)"},
 			&cli.BoolFlag{Name: "print-path", Usage: "print only the new worktree path on stdout; status lines redirect to stderr (enables `cd \"$(treeman wt create …)\"`)"},
 		},
@@ -97,261 +91,25 @@ Examples:
 			if err != nil {
 				return err
 			}
-			cfg, err := resolve.LoadResolved(repoRoot)
+			res, err := wt.Create(ctx, wt.CreateRequest{
+				RepoRoot:    repoRoot,
+				Branch:      branch,
+				From:        c.String("from"),
+				Path:        c.String("path"),
+				NoFetch:     c.Bool("no-fetch"),
+				SkipHooks:   c.Bool("skip-hooks"),
+				SkipPrepare: c.Bool("skip-prepare"),
+				Env:         CaptureInheritedEnv(),
+			}, cliSink{})
 			if err != nil {
-				return err
-			}
-
-			wtPath := c.String("path")
-			if wtPath == "" {
-				wtPath = filepath.Join(resolveWorktreesRoot(cfg, repoRoot), branch)
-			} else if !filepath.IsAbs(wtPath) {
-				wtPath = filepath.Join(repoRoot, wtPath)
-			}
-			if _, err := os.Stat(wtPath); err == nil {
-				// Idempotent path: when the dest already exists and
-				// matches what we'd create (linked worktree on the
-				// requested branch, registered in SQLite), treat the
-				// call as a no-op so scripts can retry safely.
-				if isMatchingExistingWorktree(ctx, repoRoot, wtPath, branch) {
-					PrintInfo("worktree already exists at %s on %s — no-op", wtPath, branch)
-					if printPathOnly {
-						fmt.Fprintln(os.Stdout, wtPath)
-					}
-					return nil
-				}
-				return fmt.Errorf("destination path already exists: %s", wtPath)
-			}
-			if err := os.MkdirAll(filepath.Dir(wtPath), 0o755); err != nil {
-				return err
-			}
-
-			// Git worktree add. Default base = origin/HEAD if -b
-			// missing. Pre-fetch + prefer origin/<base> so a stale
-			// local ref doesn't silently base the new branch on
-			// yesterday's commit (opt-out via --no-fetch).
-			base := c.String("from")
-			if base == "" {
-				base = detectDefaultBranch(repoRoot)
-			}
-			branchExists := gitcmd.Exists(ctx, repoRoot, "refs/heads/"+branch)
-			if !branchExists && !c.Bool("no-fetch") {
-				_ = gitcmd.RunPiped(ctx, repoRoot, nil, nil, "fetch", "origin", base, "--quiet")
-				if refExistsRemote(repoRoot, base) {
-					base = "origin/" + base
-				}
-			}
-			var gitArgs []string
-			if branchExists {
-				gitArgs = []string{"worktree", "add", wtPath, branch}
-			} else {
-				gitArgs = []string{"worktree", "add", "-b", branch, wtPath, base}
-			}
-			if err := gitcmd.RunPiped(ctx, repoRoot, os.Stdout, os.Stderr, gitArgs...); err != nil {
-				return fmt.Errorf("git worktree add: %w", err)
-			}
-			wtPath = MustAbs(wtPath)
-
-			// worktrees.links — symlinks from main into the new
-			// worktree. Entries containing glob meta-characters
-			// (`*`, `?`, `[`) expand against repoRoot via
-			// filepath.Glob — `.env.*.local` should pick up
-			// `.env.dev.local`, `.env.staging.local`, etc. without
-			// the user having to enumerate each. Glob entries that
-			// match nothing are silent (typical for optional dev
-			// overrides); literal entries that miss still warn.
-			for _, rel := range cfg.Worktrees.Links {
-				var matches []string
-				if strings.ContainsAny(rel, "*?[") {
-					m, _ := filepath.Glob(filepath.Join(repoRoot, rel))
-					matches = m
-				} else {
-					matches = []string{filepath.Join(repoRoot, rel)}
-				}
-				if len(matches) == 0 {
-					continue
-				}
-				for _, src := range matches {
-					if _, err := os.Stat(src); err != nil {
-						if !strings.ContainsAny(rel, "*?[") {
-							PrintWarn("link source missing, skipping: %s", src)
-						}
-						continue
-					}
-					relToRepo, err := filepath.Rel(repoRoot, src)
-					if err != nil {
-						relToRepo = filepath.Base(src)
-					}
-					dst := filepath.Join(wtPath, relToRepo)
-					if _, err := os.Stat(dst); err == nil {
-						continue
-					}
-					_ = os.MkdirAll(filepath.Dir(dst), 0o755)
-					if err := os.Symlink(src, dst); err != nil {
-						return fmt.Errorf("symlink %s → %s: %w", dst, src, err)
-					}
-				}
-			}
-
-			sl := slug.For(wtPath, branch)
-			tplCtx := template.FromSlug(sl)
-
-			// env_scoping patches.
-			pairs := make([]patcher.Pair, 0, len(cfg.EnvScoping.Patches))
-			for _, p := range cfg.EnvScoping.Patches {
-				v, err := template.Render(p.Template, tplCtx)
-				if err != nil {
-					return fmt.Errorf("render env_scoping patch %s: %w", p.Key, err)
-				}
-				pairs = append(pairs, patcher.Pair{Key: p.Key, Value: v})
-			}
-			skipWT := cfg.EnvScoping.SkipWorktree == nil || *cfg.EnvScoping.SkipWorktree
-			for _, f := range cfg.EnvScoping.Files {
-				abs := filepath.Join(wtPath, f)
-				var outcome patcher.Outcome
-				if filepath.Ext(abs) == ".xml" {
-					outcome, err = patcher.PatchPhpunitFile(abs, pairs)
-				} else {
-					outcome, err = patcher.PatchEnvFile(abs, pairs)
-				}
-				if err != nil {
-					return err
-				}
-				if outcome == patcher.Updated {
-					fmt.Printf("patched %s\n", abs)
-				}
-				// Apply skip-worktree regardless of patch outcome: a
-				// re-run of `wt create` (or finalize) on an already-
-				// patched file must still enforce the bit, otherwise
-				// the second run silently drops it. `SkipWorktree`
-				// is a no-op when the file isn't tracked.
-				if skipWT {
-					_, _ = patcher.SkipWorktree(wtPath, abs)
-				}
-			}
-
-			// Store register.
-			dbPath, _ := store.DefaultDBPath()
-			st, err := store.Open(ctx, dbPath)
-			if err != nil {
-				return err
-			}
-			defer st.Close()
-			repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			if err != nil {
-				return err
-			}
-			wtID, err := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, branch)
-			if err != nil {
-				return err
-			}
-			PrintOK("created worktree #%d slug=%s path=%s", wtID, sl.Value, wtPath)
-
-			if c.Bool("skip-hooks") {
-				if printPathOnly {
-					fmt.Fprintln(os.Stdout, wtPath)
-				}
-				return nil
-			}
-
-			env := CaptureInheritedEnv()
-
-			// precreate is the sync phase.
-			if len(cfg.Hooks.Precreate) > 0 {
-				started := hooks.EmitHookStart(ctx, st, repoID, wtID, "precreate", len(cfg.Hooks.Precreate))
-				out, err := hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wtPath, sl.Value, env)
-				hooks.PersistOutcome(ctx, st, repoID, wtID, "precreate", started, time.Now().UnixMilli(), out)
-				if err != nil {
-					return err
-				}
-				fmt.Printf("precreate: exit=%d\n", out.AggregateExitCode)
-				if out.AggregateExitCode != 0 {
-					// Surface the first failing group so the user
-					// gets a log path and exit code without having
-					// to grep .treeman-hooks/ by hand.
-					for _, g := range out.Groups {
-						if g.ExitCode != 0 {
-							if g.LogPath != "" {
-								return fmt.Errorf("precreate failed (exit %d) — see %s", g.ExitCode, g.LogPath)
-							}
-							return fmt.Errorf("precreate failed (exit %d): %s", g.ExitCode, g.Command)
-						}
-					}
-					return fmt.Errorf("precreate failed (aggregate exit %d)", out.AggregateExitCode)
-				}
-			}
-
-			// Async via daemon when async_create is true (default).
-			// On daemon failure we no longer fall through to a blocking
-			// foreground tail: that used to leave the interactive shell
-			// hanging for minutes on composer install + dump load +
-			// migrate. Instead we (a) try to bring the daemon back up,
-			// (b) failing that, detach a setsid child running `treeman
-			// wt finalize --local <wt>` and return immediately.
-			asyncCreate := cfg.Worktrees.AsyncCreate == nil || *cfg.Worktrees.AsyncCreate
-			needsWork := len(cfg.Hooks.Postcreate) > 0 || (!c.Bool("skip-prepare") && len(cfg.Databases) > 0)
-			if asyncCreate && !c.Bool("foreground") && !c.Bool("skip-prepare") && needsWork {
-				if queued := dispatchFinalize(ctx, repoRoot, wtPath, env); queued {
-					if printPathOnly {
-						fmt.Fprintln(os.Stdout, wtPath)
-					}
-					return nil
-				}
-				if logPath, err := detachLocalFinalize(wtPath, repoRoot); err == nil {
-					PrintOK("queued: postcreate + prepare detached (daemon unreachable — log: %s)", logPath)
-					if printPathOnly {
-						fmt.Fprintln(os.Stdout, wtPath)
-					}
-					return nil
-				} else {
-					PrintWarn("detach failed (%v); falling back to foreground", err)
-				}
-			}
-
-			// Foreground tail (--foreground was set, or detach failed).
-			if err := runLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, env, c.Bool("skip-prepare")); err != nil {
 				return err
 			}
 			if printPathOnly {
-				fmt.Fprintln(os.Stdout, wtPath)
+				fmt.Fprintln(os.Stdout, res.WtPath)
 			}
 			return nil
 		},
 	}
-}
-
-// dispatchFinalize attempts to hand postcreate + prepare to the
-// daemon. Returns true when the daemon successfully queued the work.
-// On the first RPC error this also tries `ensureDaemon` and retries
-// once, so a daemon that's merely been signalled-but-not-yet-up gets
-// a chance to come back before we resort to detaching a child.
-func dispatchFinalize(ctx context.Context, repoRoot, wtPath string, env map[string]string) bool {
-	req := rpc.Request{
-		Method: rpc.MethodWorktreeFinalize,
-		WorktreeFinalize: &rpc.WorktreeFinalizeArgs{
-			RepoPath:     repoRoot,
-			WorktreePath: wtPath,
-			InheritedEnv: env,
-		},
-	}
-	if resp, err := rpc.Call(ctx, req); err == nil {
-		if resp.Kind == rpc.KindWorktreeFinalizeQueued {
-			PrintOK("queued: postcreate + prepare detached to daemon — follow with `treeman logs tail --follow`")
-			return true
-		}
-		if resp.Kind == rpc.KindError {
-			PrintWarn("daemon: %s", resp.Message)
-		}
-	} else {
-		PrintWarn("daemon RPC failed (%v); trying daemon restart", err)
-		if startErr := ensureDaemon(ctx); startErr == nil {
-			if resp, err := rpc.Call(ctx, req); err == nil && resp.Kind == rpc.KindWorktreeFinalizeQueued {
-				PrintOK("queued: postcreate + prepare detached to daemon (auto-restarted)")
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func wtDelete() *cli.Command {
@@ -360,19 +118,24 @@ func wtDelete() *cli.Command {
 		Aliases:   []string{"rm"},
 		Usage:     "delete a worktree end-to-end",
 		ArgsUsage: "<path-or-branch>",
-		Description: `Runs predelete hooks + DB teardown + git worktree remove, then
+		Description: `Runs teardown hooks + DB teardown + git worktree remove, then
 removes the registry row. The teardown is dispatched to the daemon
-so the shell returns immediately; pass --foreground to block.
+(or a setsid child when the daemon is unreachable) — the CLI
+always returns immediately.
 
 Examples:
   treeman wt delete PROJ-1234
-  treeman wt delete /path/to/wt --force      # remove stale registry entry
-  treeman wt delete feature/x --foreground   # block on teardown`,
+  treeman wt delete /path/to/wt --force      # remove stale registry entry`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo"},
 			&cli.BoolFlag{Name: "force", Aliases: []string{"f"}},
-			&cli.BoolFlag{Name: "foreground", Usage: "force fg execution of predelete + teardown + git remove"},
 			&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip the confirmation prompt"},
+			// `--detached` is the internal flag set by detachLocalDelete
+			// when the daemon RPC is unreachable. Tells this process
+			// "you ARE the detached worker; run the teardown inline
+			// instead of trying to dispatch back to the daemon".
+			// Not documented in help.
+			&cli.BoolFlag{Name: "detached", Hidden: true},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
@@ -382,7 +145,7 @@ Examples:
 
 			// Resolve the repo root first (--repo flag > cwd walk-up >
 			// fall back to target-as-path). Needed before the branch /
-			// slug lookup below so the SQLite query is scoped correctly.
+			// slug lookup so the SQLite query is scoped correctly.
 			repoRoot, err := resolveRepo(c.String("repo"))
 			if err != nil {
 				repoRoot, err = DiscoverRepoRoot(MustAbs(target))
@@ -391,127 +154,33 @@ Examples:
 				}
 			}
 
-			// Resolve target → worktree path. Branch / slug / basename
-			// lookup wins over the literal `MustAbs(target)`
-			// interpretation: `treeman wt delete feature/foo` used to
-			// silently register a phantom worktree at $PWD/feature/foo
-			// because MustAbs was applied unconditionally. Now we
-			// consult the registry first, only falling back to
-			// path-as-typed when no match is found. With --force we
-			// allow the path-as-typed fallback even when the directory
-			// is gone (cleaning up a stale registry entry).
-			var wtPath string
-			if p, ok := lookupWorktree(ctx, repoRoot, target); ok {
+			// Confirmation lives in the CLI — wt.Delete itself is
+			// non-interactive. Resolve the wtPath up front so the
+			// prompt can name the target precisely; this duplicates
+			// wt.Delete's lookup but the second pass inside the
+			// orchestrator is cheap (sqlite query).
+			wtPath := MustAbs(target)
+			if p, ok := wt.LookupWorktree(ctx, repoRoot, target, cliSink{}); ok {
 				wtPath = p
-			} else {
-				wtPath = MustAbs(target)
-				if _, statErr := os.Stat(wtPath); statErr != nil && !c.Bool("force") {
-					return fmt.Errorf("no worktree matches %q in %s (use --force to remove a stale registry entry)", target, repoRoot)
-				}
 			}
 
-			cfg, err := resolve.LoadResolved(repoRoot)
-			if err != nil {
-				return err
-			}
-			env := CaptureInheritedEnv()
-
-			// Destructive: predelete hooks + DROP DATABASE × N +
-			// git worktree remove. Confirm with the user on a TTY;
-			// scripts and `--yes` skip the prompt.
 			if !c.Bool("yes") {
 				q := fmt.Sprintf("delete worktree %s and drop its databases?", wtPath)
 				if !ui.Confirm(q) {
-					return fmt.Errorf("aborted")
+					PrintInfo("aborted: worktree %s left intact", wtPath)
+					return nil
 				}
 			}
 
-			// On daemon failure we don't run teardown synchronously
-			// any more — DROP DATABASE × N + git worktree remove on a
-			// Laravel-sized vendor/ can take 10+ seconds. Try the
-			// daemon, attempt auto-restart on failure, and if that
-			// still misses, detach a setsid child running the same
-			// `--foreground` codepath so the user's shell returns
-			// immediately.
-			asyncDelete := cfg.Worktrees.AsyncDelete == nil || *cfg.Worktrees.AsyncDelete
-			if asyncDelete && !c.Bool("foreground") {
-				if queued := dispatchTeardown(ctx, repoRoot, wtPath, c.Bool("force"), env); queued {
-					return nil
-				}
-				if logPath, err := detachLocalDelete(wtPath, repoRoot, c.Bool("force")); err == nil {
-					PrintOK("queued: predelete + DB teardown + git remove detached (daemon unreachable — log: %s)", logPath)
-					return nil
-				} else {
-					PrintWarn("detach failed (%v); falling back to foreground", err)
-				}
-			}
-
-			// Foreground.
-			dbPath, _ := store.DefaultDBPath()
-			st, err := store.Open(ctx, dbPath)
-			if err != nil {
-				return err
-			}
-			defer st.Close()
-			sl := slug.For(wtPath, "")
-			repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			wtID, _ := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, "")
-			if len(cfg.Hooks.Predelete) > 0 {
-				// Await predelete groups so external cleanup
-				// (kill watchers, drop sibling DBs) finishes
-				// before TeardownDatabases blows away SQL state.
-				started := hooks.EmitHookStart(ctx, st, repoID, wtID, "predelete", len(cfg.Hooks.Predelete))
-				out, _ := hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete, repoRoot, wtPath, sl.Value, env, true)
-				hooks.PersistOutcome(ctx, st, repoID, wtID, "predelete", started, time.Now().UnixMilli(), out)
-			}
-			_ = prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st)
-			// Mark deleted BEFORE `git worktree remove`. The remove
-			// fires the fsnotify REMOVE event the daemon's lifecycle
-			// watcher subscribes to; if the row isn't already marked
-			// deleted by the time onRemove looks it up, the watcher
-			// spawns a duplicate teardownOrphan that re-runs
-			// postdelete + DB drop. Marking deleted first closes the
-			// window — onRemove's deleted-check short-circuits. If
-			// the git remove subsequently fails, the row is left
-			// falsely marked deleted; a re-run of `treeman wt delete`
-			// resurrects it via EnsureWorktree (deleted_at cleared)
-			// before retrying.
-			_ = st.MarkWorktreeDeleted(ctx, wtID)
-			args := []string{"worktree", "remove"}
-			if c.Bool("force") {
-				args = append(args, "--force")
-			}
-			args = append(args, wtPath)
-			if err := gitcmd.RunPiped(ctx, repoRoot, os.Stdout, os.Stderr, args...); err != nil && !c.Bool("force") {
-				return fmt.Errorf("git worktree remove: %w", err)
-			}
-			pruneEmptyParents(wtPath, resolveWorktreesRoot(cfg, repoRoot))
-			PrintOK("deleted worktree #%d (%s)", wtID, wtPath)
-			return nil
+			_, err = wt.Delete(ctx, wt.DeleteRequest{
+				RepoRoot: repoRoot,
+				Target:   target,
+				Force:    c.Bool("force"),
+				Env:      CaptureInheritedEnv(),
+				Detached: c.Bool("detached"),
+			}, cliSink{})
+			return err
 		},
-	}
-}
-
-// pruneEmptyParents walks up from `start` removing now-empty
-// directories until we leave `wtRoot` (the configured worktrees
-// root). Prevents an empty `.worktrees/feature/` from lingering
-// after deleting `.worktrees/feature/foo`. Best-effort: any rmdir
-// error stops the walk (e.g. parent is not empty, or permissions).
-func pruneEmptyParents(start, wtRoot string) {
-	if start == "" || wtRoot == "" {
-		return
-	}
-	parent := filepath.Dir(start)
-	for {
-		// Stop once we reach (or pass) the worktrees root itself.
-		rel, err := filepath.Rel(wtRoot, parent)
-		if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-			return
-		}
-		if err := os.Remove(parent); err != nil {
-			return // non-empty or unreadable — done.
-		}
-		parent = filepath.Dir(parent)
 	}
 }
 
@@ -580,100 +249,6 @@ func wtUnregister() *cli.Command {
 				return fmt.Errorf("worktree not found: %s", path)
 			}
 			return st.MarkWorktreeDeleted(ctx, id)
-		},
-	}
-}
-
-// wtWatch — `treeman wt watch [on|off|status]` toggles the per-repo
-// opt-in flag for the daemon's lifecycle watcher. When ON (and the
-// resolved config has `worktrees.hook_lifecycle: true`), the daemon
-// tails `<common-dir>/worktrees/` and fires postcreate / postdelete
-// for `git worktree add`/`remove` runs that bypass the treeman CLI.
-//
-// Two gates must be set for the watcher to act on a repo:
-//   - config bool (default false; layered global + per-repo)
-//   - this DB opt-in (set via `treeman wt watch on`)
-func wtWatch() *cli.Command {
-	return &cli.Command{
-		Name:      "watch",
-		Usage:     "toggle lifecycle-watcher opt-in (on|off|status)",
-		ArgsUsage: "<on|off|status>",
-		Description: `Marks the current repo as opted-in (or out) of the daemon's
-lifecycle watcher. With opt-in ON, the daemon fires postcreate /
-postdelete hooks automatically when 'git worktree add' or
-'git worktree remove' is invoked outside the treeman CLI.
-
-Both this opt-in AND the resolved config bool
-'worktrees.hook_lifecycle: true' must be set for the watcher to
-activate. Default config is OFF.
-
-Examples:
-  treeman wt watch on
-  treeman wt watch off
-  treeman wt watch status`,
-		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "repo"},
-		},
-		Action: func(ctx context.Context, c *cli.Command) error {
-			action := "status"
-			if c.NArg() >= 1 {
-				action = strings.ToLower(c.Args().First())
-			}
-			repoRoot, err := resolveRepo(c.String("repo"))
-			if err != nil {
-				return err
-			}
-			cfg, err := resolve.LoadResolved(repoRoot)
-			if err != nil {
-				return err
-			}
-			dbPath, _ := store.DefaultDBPath()
-			st, err := store.Open(ctx, dbPath)
-			if err != nil {
-				return err
-			}
-			defer st.Close()
-			repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			if err != nil {
-				return err
-			}
-			configEnabled := cfg.Worktrees.HookLifecycle != nil && *cfg.Worktrees.HookLifecycle
-			switch action {
-			case "on", "enable":
-				if err := st.SetRepoWatchLifecycle(ctx, repoID, true); err != nil {
-					return err
-				}
-				PrintOK("lifecycle watcher: opted IN for %s", repoRoot)
-				if !configEnabled {
-					PrintWarn("config gate is OFF — set `worktrees.hook_lifecycle: true` in .treeman.yaml or your global config to activate")
-				}
-				// Notify the daemon to (re)start the watcher pipeline
-				// for this repo. The watcher_start path picks up the
-				// opt-in via the new DB column.
-				if resp, err := rpc.Call(ctx, rpc.Request{
-					Method:       rpc.MethodWatcherStart,
-					WatcherStart: &rpc.WatcherStartArgs{RepoPath: repoRoot},
-				}); err == nil && resp.Kind == rpc.KindError {
-					PrintWarn("daemon: %s", resp.Message)
-				}
-				return nil
-			case "off", "disable":
-				if err := st.SetRepoWatchLifecycle(ctx, repoID, false); err != nil {
-					return err
-				}
-				PrintOK("lifecycle watcher: opted OUT for %s", repoRoot)
-				PrintInfo("the daemon-side watcher stops on the next watcher_stop or daemon restart")
-				return nil
-			case "status", "":
-				on, _ := st.GetRepoWatchLifecycle(ctx, repoID)
-				fmt.Printf("repo:           %s\n", repoRoot)
-				fmt.Printf("opt-in (db):    %v\n", on)
-				fmt.Printf("config gate:    %v\n", configEnabled)
-				active := on && configEnabled
-				fmt.Printf("watcher active: %v\n", active)
-				return nil
-			}
-			return fmt.Errorf("usage: treeman wt watch <on|off|status>")
 		},
 	}
 }
@@ -907,10 +482,10 @@ func lastLabel(headTs, visitedTs int64) string {
 func wtFinalize() *cli.Command {
 	return &cli.Command{
 		Name:  "finalize",
-		Usage: "rerun postcreate + prepare for a worktree (default via daemon; --local runs inline)",
+		Usage: "rerun setup + prepare for a worktree (default via daemon; --local runs inline)",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo"},
-			&cli.BoolFlag{Name: "local", Usage: "run postcreate + prepare in this process instead of dispatching to the daemon"},
+			&cli.BoolFlag{Name: "local", Usage: "run setup + prepare in this process instead of dispatching to the daemon"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			path := "."
@@ -944,7 +519,7 @@ func wtFinalize() *cli.Command {
 				sl := slug.For(wtPath, "")
 				repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 				wtID, _ := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, "")
-				return runLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, CaptureInheritedEnv(), false)
+				return wt.RunLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, CaptureInheritedEnv(), false, cliSink{})
 			}
 
 			resp, err := rpc.Call(ctx, rpc.Request{
@@ -961,85 +536,10 @@ func wtFinalize() *cli.Command {
 			if resp.Kind == rpc.KindError {
 				return fmt.Errorf("daemon: %s", resp.Message)
 			}
-			PrintOK("queued: postcreate + prepare detached to daemon — follow with `treeman logs tail --follow`")
+			PrintOK("queued: setup + prepare detached to daemon — follow with `treeman logs tail --follow`")
 			return nil
 		},
 	}
-}
-
-// dispatchTeardown is the wt-delete twin of dispatchFinalize: tries
-// the daemon, retries once after ensureDaemon on RPC failure, and
-// returns true when the daemon successfully queued the teardown.
-func dispatchTeardown(ctx context.Context, repoRoot, wtPath string, force bool, env map[string]string) bool {
-	req := rpc.Request{
-		Method: rpc.MethodWorktreeTeardown,
-		WorktreeTeardown: &rpc.WorktreeTeardownArgs{
-			RepoPath:     repoRoot,
-			WorktreePath: wtPath,
-			Force:        force,
-			InheritedEnv: env,
-		},
-	}
-	if resp, err := rpc.Call(ctx, req); err == nil {
-		if resp.Kind == rpc.KindWorktreeTeardownQueued {
-			PrintOK("queued: predelete + DB teardown + git remove detached to daemon — follow with `treeman logs tail --follow`")
-			return true
-		}
-		if resp.Kind == rpc.KindError {
-			PrintWarn("daemon: %s", resp.Message)
-		}
-	} else {
-		PrintWarn("daemon RPC failed (%v); trying daemon restart", err)
-		if startErr := ensureDaemon(ctx); startErr == nil {
-			if resp, err := rpc.Call(ctx, req); err == nil && resp.Kind == rpc.KindWorktreeTeardownQueued {
-				PrintOK("queued: predelete + DB teardown + git remove detached to daemon (auto-restarted)")
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// runLocalFinalize executes the postcreate + prepare tail in the
-// current process. Shared by wt create's last-resort foreground
-// fallback and by `wt finalize --local` (the subcommand the detach
-// helper spawns when the daemon is unreachable).
-func runLocalFinalize(
-	ctx context.Context,
-	cfg *config.Config,
-	repoRoot, wtPath string,
-	sl slug.Slug,
-	st *store.Store,
-	repoID, wtID int64,
-	env map[string]string,
-	skipPrepare bool,
-) error {
-	if len(cfg.Hooks.Postcreate) > 0 {
-		// Block on postcreate completion before prepare so e.g.
-		// `composer install` finishes populating vendor/ before
-		// artisan migrate runs. Same rationale as the daemon's
-		// FinalizeWorktree path.
-		started := hooks.EmitHookStart(ctx, st, repoID, wtID, "postcreate", len(cfg.Hooks.Postcreate))
-		out, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate, repoRoot, wtPath, sl.Value, env, true)
-		hooks.PersistOutcome(ctx, st, repoID, wtID, "postcreate", started, time.Now().UnixMilli(), out)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("postcreate: %d group(s) complete (logs in %s/.treeman-hooks/)\n",
-			len(cfg.Hooks.Postcreate), wtPath)
-	}
-	if skipPrepare || len(cfg.Databases) == 0 {
-		return nil
-	}
-	outs, err := prepare.Run(ctx, cfg, wtPath, sl, st, repoID, wtID, env)
-	if err != nil {
-		PrintWarn("prepare failed: %v", err)
-	}
-	for _, o := range outs {
-		fmt.Printf("prepare[%s] %s template=%s clones=%d\n",
-			o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
-	}
-	return nil
 }
 
 // resolveRepo returns the explicit `--repo` if set, else discovers
@@ -1053,30 +553,6 @@ func resolveRepo(override string) (string, error) {
 		return "", err
 	}
 	return DiscoverRepoRoot(cwd)
-}
-
-func resolveWorktreesRoot(cfg config.Config, repoRoot string) string {
-	raw := cfg.Worktrees.Root
-	if raw == "" {
-		raw = ".worktrees"
-	}
-	if filepath.IsAbs(raw) {
-		return raw
-	}
-	return filepath.Join(repoRoot, raw)
-}
-
-func detectDefaultBranch(repoRoot string) string {
-	if s, err := gitcmd.String(context.Background(), repoRoot, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
-		if len(s) > len("origin/") && s[:len("origin/")] == "origin/" {
-			return s[len("origin/"):]
-		}
-		return s
-	}
-	if s, err := gitcmd.String(context.Background(), repoRoot, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
-		return s
-	}
-	return "main"
 }
 
 // wtSwitch — `treeman wt switch [name]`. Prints the absolute path
@@ -1116,14 +592,14 @@ func wtSwitch() *cli.Command {
 				return err
 			}
 
-			if path, ok := lookupWorktree(ctx, repoRoot, name); ok {
+			if path, ok := wt.LookupWorktree(ctx, repoRoot, name, cliSink{}); ok {
 				touchVisitedByPath(ctx, path)
 				fmt.Println(path)
 				return nil
 			}
 
 			// Filesystem fallback.
-			fsCandidate := filepath.Join(resolveWorktreesRoot(cfg, repoRoot), name)
+			fsCandidate := filepath.Join(wt.WorktreesRoot(cfg, repoRoot), name)
 			if fi, err := os.Stat(fsCandidate); err == nil && fi.IsDir() {
 				fmt.Println(fsCandidate)
 				return nil
@@ -1146,73 +622,10 @@ func wtSwitch() *cli.Command {
 				return err
 			}
 			// After create, wtPath is `<root>/<name>` by default.
-			fmt.Println(filepath.Join(resolveWorktreesRoot(cfg, repoRoot), name))
+			fmt.Println(filepath.Join(wt.WorktreesRoot(cfg, repoRoot), name))
 			return nil
 		},
 	}
-}
-
-// lookupWorktree queries SQLite for active worktrees attached to
-// `repoRoot` and returns the path that best matches `name` (exact
-// basename, then exact slug, then unambiguous prefix).
-func lookupWorktree(ctx context.Context, repoRoot, name string) (string, bool) {
-	dbPath, err := store.DefaultDBPath()
-	if err != nil {
-		return "", false
-	}
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return "", false
-	}
-	defer st.Close()
-	rows, err := st.DB.QueryContext(ctx, `
-		SELECT w.path, w.slug, COALESCE(w.branch,'')
-		FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		WHERE w.deleted_at IS NULL AND r.path = ?`, repoRoot)
-	if err != nil {
-		return "", false
-	}
-	defer rows.Close()
-	var exactBase, exactSlug, exactBranch string
-	var prefixHits []string
-	for rows.Next() {
-		var path, slug, branch string
-		if err := rows.Scan(&path, &slug, &branch); err != nil {
-			continue
-		}
-		base := filepath.Base(path)
-		switch {
-		case base == name:
-			exactBase = path
-		case slug == name:
-			exactSlug = path
-		case branch == name:
-			exactBranch = path
-		case len(name) >= 2 && (hasPrefix(base, name) || hasPrefix(slug, name) || hasPrefix(branch, name)):
-			prefixHits = append(prefixHits, path)
-		}
-	}
-	switch {
-	case exactBase != "":
-		return exactBase, true
-	case exactBranch != "":
-		return exactBranch, true
-	case exactSlug != "":
-		return exactSlug, true
-	case len(prefixHits) == 1:
-		return prefixHits[0], true
-	case len(prefixHits) > 1:
-		fmt.Fprintln(os.Stderr, "ambiguous prefix match — candidates:")
-		for _, p := range prefixHits {
-			fmt.Fprintln(os.Stderr, "  ", p)
-		}
-		return "", false
-	}
-	return "", false
-}
-
-func hasPrefix(s, p string) bool {
-	return len(s) >= len(p) && s[:len(p)] == p
 }
 
 // wtBack — `treeman wt back`. Prints the main repo root for the
@@ -1439,7 +852,7 @@ func wtGo() *cli.Command {
 			base := c.String("from")
 			if c.Bool("create") {
 				mode = "create"
-				if refExistsLocal(repoRoot, branch) {
+				if wt.RefExistsLocal(ctx, repoRoot, branch) {
 					mode = "checkout"
 					base = ""
 				}
@@ -1450,7 +863,7 @@ func wtGo() *cli.Command {
 			// as zsh's _resolve_base.
 			if mode == "create" && base != "" && !c.Bool("no-fetch") {
 				_ = gitcmd.RunPiped(ctx, repoRoot, nil, nil, "fetch", "origin", base, "--quiet")
-				if refExistsRemote(repoRoot, base) {
+				if wt.RefExistsRemote(ctx, repoRoot, base) {
 					base = "origin/" + base
 				}
 			}
@@ -1512,7 +925,7 @@ func wtGo() *cli.Command {
 			}
 			// Fall back to the default location (matches wt create's path math).
 			cfg, _ := resolve.LoadResolved(repoRoot)
-			path := filepath.Join(resolveWorktreesRoot(cfg, repoRoot), branch)
+			path := filepath.Join(wt.WorktreesRoot(cfg, repoRoot), branch)
 			fmt.Println(path)
 			return nil
 		},
@@ -1544,55 +957,6 @@ func registryWorktreeForBranch(ctx context.Context, repoRoot, branch string) (st
 	return p, true
 }
 
-// isMatchingExistingWorktree reports whether `wtPath` is already a
-// linked git worktree of `repoRoot` checked out on `branch` and is
-// present in the SQLite registry. Used by `wt create` to short-
-// circuit re-creation: a script that retries the command after a
-// transient failure shouldn't error with "path already exists" when
-// the previous run actually succeeded.
-//
-// All four conditions must hold: (1) `wtPath` exists, (2) its
-// `.git` file is a gitlink (not a directory — so it's a linked
-// worktree), (3) `git -C <wtPath> branch --show-current` equals
-// `branch`, (4) the registry has an active row for this path.
-// Mismatches return false → caller falls back to the original
-// "already exists" error so we never silently swallow drift.
-func isMatchingExistingWorktree(ctx context.Context, repoRoot, wtPath, branch string) bool {
-	if !gitenv.IsLinkedWorktree(wtPath) {
-		return false
-	}
-	current, err := gitcmd.String(ctx, wtPath, "branch", "--show-current")
-	if err != nil || current != branch {
-		return false
-	}
-	dbPath, err := store.DefaultDBPath()
-	if err != nil {
-		return false
-	}
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return false
-	}
-	defer st.Close()
-	var n int
-	_ = st.DB.QueryRowContext(ctx,
-		`SELECT 1 FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		 WHERE r.path = ? AND w.path = ? AND w.deleted_at IS NULL`,
-		repoRoot, wtPath).Scan(&n)
-	return n == 1
-}
-
-// refExistsLocal returns true when refs/heads/<name> resolves in
-// repoRoot. Used by wt go to flip --create → checkout when the
-// branch already exists.
-func refExistsLocal(repoRoot, name string) bool {
-	return gitcmd.Exists(context.Background(), repoRoot, "refs/heads/"+name)
-}
-
-func refExistsRemote(repoRoot, name string) bool {
-	return gitcmd.Exists(context.Background(), repoRoot, "refs/remotes/origin/"+name)
-}
-
 // touchVisitedByPath stamps last_visited_at on the worktree row at
 // `path`. Swallows errors — visit-tracking is best-effort metadata,
 // not a correctness gate.
@@ -1607,14 +971,4 @@ func touchVisitedByPath(ctx context.Context, path string) {
 	}
 	defer st.Close()
 	_ = st.TouchWorktreeVisitedByPath(ctx, path)
-}
-
-func trimSpace(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\n' || s[0] == '\r') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t' || s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
-		s = s[:len(s)-1]
-	}
-	return s
 }

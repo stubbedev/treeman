@@ -5,6 +5,8 @@ package redis
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 
 	"github.com/redis/go-redis/v9"
 
@@ -13,15 +15,25 @@ import (
 	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
-// Driver wraps go-redis's Client. We keep the parsed URL around so
-// FlushDB can dial a per-index sub-client.
+// Driver wraps go-redis's Client. Clients are pooled per db index
+// because FlushDB / inspection tools each need a connection scoped
+// to a specific db, and go-redis treats Options.DB as fixed-per-client.
 type Driver struct {
-	url string
+	baseOpts *redis.Options
+
+	mu      sync.Mutex
+	clients map[int]*redis.Client // keyed by db index; -1 means base
+
+	// Lazy-resolved COPY-command support flag. Redis 6.2+ supports
+	// the server-side `COPY` command (fast, single round-trip per
+	// key); older versions need the DUMP+RESTORE fallback. The
+	// detection runs once on the first snapshot op and caches.
+	copyOnce      sync.Once
+	copySupported bool
 }
 
-// Connect probes TCP reachability + returns a Driver. The actual
-// client is opened lazily per-index since FLUSHDB needs a connection
-// scoped to a specific db index.
+// Connect probes TCP reachability + parses the URL once. Per-db
+// clients are opened lazily.
 func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
 	url := cfg.URL
 	if cfg.Container != "" || cfg.ComposeService != "" {
@@ -41,73 +53,67 @@ func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
 			url = containerip.RewriteHostPortInURIWithPort(url, addr.Host, addr.Port)
 		}
 	}
-	if err := reachability.ProbeURL("redis", url); err != nil {
+	if err := reachability.ProbeURLCtx(ctx, "redis", url); err != nil {
 		return nil, err
 	}
-	if _, err := redis.ParseURL(url); err != nil {
+	opts, err := redis.ParseURL(url)
+	if err != nil {
 		return nil, fmt.Errorf("redis url: %w", err)
 	}
-	return &Driver{url: url}, nil
+	return &Driver{baseOpts: opts, clients: map[int]*redis.Client{}}, nil
 }
 
-// Close is a no-op — each FLUSHDB opens its own short-lived client.
-func (d *Driver) Close() error { return nil }
+// Close shuts down every pooled client.
+func (d *Driver) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var firstErr error
+	for k, c := range d.clients {
+		if err := c.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		delete(d.clients, k)
+	}
+	return firstErr
+}
+
+// clientFor returns a pooled redis.Client scoped to db. The first
+// call for a given db opens the client; subsequent calls reuse it.
+// Pass -1 for "use whatever DB was encoded in the URL" (base).
+func (d *Driver) clientFor(db int) *redis.Client {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if c, ok := d.clients[db]; ok {
+		return c
+	}
+	o := *d.baseOpts // shallow copy; we only override DB
+	if db >= 0 {
+		o.DB = db
+	}
+	c := redis.NewClient(&o)
+	d.clients[db] = c
+	return c
+}
 
 // EngineVersion → `INFO server` → `redis_version:` line.
 func (d *Driver) EngineVersion(ctx context.Context) (string, error) {
-	opts, _ := redis.ParseURL(d.url)
-	c := redis.NewClient(opts)
-	defer c.Close()
-	info, err := c.Info(ctx, "server").Result()
+	info, err := d.clientFor(-1).Info(ctx, "server").Result()
 	if err != nil {
 		return "", err
 	}
-	for _, line := range splitLines(info) {
-		if v, ok := stripPrefix(line, "redis_version:"); ok {
+	for _, line := range strings.Split(info, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if v, ok := strings.CutPrefix(line, "redis_version:"); ok {
 			return v, nil
 		}
 	}
 	return "", nil
 }
 
-// FlushDB issues `SELECT <db>` then `FLUSHDB`.
+// FlushDB issues `FLUSHDB` against the pooled client for `db`.
 func (d *Driver) FlushDB(ctx context.Context, db uint8) error {
-	opts, err := redis.ParseURL(d.url)
-	if err != nil {
-		return err
-	}
-	opts.DB = int(db)
-	c := redis.NewClient(opts)
-	defer c.Close()
-	if err := c.FlushDB(ctx).Err(); err != nil {
+	if err := d.clientFor(int(db)).FlushDB(ctx).Err(); err != nil {
 		return fmt.Errorf("FLUSHDB %d: %w", db, err)
 	}
 	return nil
-}
-
-func splitLines(s string) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' || s[i] == '\r' {
-			if i > start {
-				out = append(out, s[start:i])
-			}
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		out = append(out, s[start:])
-	}
-	return out
-}
-
-func stripPrefix(line, prefix string) (string, bool) {
-	if len(line) < len(prefix) {
-		return "", false
-	}
-	if line[:len(prefix)] != prefix {
-		return "", false
-	}
-	return line[len(prefix):], true
 }

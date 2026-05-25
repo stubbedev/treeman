@@ -7,20 +7,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/hooks"
+	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/template"
 )
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
 // goroutine) tail of `treeman wt create` when
-// `worktrees.async_create` is true. Runs postcreate hooks + prepare
+// `worktrees.async_create` is true. Runs setup hooks + prepare
 // against the main repo root.
 func FinalizeWorktree(
 	ctx context.Context,
@@ -38,7 +42,7 @@ func FinalizeWorktree(
 	// but this is the belt to that braces: even if a second caller
 	// slips through (e.g. an explicit `treeman wt finalize` while
 	// one is still running), it returns immediately instead of
-	// re-running postcreate hooks in parallel.
+	// re-running setup hooks in parallel.
 	if !st.MarkFinalizeInFlight(wtRoot) {
 		return nil
 	}
@@ -61,33 +65,63 @@ func FinalizeWorktree(
 		return err
 	}
 
+	// Cache the user's shell env per-worktree so daemon-driven re-
+	// runs (HEAD watcher, file watcher) can rehydrate PATH etc.
+	// FinalizeWorktree is reached from `wt create` / `wt finalize`
+	// where the CLI captured os.Environ() and shipped it via RPC —
+	// that's the canonical source for the worktree's env going
+	// forward.
+	if len(inheritedEnv) > 0 {
+		_ = st.Store.SaveInheritedEnv(ctx, wtID, inheritedEnv)
+	}
+
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_start",
-		"daemon-detached postcreate + prepare beginning",
+		"daemon-detached setup + prepare beginning",
 		repoID, wtID, "", 0, nil)
 
-	if len(cfg.Hooks.Postcreate) > 0 {
-		// Block until every postcreate group exits before kicking off
-		// prepare. Framework migrate commands (Laravel artisan, Rails
-		// rake, Django manage.py) read `vendor/` / `node_modules/` /
-		// the venv that a postcreate `composer install` / `yarn
-		// install` / `pip install` populates. Firing prepare in
-		// parallel with hooks races against an empty vendor dir and
-		// blows up with `migrate exit 255`. Hook groups still run in
-		// parallel with each other; only the phase-to-phase
-		// transition is gated.
-		started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, "postcreate", len(cfg.Hooks.Postcreate))
-		out, err := hooks.RunHooks(ctx, "postcreate", cfg.Hooks.Postcreate,
-			repoRoot, wtRoot, sl.Value, inheritedEnv, true)
-		hooks.PersistOutcome(ctx, st.Store, repoID, wtID, "postcreate", started, nowMillis(), out)
-		if err != nil {
-			return fmt.Errorf("postcreate hooks: %w", err)
+	// Re-apply top-level patches: every finalize evaluates them
+	// against the current HEAD's slug. Idempotent — Unchanged is a
+	// no-op write, and the skip-worktree bit is re-asserted whether
+	// or not the content changed (re-run after `git pull` must
+	// re-enforce). Failures are logged but non-fatal so a broken
+	// patch driver doesn't block the rest of finalize.
+	if len(cfg.Patches) > 0 {
+		tplCtx := template.FromSlug(sl)
+		for _, p := range cfg.Patches {
+			res, err := patcher.Apply(p, wtRoot, tplCtx)
+			if err != nil {
+				slog.Warn("patch failed", "wt", wtRoot, "file", p.File, "err", err)
+				continue
+			}
+			if res.Outcome == patcher.Updated {
+				_ = st.Store.WriteEvent(ctx, store.LevelInfo, "patch_applied",
+					fmt.Sprintf("driver=%s file=%s", res.Driver, res.File),
+					repoID, wtID, "", 0, map[string]string{
+						"driver": res.Driver,
+						"file":   res.File,
+					})
+			}
 		}
 	}
 
+	// Three-step setup pipeline: on-create-before-engines actions →
+	// engine prepare → on-create-after-engines actions. Each step waits
+	// for the previous on the daemon side; the CLI never sees this
+	// (it already returned).
+	if err := runTriggerActions(ctx, st, "on-create-before-engines",
+		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
+		repoID, wtID, inheritedEnv); err != nil {
+		return err
+	}
 	if len(cfg.Databases) > 0 {
 		if _, err := prepare.Run(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv); err != nil {
 			return fmt.Errorf("prepare: %w", err)
 		}
+	}
+	if err := runTriggerActions(ctx, st, "on-create-after-engines",
+		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
+		repoID, wtID, inheritedEnv); err != nil {
+		return err
 	}
 
 	// Start (or keep) the per-worktree fsnotify watcher so subsequent
@@ -97,21 +131,93 @@ func FinalizeWorktree(
 	}
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done",
-		"daemon-detached postcreate + prepare complete",
+		"daemon-detached setup + prepare complete",
 		repoID, wtID, "", 0, nil)
 	return nil
 }
 
+// FinalizeWorktreeForWatch is the watcher-driven re-prepare path.
+// Called when a file matching one of the owning database's
+// `inputs:` globs changes. Re-applies patches (cheap, idempotent)
+// and re-runs prepare scoped to the matched database. The cache-
+// hit / cold-build decision is derived purely from the input hash
+// fingerprint — no force-rebuild override.
+//
+// `dbIdx == -1` means the matched glob was top-level / applies to
+// every database; in that case every DB re-prepares.
+//
+// Setup hooks are NOT re-run by this path — they're for
+// initial worktree setup, not edit-driven re-prep. Use the regular
+// `FinalizeWorktree` (e.g. `treeman wt finalize`) when hooks need
+// to fire.
+func FinalizeWorktreeForWatch(
+	ctx context.Context,
+	st *State,
+	repoPath, worktreePath string,
+	dbIdx int,
+	inheritedEnv map[string]string,
+) error {
+	repoRoot := repoPath
+	wtRoot := worktreePath
+
+	if !st.MarkFinalizeInFlight(wtRoot) {
+		return nil
+	}
+	defer st.UnmarkFinalizeInFlight(wtRoot)
+
+	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
+	if err != nil {
+		return err
+	}
+	branch := detectBranch(wtRoot)
+	sl := slug.For(wtRoot, branch)
+	repoName := filepath.Base(repoRoot)
+	repoID, err := st.Store.EnsureRepo(ctx, repoRoot, repoName)
+	if err != nil {
+		return err
+	}
+	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wtRoot, sl.Value, branch)
+	if err != nil {
+		return err
+	}
+
+	// Re-apply patches. Cheap; idempotent for unchanged content.
+	if len(cfg.Patches) > 0 {
+		tplCtx := template.FromSlug(sl)
+		for _, p := range cfg.Patches {
+			if _, err := patcher.Apply(p, wtRoot, tplCtx); err != nil {
+				slog.Warn("patch failed (watch-trigger)", "wt", wtRoot, "file", p.File, "err", err)
+			}
+		}
+	}
+
+	if len(cfg.Databases) == 0 {
+		return nil
+	}
+	// The fingerprint hashes every declared input + dump + the
+	// migrate/seed run-strings. If anything changed, prepare cold-
+	// builds; otherwise cache-hits. No separate force-rebuild knob.
+	opts := prepare.RunOptions{}
+	if dbIdx >= 0 && dbIdx < len(cfg.Databases) {
+		opts.FilterDBs = true
+		opts.OnlyDBIndex = dbIdx
+	}
+	if _, err := prepare.RunFiltered(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv, opts); err != nil {
+		return fmt.Errorf("prepare (watch-trigger): %w", err)
+	}
+	return nil
+}
+
 // TeardownWorktree mirrors FinalizeWorktree for `treeman wt delete`.
-// Runs predelete hooks + DB teardown + worktree removal. All in the
+// Runs teardown hooks + DB teardown + worktree removal. All in the
 // daemon's runtime so the CLI returns immediately.
 //
 // Mutex scope: the per-repo teardown mutex is held ONLY across the
 // git operations that touch the shared <common>/worktrees/ admin
-// directory. Predelete hooks and DROP DATABASE are per-worktree
+// directory. Teardown hooks and DROP DATABASE are per-worktree
 // work — running them in parallel for two simultaneous teardowns of
 // the same repo is fine, and shrinking the mutex window lets a
-// second `gwtd` start its predelete/DB drops without waiting for the
+// second `gwtd` start its teardown/DB drops without waiting for the
 // first's rm to finish.
 //
 // Heavy rm-rf is offloaded to a background reaper: the worktree is
@@ -187,34 +293,24 @@ func TeardownWorktree(
 	worktreesRoot := worktreesRootOf(cfg.Worktrees.Root, repoRoot)
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_start",
-		"daemon-detached predelete + db teardown + git remove beginning",
+		"daemon-detached teardown hooks + db teardown + git remove beginning",
 		repoID, wtID, "", 0, nil)
 
-	if len(cfg.Hooks.Predelete) > 0 {
-		// Block until every predelete group exits before dropping
-		// databases — same rationale as the postcreate await: a hook
-		// that closes app connections must finish before DROP
-		// DATABASE, or the DB server rejects the drop.
-		started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, "predelete", len(cfg.Hooks.Predelete))
-		out, _ := hooks.RunHooks(ctx, "predelete", cfg.Hooks.Predelete,
-			repoRoot, wtRoot, slugVal, inheritedEnv, true)
-		hooks.PersistOutcome(ctx, st.Store, repoID, wtID, "predelete", started, nowMillis(), out)
-	}
-
+	// Three-step teardown: on-delete-before-engines actions →
+	// engine drop (inline + synchronous so post-engine actions can
+	// observe the drop) → on-delete-after-engines actions. Drop
+	// failures are logged but don't abort the rest.
+	_ = runTriggerActions(ctx, st, "on-delete-before-engines",
+		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, slugVal,
+		repoID, wtID, inheritedEnv)
 	if len(cfg.Databases) > 0 {
-		// DROP DATABASE is the second source of "wt delete locks the
-		// host" complaints — on MySQL+InnoDB the ibd unlinks for a
-		// large schema can stall the server for seconds. Same pattern
-		// as the file reaper: queue the drop on a per-repo worker so
-		// the RPC caller returns immediately and concurrent gwtds on
-		// the same repo serialise drops instead of fanning out.
-		ScheduleDBDrop(st, repoRoot, DBDropJob{
-			Cfg:        cfg,
-			Slug:       slugVal,
-			RepoID:     repoID,
-			WorktreeID: wtID,
-		})
+		if err := prepare.TeardownDatabases(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
+			slog.Warn("teardown DB drop", "wt", wtRoot, "err", err)
+		}
 	}
+	_ = runTriggerActions(ctx, st, "on-delete-after-engines",
+		cfg.Hooks.OnDeleteAfterEngines, repoRoot, wtRoot, slugVal,
+		repoID, wtID, inheritedEnv)
 
 	// Acquire the per-repo mutex only for the git operations — they
 	// touch the shared <common>/worktrees/ admin tree and aren't
@@ -316,6 +412,32 @@ func lowPriorityCommand(ctx context.Context, name string, args []string) *exec.C
 	return exec.CommandContext(ctx, prefix[0], cmdArgs...)
 }
 
+// runTriggerActions dispatches one trigger's actions (parallel
+// groups; the daemon blocks on completion before returning, but the
+// CLI dispatched-and-returned long ago). No-op when the trigger has
+// no actions. Errors are returned so the caller can decide whether
+// to abort the pipeline.
+func runTriggerActions(
+	ctx context.Context,
+	st *State,
+	trigger string,
+	actions []config.Action,
+	repoRoot, wtRoot, slugVal string,
+	repoID, wtID int64,
+	inheritedEnv map[string]string,
+) error {
+	if len(actions) == 0 {
+		return nil
+	}
+	started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, trigger, len(actions))
+	out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtRoot, slugVal, inheritedEnv, true)
+	hooks.PersistOutcome(ctx, st.Store, repoID, wtID, trigger, started, nowMillis(), out)
+	if err != nil {
+		return fmt.Errorf("%s: %w", trigger, err)
+	}
+	return nil
+}
+
 // detectBranch reads `.git/HEAD` (or the gitlink-resolved file) and
 // returns the branch name, empty when detached or readable.
 func detectBranch(worktree string) string {
@@ -327,35 +449,15 @@ func detectBranch(worktree string) string {
 		if err != nil {
 			return ""
 		}
-		gitdir := stripPrefix(string(linkBytes), "gitdir: ")
-		gitdir = trimSpace(gitdir)
-		headPath = filepath.Join(gitdir, "HEAD")
+		gitdir, _ := strings.CutPrefix(string(linkBytes), "gitdir: ")
+		headPath = filepath.Join(strings.TrimSpace(gitdir), "HEAD")
 	}
 	b, err := os.ReadFile(headPath)
 	if err != nil {
 		return ""
 	}
-	line := trimSpace(string(b))
-	const prefix = "ref: refs/heads/"
-	if len(line) > len(prefix) && line[:len(prefix)] == prefix {
-		return line[len(prefix):]
+	if ref, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "ref: refs/heads/"); ok {
+		return ref
 	}
 	return ""
-}
-
-func stripPrefix(s, p string) string {
-	if len(s) >= len(p) && s[:len(p)] == p {
-		return s[len(p):]
-	}
-	return s
-}
-
-func trimSpace(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\n' || s[0] == '\r') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t' || s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
-		s = s[:len(s)-1]
-	}
-	return s
 }

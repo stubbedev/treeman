@@ -1,61 +1,87 @@
-// Package runner invokes a framework's migrate command against a
-// target database. Frameworks read connection settings from their
-// own config (Laravel .env, Rails config/database.yml, etc.); we
-// override the target DB name with framework-appropriate env vars.
+// Package runner invokes a user-declared shell command (either a
+// migration runner from `migrations.migrate` or a seeder from
+// `databases[].seed`) against a target database. The command and
+// env-var overrides come verbatim from YAML — no framework-based
+// dispatch lives here.
 package runner
 
 import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"strings"
+
+	"github.com/stubbedev/treeman/internal/config"
 )
 
-// Mode — Up runs all migrations from scratch; Pending applies only
-// the newly-added migrations.
-type Mode int
+// Spec is the shape the runner accepts: a shell command + env-var
+// overrides + a label used in error messages so callers know which
+// YAML block produced the failure.
+type Spec struct {
+	Run   string
+	Env   map[string]string
+	Label string // e.g. "migrations.migrate" or "seed"
+}
 
-const (
-	ModeUp Mode = iota
-	ModePending
-)
+// FromMigrate converts a `databases[].migrate` block to a Spec.
+func FromMigrate(s config.Step) Spec {
+	return Spec{Run: s.Run, Env: s.Env, Label: "migrate"}
+}
 
-// Outcome is the result of one migrate invocation.
+// FromSeed converts a `databases[].seed` block to a Spec.
+func FromSeed(s config.Step) Spec {
+	return Spec{Run: s.Run, Env: s.Env, Label: "seed"}
+}
+
+// Outcome is the result of one runner invocation.
 type Outcome struct {
 	ExitCode   int
 	StdoutTail string
 	StderrTail string
 }
 
-// Run executes the framework's migrate command. `inheritedEnv` is
-// the env captured at CLI invocation (clears the daemon's env, layers
-// the caller's PATH-aware env on top, then the per-framework knobs).
+// Run executes `spec.Run` via `sh -c` against `targetDB`.
+// `inheritedEnv` is the env captured at CLI invocation (the daemon's
+// PATH-aware env layered on top of its own); `spec.Env` entries are
+// templated with `{target_db}` and then set last so they win.
 func Run(
 	ctx context.Context,
-	framework string,
+	spec Spec,
 	repoRoot string,
 	targetDB string,
-	mode Mode,
-	connEnvOverrides map[string]string,
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
-	bin, args, err := commandFor(framework, mode)
-	if err != nil {
-		return Outcome{ExitCode: -1}, err
+	if strings.TrimSpace(spec.Run) == "" {
+		label := spec.Label
+		if label == "" {
+			label = "command"
+		}
+		return Outcome{ExitCode: -1}, fmt.Errorf("%s.run is required", label)
 	}
-	c := exec.CommandContext(ctx, bin, args...)
+	c := exec.CommandContext(ctx, "sh", "-c", spec.Run)
 	c.Dir = repoRoot
 
-	env := make([]string, 0, len(inheritedEnv)+len(connEnvOverrides)+8)
+	// Build the subprocess env. User's cached env wins; fall back to
+	// the daemon's PATH only when the user's env has none (rare —
+	// see hooks.buildEnv doc-comment for the rationale).
+	env := make([]string, 0, len(inheritedEnv)+len(spec.Env)+2)
+	havePath := false
 	for k, v := range inheritedEnv {
+		if k == "PATH" {
+			havePath = true
+		}
 		env = append(env, k+"="+v)
+	}
+	if !havePath {
+		if p := os.Getenv("PATH"); p != "" {
+			env = append(env, "PATH="+p)
+		}
 	}
 	env = append(env, "TREEMAN_TARGET_DB="+targetDB)
-	for k, v := range frameworkEnv(framework, targetDB) {
-		env = append(env, k+"="+v)
-	}
-	for k, v := range connEnvOverrides {
-		env = append(env, k+"="+v)
+	for k, tmpl := range spec.Env {
+		env = append(env, k+"="+strings.ReplaceAll(tmpl, "{target_db}", targetDB))
 	}
 	c.Env = env
 
@@ -63,7 +89,7 @@ func Run(
 	c.Stdout = tailWriter(&stdout, 16*1024)
 	c.Stderr = tailWriter(&stderr, 16*1024)
 
-	err = c.Run()
+	err := c.Run()
 	out := Outcome{
 		StdoutTail: stdout.String(),
 		StderrTail: stderr.String(),
@@ -78,62 +104,6 @@ func Run(
 	}
 	out.ExitCode = 0
 	return out, nil
-}
-
-func commandFor(framework string, mode Mode) (string, []string, error) {
-	_ = mode // all frameworks use the same migrate-up command today
-	switch framework {
-	case "laravel":
-		return "php", []string{"artisan", "migrate", "--force"}, nil
-	case "rails":
-		return "bin/rails", []string{"db:migrate"}, nil
-	case "django":
-		return "python", []string{"manage.py", "migrate", "--noinput"}, nil
-	case "golang-migrate":
-		return "migrate", []string{"up"}, nil
-	case "sqlx-cli":
-		return "sqlx", []string{"migrate", "run"}, nil
-	case "diesel":
-		return "diesel", []string{"migration", "run"}, nil
-	case "prisma":
-		return "npx", []string{"prisma", "migrate", "deploy"}, nil
-	case "knex":
-		return "npx", []string{"knex", "migrate:latest"}, nil
-	case "alembic":
-		return "alembic", []string{"upgrade", "head"}, nil
-	case "flyway":
-		return "flyway", []string{"migrate"}, nil
-	case "typeorm":
-		return "npx", []string{"typeorm", "migration:run"}, nil
-	case "drizzle":
-		return "npx", []string{"drizzle-kit", "migrate"}, nil
-	case "sequelize":
-		return "npx", []string{"sequelize", "db:migrate"}, nil
-	case "mikro-orm":
-		return "npx", []string{"mikro-orm", "migration:up"}, nil
-	}
-	return "", nil, fmt.Errorf("unknown migration framework: %s", framework)
-}
-
-func frameworkEnv(framework, targetDB string) map[string]string {
-	switch framework {
-	case "laravel":
-		return map[string]string{
-			"DB_DATABASE":      targetDB,
-			"DB_TEST_DATABASE": targetDB,
-		}
-	case "rails":
-		return map[string]string{"DATABASE": targetDB}
-	case "django":
-		return map[string]string{"DJANGO_DB_NAME": targetDB}
-	case "golang-migrate":
-		return map[string]string{"MIGRATE_DATABASE_NAME": targetDB}
-	case "sqlx-cli":
-		return map[string]string{"DATABASE_URL_NAME": targetDB}
-	case "alembic", "flyway", "prisma", "knex", "typeorm", "drizzle", "sequelize", "mikro-orm", "diesel":
-		return map[string]string{"DATABASE_NAME": targetDB}
-	}
-	return nil
 }
 
 // tailWriter caps a bytes.Buffer at `n` bytes by truncating the

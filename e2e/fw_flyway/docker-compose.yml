@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: treeman-e2e-fw-flyway-pg
+    environment: { POSTGRES_PASSWORD: pgpw }
+    ports: ["15562:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # Flyway ships an official CLI image that bundles JRE + flyway.
+  flyway:
+    image: flyway/flyway:10
+    container_name: treeman-e2e-fw-flyway-cli
+    entrypoint: ["sh", "-c", "sleep infinity"]
+    volumes:
+      - /tmp:/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy

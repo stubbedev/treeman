@@ -1,0 +1,27 @@
+#!/usr/bin/env ruby
+# Minimal `bin/rails db:migrate` substitute. Uses ActiveRecord
+# directly (no full Rails stack) so the container image stays small
+# and the test runs fast.
+require "active_record"
+
+ActiveRecord::Base.establish_connection(ENV.fetch("DATABASE_URL"))
+
+ActiveRecord::Migration.verbose = false
+
+action = ARGV[0]
+case action
+when "db:migrate"
+  # Apply each migration directly. Bypasses MigrationContext's
+  # version-tracking shim (which moved between AR major versions)
+  # since treeman re-creates the source DB before each cold-build —
+  # the "always from scratch" semantics are exactly what we want.
+  Dir["db/migrate/*.rb"].sort.each do |f|
+    require File.expand_path(f)
+    cls = File.basename(f, ".rb").sub(/^\d+_/, "").split("_").map(&:capitalize).join
+    Object.const_get(cls).new.migrate(:up)
+  end
+  puts "ok"
+else
+  warn "usage: bin/rails db:migrate"
+  exit 2
+end

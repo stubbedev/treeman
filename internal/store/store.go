@@ -11,12 +11,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/stubbedev/treeman/internal/runid"
 )
 
 //go:embed migrations/*.sql
@@ -160,8 +163,11 @@ func (s *Store) StopEventBatcher() {
 		<-done
 	}
 	// Final drain: anything that arrived after the cancel but before
-	// the goroutine observed it.
-	s.flushEvents(context.Background())
+	// the goroutine observed it. Bounded so a wedged sqlite write
+	// can't block daemon shutdown forever.
+	ctx, cancelFinal := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFinal()
+	s.flushEvents(ctx)
 }
 
 // eventBatchLoop runs in its own goroutine when batching is active.
@@ -174,7 +180,12 @@ func (s *Store) eventBatchLoop() {
 	for {
 		select {
 		case <-s.batchCtx.Done():
-			s.flushEvents(context.Background())
+			// Don't reuse batchCtx (already cancelled). Use a
+			// bounded fresh ctx so the final drain can't block
+			// shutdown forever on a wedged sqlite write.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			s.flushEvents(ctx)
+			cancel()
 			return
 		case <-ticker.C:
 			s.flushEvents(s.batchCtx)
@@ -184,12 +195,12 @@ func (s *Store) eventBatchLoop() {
 	}
 }
 
-// flushEvents commits every buffered row in one transaction. Errors
-// are logged via the database driver path but never returned — the
-// batch path is fire-and-forget by design (callers used `_ =
-// WriteEvent(...)` everywhere). One bad row poisoning a whole batch
-// would lose unrelated events, so we fall back to a per-row insert
-// when the transaction fails.
+// flushEvents commits every buffered row in one transaction. The
+// batch path is fire-and-forget by design (callers use `_ =
+// WriteEvent(...)` everywhere) — so errors are logged via slog
+// instead of returned. One bad row poisoning a whole batch would
+// lose unrelated events, so we fall back to a per-row insert when
+// the transaction fails.
 func (s *Store) flushEvents(ctx context.Context) {
 	s.batchMu.Lock()
 	if len(s.batchBuf) == 0 {
@@ -202,6 +213,7 @@ func (s *Store) flushEvents(ctx context.Context) {
 
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
+		slog.Warn("event batch: begin tx failed, falling back to per-row", "err", err, "rows", len(batch))
 		s.flushEventsFallback(ctx, batch)
 		return
 	}
@@ -212,25 +224,36 @@ func (s *Store) flushEvents(ctx context.Context) {
 			e.tsMillis, e.level, e.repoID, e.worktreeID, e.eventType,
 			e.phase, e.message, e.payload, e.durationMs); err != nil {
 			_ = tx.Rollback()
+			slog.Warn("event batch: row insert failed, falling back to per-row", "err", err, "rows", len(batch))
 			s.flushEventsFallback(ctx, batch)
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		slog.Warn("event batch: commit failed, falling back to per-row", "err", err, "rows", len(batch))
 		s.flushEventsFallback(ctx, batch)
 	}
 }
 
 // flushEventsFallback re-inserts a batch one row at a time when the
 // batched transaction fails. Slower but resilient: a single
-// constraint violation can't lose the rest of the buffer.
+// constraint violation can't lose the rest of the buffer. Per-row
+// errors are surfaced via slog so a stuck disk / corrupted DB
+// doesn't silently vanish the event log.
 func (s *Store) flushEventsFallback(ctx context.Context, batch []pendingEvent) {
 	const stmt = `INSERT INTO events(ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	failed := 0
 	for _, e := range batch {
-		_, _ = s.DB.ExecContext(ctx, stmt,
+		if _, err := s.DB.ExecContext(ctx, stmt,
 			e.tsMillis, e.level, e.repoID, e.worktreeID, e.eventType,
-			e.phase, e.message, e.payload, e.durationMs)
+			e.phase, e.message, e.payload, e.durationMs); err != nil {
+			failed++
+			slog.Warn("event row insert failed", "err", err, "type", e.eventType)
+		}
+	}
+	if failed > 0 {
+		slog.Warn("event batch fallback: rows lost", "failed", failed, "total", len(batch))
 	}
 }
 
@@ -492,9 +515,8 @@ func (s *Store) CountActiveWorktreesForRepo(ctx context.Context, repoID int64) (
 
 // RemoveRepo deletes the repo row and every child row that would
 // otherwise block the FK constraint or hang around as orphan tracking
-// data: hook_runs, events, snapshots, binlog_checkpoints, worktrees.
-// Wrapped in a transaction so a mid-delete failure leaves the
-// registry intact.
+// data: hook_runs, events, snapshots, worktrees. Wrapped in a
+// transaction so a mid-delete failure leaves the registry intact.
 //
 // External resources (per-worktree databases, on-disk git worktree
 // dirs, dump caches under `.treeman-snapshots/`, advisory hash caches
@@ -511,14 +533,12 @@ func (s *Store) RemoveRepo(ctx context.Context, repoID int64) error {
 		`DELETE FROM hook_runs WHERE worktree_id IN (SELECT id FROM worktrees WHERE repo_id = ?)`,
 		`DELETE FROM events    WHERE repo_id = ? OR worktree_id IN (SELECT id FROM worktrees WHERE repo_id = ?)`,
 		`DELETE FROM snapshots WHERE repo_id = ?`,
-		`DELETE FROM binlog_checkpoints WHERE repo_id = ?`,
 		`DELETE FROM worktrees WHERE repo_id = ?`,
 		`DELETE FROM repos     WHERE id = ?`,
 	}
 	args := [][]any{
 		{repoID},
 		{repoID, repoID},
-		{repoID},
 		{repoID},
 		{repoID},
 		{repoID},
@@ -531,37 +551,11 @@ func (s *Store) RemoveRepo(ctx context.Context, repoID int64) error {
 	return tx.Commit()
 }
 
-// SetRepoWatchLifecycle toggles the per-repo lifecycle-watcher opt-in
-// flag. The watcher only acts on repos where this is 1 AND the global
-// `worktrees.hook_lifecycle` config bool is true.
-func (s *Store) SetRepoWatchLifecycle(ctx context.Context, repoID int64, on bool) error {
-	v := 0
-	if on {
-		v = 1
-	}
-	_, err := s.DB.ExecContext(ctx,
-		"UPDATE repos SET watch_lifecycle = ? WHERE id = ?", v, repoID)
-	return err
-}
-
-// GetRepoWatchLifecycle returns the current opt-in flag for repoID.
-func (s *Store) GetRepoWatchLifecycle(ctx context.Context, repoID int64) (bool, error) {
-	row := s.DB.QueryRowContext(ctx, "SELECT watch_lifecycle FROM repos WHERE id = ?", repoID)
-	var v int
-	if err := row.Scan(&v); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	return v != 0, nil
-}
-
-// ListLifecycleWatchedRepos returns every repo (path + id) where
-// watch_lifecycle = 1. Used by the daemon at boot to subscribe.
-func (s *Store) ListLifecycleWatchedRepos(ctx context.Context) ([]RepoRef, error) {
-	rows, err := s.DB.QueryContext(ctx,
-		"SELECT id, path FROM repos WHERE watch_lifecycle = 1 ORDER BY id")
+// ListRepoRefs returns (id, path) for every registered repo in
+// insertion order. Used by the daemon at boot to subscribe the
+// always-on lifecycle watcher to every known repo.
+func (s *Store) ListRepoRefs(ctx context.Context) ([]RepoRef, error) {
+	rows, err := s.DB.QueryContext(ctx, "SELECT id, path FROM repos ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -589,6 +583,70 @@ func (s *Store) MarkWorktreeDeleted(ctx context.Context, id int64) error {
 	_, err := s.DB.ExecContext(ctx,
 		"UPDATE worktrees SET deleted_at = ? WHERE id = ?", nowMillis(), id)
 	return err
+}
+
+// SaveInheritedEnv caches the user's shell env per worktree so the
+// daemon's HEAD-watcher and file-watcher paths can rehydrate it
+// when re-running hooks/prepare. Empty maps are stored as NULL so
+// the caller can tell "never set" from "set to empty".
+func (s *Store) SaveInheritedEnv(ctx context.Context, worktreeID int64, env map[string]string) error {
+	if len(env) == 0 {
+		_, err := s.DB.ExecContext(ctx,
+			"UPDATE worktrees SET inherited_env_json = NULL WHERE id = ?", worktreeID)
+		return err
+	}
+	b, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("marshal inherited env: %w", err)
+	}
+	_, err = s.DB.ExecContext(ctx,
+		"UPDATE worktrees SET inherited_env_json = ? WHERE id = ?", string(b), worktreeID)
+	return err
+}
+
+// LoadInheritedEnv returns the cached env captured at the last
+// SaveInheritedEnv call. Returns nil + nil-error when the column is
+// NULL (no env ever cached for this worktree).
+func (s *Store) LoadInheritedEnv(ctx context.Context, worktreeID int64) (map[string]string, error) {
+	row := s.DB.QueryRowContext(ctx,
+		"SELECT inherited_env_json FROM worktrees WHERE id = ?", worktreeID)
+	var raw sql.NullString
+	if err := row.Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !raw.Valid || raw.String == "" {
+		return nil, nil
+	}
+	var env map[string]string
+	if err := json.Unmarshal([]byte(raw.String), &env); err != nil {
+		return nil, fmt.Errorf("unmarshal inherited env: %w", err)
+	}
+	return env, nil
+}
+
+// LoadInheritedEnvByPath looks up the cached env by worktree path,
+// for callers that have the path but not the ID.
+func (s *Store) LoadInheritedEnvByPath(ctx context.Context, worktreePath string) (map[string]string, error) {
+	row := s.DB.QueryRowContext(ctx,
+		"SELECT inherited_env_json FROM worktrees WHERE path = ?", worktreePath)
+	var raw sql.NullString
+	if err := row.Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !raw.Valid || raw.String == "" {
+		return nil, nil
+	}
+	var env map[string]string
+	if err := json.Unmarshal([]byte(raw.String), &env); err != nil {
+		return nil, fmt.Errorf("unmarshal inherited env: %w", err)
+	}
+	return env, nil
 }
 
 // TouchWorktreeVisited stamps `last_visited_at = now` on the worktree
@@ -721,6 +779,7 @@ func (s *Store) WriteEvent(ctx context.Context,
 	durationMs int64,
 	payload any,
 ) error {
+	payload = injectRunID(ctx, payload)
 	pj, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("encode event payload: %w", err)
@@ -768,4 +827,32 @@ func (s *Store) WriteEvent(ctx context.Context,
 		row.tsMillis, row.level, row.repoID, row.worktreeID,
 		row.eventType, row.phase, row.message, row.payload, row.durationMs)
 	return err
+}
+
+// injectRunID stamps the ctx-bound run_id into payload so every event
+// emitted by one flow shares a correlation key. Maps (the common
+// case) get the field in place; nil payloads become a fresh map;
+// anything else (rare) is wrapped under {run_id, payload}. The
+// run_id key is left alone if the caller already supplied one.
+func injectRunID(ctx context.Context, payload any) any {
+	id := runid.From(ctx)
+	if id == "" {
+		return payload
+	}
+	switch p := payload.(type) {
+	case nil:
+		return map[string]string{"run_id": id}
+	case map[string]any:
+		if _, ok := p["run_id"]; !ok {
+			p["run_id"] = id
+		}
+		return p
+	case map[string]string:
+		if _, ok := p["run_id"]; !ok {
+			p["run_id"] = id
+		}
+		return p
+	default:
+		return map[string]any{"run_id": id, "payload": p}
+	}
 }

@@ -7,134 +7,245 @@ import (
 	"testing"
 )
 
-func writeTmp(t *testing.T, content string) string {
+func writeTmp(t *testing.T, body string) string {
 	t.Helper()
-	// Isolate the test from the user's real ~/.config/treeman/
-	// config.yaml so config-merge layering doesn't pick it up.
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	d := t.TempDir()
-	p := filepath.Join(d, ".treeman.yaml")
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".treeman.yaml"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return d
+	return dir
 }
 
-func TestParseBareStringHookEntry(t *testing.T) {
+func TestActionSingleStringRun(t *testing.T) {
+	// `run: "..."` decodes to []string{"..."} so callers don't need
+	// to branch on shape.
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
-  postcreate:
-    - "composer install"
+  on-create-before-engines:
+    - run: "composer install"
 `)
 	cfg, err := LoadLayered(d)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Hooks.Postcreate) != 1 {
-		t.Fatalf("want 1 group, got %d", len(cfg.Hooks.Postcreate))
+	if len(cfg.Hooks.OnCreateBeforeEngines) != 1 {
+		t.Fatalf("want 1 action, got %d", len(cfg.Hooks.OnCreateBeforeEngines))
 	}
-	g := cfg.Hooks.Postcreate[0]
-	if len(g.Steps) != 1 || g.Steps[0].Run != "composer install" {
-		t.Errorf("unexpected: %#v", g)
+	a := cfg.Hooks.OnCreateBeforeEngines[0]
+	if len(a.Run) != 1 || a.Run[0] != "composer install" {
+		t.Errorf("unexpected: %#v", a)
 	}
 }
 
-func TestParseMapHookEntry(t *testing.T) {
+func TestActionListRun(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
-  postcreate:
-    - { run: "yarn install", cwd: frontend }
+  on-create-before-engines:
+    - run:
+        - "npm install"
+        - "npm run build"
 `)
 	cfg, err := LoadLayered(d)
 	if err != nil {
 		t.Fatal(err)
 	}
-	g := cfg.Hooks.Postcreate[0]
-	if g.Steps[0].Run != "yarn install" || g.Steps[0].Cwd != "frontend" {
-		t.Errorf("unexpected: %#v", g)
+	a := cfg.Hooks.OnCreateBeforeEngines[0]
+	if len(a.Run) != 2 || a.Run[0] != "npm install" || a.Run[1] != "npm run build" {
+		t.Errorf("unexpected: %#v", a)
 	}
 }
 
-func TestParseGroupHookEntry(t *testing.T) {
+func TestActionGroupLevelCwd(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
-  postcreate:
-    - - "npm install"
-      - { run: "npm run build" }
+  on-create-before-engines:
+    - run:
+        - "yarn install"
+        - "yarn build"
+      cwd: frontend
 `)
 	cfg, err := LoadLayered(d)
 	if err != nil {
 		t.Fatal(err)
 	}
-	g := cfg.Hooks.Postcreate[0]
-	if len(g.Steps) != 2 {
-		t.Fatalf("want 2 steps in group, got %d", len(g.Steps))
-	}
-	if g.Steps[0].Run != "npm install" || g.Steps[1].Run != "npm run build" {
-		t.Errorf("unexpected: %#v", g)
+	a := cfg.Hooks.OnCreateBeforeEngines[0]
+	if a.Cwd != "frontend" {
+		t.Errorf("cwd: %q", a.Cwd)
 	}
 }
 
-func TestParseHookEntryInContainerSingleStep(t *testing.T) {
+func TestAllTriggersParseAndCarryActions(t *testing.T) {
+	// Asserts every top-level trigger key in the schema accepts an
+	// actions list and lands on the matching struct field. The
+	// `on-file-change` trigger now lives per-database (covered by
+	// TestPerDBOnFileChange below).
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
-  postcreate:
-    - { run: "composer install", in_container: app }
+  on-create-before-engines:
+    - run: "composer install"
+  on-create-after-engines:
+    - run: "warm-cache.sh"
+  on-delete-before-engines:
+    - run: "drain-queues"
+  on-delete-after-engines:
+    - run: "notify-slack"
+  on-checkout:
+    - run: "refresh-test-data"
 `)
 	cfg, err := LoadLayered(d)
 	if err != nil {
 		t.Fatal(err)
 	}
-	g := cfg.Hooks.Postcreate[0]
-	if g.Container != "app" {
-		t.Errorf("Container=%q want app", g.Container)
+	cases := []struct {
+		name   string
+		actual []Action
+		want   string
+	}{
+		{"on-create-before-engines", cfg.Hooks.OnCreateBeforeEngines, "composer install"},
+		{"on-create-after-engines", cfg.Hooks.OnCreateAfterEngines, "warm-cache.sh"},
+		{"on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines, "drain-queues"},
+		{"on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines, "notify-slack"},
+		{"on-checkout", cfg.Hooks.OnCheckout, "refresh-test-data"},
 	}
-	if len(g.Steps) != 1 || g.Steps[0].Run != "composer install" {
-		t.Errorf("steps: %#v", g.Steps)
+	for _, c := range cases {
+		if len(c.actual) != 1 {
+			t.Errorf("%s: want 1 action, got %d", c.name, len(c.actual))
+			continue
+		}
+		if len(c.actual[0].Run) != 1 || c.actual[0].Run[0] != c.want {
+			t.Errorf("%s: got %#v, want %q", c.name, c.actual[0].Run, c.want)
+		}
 	}
 }
 
-func TestParseHookEntryComposeServiceGroup(t *testing.T) {
+// TestOnFileChangeGlobalWithLabels asserts the global
+// hooks.on-file-change block parses with the three valid `match:`
+// shapes: omitted (wildcard), single string, and list.
+func TestOnFileChangeGlobalWithLabels(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
+databases:
+  - engine: mysql
+    name_template: "app_{slug}"
+    inputs:
+      - { glob: "db/migrations/**/*.sql", label: migrations, hash: filename }
+      - { glob: "db/seeders/**/*.sql",    label: seeders }
+  - engine: elasticsearch
+    key_prefix: "app_{slug}_"
+    inputs:
+      - { glob: "es/mappings/**/*.json", label: es-mappings }
 hooks:
-  postcreate:
+  on-file-change:
+    - run: "echo any change anywhere"               # wildcard
+    - match: migrations                              # single label
+      run: "echo mysql migration changed"
+    - match: [migrations, seeders]                   # list of labels
+      run: ["echo any mysql change", "echo step two"]
+    - match: es-mappings
+      run: "curl -XPOST 'http://es/_reindex'"
+`)
+	cfg, err := LoadLayered(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Hooks.OnFileChange) != 4 {
+		t.Fatalf("on-file-change: want 4 actions, got %d", len(cfg.Hooks.OnFileChange))
+	}
+	a := cfg.Hooks.OnFileChange
+	if len(a[0].Match) != 0 {
+		t.Errorf("wildcard: want empty Match, got %#v", a[0].Match)
+	}
+	if !a[0].Matches("anything") || !a[0].Matches("") {
+		t.Error("wildcard should match anything")
+	}
+	if len(a[1].Match) != 1 || a[1].Match[0] != "migrations" {
+		t.Errorf("single-string match: %#v", a[1].Match)
+	}
+	if !a[1].Matches("migrations") || a[1].Matches("seeders") {
+		t.Error("single-string match dispatched wrong")
+	}
+	if len(a[2].Match) != 2 || a[2].Match[0] != "migrations" || a[2].Match[1] != "seeders" {
+		t.Errorf("list match: %#v", a[2].Match)
+	}
+	if !a[2].Matches("migrations") || !a[2].Matches("seeders") || a[2].Matches("es-mappings") {
+		t.Error("list match dispatched wrong")
+	}
+	if !a[3].Matches("es-mappings") {
+		t.Error("es-mappings should match")
+	}
+}
+
+func TestActionContainerSingleStep(t *testing.T) {
+	d := writeTmp(t, `
+repo: x
+hooks:
+  on-create-before-engines:
+    - run: "composer install"
+      container: app
+`)
+	cfg, err := LoadLayered(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.Hooks.OnCreateBeforeEngines[0]
+	if a.Container != "app" {
+		t.Errorf("Container=%q want app", a.Container)
+	}
+}
+
+// TestActionInContainerAliasRejected asserts the removed `in_container:`
+// alias produces a clear error rather than silently mis-parsing.
+func TestActionInContainerAliasRejected(t *testing.T) {
+	d := writeTmp(t, `
+repo: x
+hooks:
+  on-create-before-engines:
+    - run: "composer install"
+      in_container: app
+`)
+	_, err := LoadLayered(d)
+	if err == nil {
+		t.Fatal("want error for removed in_container alias")
+	}
+}
+
+func TestActionComposeService(t *testing.T) {
+	d := writeTmp(t, `
+repo: x
+hooks:
+  on-create-before-engines:
     - compose_service: app
       compose_project: myproj
       container_engine: podman
-      steps:
+      run:
         - "composer install"
-        - { run: "php artisan migrate", cwd: /var/www }
+        - "php artisan migrate"
 `)
 	cfg, err := LoadLayered(d)
 	if err != nil {
 		t.Fatal(err)
 	}
-	g := cfg.Hooks.Postcreate[0]
-	if g.ComposeService != "app" || g.ComposeProject != "myproj" || g.Engine != "podman" {
-		t.Errorf("meta: %#v", g)
+	a := cfg.Hooks.OnCreateBeforeEngines[0]
+	if a.ComposeService != "app" || a.ComposeProject != "myproj" || a.Engine != "podman" {
+		t.Errorf("meta: %#v", a)
 	}
-	if len(g.Steps) != 2 {
-		t.Fatalf("steps=%d", len(g.Steps))
-	}
-	if g.Steps[1].Cwd != "/var/www" {
-		t.Errorf("cwd: %#v", g.Steps[1])
+	if len(a.Run) != 2 {
+		t.Errorf("steps: %d", len(a.Run))
 	}
 }
 
-func TestParseHookEntryContainerAndComposeServiceMutuallyExclusive(t *testing.T) {
+func TestActionContainerAndComposeServiceMutuallyExclusive(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
-  postcreate:
-    - in_container: app
+  on-create-before-engines:
+    - container: app
       compose_service: also-app
-      steps:
-        - "boom"
+      run: "boom"
 `)
 	if _, err := LoadLayered(d); err == nil {
 		t.Fatal("want error for combined refs")
@@ -143,10 +254,11 @@ hooks:
 
 func TestLegacyBackgroundFieldRejected(t *testing.T) {
 	d := writeTmp(t, `
-repo: { name: x }
+repo: x
 hooks:
-  postcreate:
-    - { run: "yarn install", background: true }
+  on-create-before-engines:
+    - run: "yarn install"
+      background: true
 `)
 	_, err := LoadLayered(d)
 	if err == nil {
@@ -157,21 +269,55 @@ hooks:
 	}
 }
 
+func TestLegacyStepsKeywordRejected(t *testing.T) {
+	d := writeTmp(t, `
+repo: x
+hooks:
+  on-create-before-engines:
+    - steps:
+        - "a"
+        - "b"
+`)
+	_, err := LoadLayered(d)
+	if err == nil {
+		t.Fatal("want error rejecting legacy `steps:` keyword")
+	}
+	if !strings.Contains(err.Error(), "steps") {
+		t.Errorf("error should mention `steps:`: %v", err)
+	}
+}
+
+func TestActionRejectsBareString(t *testing.T) {
+	d := writeTmp(t, `
+repo: x
+hooks:
+  on-create-before-engines:
+    - "composer install"
+`)
+	_, err := LoadLayered(d)
+	if err == nil {
+		t.Fatal("want error rejecting bare-string shorthand")
+	}
+	if !strings.Contains(err.Error(), "mapping") {
+		t.Errorf("error should explain the required mapping shape: %v", err)
+	}
+}
+
 func TestRealisticLaravelStyleConfig(t *testing.T) {
 	// Sanity check: a realistic Laravel-style YAML parses to the
-	// expected shape — hook groups, env_scoping with patches,
+	// expected shape — flat trigger-keyed hooks, patches block,
 	// databases with paratest fan-out.
 	d := writeTmp(t, `
-repo:
-  name: myapp
+repo: myapp
 worktrees:
   root: .worktrees
-  links: [.env, .env.testing]
-env_scoping:
-  files: [.env.testing, phpunit.xml]
-  skip_worktree: true
-  patches:
-    - { key: DB_TEST_DATABASE, template: "myapp_testing_{slug}" }
+  copies: [.env]
+  links: [vendor]
+env_sources: [.env, .env.testing]
+patches:
+  - file: .env.testing
+    set:
+      DB_TEST_DATABASE: "myapp_testing_{slug}"
 databases:
   - engine: mysql
     name_template: "myapp_testing_{slug}"
@@ -179,34 +325,43 @@ databases:
       clones: auto
       name_template: "myapp_testing_{slug}_test_{n}"
 hooks:
-  postcreate:
-    - "composer install --no-interaction"
-    - "yarn install --frozen-lockfile"
-    - { run: "yarn install", cwd: frontend }
+  on-create-before-engines:
+    - run: "composer install --no-interaction"
+    - run: "yarn install --frozen-lockfile"
+    - run:
+        - "yarn install"
+        - "yarn build"
+      cwd: frontend
+  on-create-after-engines:
+    - run: "warm-cache.sh"
+  on-delete-before-engines:
+    - run: "drain-queues"
 `)
 	cfg, err := LoadLayered(d)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Repo == nil || cfg.Repo.Name != "myapp" {
-		t.Errorf("repo: %#v", cfg.Repo)
+	if len(cfg.Hooks.OnCreateBeforeEngines) != 3 {
+		t.Errorf("want 3 on-create-before-engines actions, got %d", len(cfg.Hooks.OnCreateBeforeEngines))
 	}
-	if cfg.Worktrees.Root != ".worktrees" {
-		t.Errorf("worktrees.root: %q", cfg.Worktrees.Root)
+	if len(cfg.Hooks.OnCreateAfterEngines) != 1 {
+		t.Errorf("want 1 on-create-after-engines action, got %d", len(cfg.Hooks.OnCreateAfterEngines))
 	}
-	if cfg.Worktrees.AsyncCreate == nil || !*cfg.Worktrees.AsyncCreate {
-		t.Error("async_create default should be true")
-	}
-	if cfg.Worktrees.AsyncDelete == nil || !*cfg.Worktrees.AsyncDelete {
-		t.Error("async_delete default should be true")
-	}
-	if len(cfg.Hooks.Postcreate) != 3 {
-		t.Errorf("want 3 postcreate groups, got %d", len(cfg.Hooks.Postcreate))
+	if len(cfg.Hooks.OnDeleteBeforeEngines) != 1 {
+		t.Errorf("want 1 on-delete-before-engines action, got %d", len(cfg.Hooks.OnDeleteBeforeEngines))
 	}
 	if len(cfg.Databases) != 1 || cfg.Databases[0].Engine != "mysql" {
 		t.Errorf("databases: %#v", cfg.Databases)
 	}
 	if cfg.Databases[0].TestClones == nil || !cfg.Databases[0].TestClones.Clones.Auto {
 		t.Error("test_clones.clones should be auto")
+	}
+	if len(cfg.Patches) != 1 || cfg.Patches[0].File != ".env.testing" {
+		t.Errorf("patches: %#v", cfg.Patches)
+	}
+	// Spot-check that the 3rd on-create-before-engines action is the grouped one with cwd.
+	a := cfg.Hooks.OnCreateBeforeEngines[2]
+	if a.Cwd != "frontend" || len(a.Run) != 2 {
+		t.Errorf("3rd action: %#v", a)
 	}
 }

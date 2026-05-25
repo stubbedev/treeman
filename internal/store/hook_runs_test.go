@@ -21,11 +21,11 @@ func TestWriteHookRunPersistsAndQueries(t *testing.T) {
 	repoID, _ := s.EnsureRepo(ctx, "/repos/foo", "foo")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/repos/foo/.wt/x", "x", "feature/x")
 
-	if err := s.WriteHookRun(ctx, wtID, "postcreate", 0,
+	if err := s.WriteHookRun(ctx, wtID, "setup", 0,
 		"composer install", 1000, 1250, 0, "ok", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.WriteHookRun(ctx, wtID, "postcreate", 1,
+	if err := s.WriteHookRun(ctx, wtID, "setup", 1,
 		"yarn install", 1000, 1400, 2, "", "boom\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestWriteHookRunZeroWorktreeIsNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.WriteHookRun(ctx, 0, "precreate", 0, "noop", 1, 2, 0, "", ""); err != nil {
+	if err := s.WriteHookRun(ctx, 0, "setup", 0, "noop", 1, 2, 0, "", ""); err != nil {
 		t.Fatalf("zero-wt should be a silent no-op, got %v", err)
 	}
 }

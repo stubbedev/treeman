@@ -1,0 +1,116 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+)
+
+// TestFreshDBHasExpectedSchema opens a brand-new store DB and asserts
+// the consolidated init migration produced the right set of tables
+// + indexes. Acts as a regression net against future drift between
+// 0001_init.sql and the schema the store code expects to query.
+func TestFreshDBHasExpectedSchema(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "tm.db")
+	st, err := Open(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+
+	got := dump(t, raw)
+	wantTables := []string{
+		"_treeman_migrations",
+		"dir_hashes",
+		"events",
+		"file_hashes",
+		"hook_runs",
+		"repos",
+		"snapshots",
+		"worktrees",
+	}
+	if !equalLists(got.tables, wantTables) {
+		t.Errorf("tables\n got: %v\nwant: %v", got.tables, wantTables)
+	}
+	// Indexes from 0001_init.sql. Auto-generated sqlite_autoindex_* are
+	// filtered out — only user-declared CREATE INDEXes show up here.
+	wantIndexes := []string{
+		"idx_events_ts",
+		"idx_events_type",
+		"idx_events_worktree",
+		"idx_file_hashes_content",
+		"idx_hook_runs_worktree",
+		"idx_snapshots_lru",
+		"idx_snapshots_repo_lru",
+		"idx_worktrees_admin_dir",
+		"idx_worktrees_repo",
+		"idx_worktrees_repo_visited",
+		"idx_worktrees_slug",
+	}
+	if !equalLists(got.indexes, wantIndexes) {
+		t.Errorf("indexes\n got: %v\nwant: %v", got.indexes, wantIndexes)
+	}
+
+	// Sanity: the binlog_checkpoints table is gone (was 0003 in the
+	// old chain; squashed out when the binlog feature was removed).
+	for _, tbl := range got.tables {
+		if tbl == "binlog_checkpoints" {
+			t.Errorf("binlog_checkpoints should not exist in fresh DBs")
+		}
+	}
+}
+
+type schemaSnapshot struct {
+	tables  []string
+	indexes []string
+}
+
+func dump(t *testing.T, db *sql.DB) schemaSnapshot {
+	t.Helper()
+	rows, err := db.Query(`
+		SELECT type, name FROM sqlite_master
+		WHERE type IN ('table','index')
+		  AND name NOT LIKE 'sqlite_%'
+		ORDER BY name
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var s schemaSnapshot
+	for rows.Next() {
+		var typ, name string
+		_ = rows.Scan(&typ, &name)
+		switch typ {
+		case "table":
+			s.tables = append(s.tables, name)
+		case "index":
+			s.indexes = append(s.indexes, name)
+		}
+	}
+	sort.Strings(s.tables)
+	sort.Strings(s.indexes)
+	return s
+}
+
+func equalLists(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}

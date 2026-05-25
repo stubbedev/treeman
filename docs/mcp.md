@@ -33,7 +33,7 @@ being able to change anything.
 | `registry_register`, `registry_unregister`, `registry_repair` | `--allow-mutations` | Mutate the SQLite worktree registry directly. `repair` diffs `git worktree list` vs SQLite and auto-reconciles drift. |
 | `snapshots_purge`, `logs_purge` | `--allow-mutations` | Wipe the snapshot cache (forces next prepare to rebuild) / delete event-log rows by filter (at least one filter required). |
 | `daemon_control` | `--allow-mutations` | Start / stop treemand. Prefers the installed systemd/launchd unit; otherwise forks the `treemand` binary (start) or sends the shutdown RPC (stop). |
-| `worktree_create`, `worktree_delete` | `--allow-shell` | Shell out to `treeman wt create|delete` for the full git + hooks + prepare lifecycle. |
+| `worktree_create`, `worktree_delete` | `--allow-shell` | Run the full git + hooks + prepare lifecycle in-process via `internal/wt`. The heavy tail (hooks + prepare for create; teardown for delete) is dispatched to the daemon; on daemon-unreachable the orchestrator spawns a detached `treeman wt finalize --local` / `wt delete --detached` child and returns immediately. Returns a structured result (`wt_path`, `status`, `slug`, `worktree_id`, `log_path`). |
 
 ## Claude Code
 
@@ -103,10 +103,11 @@ wrap the command in anything that mixes the two.
   to the repo, the daemon socket, and any `.env` files. Only
   enable `--allow-shell` for agents you trust to call
   `wt create/delete` on your behalf.
-- `worktree_delete` from MCP runs through `treeman wt delete`,
-  which prompts for confirmation on a TTY — but the MCP server's
-  stdin is JSON-RPC, not a TTY, so the prompt is **skipped**.
-  Treat `--allow-shell` accordingly.
+- `worktree_delete` from MCP runs `wt.Delete` in-process. The
+  TTY confirmation prompt is a CLI-only concern (it lives in
+  the `wt delete` action closure, not the orchestrator), so MCP
+  callers get **no confirmation** — every `worktree_delete`
+  invocation runs the teardown. Treat `--allow-shell` accordingly.
 - Hook stdout/stderr and event payloads pass through
   `redactSecrets` (see `internal/mcp/ops.go`) before being
   returned to the client. False positives just hide a token;

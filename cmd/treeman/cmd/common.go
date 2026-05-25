@@ -4,7 +4,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,9 +59,6 @@ func PrintWarn(format string, args ...any) { ui.Warn(format, args...) }
 func PrintErr(format string, args ...any)  { ui.Error(format, args...) }
 func PrintInfo(format string, args ...any) { ui.Info(format, args...) }
 func PrintHint(format string, args ...any) { ui.Hint(format, args...) }
-
-// Ctx returns a background context (no per-CLI cancellation today).
-func Ctx() context.Context { return context.Background() }
 
 // SuggestNearestCommands returns the up-to-`max` subcommand names
 // in `commands` that are closest to `typed` by Levenshtein

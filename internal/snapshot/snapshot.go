@@ -2,7 +2,7 @@
 // fan-out logic.
 //
 // A SnapshotKey is the cache key the prepare orchestrator uses to
-// look up a built template DB: identical (engine, framework,
+// look up a built template DB: identical (engine, source DB name,
 // migrations_hash, dump_hash, lockfile_hashes) means an existing
 // template can be restored instead of rebuilt from scratch.
 package snapshot
@@ -24,9 +24,11 @@ import (
 // way that invalidates existing fingerprints. v2 swapped sha256 →
 // blake3 across both the fingerprint hash and the per-file content
 // hashes that feed it. v3 hashes the canonical field stream directly
-// into blake3 (no JSON intermediate). Every existing _tm_… template
-// rebuilds once after each bump.
-const FormatVersion uint32 = 3
+// into blake3 (no JSON intermediate). v4 dropped the Framework field
+// (framework dispatch was removed; the migrate command is declared
+// per-repo in YAML). Every existing _tm_… template rebuilds once
+// after each bump.
+const FormatVersion uint32 = 4
 
 // Key fingerprints a snapshot. Two prepare runs that share every
 // field can reuse the same template DB.
@@ -35,7 +37,6 @@ type Key struct {
 	Engine            string            `json:"engine"`
 	EngineVersion     string            `json:"engine_version"`
 	SourceDBName      string            `json:"source_db_name"`
-	Framework         string            `json:"framework"`
 	HashMode          string            `json:"hash_mode"`
 	MigrationsHashHex string            `json:"migrations_hash_hex"`
 	DumpHashHex       string            `json:"dump_hash_hex,omitempty"`
@@ -43,7 +44,7 @@ type Key struct {
 }
 
 // New constructs a Key with the format version pinned.
-func New(engine, engineVersion, sourceDB, framework, hashMode, migrationsHash, dumpHash string, lockfileHashes map[string]string) Key {
+func New(engine, engineVersion, sourceDB, hashMode, migrationsHash, dumpHash string, lockfileHashes map[string]string) Key {
 	if lockfileHashes == nil {
 		lockfileHashes = map[string]string{}
 	}
@@ -52,7 +53,6 @@ func New(engine, engineVersion, sourceDB, framework, hashMode, migrationsHash, d
 		Engine:            engine,
 		EngineVersion:     engineVersion,
 		SourceDBName:      sourceDB,
-		Framework:         framework,
 		HashMode:          hashMode,
 		MigrationsHashHex: migrationsHash,
 		DumpHashHex:       dumpHash,
@@ -85,7 +85,6 @@ func (k Key) Fingerprint() string {
 		k.Engine,
 		k.EngineVersion,
 		k.SourceDBName,
-		k.Framework,
 		k.HashMode,
 		k.MigrationsHashHex,
 		k.DumpHashHex,
@@ -126,6 +125,14 @@ func (k Key) Fingerprint() string {
 // shorter form.
 func (k Key) TemplateName() string {
 	return fmt.Sprintf("_tm_%s", k.Fingerprint()[:16])
+}
+
+// IndexPrefix is the ES/OpenSearch variant of TemplateName: ES
+// forbids index names starting with `_`, so we drop the leading
+// namespace marker. Returns a stable, lowercase, hyphen-free prefix
+// without trailing punctuation; callers add their own separator.
+func (k Key) IndexPrefix() string {
+	return fmt.Sprintf("tm_%s", k.Fingerprint()[:16])
 }
 
 // HashCache is the subset of *store.Store that LockfileHashesFor +

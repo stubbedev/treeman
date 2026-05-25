@@ -18,24 +18,40 @@ import (
 // giving up.
 const DefaultTimeout = 1500 * time.Millisecond
 
-// Probe tries a TCP connect within DefaultTimeout. On failure
-// returns an error whose message names the engine so callers don't
-// have to wrap it.
+// Probe tries a TCP connect within DefaultTimeout, ignoring any
+// surrounding context.
+//
+// Deprecated: prefer ProbeCtx so callers can short-circuit the dial
+// when their own context expires.
 func Probe(engine, host string, port uint16) error {
 	return ProbeWithTimeout(engine, host, port, DefaultTimeout)
 }
 
-// ProbeWithTimeout is the explicit-timeout variant.
+// ProbeWithTimeout is the explicit-timeout variant of Probe.
+//
+// Deprecated: prefer ProbeCtx.
 func ProbeWithTimeout(engine, host string, port uint16, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return ProbeCtx(ctx, engine, host, port)
+}
+
+// ProbeCtx tries a TCP connect bounded by ctx. If ctx has no
+// deadline, DefaultTimeout is applied so a missing deadline doesn't
+// hang the dial indefinitely.
+func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultTimeout)
+		defer cancel()
+	}
 	d := net.Dialer{}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
 	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf(
-				"%s unreachable at %s:%d (tcp connect timeout after %dms — is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`)",
-				engine, host, port, timeout.Milliseconds(), port)
+				"%s unreachable at %s:%d (tcp connect timeout — is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`)",
+				engine, host, port, port)
 		}
 		return fmt.Errorf("%s unreachable at %s:%d (tcp connect refused: %v — if the service is in docker, set `container:`/`compose_service:` so treeman can find its bridge IP or published port)", engine, host, port, err)
 	}
@@ -46,12 +62,19 @@ func ProbeWithTimeout(engine, host string, port uint16, timeout time.Duration) e
 // ProbeURL parses a URL-style connection string and probes the
 // resulting host:port. Falls back to scheme default if the URL
 // omits a port.
+//
+// Deprecated: prefer ProbeURLCtx.
 func ProbeURL(engine, raw string) error {
+	return ProbeURLCtx(context.Background(), engine, raw)
+}
+
+// ProbeURLCtx is the ctx-aware variant of ProbeURL.
+func ProbeURLCtx(ctx context.Context, engine, raw string) error {
 	host, port, err := parseHostPort(engine, raw)
 	if err != nil {
 		return err
 	}
-	return Probe(engine, host, port)
+	return ProbeCtx(ctx, engine, host, port)
 }
 
 func parseHostPort(engine, raw string) (string, uint16, error) {

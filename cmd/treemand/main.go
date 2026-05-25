@@ -16,11 +16,30 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/version"
 )
+
+// slogLevel parses a daemon.log_level YAML value into a slog.Level.
+// Unknown values fall back to info with a stderr warning so a typo
+// doesn't silently degrade visibility.
+func slogLevel(raw string) slog.Level {
+	switch raw {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	case "", "info":
+		return slog.LevelInfo
+	}
+	fmt.Fprintf(os.Stderr, "treemand: unknown daemon.log_level %q, defaulting to info\n", raw)
+	return slog.LevelInfo
+}
 
 func main() {
 	if len(os.Args) >= 2 && (os.Args[1] == "--version" || os.Args[1] == "-V") {
@@ -28,7 +47,11 @@ func main() {
 		return
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	level := slog.LevelInfo
+	if gcfg, err := config.LoadGlobal(); err == nil {
+		level = slogLevel(gcfg.Daemon.LogLevel)
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 
 	if err := run(); err != nil {
@@ -101,12 +124,12 @@ func run() error {
 	}
 
 	// Auto-resume per-repo watchers on boot. Each known repo gets
-	// its binlog replicators re-spawned via the same path the
+	// its watchers re-spawned via the same path the
 	// watcher_start RPC takes. Failures per-repo are logged + skipped
 	// — a missing or moved repo dir shouldn't abort daemon startup.
 	//
 	// Parallelised with a bounded worker pool: each repo load reads
-	// the layered config from disk and opens binlog connections,
+	// the layered config from disk,
 	// both of which dominate boot time on hosts with many registered
 	// repos. 8 concurrent resumes keeps the host responsive while
 	// cutting boot wall-time roughly proportionally.
@@ -149,21 +172,16 @@ func run() error {
 		})
 	}
 
-	// Auto-resume lifecycle watchers for repos that opted in via
-	// `treeman wt watch on`. The lifecycle watcher tails
-	// `<common-dir>/worktrees/` so `git worktree add`/`remove` run
-	// outside the treeman CLI still fire postcreate / postdelete.
-	// Gated on both the per-repo opt-in row and the resolved config
-	// bool `worktrees.hook_lifecycle`.
-	if repos, err := s.ListLifecycleWatchedRepos(ctx); err == nil {
+	// Auto-resume lifecycle watchers for every registered repo. The
+	// lifecycle watcher tails `<common-dir>/worktrees/` so
+	// `git worktree add`/`remove` runs outside the treeman CLI still
+	// fire setup / teardown. Unconditional — worktree
+	// lifecycle is infrastructure, not user policy.
+	if repos, err := s.ListRepoRefs(ctx); err == nil {
 		for _, r := range repos {
 			if _, err := os.Stat(r.Path); err != nil {
 				slog.Warn("resume lifecycle watcher skipped (path missing)",
 					"repo", r.Path, "err", err)
-				continue
-			}
-			if !daemon.LifecycleEnabledForRepo(r.Path) {
-				slog.Info("lifecycle watcher skipped (config disabled)", "repo", r.Path)
 				continue
 			}
 			if _, err := daemon.StartLifecycleWatcher(ctx, st, r.ID, r.Path); err != nil {

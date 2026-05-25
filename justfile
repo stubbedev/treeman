@@ -54,6 +54,14 @@ lint-check:
 test:
     go test ./...
 
+# Run the e2e suite against real docker-backed engines. Pulls
+# ~3GB of images on first run (mysql, postgres, mongo, redis, es)
+# and binds local ports 13306-13356 + 15432 + 27117 + 16379 + 19200
+# — make sure those are free. Each subtest brings up + tears down
+# its own docker-compose stack.
+test-e2e:
+    go test -tags=e2e ./e2e/... -timeout 30m
+
 check: lint test sync-schema sync-docs sync-flake
 
 # Regenerate `docs/cli.md` from the live cli.Command tree. Catches

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"gopkg.in/yaml.v3"
 
@@ -70,42 +71,37 @@ func RenderTemplate(cwd string) string {
 	// the yaml-language-server modeline that wires editor hinting.
 	root.HeadComment = "yaml-language-server: $schema=" + schema.URL
 
-	// repo:
-	mapSet(root, "repo", mapNode(
-		"name", scalar(name),
-	))
-
 	// worktrees:
 	mapSet(root, "worktrees", mapNode(
 		"root", scalar(".worktrees"),
-		"links", seqNode(scalar(".env")),
+		"copies", seqNode(scalar(".env")),
 	))
 
-	// env_scoping:
+	// env_sources: read-list for the credential resolver (patches
+	// live in the top-level `patches:` block).
 	envSources := defaultEnvSourcesFor(detected, has)
 	if len(envSources) > 0 {
 		sources := seqNode()
 		for _, s := range envSources {
 			sources.Content = append(sources.Content, scalar(s))
 		}
-		envBlock := mapNode("sources", sources)
-		// LineComment on the `sources` key node prints next to
-		// `sources:` and explains the precedence rule. mapKeyNode
-		// returns the key scalar inside envBlock.
-		mapKeyNode(envBlock, "sources").LineComment = "files read in order, last wins"
-		if hasFrameworkNamed(detected, "laravel") {
-			files := seqNode(scalar(".env.testing"))
-			files.Style = yaml.FlowStyle
-			mapSet(envBlock, "files", files)
-			mapSet(envBlock, "skip_worktree", scalarBool(true))
-			patch := mapNode(
-				"key", scalar("DB_TEST_DATABASE"),
-				"template", scalar(name+"_testing_{slug}"),
-			)
-			patch.Style = yaml.FlowStyle
-			mapSet(envBlock, "patches", seqNode(patch))
-		}
-		mapSet(root, "env_scoping", envBlock)
+		sources.LineComment = "files read in order, last wins"
+		mapSet(root, "env_sources", sources)
+	}
+
+	// patches: — generic file-rewriting block. For Laravel projects
+	// the canonical patch is `.env.testing` → DB_TEST_DATABASE, with
+	// skip-worktree so it doesn't appear dirty in git. Driver is
+	// auto-detected from the `.env` extension.
+	if hasFrameworkNamed(detected, "laravel") {
+		setMap := mapNode(
+			"DB_TEST_DATABASE", scalar(name+"_testing_{slug}"),
+		)
+		patch := mapNode(
+			"file", scalar(".env.testing"),
+			"set", setMap,
+		)
+		mapSet(root, "patches", seqNode(patch))
 	}
 
 	// databases:
@@ -115,21 +111,11 @@ func RenderTemplate(cwd string) string {
 		if engine == "" {
 			engine = "mysql"
 		}
-		frameworkVal := scalar(spec.Name)
-		frameworkVal.LineComment = "label only — runtime uses the fields below"
-		mig := mapNode(
-			"framework", frameworkVal,
-		)
-		mapSet(mig, "migration_dirs", stringSeq(spec.MigrationDirs))
-		mapSet(mig, "file_globs", stringSeq(spec.FileGlobs))
-		mapSet(mig, "lockfiles", stringSeq(spec.Lockfiles))
-		mapSet(mig, "hash_mode", scalar(string(spec.HashMode)))
-		mapSet(mig, "on_modify", scalar(string(spec.OnModify)))
-
 		db := mapNode(
 			"engine", scalar(engine),
 			"name_template", scalar(name+"_testing_{slug}"),
-			"migrations", mig,
+			"migrate", migrateBlock(spec),
+			"inputs", inputNodes(spec),
 			"test_clones", mapNode(
 				"clones", scalar("auto"),
 				"name_template", scalar(name+"_testing_{slug}_test_{n}"),
@@ -138,25 +124,25 @@ func RenderTemplate(cwd string) string {
 		mapSet(root, "databases", seqNode(db))
 	}
 
-	// hooks: postcreate:
-	postcreate := seqNode()
+	// hooks: on-create-before-engines:
+	actions := seqNode()
 	if hasComposer {
-		postcreate.Content = append(postcreate.Content, hookGroup("composer install --no-interaction --prefer-dist"))
+		actions.Content = append(actions.Content, hookGroup("composer install --no-interaction --prefer-dist"))
 	}
 	if jsPkgMgr != "" {
-		postcreate.Content = append(postcreate.Content, hookGroup(jsInstallCmd(jsPkgMgr)))
+		actions.Content = append(actions.Content, hookGroup(jsInstallCmd(jsPkgMgr)))
 	}
 	if frontendDir != "" && jsPkgMgr != "" {
-		postcreate.Content = append(postcreate.Content, hookGroup("cd "+frontendDir+" && "+jsInstallCmd(jsPkgMgr)))
+		actions.Content = append(actions.Content, hookGroup("cd "+frontendDir+" && "+jsInstallCmd(jsPkgMgr)))
 	}
 	if hasGoMod {
-		postcreate.Content = append(postcreate.Content, hookGroup("go mod download"))
+		actions.Content = append(actions.Content, hookGroup("go mod download"))
 	}
-	if len(postcreate.Content) == 0 {
-		postcreate.Style = yaml.FlowStyle
-		postcreate.HeadComment = "add install commands here — each `group` runs in parallel;\nentries within a group run in sequence."
+	if len(actions.Content) == 0 {
+		actions.Style = yaml.FlowStyle
+		actions.HeadComment = "add install commands here — each action is one parallel group;\nuse run: [step1, step2] for sequenced commands inside one group."
 	}
-	hooks := mapNode("postcreate", postcreate)
+	hooks := mapNode("on-create-before-engines", actions)
 	mapSet(root, "hooks", hooks)
 	if len(detected) == 0 {
 		// Attach the "no databases yet" hint as a HeadComment on the
@@ -171,9 +157,70 @@ func RenderTemplate(cwd string) string {
 		// Falls back to a minimal stub so callers always get something
 		// loadable. Should never trigger — the builders above only
 		// emit well-formed nodes.
-		return "repo:\n  name: " + name + "\n"
+		return "worktrees:\n  root: .worktrees\n"
 	}
 	return string(body)
+}
+
+// migrateBlock renders the `migrations.migrate:` mapping for a
+// scaffolded framework — the shell command and the env-var overrides
+// that point the framework's migrate CLI at the per-run template DB.
+// Env keys are sorted so the emitted YAML is deterministic.
+func migrateBlock(spec framework.Spec) *yaml.Node {
+	out := mapNode("run", scalar(spec.MigrateRun))
+	if len(spec.MigrateEnv) > 0 {
+		envKeys := make([]string, 0, len(spec.MigrateEnv))
+		for k := range spec.MigrateEnv {
+			envKeys = append(envKeys, k)
+		}
+		sort.Strings(envKeys)
+		env := mapNode()
+		for _, k := range envKeys {
+			mapSet(env, k, scalar(spec.MigrateEnv[k]))
+		}
+		mapSet(out, "env", env)
+	}
+	return out
+}
+
+// inputNodes builds the `databases[].inputs:` sequence from a
+// detected framework. Each (migration_dir, file_glob) pair becomes
+// one entry with hash mode `filename` (migrations are append-only
+// in every framework we ship). Each lockfile becomes a bare-string
+// entry (default checksum hash).
+func inputNodes(spec framework.Spec) *yaml.Node {
+	type entry struct {
+		glob, label, hash string
+	}
+	var entries []entry
+	seen := map[string]struct{}{}
+	add := func(glob, label, hash string) {
+		if _, dup := seen[glob]; dup {
+			return
+		}
+		seen[glob] = struct{}{}
+		entries = append(entries, entry{glob: glob, label: label, hash: hash})
+	}
+	for _, dir := range spec.MigrationDirs {
+		for _, pat := range spec.FileGlobs {
+			add(dir+"/**/"+pat, "migrations", "filename")
+		}
+	}
+	for _, lf := range spec.Lockfiles {
+		add(lf, "lockfile", "")
+	}
+	seq := seqNode()
+	for _, e := range entries {
+		m := mapNode("glob", scalar(e.glob))
+		if e.label != "" {
+			mapSet(m, "label", scalar(e.label))
+		}
+		if e.hash != "" {
+			mapSet(m, "hash", scalar(e.hash))
+		}
+		seq.Content = append(seq.Content, m)
+	}
+	return seq
 }
 
 // DetectFrameworkNames returns the names of every migration framework
@@ -232,10 +279,10 @@ func stringSeq(items []string) *yaml.Node {
 	return n
 }
 
-// hookGroup wraps a shell command in the `{group: [cmd]}` shape the
-// hooks runner expects.
+// hookGroup wraps a shell command in the `{run: "<cmd>"}` Action
+// shape the hooks runner expects.
 func hookGroup(cmd string) *yaml.Node {
-	return mapNode("group", seqNode(scalar(cmd)))
+	return mapNode("run", scalar(cmd))
 }
 
 // mapKeyNode returns the key scalar node matching `name` inside a

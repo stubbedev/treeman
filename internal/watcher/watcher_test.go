@@ -31,13 +31,11 @@ func TestDispatchesOnMatchingGlob(t *testing.T) {
 		return nil
 	}
 
-	cfg := config.WatcherConfig{
-		DebounceMs: 100,
-		Paths: []config.WatcherPath{
-			{Glob: "database/migrations/**", On: "rebuild"},
-		},
+	const debounceMs uint64 = 100
+	paths := []config.WatcherPath{
+		{Glob: "database/migrations/**"},
 	}
-	w, err := New(repoRoot, cfg, dispatch)
+	w, err := New(repoRoot, paths, debounceMs, dispatch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,9 +66,6 @@ func TestDispatchesOnMatchingGlob(t *testing.T) {
 	if len(events) == 0 {
 		t.Fatal("no events dispatched")
 	}
-	if events[0].Mode != ModeRebuild {
-		t.Errorf("mode=%q want rebuild", events[0].Mode)
-	}
 }
 
 // TestIgnoresUnmatchedPaths confirms changes outside the configured
@@ -89,11 +84,9 @@ func TestIgnoresUnmatchedPaths(t *testing.T) {
 
 	var fired bool
 	dispatch := func(_ context.Context, _ Event) error { fired = true; return nil }
-	cfg := config.WatcherConfig{
-		DebounceMs: 100,
-		Paths:      []config.WatcherPath{{Glob: "database/migrations/**", On: "auto"}},
-	}
-	w, err := New(repoRoot, cfg, dispatch)
+	const debounceMs uint64 = 100
+	paths := []config.WatcherPath{{Glob: "database/migrations/**"}}
+	w, err := New(repoRoot, paths, debounceMs, dispatch)
 	if err != nil {
 		t.Fatal(err)
 	}

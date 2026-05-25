@@ -43,7 +43,7 @@ func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 		}
 	}
 	if !strings.HasPrefix(uri, "mongodb+srv://") {
-		if err := reachability.ProbeURL("mongodb", uri); err != nil {
+		if err := reachability.ProbeURLCtx(ctx, "mongodb", uri); err != nil {
 			return nil, err
 		}
 	}

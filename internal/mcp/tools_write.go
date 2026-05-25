@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -25,33 +24,39 @@ import (
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/wt"
 	"github.com/stubbedev/treeman/internal/wtreg"
 	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
 
-// registerWriteTools binds tools that mutate state. Gated by
-// Options.AllowMutations in Serve. Tools that shell out to the
-// `treeman` binary (worktree_create, worktree_delete, init,
-// schema_install) are further gated by AllowShellOps.
-func registerWriteTools(srv *mcpsdk.Server, opts Options) {
+// registerWriteTools binds every tool that mutates state, including
+// the shell-spawning `treeman wt create` / `wt delete` wrappers.
+// No flag-gating: the MCP surface is the fully-qualified link to
+// treeman's functionality; clients restrict at the agent-policy
+// layer.
+func registerWriteTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "prepare_run",
-		Description: "Run the prepare pipeline for a worktree (ensure → dump → migrate → snapshot → replicate). Foreground; blocks until every engine returns an outcome.",
+		Description: "Drive the full prepare pipeline for a worktree (ensure source DB → load dump → run migrate → run seed → snapshot → fanout test clones). Foreground — BLOCKS until every engine returns. Long-running on cold-builds; pair with logs_wait if you need to surface progress to the user while it runs. Use prepare_run when a user-driven schema or seed change needs to propagate; the daemon's watcher already re-runs this on input edits.",
+		Annotations: writeAnno("Run prepare", true, true, true),
 	}, prepareTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "hook_run",
-		Description: "Run one configured hook phase synchronously. Accepts precreate|postcreate|predelete|postdelete. Returns per-group exit codes and stdout/stderr tails.",
+		Description: "Execute one configured hook phase (setup|teardown) synchronously for a worktree. Returns per-group exit codes and stdout/stderr tails. Use this to re-run a flaky setup phase without recreating the worktree.",
+		Annotations: writeAnno("Run hook phase", true, false, true),
 	}, hookTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_write",
-		Description: "Replace .treeman.yaml with the supplied body. The body is parsed into config.Config first; the write only happens if parsing succeeds, so invalid YAML never lands on disk. Returns the byte count written.",
+		Description: "Overwrite .treeman.yaml with the supplied body. Parses the body into config.Config FIRST and only writes if parsing succeeds — invalid YAML never lands on disk. Preview the diff with config_diff before calling this. Returns the byte count written.",
+		Annotations: writeAnno("Write .treeman.yaml", true, true, false),
 	}, configWriteTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_set",
-		Description: "Patch a single field of .treeman.yaml addressed by a dotted path (e.g. 'daemon.gc_interval' or 'databases[0].engine'). Preserves surrounding comments + key ordering by editing the YAML AST in place. Creates missing intermediate mapping keys; refuses to extend sequences. The result is validated by parsing into config.Config before the write lands. Returns the previous + new value as JSON.",
+		Description: "Patch ONE field of .treeman.yaml by dotted path (e.g. 'daemon.gc_interval', 'databases[0].engine'). Preserves surrounding comments + key ordering by editing the YAML AST in place — prefer this over config_write for surgical edits. Creates missing intermediate mapping keys; refuses to extend sequences. The result is validated before the write lands. Returns previous + new value as JSON.",
+		Annotations: writeAnno("Patch config field", false, true, false),
 	}, configSetTool)
 
 	// In-process registry mutations. No shell-out, no daemon dependency
@@ -59,67 +64,71 @@ func registerWriteTools(srv *mcpsdk.Server, opts Options) {
 	// register|unregister` would.
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_register",
-		Description: "Register a worktree in the SQLite registry without touching git. Provide path (absolute) and branch; slug is computed automatically when omitted. Returns the upserted worktree row id.",
+		Description: "Add a worktree row to the SQLite registry without touching git. Use this when a worktree exists on disk but treeman doesn't know about it (typically: created via raw `git worktree add`). Slug is auto-computed when omitted. Idempotent — re-registering the same path updates the row. Returns the upserted row id.",
+		Annotations: writeAnno("Register worktree", false, true, false),
 	}, registryRegisterTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_unregister",
-		Description: "Mark a worktree deleted in SQLite without touching git. name resolves by slug, branch, or basename. Idempotent.",
+		Description: "Mark a worktree deleted in SQLite without touching git or external resources (databases stay, on-disk path stays). Use this when the on-disk worktree was removed externally and the SQLite row needs to follow. Idempotent. Resolves name by slug, branch, or basename.",
+		Annotations: writeAnno("Unregister worktree", true, true, false),
 	}, registryUnregisterTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_repair",
-		Description: "Reconcile the SQLite registry with `git worktree list` for the current (or specified) repo: register paths git knows that SQLite doesn't, and mark deleted those SQLite knows that git doesn't. Returns per-action counts.",
+		Description: "Reconcile the SQLite registry with `git worktree list`. Registers worktrees git knows that SQLite doesn't and marks deleted those SQLite knows that git doesn't. Use this when registry_register/unregister would be the wrong tool because you don't know which direction the drift is in. Returns per-action counts.",
+		Annotations: writeAnno("Repair registry", true, true, true),
 	}, registryRepairTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_remove",
-		Description: "Drop a repo from the SQLite registry. Stops any live daemon watchers attached to the repo and deletes child rows (worktrees, events, snapshots, binlog_checkpoints, hook_runs). External resources (databases, on-disk worktree dirs, dump caches) are NOT touched. Refuses by default if active worktrees still exist — pass force=true to override.",
+		Description: "Drop a REPO from the SQLite registry. Stops the daemon's watchers attached to the repo and cascades to delete child rows (worktrees, events, snapshots, hook_runs). External resources (databases, on-disk worktrees, dump caches) are NOT touched. Refuses by default when active worktrees still exist — pass force=true to override.",
+		Annotations: writeAnno("Remove repo", true, true, false),
 	}, registryRemoveTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "worktree_watch",
-		Description: "Toggle the per-repo opt-in for the daemon's lifecycle watcher. With opt-in ON, the daemon tails `<common-dir>/worktrees/` and fires postcreate / postdelete hooks automatically when `git worktree add`/`remove` runs outside the treeman CLI. Action must be one of: on, off, status. Both this opt-in AND the resolved config bool `worktrees.hook_lifecycle: true` must be set for the watcher to activate.",
-	}, worktreeWatchTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshots_purge",
-		Description: "Drop every cached snapshot (template DB) belonging to the current (or specified) repo. Frees engine-side storage and forces the next prepare to rebuild from scratch. Returns counts + any per-engine errors.",
+		Description: "DELETE every cached snapshot (template DB) belonging to one repo. Frees engine-side storage and forces the next prepare to cold-build from scratch. Use snapshots_list FIRST to see what will be wiped. For targeted eviction of only stale entries, use the cache-cleanup prompt instead. Returns counts + per-engine errors.",
+		Annotations: writeAnno("Purge snapshots", true, true, true),
 	}, snapshotsPurgeTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_purge",
-		Description: "Delete event-log rows. Filters are AND-combined; pass older_than=24h to drop anything older than the cutoff. All filters are optional, but at least one must be specified to prevent accidental full wipes. Returns the row count removed.",
+		Description: "Delete event-log rows. Filters are AND-combined; pass older_than=24h to drop anything older. At least one filter is REQUIRED to prevent accidental full wipes. Returns the row count removed.",
+		Annotations: writeAnno("Purge events", true, false, false),
 	}, logsPurgeTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "schema_install",
-		Description: "Generate the JSON Schema for .treeman.yaml and wire it into the yaml-language-server modeline. target=repo writes <repo>/schemas/treeman.schema.json (default). target=global writes the user-XDG path so multiple repos share one file. target=url skips the file write and points the modeline at the canonical upstream URL.",
+		Description: "Generate the JSON Schema for .treeman.yaml and wire it into the yaml-language-server modeline so editor autocomplete + inline validation work. target=repo writes <repo>/schemas/treeman.schema.json (default). target=global writes a user-XDG path shared across repos. target=url skips the file write and points the modeline at the canonical upstream URL.",
+		Annotations: writeAnno("Install schema", false, true, false),
 	}, schemaInstallTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "init_repo",
-		Description: "Scaffold .treeman.yaml under cwd (or --repo). Detects migration framework + JS package manager and emits matching databases/hooks blocks. Pass force=true to overwrite an existing file. Returns the chosen path, byte count, and detected framework names.",
+		Description: "Scaffold a fresh .treeman.yaml under cwd (or --repo). Auto-detects migration framework + JS package manager and emits matching databases/hooks blocks. Use the scaffold-from-framework prompt for the full guided flow. Pass force=true to overwrite an existing file. Returns the chosen path, byte count, and detected framework names.",
+		Annotations: writeAnno("Scaffold config", false, false, false),
 	}, initRepoTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_control",
-		Description: "Start or stop treemand. Action must be one of: start, stop. Prefers the installed systemd/launchd unit when present; otherwise forks the treemand binary (start) or sends the shutdown RPC (stop). In-process — no shell-out.",
+		Description: "Start or stop treemand. action ∈ {start, stop}. Prefers the installed systemd/launchd unit when present; otherwise forks the treemand binary (start) or sends the shutdown RPC (stop). Use this only when daemon_status reports not-running and you need it back up.",
+		Annotations: writeAnno("Daemon control", true, true, true),
 	}, daemonControlTool)
-
-	if !opts.AllowShellOps {
-		return
-	}
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_create",
-		Description: "Create a new git worktree under .worktrees/<branch> and dispatch postcreate hooks + prepare via the daemon. Shells to `treeman wt create`. Long-running. Returns the captured stdout/stderr and exit code.",
+		Description: "Create a new git worktree under .worktrees/<branch> AND dispatch setup hooks + prepare via the daemon. Use branches_list first to pick an unoccupied branch. Returns structured result: wt_path, slug, repo_id, worktree_id, status (queued|detached|noop|no_finalize), log_path (when detached). Non-blocking — the heavy tail runs in the daemon (or a detached child when the daemon is unreachable); tail progress via logs_tail.",
+		Annotations: writeAnno("Create worktree", false, false, true),
 	}, worktreeCreateTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_delete",
-		Description: "Tear down a worktree: predelete hooks → DB teardown → git worktree remove. Shells to `treeman wt delete`. Returns the captured stdout/stderr and exit code.",
+		Description: "Tear down a worktree end-to-end: run teardown hooks → drop databases/redis prefixes/ES indices → remove the git worktree directory. Use worktree_show first to confirm the right slug. Returns structured result: wt_path, status (queued|detached), log_path (when detached). Non-blocking — teardown runs in the daemon.",
+		Annotations: writeAnno("Delete worktree", true, true, true),
 	}, worktreeDeleteTool)
+
+	registerEngineWriteTools(srv)
 }
 
 // ─── prepare_run ──────────────────────────────────────────────────
@@ -143,7 +152,7 @@ func prepareTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in prepareIn) (
 // ─── hook_run ─────────────────────────────────────────────────────
 
 type hookIn struct {
-	Phase    string `json:"phase" jsonschema:"precreate|postcreate|predelete|postdelete"`
+	Phase    string `json:"phase" jsonschema:"setup|teardown"`
 	Worktree string `json:"worktree,omitempty"`
 }
 type hookOut struct {
@@ -200,76 +209,6 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 // `.treeman.yaml.bak.*` history. Five-snapshot cap matches the CLI.
 func atomicWrite(path string, data []byte) error {
 	return yamlpatch.AtomicWriteWithBackup(path, data, 5)
-}
-
-// ─── shell-out helpers ────────────────────────────────────────────
-
-type shellOut struct {
-	ExitCode int    `json:"exit_code"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-}
-
-// runTreeman shells out to the treeman binary (same one currently
-// executing when possible) with the given arg list. cwd controls
-// the worktree the CLI sees; pass "" for the current process cwd.
-func runTreeman(ctx context.Context, cwd string, args ...string) (shellOut, error) {
-	bin, err := treemanBinary()
-	if err != nil {
-		return shellOut{}, err
-	}
-	cmd := exec.CommandContext(ctx, bin, args...)
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return shellOut{}, fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return shellOut{}, fmt.Errorf("stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return shellOut{}, err
-	}
-	outBytes, _ := readAll(stdout)
-	errBytes, _ := readAll(stderr)
-	waitErr := cmd.Wait()
-	code := 0
-	if exitErr, ok := waitErr.(*exec.ExitError); ok {
-		code = exitErr.ExitCode()
-	} else if waitErr != nil {
-		code = -1
-	}
-	return shellOut{ExitCode: code, Stdout: string(outBytes), Stderr: string(errBytes)}, nil
-}
-
-func treemanBinary() (string, error) {
-	if p, err := os.Executable(); err == nil {
-		return p, nil
-	}
-	return exec.LookPath("treeman")
-}
-
-func readAll(r interface{ Read([]byte) (int, error) }) ([]byte, error) {
-	const max = 1 << 20 // 1 MiB cap so a runaway hook can't OOM the mcp server
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for {
-		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if len(buf) >= max {
-				buf = buf[:max]
-				break
-			}
-		}
-		if err != nil {
-			break
-		}
-	}
-	return buf, nil
 }
 
 // ─── init_repo / schema_install ───────────────────────────────────
@@ -542,76 +481,6 @@ func registryRepairTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in regis
 	return nil, res, err
 }
 
-// ─── worktree_watch ───────────────────────────────────────────────
-
-type worktreeWatchIn struct {
-	Repo   string `json:"repo,omitempty"`
-	Action string `json:"action" jsonschema:"on|off|status"`
-}
-type worktreeWatchOut struct {
-	Repo          string `json:"repo"`
-	OptIn         bool   `json:"opt_in"`
-	ConfigEnabled bool   `json:"config_enabled"`
-	Active        bool   `json:"active"`
-}
-
-func worktreeWatchTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeWatchIn) (*mcpsdk.CallToolResult, worktreeWatchOut, error) {
-	action := strings.ToLower(strings.TrimSpace(in.Action))
-	if action == "" {
-		action = "status"
-	}
-	repoRoot, err := resolveRepo(in.Repo)
-	if err != nil {
-		return nil, worktreeWatchOut{}, err
-	}
-	cfg, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
-		return nil, worktreeWatchOut{}, fmt.Errorf("load config: %w", err)
-	}
-	st, err := openStore(ctx)
-	if err != nil {
-		return nil, worktreeWatchOut{}, err
-	}
-	defer st.Close()
-	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	if err != nil {
-		return nil, worktreeWatchOut{}, fmt.Errorf("ensure repo: %w", err)
-	}
-
-	configEnabled := cfg.Worktrees.HookLifecycle != nil && *cfg.Worktrees.HookLifecycle
-
-	switch action {
-	case "on", "enable":
-		if err := st.SetRepoWatchLifecycle(ctx, repoID, true); err != nil {
-			return nil, worktreeWatchOut{}, err
-		}
-		writeMCPEvent(context.Background(), "worktree_watch", "opted in "+repoRoot, repoID, map[string]string{
-			"repo":   repoRoot,
-			"action": "on",
-		})
-	case "off", "disable":
-		if err := st.SetRepoWatchLifecycle(ctx, repoID, false); err != nil {
-			return nil, worktreeWatchOut{}, err
-		}
-		writeMCPEvent(context.Background(), "worktree_watch", "opted out "+repoRoot, repoID, map[string]string{
-			"repo":   repoRoot,
-			"action": "off",
-		})
-	case "status":
-		// read-only
-	default:
-		return nil, worktreeWatchOut{}, fmt.Errorf("unknown action %q (want on|off|status)", in.Action)
-	}
-
-	on, _ := st.GetRepoWatchLifecycle(ctx, repoID)
-	return nil, worktreeWatchOut{
-		Repo:          repoRoot,
-		OptIn:         on,
-		ConfigEnabled: configEnabled,
-		Active:        on && configEnabled,
-	}, nil
-}
-
 // ─── snapshots_purge ──────────────────────────────────────────────
 
 type snapshotsPurgeIn struct {
@@ -744,26 +613,22 @@ type worktreeCreateIn struct {
 	NoFetch bool   `json:"no_fetch,omitempty"`
 }
 
-func worktreeCreateTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeCreateIn) (*mcpsdk.CallToolResult, shellOut, error) {
+func worktreeCreateTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeCreateIn) (*mcpsdk.CallToolResult, wt.CreateResult, error) {
 	if in.Branch == "" {
-		return nil, shellOut{}, fmt.Errorf("branch is required")
+		return nil, wt.CreateResult{}, fmt.Errorf("branch is required")
 	}
-	args := []string{"wt", "create", in.Branch}
-	if in.From != "" {
-		args = append(args, "--from", in.From)
-	}
-	if in.Path != "" {
-		args = append(args, "--path", in.Path)
-	}
-	if in.NoFetch {
-		args = append(args, "--no-fetch")
-	}
-	cwd, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
-		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+		return nil, wt.CreateResult{}, fmt.Errorf("resolve repo: %w", err)
 	}
-	out, err := runTreeman(ctx, cwd, args...)
-	return nil, out, err
+	res, err := wt.Create(ctx, wt.CreateRequest{
+		RepoRoot: repoRoot,
+		Branch:   in.Branch,
+		From:     in.From,
+		Path:     in.Path,
+		NoFetch:  in.NoFetch,
+	}, wt.NoopSink{})
+	return nil, res, err
 }
 
 type worktreeDeleteIn struct {
@@ -772,20 +637,20 @@ type worktreeDeleteIn struct {
 	Force bool   `json:"force,omitempty"`
 }
 
-func worktreeDeleteTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeDeleteIn) (*mcpsdk.CallToolResult, shellOut, error) {
+func worktreeDeleteTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeDeleteIn) (*mcpsdk.CallToolResult, wt.DeleteResult, error) {
 	if in.Name == "" {
-		return nil, shellOut{}, fmt.Errorf("name is required")
+		return nil, wt.DeleteResult{}, fmt.Errorf("name is required")
 	}
-	args := []string{"wt", "delete", in.Name}
-	if in.Force {
-		args = append(args, "--force")
-	}
-	cwd, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
-		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+		return nil, wt.DeleteResult{}, fmt.Errorf("resolve repo: %w", err)
 	}
-	out, err := runTreeman(ctx, cwd, args...)
-	return nil, out, err
+	res, err := wt.Delete(ctx, wt.DeleteRequest{
+		RepoRoot: repoRoot,
+		Target:   in.Name,
+		Force:    in.Force,
+	}, wt.NoopSink{})
+	return nil, res, err
 }
 
 // ─── daemon_control ───────────────────────────────────────────────

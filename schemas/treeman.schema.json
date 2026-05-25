@@ -1,36 +1,51 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$defs": {
-    "BinlogConfig": {
+    "Action": {
       "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Master switch. When false (default) the tailer is dormant —\nno replication connection is opened, no DDL is replayed."
-        },
-        "server_id": {
-          "type": "integer",
-          "description": "ServerID treeman registers as a fake replica. Must be unique\namong all replicas the upstream server sees. Defaults to a\ndeterministic hash of the daemon's socket path so two\ndevelopers on the same host don't clash."
-        },
-        "flavor": {
-          "type": "string",
-          "enum": [
-            "mysql",
-            "mariadb"
+        "run": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single shell command executed via `sh -c`."
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "description": "Ordered list of shell commands chained with `\u0026\u0026`."
+            }
           ],
-          "description": "Flavor — \"mysql\" (default) or \"mariadb\"."
+          "description": "Shell work for this action. String = single step; list = sequenced steps chained with `\u0026\u0026`. Required."
         },
-        "apply_ddl": {
-          "type": "boolean",
-          "description": "ApplyDDL toggles execution of DDL Query events. Default true."
+        "cwd": {
+          "type": "string",
+          "description": "Working directory for every step in this action. Relative paths resolve against the worktree root (host) or container WORKDIR (when wrapped)."
         },
-        "apply_dml": {
-          "type": "boolean",
-          "description": "ApplyDML toggles execution of ROW events. Default false (DDL\nreplay is the high-value path; DML is a follow-up)."
+        "container": {
+          "type": "string",
+          "description": "Container name or ID. When set, every step is wrapped in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
+        },
+        "compose_service": {
+          "type": "string",
+          "description": "Docker Compose service name. Wraps every step in `\u003cengine\u003e compose exec`. Mutually exclusive with `container`."
+        },
+        "compose_project": {
+          "type": "string",
+          "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or parent dir name. Only meaningful with `compose_service`."
+        },
+        "container_engine": {
+          "type": "string",
+          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
         }
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "BinlogConfig — `watcher.binlog:` block. Controls the MySQL\nbinary-log tailer that replays DDL + DML events from the source\ndatabase onto cached template + paratest clone databases. Off by\ndefault; enabling requires a server configured with\n`binlog_format=ROW` and a replication-privileged user."
+      "required": [
+        "run"
+      ],
+      "description": "One action: a `run` (string or list of strings) plus optional cwd + container wrapping."
     },
     "ClonesSetting": {
       "oneOf": [
@@ -53,7 +68,7 @@
       "properties": {
         "mysql": {
           "$ref": "#/$defs/MysqlConn",
-          "description": "MySQL / MariaDB / TiDB connection. Set when any `databases:`\nentry uses one of those engines. Treeman dials this server to\ncreate clones, dump templates, and tail binlogs."
+          "description": "MySQL / MariaDB / TiDB connection. Set when any `databases:`\nentry uses one of those engines. Treeman dials this server to\ncreate clones, dump templates."
         },
         "postgres": {
           "$ref": "#/$defs/PostgresConn",
@@ -83,14 +98,14 @@
             "type": "string"
           },
           "type": "array",
-          "description": "Files (relative to repo root) whose presence indicates this\nframework is in use. Used by `treeman fw detect` to pick the\nframework when no explicit MigrationSpec is configured.\nExample: `[\"alembic.ini\", \"migrations/env.py\"]`."
+          "description": "Files (relative to repo root) whose presence indicates this\nframework is in use. Used by `treeman fw detect` to pick the\nframework when scaffolding a new config.\nExample: `[\"alembic.ini\", \"migrations/env.py\"]`."
         },
         "migration_dirs": {
           "items": {
             "type": "string"
           },
           "type": "array",
-          "description": "Glob patterns for the directories holding migration files.\nCopied into the MigrationSpec when detection picks this\nframework."
+          "description": "Glob patterns for the directories holding migration files.\nEmitted as `inputs[]` entries during `treeman init`."
         },
         "file_pattern": {
           "type": "string",
@@ -102,22 +117,14 @@
             "filename",
             "checksum"
           ],
-          "description": "Hash strategy applied to the migration files: `filename`\n(default) or `checksum`. Same semantics as\nMigrationSpec.HashMode."
-        },
-        "on_modify": {
-          "type": "string",
-          "enum": [
-            "rebuild",
-            "delta"
-          ],
-          "description": "Change-handling policy: `rebuild` (default) or `delta`. Same\nsemantics as MigrationSpec.OnModify."
+          "description": "Hash strategy applied to the migration files: `filename`\n(default) or `checksum`. Maps to the `hash:` field on each\nemitted Input."
         },
         "lockfiles": {
           "items": {
             "type": "string"
           },
           "type": "array",
-          "description": "Lockfiles whose contents are folded into the snapshot hash\n(e.g. `requirements.txt`, `pyproject.toml`,\n`composer.lock`)."
+          "description": "Lockfiles whose contents are folded into the snapshot hash\n(e.g. `requirements.txt`, `pyproject.toml`, `composer.lock`).\nEmitted as `inputs[]` entries with label `lockfile`."
         },
         "engine_hint": {
           "type": "string",
@@ -131,26 +138,18 @@
         "migration_dirs",
         "file_pattern"
       ],
-      "description": "CustomFramework — `frameworks:` entry, lets users declare\nmigration frameworks treeman doesn't know about natively."
+      "description": "CustomFramework — `frameworks:` entry, lets users declare\nmigration frameworks treeman doesn't know about natively. Consumed\nonly by `treeman fw detect` and `treeman init` for scaffolding; at\nruntime treeman reads `databases[].inputs[]` directly."
     },
     "DaemonConfig": {
       "properties": {
-        "socket": {
-          "type": "string",
-          "description": "Unix-socket path the daemon listens on. Defaults to\n`$XDG_RUNTIME_DIR/treeman.sock`. CLI clients dial the same\npath; override only if the runtime dir is unwritable (CI, some\ncontainers) or you want a per-project daemon."
-        },
         "log_level": {
           "type": "string",
-          "description": "Log level for daemon stderr: `trace`, `debug`, `info` (default),\n`warn`, `error`. Hook output is always captured regardless."
-        },
-        "db_log_path": {
-          "type": "string",
-          "description": "Path to the SQLite log database the daemon writes structured\nevents to. Defaults to `$XDG_STATE_HOME/treeman/logs.db`.\nInspected via `treeman logs query` / the `logs_query` MCP tool."
+          "description": "Log level for daemon stderr: `debug`, `info` (default),\n`warn`, `error`. Read once at startup; reload by restarting\nthe daemon. Hook output is always captured regardless."
         }
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "DaemonConfig — `daemon:` block."
+      "description": "DaemonConfig — `daemon:` block. Only `log_level` is user-tunable;\nthe socket path and event-log location are derived from\n$XDG_RUNTIME_DIR / $XDG_STATE_HOME respectively and are not\nconfigurable through YAML (one source of truth — the runtime\ndirs the OS already manages)."
     },
     "DatabaseConfig": {
       "properties": {
@@ -177,17 +176,28 @@
           "$ref": "#/$defs/DumpSpec",
           "description": "Source dump used to seed clones. Path is relative to the repo\nroot. Treeman hashes this file into the snapshot key, so\nchanges invalidate the cache."
         },
-        "migrations": {
-          "$ref": "#/$defs/MigrationSpec",
-          "description": "Migration source declaration. Treeman hashes the listed files\nto decide whether a cached snapshot is still valid and replays\nmigrations into the template before cloning."
+        "migrate": {
+          "$ref": "#/$defs/Step",
+          "description": "Migrate is the shell command that brings a freshly-loaded\nsource DB up to the current schema. Required when any input\nglob matches migration files; optional otherwise (e.g. a DB\nthat's purely seed-driven)."
+        },
+        "seed": {
+          "$ref": "#/$defs/Step",
+          "description": "Seed is the shell command that populates non-migration data\n(fixtures, ES mappings, Redis warm-cache keys, etc.). Runs\nAFTER dump-load + migrate as the final cold-build step,\nbefore treeman snapshots the populated state into the\ntemplate DB."
+        },
+        "inputs": {
+          "items": {
+            "$ref": "#/$defs/Input"
+          },
+          "type": "array",
+          "description": "Inputs declare every file that determines this database's\ntemplate state. Each entry:\n  1. Contributes a hash to the snapshot fingerprint (so any\n     change auto-invalidates the cached template).\n  2. Subscribes fsnotify so changes trigger a re-prep.\n  3. Carries an optional `label:` that `hooks.on-file-change`\n     actions can match against.\n\nGlob patterns are repo-root-relative. Hash mode is per-entry:\n`filename` for append-only files (Laravel migrations, …),\n`checksum` for files edited in place (seeders, lockfiles).\nDefault is checksum.\n\nCache-hit vs cold-build is derived purely from the input\nhashes — there's no separate `on: rebuild` knob. If you want\nto force a rebuild, change an input."
         },
         "test_clones": {
           "$ref": "#/$defs/TestClonesSpec",
           "description": "Test-clone fanout: how many parallel database clones to\npre-warm for paratest/pytest-xdist/Jest workers/etc."
         },
-        "namespaces": {
-          "$ref": "#/$defs/Namespaces",
-          "description": "Engine-specific namespacing templates (Redis db index,\nElasticsearch index prefix). Use when the engine doesn't\nscope by database name."
+        "key_prefix": {
+          "type": "string",
+          "description": "KeyPrefix scopes every key/index a worktree creates under a\nper-worktree prefix. Used by engines that don't scope by\ndatabase name — Redis (key prefix in DB 0) and Elasticsearch\n/ OpenSearch (index-name prefix). Example: `{slug}:` →\n`feature-x:`. The app must honour the prefix — Laravel's\n`CACHE_PREFIX`, Rails `Rails.cache.options[:namespace]`,\nioredis `keyPrefix`, etc."
         },
         "fanout": {
           "type": "integer",
@@ -204,543 +214,422 @@
       "description": "DatabaseConfig — one `databases:` entry. The `engine` discriminator\ngates which sub-fields are valid.\n\n`Fanout` is the optional override for the outer concurrency cap\nduring clone restore + DropMatching. Leave unset (omitempty / 0)\nto use the safe per-engine default from internal/prepare. Raise\nonly if the server is provisioned for it (max_connections raised,\nPG pg_database lock contention acceptable, etc.)."
     },
     "DumpSpec": {
-      "properties": {
-        "path": {
-          "type": "string",
-          "description": "Path to the dump file relative to the repo root. Format must\nmatch the engine — `.sql` for MySQL/Postgres, `.bson`/archive\nfor Mongo. The file is hashed into the snapshot key so changes\ninvalidate cached snapshots."
-        },
-        "optional": {
-          "type": "boolean",
-          "description": "When true, a missing dump file is not an error — treeman will\nbuild the template from migrations alone. Use for greenfield\nprojects that haven't created a baseline dump yet."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "path"
-      ],
-      "description": "DumpSpec — `dump:` sub-block of a DatabaseConfig."
-    },
-    "EnvPatch": {
-      "properties": {
-        "key": {
-          "type": "string",
-          "description": "Env variable key to overwrite, e.g. `DB_NAME`, `REDIS_DB`,\n`S3_BUCKET_PREFIX`."
-        },
-        "template": {
-          "type": "string",
-          "description": "Template for the new value. Supports `{slug}` (the\nper-worktree slug), `{repo}`, and `{branch}` placeholders.\nExample: `app_{slug}` produces `app_feature-x` for a slug of\n`feature-x`."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "key",
-        "template"
-      ],
-      "description": "EnvPatch — one `(key, template)` pair."
-    },
-    "EnvScoping": {
-      "properties": {
-        "files": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "description": "WRITE list — `.env*` files that get rewritten in each new\nworktree to embed the per-worktree slug (so DB_NAME, REDIS_DB,\netc. point at the cloned resources instead of the shared\nones). Each entry is a path relative to the worktree root."
-        },
-        "sources": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "description": "READ list — paths the credential resolver consults in order\nwhen looking up DB passwords and other secrets. Later layers\noverride earlier ones. When empty, the resolver falls back to\nthe default ordered search:\n`.env` → `.env.local` → `.env.test` → `.env.testing` →\n`.env.test.local` → `.env.testing.local`."
-        },
-        "skip_worktree": {
-          "type": "boolean",
-          "description": "When true (default), treeman skips writing into the main\nworktree's env files — only the per-worktree copies get\npatched. Set false to also apply patches to the main worktree\n(rare; mostly for single-worktree projects)."
-        },
-        "patches": {
-          "items": {
-            "$ref": "#/$defs/EnvPatch"
-          },
-          "type": "array",
-          "description": "Extra key/template pairs to apply on top of the default\nslug-substitution patches. Use this for env keys treeman\ndoesn't know about by default (e.g. queue names, S3 prefixes)."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "EnvScoping — `env_scoping:` block.\n\n`Files` is the WRITE list — `.env*` files that get patched with\nthe per-worktree slug. `Sources` is the READ list used by the\ncredential resolver: every path is read in order and later layers\noverride earlier ones (so a `.env.testing.local` override beats\nthe committed `.env.testing` baseline). When `Sources` is empty,\nthe resolver falls back to the default search order:\n\n\t.env  →  .env.local  →  .env.test  →  .env.testing\n\t     →  .env.test.local  →  .env.testing.local"
-    },
-    "EsConn": {
-      "properties": {
-        "url": {
-          "type": "string",
-          "description": "Elasticsearch / OpenSearch HTTP URL\n(`http://host:9200` or `https://...`). Required.\nContainerRef rewrites host/port at dial time."
-        },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "url"
-      ],
-      "description": "EsConn — Elasticsearch / OpenSearch HTTP URL. Same ContainerRef\nsemantics as MongoConn."
-    },
-    "HookEntry": {
       "oneOf": [
         {
           "type": "string",
-          "description": "Bare command shorthand. Group of one step. No container wrapping possible in this form."
+          "description": "Bare path string. Equivalent to `{path: \u003cthis string\u003e}`."
         },
         {
           "properties": {
-            "run": {
+            "path": {
               "type": "string",
-              "description": "Shell command executed via `sh -c`. Wrapped in `\u003cengine\u003e exec` when container/compose metadata is set on this entry."
+              "description": "Dump file path, repo-root-relative. Required."
             },
-            "cwd": {
-              "type": "string",
-              "description": "Working directory for the command. Relative paths resolve inside the worktree (host) or inside the container WORKDIR (when wrapped)."
-            },
-            "in_container": {
-              "type": "string",
-              "description": "Container name or ID to wrap every step in `\u003cengine\u003e exec`. Alias for `container`. Mutually exclusive with `compose_service`."
-            },
-            "container": {
-              "type": "string",
-              "description": "Container name or ID to wrap every step in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
-            },
-            "compose_service": {
-              "type": "string",
-              "description": "Docker Compose service name. Treeman finds the running container by the standard compose labels and wraps every step in `\u003cengine\u003e compose exec`."
-            },
-            "compose_project": {
-              "type": "string",
-              "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME / parent directory name. Only meaningful with `compose_service`."
-            },
-            "container_engine": {
-              "type": "string",
-              "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
-            },
-            "engine": {
-              "type": "string",
-              "description": "Alias for `container_engine`."
+            "optional": {
+              "type": "boolean",
+              "description": "When true, missing dump is not an error."
             }
           },
           "additionalProperties": false,
           "type": "object",
           "required": [
-            "run"
+            "path"
           ],
-          "description": "Single-step mapping with optional container/compose metadata. Use when you want one command wrapped in `\u003cengine\u003e exec`."
-        },
-        {
-          "properties": {
-            "steps": {
-              "items": {
-                "oneOf": [
-                  {
-                    "type": "string",
-                    "description": "Bare command form. Equivalent to `{ run: \"\u003cthis string\u003e\" }`. Executed via `sh -c` in the worktree root."
-                  },
-                  {
-                    "properties": {
-                      "run": {
-                        "type": "string",
-                        "description": "Shell command to execute via `sh -c`. Required. Inherits the daemon's environment plus any EnvScoping patches."
-                      },
-                      "cwd": {
-                        "type": "string",
-                        "description": "Working directory (relative to the worktree root, or absolute). Defaults to the worktree root."
-                      }
-                    },
-                    "additionalProperties": false,
-                    "type": "object",
-                    "required": [
-                      "run"
-                    ],
-                    "description": "Mapping form. Set `cwd` when the command needs to run in a subdirectory of the worktree."
-                  }
-                ],
-                "description": "A single command. Either a bare string (shorthand for `{ run: \"\u003ccmd\u003e\" }`) or a `{ run, cwd }` mapping."
-              },
-              "type": "array",
-              "description": "Ordered list of single-step commands chained with `\u0026\u0026`. All steps share the entry's container/compose metadata."
-            },
-            "in_container": {
-              "type": "string",
-              "description": "Container name or ID to wrap every step in `\u003cengine\u003e exec`. Alias for `container`. Mutually exclusive with `compose_service`."
-            },
-            "container": {
-              "type": "string",
-              "description": "Container name or ID to wrap every step in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
-            },
-            "compose_service": {
-              "type": "string",
-              "description": "Docker Compose service name. Treeman finds the running container by the standard compose labels and wraps every step in `\u003cengine\u003e compose exec`."
-            },
-            "compose_project": {
-              "type": "string",
-              "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME / parent directory name. Only meaningful with `compose_service`."
-            },
-            "container_engine": {
-              "type": "string",
-              "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
-            },
-            "engine": {
-              "type": "string",
-              "description": "Alias for `container_engine`."
-            }
-          },
-          "additionalProperties": false,
-          "type": "object",
-          "required": [
-            "steps"
-          ],
-          "description": "Group form: explicit step list with shared container/compose metadata. All listed steps are wrapped in the same `\u003cengine\u003e exec` context."
-        },
-        {
-          "items": {
-            "oneOf": [
-              {
-                "type": "string",
-                "description": "Bare command form. Equivalent to `{ run: \"\u003cthis string\u003e\" }`. Executed via `sh -c` in the worktree root."
-              },
-              {
-                "properties": {
-                  "run": {
-                    "type": "string",
-                    "description": "Shell command to execute via `sh -c`. Required. Inherits the daemon's environment plus any EnvScoping patches."
-                  },
-                  "cwd": {
-                    "type": "string",
-                    "description": "Working directory (relative to the worktree root, or absolute). Defaults to the worktree root."
-                  }
-                },
-                "additionalProperties": false,
-                "type": "object",
-                "required": [
-                  "run"
-                ],
-                "description": "Mapping form. Set `cwd` when the command needs to run in a subdirectory of the worktree."
-              }
-            ],
-            "description": "A single command. Either a bare string (shorthand for `{ run: \"\u003ccmd\u003e\" }`) or a `{ run, cwd }` mapping."
-          },
-          "type": "array",
-          "description": "Sequence shorthand: list of single steps chained with `\u0026\u0026`. No container wrapping in this form — use the `{ steps, ... }` mapping if you need that."
+          "description": "Full dump mapping with optional `optional` flag."
         }
       ],
-      "description": "One hook group. Groups run in parallel; steps within a group run sequentially. Four shapes accepted: bare command string, `{ run, cwd, ...meta }` single-step mapping, `{ steps, ...meta }` group mapping, or a sequence of single-step children."
+      "description": "Source dump file. Bare string OR `{path, optional}` mapping."
+    },
+    "EsConn": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Bare URL/URI. Equivalent to `{url: \u003cthis string\u003e}`."
+        },
+        {
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "url"
+          ]
+        }
+      ],
+      "description": "elasticsearch connection — bare URL string OR structured object."
+    },
+    "FilteredAction": {
+      "properties": {
+        "run": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single shell command executed via `sh -c`."
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "description": "Ordered list of shell commands chained with `\u0026\u0026`."
+            }
+          ],
+          "description": "Shell work for this action. String = single step; list = sequenced steps chained with `\u0026\u0026`. Required."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory for every step in this action. Relative paths resolve against the worktree root (host) or container WORKDIR (when wrapped)."
+        },
+        "container": {
+          "type": "string",
+          "description": "Container name or ID. When set, every step is wrapped in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
+        },
+        "compose_service": {
+          "type": "string",
+          "description": "Docker Compose service name. Wraps every step in `\u003cengine\u003e compose exec`. Mutually exclusive with `container`."
+        },
+        "compose_project": {
+          "type": "string",
+          "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or parent dir name. Only meaningful with `compose_service`."
+        },
+        "container_engine": {
+          "type": "string",
+          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
+        },
+        "match": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single watch label to match."
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "description": "Set of watch labels; the action fires when any of them matches."
+            }
+          ],
+          "description": "Restrict this action to watch events carrying one of the named labels. Omit to fire for every event."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "description": "On-file-change action with optional label filter. Same shape as a hook Action plus a `match:` field (string or list)."
     },
     "HooksConfig": {
       "properties": {
-        "precreate": {
+        "on-create-before-engines": {
           "items": {
-            "$ref": "#/$defs/SingleStep"
+            "$ref": "#/$defs/Action"
           },
           "type": "array",
-          "description": "Sync phase: runs before the worktree is created. A non-zero\nexit from any step aborts creation. Steps are list-shaped\nsingle commands (no grouping, no container wrapping); use this\nfor cheap host-side checks (e.g. `command -v node`)."
+          "description": "OnCreateBeforeEngines — actions fire after worktree create +\npatches + bring-in, before engine prepare."
         },
-        "postcreate": {
+        "on-create-after-engines": {
           "items": {
-            "$ref": "#/$defs/HookEntry"
+            "$ref": "#/$defs/Action"
           },
           "type": "array",
-          "description": "Async phase: runs after worktree create. Each entry is one\ngroup; steps within a group run sequentially, groups run in\nparallel. Groups can be wrapped in `\u003cengine\u003e exec` via\ncontainer/compose metadata."
+          "description": "OnCreateAfterEngines — actions fire after engine prepare completes."
         },
-        "predelete": {
+        "on-delete-before-engines": {
           "items": {
-            "$ref": "#/$defs/HookEntry"
+            "$ref": "#/$defs/Action"
           },
           "type": "array",
-          "description": "Async phase: runs before worktree delete. Same grouping\nsemantics as postcreate. Use for graceful shutdown\n(`docker compose stop`, draining queues)."
+          "description": "OnDeleteBeforeEngines — actions fire before DB drop on delete."
         },
-        "postdelete": {
+        "on-delete-after-engines": {
           "items": {
-            "$ref": "#/$defs/HookEntry"
+            "$ref": "#/$defs/Action"
           },
           "type": "array",
-          "description": "Async phase: runs after worktree delete. Same grouping\nsemantics. Use for cleanup of resources outside the worktree\n(CDN purges, Slack notifications)."
+          "description": "OnDeleteAfterEngines — actions fire after DB drop + worktree\nremove on delete."
+        },
+        "on-checkout": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnCheckout — actions fire when the HEAD watcher detects a\nbranch switch inside an existing worktree."
+        },
+        "on-file-change": {
+          "items": {
+            "$ref": "#/$defs/FilteredAction"
+          },
+          "type": "array",
+          "description": "OnFileChange — actions fire when any `databases[].inputs[]`\nglob matches a filesystem event. Each action can optionally\n`match: \u003clabel\u003e` to fire only when the matched input entry\ncarries that label; actions without `match:` fire for every\ninput event (any engine, any label).\n\nThe subprocess receives extra env vars naming the trigger:\n  TREEMAN_WATCH_PATH   — absolute path that fired\n  TREEMAN_WATCH_MODE   — auto | delta | rebuild\n  TREEMAN_WATCH_LABEL  — the label on the matched watch entry (or \"\")\n  TREEMAN_WATCH_ENGINE — engine of the owning database (mysql, postgres, …)\n  TREEMAN_WATCH_DB_NAME — rendered name_template of the owning database"
         }
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "HooksConfig — `hooks:` block."
+      "description": "HooksConfig — `hooks:` block. A flat map keyed by trigger name.\nEach key's value is a list of Actions that fire when that trigger\nhappens. Actions in the same list run in parallel; the trigger\nkey itself encodes BOTH the lifecycle phase AND the timing point,\nso there's no separate `when:` field anywhere.\n\nTriggers (all optional — omit any you don't need):\n\n  - on-create-before-engines — during `wt create`, after patches +\n    bring-in (copies/links), BEFORE engine prepare. Standard\n    home of dependency installs (composer/yarn/pip) so migrate\n    can find vendor/.\n  - on-create-after-engines — during `wt create`, after engine\n    prepare. Use when actions need a populated database\n    (cache warming, seed verification).\n  - on-delete-before-engines — during `wt delete`, BEFORE DB\n    drop. Graceful shutdown: drain queues, docker compose stop.\n  - on-delete-after-engines — during `wt delete`, AFTER DB drop +\n    git worktree remove. External notifications (Slack, CDN\n    purge) that should announce only once the data is gone.\n  - on-checkout — fires when the HEAD watcher sees a branch\n    switch inside an existing worktree. Re-runs in addition to\n    the regular finalize-on-HEAD-change behaviour.\n  - on-file-change — fires when any `databases[].inputs[]` glob\n    matches a filesystem event. Each action can optionally\n    `match: \u003clabel\u003e` to filter by the input entry's label.\n\nThe map shape lets new triggers be added without touching every\nexisting config. Daemon execution is always non-blocking from the\nCLI's perspective — each list of actions dispatches in parallel."
     },
-    "MigrationSpec": {
-      "properties": {
-        "framework": {
+    "Input": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "Free-form label identifying the migration tool (`laravel`,\n`flyway`, `golang-migrate`, `alembic`, etc.). Logged and\nsurfaced in `treeman fw detect`; never inspected by runtime\ndispatch logic — every behavior is driven by the explicit\nfields below."
+          "description": "Bare glob string. Equivalent to `{glob: \u003cthis string\u003e}` with default hash mode."
         },
-        "migration_dirs": {
-          "items": {
-            "type": "string"
+        {
+          "properties": {
+            "glob": {
+              "type": "string",
+              "description": "Glob pattern (repo-root-relative). Required."
+            },
+            "label": {
+              "type": "string",
+              "description": "Optional label for `hooks.on-file-change` matchers."
+            },
+            "hash": {
+              "type": "string",
+              "enum": [
+                "checksum",
+                "filename"
+              ],
+              "description": "Hash mode: checksum (default) or filename (append-only files)."
+            }
           },
-          "type": "array",
-          "description": "Glob patterns (relative to repo root) for directories\ncontaining migration files. Required for any behavior beyond\npure-dump templates."
-        },
-        "file_globs": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "description": "Glob patterns for migration filenames within `migration_dirs`.\nExample: `*.sql`, `*_*.up.sql`, `[0-9]*-*.sql`."
-        },
-        "lockfiles": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "description": "Extra files whose contents are folded into the snapshot hash\n(typically lockfiles like `composer.lock`, `package-lock.json`,\n`go.sum`). Use when migrations are framework-managed and the\ninstalled framework version itself affects schema."
-        },
-        "hash_mode": {
-          "type": "string",
-          "enum": [
-            "filename",
-            "checksum"
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "glob"
           ],
-          "description": "Hash strategy. `filename` (default) hashes only the migration\nfilenames — fast, works when migrations are append-only.\n`checksum` hashes file contents — required when migrations are\nedited in-place during development."
-        },
-        "on_modify": {
-          "type": "string",
-          "enum": [
-            "rebuild",
-            "delta"
-          ],
-          "description": "What to do when a migration file changes. `rebuild` (default)\ndrops the cached template and re-runs migrations from the\ndump. `delta` runs only the new migrations on top of the\nexisting template — faster but assumes append-only history."
+          "description": "Full input mapping with optional label + hash mode."
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "framework"
       ],
-      "description": "MigrationSpec — `migrations:` sub-block. Fully declarative: every\ninput the runtime needs (migration directories, file globs,\nlockfiles, hash mode, on-modify policy) is read from this struct,\nnever inferred at runtime from `framework`. `framework` is a free-\nform label for logs + downstream tooling.\n\n`treeman init` emits these fields populated from the matching\nbuilt-in preset; `treeman fw detect` lists the presets so you can\ncopy fields in by hand. There is no implicit fallback — leaving\ne.g. MigrationDirs empty means treeman has no migration source\nfor the hash, so the snapshot key won't change when files do."
+      "description": "One source of file state for the template fingerprint. Bare string OR full mapping."
     },
     "MongoConn": {
-      "properties": {
-        "uri": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "MongoDB connection URI (`mongodb://[user:pass@]host:port/[...]`).\nRequired. When a ContainerRef is set, host/port are rewritten\nat dial time using the container's published mapping or IP."
+          "description": "Bare URL/URI. Equivalent to `{uri: \u003cthis string\u003e}`."
         },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
+        {
+          "properties": {
+            "uri": {
+              "type": "string"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "uri"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "uri"
       ],
-      "description": "MongoConn — `mongodb://…` URI. When a ContainerRef is set, the\nURI's host/port are rewritten at dial time."
+      "description": "mongodb connection — bare URL string OR structured object."
     },
     "MysqlConn": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "DSN: `mysql://user:pass@host:port/dbname`. Equivalent to the structured form below."
+        },
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "user": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "pool_max": {
+              "type": "integer"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "user"
+          ]
+        }
+      ],
+      "description": "MySQL connection — bare DSN string OR structured object."
+    },
+    "Patch": {
       "properties": {
-        "host": {
+        "file": {
           "type": "string",
-          "description": "Hostname or IP the daemon dials. Defaults to `127.0.0.1`.\nIgnored when `container` or `compose_service` is set and the\nengine socket is reachable — the container's published port or\nnetwork IP is used instead."
+          "description": "File path relative to the worktree root. Required."
         },
-        "port": {
-          "type": "integer",
-          "description": "TCP port. Defaults to 3306. Same container-rewriting rules as\n`host`."
+        "skip_worktree": {
+          "type": "boolean",
+          "description": "When true (default), apply `git update-index --skip-worktree`\nafter patching so the file doesn't show in `git status`."
         },
-        "user": {
+        "format": {
           "type": "string",
-          "description": "Database user. Required. Should have privileges to\nCREATE/DROP databases (for clones) and SHOW BINARY LOGS +\nREPLICATION SLAVE (when the binlog watcher is enabled)."
+          "enum": [
+            "dotenv",
+            "phpunit",
+            "yaml",
+            "json",
+            "toml",
+            "ini"
+          ],
+          "description": "Driver name. Optional — leave unset to auto-detect from the\nfile extension. Explicit when the extension is ambiguous\n(e.g. `phpunit` for a `.xml` that isn't standard XML)."
         },
-        "password_env": {
-          "type": "string",
-          "description": "Environment variable name holding the password. The daemon\nreads it from the process env, the repo's `.env*` files, or\n(last resort) the container's own env vars when a ContainerRef\nis set."
-        },
-        "pool_max": {
-          "type": "integer",
-          "description": "Maximum open connections in the daemon's pool to this server.\nDefaults to a per-engine safe value. Raise only if the server\nis provisioned for it (max_connections raised, etc.)."
-        },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
+        "set": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Key → value-template map. Path syntax depends on the driver\n(see the type doc-comment)."
         }
       },
       "additionalProperties": false,
       "type": "object",
       "required": [
-        "user"
+        "file"
       ],
-      "description": "MysqlConn — host/port/user. `Password` is runtime-only; never\nserialised. The resolver fills it from the repo's `.env*` files\n+ process env (and finally the container's own env when a\nContainerRef is set)."
-    },
-    "Namespaces": {
-      "properties": {
-        "db_index_template": {
-          "type": "string",
-          "description": "Redis-specific: template producing a numeric DB index per\nworktree. Must evaluate to an integer in 0–15 (default Redis\nconfig). Example: `{slug_hash16}` produces a stable hash in\nthe valid range."
-        },
-        "index_prefix_template": {
-          "type": "string",
-          "description": "Elasticsearch/OpenSearch-specific: template producing the\nindex-name prefix. All indexes the app creates are scoped by\nthis prefix per worktree. Example: `app_{slug}_`."
-        },
-        "prefix_template": {
-          "type": "string",
-          "description": "Generic key-prefix template for engines that scope by key\nprefix rather than db/index (e.g. Redis key namespacing when\ndb-index isolation isn't enough)."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "Namespaces — engine-specific namespacing (redis db-index,\nelasticsearch index prefix, etc.)."
+      "description": "Patch — one entry in the top-level `patches:` block. Each entry\ntargets one file under the worktree root and rewrites it with\nper-worktree values via the `set:` map. Values are template\nstrings that accept `{slug}`, `{slug_dash}`, `{slug_upper}`,\n`{slug_redis_queue}`, `{slug_redis_cache}`, `{repo}`, `{branch}`.\n\nThe driver is picked from `format:` when set, otherwise auto-\ndetected from the file extension:\n\n\tdotenv  — `.env`, `.env.*`\n\tphpunit — `.xml`, `.xml.dist` (phpunit.xml `\u003cenv\u003e` blocks)\n\tyaml    — `.yaml`, `.yml`\n\tjson    — `.json`\n\ttoml    — `.toml`\n\tini     — `.ini`, `.cfg`\n\nPath syntax inside `set:` is uniform across drivers:\n\n\tdotenv / phpunit  — flat key (e.g. `DB_DATABASE`)\n\tini               — `section.key` (top-level keys allowed too)\n\tyaml / json / toml — dotted path, optionally with `[N]` indices\n\t                    (e.g. `services[0].host`)\n\nWhen `skip_worktree` is true (default), treeman calls\n`git update-index --skip-worktree` on the patched file so the\nrewrite doesn't show up as a dirty file. The file must be tracked\nby git for the skip-worktree call to do anything; gitignored\nfiles are patched in-place without any git interaction."
     },
     "PostgresConn": {
-      "properties": {
-        "host": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "Hostname or IP. Defaults to `127.0.0.1`. ContainerRef overrides\nit at dial time when set."
+          "description": "DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below."
         },
-        "port": {
-          "type": "integer",
-          "description": "TCP port. Defaults to 5432."
-        },
-        "user": {
-          "type": "string",
-          "description": "Database role. Required. Needs CREATEDB to clone, and\nREPLICATION when wire-protocol replay is enabled."
-        },
-        "password_env": {
-          "type": "string",
-          "description": "Env var name holding the password. Same resolution order as\nMysqlConn.PasswordEnv."
-        },
-        "pool_max": {
-          "type": "integer",
-          "description": "Maximum open connections in the daemon's pool."
-        },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "user": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "pool_max": {
+              "type": "integer"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "user"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "user"
       ],
-      "description": "PostgresConn — same shape as MysqlConn."
+      "description": "Postgres connection — bare DSN string OR structured object."
     },
     "RedisConn": {
-      "properties": {
-        "url": {
+      "oneOf": [
+        {
           "type": "string",
-          "description": "Redis connection URL (`redis://[:pass@]host:port[/db]`).\nRequired. ContainerRef rewrites host/port at dial time."
+          "description": "Bare URL/URI. Equivalent to `{url: \u003cthis string\u003e}`."
         },
-        "container": {
-          "type": "string",
-          "description": "Container name or ID. When set, treeman runs\n`\u003cengine\u003e inspect` on this container and rewrites the host/port\nusing its published port mapping (macOS, Windows Docker\nDesktop) or bridge-network IP (Linux). Mutually exclusive with\n`compose_service`."
-        },
-        "compose_service": {
-          "type": "string",
-          "description": "Docker Compose service name. Treeman finds the matching\ncontainer by the standard compose labels\n(`com.docker.compose.service` + `com.docker.compose.project`).\nMutually exclusive with `container`."
-        },
-        "compose_project": {
-          "type": "string",
-          "description": "Docker Compose project name (the `-p` flag value). Defaults to\n$COMPOSE_PROJECT_NAME, which compose itself derives from the\nparent directory name. Only meaningful with `compose_service`."
-        },
-        "container_engine": {
-          "type": "string",
-          "description": "Container engine binary: `docker` (default), `podman`,\n`nerdctl`, `finch`, `orbctl`. Any binary that supports\n`inspect` and `ps --filter label=...` works."
-        },
-        "container_network": {
-          "type": "string",
-          "description": "Docker network name. When the container is attached to several\nnetworks (compose adds a project network alongside any\nexplicit ones) this pins which network's IP treeman uses."
+        {
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "url"
+          ]
         }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "url"
       ],
-      "description": "RedisConn — `redis://…` URL. Same ContainerRef semantics as MongoConn."
+      "description": "redis connection — bare URL string OR structured object."
     },
-    "RepoBlock": {
-      "properties": {
-        "name": {
-          "type": "string",
-          "description": "Repository identifier. Used in registry keys, snapshot cache\npaths, slug templates, and database name templates. Defaults\nto the directory's basename when unset. Should be stable\nacross machines so snapshots cached by one developer are\nreusable by another."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "name"
-      ],
-      "description": "RepoBlock — `repo:` block."
-    },
-    "RetentionConfig": {
+    "SnapshotsConfig": {
       "properties": {
         "cap_per_repo": {
           "type": "integer",
@@ -765,60 +654,28 @@
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "RetentionConfig — `snapshots.retention:` policies.\n\n`CapPerRepo` is the hard cap that triggers eviction on every\n`RecordSnapshot`. LRU rows above the cap are dropped immediately\n(in a background goroutine) so a busy worktree workflow never\naccumulates unbounded cached templates per repo.\n\n`KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`\ndrive the periodic daemon-side sweep; they're not consulted by\nthe inline-on-write eviction path."
+      "description": "SnapshotsConfig — `snapshots:` block. Carries the retention /\neviction policies for cached engine templates. Snapshot state\nlives entirely in SQLite + the engines themselves (template DBs);\nno on-disk cache directory needs configuring.\n\n`CapPerRepo` is the hard cap that triggers eviction on every\n`RecordSnapshot`. LRU rows above the cap are dropped immediately\n(in a background goroutine) so a busy worktree workflow never\naccumulates unbounded cached templates per repo.\n\n`KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`\ndrive the periodic daemon-side sweep; they're not consulted by\nthe inline-on-write eviction path."
     },
-    "SingleStep": {
-      "oneOf": [
-        {
+    "Step": {
+      "properties": {
+        "run": {
           "type": "string",
-          "description": "Bare command form. Equivalent to `{ run: \"\u003cthis string\u003e\" }`. Executed via `sh -c` in the worktree root."
+          "description": "Run is the shell command treeman invokes via `sh -c`.\nRequired; an empty Run aborts `prepare` with a clear error."
         },
-        {
-          "properties": {
-            "run": {
-              "type": "string",
-              "description": "Shell command to execute via `sh -c`. Required. Inherits the daemon's environment plus any EnvScoping patches."
-            },
-            "cwd": {
-              "type": "string",
-              "description": "Working directory (relative to the worktree root, or absolute). Defaults to the worktree root."
-            }
+        "env": {
+          "additionalProperties": {
+            "type": "string"
           },
-          "additionalProperties": false,
           "type": "object",
-          "required": [
-            "run"
-          ],
-          "description": "Mapping form. Set `cwd` when the command needs to run in a subdirectory of the worktree."
+          "description": "Env is a map of env-var names to value templates. Each entry\nis set on the subprocess (overriding the framework's config\nfile). `{target_db}` is substituted with the resolved per-run\ndatabase name; literal values pass through unchanged."
         }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "run"
       ],
-      "description": "A single command. Either a bare string (shorthand for `{ run: \"\u003ccmd\u003e\" }`) or a `{ run, cwd }` mapping."
-    },
-    "SlugRules": {
-      "properties": {
-        "override": {
-          "type": "string",
-          "description": "Forced slug value, bypassing the branch-name derivation.\nMostly useful in CI where the branch name might be noisy\n(`HEAD`, detached, PR-merge ref) and you want a deterministic\nslug for the run."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "SlugRules — placeholder for future per-repo slug overrides."
-    },
-    "SnapshotsConfig": {
-      "properties": {
-        "cache_dir": {
-          "type": "string",
-          "description": "Directory where cached template snapshots (dumps, lockfiles,\nhash manifests) live. Defaults to\n`$XDG_CACHE_HOME/treeman/snapshots`. Should be on the same\nfilesystem as the worktrees root for fast hardlink-based\nrestores."
-        },
-        "retention": {
-          "$ref": "#/$defs/RetentionConfig",
-          "description": "Retention/eviction policies controlling how many snapshots\nper repo are kept and how aggressively they're pruned."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "SnapshotsConfig — `snapshots:` block."
+      "description": "Step is one user-declared shell command executed against a target\ndatabase. Used by both `databases[].migrate:` and\n`databases[].seed:` — the same shape, different lifecycle slots.\n\nThe framework's CLI reads its target DB from its own config\n(Laravel: `DB_DATABASE` in `.env`; Rails: `DATABASE`; Django:\n`DJANGO_DB_NAME`; etc.). Treeman builds per-worktree template\ndatabases with names like `myapp_template_feature-x` and needs to\nredirect the command at *that* DB, not the one the committed\n`.env` references. The `Env` map says which env-var names to\noverride; the value template `{target_db}` is substituted at\nruntime with the resolved database name. No other placeholders\nare supported."
     },
     "TestClonesSpec": {
       "properties": {
@@ -838,51 +695,6 @@
       ],
       "description": "TestClonesSpec — `test_clones:` sub-block. Used by every parallel\ntest runner (paratest, pest, pytest-xdist, Jest workers, Go\n`-parallel`, cargo nextest, …). `clones` is either `auto` (treeman\nreads the project's worker-count config) or an explicit integer."
     },
-    "WatcherConfig": {
-      "properties": {
-        "paths": {
-          "items": {
-            "$ref": "#/$defs/WatcherPath"
-          },
-          "type": "array",
-          "description": "File-system globs the watcher monitors. When a matching file\nchanges the watcher invalidates affected snapshots (per the\nglob's `on:` policy) so the next `prepare` rebuilds the\ntemplate."
-        },
-        "debounce_ms": {
-          "type": "integer",
-          "description": "Debounce window in milliseconds. The watcher coalesces events\narriving within this window before invalidating snapshots,\nwhich prevents thrashing when an editor saves many files at\nonce. Default 500."
-        },
-        "binlog": {
-          "$ref": "#/$defs/BinlogConfig",
-          "description": "MySQL binary-log tailer settings. Disabled by default; enable\nto replay DDL events from the source database onto cached\ntemplates and test clones automatically."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "description": "WatcherConfig — `watcher:` block."
-    },
-    "WatcherPath": {
-      "properties": {
-        "glob": {
-          "type": "string",
-          "description": "Filesystem glob (relative to repo root) the watcher monitors.\nSupports `**` recursion. Example:\n`database/migrations/**/*.sql`."
-        },
-        "on": {
-          "type": "string",
-          "enum": [
-            "auto",
-            "delta",
-            "rebuild"
-          ],
-          "description": "Invalidation strategy when a matching file changes:\n  `auto`    — defer to the matching DatabaseConfig's `on_modify`.\n  `delta`   — keep the cached template, replay only new files.\n  `rebuild` — drop the template, replay everything from the dump.\nDefault: `auto`."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "glob"
-      ],
-      "description": "WatcherPath — one `paths:` entry."
-    },
     "WorktreesConfig": {
       "properties": {
         "root": {
@@ -894,19 +706,14 @@
             "type": "string"
           },
           "type": "array",
-          "description": "Files/directories from the main worktree to symlink into each\nnew worktree on create. Useful for committed-in-main-only\ncaches (e.g. `node_modules`, `vendor`) and tool configs that\nshouldn't be duplicated."
+          "description": "Paths (relative to the main worktree) to *symlink* into each\nnew worktree on create. Use for committed-in-main-only caches\nthat the worktree should read but never mutate per-branch —\ne.g. `node_modules`, `vendor`. The symlink points at the main\nworktree's copy so all worktrees share one on-disk cache.\nGlob meta-characters expand against the main worktree root."
         },
-        "async_create": {
-          "type": "boolean",
-          "description": "When true (default), postcreate hooks run asynchronously: the\n`worktree create` command returns immediately and the daemon\ndrives the hooks in the background. Set false for CI where you\nwant a synchronous failure if a hook breaks."
-        },
-        "async_delete": {
-          "type": "boolean",
-          "description": "When true (default), predelete + postdelete hooks run async."
-        },
-        "hook_lifecycle": {
-          "type": "boolean",
-          "description": "When true, the daemon watches `\u003ccommon-dir\u003e/worktrees/` via\nfsnotify and fires `postcreate` / `postdelete` automatically\nwhen `git worktree add`/`remove` runs outside the treeman CLI.\nDefault false. Even when true globally, a repo must be\nopted in via `treeman wt watch on` (see `repos.watch_lifecycle`\nin the daemon store) — both gates must be set for the watcher\nto act on a given repo."
+        "copies": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Paths (relative to the main worktree) to *copy* into each new\nworktree on create. Use for gitignored files that the worktree\nneeds in its own copy so it can be patched per-branch without\naffecting the main worktree's copy — e.g. `.env`, `.env.local`.\nGlob meta-characters expand against the main worktree root.\nDirectories are recursed; existing destinations are left alone\n(idempotent re-runs)."
         }
       },
       "additionalProperties": false,
@@ -921,27 +728,29 @@
     },
     "connections": {
       "$ref": "#/$defs/ConnectionsConfig",
-      "description": "Connection blocks per supported engine (MySQL, Postgres,\nMongoDB, Redis, Elasticsearch). Treeman dials these to create\nper-worktree clone databases, run migrations, and tail binlogs."
+      "description": "Connection blocks per supported engine (MySQL, Postgres,\nMongoDB, Redis, Elasticsearch). Treeman dials these to create\nper-worktree clone databases, run migrations."
     },
     "snapshots": {
       "$ref": "#/$defs/SnapshotsConfig",
       "description": "Snapshot cache settings: where post-migration template\nsnapshots are cached on disk, plus retention/eviction policy."
     },
-    "repo": {
-      "$ref": "#/$defs/RepoBlock",
-      "description": "Identifies this repository in the registry. The `name` field is\nused in registry keys, snapshot paths, and slug templates.\nDefaults to the directory's basename when unset."
-    },
-    "slug": {
-      "$ref": "#/$defs/SlugRules",
-      "description": "Per-repo slug-template overrides. Slugs are the short\nidentifier (typically derived from the branch name) used in\ndatabase names, container labels, and on-disk paths."
-    },
     "worktrees": {
       "$ref": "#/$defs/WorktreesConfig",
       "description": "Worktree creation/deletion behaviour: root path, symlink mirrors,\nasync vs sync semantics for hooks."
     },
-    "env_scoping": {
-      "$ref": "#/$defs/EnvScoping",
-      "description": ".env file scoping rules. Controls which env files get rewritten\nwith the worktree slug, which are read as credential sources,\nand any user-defined key/template patches."
+    "env_sources": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array",
+      "description": "EnvSources is the ordered list of `.env*` files the credential\nresolver consults when looking up DB passwords and other\nsecrets. Later entries override earlier ones. Empty falls back\nto the default search order:\n  .env → .env.local → .env.test → .env.testing →\n  .env.test.local → .env.testing.local\nPer-worktree rewriting of these files lives in `patches:`."
+    },
+    "patches": {
+      "items": {
+        "$ref": "#/$defs/Patch"
+      },
+      "type": "array",
+      "description": "Files to rewrite inside each worktree with per-worktree values\n(slug-substituted DB names, cache prefixes, etc.). Supports\ndotenv key=value files, phpunit.xml `\u003cenv\u003e` blocks, generic\nYAML, and generic JSON. When `skip_worktree: true` (default)\neach patched file gets `git update-index --skip-worktree`\napplied so the rewrite doesn't show up as a dirty file.\n\nRe-applied on every `treeman wt finalize` so a branch switch\ninside an existing worktree re-evaluates each patch against\nthe new HEAD's slug."
     },
     "databases": {
       "items": {
@@ -952,11 +761,11 @@
     },
     "hooks": {
       "$ref": "#/$defs/HooksConfig",
-      "description": "Lifecycle hooks fired around worktree create/delete. `precreate`\nruns sync (and can abort the operation); the other three phases\nrun async."
+      "description": "Lifecycle hooks fired around worktree create/delete. Two phases:\n`setup` (after create) and `teardown` (before delete). Run\nasync by default; `worktrees.async_create` / `async_delete`\ncontrol whether the CLI blocks on completion."
     },
-    "watcher": {
-      "$ref": "#/$defs/WatcherConfig",
-      "description": "File-system + binlog watcher settings. The watcher invalidates\ncached snapshots when migration files or DDL events change."
+    "debounce_ms": {
+      "type": "integer",
+      "description": "DebounceMs is the file-watcher debounce window in\nmilliseconds. Coalesces editor save bursts into one re-prep\ndispatch. Default 500."
     },
     "frameworks": {
       "additionalProperties": {

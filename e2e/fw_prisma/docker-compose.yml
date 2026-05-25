@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: treeman-e2e-fw-prisma-pg
+    environment: { POSTGRES_PASSWORD: pgpw }
+    ports: ["15452:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # Long-running node container — prisma's precompiled engines need
+  # a standard linux/glibc base which NixOS hosts can't provide.
+  # The test execs `npm install` + `npx prisma` inside this container.
+  # Bind-mounts /tmp so any t.TempDir() worktree path is visible.
+  # Uses the same network as postgres so DATABASE_URL=postgres://...
+  # @postgres:5432 resolves through the docker network.
+  node:
+    # Plain `node:20` includes openssl which prisma needs at runtime.
+    # node:20-slim drops it and prisma's engine fails to start.
+    image: node:20
+    container_name: treeman-e2e-fw-prisma-node
+    command: ["sleep", "infinity"]
+    volumes:
+      - /tmp:/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy

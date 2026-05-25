@@ -8,14 +8,17 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
-	"github.com/stubbedev/treeman/internal/db/reachability"
+	"github.com/stubbedev/treeman/internal/db/ident"
 )
 
 // Driver wraps a server-level *sql.DB so DDL like CREATE DATABASE
@@ -27,57 +30,54 @@ type Driver struct {
 
 // Connect opens a server-level pool against `postgres` DB so we can
 // issue CREATE / DROP / TEMPLATE statements at the cluster level.
+// Three connection modes are auto-detected from cfg:
+//
+//   - Container/ComposeService set → containerip rewrites Host:Port
+//     to the published mapping (or bridge-network IP fallback), then
+//     dials TCP.
+//   - cfg.Host starts with "/" → unix-socket DSN
+//     (`postgres:///postgres?host=/var/run/postgresql`), TCP probe
+//     skipped.
+//   - Otherwise → plain TCP, probe-first.
 func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 5432
 	}
-	opts := containerip.Opts{
-		Container:      cfg.Container,
-		ComposeService: cfg.ComposeService,
-		ComposeProject: cfg.ComposeProject,
-		Engine:         cfg.ContainerEngine,
-		Network:        cfg.Network,
-		InternalPort:   cfg.Port,
-	}
-	if addr, err := containerip.ResolveAddr(opts); err != nil {
-		return nil, fmt.Errorf("resolve container: %w", err)
-	} else if addr != nil {
-		cfg.Host = addr.Host
-		if addr.Port != 0 {
-			cfg.Port = addr.Port
+	socketMode := strings.HasPrefix(cfg.Host, "/")
+	if !socketMode {
+		opts := containerip.Opts{
+			Container:      cfg.Container,
+			ComposeService: cfg.ComposeService,
+			ComposeProject: cfg.ComposeProject,
+			Engine:         cfg.ContainerEngine,
+			Network:        cfg.Network,
+			InternalPort:   cfg.Port,
 		}
-	}
-	if err := reachability.Probe("postgres", cfg.Host, cfg.Port); err != nil {
-		if cfg.Container != "" || cfg.ComposeService != "" {
-			containerip.RefreshOpts(opts)
-			if addr, e := containerip.ResolveAddr(opts); e == nil && addr != nil {
-				cfg.Host = addr.Host
-				if addr.Port != 0 {
-					cfg.Port = addr.Port
-				}
-				if err2 := reachability.Probe("postgres", cfg.Host, cfg.Port); err2 != nil {
-					return nil, err2
-				}
-			} else {
-				return nil, err
-			}
-		} else {
+		if err := adapter.ResolveAndProbe(ctx, "postgres", opts, &cfg.Host, &cfg.Port); err != nil {
 			return nil, err
 		}
 	}
-	dsn := fmt.Sprintf(
-		"postgres://%s:%s@%s:%d/postgres?sslmode=disable",
-		url.QueryEscape(cfg.User),
-		url.QueryEscape(cfg.Password),
-		cfg.Host, cfg.Port,
-	)
+	var dsn string
+	if socketMode {
+		dsn = fmt.Sprintf(
+			"postgres://%s:%s@/postgres?sslmode=disable&host=%s",
+			url.QueryEscape(cfg.User),
+			url.QueryEscape(cfg.Password),
+			url.QueryEscape(cfg.Host),
+		)
+	} else {
+		dsn = fmt.Sprintf(
+			"postgres://%s:%s@%s:%d/postgres?sslmode=disable",
+			url.QueryEscape(cfg.User),
+			url.QueryEscape(cfg.Password),
+			cfg.Host, cfg.Port,
+		)
+	}
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
 	}
-	if cfg.PoolMax > 0 {
-		db.SetMaxOpenConns(int(cfg.PoolMax))
-	}
+	adapter.ConfigurePool(db, int(cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
@@ -86,6 +86,40 @@ func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 }
 
 func (d *Driver) Close() error { return d.DB.Close() }
+
+// OpenScoped returns a fresh *sql.DB scoped to `dbName`. Use when
+// you need to execute SQL that hits a specific database — Postgres
+// has no `USE`, so each target DB needs its own connection. The
+// returned DB owns its pool; the caller MUST Close it.
+func (d *Driver) OpenScoped(ctx context.Context, dbName string) (*sql.DB, error) {
+	var dsn string
+	if strings.HasPrefix(d.cfg.Host, "/") {
+		dsn = fmt.Sprintf(
+			"postgres://%s:%s@/%s?sslmode=disable&host=%s",
+			url.QueryEscape(d.cfg.User),
+			url.QueryEscape(d.cfg.Password),
+			url.QueryEscape(dbName),
+			url.QueryEscape(d.cfg.Host),
+		)
+	} else {
+		dsn = fmt.Sprintf(
+			"postgres://%s:%s@%s:%d/%s?sslmode=disable",
+			url.QueryEscape(d.cfg.User),
+			url.QueryEscape(d.cfg.Password),
+			d.cfg.Host, d.cfg.Port,
+			url.QueryEscape(dbName),
+		)
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open postgres %s: %w", dbName, err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping postgres %s: %w", dbName, err)
+	}
+	return db, nil
+}
 
 func (d *Driver) EngineVersion(ctx context.Context) (string, error) {
 	var v string
@@ -112,7 +146,8 @@ func (d *Driver) MaxConnections(ctx context.Context) (int, error) {
 }
 
 func (d *Driver) EnsureDB(ctx context.Context, name string) error {
-	if err := validateIdent(name); err != nil {
+	qname, err := ident.QuotePostgres(name)
+	if err != nil {
 		return err
 	}
 	exists, err := d.dbExists(ctx, name)
@@ -122,7 +157,7 @@ func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 	if exists {
 		return nil
 	}
-	_, err = d.execOutsideTx(ctx, fmt.Sprintf(`CREATE DATABASE "%s"`, name))
+	_, err = d.execOutsideTx(ctx, "CREATE DATABASE "+qname)
 	return err
 }
 
@@ -149,11 +184,15 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	for _, n := range matched {
 		n := n
 		g.Go(func() error {
+			qn, err := ident.QuotePostgres(n)
+			if err != nil {
+				return err
+			}
 			// Boot any straggler connections so DROP can proceed.
 			_, _ = d.DB.ExecContext(gctx,
 				"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1", n)
-			if _, err := d.execOutsideTx(gctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, n)); err != nil {
-				return fmt.Errorf("DROP DATABASE %q: %w", n, err)
+			if _, err := d.execOutsideTx(gctx, "DROP DATABASE IF EXISTS "+qn); err != nil {
+				return fmt.Errorf("DROP DATABASE %s: %w", qn, err)
 			}
 			return nil
 		})
@@ -193,51 +232,62 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 // SnapshotCreate uses native `CREATE DATABASE … TEMPLATE` — the
 // fastest path Postgres offers for cloning a database.
 func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
-	if err := validateIdent(source); err != nil {
+	qsource, err := ident.QuotePostgres(source)
+	if err != nil {
 		return err
 	}
-	if err := validateIdent(template); err != nil {
+	qtemplate, err := ident.QuotePostgres(template)
+	if err != nil {
 		return err
 	}
 	// Fence the source so no new connections sneak in mid-clone.
-	if _, err := d.execOutsideTx(ctx, fmt.Sprintf(
-		`ALTER DATABASE "%s" ALLOW_CONNECTIONS = false`, source)); err != nil {
+	if _, err := d.execOutsideTx(ctx,
+		"ALTER DATABASE "+qsource+" ALLOW_CONNECTIONS = false"); err != nil {
 		return err
 	}
 	defer func() {
-		_, _ = d.execOutsideTx(ctx, fmt.Sprintf(
-			`ALTER DATABASE "%s" ALLOW_CONNECTIONS = true`, source))
+		// Use a fresh, short-lived context so the unfence runs even
+		// when ctx has been cancelled or timed out mid-clone.
+		// Otherwise a cancellation can leave the source DB
+		// read-only-to-new-clients forever.
+		bgctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = d.execOutsideTx(bgctx,
+			"ALTER DATABASE "+qsource+" ALLOW_CONNECTIONS = true")
 	}()
 	_, _ = d.DB.ExecContext(ctx,
 		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1", source)
-	_, _ = d.execOutsideTx(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, template))
-	if _, err := d.execOutsideTx(ctx, fmt.Sprintf(
-		`CREATE DATABASE "%s" TEMPLATE "%s"`, template, source)); err != nil {
+	_, _ = d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
+	if _, err := d.execOutsideTx(ctx,
+		"CREATE DATABASE "+qtemplate+" TEMPLATE "+qsource); err != nil {
 		return err
 	}
 	return nil
 }
 
 func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
-	if err := validateIdent(template); err != nil {
+	qtemplate, err := ident.QuotePostgres(template)
+	if err != nil {
 		return err
 	}
-	if err := validateIdent(target); err != nil {
+	qtarget, err := ident.QuotePostgres(target)
+	if err != nil {
 		return err
 	}
-	if _, err := d.execOutsideTx(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, target)); err != nil {
+	if _, err := d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
 		return err
 	}
-	_, err := d.execOutsideTx(ctx, fmt.Sprintf(
-		`CREATE DATABASE "%s" TEMPLATE "%s"`, target, template))
+	_, err = d.execOutsideTx(ctx,
+		"CREATE DATABASE "+qtarget+" TEMPLATE "+qtemplate)
 	return err
 }
 
 func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
-	if err := validateIdent(template); err != nil {
+	qtemplate, err := ident.QuotePostgres(template)
+	if err != nil {
 		return err
 	}
-	_, err := d.execOutsideTx(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, template))
+	_, err = d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
 	return err
 }
 
@@ -268,17 +318,4 @@ func (d *Driver) execOutsideTx(ctx context.Context, stmt string) (sql.Result, er
 	}
 	defer conn.Close()
 	return conn.ExecContext(ctx, stmt)
-}
-
-func validateIdent(s string) error {
-	if s == "" {
-		return fmt.Errorf("empty postgres identifier")
-	}
-	for _, c := range s {
-		ok := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'
-		if !ok {
-			return fmt.Errorf("invalid postgres identifier: %q", s)
-		}
-	}
-	return nil
 }

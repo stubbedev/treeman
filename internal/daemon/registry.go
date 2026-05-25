@@ -10,7 +10,7 @@ import (
 
 // removeRepoFromRegistry tears down every live watcher attached to
 // `repoPath`, then deletes the repo row and its child rows (worktrees,
-// events, snapshots, binlog_checkpoints, hook_runs) from SQLite.
+// events, snapshots, hook_runs) from SQLite.
 //
 // External resources (per-worktree databases, on-disk worktree dirs,
 // dump caches) are deliberately untouched — `registry remove` is the
@@ -42,7 +42,7 @@ func removeRepoFromRegistry(ctx context.Context, st *State, repoPath string, for
 		}
 	}
 
-	// Stop watchers BEFORE deleting rows. A live binlog replicator
+	// Stop watchers BEFORE deleting rows. A live watcher
 	// holds a transaction against the source DB; a wt fsnotify
 	// watcher could fire a finalize that would EnsureRepo the row
 	// straight back into existence and race the DELETE.

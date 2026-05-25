@@ -46,7 +46,7 @@ func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 			url = containerip.RewriteHostPortInURIWithPort(url, addr.Host, addr.Port)
 		}
 	}
-	if err := reachability.ProbeURL("elasticsearch", url); err != nil {
+	if err := reachability.ProbeURLCtx(ctx, "elasticsearch", url); err != nil {
 		return nil, err
 	}
 	return &Driver{
@@ -145,7 +145,10 @@ func (d *Driver) get(ctx context.Context, path string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: read body: %w", path, err)
+	}
 	if resp.StatusCode >= 400 {
 		return body, fmt.Errorf("GET %s → HTTP %d: %s", path, resp.StatusCode, string(body))
 	}

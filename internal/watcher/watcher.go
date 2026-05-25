@@ -8,13 +8,6 @@
 // dispatch mode (`auto` | `delta` | `rebuild`). Events are debounced
 // per (worktree, mode) pair so a `git pull` that drops 40 migration
 // files at once collapses into one prepare run per worktree.
-//
-// The watcher coexists with the MySQL binlog tailer in
-// `internal/db/binlog`: the binlog handles DDL applied directly to
-// the source DB (e.g. someone running `php artisan migrate` in a
-// worktree), while this watcher handles edits to the migration
-// SOURCE files (someone adding a new migration to git). Both
-// pathways are needed because each catches the other's blind spot.
 package watcher
 
 import (
@@ -33,22 +26,17 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 )
 
-// DispatchMode classifies what the watcher wants done. The actual
-// `prepare`-vs-`delta` decision lives in the Dispatcher callback;
-// this is the watcher's hint based on the glob's `on:` field.
-type DispatchMode string
-
-const (
-	ModeAuto    DispatchMode = "auto"
-	ModeDelta   DispatchMode = "delta"
-	ModeRebuild DispatchMode = "rebuild"
-)
-
 // Event is one debounced filesystem event ready for dispatch.
+// The cache-hit / cold-build decision is derived from the input
+// fingerprint downstream — there's no per-event mode override.
 type Event struct {
 	RepoPath string
 	Path     string
-	Mode     DispatchMode
+	// DBIndex is the index into cfg.Databases for the owning DB.
+	DBIndex int
+	// Label is the optional label on the matched Input, referenced
+	// by `hooks.on-file-change[].match:` for filtered dispatch.
+	Label string
 }
 
 // Dispatcher is the callback invoked once per debounced event. The
@@ -58,7 +46,7 @@ type Dispatcher func(ctx context.Context, ev Event) error
 // Watcher tails one repo. Call Start in a goroutine; Stop to cancel.
 type Watcher struct {
 	repoPath   string
-	cfg        config.WatcherConfig
+	paths      []config.WatcherPath
 	dispatch   Dispatcher
 	debounceMs time.Duration
 
@@ -70,8 +58,12 @@ type Watcher struct {
 	pending map[string]Event
 }
 
-// New constructs a Watcher. Call Start to begin streaming.
-func New(repoPath string, cfg config.WatcherConfig, dispatch Dispatcher) (*Watcher, error) {
+// New constructs a Watcher. `paths` is the aggregated list of
+// WatcherPath entries (each one carries its DBIndex + optional
+// Label) the daemon collected by walking every database's
+// `inputs:` block. `debounceMs` is the coalesce window in ms (0 →
+// 500 ms default).
+func New(repoPath string, paths []config.WatcherPath, debounceMs uint64, dispatch Dispatcher) (*Watcher, error) {
 	if dispatch == nil {
 		return nil, errors.New("watcher: nil dispatcher")
 	}
@@ -79,13 +71,13 @@ func New(repoPath string, cfg config.WatcherConfig, dispatch Dispatcher) (*Watch
 	if err != nil {
 		return nil, fmt.Errorf("fsnotify new: %w", err)
 	}
-	debounce := time.Duration(cfg.DebounceMs) * time.Millisecond
+	debounce := time.Duration(debounceMs) * time.Millisecond
 	if debounce == 0 {
 		debounce = 500 * time.Millisecond
 	}
 	return &Watcher{
 		repoPath:   repoPath,
-		cfg:        cfg,
+		paths:      paths,
 		dispatch:   dispatch,
 		debounceMs: debounce,
 		fsw:        fsw,
@@ -100,7 +92,7 @@ func New(repoPath string, cfg config.WatcherConfig, dispatch Dispatcher) (*Watch
 func (w *Watcher) Start(ctx context.Context) error {
 	defer w.fsw.Close()
 
-	if len(w.cfg.Paths) == 0 {
+	if len(w.paths) == 0 {
 		// No globs declared — nothing to watch. Sleep until ctx
 		// cancels so the WatcherEntry tracking stays alive (caller
 		// uses our presence to count active watchers).
@@ -132,13 +124,13 @@ func (w *Watcher) Start(ctx context.Context) error {
 					_ = w.fsw.Add(ev.Name)
 				}
 			}
-			mode, matched := w.classify(ev.Name)
+			dbIdx, label, matched := w.classify(ev.Name)
 			if !matched {
 				continue
 			}
 			w.mu.Lock()
-			w.pending[ev.Name+"\x00"+string(mode)] = Event{
-				RepoPath: w.repoPath, Path: ev.Name, Mode: mode,
+			w.pending[ev.Name] = Event{
+				RepoPath: w.repoPath, Path: ev.Name, DBIndex: dbIdx, Label: label,
 			}
 			w.mu.Unlock()
 
@@ -185,7 +177,7 @@ var noiseDirNames = map[string]struct{}{
 // files within an added dir without recursing.
 func (w *Watcher) addAllDirs() error {
 	added := map[string]struct{}{}
-	for _, p := range w.cfg.Paths {
+	for _, p := range w.paths {
 		// Take the longest path prefix without a glob meta-character
 		// so we anchor on something concrete (e.g.
 		// `database/migrations/**` → `database/migrations`).
@@ -221,32 +213,23 @@ func (w *Watcher) addAllDirs() error {
 }
 
 // classify resolves an event path against the configured globs and
-// returns the first matching mode. Unmatched paths drop on the
-// floor (`auto` for everything would be too noisy — `.git`,
-// `node_modules` etc.).
-func (w *Watcher) classify(path string) (DispatchMode, bool) {
+// returns the first matching DB index + label. Unmatched paths
+// drop on the floor (the user explicitly listed which paths matter
+// via inputs:; everything else is noise).
+func (w *Watcher) classify(path string) (int, string, bool) {
 	rel, err := filepath.Rel(w.repoPath, path)
 	if err != nil {
-		return "", false
+		return 0, "", false
 	}
 	rel = filepath.ToSlash(rel)
-	for _, p := range w.cfg.Paths {
+	for _, p := range w.paths {
 		match, _ := doublestar.PathMatch(p.Glob, rel)
 		if !match {
 			continue
 		}
-		mode := ModeAuto
-		switch p.On {
-		case "delta":
-			mode = ModeDelta
-		case "rebuild":
-			mode = ModeRebuild
-		case "", "auto":
-			mode = ModeAuto
-		}
-		return mode, true
+		return p.DBIndex, p.Label, true
 	}
-	return "", false
+	return 0, "", false
 }
 
 // flush dispatches every pending event then clears the buffer.
@@ -267,7 +250,7 @@ func (w *Watcher) flush(ctx context.Context) {
 
 	for _, e := range events {
 		if err := w.dispatch(ctx, e); err != nil {
-			slog.Warn("watcher dispatch", "path", e.Path, "mode", e.Mode, "err", err)
+			slog.Warn("watcher dispatch", "path", e.Path, "label", e.Label, "err", err)
 		}
 	}
 }

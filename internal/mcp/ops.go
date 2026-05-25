@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -199,35 +200,24 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 		wtID, _ = st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
 	}
 
-	var entries int
+	var entries []config.Action
 	switch phase {
-	case "precreate":
-		entries = len(cfg.Hooks.Precreate)
-	case "postcreate":
-		entries = len(cfg.Hooks.Postcreate)
-	case "predelete":
-		entries = len(cfg.Hooks.Predelete)
-	case "postdelete":
-		entries = len(cfg.Hooks.Postdelete)
+	case "on-create-before-engines":
+		entries = cfg.Hooks.OnCreateBeforeEngines
+	case "on-create-after-engines":
+		entries = cfg.Hooks.OnCreateAfterEngines
+	case "on-delete-before-engines":
+		entries = cfg.Hooks.OnDeleteBeforeEngines
+	case "on-delete-after-engines":
+		entries = cfg.Hooks.OnDeleteAfterEngines
+	case "on-checkout":
+		entries = cfg.Hooks.OnCheckout
 	default:
-		return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want precreate|postcreate|predelete|postdelete)", phase)
+		return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)", phase)
 	}
 
-	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, entries)
-	var (
-		out  hooks.RunOutcome
-		rErr error
-	)
-	switch phase {
-	case "precreate":
-		out, rErr = hooks.RunPrecreateHooks(ctx, cfg.Hooks.Precreate, repoRoot, wt, sl.Value, env)
-	case "postcreate":
-		out, rErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postcreate, repoRoot, wt, sl.Value, env, true)
-	case "predelete":
-		out, rErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Predelete, repoRoot, wt, sl.Value, env, true)
-	case "postdelete":
-		out, rErr = hooks.RunHooks(ctx, phase, cfg.Hooks.Postdelete, repoRoot, wt, sl.Value, env, true)
-	}
+	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, len(entries))
+	out, rErr := hooks.RunHooks(ctx, phase, entries, repoRoot, wt, sl.Value, env, true)
 	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, started, time.Now().UnixMilli(), out)
 	return out, rErr
 }

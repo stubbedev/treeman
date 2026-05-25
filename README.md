@@ -50,7 +50,7 @@ event log records every step.
 - **Parallel test runner support** — `clones: auto` detects
   worker counts from phpunit.xml, pytest-xdist, Jest, vitest,
   paratest, cargo nextest, etc.
-- **File watcher** (fsnotify + MySQL binlog tail) for live
+- **File watcher** (fsnotify) for live
   rebuild-or-delta as migrations or seed dumps change.
 - **MCP server** — `treeman mcp` lets Claude Code / Claude
   Desktop / Cursor drive the lifecycle over stdio.
@@ -186,7 +186,7 @@ wt list              # passthrough to `treeman wt list`
 |---|---|
 | [docs/cli.md](docs/cli.md) | Full command reference, log filters, completion, output/color/paging, env vars |
 | [docs/configuration.md](docs/configuration.md) | `.treeman.yaml` reference — every block, per-stack examples, templated names, hooks, credential resolution, container DBs + hooks |
-| [docs/advanced.md](docs/advanced.md) | Snapshot cache + GC, framework presets, MySQL binlog delta replay |
+| [docs/advanced.md](docs/advanced.md) | Snapshot cache + GC, framework presets |
 | [docs/mcp.md](docs/mcp.md) | MCP / AI integration — Claude Code, Claude Desktop, Cursor, security model |
 | [docs/internals.md](docs/internals.md) | Storage layout, daemon model, init parity, RPC envelope, development |
 

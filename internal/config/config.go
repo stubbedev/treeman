@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/invopop/jsonschema"
 	orderedmap "github.com/pb33f/ordered-map/v2"
@@ -28,45 +30,53 @@ type Config struct {
 
 	// Connection blocks per supported engine (MySQL, Postgres,
 	// MongoDB, Redis, Elasticsearch). Treeman dials these to create
-	// per-worktree clone databases, run migrations, and tail binlogs.
+	// per-worktree clone databases, run migrations.
 	Connections ConnectionsConfig `yaml:"connections,omitempty"`
 
 	// Snapshot cache settings: where post-migration template
 	// snapshots are cached on disk, plus retention/eviction policy.
 	Snapshots SnapshotsConfig `yaml:"snapshots,omitempty"`
 
-	// Identifies this repository in the registry. The `name` field is
-	// used in registry keys, snapshot paths, and slug templates.
-	// Defaults to the directory's basename when unset.
-	Repo *RepoBlock `yaml:"repo,omitempty"`
-
-	// Per-repo slug-template overrides. Slugs are the short
-	// identifier (typically derived from the branch name) used in
-	// database names, container labels, and on-disk paths.
-	Slug SlugRules `yaml:"slug,omitempty"`
-
 	// Worktree creation/deletion behaviour: root path, symlink mirrors,
 	// async vs sync semantics for hooks.
 	Worktrees WorktreesConfig `yaml:"worktrees,omitempty"`
 
-	// .env file scoping rules. Controls which env files get rewritten
-	// with the worktree slug, which are read as credential sources,
-	// and any user-defined key/template patches.
-	EnvScoping EnvScoping `yaml:"env_scoping,omitempty"`
+	// EnvSources is the ordered list of `.env*` files the credential
+	// resolver consults when looking up DB passwords and other
+	// secrets. Later entries override earlier ones. Empty falls back
+	// to the default search order:
+	//   .env → .env.local → .env.test → .env.testing →
+	//   .env.test.local → .env.testing.local
+	// Per-worktree rewriting of these files lives in `patches:`.
+	EnvSources []string `yaml:"env_sources,omitempty"`
+
+	// Files to rewrite inside each worktree with per-worktree values
+	// (slug-substituted DB names, cache prefixes, etc.). Supports
+	// dotenv key=value files, phpunit.xml `<env>` blocks, generic
+	// YAML, and generic JSON. When `skip_worktree: true` (default)
+	// each patched file gets `git update-index --skip-worktree`
+	// applied so the rewrite doesn't show up as a dirty file.
+	//
+	// Re-applied on every `treeman wt finalize` so a branch switch
+	// inside an existing worktree re-evaluates each patch against
+	// the new HEAD's slug.
+	Patches []Patch `yaml:"patches,omitempty"`
 
 	// One entry per database the project owns. Each entry pairs an
 	// engine with a dump path, migration source, test-clone fanout,
 	// and optional namespace template.
 	Databases []DatabaseConfig `yaml:"databases,omitempty"`
 
-	// Lifecycle hooks fired around worktree create/delete. `precreate`
-	// runs sync (and can abort the operation); the other three phases
-	// run async.
+	// Lifecycle hooks fired around worktree create/delete. Two phases:
+	// `setup` (after create) and `teardown` (before delete). Run
+	// async by default; `worktrees.async_create` / `async_delete`
+	// control whether the CLI blocks on completion.
 	Hooks HooksConfig `yaml:"hooks,omitempty"`
 
-	// File-system + binlog watcher settings. The watcher invalidates
-	// cached snapshots when migration files or DDL events change.
-	Watcher WatcherConfig `yaml:"watcher,omitempty"`
+	// DebounceMs is the file-watcher debounce window in
+	// milliseconds. Coalesces editor save bursts into one re-prep
+	// dispatch. Default 500.
+	DebounceMs uint64 `yaml:"debounce_ms,omitempty"`
 
 	// User-defined migration frameworks keyed by name. Use this when
 	// the built-in framework presets don't cover your tool — declare
@@ -75,29 +85,23 @@ type Config struct {
 	Frameworks map[string]CustomFramework `yaml:"frameworks,omitempty"`
 }
 
-// DaemonConfig — `daemon:` block.
+// DaemonConfig — `daemon:` block. Only `log_level` is user-tunable;
+// the socket path and event-log location are derived from
+// $XDG_RUNTIME_DIR / $XDG_STATE_HOME respectively and are not
+// configurable through YAML (one source of truth — the runtime
+// dirs the OS already manages).
 type DaemonConfig struct {
-	// Unix-socket path the daemon listens on. Defaults to
-	// `$XDG_RUNTIME_DIR/treeman.sock`. CLI clients dial the same
-	// path; override only if the runtime dir is unwritable (CI, some
-	// containers) or you want a per-project daemon.
-	Socket string `yaml:"socket,omitempty"`
-
-	// Log level for daemon stderr: `trace`, `debug`, `info` (default),
-	// `warn`, `error`. Hook output is always captured regardless.
+	// Log level for daemon stderr: `debug`, `info` (default),
+	// `warn`, `error`. Read once at startup; reload by restarting
+	// the daemon. Hook output is always captured regardless.
 	LogLevel string `yaml:"log_level,omitempty"`
-
-	// Path to the SQLite log database the daemon writes structured
-	// events to. Defaults to `$XDG_STATE_HOME/treeman/logs.db`.
-	// Inspected via `treeman logs query` / the `logs_query` MCP tool.
-	DbLogPath string `yaml:"db_log_path,omitempty"`
 }
 
 // ConnectionsConfig — `connections:` block.
 type ConnectionsConfig struct {
 	// MySQL / MariaDB / TiDB connection. Set when any `databases:`
 	// entry uses one of those engines. Treeman dials this server to
-	// create clones, dump templates, and tail binlogs.
+	// create clones, dump templates.
 	Mysql *MysqlConn `yaml:"mysql,omitempty"`
 
 	// PostgreSQL connection. Required when any `databases:` entry
@@ -191,25 +195,92 @@ type MysqlConn struct {
 	Port uint16 `yaml:"port,omitempty"`
 
 	// Database user. Required. Should have privileges to
-	// CREATE/DROP databases (for clones) and SHOW BINARY LOGS +
-	// REPLICATION SLAVE (when the binlog watcher is enabled).
+	// CREATE/DROP databases (for clones).
 	User string `yaml:"user"`
 
-	// Environment variable name holding the password. The daemon
-	// reads it from the process env, the repo's `.env*` files, or
-	// (last resort) the container's own env vars when a ContainerRef
-	// is set.
-	PasswordEnv *string `yaml:"password_env,omitempty"`
-
-	// Resolved password — runtime-only. The `yaml:"-"` tag keeps it
-	// out of serialised YAML so secrets never leak into snapshots.
-	Password string `yaml:"-"`
+	// Password is either a literal value or a `$NAME` / `${NAME}`
+	// reference to an env var. Refs are resolved from
+	// `env_sources:` files + the process env + (last resort) the
+	// container's own env vars when a ContainerRef is set.
+	//
+	// Use a ref in any setup beyond local dev — embedding a literal
+	// password in committed YAML is a security anti-pattern.
+	Password string `yaml:"password,omitempty"`
 
 	// Maximum open connections in the daemon's pool to this server.
 	// Defaults to a per-engine safe value. Raise only if the server
 	// is provisioned for it (max_connections raised, etc.).
-	PoolMax      uint32 `yaml:"pool_max,omitempty"`
+	PoolMax uint32 `yaml:"pool_max,omitempty"`
+
 	ContainerRef `yaml:",inline"`
+}
+
+// UnmarshalYAML accepts either a bare DSN string
+// (`mysql://user:pass@host:port/db`) or the structured object.
+// DSN form is for the common dev case where one URL captures
+// everything. Use the structured form when you need fine-grained
+// fields like `container`, `pool_max`, or container refs.
+//
+// DSN trade-offs:
+//   - Password is embedded in the URL — fine for dev, never for prod.
+//     For prod use `password: $ENVNAME` in the structured form.
+//   - Container/compose refs aren't expressible in a single URL —
+//     drop down to the structured form when you need them.
+func (c *MysqlConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return parseMysqlDSN(node.Value, c)
+	}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("mysql connection (line %d): want a DSN string or mapping", node.Line)
+	}
+	type alias MysqlConn
+	return node.Decode((*alias)(c))
+}
+
+// JSONSchema for MysqlConn: scalar DSN OR full structured object.
+func (MysqlConn) JSONSchema() *jsonschema.Schema {
+	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
+	obj := r.Reflect(&struct {
+		Host         string       `yaml:"host,omitempty"`
+		Port         uint16       `yaml:"port,omitempty"`
+		User         string       `yaml:"user"`
+		Password     string       `yaml:"password,omitempty"`
+		PoolMax      uint32       `yaml:"pool_max,omitempty"`
+		ContainerRef ContainerRef `yaml:",inline"`
+	}{})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "DSN: `mysql://user:pass@host:port/dbname`. Equivalent to the structured form below."},
+			obj,
+		},
+		Description: "MySQL connection — bare DSN string OR structured object.",
+	}
+}
+
+// parseMysqlDSN fills cfg from a URL-form DSN.
+func parseMysqlDSN(dsn string, cfg *MysqlConn) error {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return fmt.Errorf("parse mysql DSN: %w", err)
+	}
+	if u.Scheme != "mysql" && u.Scheme != "mariadb" {
+		return fmt.Errorf("mysql DSN: scheme must be mysql(:|maria:)//, got %q", u.Scheme)
+	}
+	cfg.Host = u.Hostname()
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return fmt.Errorf("mysql DSN port: %w", err)
+		}
+		cfg.Port = uint16(n)
+	}
+	if u.User != nil {
+		cfg.User = u.User.Username()
+		if pw, ok := u.User.Password(); ok {
+			cfg.Password = pw
+		}
+	}
+	return nil
 }
 
 // PostgresConn — same shape as MysqlConn.
@@ -225,16 +296,74 @@ type PostgresConn struct {
 	// REPLICATION when wire-protocol replay is enabled.
 	User string `yaml:"user"`
 
-	// Env var name holding the password. Same resolution order as
-	// MysqlConn.PasswordEnv.
-	PasswordEnv *string `yaml:"password_env,omitempty"`
-
-	// Resolved password — runtime-only, never serialised.
-	Password string `yaml:"-"`
+	// Password is either a literal value or a `$NAME` / `${NAME}`
+	// env-var reference. See MysqlConn.Password for the resolution
+	// order and the security warning about literals.
+	Password string `yaml:"password,omitempty"`
 
 	// Maximum open connections in the daemon's pool.
 	PoolMax      uint32 `yaml:"pool_max,omitempty"`
 	ContainerRef `yaml:",inline"`
+}
+
+// UnmarshalYAML accepts either a bare DSN string
+// (`postgres://user:pass@host:port/db`) or the structured object.
+// Mirrors MysqlConn — see its doc-comment for the trade-offs.
+func (c *PostgresConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return parsePostgresDSN(node.Value, c)
+	}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("postgres connection (line %d): want a DSN string or mapping", node.Line)
+	}
+	type alias PostgresConn
+	return node.Decode((*alias)(c))
+}
+
+// JSONSchema for PostgresConn: scalar DSN OR full structured object.
+func (PostgresConn) JSONSchema() *jsonschema.Schema {
+	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
+	obj := r.Reflect(&struct {
+		Host         string       `yaml:"host,omitempty"`
+		Port         uint16       `yaml:"port,omitempty"`
+		User         string       `yaml:"user"`
+		Password     string       `yaml:"password,omitempty"`
+		PoolMax      uint32       `yaml:"pool_max,omitempty"`
+		ContainerRef ContainerRef `yaml:",inline"`
+	}{})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below."},
+			obj,
+		},
+		Description: "Postgres connection — bare DSN string OR structured object.",
+	}
+}
+
+// parsePostgresDSN fills cfg from a URL-form DSN.
+func parsePostgresDSN(dsn string, cfg *PostgresConn) error {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return fmt.Errorf("parse postgres DSN: %w", err)
+	}
+	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
+		return fmt.Errorf("postgres DSN: scheme must be postgres(ql)://, got %q", u.Scheme)
+	}
+	cfg.Host = u.Hostname()
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return fmt.Errorf("postgres DSN port: %w", err)
+		}
+		cfg.Port = uint16(n)
+	}
+	if u.User != nil {
+		cfg.User = u.User.Username()
+		if pw, ok := u.User.Password(); ok {
+			cfg.Password = pw
+		}
+	}
+	return nil
 }
 
 // MongoConn — `mongodb://…` URI. When a ContainerRef is set, the
@@ -247,6 +376,17 @@ type MongoConn struct {
 	ContainerRef `yaml:",inline"`
 }
 
+func (c *MongoConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		c.URI = node.Value
+		return nil
+	}
+	type alias MongoConn
+	return node.Decode((*alias)(c))
+}
+
+func (MongoConn) JSONSchema() *jsonschema.Schema { return uriOrMap("mongodb", "uri") }
+
 // RedisConn — `redis://…` URL. Same ContainerRef semantics as MongoConn.
 type RedisConn struct {
 	// Redis connection URL (`redis://[:pass@]host:port[/db]`).
@@ -254,6 +394,17 @@ type RedisConn struct {
 	URL          string `yaml:"url"`
 	ContainerRef `yaml:",inline"`
 }
+
+func (c *RedisConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		c.URL = node.Value
+		return nil
+	}
+	type alias RedisConn
+	return node.Decode((*alias)(c))
+}
+
+func (RedisConn) JSONSchema() *jsonschema.Schema { return uriOrMap("redis", "url") }
 
 // EsConn — Elasticsearch / OpenSearch HTTP URL. Same ContainerRef
 // semantics as MongoConn.
@@ -265,21 +416,41 @@ type EsConn struct {
 	ContainerRef `yaml:",inline"`
 }
 
-// SnapshotsConfig — `snapshots:` block.
-type SnapshotsConfig struct {
-	// Directory where cached template snapshots (dumps, lockfiles,
-	// hash manifests) live. Defaults to
-	// `$XDG_CACHE_HOME/treeman/snapshots`. Should be on the same
-	// filesystem as the worktrees root for fast hardlink-based
-	// restores.
-	CacheDir string `yaml:"cache_dir,omitempty"`
-
-	// Retention/eviction policies controlling how many snapshots
-	// per repo are kept and how aggressively they're pruned.
-	Retention RetentionConfig `yaml:"retention,omitempty"`
+func (c *EsConn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		c.URL = node.Value
+		return nil
+	}
+	type alias EsConn
+	return node.Decode((*alias)(c))
 }
 
-// RetentionConfig — `snapshots.retention:` policies.
+func (EsConn) JSONSchema() *jsonschema.Schema { return uriOrMap("elasticsearch", "url") }
+
+// uriOrMap builds a polymorphic schema for the Mongo/Redis/ES
+// connection blocks: scalar URI string OR a structured object that
+// pairs the URI field with the embedded ContainerRef.
+func uriOrMap(engine, urlField string) *jsonschema.Schema {
+	objProps := orderedmap.New[string, *jsonschema.Schema]()
+	objProps.Set(urlField, &jsonschema.Schema{Type: "string"})
+	objProps.Set("container", &jsonschema.Schema{Type: "string"})
+	objProps.Set("compose_service", &jsonschema.Schema{Type: "string"})
+	objProps.Set("compose_project", &jsonschema.Schema{Type: "string"})
+	objProps.Set("container_engine", &jsonschema.Schema{Type: "string"})
+	objProps.Set("container_network", &jsonschema.Schema{Type: "string"})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "Bare URL/URI. Equivalent to `{" + urlField + ": <this string>}`."},
+			{Type: "object", Properties: objProps, Required: []string{urlField}, AdditionalProperties: jsonschema.FalseSchema},
+		},
+		Description: engine + " connection — bare URL string OR structured object.",
+	}
+}
+
+// SnapshotsConfig — `snapshots:` block. Carries the retention /
+// eviction policies for cached engine templates. Snapshot state
+// lives entirely in SQLite + the engines themselves (template DBs);
+// no on-disk cache directory needs configuring.
 //
 // `CapPerRepo` is the hard cap that triggers eviction on every
 // `RecordSnapshot`. LRU rows above the cap are dropped immediately
@@ -289,7 +460,7 @@ type SnapshotsConfig struct {
 // `KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`
 // drive the periodic daemon-side sweep; they're not consulted by
 // the inline-on-write eviction path.
-type RetentionConfig struct {
+type SnapshotsConfig struct {
 	// Hard cap on cached snapshots per repository. Eviction runs
 	// inline on every `RecordSnapshot`: rows above the cap (LRU
 	// order) are dropped immediately in a background goroutine.
@@ -314,25 +485,6 @@ type RetentionConfig struct {
 	GcIntervalMinutes uint32 `yaml:"gc_interval_minutes,omitempty"`
 }
 
-// RepoBlock — `repo:` block.
-type RepoBlock struct {
-	// Repository identifier. Used in registry keys, snapshot cache
-	// paths, slug templates, and database name templates. Defaults
-	// to the directory's basename when unset. Should be stable
-	// across machines so snapshots cached by one developer are
-	// reusable by another.
-	Name string `yaml:"name"`
-}
-
-// SlugRules — placeholder for future per-repo slug overrides.
-type SlugRules struct {
-	// Forced slug value, bypassing the branch-name derivation.
-	// Mostly useful in CI where the branch name might be noisy
-	// (`HEAD`, detached, PR-merge ref) and you want a deterministic
-	// slug for the run.
-	Override string `yaml:"override,omitempty"`
-}
-
 // WorktreesConfig — `worktrees:` block.
 type WorktreesConfig struct {
 	// Path (relative to the main worktree) where new worktrees are
@@ -340,351 +492,279 @@ type WorktreesConfig struct {
 	// `../foo-worktrees` for the sibling-dir convention.
 	Root string `yaml:"root,omitempty"`
 
-	// Files/directories from the main worktree to symlink into each
-	// new worktree on create. Useful for committed-in-main-only
-	// caches (e.g. `node_modules`, `vendor`) and tool configs that
-	// shouldn't be duplicated.
+	// Paths (relative to the main worktree) to *symlink* into each
+	// new worktree on create. Use for committed-in-main-only caches
+	// that the worktree should read but never mutate per-branch —
+	// e.g. `node_modules`, `vendor`. The symlink points at the main
+	// worktree's copy so all worktrees share one on-disk cache.
+	// Glob meta-characters expand against the main worktree root.
 	Links []string `yaml:"links,omitempty"`
 
-	// When true (default), postcreate hooks run asynchronously: the
-	// `worktree create` command returns immediately and the daemon
-	// drives the hooks in the background. Set false for CI where you
-	// want a synchronous failure if a hook breaks.
-	AsyncCreate *bool `yaml:"async_create,omitempty"`
-
-	// When true (default), predelete + postdelete hooks run async.
-	AsyncDelete *bool `yaml:"async_delete,omitempty"`
-
-	// When true, the daemon watches `<common-dir>/worktrees/` via
-	// fsnotify and fires `postcreate` / `postdelete` automatically
-	// when `git worktree add`/`remove` runs outside the treeman CLI.
-	// Default false. Even when true globally, a repo must be
-	// opted in via `treeman wt watch on` (see `repos.watch_lifecycle`
-	// in the daemon store) — both gates must be set for the watcher
-	// to act on a given repo.
-	HookLifecycle *bool `yaml:"hook_lifecycle,omitempty"`
+	// Paths (relative to the main worktree) to *copy* into each new
+	// worktree on create. Use for gitignored files that the worktree
+	// needs in its own copy so it can be patched per-branch without
+	// affecting the main worktree's copy — e.g. `.env`, `.env.local`.
+	// Glob meta-characters expand against the main worktree root.
+	// Directories are recursed; existing destinations are left alone
+	// (idempotent re-runs).
+	Copies []string `yaml:"copies,omitempty"`
 }
 
-// EnvScoping — `env_scoping:` block.
+// Patch — one entry in the top-level `patches:` block. Each entry
+// targets one file under the worktree root and rewrites it with
+// per-worktree values via the `set:` map. Values are template
+// strings that accept `{slug}`, `{slug_dash}`, `{slug_upper}`,
+// `{slug_redis_queue}`, `{slug_redis_cache}`, `{repo}`, `{branch}`.
 //
-// `Files` is the WRITE list — `.env*` files that get patched with
-// the per-worktree slug. `Sources` is the READ list used by the
-// credential resolver: every path is read in order and later layers
-// override earlier ones (so a `.env.testing.local` override beats
-// the committed `.env.testing` baseline). When `Sources` is empty,
-// the resolver falls back to the default search order:
+// The driver is picked from `format:` when set, otherwise auto-
+// detected from the file extension:
 //
-//	.env  →  .env.local  →  .env.test  →  .env.testing
-//	     →  .env.test.local  →  .env.testing.local
-type EnvScoping struct {
-	// WRITE list — `.env*` files that get rewritten in each new
-	// worktree to embed the per-worktree slug (so DB_NAME, REDIS_DB,
-	// etc. point at the cloned resources instead of the shared
-	// ones). Each entry is a path relative to the worktree root.
-	Files []string `yaml:"files,omitempty"`
+//	dotenv  — `.env`, `.env.*`
+//	phpunit — `.xml`, `.xml.dist` (phpunit.xml `<env>` blocks)
+//	yaml    — `.yaml`, `.yml`
+//	json    — `.json`
+//	toml    — `.toml`
+//	ini     — `.ini`, `.cfg`
+//
+// Path syntax inside `set:` is uniform across drivers:
+//
+//	dotenv / phpunit  — flat key (e.g. `DB_DATABASE`)
+//	ini               — `section.key` (top-level keys allowed too)
+//	yaml / json / toml — dotted path, optionally with `[N]` indices
+//	                    (e.g. `services[0].host`)
+//
+// When `skip_worktree` is true (default), treeman calls
+// `git update-index --skip-worktree` on the patched file so the
+// rewrite doesn't show up as a dirty file. The file must be tracked
+// by git for the skip-worktree call to do anything; gitignored
+// files are patched in-place without any git interaction.
+type Patch struct {
+	// File path relative to the worktree root. Required.
+	File string `yaml:"file"`
 
-	// READ list — paths the credential resolver consults in order
-	// when looking up DB passwords and other secrets. Later layers
-	// override earlier ones. When empty, the resolver falls back to
-	// the default ordered search:
-	// `.env` → `.env.local` → `.env.test` → `.env.testing` →
-	// `.env.test.local` → `.env.testing.local`.
-	Sources []string `yaml:"sources,omitempty"`
-
-	// When true (default), treeman skips writing into the main
-	// worktree's env files — only the per-worktree copies get
-	// patched. Set false to also apply patches to the main worktree
-	// (rare; mostly for single-worktree projects).
+	// When true (default), apply `git update-index --skip-worktree`
+	// after patching so the file doesn't show in `git status`.
 	SkipWorktree *bool `yaml:"skip_worktree,omitempty"`
 
-	// Extra key/template pairs to apply on top of the default
-	// slug-substitution patches. Use this for env keys treeman
-	// doesn't know about by default (e.g. queue names, S3 prefixes).
-	Patches []EnvPatch `yaml:"patches,omitempty"`
+	// Driver name. Optional — leave unset to auto-detect from the
+	// file extension. Explicit when the extension is ambiguous
+	// (e.g. `phpunit` for a `.xml` that isn't standard XML).
+	Format string `yaml:"format,omitempty" jsonschema:"enum=dotenv,enum=phpunit,enum=yaml,enum=json,enum=toml,enum=ini"`
+
+	// Key → value-template map. Path syntax depends on the driver
+	// (see the type doc-comment).
+	Set map[string]string `yaml:"set,omitempty"`
 }
 
-// EnvPatch — one `(key, template)` pair.
-type EnvPatch struct {
-	// Env variable key to overwrite, e.g. `DB_NAME`, `REDIS_DB`,
-	// `S3_BUCKET_PREFIX`.
-	Key string `yaml:"key"`
-
-	// Template for the new value. Supports `{slug}` (the
-	// per-worktree slug), `{repo}`, and `{branch}` placeholders.
-	// Example: `app_{slug}` produces `app_feature-x` for a slug of
-	// `feature-x`.
-	Template string `yaml:"template"`
-}
-
-// HooksConfig — `hooks:` block.
+// HooksConfig — `hooks:` block. A flat map keyed by trigger name.
+// Each key's value is a list of Actions that fire when that trigger
+// happens. Actions in the same list run in parallel; the trigger
+// key itself encodes BOTH the lifecycle phase AND the timing point,
+// so there's no separate `when:` field anywhere.
+//
+// Triggers (all optional — omit any you don't need):
+//
+//   - on-create-before-engines — during `wt create`, after patches +
+//     bring-in (copies/links), BEFORE engine prepare. Standard
+//     home of dependency installs (composer/yarn/pip) so migrate
+//     can find vendor/.
+//   - on-create-after-engines — during `wt create`, after engine
+//     prepare. Use when actions need a populated database
+//     (cache warming, seed verification).
+//   - on-delete-before-engines — during `wt delete`, BEFORE DB
+//     drop. Graceful shutdown: drain queues, docker compose stop.
+//   - on-delete-after-engines — during `wt delete`, AFTER DB drop +
+//     git worktree remove. External notifications (Slack, CDN
+//     purge) that should announce only once the data is gone.
+//   - on-checkout — fires when the HEAD watcher sees a branch
+//     switch inside an existing worktree. Re-runs in addition to
+//     the regular finalize-on-HEAD-change behaviour.
+//   - on-file-change — fires when any `databases[].inputs[]` glob
+//     matches a filesystem event. Each action can optionally
+//     `match: <label>` to filter by the input entry's label.
+//
+// The map shape lets new triggers be added without touching every
+// existing config. Daemon execution is always non-blocking from the
+// CLI's perspective — each list of actions dispatches in parallel.
 type HooksConfig struct {
-	// Sync phase: runs before the worktree is created. A non-zero
-	// exit from any step aborts creation. Steps are list-shaped
-	// single commands (no grouping, no container wrapping); use this
-	// for cheap host-side checks (e.g. `command -v node`).
-	Precreate []SingleStep `yaml:"precreate,omitempty"`
+	// OnCreateBeforeEngines — actions fire after worktree create +
+	// patches + bring-in, before engine prepare.
+	OnCreateBeforeEngines []Action `yaml:"on-create-before-engines,omitempty"`
 
-	// Async phase: runs after worktree create. Each entry is one
-	// group; steps within a group run sequentially, groups run in
-	// parallel. Groups can be wrapped in `<engine> exec` via
-	// container/compose metadata.
-	Postcreate []HookEntry `yaml:"postcreate,omitempty"`
+	// OnCreateAfterEngines — actions fire after engine prepare completes.
+	OnCreateAfterEngines []Action `yaml:"on-create-after-engines,omitempty"`
 
-	// Async phase: runs before worktree delete. Same grouping
-	// semantics as postcreate. Use for graceful shutdown
-	// (`docker compose stop`, draining queues).
-	Predelete []HookEntry `yaml:"predelete,omitempty"`
+	// OnDeleteBeforeEngines — actions fire before DB drop on delete.
+	OnDeleteBeforeEngines []Action `yaml:"on-delete-before-engines,omitempty"`
 
-	// Async phase: runs after worktree delete. Same grouping
-	// semantics. Use for cleanup of resources outside the worktree
-	// (CDN purges, Slack notifications).
-	Postdelete []HookEntry `yaml:"postdelete,omitempty"`
+	// OnDeleteAfterEngines — actions fire after DB drop + worktree
+	// remove on delete.
+	OnDeleteAfterEngines []Action `yaml:"on-delete-after-engines,omitempty"`
+
+	// OnCheckout — actions fire when the HEAD watcher detects a
+	// branch switch inside an existing worktree.
+	OnCheckout []Action `yaml:"on-checkout,omitempty"`
+
+	// OnFileChange — actions fire when any `databases[].inputs[]`
+	// glob matches a filesystem event. Each action can optionally
+	// `match: <label>` to fire only when the matched input entry
+	// carries that label; actions without `match:` fire for every
+	// input event (any engine, any label).
+	//
+	// The subprocess receives extra env vars naming the trigger:
+	//   TREEMAN_WATCH_PATH   — absolute path that fired
+	//   TREEMAN_WATCH_MODE   — auto | delta | rebuild
+	//   TREEMAN_WATCH_LABEL  — the label on the matched watch entry (or "")
+	//   TREEMAN_WATCH_ENGINE — engine of the owning database (mysql, postgres, …)
+	//   TREEMAN_WATCH_DB_NAME — rendered name_template of the owning database
+	OnFileChange []FilteredAction `yaml:"on-file-change,omitempty"`
 }
 
-// SingleStep — `{ run: "...", cwd: "..." }`. The bare-string YAML
-// shorthand is decoded into one of these too.
-type SingleStep struct {
-	// Shell command to execute via `sh -c`. Required. Inherits the
-	// daemon's environment plus any patches applied by EnvScoping.
-	Run string `yaml:"run"`
+// Action — one entry under `hooks.{setup,teardown}.actions`. Every
+// action is a mapping; there are no shorthand forms.
+//
+//   - `run` is the work, as either a single shell string (one
+//     command) or a list of shell strings (sequenced steps chained
+//     with `&&`).
+//   - `cwd` is the group-level working directory; all steps in the
+//     action share it. Use multiple actions if you need different
+//     cwds.
+//   - `container` / `compose_service` (mutually exclusive) wrap the
+//     whole action in `<engine> exec` / `<engine> compose exec` so
+//     it runs inside the named container. `in_container` is an
+//     accepted alias for `container`. `engine` is an alias for
+//     `container_engine`.
+//
+// Actions in the same `actions:` list run in parallel; steps within
+// one action run sequentially.
+type Action struct {
+	// Run is the shell command(s) for this action. The YAML accepts
+	// either a single string or a list of strings; either way the
+	// in-memory form is the list. Required.
+	Run []string `yaml:"run"`
 
-	// Working directory (relative to the worktree root, or absolute).
-	// Defaults to the worktree root when unset.
+	// Cwd is the working directory for every step in this action.
+	// Relative paths resolve against the worktree root (host) or
+	// against the container's WORKDIR (when wrapped). Optional.
 	Cwd string `yaml:"cwd,omitempty"`
+
+	// Container name or ID. When set, every step runs via
+	// `<engine> exec <id> sh -c '<cmd>'`. Mutually exclusive with
+	// ComposeService.
+	Container string `yaml:"container,omitempty"`
+
+	// ComposeService is the docker-compose service name. Treeman
+	// resolves the running container via the standard compose
+	// labels and wraps every step in `<engine> compose exec`.
+	// Mutually exclusive with Container.
+	ComposeService string `yaml:"compose_service,omitempty"`
+
+	// ComposeProject is the docker-compose project (`-p` flag).
+	// Defaults to $COMPOSE_PROJECT_NAME / parent directory name.
+	// Only meaningful with ComposeService.
+	ComposeProject string `yaml:"compose_project,omitempty"`
+
+	// Engine is the container engine binary: `docker` (default),
+	// `podman`, `nerdctl`, `finch`, `orbctl`.
+	Engine string `yaml:"container_engine,omitempty"`
 }
 
-// JSONSchema overrides the reflection-generated schema so editor
-// hinting accepts both YAML shapes the UnmarshalYAML below decodes:
-// a bare scalar string or a `{ run, cwd }` mapping.
-func (SingleStep) JSONSchema() *jsonschema.Schema {
+// JSONSchema describes the YAML shape — one map per action, with
+// `run` accepting string OR []string.
+func (Action) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
 	props.Set("run", &jsonschema.Schema{
-		Type:        "string",
-		Description: "Shell command to execute via `sh -c`. Required. Inherits the daemon's environment plus any EnvScoping patches.",
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "Single shell command executed via `sh -c`."},
+			{Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "Ordered list of shell commands chained with `&&`."},
+		},
+		Description: "Shell work for this action. String = single step; list = sequenced steps chained with `&&`. Required.",
 	})
 	props.Set("cwd", &jsonschema.Schema{
 		Type:        "string",
-		Description: "Working directory (relative to the worktree root, or absolute). Defaults to the worktree root.",
+		Description: "Working directory for every step in this action. Relative paths resolve against the worktree root (host) or container WORKDIR (when wrapped).",
+	})
+	props.Set("container", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Container name or ID. When set, every step is wrapped in `<engine> exec`. Mutually exclusive with `compose_service`.",
+	})
+	props.Set("compose_service", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Docker Compose service name. Wraps every step in `<engine> compose exec`. Mutually exclusive with `container`.",
+	})
+	props.Set("compose_project", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or parent dir name. Only meaningful with `compose_service`.",
+	})
+	props.Set("container_engine", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.",
 	})
 	return &jsonschema.Schema{
-		Description: "A single command. Either a bare string (shorthand for `{ run: \"<cmd>\" }`) or a `{ run, cwd }` mapping.",
-		OneOf: []*jsonschema.Schema{
-			{
-				Type:        "string",
-				Description: "Bare command form. Equivalent to `{ run: \"<this string>\" }`. Executed via `sh -c` in the worktree root.",
-			},
-			{
-				Type:                 "object",
-				Properties:           props,
-				Required:             []string{"run"},
-				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Mapping form. Set `cwd` when the command needs to run in a subdirectory of the worktree.",
-			},
-		},
+		Type:                 "object",
+		Properties:           props,
+		Required:             []string{"run"},
+		AdditionalProperties: jsonschema.FalseSchema,
+		Description:          "One action: a `run` (string or list of strings) plus optional cwd + container wrapping.",
 	}
 }
 
-// UnmarshalYAML accepts either a bare scalar (`"command"`) or a
-// mapping (`{ run: ..., cwd: ... }`).
-func (s *SingleStep) UnmarshalYAML(node *yaml.Node) error {
-	switch node.Kind {
+// UnmarshalYAML decodes one action map. Accepts both `run: string`
+// and `run: [string, ...]`. Rejects the legacy `background:`,
+// `steps:`, `in_container:`, and `engine:` keys loudly so old
+// configs surface a clear error rather than silently mis-parse.
+func (a *Action) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("action (line %d): want a mapping; bare strings + list shorthands have been removed — wrap each action in `{ run: ... }`", node.Line)
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		switch node.Content[i].Value {
+		case "background":
+			return fmt.Errorf("action: `background:` is no longer supported — hooks are always async (line %d)", node.Content[i].Line)
+		case "steps":
+			return fmt.Errorf("action: `steps:` is no longer supported — use `run:` with a list of strings (line %d)", node.Content[i].Line)
+		case "in_container":
+			return fmt.Errorf("action: `in_container:` alias removed — use `container:` (line %d)", node.Content[i].Line)
+		case "engine":
+			return fmt.Errorf("action: `engine:` alias removed — use `container_engine:` (line %d)", node.Content[i].Line)
+		}
+	}
+	var raw struct {
+		Run            yaml.Node `yaml:"run"`
+		Cwd            string    `yaml:"cwd"`
+		Container      string    `yaml:"container"`
+		ComposeService string    `yaml:"compose_service"`
+		ComposeProject string    `yaml:"compose_project"`
+		Engine         string    `yaml:"container_engine"`
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	switch raw.Run.Kind {
 	case yaml.ScalarNode:
-		s.Run = node.Value
-		return nil
-	case yaml.MappingNode:
-		type alias SingleStep
-		return node.Decode((*alias)(s))
-	default:
-		return fmt.Errorf("step: want scalar or mapping, got node kind %d", node.Kind)
-	}
-}
-
-// HookEntry — one of:
-//   - bare command string  → group of one
-//   - mapping with `run:`  → group of one with cwd
-//   - mapping with `steps:` → explicit group; metadata fields
-//     (container, compose_service, container_engine, ...) wrap all
-//     steps in `docker exec` (or compose exec) at runtime.
-//   - sequence of children → group sequence (chained with `&&`)
-//
-// `Container` / `ComposeService` are mutually exclusive. When set,
-// every step in the group is wrapped in
-// `<engine> exec [-w cwd] <id> sh -c '<cmd>'` so the work runs
-// inside the named container instead of on the host. Use this to
-// run install/migrate/seed commands inside the app dev container.
-type HookEntry struct {
-	Steps          []SingleStep
-	Container      string
-	ComposeService string
-	ComposeProject string
-	Engine         string
-}
-
-// JSONSchema overrides the reflection-generated schema so editor
-// hinting accepts every shape UnmarshalYAML below decodes: bare
-// command string, `{ run, cwd, ... }` mapping, `{ steps, ... }`
-// group mapping, or a sequence of single-step children.
-func (HookEntry) JSONSchema() *jsonschema.Schema {
-	metaDescs := map[string]string{
-		"in_container":     "Container name or ID to wrap every step in `<engine> exec`. Alias for `container`. Mutually exclusive with `compose_service`.",
-		"container":        "Container name or ID to wrap every step in `<engine> exec`. Mutually exclusive with `compose_service`.",
-		"compose_service":  "Docker Compose service name. Treeman finds the running container by the standard compose labels and wraps every step in `<engine> compose exec`.",
-		"compose_project":  "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME / parent directory name. Only meaningful with `compose_service`.",
-		"container_engine": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.",
-		"engine":           "Alias for `container_engine`.",
-	}
-	addMeta := func(p *orderedmap.OrderedMap[string, *jsonschema.Schema]) {
-		for _, k := range []string{
-			"in_container", "container",
-			"compose_service", "compose_project",
-			"container_engine", "engine",
-		} {
-			p.Set(k, &jsonschema.Schema{Type: "string", Description: metaDescs[k]})
-		}
-	}
-
-	runProps := orderedmap.New[string, *jsonschema.Schema]()
-	runProps.Set("run", &jsonschema.Schema{
-		Type:        "string",
-		Description: "Shell command executed via `sh -c`. Wrapped in `<engine> exec` when container/compose metadata is set on this entry.",
-	})
-	runProps.Set("cwd", &jsonschema.Schema{
-		Type:        "string",
-		Description: "Working directory for the command. Relative paths resolve inside the worktree (host) or inside the container WORKDIR (when wrapped).",
-	})
-	addMeta(runProps)
-
-	step := SingleStep{}.JSONSchema()
-	stepsProps := orderedmap.New[string, *jsonschema.Schema]()
-	stepsProps.Set("steps", &jsonschema.Schema{
-		Type:        "array",
-		Items:       step,
-		Description: "Ordered list of single-step commands chained with `&&`. All steps share the entry's container/compose metadata.",
-	})
-	addMeta(stepsProps)
-
-	return &jsonschema.Schema{
-		Description: "One hook group. Groups run in parallel; steps within a group run sequentially. " +
-			"Four shapes accepted: bare command string, `{ run, cwd, ...meta }` single-step mapping, " +
-			"`{ steps, ...meta }` group mapping, or a sequence of single-step children.",
-		OneOf: []*jsonschema.Schema{
-			{
-				Type:        "string",
-				Description: "Bare command shorthand. Group of one step. No container wrapping possible in this form.",
-			},
-			{
-				Type:                 "object",
-				Properties:           runProps,
-				Required:             []string{"run"},
-				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Single-step mapping with optional container/compose metadata. Use when you want one command wrapped in `<engine> exec`.",
-			},
-			{
-				Type:                 "object",
-				Properties:           stepsProps,
-				Required:             []string{"steps"},
-				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Group form: explicit step list with shared container/compose metadata. All listed steps are wrapped in the same `<engine> exec` context.",
-			},
-			{
-				Type:        "array",
-				Items:       step,
-				Description: "Sequence shorthand: list of single steps chained with `&&`. No container wrapping in this form — use the `{ steps, ... }` mapping if you need that.",
-			},
-		},
-	}
-}
-
-// UnmarshalYAML decides which of the shapes applies based on the
-// node kind. Strict: anything else is a typo we want to surface
-// instead of silently coalesce.
-func (h *HookEntry) UnmarshalYAML(node *yaml.Node) error {
-	switch node.Kind {
-	case yaml.ScalarNode:
-		h.Steps = []SingleStep{{Run: node.Value}}
-		return nil
-	case yaml.MappingNode:
-		// Reject the legacy `background:` field loudly. Hooks are
-		// always async in v1.0+; if a YAML still carries that field
-		// we want the user to see why their config no longer
-		// parses.
-		hasSteps := false
-		for i := 0; i < len(node.Content); i += 2 {
-			switch node.Content[i].Value {
-			case "background":
-				return fmt.Errorf("hook entry: `background` is no longer supported — hooks are always async; group commands by nesting them in a list to express sequencing (line %d)", node.Content[i].Line)
-			case "steps":
-				hasSteps = true
-			}
-		}
-		if hasSteps {
-			// Group form: { in_container/compose_service/..., steps: [...] }.
-			var raw struct {
-				Container      string       `yaml:"in_container"`
-				ContainerAlt   string       `yaml:"container"`
-				ComposeService string       `yaml:"compose_service"`
-				ComposeProject string       `yaml:"compose_project"`
-				Engine         string       `yaml:"container_engine"`
-				EngineAlt      string       `yaml:"engine"`
-				Steps          []SingleStep `yaml:"steps"`
-			}
-			if err := node.Decode(&raw); err != nil {
-				return err
-			}
-			h.Container = firstNonEmpty(raw.Container, raw.ContainerAlt)
-			h.ComposeService = raw.ComposeService
-			h.ComposeProject = raw.ComposeProject
-			h.Engine = firstNonEmpty(raw.Engine, raw.EngineAlt)
-			h.Steps = raw.Steps
-			if h.Container != "" && h.ComposeService != "" {
-				return fmt.Errorf("hook entry (line %d): set either `in_container:` or `compose_service:`, not both", node.Line)
-			}
-			return nil
-		}
-		// Single-step form (existing): { run: ..., cwd: ..., [in_container/compose_service/...] }.
-		var s SingleStep
-		if err := node.Decode(&s); err != nil {
-			return err
-		}
-		var meta struct {
-			Container      string `yaml:"in_container"`
-			ContainerAlt   string `yaml:"container"`
-			ComposeService string `yaml:"compose_service"`
-			ComposeProject string `yaml:"compose_project"`
-			Engine         string `yaml:"container_engine"`
-			EngineAlt      string `yaml:"engine"`
-		}
-		_ = node.Decode(&meta)
-		h.Container = firstNonEmpty(meta.Container, meta.ContainerAlt)
-		h.ComposeService = meta.ComposeService
-		h.ComposeProject = meta.ComposeProject
-		h.Engine = firstNonEmpty(meta.Engine, meta.EngineAlt)
-		if h.Container != "" && h.ComposeService != "" {
-			return fmt.Errorf("hook entry (line %d): set either `in_container:` or `compose_service:`, not both", node.Line)
-		}
-		h.Steps = []SingleStep{s}
-		return nil
+		a.Run = []string{raw.Run.Value}
 	case yaml.SequenceNode:
-		var children []SingleStep
-		for _, child := range node.Content {
-			var s SingleStep
-			if err := s.UnmarshalYAML(child); err != nil {
-				return err
+		a.Run = make([]string, 0, len(raw.Run.Content))
+		for _, child := range raw.Run.Content {
+			if child.Kind != yaml.ScalarNode {
+				return fmt.Errorf("action (line %d): every entry in `run:` must be a string", child.Line)
 			}
-			children = append(children, s)
+			a.Run = append(a.Run, child.Value)
 		}
-		h.Steps = children
-		return nil
+	case 0:
+		return fmt.Errorf("action (line %d): `run:` is required", node.Line)
 	default:
-		return fmt.Errorf("hook entry: unsupported node kind %d", node.Kind)
+		return fmt.Errorf("action (line %d): `run:` must be a string or list of strings", node.Line)
 	}
-}
-
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
+	a.Cwd = raw.Cwd
+	a.Container = raw.Container
+	a.ComposeService = raw.ComposeService
+	a.ComposeProject = raw.ComposeProject
+	a.Engine = raw.Engine
+	if a.Container != "" && a.ComposeService != "" {
+		return fmt.Errorf("action (line %d): set either `container:` or `compose_service:`, not both", node.Line)
 	}
-	return b
+	return nil
 }
 
 // DatabaseConfig — one `databases:` entry. The `engine` discriminator
@@ -713,19 +793,49 @@ type DatabaseConfig struct {
 	// changes invalidate the cache.
 	Dump *DumpSpec `yaml:"dump,omitempty"`
 
-	// Migration source declaration. Treeman hashes the listed files
-	// to decide whether a cached snapshot is still valid and replays
-	// migrations into the template before cloning.
-	Migrations *MigrationSpec `yaml:"migrations,omitempty"`
+	// Migrate is the shell command that brings a freshly-loaded
+	// source DB up to the current schema. Required when any input
+	// glob matches migration files; optional otherwise (e.g. a DB
+	// that's purely seed-driven).
+	Migrate *Step `yaml:"migrate,omitempty"`
+
+	// Seed is the shell command that populates non-migration data
+	// (fixtures, ES mappings, Redis warm-cache keys, etc.). Runs
+	// AFTER dump-load + migrate as the final cold-build step,
+	// before treeman snapshots the populated state into the
+	// template DB.
+	Seed *Step `yaml:"seed,omitempty"`
+
+	// Inputs declare every file that determines this database's
+	// template state. Each entry:
+	//   1. Contributes a hash to the snapshot fingerprint (so any
+	//      change auto-invalidates the cached template).
+	//   2. Subscribes fsnotify so changes trigger a re-prep.
+	//   3. Carries an optional `label:` that `hooks.on-file-change`
+	//      actions can match against.
+	//
+	// Glob patterns are repo-root-relative. Hash mode is per-entry:
+	// `filename` for append-only files (Laravel migrations, …),
+	// `checksum` for files edited in place (seeders, lockfiles).
+	// Default is checksum.
+	//
+	// Cache-hit vs cold-build is derived purely from the input
+	// hashes — there's no separate `on: rebuild` knob. If you want
+	// to force a rebuild, change an input.
+	Inputs []Input `yaml:"inputs,omitempty"`
 
 	// Test-clone fanout: how many parallel database clones to
 	// pre-warm for paratest/pytest-xdist/Jest workers/etc.
 	TestClones *TestClonesSpec `yaml:"test_clones,omitempty"`
 
-	// Engine-specific namespacing templates (Redis db index,
-	// Elasticsearch index prefix). Use when the engine doesn't
-	// scope by database name.
-	Namespaces *Namespaces `yaml:"namespaces,omitempty"`
+	// KeyPrefix scopes every key/index a worktree creates under a
+	// per-worktree prefix. Used by engines that don't scope by
+	// database name — Redis (key prefix in DB 0) and Elasticsearch
+	// / OpenSearch (index-name prefix). Example: `{slug}:` →
+	// `feature-x:`. The app must honour the prefix — Laravel's
+	// `CACHE_PREFIX`, Rails `Rails.cache.options[:namespace]`,
+	// ioredis `keyPrefix`, etc.
+	KeyPrefix string `yaml:"key_prefix,omitempty"`
 
 	// Outer concurrency cap for clone restore + DropMatching.
 	// Defaults to the per-engine safe value from internal/prepare.
@@ -734,65 +844,246 @@ type DatabaseConfig struct {
 	Fanout uint32 `yaml:"fanout,omitempty" jsonschema:"minimum=0,maximum=64"`
 }
 
-// DumpSpec — `dump:` sub-block of a DatabaseConfig.
+// Input declares one source of file state that contributes to the
+// template fingerprint AND triggers a re-prep when it changes.
+// Replaces the older split between `migrations.migration_dirs`,
+// `migrations.file_globs`, `migrations.lockfiles`, and
+// `databases[].watch[]`. Unifying makes the cache-key derivation
+// transparent: every input is hashed; nothing else is. Watches
+// always trigger best-effort re-prep — there's no separate
+// `on: rebuild` override.
+type Input struct {
+	// Glob pattern (relative to repo root). Supports `**` recursion.
+	// Required.
+	Glob string `yaml:"glob"`
+
+	// Optional label that `hooks.on-file-change` actions can match
+	// against via their `match:` field. Multiple entries can share a
+	// label so one action handles a logical group of file types.
+	Label string `yaml:"label,omitempty"`
+
+	// Hash mode for files matching this glob:
+	//   `checksum` (default) — full content hash. Detects edits.
+	//     Right for lockfiles, seeders, factories, fixtures.
+	//   `filename`            — hash of the filename only. Cheaper.
+	//     Right for append-only directories (Laravel/Rails/Django
+	//     migrations where existing files never change).
+	Hash string `yaml:"hash,omitempty" jsonschema:"enum=checksum,enum=filename"`
+}
+
+// JSONSchema documents the polymorphic shape: an Input is either a
+// bare glob string (shorthand for `{glob: <string>}`) or a full
+// `{glob, label, hash}` mapping.
+func (Input) JSONSchema() *jsonschema.Schema {
+	props := orderedmap.New[string, *jsonschema.Schema]()
+	props.Set("glob", &jsonschema.Schema{Type: "string", Description: "Glob pattern (repo-root-relative). Required."})
+	props.Set("label", &jsonschema.Schema{Type: "string", Description: "Optional label for `hooks.on-file-change` matchers."})
+	props.Set("hash", &jsonschema.Schema{Type: "string", Enum: []any{"checksum", "filename"}, Description: "Hash mode: checksum (default) or filename (append-only files)."})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "Bare glob string. Equivalent to `{glob: <this string>}` with default hash mode."},
+			{
+				Type:                 "object",
+				Properties:           props,
+				Required:             []string{"glob"},
+				AdditionalProperties: jsonschema.FalseSchema,
+				Description:          "Full input mapping with optional label + hash mode.",
+			},
+		},
+		Description: "One source of file state for the template fingerprint. Bare string OR full mapping.",
+	}
+}
+
+// UnmarshalYAML accepts either a bare glob string or a mapping.
+func (i *Input) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		i.Glob = node.Value
+		return nil
+	case yaml.MappingNode:
+		type alias Input
+		return node.Decode((*alias)(i))
+	default:
+		return fmt.Errorf("input (line %d): want a string or mapping", node.Line)
+	}
+}
+
+// FilteredAction is an Action with an optional `match:` that
+// filters which watch labels can trigger it. Used by
+// `hooks.on-file-change`.
+type FilteredAction struct {
+	// Match restricts the action to a set of watch labels. Accepts
+	// either a single string (`match: migrations`) or a list of
+	// strings (`match: [migrations, seeders]`). Empty/missing means
+	// the action fires for ANY watch event (any engine, any label).
+	Match []string `yaml:"match,omitempty"`
+
+	// Embedded Action: same shape as the universal hooks Action
+	// (run, cwd, container, …).
+	Action `yaml:",inline"`
+}
+
+// JSONSchema documents the string|[]string polymorphism for `match:`.
+func (FilteredAction) JSONSchema() *jsonschema.Schema {
+	// Pull in Action's schema for the base shape, then layer `match:`
+	// on top so editor hints describe the whole filtered action.
+	base := Action{}.JSONSchema()
+	if base.Properties != nil {
+		base.Properties.Set("match", &jsonschema.Schema{
+			OneOf: []*jsonschema.Schema{
+				{Type: "string", Description: "Single watch label to match."},
+				{Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "Set of watch labels; the action fires when any of them matches."},
+			},
+			Description: "Restrict this action to watch events carrying one of the named labels. Omit to fire for every event.",
+		})
+	}
+	base.Description = "On-file-change action with optional label filter. Same shape as a hook Action plus a `match:` field (string or list)."
+	return base
+}
+
+// UnmarshalYAML peels off the `match:` field (accepting either a
+// scalar or a sequence) and delegates the remaining keys to
+// Action's UnmarshalYAML.
+func (f *FilteredAction) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("on-file-change action (line %d): want a mapping", node.Line)
+	}
+	// Pull the `match:` value out separately so we can accept both
+	// scalar + sequence forms. Other keys are decoded by Action.
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value != "match" {
+			continue
+		}
+		v := node.Content[i+1]
+		switch v.Kind {
+		case yaml.ScalarNode:
+			if v.Value != "" {
+				f.Match = []string{v.Value}
+			}
+		case yaml.SequenceNode:
+			f.Match = make([]string, 0, len(v.Content))
+			for _, child := range v.Content {
+				if child.Kind != yaml.ScalarNode {
+					return fmt.Errorf("on-file-change (line %d): every `match` entry must be a string label", child.Line)
+				}
+				f.Match = append(f.Match, child.Value)
+			}
+		default:
+			return fmt.Errorf("on-file-change (line %d): `match` must be a string or list of strings", v.Line)
+		}
+		break
+	}
+	return f.Action.UnmarshalYAML(node)
+}
+
+// Matches reports whether this action's label filter accepts an
+// event carrying `label`. An empty Match list (wildcard) matches
+// everything; otherwise the label must equal one of the listed
+// strings.
+func (f FilteredAction) Matches(label string) bool {
+	if len(f.Match) == 0 {
+		return true
+	}
+	for _, m := range f.Match {
+		if m == label {
+			return true
+		}
+	}
+	return false
+}
+
+// Step is one user-declared shell command executed against a target
+// database. Used by both `databases[].migrate:` and
+// `databases[].seed:` — the same shape, different lifecycle slots.
+//
+// The framework's CLI reads its target DB from its own config
+// (Laravel: `DB_DATABASE` in `.env`; Rails: `DATABASE`; Django:
+// `DJANGO_DB_NAME`; etc.). Treeman builds per-worktree template
+// databases with names like `myapp_template_feature-x` and needs to
+// redirect the command at *that* DB, not the one the committed
+// `.env` references. The `Env` map says which env-var names to
+// override; the value template `{target_db}` is substituted at
+// runtime with the resolved database name. No other placeholders
+// are supported.
+type Step struct {
+	// Run is the shell command treeman invokes via `sh -c`.
+	// Required; an empty Run aborts `prepare` with a clear error.
+	Run string `yaml:"run"`
+
+	// Env is a map of env-var names to value templates. Each entry
+	// is set on the subprocess (overriding the framework's config
+	// file). `{target_db}` is substituted with the resolved per-run
+	// database name; literal values pass through unchanged.
+	Env map[string]string `yaml:"env,omitempty"`
+}
+
+// DumpSpec — `dump:` sub-block of a DatabaseConfig. Accepts either
+// a bare string (`dump: storage/dumps/seed.sql.gz`) or a full
+// mapping (`dump: { path: ..., optional: true }`).
+//
+// Supported engines + formats:
+//
+//   - MySQL/MariaDB/TiDB: plain `.sql` text dumps (mysqldump output)
+//   - Postgres:            plain `.sql` text dumps (pg_dump --format=plain)
+//   - MongoDB:             `mongodump --archive` archives (binary)
+//   - Elasticsearch/OS:    `_bulk`-format NDJSON
+//
+// Compression (gzip / zstd / bzip2 / xz) is auto-detected from the
+// file's magic bytes — extension is not consulted. Same single
+// `dump:` field works for `seed.sql`, `seed.sql.gz`, `seed.sql.zst`,
+// `dump.archive.gz`, etc.
 type DumpSpec struct {
-	// Path to the dump file relative to the repo root. Format must
-	// match the engine — `.sql` for MySQL/Postgres, `.bson`/archive
-	// for Mongo. The file is hashed into the snapshot key so changes
-	// invalidate cached snapshots.
+	// Path to the dump file relative to the repo root. The file is
+	// hashed into the snapshot key so changes invalidate cached
+	// snapshots.
 	Path string `yaml:"path"`
 
 	// When true, a missing dump file is not an error — treeman will
-	// build the template from migrations alone. Use for greenfield
-	// projects that haven't created a baseline dump yet.
+	// build the template from migrations / seed alone. Use for
+	// greenfield projects that haven't created a baseline dump yet.
 	Optional bool `yaml:"optional,omitempty"`
+
+	// SourceDB names the database the archive was originally dumped
+	// from (e.g. `production` if you ran `mongodump --db=production`).
+	// MongoDB only — treeman remaps that DB's collections into the
+	// per-worktree target DB via mongorestore's --nsFrom/--nsTo.
+	// Leave empty to skip the rename (the archive must already use
+	// the target DB name). Ignored by MySQL/Postgres/ES drivers.
+	SourceDB string `yaml:"source_db,omitempty"`
 }
 
-// MigrationSpec — `migrations:` sub-block. Fully declarative: every
-// input the runtime needs (migration directories, file globs,
-// lockfiles, hash mode, on-modify policy) is read from this struct,
-// never inferred at runtime from `framework`. `framework` is a free-
-// form label for logs + downstream tooling.
-//
-// `treeman init` emits these fields populated from the matching
-// built-in preset; `treeman fw detect` lists the presets so you can
-// copy fields in by hand. There is no implicit fallback — leaving
-// e.g. MigrationDirs empty means treeman has no migration source
-// for the hash, so the snapshot key won't change when files do.
-type MigrationSpec struct {
-	// Free-form label identifying the migration tool (`laravel`,
-	// `flyway`, `golang-migrate`, `alembic`, etc.). Logged and
-	// surfaced in `treeman fw detect`; never inspected by runtime
-	// dispatch logic — every behavior is driven by the explicit
-	// fields below.
-	Framework string `yaml:"framework"`
+// JSONSchema documents the bare-string-or-mapping shape.
+func (DumpSpec) JSONSchema() *jsonschema.Schema {
+	props := orderedmap.New[string, *jsonschema.Schema]()
+	props.Set("path", &jsonschema.Schema{Type: "string", Description: "Dump file path, repo-root-relative. Required."})
+	props.Set("optional", &jsonschema.Schema{Type: "boolean", Description: "When true, missing dump is not an error."})
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			{Type: "string", Description: "Bare path string. Equivalent to `{path: <this string>}`."},
+			{
+				Type:                 "object",
+				Properties:           props,
+				Required:             []string{"path"},
+				AdditionalProperties: jsonschema.FalseSchema,
+				Description:          "Full dump mapping with optional `optional` flag.",
+			},
+		},
+		Description: "Source dump file. Bare string OR `{path, optional}` mapping.",
+	}
+}
 
-	// Glob patterns (relative to repo root) for directories
-	// containing migration files. Required for any behavior beyond
-	// pure-dump templates.
-	MigrationDirs []string `yaml:"migration_dirs,omitempty"`
-
-	// Glob patterns for migration filenames within `migration_dirs`.
-	// Example: `*.sql`, `*_*.up.sql`, `[0-9]*-*.sql`.
-	FileGlobs []string `yaml:"file_globs,omitempty"`
-
-	// Extra files whose contents are folded into the snapshot hash
-	// (typically lockfiles like `composer.lock`, `package-lock.json`,
-	// `go.sum`). Use when migrations are framework-managed and the
-	// installed framework version itself affects schema.
-	Lockfiles []string `yaml:"lockfiles,omitempty"`
-
-	// Hash strategy. `filename` (default) hashes only the migration
-	// filenames — fast, works when migrations are append-only.
-	// `checksum` hashes file contents — required when migrations are
-	// edited in-place during development.
-	HashMode string `yaml:"hash_mode,omitempty" jsonschema:"enum=filename,enum=checksum"`
-
-	// What to do when a migration file changes. `rebuild` (default)
-	// drops the cached template and re-runs migrations from the
-	// dump. `delta` runs only the new migrations on top of the
-	// existing template — faster but assumes append-only history.
-	OnModify string `yaml:"on_modify,omitempty" jsonschema:"enum=rebuild,enum=delta"`
+// UnmarshalYAML accepts either a bare path string or a mapping.
+func (d *DumpSpec) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		d.Path = node.Value
+		return nil
+	case yaml.MappingNode:
+		type alias DumpSpec
+		return node.Decode((*alias)(d))
+	default:
+		return fmt.Errorf("dump (line %d): want a string or mapping", node.Line)
+	}
 }
 
 // TestClonesSpec — `test_clones:` sub-block. Used by every parallel
@@ -858,96 +1149,33 @@ func (c *ClonesSetting) UnmarshalYAML(node *yaml.Node) error {
 	return fmt.Errorf("clones: want scalar")
 }
 
-// Namespaces — engine-specific namespacing (redis db-index,
-// elasticsearch index prefix, etc.).
-type Namespaces struct {
-	// Redis-specific: template producing a numeric DB index per
-	// worktree. Must evaluate to an integer in 0–15 (default Redis
-	// config). Example: `{slug_hash16}` produces a stable hash in
-	// the valid range.
-	DbIndexTemplate string `yaml:"db_index_template,omitempty"`
-
-	// Elasticsearch/OpenSearch-specific: template producing the
-	// index-name prefix. All indexes the app creates are scoped by
-	// this prefix per worktree. Example: `app_{slug}_`.
-	IndexPrefixTemplate string `yaml:"index_prefix_template,omitempty"`
-
-	// Generic key-prefix template for engines that scope by key
-	// prefix rather than db/index (e.g. Redis key namespacing when
-	// db-index isolation isn't enough).
-	PrefixTemplate string `yaml:"prefix_template,omitempty"`
-}
-
-// WatcherConfig — `watcher:` block.
-type WatcherConfig struct {
-	// File-system globs the watcher monitors. When a matching file
-	// changes the watcher invalidates affected snapshots (per the
-	// glob's `on:` policy) so the next `prepare` rebuilds the
-	// template.
-	Paths []WatcherPath `yaml:"paths,omitempty"`
-
-	// Debounce window in milliseconds. The watcher coalesces events
-	// arriving within this window before invalidating snapshots,
-	// which prevents thrashing when an editor saves many files at
-	// once. Default 500.
-	DebounceMs uint64 `yaml:"debounce_ms,omitempty"`
-
-	// MySQL binary-log tailer settings. Disabled by default; enable
-	// to replay DDL events from the source database onto cached
-	// templates and test clones automatically.
-	Binlog BinlogConfig `yaml:"binlog,omitempty"`
-}
-
-// BinlogConfig — `watcher.binlog:` block. Controls the MySQL
-// binary-log tailer that replays DDL + DML events from the source
-// database onto cached template + paratest clone databases. Off by
-// default; enabling requires a server configured with
-// `binlog_format=ROW` and a replication-privileged user.
-type BinlogConfig struct {
-	// Master switch. When false (default) the tailer is dormant —
-	// no replication connection is opened, no DDL is replayed.
-	Enabled bool `yaml:"enabled,omitempty"`
-	// ServerID treeman registers as a fake replica. Must be unique
-	// among all replicas the upstream server sees. Defaults to a
-	// deterministic hash of the daemon's socket path so two
-	// developers on the same host don't clash.
-	ServerID uint32 `yaml:"server_id,omitempty"`
-	// Flavor — "mysql" (default) or "mariadb".
-	Flavor string `yaml:"flavor,omitempty" jsonschema:"enum=mysql,enum=mariadb"`
-	// ApplyDDL toggles execution of DDL Query events. Default true.
-	ApplyDDL *bool `yaml:"apply_ddl,omitempty"`
-	// ApplyDML toggles execution of ROW events. Default false (DDL
-	// replay is the high-value path; DML is a follow-up).
-	ApplyDML *bool `yaml:"apply_dml,omitempty"`
-}
-
-// WatcherPath — one `paths:` entry.
+// WatcherPath is the internal projection of an Input that the
+// fsnotify driver subscribes to. Users never write this type
+// directly — they declare `databases[].inputs[]` and treeman
+// aggregates them into WatcherPaths at watcher-start time.
 type WatcherPath struct {
-	// Filesystem glob (relative to repo root) the watcher monitors.
-	// Supports `**` recursion. Example:
-	// `database/migrations/**/*.sql`.
-	Glob string `yaml:"glob"`
-
-	// Invalidation strategy when a matching file changes:
-	//   `auto`    — defer to the matching DatabaseConfig's `on_modify`.
-	//   `delta`   — keep the cached template, replay only new files.
-	//   `rebuild` — drop the template, replay everything from the dump.
-	// Default: `auto`.
-	On string `yaml:"on,omitempty" jsonschema:"enum=auto,enum=delta,enum=rebuild"`
+	// Filesystem glob (relative to repo root). Supports `**` recursion.
+	Glob string `yaml:"-" json:"-"`
+	// Label passes through from the originating Input so hook
+	// matchers can filter on it.
+	Label string `yaml:"-" json:"-"`
+	// DBIndex is the index of the originating database in cfg.Databases.
+	DBIndex int `yaml:"-" json:"-"`
 }
 
 // CustomFramework — `frameworks:` entry, lets users declare
-// migration frameworks treeman doesn't know about natively.
+// migration frameworks treeman doesn't know about natively. Consumed
+// only by `treeman fw detect` and `treeman init` for scaffolding; at
+// runtime treeman reads `databases[].inputs[]` directly.
 type CustomFramework struct {
 	// Files (relative to repo root) whose presence indicates this
 	// framework is in use. Used by `treeman fw detect` to pick the
-	// framework when no explicit MigrationSpec is configured.
+	// framework when scaffolding a new config.
 	// Example: `["alembic.ini", "migrations/env.py"]`.
 	Markers []string `yaml:"markers"`
 
 	// Glob patterns for the directories holding migration files.
-	// Copied into the MigrationSpec when detection picks this
-	// framework.
+	// Emitted as `inputs[]` entries during `treeman init`.
 	MigrationDirs []string `yaml:"migration_dirs"`
 
 	// Glob pattern for individual migration files within
@@ -956,23 +1184,34 @@ type CustomFramework struct {
 	FilePattern string `yaml:"file_pattern"`
 
 	// Hash strategy applied to the migration files: `filename`
-	// (default) or `checksum`. Same semantics as
-	// MigrationSpec.HashMode.
+	// (default) or `checksum`. Maps to the `hash:` field on each
+	// emitted Input.
 	HashMode string `yaml:"hash_mode,omitempty" jsonschema:"enum=filename,enum=checksum"`
 
-	// Change-handling policy: `rebuild` (default) or `delta`. Same
-	// semantics as MigrationSpec.OnModify.
-	OnModify string `yaml:"on_modify,omitempty" jsonschema:"enum=rebuild,enum=delta"`
-
 	// Lockfiles whose contents are folded into the snapshot hash
-	// (e.g. `requirements.txt`, `pyproject.toml`,
-	// `composer.lock`).
+	// (e.g. `requirements.txt`, `pyproject.toml`, `composer.lock`).
+	// Emitted as `inputs[]` entries with label `lockfile`.
 	Lockfiles []string `yaml:"lockfiles,omitempty"`
 
 	// Optional hint about the database engine this framework
 	// targets — `mysql`, `postgres`, etc. Pre-fills the engine field
 	// in `treeman init` when this framework is detected.
 	EngineHint string `yaml:"engine_hint,omitempty"`
+}
+
+// LoadGlobal returns the user-global config alone (no repo or
+// repo-local overlay). Used by the daemon at startup to read fields
+// that need to be live before any repo is known — currently just
+// daemon.log_level. Missing global file → defaults-only Config.
+func LoadGlobal() (Config, error) {
+	var cfg Config
+	applyDefaults(&cfg)
+	if g, ok := globalConfigPath(); ok {
+		if err := mergeYAMLFile(&cfg, g); err != nil {
+			return cfg, err
+		}
+	}
+	return cfg, nil
 }
 
 // LoadLayered reads global + repo + repo-local YAML files into a
@@ -995,6 +1234,9 @@ func LoadLayered(repoRoot string) (Config, error) {
 		}
 	}
 	normaliseAliases(&cfg)
+	if err := cfg.Validate(); err != nil {
+		return cfg, fmt.Errorf("config invalid: %w", err)
+	}
 	return cfg, nil
 }
 
@@ -1021,6 +1263,9 @@ func LoadLayeredForWorktree(mainRoot, wtRoot string) (Config, error) {
 		}
 	}
 	normaliseAliases(&cfg)
+	if err := cfg.Validate(); err != nil {
+		return cfg, fmt.Errorf("config invalid: %w", err)
+	}
 	return cfg, nil
 }
 
@@ -1050,7 +1295,7 @@ func mergeYAMLFile(cfg *Config, path string) error {
 }
 
 // applyDefaults fills in the canonical defaults: async_create +
-// async_delete true, skip_worktree true, retention defaults.
+// skip_worktree true, retention defaults.
 func applyDefaults(cfg *Config) {
 	if cfg.Daemon.LogLevel == "" {
 		cfg.Daemon.LogLevel = "info"
@@ -1061,58 +1306,23 @@ func applyDefaults(cfg *Config) {
 		// for the parent-dir convention.
 		cfg.Worktrees.Root = ".worktrees"
 	}
-	if cfg.Worktrees.AsyncCreate == nil {
-		t := true
-		cfg.Worktrees.AsyncCreate = &t
+	if cfg.Snapshots.CapPerRepo == 0 {
+		cfg.Snapshots.CapPerRepo = 8
 	}
-	if cfg.Worktrees.AsyncDelete == nil {
-		t := true
-		cfg.Worktrees.AsyncDelete = &t
+	if cfg.Snapshots.KeepPerSource == 0 {
+		cfg.Snapshots.KeepPerSource = 500
 	}
-	if cfg.EnvScoping.SkipWorktree == nil {
-		t := true
-		cfg.EnvScoping.SkipWorktree = &t
+	if cfg.Snapshots.MaxAgeDays == 0 {
+		cfg.Snapshots.MaxAgeDays = 30
 	}
-	if cfg.Snapshots.Retention.CapPerRepo == 0 {
-		cfg.Snapshots.Retention.CapPerRepo = 8
+	if cfg.Snapshots.MaxTotalGb == 0 {
+		cfg.Snapshots.MaxTotalGb = 50
 	}
-	if cfg.Snapshots.Retention.KeepPerSource == 0 {
-		cfg.Snapshots.Retention.KeepPerSource = 500
+	if cfg.Snapshots.GcIntervalMinutes == 0 {
+		cfg.Snapshots.GcIntervalMinutes = 60
 	}
-	if cfg.Snapshots.Retention.MaxAgeDays == 0 {
-		cfg.Snapshots.Retention.MaxAgeDays = 30
-	}
-	if cfg.Snapshots.Retention.MaxTotalGb == 0 {
-		cfg.Snapshots.Retention.MaxTotalGb = 50
-	}
-	if cfg.Snapshots.Retention.GcIntervalMinutes == 0 {
-		cfg.Snapshots.Retention.GcIntervalMinutes = 60
-	}
-	if cfg.Watcher.DebounceMs == 0 {
-		cfg.Watcher.DebounceMs = 500
-	}
-	if cfg.Watcher.Binlog.Flavor == "" {
-		cfg.Watcher.Binlog.Flavor = "mysql"
-	}
-	if cfg.Watcher.Binlog.ApplyDDL == nil {
-		t := true
-		cfg.Watcher.Binlog.ApplyDDL = &t
-	}
-	if cfg.Watcher.Binlog.ApplyDML == nil {
-		f := false
-		cfg.Watcher.Binlog.ApplyDML = &f
-	}
-	if cfg.Watcher.Binlog.ServerID == 0 {
-		// Stable per host: hash the daemon's effective socket path
-		// (XDG_RUNTIME_DIR is per-user, so two users on one host get
-		// distinct IDs). Values are kept in the 1k–1M range to leave
-		// room for explicitly-numbered production replicas.
-		var h uint32 = 2166136261
-		for _, b := range []byte(os.Getenv("XDG_RUNTIME_DIR") + os.Getenv("USER")) {
-			h ^= uint32(b)
-			h *= 16777619
-		}
-		cfg.Watcher.Binlog.ServerID = 1000 + (h % 999000)
+	if cfg.DebounceMs == 0 {
+		cfg.DebounceMs = 500
 	}
 }
 

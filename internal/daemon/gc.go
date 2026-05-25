@@ -27,7 +27,7 @@ func SnapshotGCLoop(ctx context.Context, st *State) {
 	// Pull the global interval from the layered config rooted at
 	// the user's home dir (no repo). This is the steady-state knob.
 	globalCfg, _ := resolve.LoadResolved("")
-	interval := time.Duration(globalCfg.Snapshots.Retention.GcIntervalMinutes) * time.Minute
+	interval := time.Duration(globalCfg.Snapshots.GcIntervalMinutes) * time.Minute
 	if interval <= 0 {
 		interval = time.Hour
 	}

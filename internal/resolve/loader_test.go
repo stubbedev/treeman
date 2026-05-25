@@ -15,11 +15,9 @@ func TestLoadResolvedFillsCredsFromEnvWithoutYaml(t *testing.T) {
 
 	repo := t.TempDir()
 	if err := os.WriteFile(filepath.Join(repo, ".treeman.yaml"), []byte(`
-repo:
-  name: example-app
-env_scoping:
-  sources:
-    - .env.testing
+repo: example-app
+env_sources:
+  - .env.testing
 databases:
   - engine: mysql
     name_template: "app_testing_{slug}"
@@ -66,12 +64,10 @@ func TestEnvScopingSourcesOrderingLastWins(t *testing.T) {
 	repo := t.TempDir()
 
 	if err := os.WriteFile(filepath.Join(repo, ".treeman.yaml"), []byte(`
-repo:
-  name: app
-env_scoping:
-  sources:
-    - .env.base
-    - .env.override
+repo: app
+env_sources:
+  - .env.base
+  - .env.override
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -104,11 +100,9 @@ func TestLoadResolvedYamlPlusEnvPassword(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	repo := t.TempDir()
 	if err := os.WriteFile(filepath.Join(repo, ".treeman.yaml"), []byte(`
-repo:
-  name: app
-env_scoping:
-  sources:
-    - .env.testing
+repo: app
+env_sources:
+  - .env.testing
 connections:
   mysql:
     host: 127.0.0.1

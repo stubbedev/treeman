@@ -1,0 +1,124 @@
+# All 5 engines, each with a published-port AND a non-exposed
+# variant — 10 containers total. Used by containerref_all_test.go
+# to verify treeman's containerip.ResolveAddr works for every engine
+# in both published-port and bridge-IP modes.
+services:
+  # MySQL ─────────────────────────────────────────────
+  mysql-pub:
+    image: mysql:8.4
+    container_name: treeman-e2e-ctra-mysql-pub
+    environment: { MYSQL_ROOT_PASSWORD: rootpw }
+    ports: ["13367:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  mysql-int:
+    image: mysql:8.4
+    container_name: treeman-e2e-ctra-mysql-int
+    environment: { MYSQL_ROOT_PASSWORD: rootpw }
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # Postgres ──────────────────────────────────────────
+  postgres-pub:
+    image: postgres:16-alpine
+    container_name: treeman-e2e-ctra-pg-pub
+    environment: { POSTGRES_PASSWORD: pgpw }
+    ports: ["15433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  postgres-int:
+    image: postgres:16-alpine
+    container_name: treeman-e2e-ctra-pg-int
+    environment: { POSTGRES_PASSWORD: pgpw }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # MongoDB ───────────────────────────────────────────
+  mongo-pub:
+    image: mongo:7
+    container_name: treeman-e2e-ctra-mongo-pub
+    ports: ["27118:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  mongo-int:
+    image: mongo:7
+    container_name: treeman-e2e-ctra-mongo-int
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # Redis ─────────────────────────────────────────────
+  redis-pub:
+    image: redis:7-alpine
+    container_name: treeman-e2e-ctra-redis-pub
+    ports: ["16380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis-int:
+    image: redis:7-alpine
+    container_name: treeman-e2e-ctra-redis-int
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Elasticsearch ─────────────────────────────────────
+  es-pub:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: treeman-e2e-ctra-es-pub
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["19201:9200"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"\\(green\\|yellow\\)\"'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  es-int:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: treeman-e2e-ctra-es-int
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"\\(green\\|yellow\\)\"'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
