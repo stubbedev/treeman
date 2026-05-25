@@ -303,19 +303,15 @@ func (d *Driver) copyByPrefixDumpRestore(ctx context.Context, srcPrefix, dstPref
 	return flush()
 }
 
-// client opens a fresh go-redis client pinned to the treeman DB
-// index. Each helper opens its own client + defers Close — keeps
-// the lifecycle simple at the cost of more connection churn than
-// a long-lived pool. Fine for prepare-time operations which run
-// per worktree-create, not per-request.
+// client returns the pooled go-redis client pinned to the treeman
+// DB index. Reused across snapshot operations — the underlying pool
+// keeps connections warm.
 func (d *Driver) client() *redis.Client {
-	opts, _ := redis.ParseURL(d.url)
-	opts.DB = DBIndex
-	return redis.NewClient(opts)
+	return d.clientFor(DBIndex)
 }
 
 // Client is the exported entry point used by callers outside the
-// snapshot path (currently the MCP engine tools). Callers MUST
-// defer Close on the returned client — each invocation opens a
-// new connection pool.
+// snapshot path (currently the MCP engine tools). Returns the
+// pooled client; callers MUST NOT Close it — the Driver owns the
+// lifecycle.
 func (d *Driver) Client() *redis.Client { return d.client() }

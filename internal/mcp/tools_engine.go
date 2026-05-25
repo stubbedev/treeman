@@ -180,7 +180,6 @@ func probeRedis(ctx context.Context, cfg *config.Config) engineProbeResult {
 	r.Reachable = true
 	r.Version, _ = drv.EngineVersion(ctx)
 	c := drv.Client()
-	defer c.Close()
 	dbsize, err := c.DBSize(ctx).Result()
 	if err == nil {
 		r.Detail = map[string]any{"db0_keys": dbsize}
@@ -454,7 +453,6 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 			anyArgs[i] = a
 		}
 		c := drv.Client()
-		defer c.Close()
 		res, err := c.Do(ctx, anyArgs...).Result()
 		if err != nil {
 			return nil, out, err
@@ -832,7 +830,6 @@ func redisSchema(ctx context.Context, drv *dbredis.Driver, prefix string) (map[s
 		return nil, fmt.Errorf("redis schema_dump: prefix required (e.g. wt_feature-x:)")
 	}
 	c := drv.Client()
-	defer c.Close()
 	var cursor uint64
 	var keys []string
 	for {

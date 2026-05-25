@@ -4,14 +4,27 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/redis/go-redis/v9"
 )
+
+// newTestDriver builds a Driver whose pool will never dial — the
+// guards under test fire before any network call.
+func newTestDriver(t *testing.T) *Driver {
+	t.Helper()
+	opts, err := redis.ParseURL("redis://localhost:6379/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Driver{baseOpts: opts, clients: map[int]*redis.Client{}}
+}
 
 // TestDropPrefixRejectsEmpty asserts the safety guard that prevents
 // `DropPrefix("")` from SCANning the entire keyspace and DELing
 // everything. This is the most dangerous footgun in the prefix
 // model — a typo in `prefix_template` could otherwise wipe Redis.
 func TestDropPrefixRejectsEmpty(t *testing.T) {
-	d := &Driver{url: "redis://localhost:6379/0"} // not dialed; guard fires before any network call
+	d := newTestDriver(t) // not dialed; guard fires before any network call.
 	_, err := d.DropPrefix(context.Background(), "")
 	if err == nil {
 		t.Fatal("DropPrefix(\"\") should error, not wipe the keyspace")
@@ -25,7 +38,7 @@ func TestDropPrefixRejectsEmpty(t *testing.T) {
 // copying a prefix onto itself would either be a no-op (under
 // REPLACE) or destroy the source. Either way the call is a bug.
 func TestSnapshotCreateRejectsSameSrcDst(t *testing.T) {
-	d := &Driver{url: "redis://localhost:6379/0"}
+	d := newTestDriver(t)
 	err := d.SnapshotCreate(context.Background(), "foo:", "foo:")
 	if err == nil || !strings.Contains(err.Error(), "differ") {
 		t.Errorf("expected differ-error, got %v", err)

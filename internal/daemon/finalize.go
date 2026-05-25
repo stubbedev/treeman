@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -448,35 +449,15 @@ func detectBranch(worktree string) string {
 		if err != nil {
 			return ""
 		}
-		gitdir := stripPrefix(string(linkBytes), "gitdir: ")
-		gitdir = trimSpace(gitdir)
-		headPath = filepath.Join(gitdir, "HEAD")
+		gitdir, _ := strings.CutPrefix(string(linkBytes), "gitdir: ")
+		headPath = filepath.Join(strings.TrimSpace(gitdir), "HEAD")
 	}
 	b, err := os.ReadFile(headPath)
 	if err != nil {
 		return ""
 	}
-	line := trimSpace(string(b))
-	const prefix = "ref: refs/heads/"
-	if len(line) > len(prefix) && line[:len(prefix)] == prefix {
-		return line[len(prefix):]
+	if ref, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "ref: refs/heads/"); ok {
+		return ref
 	}
 	return ""
-}
-
-func stripPrefix(s, p string) string {
-	if len(s) >= len(p) && s[:len(p)] == p {
-		return s[len(p):]
-	}
-	return s
-}
-
-func trimSpace(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\n' || s[0] == '\r') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t' || s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
-		s = s[:len(s)-1]
-	}
-	return s
 }
