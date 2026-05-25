@@ -16,9 +16,17 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	dbes "github.com/stubbedev/treeman/internal/db/es"
+	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
+	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
+	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
+	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	"github.com/stubbedev/treeman/internal/gitcmd"
+	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/template"
 )
 
 // ─── logs_wait ──────────────────────────────────────────────────────
@@ -375,6 +383,145 @@ func resolvePathSafe(base, untrusted string) (string, error) {
 // nowMs is a tiny shim so tests can fake the wall clock without
 // dragging in a time-mock package.
 var nowMs = func() int64 { return time.Now().UnixMilli() }
+
+// ─── inputs_fingerprint ─────────────────────────────────────────────
+
+type inputsFingerprintIn struct {
+	Repo         string `json:"repo,omitempty"`
+	WorktreePath string `json:"worktree_path,omitempty" jsonschema:"absolute worktree path; defaults to the cwd-discovered repo root"`
+	DBIndex      *int   `json:"db_index,omitempty" jsonschema:"index into databases[]; omit to return one report per configured database"`
+	ProbeEngine  bool   `json:"probe_engine,omitempty" jsonschema:"connect to the engine to fetch the real engine_version (slower but produces a fingerprint that can match the cached one); default false"`
+}
+
+type inputsFingerprintEntry struct {
+	DBIndex int                     `json:"db_index"`
+	Report  prepare.FingerprintReport `json:"report"`
+	Note    string                  `json:"note,omitempty" jsonschema:"e.g. \"engine_version skipped — pass probe_engine=true to match the cached fingerprint\""`
+}
+
+type inputsFingerprintOut struct {
+	Repo         string                   `json:"repo"`
+	WorktreePath string                   `json:"worktree_path"`
+	Entries      []inputsFingerprintEntry `json:"entries"`
+}
+
+func inputsFingerprintTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in inputsFingerprintIn) (*mcpsdk.CallToolResult, inputsFingerprintOut, error) {
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, inputsFingerprintOut{}, err
+	}
+	wt := in.WorktreePath
+	if wt == "" {
+		wt = repoRoot
+	}
+	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wt)
+	if err != nil {
+		return nil, inputsFingerprintOut{}, fmt.Errorf("load resolved config: %w", err)
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, inputsFingerprintOut{}, err
+	}
+	defer st.Close()
+
+	sl := slug.For(wt, "")
+	tplCtx := template.FromSlug(sl)
+
+	out := inputsFingerprintOut{Repo: repoRoot, WorktreePath: wt}
+	indices := []int{}
+	if in.DBIndex != nil {
+		if *in.DBIndex < 0 || *in.DBIndex >= len(cfg.Databases) {
+			return nil, out, fmt.Errorf("db_index %d out of range (0..%d)", *in.DBIndex, len(cfg.Databases)-1)
+		}
+		indices = []int{*in.DBIndex}
+	} else {
+		for i := range cfg.Databases {
+			indices = append(indices, i)
+		}
+	}
+
+	for _, i := range indices {
+		d := cfg.Databases[i]
+		sourceDB, _ := template.Render(d.NameTemplate, tplCtx)
+		engineVersion := ""
+		note := "engine_version skipped — pass probe_engine=true for a cache-comparable fingerprint"
+		if in.ProbeEngine {
+			engineVersion = probeEngineVersion(ctx, &cfg, d.Engine)
+			note = ""
+		}
+		rep := prepare.InspectFingerprint(ctx, st, d, wt, sourceDB, engineVersion)
+		out.Entries = append(out.Entries, inputsFingerprintEntry{
+			DBIndex: i,
+			Report:  rep,
+			Note:    note,
+		})
+	}
+	return nil, out, nil
+}
+
+// probeEngineVersion calls each engine driver's EngineVersion. Errors
+// are swallowed (empty string) so a half-up environment doesn't
+// crash the introspection call — the caller will see an empty
+// engine_version field and can investigate via engine_status.
+func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) string {
+	switch engine {
+	case "mysql", "mariadb", "tidb":
+		if cfg.Connections.Mysql == nil {
+			return ""
+		}
+		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
+		if err != nil {
+			return ""
+		}
+		defer drv.Close()
+		v, _ := drv.EngineVersion(ctx)
+		return v
+	case "postgres", "postgresql":
+		if cfg.Connections.Postgres == nil {
+			return ""
+		}
+		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
+		if err != nil {
+			return ""
+		}
+		defer drv.Close()
+		v, _ := drv.EngineVersion(ctx)
+		return v
+	case "mongodb":
+		if cfg.Connections.Mongodb == nil {
+			return ""
+		}
+		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+		if err != nil {
+			return ""
+		}
+		defer drv.Close(ctx)
+		v, _ := drv.EngineVersion(ctx)
+		return v
+	case "redis":
+		if cfg.Connections.Redis == nil {
+			return ""
+		}
+		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
+		if err != nil {
+			return ""
+		}
+		defer drv.Close()
+		v, _ := drv.EngineVersion(ctx)
+		return v
+	case "elasticsearch", "opensearch":
+		if cfg.Connections.Elasticsearch == nil {
+			return ""
+		}
+		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+		if err != nil {
+			return ""
+		}
+		v, _ := drv.EngineVersion(ctx)
+		return v
+	}
+	return ""
+}
 
 // branchOccupancyFromStore mirrors the CLI's branchOccupancy helper:
 // branch → worktree path for every live worktree of repoRoot, sourced

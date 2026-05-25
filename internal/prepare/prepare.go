@@ -1382,6 +1382,67 @@ func computeSnapshotKey(
 	return snapshot.New(d.Engine, engineVersion, sourceDB, "", "", dumpHash, inputHashes)
 }
 
+// FingerprintReport is what InspectFingerprint surfaces to callers
+// (notably the MCP inputs_fingerprint tool) — the current fingerprint
+// for one configured database, the inputs that fed it, and whether
+// a matching cached snapshot exists on disk.
+type FingerprintReport struct {
+	Engine        string            `json:"engine"`
+	EngineVersion string            `json:"engine_version"`
+	SourceDB      string            `json:"source_db"`
+	TemplateName  string            `json:"template_name"`
+	Fingerprint   string            `json:"fingerprint"`
+	DumpHash      string            `json:"dump_hash,omitempty"`
+	InputHashes   map[string]string `json:"input_hashes"`
+	CommandsHash  string            `json:"commands_hash,omitempty"`
+	CachedSnapshot *store.SnapshotRecord `json:"cached_snapshot,omitempty"`
+	CacheHitAvailable bool          `json:"cache_hit_available"`
+}
+
+// InspectFingerprint computes the snapshot fingerprint for one
+// configured database without doing any cold-build work — pure read
+// path. Used by the MCP `inputs_fingerprint` tool so agents can
+// answer "why did this prepare cold-build instead of hitting cache?"
+// without rummaging through every input file by hand.
+//
+// engineVersion is supplied by the caller because probing it requires
+// engine I/O, which is the MCP tool's responsibility (not this
+// pure-CPU helper's). Pass an empty string if you only need a
+// preview — the returned fingerprint won't match the cached one
+// (engine version is mixed into the hash) but the per-input hashes
+// will be accurate.
+func InspectFingerprint(
+	ctx context.Context,
+	st *store.Store,
+	d config.DatabaseConfig,
+	worktreePath, sourceDB, engineVersion string,
+) FingerprintReport {
+	key := computeSnapshotKey(ctx, st, d, worktreePath, sourceDB, engineVersion)
+	rep := FingerprintReport{
+		Engine:        d.Engine,
+		EngineVersion: engineVersion,
+		SourceDB:      sourceDB,
+		TemplateName:  key.TemplateName(),
+		Fingerprint:   key.Fingerprint(),
+		DumpHash:      key.DumpHashHex,
+		InputHashes:   map[string]string{},
+	}
+	for k, v := range key.LockfileHashes {
+		if k == "__commands__" {
+			rep.CommandsHash = v
+			continue
+		}
+		rep.InputHashes[k] = v
+	}
+	if st != nil {
+		if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+			rep.CachedSnapshot = rec
+			rep.CacheHitAvailable = true
+		}
+	}
+	return rep
+}
+
 // staticGlobPrefix returns the longest leading directory of `glob`
 // without glob meta-characters. Used to point the hash subsystem at
 // the right tree to walk.

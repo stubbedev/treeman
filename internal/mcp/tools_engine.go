@@ -32,26 +32,31 @@ func registerEngineReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "engine_status",
 		Description: "Probe every engine declared in .treeman.yaml. For each: reachable? version? per-DB summary (database list for mysql/postgres/mongo; index list for ES; DBSIZE for redis). Call this when the user asks \"are my databases up?\" or before driving prepare_run/worktree_create against a fresh environment.",
+		Annotations: readOnlyAnno("Engine status probe", true),
 	}, engineStatusTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_schema_dump",
 		Description: "Return the live schema for ONE database on a configured engine. mysql/postgres → every table's CREATE TABLE. mongodb → collection list + first-doc samples. elasticsearch → index mapping JSON. redis → SCAN-driven key-pattern summary. engine = the engine string from databases[].engine; db = the rendered per-worktree database/prefix name (use snapshot_inspect or worktree_show to find it). Use when reasoning about live shape vs. what migrations expect.",
+		Annotations: readOnlyAnno("Dump live schema", true),
 	}, dbSchemaDumpTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_query",
 		Description: "Run a READ-ONLY query against a configured engine. SQL engines (mysql/postgres) — only SELECT/SHOW/EXPLAIN/DESCRIBE/WITH accepted; mutations are REFUSED with an error. MongoDB → find-style filter JSON against a named collection. Elasticsearch → JSON _search body against an index. Redis → one command from {GET, MGET, SMEMBERS, HGETALL, KEYS, SCAN, EXISTS, TYPE, TTL, LRANGE, ZRANGE, HKEYS, HVALS, HGET, HMGET, DBSIZE, INFO, PING}. Returns rows/docs/hits as JSON. Use for inspecting live data or verifying a migration's effect.",
+		Annotations: readOnlyAnno("Run read-only query", true),
 	}, dbQueryTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_inspect",
 		Description: "Resolve ONE snapshot (by fingerprint, or by engine+source_db) and report: SQLite row contents, whether the engine-side template still exists, template size, engine version at snapshot time. Call this BEFORE snapshot_drop to confirm you're dropping the right one — and routinely when diagnosing \"cache hit but prepare still failed\": template_exists=false on a fingerprint means the row is an orphan and the next prepare will (correctly) cold-build.",
+		Annotations: readOnlyAnno("Inspect snapshot", true),
 	}, snapshotInspectTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "hook_log_read",
 		Description: "Read the FULL hook log file for one (worktree, phase, group_idx). Hook logs live at <worktree>/.treeman-hooks/<phase>-<group>.log. logs_hooks / hook_runs only stores 16KB tails — use this when you need more context than the tail. max_bytes=N returns just the trailing N bytes (and flags truncated=true).",
+		Annotations: readOnlyAnno("Read hook log", false),
 	}, hookLogReadTool)
 }
 
@@ -59,11 +64,13 @@ func registerEngineWriteTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_drop",
 		Description: "Delete ONE snapshot by fingerprint. Drops the engine-side template (DB / index-prefix / key-prefix / collection-set) AND removes the SQLite row. The next prepare for that fingerprint will cold-rebuild. Use for evicting one stale entry without nuking the rest of the cache; the cache-cleanup prompt drives this for known-orphan sweeps. Call snapshot_inspect first to confirm you're dropping the right fingerprint.",
+		Annotations: writeAnno("Drop snapshot", true, true, true),
 	}, snapshotDropTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_dump",
 		Description: "Generate a dump of a live engine database to disk. mysql → mysqldump; postgres → pg_dump --format=plain --clean --if-exists; mongodb → mongodump --archive; elasticsearch — not yet supported. output_dir defaults to <repo>/storage/dumps. Use this to refresh the seed dump treeman uses for cold builds (commit the new file then trigger prepare_run). Returns the absolute path + byte count.",
+		Annotations: writeAnno("Dump database", false, false, true),
 	}, dbDumpTool)
 }
 

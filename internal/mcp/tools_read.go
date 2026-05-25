@@ -28,77 +28,98 @@ func registerReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "doctor",
 		Description: "Run treeman health checks. Call this FIRST when investigating any \"why isn't treeman working\" question — covers daemon reachability, .treeman.yaml load, JSON schema install, migration framework detection, and registry/git worktree drift. Returns one result per check (status: ok|warn|fail|skip) plus a remediation hint.",
+		Annotations: readOnlyAnno("Treeman doctor", true),
 	}, doctorTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_get",
 		Description: "Read the .treeman.yaml for the current (or specified) repo. Pass resolved=true to see the post-substitution config treeman will actually execute against (env vars expanded, connection strings rendered). Use this before any config_write/config_set to know the current state.",
+		Annotations: readOnlyAnno("Get .treeman.yaml", false),
 	}, configGetTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_validate",
 		Description: "Parse and validate .treeman.yaml; report the first parse or validation error. Run this after every config_write to confirm the file still loads — config_write itself validates, but config_validate covers manual edits made outside MCP.",
+		Annotations: readOnlyAnno("Validate .treeman.yaml", false),
 	}, configValidateTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_schema",
 		Description: "Return the JSON Schema for .treeman.yaml, generated via reflection from config.Config. Use this to drive autocomplete or validate a proposed config body before calling config_write.",
+		Annotations: readOnlyAnno("Config JSON Schema", false),
 	}, configSchemaTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_list",
 		Description: "List active worktrees from the SQLite registry. Optionally filter by repo path. Use this to discover slugs, branches, and paths before calling worktree_show, worktree_delete, or scoping a logs_query.",
+		Annotations: readOnlyAnno("List worktrees", false),
 	}, worktreeListTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_show",
 		Description: "Show details for one worktree: slug, branch, path, created-at, and the most recent finalize event. Use this to confirm a worktree exists and reached finalize before driving prepare_run or hook_run against it.",
+		Annotations: readOnlyAnno("Show worktree", false),
 	}, worktreeShowTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_query",
 		Description: "Query the SQLite event log. The PRIMARY tool for diagnosing anything that happened in treeman — every prepare/finalize/teardown/hook/watcher action emits events. All filters are optional and AND-combined: levels, event_types, phases, since (10m|2h|RFC3339), payload_like, run_id (8-char correlation id stamped on every event from one flow). When watching a long-running prepare, prefer logs_wait over polling this.",
+		Annotations: readOnlyAnno("Query event log", false),
 	}, logsQueryTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_hooks",
 		Description: "List the most recent hook_run rows for one worktree (resolved by slug, branch, or basename). Each row carries the hook command, exit code, and stdout/stderr tails. Pair with hook_log_read when a tail isn't enough.",
+		Annotations: readOnlyAnno("Hook run history", false),
 	}, logsHooksTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "fw_detect",
 		Description: "Detect migration and test frameworks for the current (or specified) repo. Call this BEFORE init_repo to know which scaffold template will be used. Returns the same data as `treeman fw detect --json`.",
+		Annotations: readOnlyAnno("Detect frameworks", true),
 	}, fwDetectTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "slug_compute",
 		Description: "Compute the slug treeman would derive for a worktree path. Call this before worktree_create to know which database/redis prefix/index suffix the new worktree will get.",
+		Annotations: readOnlyAnno("Compute slug", false),
 	}, slugComputeTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_status",
 		Description: "Probe the running treemand for version, PID, and watcher count. Returns status=running when the socket answers, status=not-running when it doesn't. Use this before any daemon-backed action (prepare_run, worktree_create) to confirm the daemon is alive.",
+		Annotations: readOnlyAnno("Daemon status", true),
 	}, daemonStatusTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshots_list",
 		Description: "List cached snapshots (template DBs) for the current (or specified) repo. Use this BEFORE snapshots_purge to see what would be wiped. For per-snapshot drilldown, follow up with snapshot_inspect on each fingerprint.",
+		Annotations: readOnlyAnno("List snapshots", false),
 	}, snapshotsListTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_wait",
 		Description: "Block until at least min_count new events match the supplied filter, or timeout_seconds elapses. Use this instead of polling logs_query when you're watching a long prepare/finalize/teardown to surface its outcome — pair with run_id to scope the wait to one flow's events. Returns the matching events; on timeout returns whatever arrived plus a timed_out=true flag.",
+		Annotations: readOnlyAnno("Wait for events", false),
 	}, logsWaitTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "branches_list",
 		Description: "List local + remote-only git branches for the current (or specified) repo, annotated with whether each branch occupies a live worktree. Call this before worktree_create to pick an unoccupied branch — the same data the CLI's `treeman branches` shows.",
+		Annotations: readOnlyAnno("List branches", true),
 	}, branchesListTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_diff",
 		Description: "Diff a proposed .treeman.yaml body against the current resolved config. Returns added/removed/changed paths so you can preview the effect of config_write before committing. Body is parsed and validated first; a parse error short-circuits the diff.",
+		Annotations: readOnlyAnno("Diff config", false),
 	}, configDiffTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "inputs_fingerprint",
+		Description: "Compute the current snapshot fingerprint for a worktree's databases — the per-input hash breakdown plus whether a matching cached snapshot exists. Use this to answer \"why did this prepare cold-build instead of cache-hit?\": compare the returned input_hashes against the cached_snapshot fields. Omit db_index to report on every database, or pass an integer index to scope. Set probe_engine=true to fetch the live engine version (otherwise the fingerprint won't match the cached one).",
+		Annotations: readOnlyAnno("Inspect input hashes", true),
+	}, inputsFingerprintTool)
 
 	registerEngineReadTools(srv)
 }

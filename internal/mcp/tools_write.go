@@ -38,21 +38,25 @@ func registerWriteTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "prepare_run",
 		Description: "Drive the full prepare pipeline for a worktree (ensure source DB → load dump → run migrate → run seed → snapshot → fanout test clones). Foreground — BLOCKS until every engine returns. Long-running on cold-builds; pair with logs_wait if you need to surface progress to the user while it runs. Use prepare_run when a user-driven schema or seed change needs to propagate; the daemon's watcher already re-runs this on input edits.",
+		Annotations: writeAnno("Run prepare", true, true, true),
 	}, prepareTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "hook_run",
 		Description: "Execute one configured hook phase (setup|teardown) synchronously for a worktree. Returns per-group exit codes and stdout/stderr tails. Use this to re-run a flaky setup phase without recreating the worktree.",
+		Annotations: writeAnno("Run hook phase", true, false, true),
 	}, hookTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_write",
 		Description: "Overwrite .treeman.yaml with the supplied body. Parses the body into config.Config FIRST and only writes if parsing succeeds — invalid YAML never lands on disk. Preview the diff with config_diff before calling this. Returns the byte count written.",
+		Annotations: writeAnno("Write .treeman.yaml", true, true, false),
 	}, configWriteTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_set",
 		Description: "Patch ONE field of .treeman.yaml by dotted path (e.g. 'daemon.gc_interval', 'databases[0].engine'). Preserves surrounding comments + key ordering by editing the YAML AST in place — prefer this over config_write for surgical edits. Creates missing intermediate mapping keys; refuses to extend sequences. The result is validated before the write lands. Returns previous + new value as JSON.",
+		Annotations: writeAnno("Patch config field", false, true, false),
 	}, configSetTool)
 
 	// In-process registry mutations. No shell-out, no daemon dependency
@@ -61,56 +65,67 @@ func registerWriteTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_register",
 		Description: "Add a worktree row to the SQLite registry without touching git. Use this when a worktree exists on disk but treeman doesn't know about it (typically: created via raw `git worktree add`). Slug is auto-computed when omitted. Idempotent — re-registering the same path updates the row. Returns the upserted row id.",
+		Annotations: writeAnno("Register worktree", false, true, false),
 	}, registryRegisterTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_unregister",
 		Description: "Mark a worktree deleted in SQLite without touching git or external resources (databases stay, on-disk path stays). Use this when the on-disk worktree was removed externally and the SQLite row needs to follow. Idempotent. Resolves name by slug, branch, or basename.",
+		Annotations: writeAnno("Unregister worktree", true, true, false),
 	}, registryUnregisterTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_repair",
 		Description: "Reconcile the SQLite registry with `git worktree list`. Registers worktrees git knows that SQLite doesn't and marks deleted those SQLite knows that git doesn't. Use this when registry_register/unregister would be the wrong tool because you don't know which direction the drift is in. Returns per-action counts.",
+		Annotations: writeAnno("Repair registry", true, true, true),
 	}, registryRepairTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_remove",
 		Description: "Drop a REPO from the SQLite registry. Stops the daemon's watchers attached to the repo and cascades to delete child rows (worktrees, events, snapshots, hook_runs). External resources (databases, on-disk worktrees, dump caches) are NOT touched. Refuses by default when active worktrees still exist — pass force=true to override.",
+		Annotations: writeAnno("Remove repo", true, true, false),
 	}, registryRemoveTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshots_purge",
 		Description: "DELETE every cached snapshot (template DB) belonging to one repo. Frees engine-side storage and forces the next prepare to cold-build from scratch. Use snapshots_list FIRST to see what will be wiped. For targeted eviction of only stale entries, use the cache-cleanup prompt instead. Returns counts + per-engine errors.",
+		Annotations: writeAnno("Purge snapshots", true, true, true),
 	}, snapshotsPurgeTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_purge",
 		Description: "Delete event-log rows. Filters are AND-combined; pass older_than=24h to drop anything older. At least one filter is REQUIRED to prevent accidental full wipes. Returns the row count removed.",
+		Annotations: writeAnno("Purge events", true, false, false),
 	}, logsPurgeTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "schema_install",
 		Description: "Generate the JSON Schema for .treeman.yaml and wire it into the yaml-language-server modeline so editor autocomplete + inline validation work. target=repo writes <repo>/schemas/treeman.schema.json (default). target=global writes a user-XDG path shared across repos. target=url skips the file write and points the modeline at the canonical upstream URL.",
+		Annotations: writeAnno("Install schema", false, true, false),
 	}, schemaInstallTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "init_repo",
 		Description: "Scaffold a fresh .treeman.yaml under cwd (or --repo). Auto-detects migration framework + JS package manager and emits matching databases/hooks blocks. Use the scaffold-from-framework prompt for the full guided flow. Pass force=true to overwrite an existing file. Returns the chosen path, byte count, and detected framework names.",
+		Annotations: writeAnno("Scaffold config", false, false, false),
 	}, initRepoTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_control",
 		Description: "Start or stop treemand. action ∈ {start, stop}. Prefers the installed systemd/launchd unit when present; otherwise forks the treemand binary (start) or sends the shutdown RPC (stop). Use this only when daemon_status reports not-running and you need it back up.",
+		Annotations: writeAnno("Daemon control", true, true, true),
 	}, daemonControlTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_create",
 		Description: "Create a new git worktree under .worktrees/<branch> AND dispatch setup hooks + prepare via the daemon. Shells to `treeman wt create`. LONG-RUNNING (whole cold-build runs synchronously). Use branches_list first to pick an unoccupied branch. Returns captured stdout/stderr + exit code.",
+		Annotations: writeAnno("Create worktree", false, false, true),
 	}, worktreeCreateTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_delete",
 		Description: "Tear down a worktree end-to-end: run teardown hooks → drop databases/redis prefixes/ES indices → remove the git worktree directory. Shells to `treeman wt delete`. Use worktree_show first to confirm the right slug. Returns captured stdout/stderr + exit code.",
+		Annotations: writeAnno("Delete worktree", true, true, true),
 	}, worktreeDeleteTool)
 
 	registerEngineWriteTools(srv)

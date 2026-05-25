@@ -45,6 +45,27 @@ func registerPrompts(srv *mcpsdk.Server) {
 			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
 		},
 	}, cacheCleanupPrompt)
+
+	srv.AddPrompt(&mcpsdk.Prompt{
+		Name:        "worktree-setup",
+		Title:       "Create a worktree end-to-end",
+		Description: "Walks through picking an unoccupied branch, computing the slug, creating the worktree (which triggers prepare + setup hooks), waiting for finalize, and reporting the result. Best when the user says \"set me up a worktree for branch X\" but hasn't decided how to verify success.",
+		Arguments: []*mcpsdk.PromptArgument{
+			{Name: "branch", Description: "branch name to base the worktree on; omit to let the agent recommend one from branches_list", Required: false},
+			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
+		},
+	}, worktreeSetupPrompt)
+
+	srv.AddPrompt(&mcpsdk.Prompt{
+		Name:        "migration-trial",
+		Title:       "Trial a migration in an ephemeral worktree",
+		Description: "Creates a throw-away worktree, runs the user's migrate step against it, reports the outcome (plus any schema deltas via db_schema_dump), and tears the worktree down. Use this to validate a migration change BEFORE merging — without polluting any existing worktree's database state.",
+		Arguments: []*mcpsdk.PromptArgument{
+			{Name: "branch", Description: "branch carrying the migration to trial", Required: true},
+			{Name: "db_index", Description: "index into databases[] to focus the schema diff on; omit to skip the diff step", Required: false},
+			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
+		},
+	}, migrationTrialPrompt)
 }
 
 // userMsg wraps a string in the one-user-message-result shape every
@@ -131,6 +152,86 @@ Execute these tool calls in order:
 Report: the detected framework(s), the path written, the resolved databases[] block, and one short paragraph telling the user what to verify before running 'treeman prepare'.`, repoArg, repoArg)
 
 	return userMsg(text), nil
+}
+
+func worktreeSetupPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcpsdk.GetPromptResult, error) {
+	branch := req.Params.Arguments["branch"]
+	repo := req.Params.Arguments["repo"]
+	repoArg := ""
+	if repo != "" {
+		repoArg = "repo=\"" + repo + "\""
+	}
+
+	branchStep := ""
+	if branch == "" {
+		branchStep = `1. branches_list (` + repoArg + `) — list local + origin-only branches. RECOMMEND one branch to the user (prefer: has_local=true AND worktree_dir empty; otherwise has_remote=true AND worktree_dir empty). ASK the user to confirm or pick a different branch before continuing.`
+	} else {
+		branchStep = fmt.Sprintf(`1. branches_list (%s) — verify branch=%q is not already occupying a worktree (worktree_dir empty). If it is, STOP and tell the user which worktree currently has it.`, repoArg, branch)
+	}
+
+	text := fmt.Sprintf(`Set up a fresh worktree end-to-end. Do NOT skip the wait step — without it, the user can't tell whether prepare actually succeeded.
+
+%s
+
+2. daemon_status — confirm treemand is running. If status=not-running, call daemon_control(action="start") and verify status flips to running before proceeding.
+
+3. slug_compute (path=".worktrees/<branch>") — preview the slug so you can tell the user which database/redis prefix/index suffix the new worktree will get.
+
+4. worktree_create (branch=%q, %s) — this BLOCKS until the cold-build finishes. May take minutes on first runs. Capture stdout/stderr.
+
+5. If worktree_create returned a non-zero exit code, IMMEDIATELY chain into the diagnose-prepare-failure prompt (pass run_id if visible in the output). Do NOT proceed to verify if create failed.
+
+6. worktree_show — confirm the new worktree is registered, with the expected slug and branch.
+
+Report: the slug, the absolute worktree path, total wall-clock time, and one short verification command the user can run inside the worktree to sanity-check the app sees the new database.`,
+		branchStep, ifEmpty(branch, "<chosen-branch>"), repoArg)
+
+	return userMsg(text), nil
+}
+
+func migrationTrialPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcpsdk.GetPromptResult, error) {
+	branch := req.Params.Arguments["branch"]
+	dbIdx := req.Params.Arguments["db_index"]
+	repo := req.Params.Arguments["repo"]
+	repoArg := ""
+	if repo != "" {
+		repoArg = "repo=\"" + repo + "\", "
+	}
+	schemaDiffStep := ""
+	if dbIdx != "" {
+		schemaDiffStep = fmt.Sprintf(`
+6. db_schema_dump (engine=<from cfg.databases[%s].engine>, db=<from worktree_show>) — capture the post-migration schema. Compare against the pre-migration schema (run the same call against an unmodified worktree's db if one exists, or against the source DB before migration ran).`, dbIdx)
+	}
+
+	text := fmt.Sprintf(`Trial the migration on branch %q in a throw-away worktree. The worktree MUST be torn down at the end regardless of outcome — otherwise we leak DB state.
+
+Execute these tool calls in order:
+
+1. branches_list (%s) — confirm branch=%q exists. If not, STOP.
+
+2. daemon_status — confirm treemand is up. Start it if not.
+
+3. worktree_create (%sbranch=%q) — blocks until cold-build finishes. The migrate step runs as part of create.
+
+4. CAPTURE the run_id from worktree_create's output for later log queries.
+
+5. If create returned non-zero, fetch logs_query (run_id=..., levels=["error"]) and report the failing step. Then SKIP to step 7 (always teardown).
+%s
+7. worktree_delete (branch=%q) — ALWAYS run this, even on failure. The trial is throw-away by design.
+
+Report: did the migration succeed? If yes, the schema delta (table-level summary). If no, the failing step and the exact error line.`,
+		branch, repoArg, branch, repoArg, branch, schemaDiffStep, branch)
+
+	return userMsg(text), nil
+}
+
+// ifEmpty returns dflt when s is empty, otherwise s. Used to keep
+// the prompt body parameterised when the user didn't supply a value.
+func ifEmpty(s, dflt string) string {
+	if s == "" {
+		return dflt
+	}
+	return s
 }
 
 func cacheCleanupPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcpsdk.GetPromptResult, error) {

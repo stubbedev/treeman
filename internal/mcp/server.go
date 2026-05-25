@@ -32,7 +32,12 @@ func Serve(ctx context.Context) error {
 	srv := mcpsdk.NewServer(&mcpsdk.Implementation{
 		Name:    "treeman",
 		Version: version.Version,
-	}, nil)
+	}, &mcpsdk.ServerOptions{
+		// CompletionHandler powers `completion/complete` — interactive
+		// clients use it to autofill prompt args (branch, worktree,
+		// fingerprint, run_id) and resource-template slots.
+		CompletionHandler: completionHandler,
+	})
 
 	registerReadTools(srv)
 	registerResources(srv)
