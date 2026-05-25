@@ -319,11 +319,15 @@ Examples:
 
 			// Destructive: teardown hooks + DROP DATABASE × N +
 			// git worktree remove. Confirm with the user on a TTY;
-			// scripts and `--yes` skip the prompt.
+			// scripts and `--yes` skip the prompt. A user "no" is
+			// not a failure — print a clean line and exit 0 so
+			// scripts using `--yes` are the only ones that ever see
+			// a non-zero exit from this command.
 			if !c.Bool("yes") {
 				q := fmt.Sprintf("delete worktree %s and drop its databases?", wtPath)
 				if !ui.Confirm(q) {
-					return fmt.Errorf("aborted")
+					PrintInfo("aborted: worktree %s left intact", wtPath)
+					return nil
 				}
 			}
 
