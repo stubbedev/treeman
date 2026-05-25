@@ -49,7 +49,7 @@ func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
 			url = containerip.RewriteHostPortInURIWithPort(url, addr.Host, addr.Port)
 		}
 	}
-	if err := reachability.ProbeURL("redis", url); err != nil {
+	if err := reachability.ProbeURLCtx(ctx, "redis", url); err != nil {
 		return nil, err
 	}
 	if _, err := redis.ParseURL(url); err != nil {

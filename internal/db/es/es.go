@@ -46,7 +46,7 @@ func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 			url = containerip.RewriteHostPortInURIWithPort(url, addr.Host, addr.Port)
 		}
 	}
-	if err := reachability.ProbeURL("elasticsearch", url); err != nil {
+	if err := reachability.ProbeURLCtx(ctx, "elasticsearch", url); err != nil {
 		return nil, err
 	}
 	return &Driver{
