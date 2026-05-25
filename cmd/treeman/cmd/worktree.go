@@ -239,9 +239,7 @@ Examples:
 
 // dispatchFinalize attempts to hand setup + prepare to the
 // daemon. Returns true when the daemon successfully queued the work.
-// On the first RPC error this also tries `ensureDaemon` and retries
-// once, so a daemon that's merely been signalled-but-not-yet-up gets
-// a chance to come back before we resort to detaching a child.
+// See dispatchToDaemon for the retry semantics.
 func dispatchFinalize(ctx context.Context, repoRoot, wtPath string, env map[string]string) bool {
 	req := rpc.Request{
 		Method: rpc.MethodWorktreeFinalize,
@@ -251,24 +249,9 @@ func dispatchFinalize(ctx context.Context, repoRoot, wtPath string, env map[stri
 			InheritedEnv: env,
 		},
 	}
-	if resp, err := rpc.Call(ctx, req); err == nil {
-		if resp.Kind == rpc.KindWorktreeFinalizeQueued {
-			PrintOK("queued: setup + prepare detached to daemon — follow with `treeman logs tail --follow`")
-			return true
-		}
-		if resp.Kind == rpc.KindError {
-			PrintWarn("daemon: %s", resp.Message)
-		}
-	} else {
-		PrintWarn("daemon RPC failed (%v); trying daemon restart", err)
-		if startErr := ensureDaemon(ctx); startErr == nil {
-			if resp, err := rpc.Call(ctx, req); err == nil && resp.Kind == rpc.KindWorktreeFinalizeQueued {
-				PrintOK("queued: setup + prepare detached to daemon (auto-restarted)")
-				return true
-			}
-		}
-	}
-	return false
+	return dispatchToDaemon(ctx, req, rpc.KindWorktreeFinalizeQueued,
+		"setup + prepare detached to daemon — follow with `treeman logs tail --follow`",
+		"setup + prepare detached to daemon (auto-restarted)")
 }
 
 func wtDelete() *cli.Command {
@@ -789,9 +772,7 @@ func wtFinalize() *cli.Command {
 	}
 }
 
-// dispatchTeardown is the wt-delete twin of dispatchFinalize: tries
-// the daemon, retries once after ensureDaemon on RPC failure, and
-// returns true when the daemon successfully queued the teardown.
+// dispatchTeardown is the wt-delete twin of dispatchFinalize.
 func dispatchTeardown(ctx context.Context, repoRoot, wtPath string, force bool, env map[string]string) bool {
 	req := rpc.Request{
 		Method: rpc.MethodWorktreeTeardown,
@@ -802,22 +783,35 @@ func dispatchTeardown(ctx context.Context, repoRoot, wtPath string, force bool, 
 			InheritedEnv: env,
 		},
 	}
-	if resp, err := rpc.Call(ctx, req); err == nil {
-		if resp.Kind == rpc.KindWorktreeTeardownQueued {
-			PrintOK("queued: teardown + DB teardown + git remove detached to daemon — follow with `treeman logs tail --follow`")
+	return dispatchToDaemon(ctx, req, rpc.KindWorktreeTeardownQueued,
+		"teardown + DB teardown + git remove detached to daemon — follow with `treeman logs tail --follow`",
+		"teardown + DB teardown + git remove detached to daemon (auto-restarted)")
+}
+
+// dispatchToDaemon issues an RPC, prints okMsg + returns true if the
+// daemon responded with wantKind. On RPC failure, runs ensureDaemon
+// and retries once; on retry success, prints restartedMsg instead.
+// Returns false when neither attempt succeeds — callers then fall
+// back to a detached child / inline run.
+func dispatchToDaemon(ctx context.Context, req rpc.Request, wantKind, okMsg, restartedMsg string) bool {
+	resp, err := rpc.Call(ctx, req)
+	if err == nil {
+		if resp.Kind == wantKind {
+			PrintOK("queued: %s", okMsg)
 			return true
 		}
 		if resp.Kind == rpc.KindError {
 			PrintWarn("daemon: %s", resp.Message)
 		}
-	} else {
-		PrintWarn("daemon RPC failed (%v); trying daemon restart", err)
-		if startErr := ensureDaemon(ctx); startErr == nil {
-			if resp, err := rpc.Call(ctx, req); err == nil && resp.Kind == rpc.KindWorktreeTeardownQueued {
-				PrintOK("queued: teardown + DB teardown + git remove detached to daemon (auto-restarted)")
-				return true
-			}
-		}
+		return false
+	}
+	PrintWarn("daemon RPC failed (%v); trying daemon restart", err)
+	if startErr := ensureDaemon(ctx); startErr != nil {
+		return false
+	}
+	if resp, err := rpc.Call(ctx, req); err == nil && resp.Kind == wantKind {
+		PrintOK("queued: %s", restartedMsg)
+		return true
 	}
 	return false
 }

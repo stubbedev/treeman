@@ -12,16 +12,15 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/ident"
-	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
 // Driver wraps a *sql.DB plus the connection config used to open it.
@@ -55,32 +54,8 @@ func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
 			Network:        cfg.Network,
 			InternalPort:   cfg.Port,
 		}
-		if addr, err := containerip.ResolveAddr(opts); err != nil {
-			return nil, fmt.Errorf("resolve container: %w", err)
-		} else if addr != nil {
-			cfg.Host = addr.Host
-			if addr.Port != 0 {
-				cfg.Port = addr.Port
-			}
-		}
-		if err := reachability.ProbeCtx(ctx, "mysql", cfg.Host, cfg.Port); err != nil {
-			// Container IP/port may have changed (restart); evict + retry once.
-			if cfg.Container != "" || cfg.ComposeService != "" {
-				containerip.RefreshOpts(opts)
-				if addr, e := containerip.ResolveAddr(opts); e == nil && addr != nil {
-					cfg.Host = addr.Host
-					if addr.Port != 0 {
-						cfg.Port = addr.Port
-					}
-					if err2 := reachability.ProbeCtx(ctx, "mysql", cfg.Host, cfg.Port); err2 != nil {
-						return nil, err2
-					}
-				} else {
-					return nil, err
-				}
-			} else {
-				return nil, err
-			}
+		if err := adapter.ResolveAndProbe(ctx, "mysql", opts, &cfg.Host, &cfg.Port); err != nil {
+			return nil, err
 		}
 	}
 	var dsn string
@@ -103,34 +78,12 @@ func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open mysql: %w", err)
 	}
-	configurePool(db, int(cfg.PoolMax))
+	adapter.ConfigurePool(db, int(cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping mysql: %w", err)
 	}
 	return &Driver{DB: db, cfg: cfg}, nil
-}
-
-// configurePool applies sensible defaults to a freshly-opened pool.
-// Without these, database/sql defaults to MaxIdleConns=2 (so most
-// connections close immediately after use) and no max lifetime
-// (so connections stay open across server restarts and trip
-// "connection reset" errors when the server recycles).
-func configurePool(db *sql.DB, poolMax int) {
-	if poolMax > 0 {
-		db.SetMaxOpenConns(poolMax)
-		// Keep idle ~= open so the pool actually pools instead of
-		// thrashing connect/disconnect under steady load.
-		idle := poolMax / 2
-		if idle < 1 {
-			idle = 1
-		}
-		db.SetMaxIdleConns(idle)
-	}
-	// Recycle every 30m so a server restart or upstream network
-	// shuffle doesn't leave us holding dead handles.
-	db.SetConnMaxLifetime(30 * time.Minute)
-	db.SetConnMaxIdleTime(5 * time.Minute)
 }
 
 // Close shuts down the pool.
