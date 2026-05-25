@@ -58,10 +58,13 @@ Methods:
 |---|---|---|
 | `ping` | — | `{ kind: "pong" }` |
 | `status` | — | `{ kind: "status", daemon_version, pid, watcher_count }` |
-| `repo_register` | `{ path }` | `{ kind: "repo_registered", repo_id }` |
-| `worktree_finalize` | `{ repo_path, worktree_path, slug, inherited_env }` | `{ kind: "worktree_finalize_queued" }` |
+| `repo_register` | `{ path, name }` | `{ kind: "repo_registered", repo_id }` |
+| `repo_remove` | `{ repo_path, force }` | `{ kind: "repo_removed" }` |
+| `worktree_list` | `{ repo_path }` | `{ kind: "worktree_list", worktrees: [...] }` |
+| `worktree_finalize` | `{ repo_path, worktree_path, inherited_env }` | `{ kind: "worktree_finalize_queued" }` |
 | `worktree_teardown` | `{ repo_path, worktree_path, force, inherited_env }` | `{ kind: "worktree_teardown_queued" }` |
 | `watcher_start` / `watcher_stop` / `watcher_list` | `{ repo_path }` | `{ kind: "watcher_*" }` |
+| `config_reload` | `{ repo_path }` (empty = reload all) | `{ kind: "config_reloaded" }` |
 | `shutdown` | — | `{ kind: "shutdown_acked" }` |
 
 The `inherited_env` field carries the calling shell's environment

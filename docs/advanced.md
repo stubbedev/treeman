@@ -22,24 +22,24 @@ disk usage bounded without you having to babysit it.
 `treeman fw detect` lists every framework treeman recognises in
 the current repo. Built-in detectors:
 
-| Framework | Marker | Migration dir(s) | Hash mode |
+| Framework | Marker(s) | Migration dir(s) | Hash mode |
 |---|---|---|---|
-| Laravel | `artisan` | `database/migrations`, `app/Modules/*/Database/Migrations` | filename |
-| Rails | `bin/rails`, `Gemfile`, `config/database.yml` | `db/migrate` | filename |
-| Django | `manage.py` | `**/migrations` | filename |
-| golang-migrate | `go.mod` | `**/migrations` | filename |
-| sqlx-cli | `Cargo.toml`, `migrations/` | `migrations`, `crates/*/migrations` | checksum |
+| laravel | `artisan` | `database/migrations`, `app/Modules/*/Database/Migrations` | filename |
+| rails | `bin/rails`, `Gemfile`, `config/database.yml` | `db/migrate`, `engines/*/db/migrate` | filename |
+| django | `manage.py` | `**/migrations` | filename |
+| golang-migrate | `go.mod` | `**/migrations`, `services/*/migrations`, `cmd/*/migrations` | filename |
+| sqlx-cli | `Cargo.toml` + `migrations/` | `migrations`, `crates/*/migrations`, `services/*/migrations` | checksum |
 | diesel | `diesel.toml` | `migrations`, `crates/*/migrations` | filename |
-| dbmate | `db/migrations` | `db/migrations` | filename |
-| Knex | `knexfile.{js,ts}` | `migrations`, `db/migrations` | filename |
-| Drizzle | `drizzle.config.{ts,js}` | `drizzle`, `src/drizzle/migrations` | filename |
-| Prisma | `prisma/schema.prisma` | `prisma/migrations` | filename |
-| TypeORM | `data-source.{ts,js}` | `src/migrations`, `migrations` | filename |
-| mikro-orm | `mikro-orm.config.*` | `src/migrations` | filename |
-| Flyway | `flyway.{conf,toml}` | `db/migration`, `src/main/resources/db/migration` | checksum |
-| goose | `dbmate`-style with `.sql` | `db/migrations` | filename |
+| prisma | `prisma/schema.prisma` | `prisma/migrations`, `apps/*/prisma/migrations`, `packages/*/prisma/migrations` | checksum |
+| knex | `knexfile.{js,ts,cjs,mjs}` | `migrations`, `apps/*/migrations`, `packages/*/migrations` | filename |
+| alembic | `alembic.ini` | `**/versions` | filename |
+| flyway | `flyway.conf` | `**/db/migration` | checksum |
+| typeorm | `data-source.{ts,js}`, `ormconfig.*`, `typeorm.config.*` | `src/migrations`, `src/migration`, `migrations`, monorepo variants | filename |
+| drizzle | `drizzle.config.{ts,js,mjs,cjs,mts,json}` | `drizzle`, `apps/*/drizzle`, `packages/*/drizzle` | checksum |
+| sequelize | `.sequelizerc{,.js,.cjs}` | `migrations`, `apps/*/migrations`, `packages/*/migrations` | filename |
+| mikro-orm | `mikro-orm.config.{ts,js,cjs}` | `src/migrations`, `apps/*/src/migrations`, `packages/*/src/migrations` | filename |
 
 `HashFilename` mode skips file IO (Laravel/Rails/Django don't
 mutate migrations; new files alone change the hash). `HashChecksum`
-hashes contents (sqlx-cli/Flyway mutate in place).
+hashes contents (sqlx-cli / Prisma / Drizzle / Flyway mutate in place).
 

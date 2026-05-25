@@ -45,8 +45,11 @@ event log records every step.
   OpenSearch.
 - **Snapshot cache** with LRU eviction — repeated `wt create` on
   the same migrations + dump hits a cached template DB.
-- **Hook groups** — declarative DAG of postcreate / predelete
-  commands. Within a group: sequence. Across groups: parallel.
+- **Hook lifecycle** — declarative `on-create-before-engines` /
+  `on-create-after-engines` / `on-delete-before-engines` /
+  `on-delete-after-engines` / `on-checkout` / `on-file-change`
+  trigger lists. Actions in one list run in parallel; the
+  `run:` steps inside one action chain sequentially with `&&`.
 - **Parallel test runner support** — `clones: auto` detects
   worker counts from phpunit.xml, pytest-xdist, Jest, vitest,
   paratest, cargo nextest, etc.
@@ -88,12 +91,15 @@ Via Homebrew (macOS + Linux):
 brew install stubbedev/treeman/treeman
 ```
 
-Prebuilt tarballs for every tagged release:
+Prebuilt tarballs for every tagged release. The asset filename
+embeds the version, so resolve the latest tag first:
 
 ```sh
-# linux/amd64 example — substitute the platform you need
+# linux/amd64 example — substitute the platform (darwin-amd64,
+# darwin-arm64, linux-arm64) you need.
+VER=$(curl -fsSL https://api.github.com/repos/stubbedev/treeman/releases/latest | grep '"tag_name":' | cut -d'"' -f4 | sed 's/^v//')
 curl -L -o /tmp/treeman.tgz \
-  https://github.com/stubbedev/treeman/releases/latest/download/treeman-1.0.1-linux-amd64.tar.gz
+  "https://github.com/stubbedev/treeman/releases/download/v${VER}/treeman-${VER}-linux-amd64.tar.gz"
 tar -xzf /tmp/treeman.tgz -C /tmp
 install /tmp/treeman-*-linux-amd64/treeman  ~/.local/bin/
 install /tmp/treeman-*-linux-amd64/treemand ~/.local/bin/
@@ -163,19 +169,20 @@ cd "$(treeman wt back --remove)"
 ```
 
 A ready-to-source zsh shim that wraps `wt switch` / `wt back` for
-`cd`-into-worktree UX lives at `contrib/shim.zsh`:
+`cd`-into-worktree UX lives at `contrib/tm.zsh` (exposes a `tm`
+shell function):
 
 ```sh
 # In ~/.zshrc:
-source /path/to/treeman/contrib/shim.zsh
+source /path/to/treeman/contrib/tm.zsh
 
 # Then:
-wt proj-123          # cd into existing worktree (or report missing)
-wt proj-123 -c       # create + cd to new worktree
-wt new proj-123      # same as `wt proj-123 -c`
-wt -                 # cd back to main repo
-wt - --remove        # cd back + drop current worktree if clean
-wt list              # passthrough to `treeman wt list`
+tm proj-123          # cd into existing worktree (or report missing)
+tm proj-123 -c       # create + cd to new worktree
+tm new proj-123      # same as `tm proj-123 -c`
+tm -                 # cd back to main repo
+tm - --remove        # cd back + drop current worktree if clean
+tm list              # passthrough to `treeman wt list`
 ```
 
 ---

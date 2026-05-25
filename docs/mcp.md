@@ -8,32 +8,31 @@ speaks MCP — can drive the same lifecycle a human drives from the
 CLI. Transport is stdio; no extra processes, no network surface.
 
 ```sh
-treeman mcp                                    # read-only tools
-treeman mcp --allow-mutations                  # + in-process write tools (config_write, config_set, init_repo, schema_install, hook_run, prepare_run, registry_*, snapshots_purge, logs_purge)
-treeman mcp --allow-mutations --allow-shell    # + remaining shell-out tools (wt create/delete, daemon control)
+treeman mcp                                    # all tools exposed
 ```
 
-Permissions stack — `--allow-shell` implies `--allow-mutations`.
-The defaults are conservative on purpose: a fresh `treeman mcp`
-call exposes only read-only tools, so an agent can inspect state
-(list worktrees, query logs, run `doctor`, compute slugs) without
-being able to change anything.
+`treeman mcp` takes no permission flags — every tool (read, write,
+engine introspection, worktree lifecycle) is exposed unconditionally.
+The MCP surface is designed as the fully-qualified link to treeman;
+clients that want a restricted surface should enforce that at the
+agent-policy layer (Claude Code's tool allow-list, Cursor's MCP
+allow rules, etc.), not here.
 
 ## Tools exposed
 
-| Tool | Gate | What it does |
-|---|---|---|
-| `doctor`, `daemon_status` | read | Health checks. |
-| `config_get`, `config_validate`, `config_schema` | read | Read/validate the YAML config. `config_get` output is redacted (passwords in resolved connection strings). |
-| `worktree_list`, `worktree_show`, `snapshots_list` | read | Registry + snapshot-cache queries. |
-| `logs_query`, `logs_hooks` | read | Event log + hook run history. Output is run through a secret-redaction pass (URI userinfo, AWS/GitHub tokens, JWTs, `KEY=value` for password/secret/token-shaped keys) before returning to the client. |
-| `fw_detect`, `slug_compute` | read | Detection helpers. |
-| `config_write`, `config_set`, `hook_run`, `prepare_run` | `--allow-mutations` | Replace the whole YAML body, patch a single field by dotted path, run a hook phase, run the prepare pipeline. |
-| `init_repo`, `schema_install` | `--allow-mutations` | Scaffold `.treeman.yaml`; install the JSON Schema (`target=repo` / `target=global` / `target=url`) and wire its modeline. Both in-process — no shell-out. |
-| `registry_register`, `registry_unregister`, `registry_repair` | `--allow-mutations` | Mutate the SQLite worktree registry directly. `repair` diffs `git worktree list` vs SQLite and auto-reconciles drift. |
-| `snapshots_purge`, `logs_purge` | `--allow-mutations` | Wipe the snapshot cache (forces next prepare to rebuild) / delete event-log rows by filter (at least one filter required). |
-| `daemon_control` | `--allow-mutations` | Start / stop treemand. Prefers the installed systemd/launchd unit; otherwise forks the `treemand` binary (start) or sends the shutdown RPC (stop). |
-| `worktree_create`, `worktree_delete` | `--allow-shell` | Run the full git + hooks + prepare lifecycle in-process via `internal/wt`. The heavy tail (hooks + prepare for create; teardown for delete) is dispatched to the daemon; on daemon-unreachable the orchestrator spawns a detached `treeman wt finalize --local` / `wt delete --detached` child and returns immediately. Returns a structured result (`wt_path`, `status`, `slug`, `worktree_id`, `log_path`). |
+| Tool | What it does |
+|---|---|
+| `doctor`, `daemon_status` | Health checks. |
+| `config_get`, `config_validate`, `config_schema` | Read/validate the YAML config. `config_get` output is redacted (passwords in resolved connection strings). |
+| `worktree_list`, `worktree_show`, `snapshots_list` | Registry + snapshot-cache queries. |
+| `logs_query`, `logs_hooks` | Event log + hook run history. Output is run through a secret-redaction pass (URI userinfo, AWS/GitHub tokens, JWTs, `KEY=value` for password/secret/token-shaped keys) before returning to the client. |
+| `fw_detect`, `slug_compute` | Detection helpers. |
+| `config_write`, `config_set`, `hook_run`, `prepare_run` | Replace the whole YAML body, patch a single field by dotted path, run a hook phase, run the prepare pipeline. |
+| `init_repo`, `schema_install` | Scaffold `.treeman.yaml`; install the JSON Schema (`target=repo` / `target=global` / `target=url`) and wire its modeline. Both in-process. |
+| `registry_register`, `registry_unregister`, `registry_repair` | Mutate the SQLite worktree registry directly. `repair` diffs `git worktree list` vs SQLite and auto-reconciles drift. |
+| `snapshots_purge`, `logs_purge` | Wipe the snapshot cache (forces next prepare to rebuild) / delete event-log rows by filter (at least one filter required). |
+| `daemon_control` | Start / stop treemand. Prefers the installed systemd/launchd unit; otherwise forks the `treemand` binary (start) or sends the shutdown RPC (stop). |
+| `worktree_create`, `worktree_delete` | Run the full git + hooks + prepare lifecycle in-process via `internal/wt`. The heavy tail (hooks + prepare for create; teardown for delete) is dispatched to the daemon; on daemon-unreachable the orchestrator spawns a detached `treeman wt finalize --local` / `wt delete --detached` child and returns immediately. Returns a structured result (`wt_path`, `status`, `slug`, `worktree_id`, `log_path`). |
 
 ## Claude Code
 
@@ -42,13 +41,13 @@ command:
 
 ```sh
 # User-scoped (available across every project on this machine)
-claude mcp add --scope user treeman -- treeman mcp --allow-mutations --allow-shell
+claude mcp add --scope user treeman -- treeman mcp
 
 # Project-scoped (committed to .mcp.json in the repo root)
-claude mcp add --scope project treeman -- treeman mcp --allow-mutations
+claude mcp add --scope project treeman -- treeman mcp
 
 # Local-scoped (private to you in this project — `claude mcp add`'s default)
-claude mcp add treeman -- treeman mcp --allow-mutations
+claude mcp add treeman -- treeman mcp
 ```
 
 Confirm it registered with `claude mcp list`. Inside a session,
@@ -66,7 +65,7 @@ on Linux: `~/.config/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "treeman": {
       "command": "treeman",
-      "args": ["mcp", "--allow-mutations", "--allow-shell"]
+      "args": ["mcp"]
     }
   }
 }
@@ -84,7 +83,7 @@ Add to `~/.cursor/mcp.json` (global) or `<repo>/.cursor/mcp.json`
   "mcpServers": {
     "treeman": {
       "command": "treeman",
-      "args": ["mcp", "--allow-mutations"]
+      "args": ["mcp"]
     }
   }
 }
@@ -100,14 +99,16 @@ wrap the command in anything that mixes the two.
 ## Security notes
 
 - The MCP server runs **as the invoking user** with full access
-  to the repo, the daemon socket, and any `.env` files. Only
-  enable `--allow-shell` for agents you trust to call
-  `wt create/delete` on your behalf.
+  to the repo, the daemon socket, and any `.env` files. Every
+  tool is exposed unconditionally — there is no in-binary gate.
+  Restrict the exposed surface at the **agent-policy layer**
+  (Claude Code's per-tool allow rules, Cursor's MCP allow list,
+  etc.) for any agent you don't fully trust.
 - `worktree_delete` from MCP runs `wt.Delete` in-process. The
   TTY confirmation prompt is a CLI-only concern (it lives in
   the `wt delete` action closure, not the orchestrator), so MCP
   callers get **no confirmation** — every `worktree_delete`
-  invocation runs the teardown. Treat `--allow-shell` accordingly.
+  invocation runs the teardown.
 - Hook stdout/stderr and event payloads pass through
   `redactSecrets` (see `internal/mcp/ops.go`) before being
   returned to the client. False positives just hide a token;

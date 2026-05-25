@@ -66,18 +66,22 @@ databases:
       name_template: "myapp_testing_{slug}_test_{n}"
 
 hooks:
-  on-create-before-engines:                # sequenced, runs before engines come up
-    - "git pull --ff-only"
-  on-create-after-engines:                 # async (parallel groups)
-    - composer install --no-interaction --prefer-dist
-    - yarn install --frozen-lockfile
-    - group:
-        - cd frontend && yarn install
-        - cd frontend && yarn build:dev
-  on-delete-before-engines:                # async; runs before git worktree remove
-    - "echo dropping caches"
+  # Every entry under a trigger key is an action; actions in one
+  # list run in PARALLEL. `run:` itself takes a string (one step) or
+  # a list (steps chain sequentially with `&&` — failure short-circuits).
+  on-create-before-engines:                # fires after patches + bring-in, BEFORE engine prepare
+    - run: "git pull --ff-only"
+  on-create-after-engines:                 # fires after engine prepare
+    - run: composer install --no-interaction --prefer-dist
+    - run: yarn install --frozen-lockfile
+    - cwd: frontend                        # multi-step action — cd + build chain sequentially
+      run:
+        - yarn install
+        - yarn build:dev
+  on-delete-before-engines:                # fires BEFORE engine drop + git remove
+    - run: "echo dropping caches"
   on-file-change:                          # filtered by `match:` against input labels
-    - match: migrations
+    - match: migrations                    # accepts string or list (e.g. [migrations, seeders])
       run: "echo migrations changed"
 
 snapshots:
@@ -123,38 +127,47 @@ The built-in framework presets exist solely as init-time templates
 and are listed by `treeman fw detect`. Copy fields in by hand for
 custom layouts.
 
-## Hook groups
+## Hooks
 
-Each entry under `on-create-after-engines` / `on-delete-before-engines`
-/ `on-delete-after-engines` is a **group**. Within a group: commands
-run in sequence (first non-zero exit aborts the group). Across groups:
-groups run in **parallel**. Each group becomes one `setsid`-detached
-driver, so the CLI returns immediately after spawning drivers.
+Each entry under a trigger key (e.g. `on-create-after-engines`) is
+one **action**. Actions in the same list run in **parallel**. The
+`run:` field inside one action is the action's step list — steps
+chain sequentially with `&&` so the first non-zero exit aborts the
+remaining steps of that action.
 
-Three forms:
+Every action must be a mapping with at minimum a `run:` field
+(bare-string entries like `- "composer install"` were removed in
+2.x — wrap them as `- run: "composer install"`).
 
 ```yaml
 hooks:
   on-create-after-engines:
-    # bare string — one-command group
-    - "composer install"
+    # single-step action — `run:` is a string
+    - run: "composer install"
 
-    # map — one-command group with extra fields
-    - { run: "yarn build", cwd: frontend, env: { NODE_ENV: production } }
+    # action that pins cwd (host-side) and runs ONE step
+    - cwd: frontend
+      run: "yarn build"
 
-    # sequence — multi-command group, commands chain with &&
-    - group:
-        - "npm install"
-        - "npm run build"
+    # multi-step action — steps chain with &&, abort on first failure
+    - cwd: frontend
+      run:
+        - "yarn install"
+        - "yarn build:dev"
 ```
 
-Every hook trigger is async-dispatched — the CLI returns immediately
-after spawning drivers. The available triggers are:
-`on-create-before-engines`, `on-create-after-engines`,
-`on-delete-before-engines`, `on-delete-after-engines`,
-`on-checkout`, and `on-file-change`. The `*-before-engines` variants
-run before treeman touches its managed engines, the `*-after-engines`
-variants after.
+Available triggers: `on-create-before-engines`,
+`on-create-after-engines`, `on-delete-before-engines`,
+`on-delete-after-engines`, `on-checkout`, `on-file-change`. The
+`*-before-engines` variants run before treeman touches its managed
+engines, the `*-after-engines` variants after. Every hook trigger is
+async-dispatched — the CLI returns immediately after spawning
+drivers.
+
+Per-step env vars are only available on `databases[].migrate.env`
+and `databases[].seed.env` (the framework-runner step), not on
+hook actions. Use the inherited shell environment + `cwd:` to
+control hook subprocesses.
 
 ### Running hooks inside a container
 
@@ -167,10 +180,10 @@ the named container rather than on the host. Useful for
 ```yaml
 hooks:
   on-create-after-engines:
-    # Single-step group, in a named container.
+    # Single-step action, in a named container.
     - { run: "composer install", container: myapp-php }
 
-    # Multi-step group, in a compose service.
+    # Multi-step action, in a compose service.
     - compose_service: app
       compose_project: myapp
       run:
@@ -178,7 +191,7 @@ hooks:
         - "php artisan migrate"
 ```
 
-`step.cwd` becomes `-w <cwd>` on the `exec` call (interpreted
+`action.cwd` becomes `-w <cwd>` on the `exec` call (interpreted
 inside the container's filesystem). Leave unset to use the
 container's `WORKDIR`.
 
