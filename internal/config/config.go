@@ -1235,6 +1235,9 @@ func LoadLayered(repoRoot string) (Config, error) {
 		}
 	}
 	normaliseAliases(&cfg)
+	if err := cfg.Validate(); err != nil {
+		return cfg, fmt.Errorf("config invalid: %w", err)
+	}
 	return cfg, nil
 }
 
@@ -1261,6 +1264,9 @@ func LoadLayeredForWorktree(mainRoot, wtRoot string) (Config, error) {
 		}
 	}
 	normaliseAliases(&cfg)
+	if err := cfg.Validate(); err != nil {
+		return cfg, fmt.Errorf("config invalid: %w", err)
+	}
 	return cfg, nil
 }
 
