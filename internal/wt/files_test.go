@@ -1,4 +1,4 @@
-package cmd
+package wt
 
 import (
 	"os"
@@ -8,15 +8,15 @@ import (
 
 func TestBringInFilesCopiesGitignoredFile(t *testing.T) {
 	main := t.TempDir()
-	wt := t.TempDir()
+	wtDir := t.TempDir()
 	src := filepath.Join(main, ".env")
 	if err := os.WriteFile(src, []byte("DB_NAME=app\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := bringInFiles(main, wt, []string{".env"}, "copy"); err != nil {
-		t.Fatalf("bringInFiles: %v", err)
+	if err := BringInFiles(main, wtDir, []string{".env"}, "copy", NoopSink{}); err != nil {
+		t.Fatalf("BringInFiles: %v", err)
 	}
-	dst := filepath.Join(wt, ".env")
+	dst := filepath.Join(wtDir, ".env")
 	info, err := os.Lstat(dst)
 	if err != nil {
 		t.Fatalf("stat dst: %v", err)
@@ -36,7 +36,7 @@ func TestBringInFilesCopiesGitignoredFile(t *testing.T) {
 
 func TestBringInFilesSymlinkMode(t *testing.T) {
 	main := t.TempDir()
-	wt := t.TempDir()
+	wtDir := t.TempDir()
 	src := filepath.Join(main, "vendor")
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		t.Fatal(err)
@@ -44,10 +44,10 @@ func TestBringInFilesSymlinkMode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "marker"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := bringInFiles(main, wt, []string{"vendor"}, "link"); err != nil {
-		t.Fatalf("bringInFiles: %v", err)
+	if err := BringInFiles(main, wtDir, []string{"vendor"}, "link", NoopSink{}); err != nil {
+		t.Fatalf("BringInFiles: %v", err)
 	}
-	dst := filepath.Join(wt, "vendor")
+	dst := filepath.Join(wtDir, "vendor")
 	info, err := os.Lstat(dst)
 	if err != nil {
 		t.Fatalf("stat dst: %v", err)
@@ -63,22 +63,22 @@ func TestBringInFilesSymlinkMode(t *testing.T) {
 
 func TestBringInFilesIdempotent(t *testing.T) {
 	main := t.TempDir()
-	wt := t.TempDir()
+	wtDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(main, ".env"), []byte("X=1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := bringInFiles(main, wt, []string{".env"}, "copy"); err != nil {
+	if err := BringInFiles(main, wtDir, []string{".env"}, "copy", NoopSink{}); err != nil {
 		t.Fatal(err)
 	}
 	// User mutates the worktree's copy.
-	if err := os.WriteFile(filepath.Join(wt, ".env"), []byte("X=2\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(wtDir, ".env"), []byte("X=2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// Re-run: should NOT overwrite the mutated copy.
-	if err := bringInFiles(main, wt, []string{".env"}, "copy"); err != nil {
+	if err := BringInFiles(main, wtDir, []string{".env"}, "copy", NoopSink{}); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := os.ReadFile(filepath.Join(wt, ".env"))
+	got, _ := os.ReadFile(filepath.Join(wtDir, ".env"))
 	if string(got) != "X=2\n" {
 		t.Errorf("idempotent re-run overwrote user edit: %q", got)
 	}
@@ -86,7 +86,7 @@ func TestBringInFilesIdempotent(t *testing.T) {
 
 func TestBringInFilesCopiesDirectoryRecursively(t *testing.T) {
 	main := t.TempDir()
-	wt := t.TempDir()
+	wtDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(main, "seeds", "fixtures"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -96,13 +96,13 @@ func TestBringInFilesCopiesDirectoryRecursively(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(main, "seeds", "fixtures", "b.sql"), []byte("b"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := bringInFiles(main, wt, []string{"seeds"}, "copy"); err != nil {
+	if err := BringInFiles(main, wtDir, []string{"seeds"}, "copy", NoopSink{}); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := os.ReadFile(filepath.Join(wt, "seeds", "a.sql")); string(got) != "a" {
+	if got, _ := os.ReadFile(filepath.Join(wtDir, "seeds", "a.sql")); string(got) != "a" {
 		t.Errorf("missing seeds/a.sql in copy: %q", got)
 	}
-	if got, _ := os.ReadFile(filepath.Join(wt, "seeds", "fixtures", "b.sql")); string(got) != "b" {
+	if got, _ := os.ReadFile(filepath.Join(wtDir, "seeds", "fixtures", "b.sql")); string(got) != "b" {
 		t.Errorf("missing seeds/fixtures/b.sql in copy: %q", got)
 	}
 }

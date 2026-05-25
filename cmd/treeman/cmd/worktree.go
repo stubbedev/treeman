@@ -3,27 +3,21 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"io"
-	"github.com/stubbedev/treeman/internal/gitcmd"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/urfave/cli/v3"
 
-	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/gitenv"
-	"github.com/stubbedev/treeman/internal/hooks"
-	"github.com/stubbedev/treeman/internal/patcher"
-	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
-	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/ui"
+	"github.com/stubbedev/treeman/internal/wt"
 )
 
 // WorktreeCmd — `treeman wt {create,delete,register,unregister,list,finalize}`.
@@ -97,161 +91,25 @@ Examples:
 			if err != nil {
 				return err
 			}
-			cfg, err := resolve.LoadResolved(repoRoot)
+			res, err := wt.Create(ctx, wt.CreateRequest{
+				RepoRoot:    repoRoot,
+				Branch:      branch,
+				From:        c.String("from"),
+				Path:        c.String("path"),
+				NoFetch:     c.Bool("no-fetch"),
+				SkipHooks:   c.Bool("skip-hooks"),
+				SkipPrepare: c.Bool("skip-prepare"),
+				Env:         CaptureInheritedEnv(),
+			}, cliSink{})
 			if err != nil {
 				return err
-			}
-
-			wtPath := c.String("path")
-			if wtPath == "" {
-				wtPath = filepath.Join(resolveWorktreesRoot(cfg, repoRoot), branch)
-			} else if !filepath.IsAbs(wtPath) {
-				wtPath = filepath.Join(repoRoot, wtPath)
-			}
-			if _, err := os.Stat(wtPath); err == nil {
-				// Idempotent path: when the dest already exists and
-				// matches what we'd create (linked worktree on the
-				// requested branch, registered in SQLite), treat the
-				// call as a no-op so scripts can retry safely.
-				if isMatchingExistingWorktree(ctx, repoRoot, wtPath, branch) {
-					PrintInfo("worktree already exists at %s on %s — no-op", wtPath, branch)
-					if printPathOnly {
-						fmt.Fprintln(os.Stdout, wtPath)
-					}
-					return nil
-				}
-				return fmt.Errorf("destination path already exists: %s", wtPath)
-			}
-			if err := os.MkdirAll(filepath.Dir(wtPath), 0o755); err != nil {
-				return err
-			}
-
-			// Git worktree add. Default base = origin/HEAD if -b
-			// missing. Pre-fetch + prefer origin/<base> so a stale
-			// local ref doesn't silently base the new branch on
-			// yesterday's commit (opt-out via --no-fetch).
-			base := c.String("from")
-			if base == "" {
-				base = detectDefaultBranch(repoRoot)
-			}
-			branchExists := gitcmd.Exists(ctx, repoRoot, "refs/heads/"+branch)
-			if !branchExists && !c.Bool("no-fetch") {
-				_ = gitcmd.RunPiped(ctx, repoRoot, nil, nil, "fetch", "origin", base, "--quiet")
-				if refExistsRemote(repoRoot, base) {
-					base = "origin/" + base
-				}
-			}
-			var gitArgs []string
-			if branchExists {
-				gitArgs = []string{"worktree", "add", wtPath, branch}
-			} else {
-				gitArgs = []string{"worktree", "add", "-b", branch, wtPath, base}
-			}
-			if err := gitcmd.RunPiped(ctx, repoRoot, os.Stdout, os.Stderr, gitArgs...); err != nil {
-				return fmt.Errorf("git worktree add: %w", err)
-			}
-			wtPath = MustAbs(wtPath)
-
-			// worktrees.links — read-only symlinks from main into the
-			// new worktree (vendor, node_modules, …). Glob meta-chars
-			// expand against repoRoot. Idempotent: existing dst is skipped.
-			if err := bringInFiles(repoRoot, wtPath, cfg.Worktrees.Links, "link"); err != nil {
-				return err
-			}
-			// worktrees.copies — per-worktree copies so patches can
-			// mutate per-branch without affecting main.
-			if err := bringInFiles(repoRoot, wtPath, cfg.Worktrees.Copies, "copy"); err != nil {
-				return err
-			}
-
-			sl := slug.For(wtPath, branch)
-			tplCtx := template.FromSlug(sl)
-
-			// Top-level `patches:` block — dotenv, phpunit.xml, yaml,
-			// or json rewrites with per-worktree values + optional
-			// git skip-worktree so the rewrite stays out of git status.
-			for _, p := range cfg.Patches {
-				res, err := patcher.Apply(p, wtPath, tplCtx)
-				if err != nil {
-					return err
-				}
-				if res.Outcome == patcher.Updated {
-					fmt.Printf("patched %s (%s)\n", filepath.Join(wtPath, res.File), res.Driver)
-				}
-			}
-
-			// Store register.
-			dbPath, _ := store.DefaultDBPath()
-			st, err := store.Open(ctx, dbPath)
-			if err != nil {
-				return err
-			}
-			defer st.Close()
-			repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			if err != nil {
-				return err
-			}
-			wtID, err := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, branch)
-			if err != nil {
-				return err
-			}
-			PrintOK("created worktree #%d slug=%s path=%s", wtID, sl.Value, wtPath)
-
-			if c.Bool("skip-hooks") {
-				if printPathOnly {
-					fmt.Fprintln(os.Stdout, wtPath)
-				}
-				return nil
-			}
-
-			env := CaptureInheritedEnv()
-
-			// Always async. Three dispatch paths in priority order:
-			//   1. Daemon RPC (the normal happy path).
-			//   2. Spawn the daemon + retry RPC (cold-start case).
-			//   3. Detach a setsid child running `treeman wt finalize
-			//      --local <wt>` as a last resort — still returns
-			//      immediately to the user.
-			// All three are non-blocking from the user's CLI perspective.
-			needsWork := len(cfg.Hooks.OnCreateBeforeEngines) > 0 ||
-				len(cfg.Hooks.OnCreateAfterEngines) > 0 ||
-				(!c.Bool("skip-prepare") && len(cfg.Databases) > 0)
-			if needsWork {
-				if queued := dispatchFinalize(ctx, repoRoot, wtPath, env); queued {
-					if printPathOnly {
-						fmt.Fprintln(os.Stdout, wtPath)
-					}
-					return nil
-				}
-				logPath, err := detachLocalFinalize(wtPath, repoRoot)
-				if err != nil {
-					return fmt.Errorf("detach finalize: %w", err)
-				}
-				PrintOK("queued: setup + prepare detached (daemon unreachable — log: %s)", logPath)
 			}
 			if printPathOnly {
-				fmt.Fprintln(os.Stdout, wtPath)
+				fmt.Fprintln(os.Stdout, res.WtPath)
 			}
 			return nil
 		},
 	}
-}
-
-// dispatchFinalize attempts to hand setup + prepare to the
-// daemon. Returns true when the daemon successfully queued the work.
-// See dispatchToDaemon for the retry semantics.
-func dispatchFinalize(ctx context.Context, repoRoot, wtPath string, env map[string]string) bool {
-	req := rpc.Request{
-		Method: rpc.MethodWorktreeFinalize,
-		WorktreeFinalize: &rpc.WorktreeFinalizeArgs{
-			RepoPath:     repoRoot,
-			WorktreePath: wtPath,
-			InheritedEnv: env,
-		},
-	}
-	return dispatchToDaemon(ctx, req, rpc.KindWorktreeFinalizeQueued,
-		"setup + prepare detached to daemon — follow with `treeman logs tail --follow`",
-		"setup + prepare detached to daemon (auto-restarted)")
 }
 
 func wtDelete() *cli.Command {
@@ -287,7 +145,7 @@ Examples:
 
 			// Resolve the repo root first (--repo flag > cwd walk-up >
 			// fall back to target-as-path). Needed before the branch /
-			// slug lookup below so the SQLite query is scoped correctly.
+			// slug lookup so the SQLite query is scoped correctly.
 			repoRoot, err := resolveRepo(c.String("repo"))
 			if err != nil {
 				repoRoot, err = DiscoverRepoRoot(MustAbs(target))
@@ -296,33 +154,16 @@ Examples:
 				}
 			}
 
-			// Resolve target → worktree path. Branch / slug / basename
-			// lookup wins over the literal `MustAbs(target)`
-			// interpretation: `treeman wt delete feature/foo` used to
-			// silently register a phantom worktree at $PWD/feature/foo
-			// because MustAbs was applied unconditionally. Now we
-			// consult the registry first, only falling back to
-			// path-as-typed when no match is found. With --force we
-			// allow the path-as-typed fallback even when the directory
-			// is gone (cleaning up a stale registry entry).
-			var wtPath string
-			if p, ok := lookupWorktree(ctx, repoRoot, target); ok {
+			// Confirmation lives in the CLI — wt.Delete itself is
+			// non-interactive. Resolve the wtPath up front so the
+			// prompt can name the target precisely; this duplicates
+			// wt.Delete's lookup but the second pass inside the
+			// orchestrator is cheap (sqlite query).
+			wtPath := MustAbs(target)
+			if p, ok := wt.LookupWorktree(ctx, repoRoot, target, cliSink{}); ok {
 				wtPath = p
-			} else {
-				wtPath = MustAbs(target)
-				if _, statErr := os.Stat(wtPath); statErr != nil && !c.Bool("force") {
-					return fmt.Errorf("no worktree matches %q in %s (use --force to remove a stale registry entry)", target, repoRoot)
-				}
 			}
 
-			env := CaptureInheritedEnv()
-
-			// Destructive: teardown hooks + DROP DATABASE × N +
-			// git worktree remove. Confirm with the user on a TTY;
-			// scripts and `--yes` skip the prompt. A user "no" is
-			// not a failure — print a clean line and exit 0 so
-			// scripts using `--yes` are the only ones that ever see
-			// a non-zero exit from this command.
 			if !c.Bool("yes") {
 				q := fmt.Sprintf("delete worktree %s and drop its databases?", wtPath)
 				if !ui.Confirm(q) {
@@ -331,90 +172,15 @@ Examples:
 				}
 			}
 
-			// Detached child path: we ARE the detached worker. Run
-			// the teardown inline instead of trying to dispatch.
-			if c.Bool("detached") {
-				return inlineTeardown(ctx, repoRoot, wtPath, c.Bool("force"), env)
-			}
-
-			// User-facing path: always async. Try daemon RPC; on
-			// failure, detach a setsid child running this same
-			// command with --detached. The CLI returns immediately.
-			if queued := dispatchTeardown(ctx, repoRoot, wtPath, c.Bool("force"), env); queued {
-				return nil
-			}
-			logPath, err := detachLocalDelete(wtPath, repoRoot, c.Bool("force"))
-			if err != nil {
-				return fmt.Errorf("detach teardown: %w", err)
-			}
-			PrintOK("queued: teardown + DB drop + git remove detached (daemon unreachable — log: %s)", logPath)
-			return nil
+			_, err = wt.Delete(ctx, wt.DeleteRequest{
+				RepoRoot: repoRoot,
+				Target:   target,
+				Force:    c.Bool("force"),
+				Env:      CaptureInheritedEnv(),
+				Detached: c.Bool("detached"),
+			}, cliSink{})
+			return err
 		},
-	}
-}
-
-// inlineTeardown runs the full teardown sequence locally without
-// dispatching to the daemon. Only used by the `--detached` child
-// process spawned when the daemon RPC was unreachable; the user-
-// facing `wt delete` always returns immediately after dispatch.
-func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, env map[string]string) error {
-	cfg, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
-		return err
-	}
-	dbPath, _ := store.DefaultDBPath()
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	sl := slug.For(wtPath, "")
-	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	wtID, _ := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, "")
-	runTrigger := func(trigger string, actions []config.Action) {
-		if len(actions) == 0 {
-			return
-		}
-		started := hooks.EmitHookStart(ctx, st, repoID, wtID, trigger, len(actions))
-		out, _ := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, sl.Value, env, true)
-		hooks.PersistOutcome(ctx, st, repoID, wtID, trigger, started, time.Now().UnixMilli(), out)
-	}
-	runTrigger("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
-	_ = prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st)
-	runTrigger("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
-	_ = st.MarkWorktreeDeleted(ctx, wtID)
-	args := []string{"worktree", "remove"}
-	if force {
-		args = append(args, "--force")
-	}
-	args = append(args, wtPath)
-	if err := gitcmd.RunPiped(ctx, repoRoot, os.Stdout, os.Stderr, args...); err != nil && !force {
-		return fmt.Errorf("git worktree remove: %w", err)
-	}
-	pruneEmptyParents(wtPath, resolveWorktreesRoot(cfg, repoRoot))
-	return nil
-}
-
-// pruneEmptyParents walks up from `start` removing now-empty
-// directories until we leave `wtRoot` (the configured worktrees
-// root). Prevents an empty `.worktrees/feature/` from lingering
-// after deleting `.worktrees/feature/foo`. Best-effort: any rmdir
-// error stops the walk (e.g. parent is not empty, or permissions).
-func pruneEmptyParents(start, wtRoot string) {
-	if start == "" || wtRoot == "" {
-		return
-	}
-	parent := filepath.Dir(start)
-	for {
-		// Stop once we reach (or pass) the worktrees root itself.
-		rel, err := filepath.Rel(wtRoot, parent)
-		if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-			return
-		}
-		if err := os.Remove(parent); err != nil {
-			return // non-empty or unreadable — done.
-		}
-		parent = filepath.Dir(parent)
 	}
 }
 
@@ -753,7 +519,7 @@ func wtFinalize() *cli.Command {
 				sl := slug.For(wtPath, "")
 				repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 				wtID, _ := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, "")
-				return runLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, CaptureInheritedEnv(), false)
+				return wt.RunLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, CaptureInheritedEnv(), false, cliSink{})
 			}
 
 			resp, err := rpc.Call(ctx, rpc.Request{
@@ -776,95 +542,6 @@ func wtFinalize() *cli.Command {
 	}
 }
 
-// dispatchTeardown is the wt-delete twin of dispatchFinalize.
-func dispatchTeardown(ctx context.Context, repoRoot, wtPath string, force bool, env map[string]string) bool {
-	req := rpc.Request{
-		Method: rpc.MethodWorktreeTeardown,
-		WorktreeTeardown: &rpc.WorktreeTeardownArgs{
-			RepoPath:     repoRoot,
-			WorktreePath: wtPath,
-			Force:        force,
-			InheritedEnv: env,
-		},
-	}
-	return dispatchToDaemon(ctx, req, rpc.KindWorktreeTeardownQueued,
-		"teardown + DB teardown + git remove detached to daemon — follow with `treeman logs tail --follow`",
-		"teardown + DB teardown + git remove detached to daemon (auto-restarted)")
-}
-
-// dispatchToDaemon issues an RPC, prints okMsg + returns true if the
-// daemon responded with wantKind. On RPC failure, runs ensureDaemon
-// and retries once; on retry success, prints restartedMsg instead.
-// Returns false when neither attempt succeeds — callers then fall
-// back to a detached child / inline run.
-func dispatchToDaemon(ctx context.Context, req rpc.Request, wantKind, okMsg, restartedMsg string) bool {
-	resp, err := rpc.Call(ctx, req)
-	if err == nil {
-		if resp.Kind == wantKind {
-			PrintOK("queued: %s", okMsg)
-			return true
-		}
-		if resp.Kind == rpc.KindError {
-			PrintWarn("daemon: %s", resp.Message)
-		}
-		return false
-	}
-	PrintWarn("daemon RPC failed (%v); trying daemon restart", err)
-	if startErr := ensureDaemon(ctx); startErr != nil {
-		return false
-	}
-	if resp, err := rpc.Call(ctx, req); err == nil && resp.Kind == wantKind {
-		PrintOK("queued: %s", restartedMsg)
-		return true
-	}
-	return false
-}
-
-// runLocalFinalize executes the setup + prepare tail in the
-// current process. Shared by wt create's last-resort foreground
-// fallback and by `wt finalize --local` (the subcommand the detach
-// helper spawns when the daemon is unreachable).
-func runLocalFinalize(
-	ctx context.Context,
-	cfg *config.Config,
-	repoRoot, wtPath string,
-	sl slug.Slug,
-	st *store.Store,
-	repoID, wtID int64,
-	env map[string]string,
-	skipPrepare bool,
-) error {
-	runTrigger := func(trigger string, actions []config.Action) error {
-		if len(actions) == 0 {
-			return nil
-		}
-		started := hooks.EmitHookStart(ctx, st, repoID, wtID, trigger, len(actions))
-		out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, sl.Value, env, true)
-		hooks.PersistOutcome(ctx, st, repoID, wtID, trigger, started, time.Now().UnixMilli(), out)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("%s: %d action(s) complete (logs in %s/.treeman-hooks/)\n",
-			trigger, len(actions), wtPath)
-		return nil
-	}
-	if err := runTrigger("on-create-before-engines", cfg.Hooks.OnCreateBeforeEngines); err != nil {
-		return err
-	}
-	if skipPrepare || len(cfg.Databases) == 0 {
-		return runTrigger("on-create-after-engines", cfg.Hooks.OnCreateAfterEngines)
-	}
-	outs, err := prepare.Run(ctx, cfg, wtPath, sl, st, repoID, wtID, env)
-	if err != nil {
-		PrintWarn("prepare failed: %v", err)
-	}
-	for _, o := range outs {
-		fmt.Printf("prepare[%s] %s template=%s clones=%d\n",
-			o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
-	}
-	return runTrigger("on-create-after-engines", cfg.Hooks.OnCreateAfterEngines)
-}
-
 // resolveRepo returns the explicit `--repo` if set, else discovers
 // from cwd.
 func resolveRepo(override string) (string, error) {
@@ -876,30 +553,6 @@ func resolveRepo(override string) (string, error) {
 		return "", err
 	}
 	return DiscoverRepoRoot(cwd)
-}
-
-func resolveWorktreesRoot(cfg config.Config, repoRoot string) string {
-	raw := cfg.Worktrees.Root
-	if raw == "" {
-		raw = ".worktrees"
-	}
-	if filepath.IsAbs(raw) {
-		return raw
-	}
-	return filepath.Join(repoRoot, raw)
-}
-
-func detectDefaultBranch(repoRoot string) string {
-	if s, err := gitcmd.String(context.Background(), repoRoot, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
-		if len(s) > len("origin/") && s[:len("origin/")] == "origin/" {
-			return s[len("origin/"):]
-		}
-		return s
-	}
-	if s, err := gitcmd.String(context.Background(), repoRoot, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
-		return s
-	}
-	return "main"
 }
 
 // wtSwitch — `treeman wt switch [name]`. Prints the absolute path
@@ -939,14 +592,14 @@ func wtSwitch() *cli.Command {
 				return err
 			}
 
-			if path, ok := lookupWorktree(ctx, repoRoot, name); ok {
+			if path, ok := wt.LookupWorktree(ctx, repoRoot, name, cliSink{}); ok {
 				touchVisitedByPath(ctx, path)
 				fmt.Println(path)
 				return nil
 			}
 
 			// Filesystem fallback.
-			fsCandidate := filepath.Join(resolveWorktreesRoot(cfg, repoRoot), name)
+			fsCandidate := filepath.Join(wt.WorktreesRoot(cfg, repoRoot), name)
 			if fi, err := os.Stat(fsCandidate); err == nil && fi.IsDir() {
 				fmt.Println(fsCandidate)
 				return nil
@@ -969,74 +622,12 @@ func wtSwitch() *cli.Command {
 				return err
 			}
 			// After create, wtPath is `<root>/<name>` by default.
-			fmt.Println(filepath.Join(resolveWorktreesRoot(cfg, repoRoot), name))
+			fmt.Println(filepath.Join(wt.WorktreesRoot(cfg, repoRoot), name))
 			return nil
 		},
 	}
 }
 
-// lookupWorktree queries SQLite for active worktrees attached to
-// `repoRoot` and returns the path that best matches `name` (exact
-// basename, then exact slug, then unambiguous prefix).
-func lookupWorktree(ctx context.Context, repoRoot, name string) (string, bool) {
-	dbPath, err := store.DefaultDBPath()
-	if err != nil {
-		return "", false
-	}
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return "", false
-	}
-	defer st.Close()
-	rows, err := st.DB.QueryContext(ctx, `
-		SELECT w.path, w.slug, COALESCE(w.branch,'')
-		FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		WHERE w.deleted_at IS NULL AND r.path = ?`, repoRoot)
-	if err != nil {
-		return "", false
-	}
-	defer rows.Close()
-	var exactBase, exactSlug, exactBranch string
-	var prefixHits []string
-	for rows.Next() {
-		var path, slug, branch string
-		if err := rows.Scan(&path, &slug, &branch); err != nil {
-			continue
-		}
-		base := filepath.Base(path)
-		switch {
-		case base == name:
-			exactBase = path
-		case slug == name:
-			exactSlug = path
-		case branch == name:
-			exactBranch = path
-		case len(name) >= 2 && (hasPrefix(base, name) || hasPrefix(slug, name) || hasPrefix(branch, name)):
-			prefixHits = append(prefixHits, path)
-		}
-	}
-	switch {
-	case exactBase != "":
-		return exactBase, true
-	case exactBranch != "":
-		return exactBranch, true
-	case exactSlug != "":
-		return exactSlug, true
-	case len(prefixHits) == 1:
-		return prefixHits[0], true
-	case len(prefixHits) > 1:
-		fmt.Fprintln(os.Stderr, "ambiguous prefix match — candidates:")
-		for _, p := range prefixHits {
-			fmt.Fprintln(os.Stderr, "  ", p)
-		}
-		return "", false
-	}
-	return "", false
-}
-
-func hasPrefix(s, p string) bool {
-	return len(s) >= len(p) && s[:len(p)] == p
-}
 
 // wtBack — `treeman wt back`. Prints the main repo root for the
 // current cwd. With `--remove`, also deletes the current linked
@@ -1262,7 +853,7 @@ func wtGo() *cli.Command {
 			base := c.String("from")
 			if c.Bool("create") {
 				mode = "create"
-				if refExistsLocal(repoRoot, branch) {
+				if wt.RefExistsLocal(ctx, repoRoot, branch) {
 					mode = "checkout"
 					base = ""
 				}
@@ -1273,7 +864,7 @@ func wtGo() *cli.Command {
 			// as zsh's _resolve_base.
 			if mode == "create" && base != "" && !c.Bool("no-fetch") {
 				_ = gitcmd.RunPiped(ctx, repoRoot, nil, nil, "fetch", "origin", base, "--quiet")
-				if refExistsRemote(repoRoot, base) {
+				if wt.RefExistsRemote(ctx, repoRoot, base) {
 					base = "origin/" + base
 				}
 			}
@@ -1335,7 +926,7 @@ func wtGo() *cli.Command {
 			}
 			// Fall back to the default location (matches wt create's path math).
 			cfg, _ := resolve.LoadResolved(repoRoot)
-			path := filepath.Join(resolveWorktreesRoot(cfg, repoRoot), branch)
+			path := filepath.Join(wt.WorktreesRoot(cfg, repoRoot), branch)
 			fmt.Println(path)
 			return nil
 		},
@@ -1367,55 +958,6 @@ func registryWorktreeForBranch(ctx context.Context, repoRoot, branch string) (st
 	return p, true
 }
 
-// isMatchingExistingWorktree reports whether `wtPath` is already a
-// linked git worktree of `repoRoot` checked out on `branch` and is
-// present in the SQLite registry. Used by `wt create` to short-
-// circuit re-creation: a script that retries the command after a
-// transient failure shouldn't error with "path already exists" when
-// the previous run actually succeeded.
-//
-// All four conditions must hold: (1) `wtPath` exists, (2) its
-// `.git` file is a gitlink (not a directory — so it's a linked
-// worktree), (3) `git -C <wtPath> branch --show-current` equals
-// `branch`, (4) the registry has an active row for this path.
-// Mismatches return false → caller falls back to the original
-// "already exists" error so we never silently swallow drift.
-func isMatchingExistingWorktree(ctx context.Context, repoRoot, wtPath, branch string) bool {
-	if !gitenv.IsLinkedWorktree(wtPath) {
-		return false
-	}
-	current, err := gitcmd.String(ctx, wtPath, "branch", "--show-current")
-	if err != nil || current != branch {
-		return false
-	}
-	dbPath, err := store.DefaultDBPath()
-	if err != nil {
-		return false
-	}
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return false
-	}
-	defer st.Close()
-	var n int
-	_ = st.DB.QueryRowContext(ctx,
-		`SELECT 1 FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		 WHERE r.path = ? AND w.path = ? AND w.deleted_at IS NULL`,
-		repoRoot, wtPath).Scan(&n)
-	return n == 1
-}
-
-// refExistsLocal returns true when refs/heads/<name> resolves in
-// repoRoot. Used by wt go to flip --create → checkout when the
-// branch already exists.
-func refExistsLocal(repoRoot, name string) bool {
-	return gitcmd.Exists(context.Background(), repoRoot, "refs/heads/"+name)
-}
-
-func refExistsRemote(repoRoot, name string) bool {
-	return gitcmd.Exists(context.Background(), repoRoot, "refs/remotes/origin/"+name)
-}
-
 // touchVisitedByPath stamps last_visited_at on the worktree row at
 // `path`. Swallows errors — visit-tracking is best-effort metadata,
 // not a correctness gate.
@@ -1432,120 +974,3 @@ func touchVisitedByPath(ctx context.Context, path string) {
 	_ = st.TouchWorktreeVisitedByPath(ctx, path)
 }
 
-func trimSpace(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\n' || s[0] == '\r') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t' || s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
-		s = s[:len(s)-1]
-	}
-	return s
-}
-
-// bringInFiles brings each entry in `paths` from repoRoot into wtPath
-// via either symlink (mode="link") or recursive copy (mode="copy").
-// Glob meta-characters (`*?[`) expand against repoRoot. Idempotent —
-// if the destination already exists the entry is skipped.
-func bringInFiles(repoRoot, wtPath string, paths []string, mode string) error {
-	for _, rel := range paths {
-		var matches []string
-		if strings.ContainsAny(rel, "*?[") {
-			m, _ := filepath.Glob(filepath.Join(repoRoot, rel))
-			matches = m
-		} else {
-			matches = []string{filepath.Join(repoRoot, rel)}
-		}
-		if len(matches) == 0 {
-			continue
-		}
-		for _, src := range matches {
-			info, err := os.Stat(src)
-			if err != nil {
-				if !strings.ContainsAny(rel, "*?[") {
-					PrintWarn("%s source missing, skipping: %s", mode, src)
-				}
-				continue
-			}
-			relToRepo, err := filepath.Rel(repoRoot, src)
-			if err != nil {
-				relToRepo = filepath.Base(src)
-			}
-			dst := filepath.Join(wtPath, relToRepo)
-			if _, err := os.Stat(dst); err == nil {
-				continue
-			}
-			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-				return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
-			}
-			switch mode {
-			case "link":
-				if err := os.Symlink(src, dst); err != nil {
-					return fmt.Errorf("symlink %s → %s: %w", dst, src, err)
-				}
-			case "copy":
-				if err := copyPath(src, dst, info); err != nil {
-					return fmt.Errorf("copy %s → %s: %w", src, dst, err)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// copyPath copies src → dst. Regular files are copied byte-for-byte
-// with the source's mode preserved; directories are recursed; symlinks
-// in the source tree are recreated as symlinks pointing at the same
-// target (so a `.env` symlink in main becomes a `.env` symlink in the
-// worktree, not a copy of the symlinked file).
-func copyPath(src, dst string, info os.FileInfo) error {
-	mode := info.Mode()
-	switch {
-	case mode&os.ModeSymlink != 0:
-		target, err := os.Readlink(src)
-		if err != nil {
-			return err
-		}
-		return os.Symlink(target, dst)
-	case mode.IsDir():
-		if err := os.MkdirAll(dst, mode.Perm()); err != nil {
-			return err
-		}
-		entries, err := os.ReadDir(src)
-		if err != nil {
-			return err
-		}
-		for _, e := range entries {
-			childSrc := filepath.Join(src, e.Name())
-			childDst := filepath.Join(dst, e.Name())
-			childInfo, err := os.Lstat(childSrc)
-			if err != nil {
-				return err
-			}
-			if err := copyPath(childSrc, childDst, childInfo); err != nil {
-				return err
-			}
-		}
-		return nil
-	case mode.IsRegular():
-		return copyRegularFile(src, dst, mode.Perm())
-	default:
-		return fmt.Errorf("unsupported file type for %s (mode=%v)", src, mode)
-	}
-}
-
-func copyRegularFile(src, dst string, perm os.FileMode) error {
-	sf, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sf.Close()
-	df, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	defer df.Close()
-	if _, err := io.Copy(df, sf); err != nil {
-		return err
-	}
-	return nil
-}
