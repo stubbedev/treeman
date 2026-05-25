@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -25,6 +24,7 @@ import (
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/wt"
 	"github.com/stubbedev/treeman/internal/wtreg"
 	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
@@ -118,13 +118,13 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_create",
-		Description: "Create a new git worktree under .worktrees/<branch> AND dispatch setup hooks + prepare via the daemon. Shells to `treeman wt create`. LONG-RUNNING (whole cold-build runs synchronously). Use branches_list first to pick an unoccupied branch. Returns captured stdout/stderr + exit code.",
+		Description: "Create a new git worktree under .worktrees/<branch> AND dispatch setup hooks + prepare via the daemon. Use branches_list first to pick an unoccupied branch. Returns structured result: wt_path, slug, repo_id, worktree_id, status (queued|detached|noop|no_finalize), log_path (when detached). Non-blocking — the heavy tail runs in the daemon (or a detached child when the daemon is unreachable); tail progress via logs_tail.",
 		Annotations: writeAnno("Create worktree", false, false, true),
 	}, worktreeCreateTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_delete",
-		Description: "Tear down a worktree end-to-end: run teardown hooks → drop databases/redis prefixes/ES indices → remove the git worktree directory. Shells to `treeman wt delete`. Use worktree_show first to confirm the right slug. Returns captured stdout/stderr + exit code.",
+		Description: "Tear down a worktree end-to-end: run teardown hooks → drop databases/redis prefixes/ES indices → remove the git worktree directory. Use worktree_show first to confirm the right slug. Returns structured result: wt_path, status (queued|detached), log_path (when detached). Non-blocking — teardown runs in the daemon.",
 		Annotations: writeAnno("Delete worktree", true, true, true),
 	}, worktreeDeleteTool)
 
@@ -209,76 +209,6 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 // `.treeman.yaml.bak.*` history. Five-snapshot cap matches the CLI.
 func atomicWrite(path string, data []byte) error {
 	return yamlpatch.AtomicWriteWithBackup(path, data, 5)
-}
-
-// ─── shell-out helpers ────────────────────────────────────────────
-
-type shellOut struct {
-	ExitCode int    `json:"exit_code"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-}
-
-// runTreeman shells out to the treeman binary (same one currently
-// executing when possible) with the given arg list. cwd controls
-// the worktree the CLI sees; pass "" for the current process cwd.
-func runTreeman(ctx context.Context, cwd string, args ...string) (shellOut, error) {
-	bin, err := treemanBinary()
-	if err != nil {
-		return shellOut{}, err
-	}
-	cmd := exec.CommandContext(ctx, bin, args...)
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return shellOut{}, fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return shellOut{}, fmt.Errorf("stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return shellOut{}, err
-	}
-	outBytes, _ := readAll(stdout)
-	errBytes, _ := readAll(stderr)
-	waitErr := cmd.Wait()
-	code := 0
-	if exitErr, ok := waitErr.(*exec.ExitError); ok {
-		code = exitErr.ExitCode()
-	} else if waitErr != nil {
-		code = -1
-	}
-	return shellOut{ExitCode: code, Stdout: string(outBytes), Stderr: string(errBytes)}, nil
-}
-
-func treemanBinary() (string, error) {
-	if p, err := os.Executable(); err == nil {
-		return p, nil
-	}
-	return exec.LookPath("treeman")
-}
-
-func readAll(r interface{ Read([]byte) (int, error) }) ([]byte, error) {
-	const max = 1 << 20 // 1 MiB cap so a runaway hook can't OOM the mcp server
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 4096)
-	for {
-		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if len(buf) >= max {
-				buf = buf[:max]
-				break
-			}
-		}
-		if err != nil {
-			break
-		}
-	}
-	return buf, nil
 }
 
 // ─── init_repo / schema_install ───────────────────────────────────
@@ -683,26 +613,22 @@ type worktreeCreateIn struct {
 	NoFetch bool   `json:"no_fetch,omitempty"`
 }
 
-func worktreeCreateTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeCreateIn) (*mcpsdk.CallToolResult, shellOut, error) {
+func worktreeCreateTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeCreateIn) (*mcpsdk.CallToolResult, wt.CreateResult, error) {
 	if in.Branch == "" {
-		return nil, shellOut{}, fmt.Errorf("branch is required")
+		return nil, wt.CreateResult{}, fmt.Errorf("branch is required")
 	}
-	args := []string{"wt", "create", in.Branch}
-	if in.From != "" {
-		args = append(args, "--from", in.From)
-	}
-	if in.Path != "" {
-		args = append(args, "--path", in.Path)
-	}
-	if in.NoFetch {
-		args = append(args, "--no-fetch")
-	}
-	cwd, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
-		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+		return nil, wt.CreateResult{}, fmt.Errorf("resolve repo: %w", err)
 	}
-	out, err := runTreeman(ctx, cwd, args...)
-	return nil, out, err
+	res, err := wt.Create(ctx, wt.CreateRequest{
+		RepoRoot: repoRoot,
+		Branch:   in.Branch,
+		From:     in.From,
+		Path:     in.Path,
+		NoFetch:  in.NoFetch,
+	}, wt.NoopSink{})
+	return nil, res, err
 }
 
 type worktreeDeleteIn struct {
@@ -711,20 +637,20 @@ type worktreeDeleteIn struct {
 	Force bool   `json:"force,omitempty"`
 }
 
-func worktreeDeleteTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeDeleteIn) (*mcpsdk.CallToolResult, shellOut, error) {
+func worktreeDeleteTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeDeleteIn) (*mcpsdk.CallToolResult, wt.DeleteResult, error) {
 	if in.Name == "" {
-		return nil, shellOut{}, fmt.Errorf("name is required")
+		return nil, wt.DeleteResult{}, fmt.Errorf("name is required")
 	}
-	args := []string{"wt", "delete", in.Name}
-	if in.Force {
-		args = append(args, "--force")
-	}
-	cwd, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
-		return nil, shellOut{}, fmt.Errorf("resolve repo: %w", err)
+		return nil, wt.DeleteResult{}, fmt.Errorf("resolve repo: %w", err)
 	}
-	out, err := runTreeman(ctx, cwd, args...)
-	return nil, out, err
+	res, err := wt.Delete(ctx, wt.DeleteRequest{
+		RepoRoot: repoRoot,
+		Target:   in.Name,
+		Force:    in.Force,
+	}, wt.NoopSink{})
+	return nil, res, err
 }
 
 // ─── daemon_control ───────────────────────────────────────────────
