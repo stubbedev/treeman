@@ -22,6 +22,15 @@
           # build` will print the expected hash on mismatch.
           # go-sum: 5980445213f7e36709c4eb8fa3ab76dad936eeda0f49a4d48de053ce69fa831b
           vendorHash = "sha256-wdjBBsuVezbXxqxB7dm6ZIaKsCzSN3zZTU9R1OCBv3E=";
+          # subPackages also scopes the default checkPhase — `go test`
+          # only runs against these two paths (neither has test files),
+          # so `nix build` / `nix profile install` finishes the check
+          # phase in milliseconds instead of running the full unit
+          # suite (let alone the docker-backed e2e suite, which is
+          # `//go:build e2e`-gated and would fail in the sandbox).
+          # DO NOT remove subPackages without also setting
+          # `doCheck = false` — otherwise install will start running
+          # internal/* tests against an empty sandboxed environment.
           subPackages = [ "cmd/treeman" "cmd/treemand" ];
           ldflags = [
             "-s"
