@@ -294,13 +294,30 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 		}
 	}
 
+	// Fan out onCreate / onRemove across reconcileWorkers goroutines.
+	// Each onCreate calls FinalizeWorktree (db setup + hook chains),
+	// each onRemove calls teardownOrphan (db teardown + hook chains) —
+	// on boot of a daemon with N stale worktrees, the old serial loop
+	// stalled the constructor for N×finalize-time before the event
+	// loop could serve its first RPC.
+	const reconcileWorkers = 4
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, reconcileWorkers)
+
 	for admin, wtPath := range onDisk {
 		lw.mu.Lock()
 		lw.seen[admin] = wtPath
 		lw.mu.Unlock()
 		row, ok := dbByAdmin[admin]
 		if !ok || row.Deleted {
-			lw.onCreate(ctx, admin)
+			admin := admin
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				lw.onCreate(ctx, admin)
+			}()
 			continue
 		}
 		// Row exists and active — make sure admin_dir is stamped
@@ -318,8 +335,16 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 		if _, ok := onDisk[admin]; ok {
 			continue
 		}
-		lw.onRemove(ctx, admin)
+		admin := admin
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			lw.onRemove(ctx, admin)
+		}()
 	}
+	wg.Wait()
 	return nil
 }
 
