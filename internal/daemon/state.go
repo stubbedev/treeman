@@ -228,28 +228,34 @@ func (st *State) WatcherCount() uint32 {
 }
 
 // RegisterWatcher inserts (or replaces) an entry; Phase 10 wires the
-// actual fsnotify spawn.
+// actual fsnotify spawn. The prior entry's Cancel runs after the map
+// mutation and the mutex are released so watcher-goroutine cleanup
+// callbacks that try to take st.mu (e.g. self-unregistering on exit)
+// can't deadlock.
 func (st *State) RegisterWatcher(repoPath string, e *WatcherEntry) {
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	if prev, ok := st.watchers[repoPath]; ok && prev.Cancel != nil {
+	prev := st.watchers[repoPath]
+	st.watchers[repoPath] = e
+	st.mu.Unlock()
+	if prev != nil && prev.Cancel != nil {
 		prev.Cancel()
 	}
-	st.watchers[repoPath] = e
 }
 
-// UnregisterWatcher cancels + drops a watcher entry.
+// UnregisterWatcher cancels + drops a watcher entry. Cancel runs after
+// the mutex is released (see RegisterWatcher).
 func (st *State) UnregisterWatcher(repoPath string) bool {
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	e, ok := st.watchers[repoPath]
 	if !ok {
+		st.mu.Unlock()
 		return false
 	}
+	delete(st.watchers, repoPath)
+	st.mu.Unlock()
 	if e.Cancel != nil {
 		e.Cancel()
 	}
-	delete(st.watchers, repoPath)
 	return true
 }
 
@@ -278,25 +284,27 @@ func (st *State) HasWtWatcher(wtPath string) bool {
 // and replacing any prior one for the same path.
 func (st *State) RegisterWtWatcher(wtPath string, e *WatcherEntry) {
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	if prev, ok := st.wtWatchers[wtPath]; ok && prev.Cancel != nil {
+	prev := st.wtWatchers[wtPath]
+	st.wtWatchers[wtPath] = e
+	st.mu.Unlock()
+	if prev != nil && prev.Cancel != nil {
 		prev.Cancel()
 	}
-	st.wtWatchers[wtPath] = e
 }
 
 // UnregisterWtWatcher cancels + drops a per-worktree watcher.
 func (st *State) UnregisterWtWatcher(wtPath string) bool {
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	e, ok := st.wtWatchers[wtPath]
 	if !ok {
+		st.mu.Unlock()
 		return false
 	}
+	delete(st.wtWatchers, wtPath)
+	st.mu.Unlock()
 	if e.Cancel != nil {
 		e.Cancel()
 	}
-	delete(st.wtWatchers, wtPath)
 	return true
 }
 
@@ -304,26 +312,28 @@ func (st *State) UnregisterWtWatcher(wtPath string) bool {
 // entry for repoPath, cancelling any prior watcher for the same path.
 func (st *State) RegisterLifecycleWatcher(repoPath string, e *WatcherEntry) {
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	if prev, ok := st.lifecycleWatchers[repoPath]; ok && prev.Cancel != nil {
+	prev := st.lifecycleWatchers[repoPath]
+	st.lifecycleWatchers[repoPath] = e
+	st.mu.Unlock()
+	if prev != nil && prev.Cancel != nil {
 		prev.Cancel()
 	}
-	st.lifecycleWatchers[repoPath] = e
 }
 
 // UnregisterLifecycleWatcher cancels + drops the lifecycle watcher
 // entry for repoPath.
 func (st *State) UnregisterLifecycleWatcher(repoPath string) bool {
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	e, ok := st.lifecycleWatchers[repoPath]
 	if !ok {
+		st.mu.Unlock()
 		return false
 	}
+	delete(st.lifecycleWatchers, repoPath)
+	st.mu.Unlock()
 	if e.Cancel != nil {
 		e.Cancel()
 	}
-	delete(st.lifecycleWatchers, repoPath)
 	return true
 }
 
