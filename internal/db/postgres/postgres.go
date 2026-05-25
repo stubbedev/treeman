@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -16,6 +17,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
+	"github.com/stubbedev/treeman/internal/db/ident"
 	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
@@ -169,7 +171,8 @@ func (d *Driver) MaxConnections(ctx context.Context) (int, error) {
 }
 
 func (d *Driver) EnsureDB(ctx context.Context, name string) error {
-	if err := validateIdent(name); err != nil {
+	qname, err := ident.QuotePostgres(name)
+	if err != nil {
 		return err
 	}
 	exists, err := d.dbExists(ctx, name)
@@ -179,7 +182,7 @@ func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 	if exists {
 		return nil
 	}
-	_, err = d.execOutsideTx(ctx, fmt.Sprintf(`CREATE DATABASE "%s"`, name))
+	_, err = d.execOutsideTx(ctx, "CREATE DATABASE "+qname)
 	return err
 }
 
@@ -206,11 +209,15 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	for _, n := range matched {
 		n := n
 		g.Go(func() error {
+			qn, err := ident.QuotePostgres(n)
+			if err != nil {
+				return err
+			}
 			// Boot any straggler connections so DROP can proceed.
 			_, _ = d.DB.ExecContext(gctx,
 				"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1", n)
-			if _, err := d.execOutsideTx(gctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, n)); err != nil {
-				return fmt.Errorf("DROP DATABASE %q: %w", n, err)
+			if _, err := d.execOutsideTx(gctx, "DROP DATABASE IF EXISTS "+qn); err != nil {
+				return fmt.Errorf("DROP DATABASE %s: %w", qn, err)
 			}
 			return nil
 		})
@@ -250,51 +257,62 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 // SnapshotCreate uses native `CREATE DATABASE … TEMPLATE` — the
 // fastest path Postgres offers for cloning a database.
 func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
-	if err := validateIdent(source); err != nil {
+	qsource, err := ident.QuotePostgres(source)
+	if err != nil {
 		return err
 	}
-	if err := validateIdent(template); err != nil {
+	qtemplate, err := ident.QuotePostgres(template)
+	if err != nil {
 		return err
 	}
 	// Fence the source so no new connections sneak in mid-clone.
-	if _, err := d.execOutsideTx(ctx, fmt.Sprintf(
-		`ALTER DATABASE "%s" ALLOW_CONNECTIONS = false`, source)); err != nil {
+	if _, err := d.execOutsideTx(ctx,
+		"ALTER DATABASE "+qsource+" ALLOW_CONNECTIONS = false"); err != nil {
 		return err
 	}
 	defer func() {
-		_, _ = d.execOutsideTx(ctx, fmt.Sprintf(
-			`ALTER DATABASE "%s" ALLOW_CONNECTIONS = true`, source))
+		// Use a fresh, short-lived context so the unfence runs even
+		// when ctx has been cancelled or timed out mid-clone.
+		// Otherwise a cancellation can leave the source DB
+		// read-only-to-new-clients forever.
+		bgctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = d.execOutsideTx(bgctx,
+			"ALTER DATABASE "+qsource+" ALLOW_CONNECTIONS = true")
 	}()
 	_, _ = d.DB.ExecContext(ctx,
 		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1", source)
-	_, _ = d.execOutsideTx(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, template))
-	if _, err := d.execOutsideTx(ctx, fmt.Sprintf(
-		`CREATE DATABASE "%s" TEMPLATE "%s"`, template, source)); err != nil {
+	_, _ = d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
+	if _, err := d.execOutsideTx(ctx,
+		"CREATE DATABASE "+qtemplate+" TEMPLATE "+qsource); err != nil {
 		return err
 	}
 	return nil
 }
 
 func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
-	if err := validateIdent(template); err != nil {
+	qtemplate, err := ident.QuotePostgres(template)
+	if err != nil {
 		return err
 	}
-	if err := validateIdent(target); err != nil {
+	qtarget, err := ident.QuotePostgres(target)
+	if err != nil {
 		return err
 	}
-	if _, err := d.execOutsideTx(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, target)); err != nil {
+	if _, err := d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
 		return err
 	}
-	_, err := d.execOutsideTx(ctx, fmt.Sprintf(
-		`CREATE DATABASE "%s" TEMPLATE "%s"`, target, template))
+	_, err = d.execOutsideTx(ctx,
+		"CREATE DATABASE "+qtarget+" TEMPLATE "+qtemplate)
 	return err
 }
 
 func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
-	if err := validateIdent(template); err != nil {
+	qtemplate, err := ident.QuotePostgres(template)
+	if err != nil {
 		return err
 	}
-	_, err := d.execOutsideTx(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, template))
+	_, err = d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
 	return err
 }
 
@@ -327,15 +345,3 @@ func (d *Driver) execOutsideTx(ctx context.Context, stmt string) (sql.Result, er
 	return conn.ExecContext(ctx, stmt)
 }
 
-func validateIdent(s string) error {
-	if s == "" {
-		return fmt.Errorf("empty postgres identifier")
-	}
-	for _, c := range s {
-		ok := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'
-		if !ok {
-			return fmt.Errorf("invalid postgres identifier: %q", s)
-		}
-	}
-	return nil
-}

@@ -18,6 +18,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	dbes "github.com/stubbedev/treeman/internal/db/es"
+	"github.com/stubbedev/treeman/internal/db/ident"
 	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
@@ -333,7 +334,11 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 			return nil, out, err
 		}
 		defer drv.Close()
-		if _, err := drv.DB.ExecContext(ctx, "USE `"+in.DB+"`"); err != nil {
+		qdb, err := ident.QuoteMySQL(in.DB)
+		if err != nil {
+			return nil, out, fmt.Errorf("db %q: %w", in.DB, err)
+		}
+		if _, err := drv.DB.ExecContext(ctx, "USE "+qdb); err != nil {
 			return nil, out, fmt.Errorf("use %s: %w", in.DB, err)
 		}
 		rows, cols, err := runSQLQuery(ctx, drv.DB, in.Query, in.Limit)
@@ -698,8 +703,12 @@ func listPostgresDatabases(ctx context.Context, drv *dbpostgres.Driver) ([]strin
 }
 
 func mysqlSchema(ctx context.Context, drv *dbmysql.Driver, db string) (map[string]any, error) {
-	if _, err := drv.DB.ExecContext(ctx, "USE `"+db+"`"); err != nil {
-		return nil, fmt.Errorf("USE %s: %w", db, err)
+	qdb, err := ident.QuoteMySQL(db)
+	if err != nil {
+		return nil, fmt.Errorf("db %q: %w", db, err)
+	}
+	if _, err := drv.DB.ExecContext(ctx, "USE "+qdb); err != nil {
+		return nil, fmt.Errorf("USE %s: %w", qdb, err)
 	}
 	rows, err := drv.DB.QueryContext(ctx,
 		"SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME", db)
@@ -715,7 +724,14 @@ func mysqlSchema(ctx context.Context, drv *dbmysql.Driver, db string) (map[strin
 		names = append(names, n)
 	}
 	for _, n := range names {
-		row := drv.DB.QueryRowContext(ctx, fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", db, n))
+		qn, err := ident.QuoteMySQL(n)
+		if err != nil {
+			// Defensive: information_schema returned a name that
+			// fails our identifier rules. Skip it rather than
+			// inject — operator should investigate.
+			continue
+		}
+		row := drv.DB.QueryRowContext(ctx, "SHOW CREATE TABLE "+qdb+"."+qn)
 		var gotName, ddl string
 		if err := row.Scan(&gotName, &ddl); err != nil {
 			continue
