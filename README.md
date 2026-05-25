@@ -62,16 +62,15 @@ event log records every step.
   a cached template, needs a partial migrate-up, or a full
   cold-build.
 - **MCP server** — `treeman mcp` exposes treeman to Claude Code /
-  Claude Desktop / Cursor as a structured tool surface. The
-  primary use isn't driving `wt create/delete` (already automatic
-  from the CLI / shell shim) but **configuration + diagnosis**:
-  authoring/validating `.treeman.yaml` (`config_get`,
-  `config_validate`, `config_schema`, `init_repo`,
-  `schema_install`, `fw_detect`), reading the event log + hook
-  output (`logs_query`, `logs_hooks`, `hook_log_read`), querying
-  live engine state (`db_query`, `db_schema_dump`,
-  `engine_status`), and inspecting the snapshot cache
-  (`snapshots_list`, `snapshot_inspect`).
+  Claude Desktop / Cursor as a structured tool surface for
+  **configuration + diagnosis**: authoring/validating
+  `.treeman.yaml` (`config_get`, `config_validate`,
+  `config_schema`, `config_set`, `init_repo`, `schema_install`,
+  `fw_detect`), reading the event log + hook output
+  (`logs_query`, `logs_hooks`, `hook_log_read`), querying live
+  engine state (`db_query`, `db_schema_dump`, `engine_status`),
+  and inspecting the snapshot cache (`snapshots_list`,
+  `snapshot_inspect`).
 - **Single static binary** per platform — no CGo, no system
   libraries; CI cross-builds `{linux,darwin}` × `{amd64,arm64}`.
 

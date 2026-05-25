@@ -13,13 +13,9 @@ treeman mcp                                    # all tools exposed
 
 ## What is this actually for
 
-`worktree_create` / `worktree_delete` over MCP work, but they're
-not the interesting use — once you've set up the shell shim
-(`tm proj-123`) or even just `treeman wt create proj-123`, lifecycle
-is a single CLI keystroke and there's no AI in the loop.
-
-The valuable MCP uses are the ones a human would otherwise need
-to drive by reading code + scrolling logs:
+Four use cases drive the MCP surface, each backed by tools an
+agent would otherwise have to drive by reading source + scrolling
+logs:
 
 - **Configuration assistance.** An agent can read the current
   `.treeman.yaml` (`config_get`), validate edits against the
@@ -27,9 +23,9 @@ to drive by reading code + scrolling logs:
   individual fields by dotted path (`config_set`), or scaffold a
   fresh config for a repo it just detected
   (`init_repo`, `fw_detect`, `schema_install`). This is the
-  single biggest win — `.treeman.yaml` is the surface that
-  decides whether a worktree boots, and editing it without
-  treeman's own validator is where humans burn the most time.
+  biggest win — `.treeman.yaml` is the surface that decides
+  whether a worktree boots, and editing it without treeman's own
+  validator is where humans burn the most time.
 
 - **Diagnosis when prepare fails.** `logs_query` (event log) +
   `logs_hooks` (hook run summaries) + `hook_log_read` (full
@@ -51,10 +47,6 @@ to drive by reading code + scrolling logs:
   cached for the current repo; `snapshot_drop` evicts a single
   fingerprint when a template went stale; `snapshots_purge`
   wipes the whole cache.
-
-The CLI is faster for routine `wt create / delete / list`; the
-MCP surface is where you put an agent when you need it to
-reason about config, history, or live state.
 
 ## Permission model
 
