@@ -36,7 +36,6 @@ const DBIndex = 0
 // stops as soon as the first matching key shows up.
 func (d *Driver) PrefixExists(ctx context.Context, prefix string) (bool, error) {
 	c := d.client()
-	defer c.Close()
 	iter := c.Scan(ctx, 0, prefix+"*", 1).Iterator()
 	if iter.Next(ctx) {
 		return true, nil
@@ -53,7 +52,6 @@ func (d *Driver) DropPrefix(ctx context.Context, prefix string) (int, error) {
 		return 0, fmt.Errorf("redis: refusing to drop empty prefix (would wipe every key)")
 	}
 	c := d.client()
-	defer c.Close()
 	iter := c.Scan(ctx, 0, prefix+"*", 1000).Iterator()
 	var batch []string
 	deleted := 0
@@ -189,7 +187,6 @@ func versionAtLeast(v string, wantMajor, wantMinor int) bool {
 // copyByPrefixCOPY is the Redis 6.2+ fast path.
 func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix string) error {
 	c := d.client()
-	defer c.Close()
 
 	iter := c.Scan(ctx, 0, srcPrefix+"*", 1000).Iterator()
 	pipe := c.Pipeline()
@@ -237,7 +234,6 @@ func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix stri
 // keys *eventually* visited, not that every visited key still exists.
 func (d *Driver) copyByPrefixDumpRestore(ctx context.Context, srcPrefix, dstPrefix string) error {
 	c := d.client()
-	defer c.Close()
 
 	iter := c.Scan(ctx, 0, srcPrefix+"*", 1000).Iterator()
 	var batch []string
