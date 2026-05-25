@@ -27,6 +27,16 @@ install:
 fmt:
     gofmt -w ./cmd ./internal
 
+# Point git at .githooks/ so the pre-commit gofmt gate fires. One-shot
+# per clone; idempotent. CI still runs the same check as the
+# authoritative gate — the hook just catches drift earlier.
+install-hooks:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git config core.hooksPath .githooks
+    echo "git config core.hooksPath = .githooks"
+    echo "pre-commit gofmt gate is now active (bypass with --no-verify)."
+
 # Auto-fix formatting drift, then vet. Same dev contract as the
 # sync-schema / sync-docs / sync-flake recipes: anything that *can*
 # be regenerated *is* regenerated, and the release flow commits the

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Pre-commit gofmt gate. Mirrors the strict read-only check CI runs
+# (.github/workflows/ci.yml → "gofmt" step) so a drift never lands
+# on master.
+#
+# Enable once per clone:
+#   just install-hooks
+#
+# Skip in an emergency (CI will still block):
+#   git commit --no-verify
+
+set -euo pipefail
+
+# Only inspect staged Go files under cmd/ + internal/ — same scope CI
+# runs gofmt against. Skips deletions so removed files don't trip a
+# `gofmt -l` on a non-existent path.
+mapfile -t staged < <(
+    git diff --cached --name-only --diff-filter=ACMR \
+        | grep -E '^(cmd|internal)/.*\.go$' || true
+)
+
+if [ "${#staged[@]}" -eq 0 ]; then
+    exit 0
+fi
+
+drift=$(gofmt -l "${staged[@]}")
+if [ -z "$drift" ]; then
+    exit 0
+fi
+
+echo "✗ gofmt would rewrite the following staged files:" >&2
+printf '  %s\n' $drift >&2
+echo >&2
+echo "Fix with:  just fmt   (or: gofmt -w ${drift})" >&2
+echo "Bypass:    git commit --no-verify" >&2
+exit 1
