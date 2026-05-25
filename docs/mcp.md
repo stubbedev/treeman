@@ -4,12 +4,59 @@
 
 treeman ships an MCP (Model Context Protocol) server so AI agents
 — Claude Code, Claude Desktop, Cursor, Continue, anything that
-speaks MCP — can drive the same lifecycle a human drives from the
-CLI. Transport is stdio; no extra processes, no network surface.
+speaks MCP — get a structured tool surface onto treeman's state.
+Transport is stdio; no extra processes, no network surface.
 
 ```sh
 treeman mcp                                    # all tools exposed
 ```
+
+## What is this actually for
+
+`worktree_create` / `worktree_delete` over MCP work, but they're
+not the interesting use — once you've set up the shell shim
+(`tm proj-123`) or even just `treeman wt create proj-123`, lifecycle
+is a single CLI keystroke and there's no AI in the loop.
+
+The valuable MCP uses are the ones a human would otherwise need
+to drive by reading code + scrolling logs:
+
+- **Configuration assistance.** An agent can read the current
+  `.treeman.yaml` (`config_get`), validate edits against the
+  authoritative schema (`config_validate`, `config_schema`), patch
+  individual fields by dotted path (`config_set`), or scaffold a
+  fresh config for a repo it just detected
+  (`init_repo`, `fw_detect`, `schema_install`). This is the
+  single biggest win — `.treeman.yaml` is the surface that
+  decides whether a worktree boots, and editing it without
+  treeman's own validator is where humans burn the most time.
+
+- **Diagnosis when prepare fails.** `logs_query` (event log) +
+  `logs_hooks` (hook run summaries) + `hook_log_read` (full
+  per-hook stdout/stderr) give the agent everything the daemon
+  recorded. `worktree_show` is the per-worktree dossier.
+  `doctor` runs the health-check matrix. `snapshot_inspect`
+  resolves a fingerprint to "is this row an orphan or live?" —
+  the canonical answer for "cache hit but prepare still failed".
+
+- **Live engine state.** `db_query` runs READ-ONLY queries
+  (SELECT/SHOW/EXPLAIN on SQL engines; find-style filters on
+  Mongo; `_search` bodies on ES; one of {GET, SCAN, KEYS, INFO,
+  …} on Redis). `db_schema_dump` returns the live CREATE TABLEs.
+  `engine_status` probes every engine declared in
+  `.treeman.yaml`. Use these to verify a migration's effect or
+  reason about live shape vs. what the config says.
+
+- **Snapshot-cache maintenance.** `snapshots_list` shows what's
+  cached for the current repo; `snapshot_drop` evicts a single
+  fingerprint when a template went stale; `snapshots_purge`
+  wipes the whole cache.
+
+The CLI is faster for routine `wt create / delete / list`; the
+MCP surface is where you put an agent when you need it to
+reason about config, history, or live state.
+
+## Permission model
 
 `treeman mcp` takes no permission flags — every tool (read, write,
 engine introspection, worktree lifecycle) is exposed unconditionally.

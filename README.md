@@ -41,22 +41,37 @@ event log records every step.
 ## At a glance
 
 - **Per-worktree namespaces** for MySQL / MariaDB / TiDB,
-  PostgreSQL, MongoDB, Redis (DB-index scoping), Elasticsearch /
-  OpenSearch.
+  PostgreSQL, MongoDB, Redis (key-prefix in DB 0 — cluster-mode
+  safe, no 16-DB cap), Elasticsearch / OpenSearch (index-name
+  prefix).
 - **Snapshot cache** with LRU eviction — repeated `wt create` on
-  the same migrations + dump hits a cached template DB.
+  the same migrations + dump hits a cached template DB. Cap-per-
+  repo (default 8) keeps engine disk usage bounded.
 - **Hook lifecycle** — declarative `on-create-before-engines` /
   `on-create-after-engines` / `on-delete-before-engines` /
   `on-delete-after-engines` / `on-checkout` / `on-file-change`
   trigger lists. Actions in one list run in parallel; the
   `run:` steps inside one action chain sequentially with `&&`.
 - **Parallel test runner support** — `clones: auto` detects
-  worker counts from phpunit.xml, pytest-xdist, Jest, vitest,
-  paratest, cargo nextest, etc.
-- **File watcher** (fsnotify) for live
-  rebuild-or-delta as migrations or seed dumps change.
-- **MCP server** — `treeman mcp` lets Claude Code / Claude
-  Desktop / Cursor drive the lifecycle over stdio.
+  worker counts from 19+ runners (paratest / pest / phpunit,
+  pytest-xdist, jest / vitest / playwright, parallel_tests,
+  cargo-nextest, etc.) by inspecting the repo's config files.
+- **File watcher** (fsnotify) for live updates — input edits
+  re-fingerprint each affected database; the dispatch picks
+  `auto | delta | rebuild` based on whether the new hash hits
+  a cached template, needs a partial migrate-up, or a full
+  cold-build.
+- **MCP server** — `treeman mcp` exposes treeman to Claude Code /
+  Claude Desktop / Cursor as a structured tool surface. The
+  primary use isn't driving `wt create/delete` (already automatic
+  from the CLI / shell shim) but **configuration + diagnosis**:
+  authoring/validating `.treeman.yaml` (`config_get`,
+  `config_validate`, `config_schema`, `init_repo`,
+  `schema_install`, `fw_detect`), reading the event log + hook
+  output (`logs_query`, `logs_hooks`, `hook_log_read`), querying
+  live engine state (`db_query`, `db_schema_dump`,
+  `engine_status`), and inspecting the snapshot cache
+  (`snapshots_list`, `snapshot_inspect`).
 - **Single static binary** per platform — no CGo, no system
   libraries; CI cross-builds `{linux,darwin}` × `{amd64,arm64}`.
 
