@@ -15,7 +15,6 @@ import (
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
-	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
 )
@@ -59,7 +58,6 @@ func FinalizeWorktree(
 	if err != nil {
 		return err
 	}
-	branch := detectBranch(wtRoot)
 
 	repoName := filepath.Base(repoRoot)
 	repoID, err := st.Store.EnsureRepo(ctx, repoRoot, repoName)
@@ -67,47 +65,14 @@ func FinalizeWorktree(
 		return err
 	}
 
-	// Main-wt routing. Two-source-of-truth check by design:
-	//
-	//   1. `cfg.MainWorktree.Enabled` — the live config says use main.
-	//   2. An active row with is_main=1 — the registry has a main row.
-	//
-	// Either is enough. The row-fallback covers the brief window
-	// between `treeman main disable` writing the YAML and the
-	// config-reload soft-deleting the row: if a HEAD-watcher fires
-	// finalize during that window, we MUST keep using slug.ForMain
-	// against the same main row, otherwise the finalize would create
-	// a fresh path-hash-keyed DB and orphan every per-branch DB the
-	// main slug owns. Once the reload soft-deletes the row,
-	// LookupMainWorktree returns 0 and subsequent finalizes route
-	// back to the linked-wt path (slug.For).
-	isMain := false
-	if wtRoot == repoRoot {
-		if cfg.MainWorktree.Enabled {
-			isMain = true
-		} else if existing, err := st.Store.LookupMainWorktree(ctx, repoID); err == nil && existing.ID != 0 {
-			isMain = true
-		}
-	}
-
-	var sl slug.Slug
-	if isMain {
-		sl = slug.ForMain(wtRoot, branch)
-		// Apply the per-context overlay so prepare.Run + hook
-		// rendering see the main-wt-specific NameTemplate /
-		// TestClones / Fanout fields. Linked-wt finalizes skip this
-		// — their cfg stays as-loaded.
-		config.ApplyMainWorktreeOverlay(&cfg)
-	} else {
-		sl = slug.For(wtRoot, branch)
-	}
-
-	var wtID int64
-	if isMain {
-		wtID, err = st.Store.EnsureMainWorktree(ctx, repoID, wtRoot, sl.Value, branch)
-	} else {
-		wtID, err = st.Store.EnsureWorktree(ctx, repoID, wtRoot, sl.Value, branch)
-	}
+	// Main-wt routing — see resolveWorktreeIdentity for the
+	// two-source-of-truth check (cfg.MainWorktree.Enabled OR an
+	// active is_main=1 row) that bridges the disable→reload race.
+	// Without that bridge, a HEAD-watcher firing finalize between
+	// `main disable` writing YAML and the reload soft-deleting the
+	// row would create a fresh path-hash-keyed DB and orphan every
+	// per-branch DB the main slug owns.
+	sl, wtID, _, _, err := resolveWorktreeIdentity(ctx, st, &cfg, repoRoot, wtRoot, repoID)
 	if err != nil {
 		return err
 	}
@@ -240,14 +205,18 @@ func FinalizeWorktreeForWatch(
 	if err != nil {
 		return err
 	}
-	branch := detectBranch(wtRoot)
-	sl := slug.For(wtRoot, branch)
 	repoName := filepath.Base(repoRoot)
 	repoID, err := st.Store.EnsureRepo(ctx, repoRoot, repoName)
 	if err != nil {
 		return err
 	}
-	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wtRoot, sl.Value, branch)
+	// Routing through the same helper as FinalizeWorktree so a
+	// watcher-driven re-prepare on the main worktree applies the
+	// per-context overlay + uses the main_<branch> slug. Without
+	// this, a touch on a watched migration in the repo root would
+	// rebuild against a path-hash-keyed DB while the rest of the
+	// system addresses main_<branch>.
+	sl, wtID, _, _, err := resolveWorktreeIdentity(ctx, st, &cfg, repoRoot, wtRoot, repoID)
 	if err != nil {
 		return err
 	}

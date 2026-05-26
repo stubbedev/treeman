@@ -11,7 +11,6 @@ import (
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/runid"
-	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/version"
 	"github.com/stubbedev/treeman/internal/watcher"
@@ -490,6 +489,14 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 // The subprocess receives watch context as env vars so user scripts
 // can branch on the trigger details: TREEMAN_WATCH_PATH,
 // TREEMAN_WATCH_LABEL, TREEMAN_WATCH_ENGINE, TREEMAN_WATCH_DB_NAME.
+//
+// Main-wt aware: resolveWorktreeIdentity must run BEFORE we read the
+// owning database's NameTemplate, otherwise the overlay's
+// main-wt-specific template wouldn't be in cfg.Databases yet and
+// TREEMAN_WATCH_DB_NAME would resolve to the linked-wt template's
+// rendering. Same call also forces slug.ForMain + EnsureMainWorktree
+// for the repo-root path so $TREEMAN_SLUG matches the finalize path
+// and the main row's slug column isn't overwritten with a path hash.
 func fireOnFileChange(
 	ctx context.Context,
 	st *State,
@@ -517,27 +524,25 @@ func fireOnFileChange(
 	if len(matched) == 0 {
 		return
 	}
-	// Resolve the owning database's engine + rendered name so the
-	// hook can branch on engine without re-parsing config.
-	var engine, dbName string
-	if dbIdx >= 0 && dbIdx < len(cfg.Databases) {
-		d := cfg.Databases[dbIdx]
-		engine = d.Engine
-		branch := detectBranch(wtPath)
-		sl := slug.For(wtPath, branch)
-		if rendered, err := template.Render(d.NameTemplate, template.FromSlug(sl)); err == nil {
-			dbName = rendered
-		}
-	}
-	branch := detectBranch(wtPath)
-	sl := slug.For(wtPath, branch)
 	repoID, err := st.Store.EnsureRepo(ctx, repoPath, filepath.Base(repoPath))
 	if err != nil {
 		return
 	}
-	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wtPath, sl.Value, branch)
+	sl, wtID, _, _, err := resolveWorktreeIdentity(ctx, st, &cfg, repoPath, wtPath, repoID)
 	if err != nil {
 		return
+	}
+	// Resolve the owning database's engine + rendered name so the
+	// hook can branch on engine without re-parsing config. cfg has
+	// already been overlay-merged by resolveWorktreeIdentity, so
+	// d.NameTemplate is the main-wt-specific template when relevant.
+	var engine, dbName string
+	if dbIdx >= 0 && dbIdx < len(cfg.Databases) {
+		d := cfg.Databases[dbIdx]
+		engine = d.Engine
+		if rendered, err := template.Render(d.NameTemplate, template.FromSlug(sl)); err == nil {
+			dbName = rendered
+		}
 	}
 	// Layer the watch-context env on top of the user's cached env.
 	env := make(map[string]string, len(inheritedEnv)+4)
@@ -556,6 +561,12 @@ func fireOnFileChange(
 // change and on-watch dispatch paths so user-defined hooks can
 // react to those events without sharing the regular finalize logic.
 // Errors are swallowed + logged; this path is best-effort.
+//
+// Main-wt aware via resolveWorktreeIdentity: when wtPath is the repo
+// root and main-wt is enabled, the hook subprocess receives
+// $TREEMAN_SLUG=main_<branch> matching the finalize-path slug. A
+// stale slug.For here would corrupt the main row's slug column on
+// every HEAD switch (EnsureWorktree overwrites slug keyed by path).
 func fireTriggerActions(
 	ctx context.Context,
 	st *State,
@@ -572,13 +583,11 @@ func fireTriggerActions(
 	if len(actions) == 0 {
 		return
 	}
-	branch := detectBranch(wtPath)
-	sl := slug.For(wtPath, branch)
 	repoID, err := st.Store.EnsureRepo(ctx, repoPath, filepath.Base(repoPath))
 	if err != nil {
 		return
 	}
-	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wtPath, sl.Value, branch)
+	sl, wtID, _, _, err := resolveWorktreeIdentity(ctx, st, &cfg, repoPath, wtPath, repoID)
 	if err != nil {
 		return
 	}
