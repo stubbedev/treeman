@@ -43,6 +43,15 @@ type ConfigReloader struct {
 
 	timersMu sync.Mutex
 	timers   map[string]*time.Timer // debounce keyed by "" (global) or repoPath
+
+	// reloadLksMu guards reloadLks. Per-repo mutexes serialise
+	// concurrent reloadOne goroutines against the same repo so a
+	// SIGHUP + RPC + fsnotify burst can't fire three overlapping
+	// EnrollMainWorktree / unregister / re-spawn sequences on the
+	// same target. Without serialisation the watcher restart can
+	// race the worktrees row teardown and leak goroutines.
+	reloadLksMu sync.Mutex
+	reloadLks   map[string]*sync.Mutex
 }
 
 // NewConfigReloader creates the watcher and pre-registers the global
@@ -55,12 +64,13 @@ func NewConfigReloader(st *State) (*ConfigReloader, error) {
 		return nil, err
 	}
 	cr := &ConfigReloader{
-		st:       st,
-		fsw:      fsw,
-		debounce: 500 * time.Millisecond,
-		dirRefs:  map[string]int{},
-		repos:    map[string]struct{}{},
-		timers:   map[string]*time.Timer{},
+		st:        st,
+		fsw:       fsw,
+		debounce:  500 * time.Millisecond,
+		dirRefs:   map[string]int{},
+		repos:     map[string]struct{}{},
+		timers:    map[string]*time.Timer{},
+		reloadLks: map[string]*sync.Mutex{},
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		cr.globalDir = filepath.Join(home, ".config", "treeman")
@@ -242,6 +252,17 @@ func (cr *ConfigReloader) reloadOne(ctx context.Context, repoPath string) {
 		slog.Warn("config reload: repo missing", "repo", repoPath, "err", err)
 		return
 	}
+	// Serialise per-repo. SIGHUP, the `config_reload` RPC, and the
+	// debounced fsnotify timer all reach this function; without a
+	// per-repo gate two reload goroutines can interleave their
+	// EnrollMainWorktree / unregister / re-spawn sequences against
+	// the same repo, leaking watchers or producing inconsistent
+	// state. The mutex is cheap (one map lookup) and only blocks
+	// reloads of the same repo — different repos still parallelise.
+	mu := cr.lockRepo(repoPath)
+	mu.Lock()
+	defer mu.Unlock()
+
 	slog.Info("config reload: restarting watchers", "repo", repoPath)
 
 	// Re-sync the main-wt row with the freshly-loaded config BEFORE
@@ -283,4 +304,19 @@ func (cr *ConfigReloader) reloadOne(ctx context.Context, repoPath string) {
 				"wt", wt.WorktreePath, "err", err)
 		}
 	}
+}
+
+// lockRepo returns the per-repo reload mutex, lazily creating it on
+// first use. Callers Lock() on entry and Unlock() on exit. Map-level
+// access is guarded by reloadLksMu; the returned per-repo mutex is
+// what serialises actual reload work.
+func (cr *ConfigReloader) lockRepo(repoPath string) *sync.Mutex {
+	cr.reloadLksMu.Lock()
+	defer cr.reloadLksMu.Unlock()
+	mu, ok := cr.reloadLks[repoPath]
+	if !ok {
+		mu = &sync.Mutex{}
+		cr.reloadLks[repoPath] = mu
+	}
+	return mu
 }

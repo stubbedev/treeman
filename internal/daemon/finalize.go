@@ -67,13 +67,20 @@ func FinalizeWorktree(
 		return err
 	}
 
-	// Main-wt routing: when the worktree path equals the repo root AND
-	// either the repo config opts in OR an existing main row is
-	// already enrolled, use slug.ForMain so a non-ticket branch like
-	// `develop` produces a branch-specific slug instead of collapsing
-	// to the repo's path hash. Falling back to the existing-row check
-	// covers the case where the user has flipped `main_worktree.enabled`
-	// off but a deletion hasn't run yet — we honour the live row.
+	// Main-wt routing. Two-source-of-truth check by design:
+	//
+	//   1. `cfg.MainWorktree.Enabled` — the live config says use main.
+	//   2. An active row with is_main=1 — the registry has a main row.
+	//
+	// Either is enough. The row-fallback covers the brief window
+	// between `treeman main disable` writing the YAML and the
+	// config-reload soft-deleting the row: if a HEAD-watcher fires
+	// finalize during that window, we MUST keep using slug.ForMain
+	// against the same main row, otherwise the finalize would create
+	// a fresh path-hash-keyed DB and orphan every per-branch DB the
+	// main slug owns. Once the reload soft-deletes the row,
+	// LookupMainWorktree returns 0 and subsequent finalizes route
+	// back to the linked-wt path (slug.For).
 	isMain := false
 	if wtRoot == repoRoot {
 		if cfg.MainWorktree.Enabled {
