@@ -1146,14 +1146,19 @@ func (f FilteredAction) Matches(label string) bool {
 // database. Used by both `databases[].migrate:` and
 // `databases[].seed:` — the same shape, different lifecycle slots.
 //
-// The framework's CLI reads its target DB from its own config
-// (Laravel: `DB_DATABASE` in `.env`; Rails: `DATABASE`; Django:
-// `DJANGO_DB_NAME`; etc.). Treeman builds per-worktree template
-// databases with names like `myapp_template_feature-x` and needs to
-// redirect the command at *that* DB, not the one the committed
-// `.env` references. The `Env` map says which env-var names to
-// override; values are rendered through the same `template` pass
-// that produces the per-run DB name, so they can reference any of:
+// The framework's CLI reads its target DB from its own config — for
+// most stacks that's a connection string the user already keeps in
+// `.env` (or wires up in `config/database.yml`, `data-source.ts`,
+// etc.). Treeman builds per-worktree template databases with names
+// like `myapp_template_feature-x` and needs to redirect the command
+// at *that* DB, not the one the committed `.env` references. The
+// `Env` map says which env-var names to override; values are
+// rendered through the same `template` pass that produces the
+// per-run DB name. The scaffold convention is to set `DB_NAME`
+// (Laravel's preset uses the framework-native `DB_DATABASE`); the
+// user weaves `${DB_NAME}` into the relevant slot of their Run
+// command (typically inside a DSN) or wires their config to read
+// it. Supported substitutions:
 //
 //	{target_db}         — resolved per-run database name / key prefix
 //	{slug}              — the slug value

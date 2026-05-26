@@ -208,7 +208,7 @@ framework. Copy + paste into the `databases:` array of an existing
   name_template: "myapp_test_{slug}"
   migrate:
     run: "bin/rails db:migrate"
-    env: { DATABASE: "{target_db}" }
+    env: { DB_NAME: "{target_db}" }
   inputs:
     - { glob: "db/migrate/**/*.rb", label: migrations, hash: filename }
     - Gemfile.lock
@@ -224,7 +224,7 @@ framework. Copy + paste into the `databases:` array of an existing
   name_template: "myapp_test_{slug}"
   migrate:
     run: "python manage.py migrate --noinput"
-    env: { DJANGO_DB_NAME: "{target_db}" }
+    env: { DB_NAME: "{target_db}" }
   inputs:
     - { glob: "**/migrations/[0-9]*_*.py", label: migrations, hash: filename }
     - poetry.lock
@@ -242,7 +242,7 @@ framework. Copy + paste into the `databases:` array of an existing
   name_template: "svc_test_{slug}"
   migrate:
     run: "migrate up"
-    env: { MIGRATE_DATABASE_NAME: "{target_db}" }
+    env: { DB_NAME: "{target_db}" }
   inputs:
     - { glob: "migrations/**/*.up.sql", label: migrations, hash: filename }
     - { glob: "services/*/migrations/**/*.up.sql", label: migrations, hash: filename }
@@ -259,7 +259,7 @@ framework. Copy + paste into the `databases:` array of an existing
   name_template: "app_test_{slug}"
   migrate:
     run: "sqlx migrate run"
-    env: { DATABASE_URL_NAME: "{target_db}" }
+    env: { DB_NAME: "{target_db}" }
   inputs:
     # bare-string default = checksum hash, so edits to a migration
     # rebuild the snapshot (sqlx allows mutable migrations).

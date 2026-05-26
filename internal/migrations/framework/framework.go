@@ -157,10 +157,18 @@ func hasGolangMigrateEvidence(repoRoot string) bool {
 	return false
 }
 
+// dbNameEnv is the canonical MigrateEnv every non-Laravel spec uses.
+// `DB_NAME` is the treeman convention (see every fw_* e2e test): the
+// user references `${DB_NAME}` inside their MigrateRun connection
+// string, or wires their config to read the var. The framework's own
+// env-var conventions are too varied (and often non-existent) to put
+// in a default scaffold — `DB_NAME` keeps the contract uniform and
+// editor-friendly.
+func dbNameEnv() map[string]string {
+	return map[string]string{"DB_NAME": "{target_db}"}
+}
+
 func builtins() []Spec {
-	genericDBNameEnv := func() map[string]string {
-		return map[string]string{"DATABASE_NAME": "{target_db}"}
-	}
 	return []Spec{
 		{
 			Name:    "laravel",
@@ -192,7 +200,7 @@ func builtins() []Spec {
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "bin/rails db:migrate",
-			MigrateEnv:    map[string]string{"DATABASE": "{target_db}"},
+			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name:          "django",
@@ -203,7 +211,7 @@ func builtins() []Spec {
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "python manage.py migrate --noinput",
-			MigrateEnv:    map[string]string{"DJANGO_DB_NAME": "{target_db}"},
+			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name:          "golang-migrate",
@@ -214,7 +222,7 @@ func builtins() []Spec {
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "migrate up",
-			MigrateEnv:    map[string]string{"MIGRATE_DATABASE_NAME": "{target_db}"},
+			MigrateEnv:    dbNameEnv(),
 			// go.mod alone matches every Go repo, so require a second
 			// signal: either the golang-migrate module is imported, or
 			// the repo contains at least one *.up.sql file (the
@@ -230,7 +238,7 @@ func builtins() []Spec {
 			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
 			MigrateRun:    "sqlx migrate run",
-			MigrateEnv:    map[string]string{"DATABASE_URL_NAME": "{target_db}"},
+			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name:          "diesel",
@@ -241,7 +249,7 @@ func builtins() []Spec {
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "diesel migration run",
-			MigrateEnv:    genericDBNameEnv(),
+			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name:    "prisma",
@@ -256,7 +264,7 @@ func builtins() []Spec {
 			HashMode:   HashChecksum,
 			OnModify:   OnDelta,
 			MigrateRun: "npx prisma migrate deploy",
-			MigrateEnv: genericDBNameEnv(),
+			MigrateEnv: dbNameEnv(),
 		},
 		{
 			Name:          "knex",
@@ -267,7 +275,7 @@ func builtins() []Spec {
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "npx knex migrate:latest",
-			MigrateEnv:    genericDBNameEnv(),
+			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name:          "alembic",
@@ -278,17 +286,17 @@ func builtins() []Spec {
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "alembic upgrade head",
-			MigrateEnv:    genericDBNameEnv(),
+			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name:          "flyway",
-			Markers:       []string{"flyway.conf"},
+			Markers:       []string{"flyway.conf|flyway.toml"},
 			MigrationDirs: []string{"**/db/migration"},
 			FileGlobs:     []string{"[VRU]*.sql"},
 			HashMode:      HashChecksum,
 			OnModify:      OnRebuild,
 			MigrateRun:    "flyway migrate",
-			MigrateEnv:    genericDBNameEnv(),
+			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name: "typeorm",
@@ -307,7 +315,7 @@ func builtins() []Spec {
 			HashMode:   HashFilename,
 			OnModify:   OnRebuild,
 			MigrateRun: "npx typeorm migration:run",
-			MigrateEnv: genericDBNameEnv(),
+			MigrateEnv: dbNameEnv(),
 		},
 		{
 			Name: "drizzle",
@@ -320,7 +328,7 @@ func builtins() []Spec {
 			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
 			MigrateRun:    "npx drizzle-kit migrate",
-			MigrateEnv:    genericDBNameEnv(),
+			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name:          "sequelize",
@@ -331,7 +339,7 @@ func builtins() []Spec {
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "npx sequelize db:migrate",
-			MigrateEnv:    genericDBNameEnv(),
+			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name:          "mikro-orm",
@@ -342,7 +350,7 @@ func builtins() []Spec {
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "npx mikro-orm migration:up",
-			MigrateEnv:    genericDBNameEnv(),
+			MigrateEnv:    dbNameEnv(),
 		},
 	}
 }
