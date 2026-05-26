@@ -47,6 +47,21 @@
       ],
       "description": "One action: a `run` (string or list of strings) plus optional cwd + container wrapping."
     },
+    "AutoFetchConfig": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled toggles the loop. Default true. A pointer would let the\nschema distinguish \"unset\" from \"explicit false\", but defaults\nare applied centrally in applyDefaults and there is no\ninheritance subtlety — a missing key means \"use default\"."
+        },
+        "interval_minutes": {
+          "type": "integer",
+          "description": "Cadence in minutes. Default 15. Minimum 1 (values below are\nclamped at use-site to avoid a runaway tight loop on a typo)."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "AutoFetchConfig — `auto_fetch:` block. Periodic daemon-side\n`git fetch --all --prune` per registered repo, followed by a best-\neffort `git merge --ff-only @{u}` per active worktree. Pull is\nsafe: it skips when the working tree is dirty, when the branch\nhas no upstream, or when the merge would not be a fast-forward.\nEach failure logs a warning and the loop continues.\n\nUse `enabled: false` (per-repo `.treeman.yaml` override) to opt a\nrepo out, e.g. when a separate scheduler already pulls or when\nnetwork policy forbids unsolicited fetches."
+    },
     "ClonesSetting": {
       "oneOf": [
         {
@@ -788,6 +803,10 @@
     "logs": {
       "$ref": "#/$defs/LogsConfig",
       "description": "Logs retention. Daemon-side prune drops rows older than\n`keep_days` from the events, hook_runs, and hook_log_chunks\ntables on a fixed interval. Set 0 to keep forever (no prune)."
+    },
+    "auto_fetch": {
+      "$ref": "#/$defs/AutoFetchConfig",
+      "description": "AutoFetch policy. Daemon-side periodic `git fetch --all --prune`\nper registered repo, followed by a `git merge --ff-only @{u}`\nper active worktree. Skips dirty trees, non-ff branches, and\nupstreamless branches. Enabled by default at a 15-minute cadence."
     }
   },
   "additionalProperties": false,
