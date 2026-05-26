@@ -116,6 +116,15 @@ type AutoFetchConfig struct {
 	// Cadence in minutes. Default 15. Minimum 1 (values below are
 	// clamped at use-site to avoid a runaway tight loop on a typo).
 	IntervalMinutes uint32 `yaml:"interval_minutes,omitempty"`
+
+	// Mode controls how a worktree's HEAD is advanced after fetch.
+	//   - "ff" (default): `git merge --ff-only @{u}`. Refuses on
+	//     divergence; user's unpushed commits are never touched.
+	//   - "rebase": `git rebase --autostash @{u}`. Replays local
+	//     commits on top of upstream. Auto-aborts on conflict so the
+	//     working tree never lands in a half-rebased state.
+	// Opt-in only — keep the safe ff path as the default.
+	Mode string `yaml:"mode,omitempty" jsonschema:"enum=ff,enum=rebase"`
 }
 
 // IsEnabled returns the resolved on/off value, treating nil
@@ -125,6 +134,17 @@ func (a AutoFetchConfig) IsEnabled() bool {
 		return true
 	}
 	return *a.Enabled
+}
+
+// ResolvedMode normalises Mode into the canonical "ff" / "rebase"
+// values, defaulting to "ff" for any unknown / empty string.
+func (a AutoFetchConfig) ResolvedMode() string {
+	switch a.Mode {
+	case "rebase":
+		return "rebase"
+	default:
+		return "ff"
+	}
 }
 
 // LogsConfig — `logs:` block. One knob: how long to keep events +

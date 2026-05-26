@@ -122,6 +122,7 @@ func registerReadTools(srv *mcpsdk.Server) {
 	}, inputsFingerprintTool)
 
 	registerEngineReadTools(srv)
+	registerSyncReadTools(srv)
 }
 
 // ─── doctor ───────────────────────────────────────────────────────

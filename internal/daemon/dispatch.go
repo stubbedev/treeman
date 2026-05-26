@@ -150,6 +150,29 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 			Worktrees: paths,
 		}
 
+	case rpc.MethodSyncNow:
+		target := ""
+		if req.SyncNow != nil {
+			target = req.SyncNow.Path
+		}
+		statuses, errs := SyncNow(ctx, st, target)
+		return rpc.Response{
+			Kind:        rpc.KindSyncResult,
+			SyncedRepos: statuses,
+			SyncErrors:  errs,
+		}
+
+	case rpc.MethodSyncStatus:
+		filter := ""
+		if req.SyncStatus != nil {
+			filter = req.SyncStatus.RepoPath
+		}
+		statuses := SyncStatusSnapshot(ctx, st, filter)
+		return rpc.Response{
+			Kind:        rpc.KindSyncStatus,
+			SyncedRepos: statuses,
+		}
+
 	default:
 		return errResp("unknown method: " + req.Method)
 	}
@@ -332,6 +355,17 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 			if err := FinalizeWorktree(runid.With(st.BgCtx, rid), st, repoPath, wtPath, env); err != nil {
 				slog.Warn("head-triggered finalize", "wt", wtPath, "err", err)
 			}
+		})
+		// Sync the new branch against upstream — switching to a
+		// stale branch otherwise leaves it stale until the next
+		// auto-fetch tick (up to 15 min). Respects per-repo opt-out
+		// the same way the periodic sweep does.
+		safeGo("head_sync:"+wtPath, func() {
+			cfg, err := resolve.LoadResolved(repoPath)
+			if err != nil || !cfg.AutoFetch.IsEnabled() {
+				return
+			}
+			_ = SyncWorktree(runid.With(st.BgCtx, rid), st, repoID, wtPath, cfg.AutoFetch.ResolvedMode())
 		})
 	})
 	if err != nil {

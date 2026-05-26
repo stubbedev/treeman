@@ -63,6 +63,8 @@ const (
 	MethodConfigReload     = "config_reload"
 	MethodRepoRemove       = "repo_remove"
 	MethodShutdown         = "shutdown"
+	MethodSyncNow          = "sync_now"
+	MethodSyncStatus       = "sync_status"
 )
 
 // Request is the envelope every CLI message uses. Exactly one of the
@@ -77,6 +79,8 @@ type Request struct {
 	WorktreeTeardown *WorktreeTeardownArgs `json:",omitempty"`
 	ConfigReload     *ConfigReloadArgs     `json:",omitempty"`
 	RepoRemove       *RepoRemoveArgs       `json:",omitempty"`
+	SyncNow          *SyncNowArgs          `json:",omitempty"`
+	SyncStatus       *SyncStatusArgs       `json:",omitempty"`
 }
 
 // MarshalJSON flattens the discriminator + the matching args struct
@@ -123,6 +127,14 @@ func (r Request) MarshalJSON() ([]byte, error) {
 		if r.RepoRemove != nil {
 			wrapper["repo_path"] = r.RepoRemove.RepoPath
 			wrapper["force"] = r.RepoRemove.Force
+		}
+	case MethodSyncNow:
+		if r.SyncNow != nil {
+			wrapper["path"] = r.SyncNow.Path
+		}
+	case MethodSyncStatus:
+		if r.SyncStatus != nil {
+			wrapper["repo_path"] = r.SyncStatus.RepoPath
 		}
 	}
 	return json.Marshal(wrapper)
@@ -184,6 +196,12 @@ func (r *Request) UnmarshalJSON(data []byte) error {
 			"repo_path": &r.RepoRemove.RepoPath,
 			"force":     &r.RepoRemove.Force,
 		})
+	case MethodSyncNow:
+		r.SyncNow = &SyncNowArgs{}
+		return decodeFields(raw, map[string]any{"path": &r.SyncNow.Path})
+	case MethodSyncStatus:
+		r.SyncStatus = &SyncStatusArgs{}
+		return decodeFields(raw, map[string]any{"repo_path": &r.SyncStatus.RepoPath})
 	default:
 		return fmt.Errorf("rpc: unknown method %q", r.Method)
 	}
@@ -236,6 +254,44 @@ type ConfigReloadArgs struct {
 	RepoPath string
 }
 
+// SyncNowArgs — on-demand fetch + advance. Path scopes the work:
+//
+//   - empty       → every registered repo (mirrors auto-fetch sweep).
+//   - repo root   → that repo + every linked worktree.
+//   - wt path     → the repo the worktree belongs to + that wt only.
+//
+// Manual sync ignores the per-repo backoff window so a user override
+// can punch through an offline-mode pause.
+type SyncNowArgs struct {
+	Path string `json:"path,omitempty"`
+}
+
+// SyncStatusArgs — read sync state. Empty RepoPath returns every
+// registered repo; non-empty filters to one.
+type SyncStatusArgs struct {
+	RepoPath string `json:"repo_path,omitempty"`
+}
+
+// SyncRepoStatus is one row in a SyncStatus response.
+type SyncRepoStatus struct {
+	RepoPath       string               `json:"repo_path"`
+	LastFetchUnix  int64                `json:"last_fetch_unix,omitempty"`
+	ConsecFailures int                  `json:"consec_failures,omitempty"`
+	NextRetryUnix  int64                `json:"next_retry_unix,omitempty"`
+	Mode           string               `json:"mode"`
+	Worktrees      []SyncWorktreeStatus `json:"worktrees,omitempty"`
+}
+
+// SyncWorktreeStatus is one worktree row inside SyncRepoStatus.
+type SyncWorktreeStatus struct {
+	Path           string `json:"path"`
+	Branch         string `json:"branch,omitempty"`
+	Ahead          int    `json:"ahead"`
+	Behind         int    `json:"behind"`
+	Dirty          bool   `json:"dirty"`
+	LastSkipReason string `json:"last_skip_reason,omitempty"`
+}
+
 // RepoRemoveArgs — drop a repo from the SQLite registry. Daemon stops
 // every watcher attached to the repo first. Force=false refuses the
 // removal when active (`deleted_at IS NULL`) worktrees still exist.
@@ -261,6 +317,8 @@ const (
 	KindWorktreeList           = "worktree_list"
 	KindWorktreeFinalizeQueued = "worktree_finalize_queued"
 	KindWorktreeTeardownQueued = "worktree_teardown_queued"
+	KindSyncResult             = "sync_result"
+	KindSyncStatus             = "sync_status"
 	KindError                  = "error"
 )
 
@@ -282,6 +340,9 @@ type Response struct {
 	Worktrees []string         `json:"worktrees,omitempty"`
 	// Finalize / Teardown queued
 	WorktreePath string `json:"worktree_path,omitempty"`
+	// SyncResult / SyncStatus
+	SyncedRepos []SyncRepoStatus `json:"synced_repos,omitempty"`
+	SyncErrors  []string         `json:"sync_errors,omitempty"`
 	// Error
 	Message string `json:"message,omitempty"`
 }

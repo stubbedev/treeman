@@ -28,6 +28,7 @@ func New() *cli.Command {
 			cmd.WorktreeCmd(),
 			cmd.BranchesCmd(),
 			cmd.PrepareCmd(),
+			cmd.SyncCmd(),
 			cmd.HookCmd(),
 			cmd.LogsCmd(),
 			cmd.ConfigCmd(),

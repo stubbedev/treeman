@@ -75,6 +75,28 @@ type State struct {
 	// `treemand` main; nil in unit tests that exercise dispatch
 	// without booting the full daemon.
 	ConfigReloader *ConfigReloader
+
+	// syncMu guards the sync-state maps below. The auto-fetch loop and
+	// on-demand sync RPCs both mutate this from different goroutines;
+	// a single mutex is cheaper than per-repo locks given the small
+	// number of registered repos.
+	syncMu sync.Mutex
+	// syncBackoff[repoPath] is the wall time at which the repo becomes
+	// eligible for another auto-fetch. Set after a fetch failure;
+	// cleared on success. Manual `sync_now` ignores this entirely so
+	// the user can override an offline-mode pause.
+	syncBackoff map[string]time.Time
+	// syncFailCount[repoPath] is the consecutive-failure count used to
+	// derive the next backoff window (exponential, capped at 1h).
+	syncFailCount map[string]int
+	// syncLastFetch[repoPath] is the unix time of the most recent
+	// successful `git fetch` for the repo. Read by `sync_status` so
+	// callers see staleness without scanning event history.
+	syncLastFetch map[string]time.Time
+	// syncLastSkip[wtPath] is the most recent skip reason emitted for
+	// the worktree (dirty, no-upstream, non-ff, detached). Surfaces
+	// via `sync_status` for "why didn't my branch advance?".
+	syncLastSkip map[string]string
 }
 
 // DBDropJob is one queued `prepare.TeardownDatabases` invocation,
@@ -117,7 +139,78 @@ func NewState(bg context.Context, s *store.Store) *State {
 		inFlightFinalizes: map[string]context.CancelFunc{},
 		reapQueues:        map[string]chan string{},
 		dropQueues:        map[string]chan DBDropJob{},
+		syncBackoff:       map[string]time.Time{},
+		syncFailCount:     map[string]int{},
+		syncLastFetch:     map[string]time.Time{},
+		syncLastSkip:      map[string]string{},
 	}
+}
+
+// SyncBackoffUntil returns the wall time before which the repo should
+// be skipped by the auto-fetch sweep. Zero value means "eligible now".
+func (st *State) SyncBackoffUntil(repoPath string) time.Time {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	return st.syncBackoff[repoPath]
+}
+
+// RecordSyncFailure bumps the consecutive-failure count for repoPath
+// and parks the next-eligible time to `now + delay`. `delay` is
+// computed by the caller (lets the auto-fetch loop reuse the same
+// helper for variable backoff curves). Returns the new fail count.
+func (st *State) RecordSyncFailure(repoPath string, delay time.Duration) int {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	st.syncFailCount[repoPath]++
+	st.syncBackoff[repoPath] = time.Now().Add(delay)
+	return st.syncFailCount[repoPath]
+}
+
+// RecordSyncSuccess clears any backoff entry for repoPath and stamps
+// the last-successful-fetch time. Called after a fetch returns nil.
+func (st *State) RecordSyncSuccess(repoPath string) {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	delete(st.syncBackoff, repoPath)
+	delete(st.syncFailCount, repoPath)
+	st.syncLastFetch[repoPath] = time.Now()
+}
+
+// SyncFailCount returns the consecutive-failure count for repoPath.
+// 0 means the last attempt succeeded (or no attempt yet).
+func (st *State) SyncFailCount(repoPath string) int {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	return st.syncFailCount[repoPath]
+}
+
+// SyncLastFetch returns the wall time of the last successful fetch for
+// repoPath. Zero value when no fetch has succeeded since daemon boot.
+func (st *State) SyncLastFetch(repoPath string) time.Time {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	return st.syncLastFetch[repoPath]
+}
+
+// RecordSyncSkip stores the most recent skip reason for a worktree so
+// the sync_status RPC can surface "why didn't my branch advance?"
+// without scanning event history.
+func (st *State) RecordSyncSkip(wtPath, reason string) {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	if reason == "" {
+		delete(st.syncLastSkip, wtPath)
+		return
+	}
+	st.syncLastSkip[wtPath] = reason
+}
+
+// SyncLastSkip returns the most recent skip reason for wtPath, or ""
+// if the last advance succeeded (or never ran).
+func (st *State) SyncLastSkip(wtPath string) string {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	return st.syncLastSkip[wtPath]
 }
 
 // MarkTeardownInFlight records that a primary TeardownWorktree is

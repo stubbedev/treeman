@@ -129,6 +129,7 @@ func registerWriteTools(srv *mcpsdk.Server) {
 	}, worktreeDeleteTool)
 
 	registerEngineWriteTools(srv)
+	registerSyncWriteTools(srv)
 }
 
 // ─── prepare_run ──────────────────────────────────────────────────
