@@ -27,6 +27,7 @@ import (
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/ui"
+	wt2 "github.com/stubbedev/treeman/internal/wt"
 )
 
 // PrepareCmd — `treeman prepare` runs the full pipeline foreground.
@@ -148,12 +149,13 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 		return hooks.RunOutcome{}, err
 	}
 	branch := detectBranchOfWorktree(wt)
-	sl := slug.For(wt, branch)
 	env := CaptureInheritedEnv()
 
 	var (
 		st           *store.Store
 		repoID, wtID int64
+		sl           slug.Slug
+		isMain       bool
 		entries      int
 		startedMs    int64
 		out          hooks.RunOutcome
@@ -165,8 +167,17 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 			st = s
 			defer st.Close()
 			repoID, _ = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			wtID, _ = st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
+			id, idErr := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+			if idErr != nil {
+				return hooks.RunOutcome{}, idErr
+			}
+			sl, wtID, isMain = id.Slug, id.WtID, id.IsMain
 		}
+	}
+	if sl.Value == "" {
+		// Store unreachable — fall back to a path-hash slug so the hook
+		// env still has something. $TREEMAN_IS_MAIN reads "0".
+		sl = slug.For(wt, branch)
 	}
 
 	var hookEntries []config.Action
@@ -187,8 +198,7 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	entries = len(hookEntries)
 
 	startedMs = hooks.EmitHookStart(ctx, st, repoID, wtID, phase, entries)
-	// CLI-direct hook fire (not main-wt-aware; matches MCP today).
-	out, runErr = hooks.RunHooks(ctx, phase, hookEntries, repoRoot, wt, sl.Value, false, env, true)
+	out, runErr = hooks.RunHooks(ctx, phase, hookEntries, repoRoot, wt, sl.Value, isMain, env, true)
 	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, startedMs, time.Now().UnixMilli(), out)
 	return out, runErr
 }

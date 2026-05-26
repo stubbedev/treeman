@@ -14,6 +14,7 @@ import (
 	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/version"
 	"github.com/stubbedev/treeman/internal/watcher"
+	"github.com/stubbedev/treeman/internal/wt"
 )
 
 // Dispatch executes one RPC request against the live state, returning
@@ -490,7 +491,7 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 // can branch on the trigger details: TREEMAN_WATCH_PATH,
 // TREEMAN_WATCH_LABEL, TREEMAN_WATCH_ENGINE, TREEMAN_WATCH_DB_NAME.
 //
-// Main-wt aware: resolveWorktreeIdentity must run BEFORE we read the
+// Main-wt aware: wt.ResolveIdentity must run BEFORE we read the
 // owning database's NameTemplate, otherwise the overlay's
 // main-wt-specific template wouldn't be in cfg.Databases yet and
 // TREEMAN_WATCH_DB_NAME would resolve to the linked-wt template's
@@ -528,13 +529,14 @@ func fireOnFileChange(
 	if err != nil {
 		return
 	}
-	sl, wtID, _, isMain, err := resolveWorktreeIdentity(ctx, st, &cfg, repoPath, wtPath, repoID)
+	id, err := wt.ResolveIdentity(ctx, st.Store, &cfg, repoPath, wtPath, detectBranch(wtPath), repoID)
 	if err != nil {
 		return
 	}
+	sl, wtID, isMain := id.Slug, id.WtID, id.IsMain
 	// Resolve the owning database's engine + rendered name so the
 	// hook can branch on engine without re-parsing config. cfg has
-	// already been overlay-merged by resolveWorktreeIdentity, so
+	// already been overlay-merged by wt.ResolveIdentity, so
 	// d.NameTemplate is the main-wt-specific template when relevant.
 	var engine, dbName string
 	if dbIdx >= 0 && dbIdx < len(cfg.Databases) {
@@ -562,7 +564,7 @@ func fireOnFileChange(
 // react to those events without sharing the regular finalize logic.
 // Errors are swallowed + logged; this path is best-effort.
 //
-// Main-wt aware via resolveWorktreeIdentity: when wtPath is the repo
+// Main-wt aware via wt.ResolveIdentity: when wtPath is the repo
 // root and main-wt is enabled, the hook subprocess receives
 // $TREEMAN_SLUG=main_<branch> matching the finalize-path slug. A
 // stale slug.For here would corrupt the main row's slug column on
@@ -587,9 +589,9 @@ func fireTriggerActions(
 	if err != nil {
 		return
 	}
-	sl, wtID, _, isMain, err := resolveWorktreeIdentity(ctx, st, &cfg, repoPath, wtPath, repoID)
+	id, err := wt.ResolveIdentity(ctx, st.Store, &cfg, repoPath, wtPath, detectBranch(wtPath), repoID)
 	if err != nil {
 		return
 	}
-	_ = runTriggerActions(ctx, st, trigger, actions, repoPath, wtPath, sl.Value, isMain, repoID, wtID, inheritedEnv)
+	_ = runTriggerActions(ctx, st, trigger, actions, repoPath, wtPath, id.Slug.Value, id.IsMain, repoID, id.WtID, inheritedEnv)
 }

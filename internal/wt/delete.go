@@ -9,10 +9,10 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
+	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
-	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -122,23 +122,24 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 		return err
 	}
 	defer st.Close()
-	sl := slug.For(wtPath, "")
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	wtID, _ := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, "")
+	branch := gitenv.DetectBranch(wtPath)
+	id, err := ResolveIdentity(ctx, st, &cfg, repoRoot, wtPath, branch, repoID)
+	if err != nil {
+		return err
+	}
 	runTrigger := func(trigger string, actions []config.Action) {
 		if len(actions) == 0 {
 			return
 		}
-		started := hooks.EmitHookStart(ctx, st, repoID, wtID, trigger, len(actions))
-		// Local delete path (CLI-direct teardown) is always against a
-		// linked worktree — main wt teardown goes through the daemon.
-		out, _ := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, sl.Value, false, env, true)
-		hooks.PersistOutcome(ctx, st, repoID, wtID, trigger, started, time.Now().UnixMilli(), out)
+		started := hooks.EmitHookStart(ctx, st, repoID, id.WtID, trigger, len(actions))
+		out, _ := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, id.Slug.Value, id.IsMain, env, true)
+		hooks.PersistOutcome(ctx, st, repoID, id.WtID, trigger, started, time.Now().UnixMilli(), out)
 	}
 	runTrigger("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
-	_ = prepare.TeardownDatabases(ctx, &cfg, sl.Value, repoID, wtID, st)
+	_ = prepare.TeardownDatabases(ctx, &cfg, id.Slug.Value, repoID, id.WtID, st)
 	runTrigger("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
-	_ = st.MarkWorktreeDeleted(ctx, wtID)
+	_ = st.MarkWorktreeDeleted(ctx, id.WtID)
 	args := []string{"worktree", "remove"}
 	if force {
 		args = append(args, "--force")

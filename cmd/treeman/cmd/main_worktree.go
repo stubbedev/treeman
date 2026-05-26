@@ -5,12 +5,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/urfave/cli/v3"
 	"gopkg.in/yaml.v3"
 
+	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/gitcmd"
+	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/ui"
 	"github.com/stubbedev/treeman/internal/yamlpatch"
@@ -38,6 +43,7 @@ func MainCmd() *cli.Command {
 				Usage: "remove the repo root from the watcher lifecycle",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+					&cli.BoolFlag{Name: "purge", Usage: "after disabling, drop every per-branch DB the main_<branch> slug owns (current branch + every local branch). Engine resources only — the worktrees row stays soft-deleted for resurrection."},
 				},
 				Action: mainDisableAction,
 			},
@@ -86,6 +92,16 @@ func mainDisableAction(ctx context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	// Snapshot the config BEFORE patching — purge needs the engine
+	// connections + database templates that we're about to disable.
+	var cfgForPurge *config.Config
+	if c.Bool("purge") {
+		cfg, err := resolve.LoadResolved(repoRoot)
+		if err != nil {
+			return fmt.Errorf("load config for purge: %w", err)
+		}
+		cfgForPurge = &cfg
+	}
 	if err := patchMainWorktreeConfig(repoRoot, false); err != nil {
 		return err
 	}
@@ -94,8 +110,96 @@ func mainDisableAction(ctx context.Context, c *cli.Command) error {
 		ui.Hint("config written; restart treemand to apply")
 		return nil
 	}
+	if cfgForPurge != nil {
+		if err := purgeMainDatabases(ctx, repoRoot, cfgForPurge); err != nil {
+			ui.Warn("purge: %v", err)
+			ui.Hint("config disabled; re-run `treeman main disable --purge` after fixing the engine reachability issue")
+			return nil
+		}
+	}
 	PrintOK("main worktree disabled (%s)", repoRoot)
 	return nil
+}
+
+// purgeMainDatabases drops every per-branch DB the main_<branch>
+// slug owns across all local branches plus the current HEAD. Each
+// branch's databases are torn down by rendering slug.ForMain and
+// invoking prepare.TeardownDatabases with the main-wt overlay
+// applied. Errors per-branch are logged but don't abort the rest —
+// a branch whose engine resources are already gone shouldn't block
+// purging the rest.
+//
+// Best-effort enumeration: only local branches surface here. A
+// branch that was deleted between visits already has its slug-keyed
+// DB orphaned today; that pre-existing leak isn't this command's
+// problem to chase.
+func purgeMainDatabases(ctx context.Context, repoRoot string, cfg *config.Config) error {
+	dbPath, _ := store.DefaultDBPath()
+	if dbPath == "" {
+		return fmt.Errorf("no default db path")
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer st.Close()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	// Apply the main-wt overlay so prepare.TeardownDatabases sees the
+	// same templates the main-wt finalize path used to create the
+	// resources. Without the overlay, an overlay-only `name_template`
+	// override leaks DBs because the teardown probes the wrong name.
+	config.ApplyMainWorktreeOverlay(cfg)
+
+	branches := localBranches(ctx, repoRoot)
+	current := detectBranchOfWorktree(repoRoot)
+	if current != "" {
+		// Make sure HEAD is covered even if for-each-ref didn't
+		// surface it (detached HEAD edge cases).
+		seen := false
+		for _, b := range branches {
+			if b == current {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			branches = append(branches, current)
+		}
+	}
+	if len(branches) == 0 {
+		ui.Info("purge: no local branches to enumerate")
+		return nil
+	}
+
+	var purged int
+	for _, branch := range branches {
+		sl := slug.ForMain(repoRoot, branch)
+		if err := prepare.TeardownDatabases(ctx, cfg, sl.Value, repoID, 0, st); err != nil {
+			ui.Warn("purge %s: %v", sl.Value, err)
+			continue
+		}
+		purged++
+	}
+	ui.Info("purge: tore down DBs for %d branch(es)", purged)
+	return nil
+}
+
+// localBranches returns the repo's local branches via `git -C repo
+// for-each-ref`. Empty slice on error — purge is best-effort.
+func localBranches(ctx context.Context, repoRoot string) []string {
+	out, err := gitcmd.String(ctx, repoRoot,
+		"for-each-ref", "--format=%(refname:short)", "refs/heads/")
+	if err != nil {
+		return nil
+	}
+	var branches []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			branches = append(branches, line)
+		}
+	}
+	return branches
 }
 
 func mainStatusAction(ctx context.Context, c *cli.Command) error {

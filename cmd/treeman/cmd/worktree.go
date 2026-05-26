@@ -294,7 +294,7 @@ func wtList() *cli.Command {
 			default:
 				return fmt.Errorf("unknown --sort %q (id|mtime|visited)", c.String("sort"))
 			}
-			q := `SELECT id, slug, COALESCE(branch,'-'), path, COALESCE(last_visited_at, 0)
+			q := `SELECT id, slug, COALESCE(branch,'-'), path, COALESCE(last_visited_at, 0), is_main
 				FROM worktrees WHERE ` + where + ` ` + orderBy
 			rows, err := st.DB.QueryContext(ctx, q, args...)
 			if err != nil {
@@ -306,6 +306,7 @@ func wtList() *cli.Command {
 				Slug        string `json:"slug"`
 				Branch      string `json:"branch"`
 				Path        string `json:"path"`
+				IsMain      bool   `json:"is_main"`
 				HeadTs      int64  `json:"head_ts,omitempty"`
 				VisitedTs   int64  `json:"visited_ts,omitempty"`
 				Status      string `json:"status,omitempty"`
@@ -315,10 +316,14 @@ func wtList() *cli.Command {
 				FinalState  string `json:"state,omitempty"`
 			}
 			var all []wtRow
+			anyMain := false
 			for rows.Next() {
 				var r wtRow
-				if err := rows.Scan(&r.ID, &r.Slug, &r.Branch, &r.Path, &r.VisitedTs); err != nil {
+				if err := rows.Scan(&r.ID, &r.Slug, &r.Branch, &r.Path, &r.VisitedTs, &r.IsMain); err != nil {
 					return err
+				}
+				if r.IsMain {
+					anyMain = true
 				}
 				all = append(all, r)
 			}
@@ -368,7 +373,13 @@ func wtList() *cli.Command {
 				return nil
 			}
 
-			headers := []string{"ID", "SLUG", "BRANCH"}
+			// MAIN column only shows up when at least one row is the
+			// main wt — keeps the dominant linked-only output narrow.
+			headers := []string{"ID"}
+			if anyMain {
+				headers = append(headers, "MAIN")
+			}
+			headers = append(headers, "SLUG", "BRANCH")
 			if withStatus {
 				headers = append(headers, "STATUS")
 			}
@@ -379,7 +390,15 @@ func wtList() *cli.Command {
 			tbl := ui.NewTable(headers...)
 			anyStatusErr := false
 			for _, r := range all {
-				cells := []string{ui.Dim(fmt.Sprintf("%d", r.ID)), ui.Cyan(r.Slug), r.Branch}
+				cells := []string{ui.Dim(fmt.Sprintf("%d", r.ID))}
+				if anyMain {
+					if r.IsMain {
+						cells = append(cells, ui.Cyan("★"))
+					} else {
+						cells = append(cells, "")
+					}
+				}
+				cells = append(cells, ui.Cyan(r.Slug), r.Branch)
 				if withStatus {
 					if r.StatusError != "" {
 						anyStatusErr = true
@@ -505,7 +524,10 @@ func wtFinalize() *cli.Command {
 				// Used by the wt-create fallback path's detached child.
 				// Loads its own resolved config + opens its own store
 				// handle since the parent has already exited by the
-				// time this runs.
+				// time this runs. Routes through wt.ResolveIdentity so
+				// `wt finalize . --local` at the repo root picks up the
+				// main-wt overlay/slug instead of producing a path-hash
+				// slug that would corrupt the main row.
 				cfg, err := resolve.LoadResolved(repoRoot)
 				if err != nil {
 					return err
@@ -516,10 +538,13 @@ func wtFinalize() *cli.Command {
 					return err
 				}
 				defer st.Close()
-				sl := slug.For(wtPath, "")
 				repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-				wtID, _ := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, "")
-				return wt.RunLocalFinalize(ctx, &cfg, repoRoot, wtPath, sl, st, repoID, wtID, CaptureInheritedEnv(), false, cliSink{})
+				branch := detectBranchOfWorktree(wtPath)
+				id, err := wt.ResolveIdentity(ctx, st, &cfg, repoRoot, wtPath, branch, repoID)
+				if err != nil {
+					return err
+				}
+				return wt.RunLocalFinalize(ctx, &cfg, repoRoot, wtPath, id.Slug, id.IsMain, st, repoID, id.WtID, CaptureInheritedEnv(), false, cliSink{})
 			}
 
 			resp, err := rpc.Call(ctx, rpc.Request{

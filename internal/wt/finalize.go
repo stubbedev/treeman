@@ -22,6 +22,7 @@ func RunLocalFinalize(
 	cfg *config.Config,
 	repoRoot, wtPath string,
 	sl slug.Slug,
+	isMain bool,
 	st *store.Store,
 	repoID, wtID int64,
 	env map[string]string,
@@ -36,9 +37,7 @@ func RunLocalFinalize(
 			return nil
 		}
 		started := hooks.EmitHookStart(ctx, st, repoID, wtID, trigger, len(actions))
-		// Local-finalize is the wt-create detached-child path: always
-		// against a brand-new linked worktree, never the main wt.
-		out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, sl.Value, false, env, true)
+		out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, sl.Value, isMain, env, true)
 		hooks.PersistOutcome(ctx, st, repoID, wtID, trigger, started, time.Now().UnixMilli(), out)
 		if err != nil {
 			return err

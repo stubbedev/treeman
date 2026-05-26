@@ -16,6 +16,7 @@ import (
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
+	wtpkg "github.com/stubbedev/treeman/internal/wt"
 )
 
 // secretPatterns matches common credential shapes that may leak into
@@ -189,15 +190,24 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	if err != nil {
 		return hooks.RunOutcome{}, err
 	}
-	sl := slug.For(wt, branch)
 	env := captureEnv()
 
 	st, dbErr := openStore(ctx)
 	var repoID, wtID int64
+	var sl slug.Slug
+	var isMain bool
 	if dbErr == nil {
 		defer st.Close()
 		repoID, _ = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-		wtID, _ = st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
+		id, idErr := wtpkg.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+		if idErr != nil {
+			return hooks.RunOutcome{}, idErr
+		}
+		sl, wtID, isMain = id.Slug, id.WtID, id.IsMain
+	} else {
+		// No store reachable — fall back to a path-hash slug just so
+		// the hook env has something. $TREEMAN_IS_MAIN reads "0".
+		sl = slug.For(wt, branch)
 	}
 
 	var entries []config.Action
@@ -217,11 +227,7 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	}
 
 	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, len(entries))
-	// MCP-driven hook firing isn't main-wt-aware yet — surface as
-	// non-main so $TREEMAN_IS_MAIN reads "0". When MCP wants to opt
-	// into main-wt routing it needs to thread through the daemon's
-	// resolveWorktreeIdentity helper the way FinalizeWorktree does.
-	out, rErr := hooks.RunHooks(ctx, phase, entries, repoRoot, wt, sl.Value, false, env, true)
+	out, rErr := hooks.RunHooks(ctx, phase, entries, repoRoot, wt, sl.Value, isMain, env, true)
 	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, started, time.Now().UnixMilli(), out)
 	return out, rErr
 }

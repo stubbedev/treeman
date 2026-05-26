@@ -17,6 +17,7 @@ import (
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
+	"github.com/stubbedev/treeman/internal/wt"
 )
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
@@ -65,17 +66,18 @@ func FinalizeWorktree(
 		return err
 	}
 
-	// Main-wt routing — see resolveWorktreeIdentity for the
+	// Main-wt routing — see wt.ResolveIdentity for the
 	// two-source-of-truth check (cfg.MainWorktree.Enabled OR an
 	// active is_main=1 row) that bridges the disable→reload race.
 	// Without that bridge, a HEAD-watcher firing finalize between
 	// `main disable` writing YAML and the reload soft-deleting the
 	// row would create a fresh path-hash-keyed DB and orphan every
 	// per-branch DB the main slug owns.
-	sl, wtID, _, isMain, err := resolveWorktreeIdentity(ctx, st, &cfg, repoRoot, wtRoot, repoID)
+	id, err := wt.ResolveIdentity(ctx, st.Store, &cfg, repoRoot, wtRoot, detectBranch(wtRoot), repoID)
 	if err != nil {
 		return err
 	}
+	sl, wtID, isMain := id.Slug, id.WtID, id.IsMain
 
 	// Cache the user's shell env per-worktree so daemon-driven re-
 	// runs (HEAD watcher, file watcher) can rehydrate PATH etc.
@@ -216,10 +218,11 @@ func FinalizeWorktreeForWatch(
 	// this, a touch on a watched migration in the repo root would
 	// rebuild against a path-hash-keyed DB while the rest of the
 	// system addresses main_<branch>.
-	sl, wtID, _, _, err := resolveWorktreeIdentity(ctx, st, &cfg, repoRoot, wtRoot, repoID)
+	id, err := wt.ResolveIdentity(ctx, st.Store, &cfg, repoRoot, wtRoot, detectBranch(wtRoot), repoID)
 	if err != nil {
 		return err
 	}
+	sl, wtID := id.Slug, id.WtID
 
 	// Re-apply patches. Cheap; idempotent for unchanged content.
 	if len(cfg.Patches) > 0 {
