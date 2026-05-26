@@ -178,6 +178,105 @@ func dbURLEnv() map[string]string {
 	}
 }
 
+// hasGooseEvidence reports whether the repo imports pressly/goose.
+// Lets us share `go.mod` as a marker with golang-migrate without
+// collision — only one of the two validators returns true for a
+// given project.
+func hasGooseEvidence(repoRoot string) bool {
+	b, err := os.ReadFile(filepath.Join(repoRoot, "go.sum"))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(b), "github.com/pressly/goose")
+}
+
+// hasDoctrineMigrationsDep confirms a PHP project actually pulls in
+// the doctrine-migrations-bundle (or the standalone library).
+// composer.json alone is too broad — every PHP project has one.
+func hasDoctrineMigrationsDep(repoRoot string) bool {
+	b, err := os.ReadFile(filepath.Join(repoRoot, "composer.json"))
+	if err != nil {
+		return false
+	}
+	s := string(b)
+	return strings.Contains(s, "doctrine/doctrine-migrations-bundle") ||
+		strings.Contains(s, "doctrine/migrations")
+}
+
+// hasEctoEvidence confirms a Mix project actually uses Ecto. mix.exs
+// matches every Elixir project; the real signal is either ecto_sql
+// in mix.lock or a default priv/repo/migrations directory.
+func hasEctoEvidence(repoRoot string) bool {
+	if b, err := os.ReadFile(filepath.Join(repoRoot, "mix.lock")); err == nil {
+		if strings.Contains(string(b), `"ecto_sql"`) {
+			return true
+		}
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, "priv", "repo", "migrations")); err == nil {
+		return true
+	}
+	return false
+}
+
+// hasDBmateEvidence looks for DBmate's distinctive `-- migrate:up`
+// directive inside files under `db/migrations/`. DBmate ships no
+// required config file, so this content check is the only reliable
+// disambiguator from golang-migrate / sqlx-cli / Atlas.
+func hasDBmateEvidence(repoRoot string) bool {
+	matches, _ := filepath.Glob(filepath.Join(repoRoot, "db", "migrations", "*.sql"))
+	for _, m := range matches {
+		b, err := os.ReadFile(m)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(b), "-- migrate:up") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasEFCoreEvidence walks the root and one level deep for a *.csproj
+// that references Microsoft.EntityFrameworkCore. EF Core has no
+// canonical config file — the csproj content is the only static
+// signal — so the Spec uses a permissive marker and leans on this.
+func hasEFCoreEvidence(repoRoot string) bool {
+	candidates, _ := filepath.Glob(filepath.Join(repoRoot, "*.csproj"))
+	nested, _ := filepath.Glob(filepath.Join(repoRoot, "*", "*.csproj"))
+	candidates = append(candidates, nested...)
+	srcNested, _ := filepath.Glob(filepath.Join(repoRoot, "src", "*", "*.csproj"))
+	candidates = append(candidates, srcNested...)
+	for _, p := range candidates {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(b), "Microsoft.EntityFrameworkCore") {
+			return true
+		}
+	}
+	return false
+}
+
+// gooseEnv scaffolds Goose's native env-var pair. The user edits the
+// scheme / credentials; treeman substitutes {target_db} per run.
+func gooseEnv() map[string]string {
+	return map[string]string{
+		"GOOSE_DRIVER":   "postgres",
+		"GOOSE_DBSTRING": "postgres://user:password@127.0.0.1:5432/{target_db}?sslmode=disable",
+	}
+}
+
+// liquibaseEnv scaffolds Liquibase's native LIQUIBASE_COMMAND_* env
+// triplet. The CLI reads each of these without a properties file.
+func liquibaseEnv() map[string]string {
+	return map[string]string{
+		"LIQUIBASE_COMMAND_URL":      "jdbc:postgresql://127.0.0.1:5432/{target_db}",
+		"LIQUIBASE_COMMAND_USERNAME": "user",
+		"LIQUIBASE_COMMAND_PASSWORD": "password",
+	}
+}
+
 // flywayURLEnv scaffolds FLYWAY_URL with a JDBC connection-string
 // template. Flyway's CLI reads FLYWAY_URL natively, so this avoids
 // the user having to thread anything through the migrate command.
@@ -376,6 +475,106 @@ func builtins() []Spec {
 			OnModify:      OnRebuild,
 			MigrateRun:    "npx mikro-orm migration:up",
 			MigrateEnv:    dbNameEnv(),
+		},
+		{
+			// Symfony bundle (the dominant Doctrine Migrations layout).
+			// The standalone library uses different config files and a
+			// vendor/bin/doctrine-migrations binary; users on that
+			// layout will need to edit the scaffolded Run command.
+			Name:          "doctrine-migrations",
+			Markers:       []string{"composer.json"},
+			MigrationDirs: []string{"migrations", "src/Migrations"},
+			FileGlobs:     []string{"Version[0-9]*.php"},
+			Lockfiles:     []string{"composer.lock"},
+			HashMode:      HashFilename,
+			OnModify:      OnRebuild,
+			MigrateRun:    "php bin/console doctrine:migrations:migrate --no-interaction --all-or-nothing",
+			MigrateEnv:    dbURLEnv(),
+			Validate:      hasDoctrineMigrationsDep,
+		},
+		{
+			// Shares go.mod with golang-migrate; the Validator (go.sum
+			// containing pressly/goose) disambiguates. Goose puts both
+			// Up and Down in a single annotated .sql file, so the file
+			// glob does not collide with golang-migrate's *.up.sql.
+			Name:          "goose",
+			Markers:       []string{"go.mod"},
+			MigrationDirs: []string{"migrations", "db/migrations", "internal/db/migrations", "cmd/*/migrations"},
+			FileGlobs:     []string{"[0-9]*_*.sql", "[0-9]*_*.go"},
+			Lockfiles:     []string{"go.sum"},
+			HashMode:      HashFilename,
+			OnModify:      OnRebuild,
+			MigrateRun:    "goose -dir migrations up",
+			MigrateEnv:    gooseEnv(),
+			Validate:      hasGooseEvidence,
+		},
+		{
+			Name:          "liquibase",
+			Markers:       []string{"liquibase.properties|liquibase.yaml|liquibase.yml|liquibase.json"},
+			MigrationDirs: []string{"db/changelog", "src/main/resources/db/changelog", "changelog", "changelogs"},
+			FileGlobs:     []string{"*.xml", "*.yaml", "*.yml", "*.json", "*.sql"},
+			HashMode:      HashFilename,
+			OnModify:      OnRebuild,
+			MigrateRun:    "liquibase --changelog-file=db.changelog-master.xml update",
+			MigrateEnv:    liquibaseEnv(),
+		},
+		{
+			// EF Core has no canonical project-root marker file — only
+			// a *.csproj that references Microsoft.EntityFrameworkCore.
+			// Use the repo-root sentinel "." so Detect always defers
+			// to the Validator, which walks for the csproj content.
+			Name:          "ef-core",
+			Markers:       []string{"."},
+			MigrationDirs: []string{"Migrations", "*/Migrations", "src/*/Migrations"},
+			FileGlobs:     []string{"[0-9]*_*.cs"},
+			Lockfiles:     []string{"packages.lock.json", "global.json"},
+			HashMode:      HashFilename,
+			OnModify:      OnRebuild,
+			MigrateRun:    "dotnet ef database update",
+			MigrateEnv:    dbNameEnv(),
+			Validate:      hasEFCoreEvidence,
+		},
+		{
+			// mix.exs matches every Elixir project, so the Validator
+			// (ecto_sql in mix.lock OR a default priv/repo/migrations
+			// dir) is the real gate.
+			Name:          "ecto",
+			Markers:       []string{"mix.exs"},
+			MigrationDirs: []string{"priv/repo/migrations", "apps/*/priv/*/migrations"},
+			FileGlobs:     []string{"[0-9]*_*.exs"},
+			Lockfiles:     []string{"mix.lock"},
+			HashMode:      HashFilename,
+			OnModify:      OnRebuild,
+			MigrateRun:    "mix ecto.migrate",
+			MigrateEnv:    dbNameEnv(),
+			Validate:      hasEctoEvidence,
+		},
+		{
+			// DBmate ships no required config file; the Validator
+			// scans db/migrations for the distinctive `-- migrate:up`
+			// directive.
+			Name:          "dbmate",
+			Markers:       []string{"db/migrations"},
+			MigrationDirs: []string{"db/migrations"},
+			FileGlobs:     []string{"[0-9]*_*.sql"},
+			HashMode:      HashFilename,
+			OnModify:      OnRebuild,
+			MigrateRun:    "dbmate up",
+			MigrateEnv:    dbURLEnv(),
+			Validate:      hasDBmateEvidence,
+		},
+		{
+			// atlas.hcl is the strong, distinctive marker; the fallback
+			// migrations/atlas.sum covers users who scaffolded via
+			// `atlas migrate diff` without authoring an HCL config.
+			Name:          "atlas",
+			Markers:       []string{"atlas.hcl|migrations/atlas.sum"},
+			MigrationDirs: []string{"migrations"},
+			FileGlobs:     []string{"[0-9]*_*.sql"},
+			HashMode:      HashChecksum,
+			OnModify:      OnDelta,
+			MigrateRun:    `atlas migrate apply --url "$DATABASE_URL" --dir "file://migrations"`,
+			MigrateEnv:    dbURLEnv(),
 		},
 	}
 }
