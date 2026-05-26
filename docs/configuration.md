@@ -235,14 +235,18 @@ framework. Copy + paste into the `databases:` array of an existing
     name_template: "myapp_test_{slug}_w{n}"
 ```
 
-**golang-migrate + MySQL**:
+**golang-migrate + Postgres**:
 
 ```yaml
-- engine: mysql
+- engine: postgres
   name_template: "svc_test_{slug}"
   migrate:
-    run: "migrate up"
-    env: { DB_NAME: "{target_db}" }
+    # The CLI needs -path + -database; pull the DSN from
+    # DATABASE_URL so treeman's per-run substitution can swap the
+    # database portion.
+    run: 'migrate -path migrations -database "$DATABASE_URL" up'
+    env:
+      DATABASE_URL: "postgres://user:password@127.0.0.1:5432/{target_db}?sslmode=disable"
   inputs:
     - { glob: "migrations/**/*.up.sql", label: migrations, hash: filename }
     - { glob: "services/*/migrations/**/*.up.sql", label: migrations, hash: filename }
@@ -259,7 +263,9 @@ framework. Copy + paste into the `databases:` array of an existing
   name_template: "app_test_{slug}"
   migrate:
     run: "sqlx migrate run"
-    env: { DB_NAME: "{target_db}" }
+    env:
+      # sqlx-cli reads DATABASE_URL natively.
+      DATABASE_URL: "postgres://user:password@127.0.0.1:5432/{target_db}?sslmode=disable"
   inputs:
     # bare-string default = checksum hash, so edits to a migration
     # rebuild the snapshot (sqlx allows mutable migrations).

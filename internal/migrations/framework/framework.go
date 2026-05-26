@@ -157,15 +157,34 @@ func hasGolangMigrateEvidence(repoRoot string) bool {
 	return false
 }
 
-// dbNameEnv is the canonical MigrateEnv every non-Laravel spec uses.
-// `DB_NAME` is the treeman convention (see every fw_* e2e test): the
-// user references `${DB_NAME}` inside their MigrateRun connection
-// string, or wires their config to read the var. The framework's own
-// env-var conventions are too varied (and often non-existent) to put
-// in a default scaffold — `DB_NAME` keeps the contract uniform and
-// editor-friendly.
+// dbNameEnv is the MigrateEnv fallback for frameworks without a
+// strong native DSN env-var convention. The user references
+// `${DB_NAME}` inside their MigrateRun connection string, or wires
+// their config to read the var. Matches the convention every fw_*
+// e2e test uses.
 func dbNameEnv() map[string]string {
 	return map[string]string{"DB_NAME": "{target_db}"}
+}
+
+// dbURLEnv scaffolds DATABASE_URL for frameworks that natively read
+// one (Prisma, Drizzle's CLI, sqlx, diesel, golang-migrate). The URL
+// embeds `{target_db}` so treeman substitutes the per-run template
+// DB name; the user replaces the user/password/host/port portion.
+// Postgres is the default scheme — most URL-driven ecosystems lean
+// postgres — but the user is expected to edit the prefix if needed.
+func dbURLEnv() map[string]string {
+	return map[string]string{
+		"DATABASE_URL": "postgres://user:password@127.0.0.1:5432/{target_db}?sslmode=disable",
+	}
+}
+
+// flywayURLEnv scaffolds FLYWAY_URL with a JDBC connection-string
+// template. Flyway's CLI reads FLYWAY_URL natively, so this avoids
+// the user having to thread anything through the migrate command.
+func flywayURLEnv() map[string]string {
+	return map[string]string{
+		"FLYWAY_URL": "jdbc:postgresql://127.0.0.1:5432/{target_db}",
+	}
 }
 
 func builtins() []Spec {
@@ -207,7 +226,7 @@ func builtins() []Spec {
 			Markers:       []string{"manage.py"},
 			MigrationDirs: []string{"**/migrations"},
 			FileGlobs:     []string{"[0-9]*_*.py"},
-			Lockfiles:     []string{"Pipfile.lock", "poetry.lock", "requirements.txt"},
+			Lockfiles:     []string{"Pipfile.lock", "poetry.lock", "uv.lock", "requirements.txt"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "python manage.py migrate --noinput",
@@ -221,8 +240,12 @@ func builtins() []Spec {
 			Lockfiles:     []string{"go.sum"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
-			MigrateRun:    "migrate up",
-			MigrateEnv:    dbNameEnv(),
+			// Bare `migrate up` is non-functional — the CLI requires
+			// -path/-source and -database flags or env. Scaffold a
+			// working form that picks up DATABASE_URL from the env
+			// treeman injects via MigrateEnv.
+			MigrateRun: `migrate -path migrations -database "$DATABASE_URL" up`,
+			MigrateEnv: dbURLEnv(),
 			// go.mod alone matches every Go repo, so require a second
 			// signal: either the golang-migrate module is imported, or
 			// the repo contains at least one *.up.sql file (the
@@ -238,7 +261,7 @@ func builtins() []Spec {
 			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
 			MigrateRun:    "sqlx migrate run",
-			MigrateEnv:    dbNameEnv(),
+			MigrateEnv:    dbURLEnv(),
 		},
 		{
 			Name:          "diesel",
@@ -249,7 +272,7 @@ func builtins() []Spec {
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "diesel migration run",
-			MigrateEnv:    dbNameEnv(),
+			MigrateEnv:    dbURLEnv(),
 		},
 		{
 			Name:    "prisma",
@@ -264,13 +287,13 @@ func builtins() []Spec {
 			HashMode:   HashChecksum,
 			OnModify:   OnDelta,
 			MigrateRun: "npx prisma migrate deploy",
-			MigrateEnv: dbNameEnv(),
+			MigrateEnv: dbURLEnv(),
 		},
 		{
 			Name:          "knex",
 			Markers:       []string{"knexfile.js|knexfile.ts|knexfile.cjs|knexfile.mjs"},
 			MigrationDirs: []string{"migrations", "apps/*/migrations", "packages/*/migrations"},
-			FileGlobs:     []string{"*.js", "*.ts"},
+			FileGlobs:     []string{"*.js", "*.ts", "*.cjs", "*.mjs"},
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
@@ -291,12 +314,12 @@ func builtins() []Spec {
 		{
 			Name:          "flyway",
 			Markers:       []string{"flyway.conf|flyway.toml"},
-			MigrationDirs: []string{"**/db/migration"},
+			MigrationDirs: []string{"**/db/migration", "sql"},
 			FileGlobs:     []string{"[VRU]*.sql"},
 			HashMode:      HashChecksum,
 			OnModify:      OnRebuild,
 			MigrateRun:    "flyway migrate",
-			MigrateEnv:    dbNameEnv(),
+			MigrateEnv:    flywayURLEnv(),
 		},
 		{
 			Name: "typeorm",
@@ -305,16 +328,18 @@ func builtins() []Spec {
 			},
 			MigrationDirs: []string{
 				"src/migrations",
-				"src/migration",
 				"migrations",
 				"apps/*/src/migrations",
 				"packages/*/src/migrations",
 			},
-			FileGlobs:  []string{"*.ts", "*.js"},
-			Lockfiles:  []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:   HashFilename,
-			OnModify:   OnRebuild,
-			MigrateRun: "npx typeorm migration:run",
+			FileGlobs: []string{"*.ts", "*.js"},
+			Lockfiles: []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
+			HashMode:  HashFilename,
+			OnModify:  OnRebuild,
+			// v0.3+ requires -d <data-source>; bare `migration:run`
+			// fails. typeorm-ts-node-commonjs handles .ts sources
+			// without a separate compile step.
+			MigrateRun: "npx typeorm-ts-node-commonjs migration:run -- -d ./src/data-source.ts",
 			MigrateEnv: dbNameEnv(),
 		},
 		{
@@ -338,13 +363,13 @@ func builtins() []Spec {
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
 			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
-			MigrateRun:    "npx sequelize db:migrate",
+			MigrateRun:    "npx sequelize-cli db:migrate",
 			MigrateEnv:    dbNameEnv(),
 		},
 		{
 			Name:          "mikro-orm",
 			Markers:       []string{"mikro-orm.config.ts|mikro-orm.config.js|mikro-orm.config.cjs"},
-			MigrationDirs: []string{"src/migrations", "apps/*/src/migrations", "packages/*/src/migrations"},
+			MigrationDirs: []string{"migrations", "src/migrations", "apps/*/migrations", "apps/*/src/migrations", "packages/*/migrations", "packages/*/src/migrations"},
 			FileGlobs:     []string{"Migration*.ts", "Migration*.js"},
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
 			HashMode:      HashFilename,
