@@ -152,7 +152,7 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 // facing handle into a SQL filter.
 func (s *Store) LookupWorktreeID(ctx context.Context, repoID int64, name string) (int64, error) {
 	q := `SELECT id FROM worktrees WHERE deleted_at IS NULL AND
-		(slug = ? OR branch = ? OR path LIKE ?)`
+		(slug = ? OR branch = ? OR path LIKE ? COLLATE NOCASE)`
 	args := []any{name, name, "%/" + name}
 	if repoID > 0 {
 		q += " AND repo_id = ?"

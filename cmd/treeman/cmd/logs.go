@@ -487,11 +487,13 @@ func lookupWorktreeContainingCwd(ctx context.Context, st *store.Store, cwd strin
 		return row
 	}
 	// Fall back to prefix match. SQL handles this cheaply with `?
-	// LIKE path || '/%'` which `path UNIQUE` keeps short.
+	// LIKE path || '/%'` which `path UNIQUE` keeps short. The LIKE
+	// collates NOCASE so a cwd typed in different case (common on
+	// APFS-default macOS) still matches the stored row.
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), 0
 		FROM worktrees
-		WHERE deleted_at IS NULL AND ? LIKE path || '/%'
+		WHERE deleted_at IS NULL AND ? LIKE path || '/%' COLLATE NOCASE
 		ORDER BY length(path) DESC
 		LIMIT 1`, cwd)
 	if err != nil {
@@ -564,7 +566,7 @@ func openLogStore(ctx context.Context) (*store.Store, func(), error) {
 
 func lookupRepoID(ctx context.Context, st *store.Store, root string) (int64, error) {
 	var id int64
-	row := st.DB.QueryRowContext(ctx, `SELECT id FROM repos WHERE path = ?`, root)
+	row := st.DB.QueryRowContext(ctx, `SELECT id FROM repos WHERE path = ? COLLATE NOCASE`, root)
 	if err := row.Scan(&id); err != nil {
 		return 0, err
 	}

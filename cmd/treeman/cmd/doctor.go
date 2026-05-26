@@ -340,7 +340,7 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 	}
 	defer st.Close()
 	rows, err := st.DB.QueryContext(ctx, `SELECT w.path FROM worktrees w
-		JOIN repos r ON r.id = w.repo_id WHERE r.path = ? AND w.deleted_at IS NULL`, repoRoot)
+		JOIN repos r ON r.id = w.repo_id WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL`, repoRoot)
 	if err != nil {
 		return doctorResult{
 			Name:   "registry",

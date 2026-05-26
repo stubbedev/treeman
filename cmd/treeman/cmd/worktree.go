@@ -243,7 +243,7 @@ func wtUnregister() *cli.Command {
 				return err
 			}
 			defer st.Close()
-			row := st.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ?", path)
+			row := st.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
 			var id int64
 			if err := row.Scan(&id); err != nil {
 				return fmt.Errorf("worktree not found: %s", path)
@@ -948,7 +948,7 @@ func registryWorktreeForBranch(ctx context.Context, repoRoot, branch string) (st
 	defer st.Close()
 	row := st.DB.QueryRowContext(ctx, `
 		SELECT w.path FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		WHERE r.path = ? AND w.deleted_at IS NULL AND w.branch = ?
+		WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL AND w.branch = ?
 		ORDER BY w.id DESC LIMIT 1`, repoRoot, branch)
 	var p string
 	if err := row.Scan(&p); err != nil {

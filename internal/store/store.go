@@ -338,7 +338,11 @@ func nowMillis() int64 { return time.Now().UnixMilli() }
 
 // EnsureRepo upserts a (path, name) and returns the repo id.
 func (s *Store) EnsureRepo(ctx context.Context, path, name string) (int64, error) {
-	row := s.DB.QueryRowContext(ctx, "SELECT id FROM repos WHERE path = ?", path)
+	// COLLATE NOCASE so APFS case-insensitive filesystems on macOS
+	// don't double-register the same repo when the user typed a
+	// different case at create vs at access. Backed by
+	// idx_repos_path_nocase (migration 0003).
+	row := s.DB.QueryRowContext(ctx, "SELECT id FROM repos WHERE path = ? COLLATE NOCASE", path)
 	var id int64
 	if err := row.Scan(&id); err == nil {
 		return id, nil
@@ -367,7 +371,10 @@ func (s *Store) EnsureWorktree(ctx context.Context, repoID int64, path, slug, br
 // working tree has been deleted. Empty admin_dir is allowed and
 // leaves the column NULL.
 func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path, slug, branch, adminDir string) (int64, error) {
-	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ?", path)
+	// COLLATE NOCASE so an APFS case-insensitive FS on macOS matches
+	// `/Users/jane/Repo/.worktrees/x` with a later `/users/jane/repo/.worktrees/X`.
+	// Backed by idx_worktrees_path_nocase (migration 0003).
+	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
 	var id int64
 	if err := row.Scan(&id); err == nil {
 		// Resurrect: when a worktree is re-created at the path of a
@@ -437,7 +444,7 @@ func (s *Store) SetWorktreeAdminDir(ctx context.Context, id int64, adminDir stri
 func (s *Store) LookupActiveWorktreeByPath(ctx context.Context, path string) (WorktreeRow, error) {
 	row := s.DB.QueryRowContext(ctx, `
 		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), 0
-		FROM worktrees WHERE path = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`, path)
+		FROM worktrees WHERE path = ? COLLATE NOCASE AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`, path)
 	var w WorktreeRow
 	var deleted int
 	if err := row.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &deleted); err != nil {
@@ -631,7 +638,7 @@ func (s *Store) LoadInheritedEnv(ctx context.Context, worktreeID int64) (map[str
 // for callers that have the path but not the ID.
 func (s *Store) LoadInheritedEnvByPath(ctx context.Context, worktreePath string) (map[string]string, error) {
 	row := s.DB.QueryRowContext(ctx,
-		"SELECT inherited_env_json FROM worktrees WHERE path = ?", worktreePath)
+		"SELECT inherited_env_json FROM worktrees WHERE path = ? COLLATE NOCASE", worktreePath)
 	var raw sql.NullString
 	if err := row.Scan(&raw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -666,7 +673,7 @@ func (s *Store) TouchWorktreeVisited(ctx context.Context, id int64) error {
 // path and stamps `last_visited_at`. Idempotent; silently no-ops when
 // no row matches (e.g. unregistered ad-hoc worktrees).
 func (s *Store) TouchWorktreeVisitedByPath(ctx context.Context, path string) error {
-	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? AND deleted_at IS NULL", path)
+	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE AND deleted_at IS NULL", path)
 	var id int64
 	if err := row.Scan(&id); err != nil {
 		return nil
@@ -693,7 +700,7 @@ func (s *Store) PrevVisitedWorktree(ctx context.Context, repoID int64, exceptPat
 // LookupRepoID resolves a repo path to its row id. Returns 0 + nil
 // when no row matches (caller treats this as "unknown").
 func (s *Store) LookupRepoID(ctx context.Context, path string) (int64, error) {
-	row := s.DB.QueryRowContext(ctx, "SELECT id FROM repos WHERE path = ?", path)
+	row := s.DB.QueryRowContext(ctx, "SELECT id FROM repos WHERE path = ? COLLATE NOCASE", path)
 	var id int64
 	if err := row.Scan(&id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

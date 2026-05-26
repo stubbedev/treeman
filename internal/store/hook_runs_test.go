@@ -62,6 +62,56 @@ func TestWriteHookRunPersistsAndQueries(t *testing.T) {
 	}
 }
 
+// TestPathLookupsAreCaseInsensitive verifies macOS APFS parity:
+// a worktree stored with one casing must be findable under a
+// different casing via every path-keyed lookup the daemon and CLI
+// use to resolve cwd → row.
+func TestPathLookupsAreCaseInsensitive(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	stored := "/Users/Jane/Repo"
+	wt := stored + "/.worktrees/Feat"
+
+	repoID, err := s.EnsureRepo(ctx, stored, "Repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtID, err := s.EnsureWorktree(ctx, repoID, wt, "feat", "feature/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// LookupRepoID via mis-cased query.
+	got, err := s.LookupRepoID(ctx, "/users/jane/repo")
+	if err != nil || got != repoID {
+		t.Errorf("LookupRepoID case-folded miss: got=%d err=%v want=%d", got, err, repoID)
+	}
+
+	// LookupActiveWorktreeByPath via mis-cased query.
+	row, err := s.LookupActiveWorktreeByPath(ctx, "/users/jane/repo/.worktrees/feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ID != wtID {
+		t.Errorf("LookupActiveWorktreeByPath case-folded miss: got=%d want=%d", row.ID, wtID)
+	}
+
+	// EnsureWorktree on a mis-cased path must resurrect the SAME row,
+	// not insert a duplicate.
+	dupID, err := s.EnsureWorktree(ctx, repoID, "/users/jane/repo/.worktrees/FEAT", "feat", "feature/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dupID != wtID {
+		t.Errorf("EnsureWorktree inserted duplicate row under different case: got=%d want=%d", dupID, wtID)
+	}
+}
+
 // TestWriteHookRunZeroWorktreeIsNoop guards the "store wired but no
 // row resolved" case PersistOutcome short-circuits on.
 func TestWriteHookRunZeroWorktreeIsNoop(t *testing.T) {
