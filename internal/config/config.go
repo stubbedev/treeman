@@ -161,6 +161,14 @@ func (a AutoFetchConfig) ResolvedMode() string {
 // same as a `.worktrees/<slug>` linked checkout. Off by default; flip
 // `enabled: true` to start producing per-branch databases at the
 // repo root.
+//
+// One knob today (Enabled). The branch-switch policy is implicit:
+// FinalizeWorktree re-runs against the new branch's slug, which uses
+// the snapshot cache so a re-visit of any previously-seen branch is
+// a near-instant clone. Drop/keep policies will land as additional
+// fields once their teardown plumbing exists — premature wiring of
+// `on_branch_switch` would have shipped a config surface no code
+// consumed.
 type MainWorktreeConfig struct {
 	// Enabled toggles main-wt enrollment for this repo. Default false
 	// — every existing install sees zero behaviour change until the
@@ -169,30 +177,6 @@ type MainWorktreeConfig struct {
 	// watchers against the repo root, and re-runs prepare on every
 	// branch switch.
 	Enabled bool `yaml:"enabled,omitempty"`
-
-	// OnBranchSwitch picks the policy when the user changes branch
-	// inside the main worktree:
-	//   - "prepare" (default): re-run prepare against the new branch's
-	//     slug. Snapshot cache is shared across branches, so the second
-	//     visit to any branch is a near-instant clone.
-	//   - "drop": tear down the previous branch's per-wt databases
-	//     before preparing the new one. Lowest disk footprint;
-	//     re-visiting a branch is always a cold-build.
-	//   - "keep": leave previous-branch DBs intact and just switch
-	//     active. Fastest re-checkout, biggest sprawl — useful for
-	//     teams that pin a small set of branches.
-	OnBranchSwitch string `yaml:"on_branch_switch,omitempty" jsonschema:"enum=prepare,enum=drop,enum=keep"`
-}
-
-// ResolvedOnBranchSwitch normalises OnBranchSwitch into the canonical
-// values, defaulting to "prepare" for any unknown / empty string.
-func (m MainWorktreeConfig) ResolvedOnBranchSwitch() string {
-	switch m.OnBranchSwitch {
-	case "drop", "keep":
-		return m.OnBranchSwitch
-	default:
-		return "prepare"
-	}
 }
 
 // LogsConfig — `logs:` block. One knob: how long to keep events +

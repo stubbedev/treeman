@@ -30,7 +30,6 @@ func MainCmd() *cli.Command {
 				Usage: "opt the repo root into the watcher lifecycle",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
-					&cli.StringFlag{Name: "mode", Usage: "on_branch_switch policy: prepare|drop|keep", Value: "prepare"},
 				},
 				Action: mainEnableAction,
 			},
@@ -56,17 +55,11 @@ func MainCmd() *cli.Command {
 }
 
 func mainEnableAction(ctx context.Context, c *cli.Command) error {
-	mode := c.String("mode")
-	switch mode {
-	case "prepare", "drop", "keep":
-	default:
-		return fmt.Errorf("invalid --mode %q (want prepare|drop|keep)", mode)
-	}
 	repoRoot, err := resolveRepo(c.String("repo"))
 	if err != nil {
 		return err
 	}
-	if err := patchMainWorktreeConfig(repoRoot, true, mode); err != nil {
+	if err := patchMainWorktreeConfig(repoRoot, true); err != nil {
 		return err
 	}
 	if err := requestConfigReload(ctx, repoRoot); err != nil {
@@ -74,7 +67,7 @@ func mainEnableAction(ctx context.Context, c *cli.Command) error {
 		ui.Hint("config written; restart treemand to apply")
 		return nil
 	}
-	PrintOK("main worktree enabled (%s, on_branch_switch=%s)", repoRoot, mode)
+	PrintOK("main worktree enabled (%s)", repoRoot)
 	return nil
 }
 
@@ -83,7 +76,7 @@ func mainDisableAction(ctx context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	if err := patchMainWorktreeConfig(repoRoot, false, ""); err != nil {
+	if err := patchMainWorktreeConfig(repoRoot, false); err != nil {
 		return err
 	}
 	if err := requestConfigReload(ctx, repoRoot); err != nil {
@@ -109,20 +102,18 @@ func mainStatusAction(ctx context.Context, c *cli.Command) error {
 
 	if c.Bool("json") {
 		return jsonStream(map[string]any{
-			"repo":             repoRoot,
-			"enabled":          cfg.MainWorktree.Enabled,
-			"on_branch_switch": cfg.MainWorktree.ResolvedOnBranchSwitch(),
-			"row_id":           row.ID,
-			"slug":             row.Slug,
-			"branch":           row.Branch,
-			"current_branch":   branch,
+			"repo":           repoRoot,
+			"enabled":        cfg.MainWorktree.Enabled,
+			"row_id":         row.ID,
+			"slug":           row.Slug,
+			"branch":         row.Branch,
+			"current_branch": branch,
 		})
 	}
 
 	fmt.Printf("%s\n", ui.Bold(repoRoot))
-	fmt.Printf("  enabled         : %v\n", cfg.MainWorktree.Enabled)
-	fmt.Printf("  on_branch_switch: %s\n", cfg.MainWorktree.ResolvedOnBranchSwitch())
-	fmt.Printf("  current branch  : %s\n", branch)
+	fmt.Printf("  enabled        : %v\n", cfg.MainWorktree.Enabled)
+	fmt.Printf("  current branch : %s\n", branch)
 	if row.ID == 0 {
 		fmt.Printf("  enrolled        : no row\n")
 		return nil
@@ -137,7 +128,7 @@ func mainStatusAction(ctx context.Context, c *cli.Command) error {
 // back to creating the file with a minimal `main_worktree:` stanza
 // when the repo has no .treeman.yaml yet — a virgin repo wanting to
 // opt-in shouldn't need to scaffold a full config first.
-func patchMainWorktreeConfig(repoRoot string, enabled bool, mode string) error {
+func patchMainWorktreeConfig(repoRoot string, enabled bool) error {
 	target := filepath.Join(repoRoot, ".treeman.yaml")
 	raw, err := os.ReadFile(target)
 	if err != nil {
@@ -166,13 +157,6 @@ func patchMainWorktreeConfig(repoRoot string, enabled bool, mode string) error {
 	enabledNode, _ := yamlpatch.ValueToNode(enabled)
 	if _, err := yamlpatch.Set(&doc, enabledSegs, enabledNode); err != nil {
 		return err
-	}
-	if mode != "" {
-		modeSegs, _ := yamlpatch.ParsePath("main_worktree.on_branch_switch")
-		modeNode, _ := yamlpatch.ValueToNode(mode)
-		if _, err := yamlpatch.Set(&doc, modeSegs, modeNode); err != nil {
-			return err
-		}
 	}
 	body, err := yamlpatch.Marshal(&doc)
 	if err != nil {

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/stubbedev/treeman/internal/resolve"
@@ -27,6 +28,16 @@ import (
 // load (logged by caller) — we never block the boot path on a malformed
 // repo config.
 func EnrollMainWorktree(ctx context.Context, st *State, repoPath string) (int64, error) {
+	// Fast path: a repo with no `.treeman.yaml` can't opt in, so
+	// avoid the full resolve+stat hot path on every boot. Treeman
+	// instances tracking many repos (50+) where almost none use main
+	// worktrees pay otherwise.
+	if _, err := os.Stat(filepath.Join(repoPath, ".treeman.yaml")); err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+	}
+
 	cfg, err := resolve.LoadResolved(repoPath)
 	if err != nil {
 		return 0, fmt.Errorf("load cfg: %w", err)
@@ -50,6 +61,12 @@ func EnrollMainWorktree(ctx context.Context, st *State, repoPath string) (int64,
 		if err := st.Store.MarkWorktreeDeleted(ctx, existing.ID); err != nil {
 			return 0, fmt.Errorf("mark main deleted: %w", err)
 		}
+		// Preempt any in-flight FinalizeWorktree against the repo root
+		// before we tear the row down. Without this a finalize that's
+		// halfway through prepare can still write per-branch DBs and
+		// emit events keyed off the (about-to-be-deleted) main row,
+		// leaving zombie state for the next re-enable to trip over.
+		st.CancelFinalize(repoPath)
 		// Stop the per-wt watcher we may have spawned for the repo
 		// root last time main was enabled. The config reloader's
 		// subsequent ListActiveWorktrees skips deleted rows, so it
@@ -75,7 +92,6 @@ func EnrollMainWorktree(ctx context.Context, st *State, repoPath string) (int64,
 			"repo":   repoPath,
 			"slug":   sl.Value,
 			"branch": branch,
-			"mode":   cfg.MainWorktree.ResolvedOnBranchSwitch(),
 		})
 	return id, nil
 }

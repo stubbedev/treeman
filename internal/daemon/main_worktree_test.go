@@ -10,6 +10,37 @@ import (
 	"github.com/stubbedev/treeman/internal/store"
 )
 
+// TestEnrollMainWorktreeFastPathSkipsRepoWithoutConfig covers the
+// boot hot path: a registered repo that hasn't grown a .treeman.yaml
+// yet should produce a zero row + nil error without parsing config.
+// Catches regressions of the os.Stat fast path.
+func TestEnrollMainWorktreeFastPathSkipsRepoWithoutConfig(t *testing.T) {
+	requireGitAutofetch(t)
+	ctx := context.Background()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	gitRun(t, "", "init", "-q", "-b", "main", repo)
+	gitRun(t, repo, "config", "user.email", "t@t")
+	gitRun(t, repo, "config", "user.name", "t")
+	gitRun(t, repo, "commit", "--allow-empty", "-q", "-m", "init")
+	// Deliberately NO .treeman.yaml.
+
+	s, err := store.Open(ctx, filepath.Join(tmp, "treeman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	st := NewState(ctx, s)
+
+	id, err := EnrollMainWorktree(ctx, st, repo)
+	if err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	if id != 0 {
+		t.Errorf("expected zero row id when no config exists, got %d", id)
+	}
+}
+
 // TestEnrollMainWorktreeEnableDisableRoundTrip drives EnrollMainWorktree
 // through enable → disable → re-enable, asserting the worktrees table
 // follows the config and the slug is branch-aware.
