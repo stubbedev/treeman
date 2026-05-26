@@ -236,6 +236,25 @@
       ],
       "description": "DatabaseConfig — one `databases:` entry. The `engine` discriminator\ngates which sub-fields are valid.\n\n`Fanout` is the optional override for the outer concurrency cap\nduring clone restore + DropMatching. Leave unset (omitempty / 0)\nto use the safe per-engine default from internal/prepare. Raise\nonly if the server is provisioned for it (max_connections raised,\nPG pg_database lock contention acceptable, etc.)."
     },
+    "DatabaseOverlay": {
+      "properties": {
+        "name_template": {
+          "type": "string"
+        },
+        "key_prefix": {
+          "type": "string"
+        },
+        "test_clones": {
+          "$ref": "#/$defs/TestClonesSpec"
+        },
+        "fanout": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "DatabaseOverlay holds the subset of `DatabaseConfig` fields that\ncan be tweaked per-context (main wt vs linked wt). Engine + Dump\nare intentionally absent — changing engines per-context produces\nschema chaos, and main / linked worktrees should always share the\nsame seed dump for snapshot-cache coherence.\n\nField semantics:\n\n  - Strings: empty value means \"inherit\". Setting to a non-empty\n    value replaces the base template.\n  - TestClones: nil pointer means \"inherit\". A non-nil value\n    replaces the entire spec (Clones + NameTemplate).\n  - Fanout: nil pointer means \"inherit\". A non-nil value (including\n    0) replaces the base — necessary because uint32(0) is a valid\n    \"use per-engine default\" sentinel that's distinct from \"no\n    override\"."
+    },
     "DumpSpec": {
       "oneOf": [
         {
@@ -455,6 +474,24 @@
       "additionalProperties": false,
       "type": "object",
       "description": "LogsConfig — `logs:` block. One knob: how long to keep events +\nhook_runs + their attached log chunks. The daemon's prune loop\napplies the cutoff per table; chunks cascade via FK so dropping\na hook_runs row also drops its captured stdout/stderr."
+    },
+    "MainWorktreeConfig": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled toggles main-wt enrollment for this repo. Default false\n— every existing install sees zero behaviour change until the\nflag is set. Once true, the daemon ensures a worktrees row with\nis_main=1 exists for the repo, spawns the per-wt HEAD + file\nwatchers against the repo root, and re-runs prepare on every\nbranch switch."
+        },
+        "databases": {
+          "items": {
+            "$ref": "#/$defs/DatabaseOverlay"
+          },
+          "type": "array",
+          "description": "Databases is a sparse, index-aligned overlay over `databases:`.\nEach entry's set fields replace the same field on the main-\nindexed database when finalize runs against the main worktree;\nunset fields inherit the top-level value. Linked worktrees are\nuntouched.\n\nCommon uses: a different `name_template` so the main wt's app\nDB lives at `app_dev_{slug}` while linked wts use `app_{slug}`;\ndisabling test-clone fanout in main (`test_clones.clones: 0`)\nbecause the main checkout doesn't run parallel test workers.\n\nOverlay length must be \u003c= len(databases). Entries beyond the\ndeclared count are a config error caught at load time."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "MainWorktreeConfig — `main_worktree:` block. Opt-in handle that\npromotes the repo root into a first-class worktree so the daemon's\nHEAD watcher, file watcher, and prepare orchestration treat it the\nsame as a `.worktrees/\u003cslug\u003e` linked checkout. Off by default; flip\n`enabled: true` to start producing per-branch databases at the\nrepo root.\n\nOne knob today (Enabled). The branch-switch policy is implicit:\nFinalizeWorktree re-runs against the new branch's slug, which uses\nthe snapshot cache so a re-visit of any previously-seen branch is\na near-instant clone. Drop/keep policies will land as additional\nfields once their teardown plumbing exists — premature wiring of\n`on_branch_switch` would have shipped a config surface no code\nconsumed."
     },
     "MongoConn": {
       "oneOf": [
@@ -815,6 +852,10 @@
     "auto_fetch": {
       "$ref": "#/$defs/AutoFetchConfig",
       "description": "AutoFetch policy. Daemon-side periodic `git fetch --all --prune`\nper registered repo, followed by a `git merge --ff-only @{u}`\nper active worktree. Skips dirty trees, non-ff branches, and\nupstreamless branches. Enabled by default at a 15-minute cadence."
+    },
+    "main_worktree": {
+      "$ref": "#/$defs/MainWorktreeConfig",
+      "description": "MainWorktree opts the repo's main checkout (repo root) into the\nsame watcher-driven prepare/migrate/teardown lifecycle that\nlinked `.worktrees/\u003cslug\u003e` checkouts already get. Off by default\n— flipping it on for an existing repo will start creating\nper-branch databases when the user switches branches at the\nrepo root."
     }
   },
   "additionalProperties": false,
