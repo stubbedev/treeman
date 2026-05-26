@@ -177,6 +177,44 @@ type MainWorktreeConfig struct {
 	// watchers against the repo root, and re-runs prepare on every
 	// branch switch.
 	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Databases is a sparse, index-aligned overlay over `databases:`.
+	// Each entry's set fields replace the same field on the main-
+	// indexed database when finalize runs against the main worktree;
+	// unset fields inherit the top-level value. Linked worktrees are
+	// untouched.
+	//
+	// Common uses: a different `name_template` so the main wt's app
+	// DB lives at `app_dev_{slug}` while linked wts use `app_{slug}`;
+	// disabling test-clone fanout in main (`test_clones.clones: 0`)
+	// because the main checkout doesn't run parallel test workers.
+	//
+	// Overlay length must be <= len(databases). Entries beyond the
+	// declared count are a config error caught at load time.
+	Databases []DatabaseOverlay `yaml:"databases,omitempty"`
+}
+
+// DatabaseOverlay holds the subset of `DatabaseConfig` fields that
+// can be tweaked per-context (main wt vs linked wt). Engine + Dump
+// are intentionally absent — changing engines per-context produces
+// schema chaos, and main / linked worktrees should always share the
+// same seed dump for snapshot-cache coherence.
+//
+// Field semantics:
+//
+//   - Strings: empty value means "inherit". Setting to a non-empty
+//     value replaces the base template.
+//   - TestClones: nil pointer means "inherit". A non-nil value
+//     replaces the entire spec (Clones + NameTemplate).
+//   - Fanout: nil pointer means "inherit". A non-nil value (including
+//     0) replaces the base — necessary because uint32(0) is a valid
+//     "use per-engine default" sentinel that's distinct from "no
+//     override".
+type DatabaseOverlay struct {
+	NameTemplate string          `yaml:"name_template,omitempty"`
+	KeyPrefix    string          `yaml:"key_prefix,omitempty"`
+	TestClones   *TestClonesSpec `yaml:"test_clones,omitempty"`
+	Fanout       *uint32         `yaml:"fanout,omitempty"`
 }
 
 // LogsConfig — `logs:` block. One knob: how long to keep events +

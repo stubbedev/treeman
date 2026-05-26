@@ -39,6 +39,16 @@ func (c *Config) Validate() error {
 		errs = appendIfErr(errs, c.Databases[i].validate(fmt.Sprintf("databases[%d]", i)))
 	}
 
+	if n := len(c.MainWorktree.Databases); n > len(c.Databases) {
+		errs = appendIfErr(errs, fmt.Errorf(
+			"main_worktree.databases: overlay has %d entries but only %d top-level databases declared",
+			n, len(c.Databases)))
+	}
+	for i := range c.MainWorktree.Databases {
+		errs = appendIfErr(errs, c.MainWorktree.Databases[i].validate(
+			fmt.Sprintf("main_worktree.databases[%d]", i)))
+	}
+
 	for i := range c.Patches {
 		errs = appendIfErr(errs, validatePatch(c.Patches[i], fmt.Sprintf("patches[%d]", i)))
 	}
@@ -69,6 +79,25 @@ func appendIfErr(errs []error, err error) []error {
 		return errs
 	}
 	return append(errs, err)
+}
+
+// validate enforces that any templates carried in the overlay parse
+// the same way as their base-config counterparts. Empty templates are
+// fine — they simply inherit.
+func (o DatabaseOverlay) validate(path string) error {
+	var errs []error
+	if o.NameTemplate != "" {
+		errs = appendIfErr(errs, validateTemplate(path+".name_template", o.NameTemplate, template.Scope{}))
+	}
+	if o.KeyPrefix != "" {
+		errs = appendIfErr(errs, validateTemplate(path+".key_prefix", o.KeyPrefix, template.Scope{}))
+	}
+	if o.TestClones != nil && o.TestClones.NameTemplate != "" {
+		errs = appendIfErr(errs, validateTemplate(
+			path+".test_clones.name_template", o.TestClones.NameTemplate,
+			template.Scope{AllowN: true}))
+	}
+	return errors.Join(errs...)
 }
 
 // validate enforces that container / compose_service are not both

@@ -93,6 +93,11 @@ func FinalizeWorktree(
 	var sl slug.Slug
 	if isMain {
 		sl = slug.ForMain(wtRoot, branch)
+		// Apply the per-context overlay so prepare.Run + hook
+		// rendering see the main-wt-specific NameTemplate /
+		// TestClones / Fanout fields. Linked-wt finalizes skip this
+		// — their cfg stays as-loaded.
+		config.ApplyMainWorktreeOverlay(&cfg)
 	} else {
 		sl = slug.For(wtRoot, branch)
 	}
