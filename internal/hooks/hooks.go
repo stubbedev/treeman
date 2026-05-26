@@ -45,6 +45,11 @@ type GroupOutcome struct {
 	ExitCode   int
 	StdoutTail string
 	StderrTail string
+	// LogBody is the full captured merged stdout+stderr for the group,
+	// kept verbatim (ANSI escapes preserved). Populated by the
+	// wait=true path so `PersistOutcome` can stream it into the
+	// hook_log_chunks table.
+	LogBody []byte
 }
 
 // RunHooksOrphan is the lifecycle-watcher variant of RunHooks. The
@@ -179,9 +184,40 @@ func RunHooks(
 					out.Groups[idx].ExitCode = -1
 				}
 			}
+			// Slurp the full merged stdout+stderr log into the
+			// outcome so PersistOutcome can persist it as a
+			// hook_log_chunks row. The on-disk file stays put so
+			// `tail -f` workflows keep working; the DB copy is what
+			// survives worktree teardown.
+			if out.Groups[idx].LogPath != "" {
+				out.Groups[idx].LogBody = readFileBytes(out.Groups[idx].LogPath)
+				if out.Groups[idx].ExitCode != 0 {
+					out.Groups[idx].StderrTail = lastBytes(out.Groups[idx].LogBody, 4096)
+				}
+			}
 		}
 	}
 	return out, nil
+}
+
+// readFileBytes returns the full body of path, or nil on any I/O
+// error. Used to copy the on-disk hook log into the DB chunk row.
+func readFileBytes(path string) []byte {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// lastBytes returns the trailing n bytes of b as a string. Used to
+// stash a short tail in stderr_tail for the `treeman logs hooks`
+// table-rendered listing.
+func lastBytes(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[len(b)-n:])
 }
 
 // renderAction turns one Action into a single shell string. Steps

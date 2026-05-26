@@ -216,10 +216,14 @@ func (s *Store) QueryHookRuns(ctx context.Context, worktreeID int64, limit int) 
 	return out, rows.Err()
 }
 
-// WriteHookRun records one hook-group execution. exitCode<0 / finishedMs==0
-// indicate the row is for a still-running async group; the caller can
-// follow up with UpdateHookRun once the driver exits, but for the
-// current synchronous code paths every call here passes a final state.
+// WriteHookRun records one hook-group execution and returns the new
+// row's id so callers can attach log chunks. exitCode<0 /
+// finishedMs==0 indicate the row is for a still-running async group;
+// for the current synchronous code paths every call here passes a
+// final state.
+//
+// Returns (0, nil) when worktreeID <= 0 so non-daemon callers can
+// opt in to persistence gradually without checking themselves.
 func (s *Store) WriteHookRun(ctx context.Context,
 	worktreeID int64,
 	phase string,
@@ -228,9 +232,9 @@ func (s *Store) WriteHookRun(ctx context.Context,
 	startedMs, finishedMs int64,
 	exitCode int,
 	stdoutTail, stderrTail string,
-) error {
+) (int64, error) {
 	if worktreeID <= 0 {
-		return nil
+		return 0, nil
 	}
 	var fin sql.NullInt64
 	if finishedMs > 0 {
@@ -240,15 +244,95 @@ func (s *Store) WriteHookRun(ctx context.Context,
 	if finishedMs > 0 {
 		exit = sql.NullInt64{Int64: int64(exitCode), Valid: true}
 	}
-	_, err := s.DB.ExecContext(ctx,
+	res, err := s.DB.ExecContext(ctx,
 		`INSERT INTO hook_runs(worktree_id, phase, group_idx, command,
 			started_at, finished_at, exit_code, stdout_tail, stderr_tail)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		worktreeID, phase, groupIdx, command, startedMs, fin, exit, stdoutTail, stderrTail)
 	if err != nil {
-		return fmt.Errorf("insert hook_run: %w", err)
+		return 0, fmt.Errorf("insert hook_run: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// HookLogChunk is one row from `hook_log_chunks` — a buffered slice of
+// stdout / stderr / merged output captured during the hook run.
+type HookLogChunk struct {
+	ID        int64
+	HookRunID int64
+	Ts        int64
+	Stream    string // 'stdout' | 'stderr' | 'merged'
+	Body      []byte
+}
+
+// AppendHookLogChunk persists one chunk of captured output for a hook
+// run. The body is stored verbatim — ANSI escapes are preserved so a
+// later `treeman logs hooks show <id>` round-trips terminal colors.
+func (s *Store) AppendHookLogChunk(ctx context.Context, hookRunID int64, stream string, body []byte) error {
+	if hookRunID <= 0 || len(body) == 0 {
+		return nil
+	}
+	if stream == "" {
+		stream = "merged"
+	}
+	_, err := s.DB.ExecContext(ctx,
+		`INSERT INTO hook_log_chunks(hook_run_id, ts, stream, body)
+		 VALUES (?, ?, ?, ?)`,
+		hookRunID, nowMillis(), stream, body)
+	if err != nil {
+		return fmt.Errorf("insert hook_log_chunk: %w", err)
 	}
 	return nil
+}
+
+// QueryHookLog returns every chunk for hookRunID in insertion order.
+// Callers stream the bodies to stdout to render the captured output
+// (with ANSI escapes intact).
+func (s *Store) QueryHookLog(ctx context.Context, hookRunID int64) ([]HookLogChunk, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT id, hook_run_id, ts, stream, body
+		   FROM hook_log_chunks WHERE hook_run_id = ? ORDER BY id ASC`,
+		hookRunID)
+	if err != nil {
+		return nil, fmt.Errorf("query hook_log_chunks: %w", err)
+	}
+	defer rows.Close()
+	var out []HookLogChunk
+	for rows.Next() {
+		var c HookLogChunk
+		if err := rows.Scan(&c.ID, &c.HookRunID, &c.Ts, &c.Stream, &c.Body); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// PruneOldLogs removes rows older than cutoffMs from events,
+// hook_runs (and via FK cascade hook_log_chunks). Returns total rows
+// removed across all three tables. A cutoff <= 0 is a no-op so
+// callers can guard "retention disabled" without branching.
+func (s *Store) PruneOldLogs(ctx context.Context, cutoffMs int64) (int64, error) {
+	if cutoffMs <= 0 {
+		return 0, nil
+	}
+	var total int64
+	for _, q := range []struct {
+		stmt string
+		col  string
+	}{
+		{"DELETE FROM events WHERE ts < ?", "events.ts"},
+		{"DELETE FROM hook_runs WHERE started_at < ?", "hook_runs.started_at"},
+	} {
+		res, err := s.DB.ExecContext(ctx, q.stmt, cutoffMs)
+		if err != nil {
+			return total, fmt.Errorf("prune %s: %w", q.col, err)
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			total += n
+		}
+	}
+	return total, nil
 }
 
 // placeholders returns "?, ?, ?" repeated n times.

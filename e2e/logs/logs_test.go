@@ -176,13 +176,27 @@ func setup(t *testing.T) *fixture {
 		{wt1bID, "on-create-before-engines", 0, "echo c", mins(40), mins(40) + 100, 0},
 		{wt2aID, "on-create-before-engines", 0, "echo d", mins(10), mins(10) + 80, 1},
 	}
+	var hookRunIDs []int64
 	for _, h := range hooks {
-		if _, err := st.DB.ExecContext(ctx,
+		res, err := st.DB.ExecContext(ctx,
 			`INSERT INTO hook_runs(worktree_id, phase, group_idx, command, started_at, finished_at, exit_code, stdout_tail, stderr_tail)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, '', '')`,
-			h.wt, h.phase, h.groupIdx, h.command, h.started, h.finished, h.exit); err != nil {
+			h.wt, h.phase, h.groupIdx, h.command, h.started, h.finished, h.exit)
+		if err != nil {
 			t.Fatalf("seed hook_run: %v", err)
 		}
+		id, _ := res.LastInsertId()
+		hookRunIDs = append(hookRunIDs, id)
+	}
+	// Attach a captured-output chunk to the first hook so the
+	// `logs hooks --show` rendering path has bytes to stream.
+	// ANSI escape kept intact so the test pins the round-trip.
+	chunkBody := []byte("\x1b[32mhello\x1b[0m from hook stdout\n")
+	if _, err := st.DB.ExecContext(ctx,
+		`INSERT INTO hook_log_chunks(hook_run_id, ts, stream, body)
+		 VALUES (?, ?, 'merged', ?)`,
+		hookRunIDs[0], time.Now().UnixMilli(), chunkBody); err != nil {
+		t.Fatalf("seed hook_log_chunk: %v", err)
 	}
 
 	return &fixture{
@@ -473,6 +487,27 @@ func TestLogsCLI(t *testing.T) {
 			args:        []string{"logs", "hooks", "nope"},
 			wantStderr:  []string{`no worktree matches "nope"`},
 			wantExitErr: true,
+		},
+
+		// ── hooks --show <id> renders the captured chunk ─────────
+		{
+			name:       "hooks/--show renders captured chunk verbatim (ANSI preserved)",
+			cwd:        outsideDir,
+			args:       []string{"logs", "hooks", "--all", "--show", "1"},
+			wantStdout: []string{"\x1b[32mhello\x1b[0m from hook stdout"},
+		},
+		{
+			name:        "hooks/--show on unknown id errors",
+			cwd:         outsideDir,
+			args:        []string{"logs", "hooks", "--show", "99999"},
+			wantStderr:  []string{"no captured log for hook_run id=99999"},
+			wantExitErr: true,
+		},
+		{
+			name:       "hooks/--show --json emits chunk envelopes",
+			cwd:        outsideDir,
+			args:       []string{"logs", "hooks", "--all", "--show", "1", "--json"},
+			wantStdout: []string{`"Stream":"merged"`, `"HookRunID":1`},
 		},
 
 		// ── purge ────────────────────────────────────────────────

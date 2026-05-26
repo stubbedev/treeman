@@ -221,15 +221,21 @@ func logsHooks() *cli.Command {
   treeman logs hooks                # cwd-resolved worktree
   treeman logs hooks PROJ-1234
   treeman logs hooks --all          # every worktree
+  treeman logs hooks --show 42      # render captured stdout+stderr for run id 42
   treeman logs hooks --json | jq .
 
 The worktree argument is optional — when omitted, the worktree
 containing the current working directory is used. Pass --all to
-span every worktree (e.g. when running from outside any repo).`,
+span every worktree (e.g. when running from outside any repo).
+
+--show takes a hook_run id (from the ID column) and writes the
+captured merged stdout+stderr to stdout verbatim — ANSI escapes
+included, so the original terminal colors round-trip.`,
 		Flags: []cli.Flag{
 			&cli.IntFlag{Name: "n", Value: 20, Usage: "max rows"},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "repo root override"},
 			&cli.BoolFlag{Name: "all", Aliases: []string{"A"}, Usage: "show hook runs from every worktree (skips cwd auto-resolve)"},
+			&cli.IntFlag{Name: "show", Usage: "render captured stdout+stderr for the given hook_run id"},
 			&cli.BoolFlag{Name: "json"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
@@ -238,6 +244,10 @@ span every worktree (e.g. when running from outside any repo).`,
 				return err
 			}
 			defer closer()
+
+			if id := int64(c.Int("show")); id > 0 {
+				return renderHookLog(ctx, st, id, c.Bool("json"))
+			}
 			all := c.Bool("all")
 			repoID := int64(0)
 			if r := c.String("repo"); r != "" {
@@ -289,9 +299,9 @@ span every worktree (e.g. when running from outside any repo).`,
 				}
 				return nil
 			}
-			cols := []string{"STARTED", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
+			cols := []string{"ID", "STARTED", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
 			if all {
-				cols = []string{"STARTED", "WORKTREE", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
+				cols = []string{"ID", "STARTED", "WORKTREE", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
 			}
 			tbl := ui.NewTable(cols...)
 			for _, h := range runs {
@@ -323,20 +333,44 @@ span every worktree (e.g. when running from outside any repo).`,
 				}
 				cmd = singleLine(cmd, 80)
 				group := fmt.Sprintf("%d", h.GroupIdx)
+				id := ui.Dim(fmt.Sprintf("%d", h.ID))
 				if all {
 					slug := h.WorktreeSlug
 					if slug == "" {
 						slug = fmt.Sprintf("#%d", h.WorktreeID)
 					}
-					tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Magenta(slug), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
+					tbl.Row(id, ui.Dim(formatTs(h.StartedAt)), ui.Magenta(slug), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
 				} else {
-					tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
+					tbl.Row(id, ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
 				}
 			}
 			tbl.Render(nil)
 			return nil
 		},
 	}
+}
+
+// renderHookLog writes the captured stdout+stderr for a hook_run id
+// to stdout. Bytes are streamed verbatim so ANSI escape codes
+// (colors, cursor moves, hyperlinks) round-trip from the original
+// hook subprocess. JSON mode emits one envelope per chunk with the
+// raw body inline (already base64 by encoding/json when the chunk
+// contains non-UTF8 bytes).
+func renderHookLog(ctx context.Context, st *store.Store, id int64, asJSON bool) error {
+	chunks, err := st.QueryHookLog(ctx, id)
+	if err != nil {
+		return err
+	}
+	if len(chunks) == 0 {
+		return fmt.Errorf("no captured log for hook_run id=%d", id)
+	}
+	if asJSON {
+		return jsonStream(chunks)
+	}
+	for _, c := range chunks {
+		_, _ = ui.Out.Write(c.Body)
+	}
+	return nil
 }
 
 // filterScope carries the EventFilter plus the resolved worktree
@@ -583,6 +617,12 @@ func jsonStream(v any) error {
 	case []store.HookRun:
 		for _, h := range x {
 			if err := enc.Encode(h); err != nil {
+				return err
+			}
+		}
+	case []store.HookLogChunk:
+		for _, c := range x {
+			if err := enc.Encode(c); err != nil {
 				return err
 			}
 		}

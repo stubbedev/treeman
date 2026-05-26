@@ -300,11 +300,16 @@ Examples:
   treeman logs hooks                # cwd-resolved worktree
   treeman logs hooks PROJ-1234
   treeman logs hooks --all          # every worktree
+  treeman logs hooks --show 42      # render captured stdout+stderr for run id 42
   treeman logs hooks --json | jq .
 
 The worktree argument is optional — when omitted, the worktree
 containing the current working directory is used. Pass --all to
 span every worktree (e.g. when running from outside any repo).
+
+--show takes a hook_run id (from the ID column) and writes the
+captured merged stdout+stderr to stdout verbatim — ANSI escapes
+included, so the original terminal colors round-trip.
 ```
 
 | Flag | Usage |
@@ -312,6 +317,7 @@ span every worktree (e.g. when running from outside any repo).
 | `-n` | max rows |
 | `-r`, `--repo` | repo root override |
 | `-A`, `--all` | show hook runs from every worktree (skips cwd auto-resolve) |
+| `--show` | render captured stdout+stderr for the given hook_run id |
 | `--json` |  |
 
 ### `treeman logs purge`

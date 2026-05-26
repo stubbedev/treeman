@@ -83,6 +83,22 @@ type Config struct {
 	// the markers, migration dirs, file pattern, and hash policy
 	// explicitly.
 	Frameworks map[string]CustomFramework `yaml:"frameworks,omitempty"`
+
+	// Logs retention. Daemon-side prune drops rows older than
+	// `keep_days` from the events, hook_runs, and hook_log_chunks
+	// tables on a fixed interval. Set 0 to keep forever (no prune).
+	Logs LogsConfig `yaml:"logs,omitempty"`
+}
+
+// LogsConfig — `logs:` block. One knob: how long to keep events +
+// hook_runs + their attached log chunks. The daemon's prune loop
+// applies the cutoff per table; chunks cascade via FK so dropping
+// a hook_runs row also drops its captured stdout/stderr.
+type LogsConfig struct {
+	// KeepDays sets the retention window in days. Rows older than
+	// `now - keep_days * 24h` are removed on each daemon prune tick.
+	// 0 disables pruning (keep forever). Default 14.
+	KeepDays int `yaml:"keep_days,omitempty"`
 }
 
 // DaemonConfig — `daemon:` block. Only `log_level` is user-tunable;
@@ -1341,6 +1357,13 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.DebounceMs == 0 {
 		cfg.DebounceMs = 500
+	}
+	if cfg.Logs.KeepDays == 0 {
+		// 14d covers a working sprint of postmortem context without
+		// letting hook log BLOBs bloat the SQLite file unboundedly.
+		// Set explicitly to a negative value to mean "never prune"
+		// (handled by callers as <= 0).
+		cfg.Logs.KeepDays = 14
 	}
 }
 

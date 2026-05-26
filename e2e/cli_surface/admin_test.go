@@ -4,6 +4,7 @@ package cli_surface_e2e
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -189,6 +190,43 @@ func TestHookRun(t *testing.T) {
 		}
 		if got["phase"] != "on-create-before-engines" {
 			t.Errorf("expected phase=on-create-before-engines, got %v", got["phase"])
+		}
+	})
+
+	t.Run("captured stdout survives in DB and renders via --show", func(t *testing.T) {
+		// Re-run so we get a fresh hook_runs row; the row id varies by
+		// run order so we discover it via `logs hooks --json`.
+		_ = e.run(t, wtPath, "hook", "run", "on-create-before-engines")
+
+		listing := e.run(t, wtPath, "logs", "hooks", "--all", "--json")
+		if listing.err != nil {
+			t.Fatalf("logs hooks --json: %v\nstderr:\n%s", listing.err, listing.stderr)
+		}
+		// Pick the most recent row.
+		var newestID int64
+		for _, line := range strings.Split(strings.TrimSpace(listing.stdout), "\n") {
+			if line == "" {
+				continue
+			}
+			var row struct {
+				ID int64 `json:"ID"`
+			}
+			if err := json.Unmarshal([]byte(line), &row); err != nil {
+				t.Fatalf("decode hook row %q: %v", line, err)
+			}
+			if row.ID > newestID {
+				newestID = row.ID
+			}
+		}
+		if newestID == 0 {
+			t.Fatal("no hook_run rows after hook run")
+		}
+		show := e.run(t, wtPath, "logs", "hooks", "--show", strconv.FormatInt(newestID, 10))
+		if show.err != nil {
+			t.Fatalf("logs hooks --show: %v\nstderr:\n%s", show.err, show.stderr)
+		}
+		if !strings.Contains(show.stdout, "hello from hook") {
+			t.Errorf("expected hook stdout in --show output:\n%s", show.stdout)
 		}
 	})
 }

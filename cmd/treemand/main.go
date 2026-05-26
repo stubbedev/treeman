@@ -199,6 +199,9 @@ func run() error {
 	// (MaxAgeDays, MaxTotalGb) land here later.
 	go daemon.SnapshotGCLoop(ctx, st)
 	go daemon.WALCheckpointLoop(ctx, st)
+	// Daemon-side retention sweep — drops events / hook_runs (and
+	// cascaded hook_log_chunks) older than `logs.keep_days`.
+	go daemon.LogPruneLoop(ctx, st)
 
 	// SIGHUP → full reload. Independent of the shutdown signal set so
 	// `kill -HUP $(pgrep treemand)` is a deterministic operator knob

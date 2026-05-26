@@ -422,6 +422,17 @@
       ],
       "description": "One source of file state for the template fingerprint. Bare string OR full mapping."
     },
+    "LogsConfig": {
+      "properties": {
+        "keep_days": {
+          "type": "integer",
+          "description": "KeepDays sets the retention window in days. Rows older than\n`now - keep_days * 24h` are removed on each daemon prune tick.\n0 disables pruning (keep forever). Default 14."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "LogsConfig — `logs:` block. One knob: how long to keep events +\nhook_runs + their attached log chunks. The daemon's prune loop\napplies the cutoff per table; chunks cascade via FK so dropping\na hook_runs row also drops its captured stdout/stderr."
+    },
     "MongoConn": {
       "oneOf": [
         {
@@ -773,6 +784,10 @@
       },
       "type": "object",
       "description": "User-defined migration frameworks keyed by name. Use this when\nthe built-in framework presets don't cover your tool — declare\nthe markers, migration dirs, file pattern, and hash policy\nexplicitly."
+    },
+    "logs": {
+      "$ref": "#/$defs/LogsConfig",
+      "description": "Logs retention. Daemon-side prune drops rows older than\n`keep_days` from the events, hook_runs, and hook_log_chunks\ntables on a fixed interval. Set 0 to keep forever (no prune)."
     }
   },
   "additionalProperties": false,

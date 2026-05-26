@@ -42,8 +42,15 @@ func PersistOutcome(
 		if g.LogPath != "" {
 			cmd = fmt.Sprintf("%s  # log=%s", cmd, g.LogPath)
 		}
-		_ = st.WriteHookRun(ctx, wtID, phase, i, cmd,
+		runID, _ := st.WriteHookRun(ctx, wtID, phase, i, cmd,
 			startedMs, finishedMs, g.ExitCode, g.StdoutTail, g.StderrTail)
+		// Stash the merged stdout+stderr capture so the failure (or
+		// success) survives worktree teardown. ANSI escapes are
+		// preserved verbatim — `treeman logs hooks show <id>` writes
+		// the bytes back to stdout so terminal color round-trips.
+		if runID > 0 && len(g.LogBody) > 0 {
+			_ = st.AppendHookLogChunk(ctx, runID, "merged", g.LogBody)
+		}
 		if g.ExitCode != 0 {
 			failed++
 			if g.ExitCode > maxExit {
