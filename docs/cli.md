@@ -190,6 +190,35 @@ switch/create branch with auto-routing (use as cd "$(treeman wt go …)")
 | `-r`, `--repo` |  |
 | `--no-fetch` | skip the pre-checkout `git fetch origin <base>` |
 
+### `treeman main`
+
+manage main-worktree enrollment (per-branch DBs at repo root)
+
+### `treeman main enable`
+
+opt the repo root into the watcher lifecycle
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+
+### `treeman main disable`
+
+remove the repo root from the watcher lifecycle
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+
+### `treeman main status`
+
+show main-worktree enrollment state
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--json` |  |
+
 ### `treeman branches`
 
 list local + remote-only branches with worktree occupancy
