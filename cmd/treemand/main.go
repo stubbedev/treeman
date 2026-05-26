@@ -202,6 +202,11 @@ func run() error {
 	// Daemon-side retention sweep — drops events / hook_runs (and
 	// cascaded hook_log_chunks) older than `logs.keep_days`.
 	go daemon.LogPruneLoop(ctx, st)
+	// Periodic `git fetch --all --prune` + best-effort
+	// `git merge --ff-only @{u}` per registered repo's worktrees.
+	// Returns immediately when `auto_fetch.enabled: false` in the
+	// global config.
+	go daemon.AutoFetchLoop(ctx, st)
 
 	// SIGHUP → full reload. Independent of the shutdown signal set so
 	// `kill -HUP $(pgrep treemand)` is a deterministic operator knob

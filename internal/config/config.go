@@ -88,6 +88,43 @@ type Config struct {
 	// `keep_days` from the events, hook_runs, and hook_log_chunks
 	// tables on a fixed interval. Set 0 to keep forever (no prune).
 	Logs LogsConfig `yaml:"logs,omitempty"`
+
+	// AutoFetch policy. Daemon-side periodic `git fetch --all --prune`
+	// per registered repo, followed by a `git merge --ff-only @{u}`
+	// per active worktree. Skips dirty trees, non-ff branches, and
+	// upstreamless branches. Enabled by default at a 15-minute cadence.
+	AutoFetch AutoFetchConfig `yaml:"auto_fetch,omitempty"`
+}
+
+// AutoFetchConfig — `auto_fetch:` block. Periodic daemon-side
+// `git fetch --all --prune` per registered repo, followed by a best-
+// effort `git merge --ff-only @{u}` per active worktree. Pull is
+// safe: it skips when the working tree is dirty, when the branch
+// has no upstream, or when the merge would not be a fast-forward.
+// Each failure logs a warning and the loop continues.
+//
+// Use `enabled: false` (per-repo `.treeman.yaml` override) to opt a
+// repo out, e.g. when a separate scheduler already pulls or when
+// network policy forbids unsolicited fetches.
+type AutoFetchConfig struct {
+	// Enabled toggles the loop. Default true. A pointer would let the
+	// schema distinguish "unset" from "explicit false", but defaults
+	// are applied centrally in applyDefaults and there is no
+	// inheritance subtlety — a missing key means "use default".
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// Cadence in minutes. Default 15. Minimum 1 (values below are
+	// clamped at use-site to avoid a runaway tight loop on a typo).
+	IntervalMinutes uint32 `yaml:"interval_minutes,omitempty"`
+}
+
+// IsEnabled returns the resolved on/off value, treating nil
+// (`enabled:` unset) as the default-on case.
+func (a AutoFetchConfig) IsEnabled() bool {
+	if a.Enabled == nil {
+		return true
+	}
+	return *a.Enabled
 }
 
 // LogsConfig — `logs:` block. One knob: how long to keep events +
@@ -1357,6 +1394,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.DebounceMs == 0 {
 		cfg.DebounceMs = 500
+	}
+	if cfg.AutoFetch.IntervalMinutes == 0 {
+		cfg.AutoFetch.IntervalMinutes = 15
 	}
 	if cfg.Logs.KeepDays == 0 {
 		// 14d covers a working sprint of postmortem context without

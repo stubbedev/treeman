@@ -512,6 +512,10 @@ func prepareMySQL(
 	// Inputs feed the fingerprint, so any user-meaningful change
 	// invalidates the cache naturally — no force-rebuild knob.
 	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		// Touch the row BEFORE DatabaseExists so a concurrent
+		// EvictExcess sees this template as most-recently-used and
+		// won't pick it as LRU while we're about to use it.
+		_ = st.TouchSnapshot(ctx, key.Fingerprint())
 		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
 			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
 				fmt.Sprintf("template=%s", rec.TemplateName),
@@ -531,13 +535,35 @@ func prepareMySQL(
 			// dev shells, tinker — anything that reads DB_DATABASE
 			// without the `_test_N` suffix paratest appends) have a
 			// populated DB at the user-facing name_template.
-			if err := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); err != nil {
-				return Outcome{}, fmt.Errorf("restore source %s from template %s: %w", sourceDB, rec.TemplateName, err)
+			//
+			// If the template disappears mid-flight (race with
+			// EvictExcess between DatabaseExists and SnapshotRestore /
+			// fanOutClones), fall through to cold build instead of
+			// failing wt_finalize.
+			if restoreErr := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); restoreErr != nil {
+				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+					fmt.Sprintf("restore failed, falling back to cold build: %v", restoreErr),
+					repoID, worktreeID, "", 0, map[string]string{
+						"engine":      d.Engine,
+						"template":    rec.TemplateName,
+						"fingerprint": key.Fingerprint(),
+						"error":       restoreErr.Error(),
+					})
+				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+				goto mysqlColdBuild
 			}
-			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
-				return Outcome{}, err
+			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); foErr != nil {
+				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+					repoID, worktreeID, "", 0, map[string]string{
+						"engine":      d.Engine,
+						"template":    rec.TemplateName,
+						"fingerprint": key.Fingerprint(),
+						"error":       foErr.Error(),
+					})
+				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+				goto mysqlColdBuild
 			}
-			_ = st.TouchSnapshot(ctx, key.Fingerprint())
 			ms := time.Since(started).Milliseconds()
 			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
 				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
@@ -563,6 +589,7 @@ func prepareMySQL(
 		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
+mysqlColdBuild:
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
 		fmt.Sprintf("engine=mysql source=%s template=%s", sourceDB, templateName),
 		repoID, worktreeID, "", 0, map[string]string{
@@ -715,6 +742,9 @@ func preparePostgres(
 
 	// Cache hit? Fingerprint covers every declared input.
 	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		// Touch row early so concurrent EvictExcess sees this template
+		// as most-recently-used and skips it as LRU candidate.
+		_ = st.TouchSnapshot(ctx, key.Fingerprint())
 		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
 			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
 				fmt.Sprintf("template=%s", rec.TemplateName),
@@ -734,13 +764,34 @@ func preparePostgres(
 			// dev shells — anything that reads the user-facing
 			// name_template without the per-worker suffix) have a
 			// populated DB.
-			if err := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); err != nil {
-				return Outcome{}, fmt.Errorf("restore source %s from template %s: %w", sourceDB, rec.TemplateName, err)
+			//
+			// If the template disappears mid-flight (race with
+			// EvictExcess between DatabaseExists and the restore/
+			// fanout calls), fall through to cold build.
+			if restoreErr := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); restoreErr != nil {
+				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+					fmt.Sprintf("restore failed, falling back to cold build: %v", restoreErr),
+					repoID, worktreeID, "", 0, map[string]string{
+						"engine":      "postgres",
+						"template":    rec.TemplateName,
+						"fingerprint": key.Fingerprint(),
+						"error":       restoreErr.Error(),
+					})
+				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+				goto pgColdBuild
 			}
-			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
-				return Outcome{}, err
+			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); foErr != nil {
+				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+					repoID, worktreeID, "", 0, map[string]string{
+						"engine":      "postgres",
+						"template":    rec.TemplateName,
+						"fingerprint": key.Fingerprint(),
+						"error":       foErr.Error(),
+					})
+				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+				goto pgColdBuild
 			}
-			_ = st.TouchSnapshot(ctx, key.Fingerprint())
 			ms := time.Since(started).Milliseconds()
 			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
 				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
@@ -761,6 +812,7 @@ func preparePostgres(
 		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
+pgColdBuild:
 	// Cold build.
 	if _, err := drv.DropMatching(ctx, sourceDB); err != nil {
 		return Outcome{}, err
@@ -888,6 +940,9 @@ func prepareMongo(
 
 	// Cache hit?
 	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		// Touch row early so concurrent EvictExcess sees this template
+		// as most-recently-used and skips it as LRU candidate.
+		_ = st.TouchSnapshot(ctx, key.Fingerprint())
 		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
 			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
 				fmt.Sprintf("template=%s", rec.TemplateName),
@@ -901,10 +956,21 @@ func prepareMongo(
 			if err != nil {
 				return Outcome{}, err
 			}
-			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); err != nil {
-				return Outcome{}, err
+			// If the template disappears mid-flight (race with
+			// EvictExcess), fall through to cold build instead of
+			// failing wt_finalize.
+			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); foErr != nil {
+				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+					repoID, worktreeID, "", 0, map[string]string{
+						"engine":      "mongodb",
+						"template":    rec.TemplateName,
+						"fingerprint": key.Fingerprint(),
+						"error":       foErr.Error(),
+					})
+				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+				goto mongoColdBuild
 			}
-			_ = st.TouchSnapshot(ctx, key.Fingerprint())
 			ms := time.Since(started).Milliseconds()
 			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
 				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
@@ -926,6 +992,7 @@ func prepareMongo(
 		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
+mongoColdBuild:
 	// Cold build: drop source, optionally mongorestore a dump
 	// archive, run the seed step, snapshot template, fan out
 	// clones.
@@ -1069,6 +1136,9 @@ func prepareRedisPrefix(
 
 	// Cache hit?
 	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		// Touch row early so concurrent EvictExcess sees this template
+		// as most-recently-used and skips it as LRU candidate.
+		_ = st.TouchSnapshot(ctx, key.Fingerprint())
 		alive, _ := drv.PrefixExists(ctx, rec.TemplateName)
 		if alive {
 			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
@@ -1083,14 +1153,33 @@ func prepareRedisPrefix(
 			if err != nil {
 				return Outcome{}, err
 			}
-			// Restore template → source so the worktree app sees fresh data.
-			if err := drv.SnapshotRestore(ctx, rec.TemplateName, sourcePrefix); err != nil {
-				return Outcome{}, fmt.Errorf("redis restore %s → %s: %w", rec.TemplateName, sourcePrefix, err)
+			// Restore template → source so the worktree app sees fresh
+			// data. If the template disappears mid-flight (race with
+			// EvictExcess), fall through to cold build.
+			if restoreErr := drv.SnapshotRestore(ctx, rec.TemplateName, sourcePrefix); restoreErr != nil {
+				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+					fmt.Sprintf("restore failed, falling back to cold build: %v", restoreErr),
+					repoID, worktreeID, "", 0, map[string]string{
+						"engine":      "redis",
+						"template":    rec.TemplateName,
+						"fingerprint": key.Fingerprint(),
+						"error":       restoreErr.Error(),
+					})
+				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+				goto redisColdBuild
 			}
-			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); err != nil {
-				return Outcome{}, err
+			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); foErr != nil {
+				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+					repoID, worktreeID, "", 0, map[string]string{
+						"engine":      "redis",
+						"template":    rec.TemplateName,
+						"fingerprint": key.Fingerprint(),
+						"error":       foErr.Error(),
+					})
+				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+				goto redisColdBuild
 			}
-			_ = st.TouchSnapshot(ctx, key.Fingerprint())
 			ms := time.Since(started).Milliseconds()
 			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
 				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
@@ -1112,6 +1201,7 @@ func prepareRedisPrefix(
 		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
+redisColdBuild:
 	// Cold build: drop source, run seed, snapshot template, fanout.
 	if _, err := drv.DropPrefix(ctx, sourcePrefix); err != nil {
 		return Outcome{}, fmt.Errorf("redis drop %s*: %w", sourcePrefix, err)
@@ -1227,6 +1317,9 @@ func prepareES(
 
 	// Cache hit? Verify by listing indices under the template prefix.
 	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
+		// Touch row early so concurrent EvictExcess sees this template
+		// as most-recently-used and skips it as LRU candidate.
+		_ = st.TouchSnapshot(ctx, key.Fingerprint())
 		alive, _ := drv.ListMatching(ctx, rec.TemplateName)
 		if len(alive) > 0 {
 			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
@@ -1241,10 +1334,20 @@ func prepareES(
 			if err != nil {
 				return Outcome{}, err
 			}
-			if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); err != nil {
-				return Outcome{}, err
+			// If template disappears mid-flight (race with EvictExcess),
+			// fall through to cold build.
+			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); foErr != nil {
+				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+					repoID, worktreeID, "", 0, map[string]string{
+						"engine":      "elasticsearch",
+						"template":    rec.TemplateName,
+						"fingerprint": key.Fingerprint(),
+						"error":       foErr.Error(),
+					})
+				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+				goto esColdBuild
 			}
-			_ = st.TouchSnapshot(ctx, key.Fingerprint())
 			ms := time.Since(started).Milliseconds()
 			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
 				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
@@ -1266,6 +1369,7 @@ func prepareES(
 		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	}
 
+esColdBuild:
 	// Cold build: drop, optionally bulk-load a dump NDJSON, run
 	// seed, snapshot, fanout.
 	if _, err := drv.DropMatching(ctx, sourcePrefix); err != nil {
