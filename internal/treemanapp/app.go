@@ -26,6 +26,7 @@ func New() *cli.Command {
 		Suggest: true,
 		Commands: []*cli.Command{
 			cmd.WorktreeCmd(),
+			cmd.MainCmd(),
 			cmd.BranchesCmd(),
 			cmd.PrepareCmd(),
 			cmd.SyncCmd(),

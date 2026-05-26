@@ -153,6 +153,19 @@ func run() error {
 	// Sweep on startup so they don't accumulate indefinitely.
 	daemon.SweepTrashDirs(ctx, st, repoPaths)
 
+	// Enroll opt-in main worktrees BEFORE listing active worktrees so
+	// the boot resume below spawns watchers against the repo root for
+	// every repo where `main_worktree.enabled: true`. Idempotent —
+	// flips a row's is_main + slug to match the current branch.
+	for _, p := range repoPaths {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		if _, err := daemon.EnrollMainWorktree(ctx, st, p); err != nil {
+			slog.Warn("main worktree enroll skipped", "repo", p, "err", err)
+		}
+	}
+
 	// Auto-resume per-worktree fsnotify watchers. Migrations and
 	// dumps live in the worktree (each linked worktree has its own
 	// branch checkout), so the file watcher is rooted there.

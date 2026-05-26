@@ -442,7 +442,7 @@ func orphanLogDir(repoPath, slug string) string {
 // path would have `deleted_at` set and we skip it.
 func lookupWorktreeByPath(ctx context.Context, s *store.Store, path string) (store.WorktreeRow, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL, is_main
 		FROM worktrees WHERE path = ? ORDER BY id DESC LIMIT 1`, path)
 	if err != nil {
 		return store.WorktreeRow{}, err
@@ -452,7 +452,7 @@ func lookupWorktreeByPath(ctx context.Context, s *store.Store, path string) (sto
 		return store.WorktreeRow{}, nil
 	}
 	var w store.WorktreeRow
-	if err := rows.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &w.Deleted); err != nil {
+	if err := rows.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &w.Deleted, &w.IsMain); err != nil {
 		return store.WorktreeRow{}, err
 	}
 	return w, rows.Err()

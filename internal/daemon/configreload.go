@@ -244,6 +244,16 @@ func (cr *ConfigReloader) reloadOne(ctx context.Context, repoPath string) {
 	}
 	slog.Info("config reload: restarting watchers", "repo", repoPath)
 
+	// Re-sync the main-wt row with the freshly-loaded config BEFORE
+	// listing active worktrees below. Flipping `main_worktree.enabled`
+	// on inserts a new row; flipping it off soft-deletes the existing
+	// one. Either change is observed by the ListActiveWorktrees call
+	// that follows, so per-wt watcher spawn/teardown happens through
+	// the same code path linked wts use.
+	if _, err := EnrollMainWorktree(ctx, cr.st, repoPath); err != nil {
+		slog.Warn("config reload: main worktree enroll", "repo", repoPath, "err", err)
+	}
+
 	cr.st.UnregisterWatcher(repoPath)
 	cr.st.UnregisterLifecycleWatcher(repoPath)
 

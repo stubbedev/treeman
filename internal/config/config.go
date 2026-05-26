@@ -94,6 +94,14 @@ type Config struct {
 	// per active worktree. Skips dirty trees, non-ff branches, and
 	// upstreamless branches. Enabled by default at a 15-minute cadence.
 	AutoFetch AutoFetchConfig `yaml:"auto_fetch,omitempty"`
+
+	// MainWorktree opts the repo's main checkout (repo root) into the
+	// same watcher-driven prepare/migrate/teardown lifecycle that
+	// linked `.worktrees/<slug>` checkouts already get. Off by default
+	// — flipping it on for an existing repo will start creating
+	// per-branch databases when the user switches branches at the
+	// repo root.
+	MainWorktree MainWorktreeConfig `yaml:"main_worktree,omitempty"`
 }
 
 // AutoFetchConfig — `auto_fetch:` block. Periodic daemon-side
@@ -144,6 +152,46 @@ func (a AutoFetchConfig) ResolvedMode() string {
 		return "rebase"
 	default:
 		return "ff"
+	}
+}
+
+// MainWorktreeConfig — `main_worktree:` block. Opt-in handle that
+// promotes the repo root into a first-class worktree so the daemon's
+// HEAD watcher, file watcher, and prepare orchestration treat it the
+// same as a `.worktrees/<slug>` linked checkout. Off by default; flip
+// `enabled: true` to start producing per-branch databases at the
+// repo root.
+type MainWorktreeConfig struct {
+	// Enabled toggles main-wt enrollment for this repo. Default false
+	// — every existing install sees zero behaviour change until the
+	// flag is set. Once true, the daemon ensures a worktrees row with
+	// is_main=1 exists for the repo, spawns the per-wt HEAD + file
+	// watchers against the repo root, and re-runs prepare on every
+	// branch switch.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// OnBranchSwitch picks the policy when the user changes branch
+	// inside the main worktree:
+	//   - "prepare" (default): re-run prepare against the new branch's
+	//     slug. Snapshot cache is shared across branches, so the second
+	//     visit to any branch is a near-instant clone.
+	//   - "drop": tear down the previous branch's per-wt databases
+	//     before preparing the new one. Lowest disk footprint;
+	//     re-visiting a branch is always a cold-build.
+	//   - "keep": leave previous-branch DBs intact and just switch
+	//     active. Fastest re-checkout, biggest sprawl — useful for
+	//     teams that pin a small set of branches.
+	OnBranchSwitch string `yaml:"on_branch_switch,omitempty" jsonschema:"enum=prepare,enum=drop,enum=keep"`
+}
+
+// ResolvedOnBranchSwitch normalises OnBranchSwitch into the canonical
+// values, defaulting to "prepare" for any unknown / empty string.
+func (m MainWorktreeConfig) ResolvedOnBranchSwitch() string {
+	switch m.OnBranchSwitch {
+	case "drop", "keep":
+		return m.OnBranchSwitch
+	default:
+		return "prepare"
 	}
 }
 

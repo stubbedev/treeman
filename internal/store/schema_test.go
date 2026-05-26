@@ -57,6 +57,7 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 		"idx_snapshots_lru",
 		"idx_snapshots_repo_lru",
 		"idx_worktrees_admin_dir",
+		"idx_worktrees_one_main_per_repo",
 		"idx_worktrees_path_nocase",
 		"idx_worktrees_repo",
 		"idx_worktrees_repo_visited",

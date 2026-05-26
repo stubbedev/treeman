@@ -35,6 +35,64 @@ func TestFallsBackToPathHash(t *testing.T) {
 	}
 }
 
+func TestForMainBranchAware(t *testing.T) {
+	cases := []struct {
+		branch string
+		want   string
+	}{
+		{"main", "main_main"},
+		{"develop", "main_develop"},
+		{"feature/foo-bar", "main_feature_foo_bar"},
+		{"feature/PROJ-123", "main_feature_proj_123"},
+		{"release/v1.0.0", "main_release_v1_0_0"},
+	}
+	for _, tc := range cases {
+		got := ForMain("/some/repo", tc.branch)
+		if got.Value != tc.want {
+			t.Errorf("ForMain branch=%q value=%q want=%q", tc.branch, got.Value, tc.want)
+		}
+		if got.Source != SourceMain {
+			t.Errorf("ForMain branch=%q source=%v want=SourceMain", tc.branch, got.Source)
+		}
+	}
+}
+
+func TestForMainDetachedHasStableHash(t *testing.T) {
+	a := ForMain("/some/repo", "")
+	b := ForMain("/some/repo", "")
+	if a.Value != b.Value {
+		t.Errorf("detached slug not deterministic: %q vs %q", a.Value, b.Value)
+	}
+	if !strings.HasPrefix(a.Value, "main_detached_") {
+		t.Errorf("want main_detached_ prefix, got %q", a.Value)
+	}
+	c := ForMain("/different/repo", "")
+	if a.Value == c.Value {
+		t.Errorf("different repos collapsed to same detached slug: %q", a.Value)
+	}
+}
+
+func TestForMainSymbolOnlyBranchFallsBackToHash(t *testing.T) {
+	got := ForMain("/some/repo", "@@@")
+	if !strings.HasPrefix(got.Value, "main_sym_") {
+		t.Errorf("symbol-only branch should hash, got %q", got.Value)
+	}
+	// Different symbol-only branches must produce different slugs so
+	// two odd branches don't collide on `main_`.
+	other := ForMain("/some/repo", "###")
+	if got.Value == other.Value {
+		t.Errorf("symbol-only branches collided: %q == %q", got.Value, other.Value)
+	}
+}
+
+func TestForMainLongBranchTruncated(t *testing.T) {
+	long := strings.Repeat("a", 200)
+	got := ForMain("/some/repo", long)
+	if len(got.Value) > 32 {
+		t.Errorf("want <=32 chars, got len=%d %q", len(got.Value), got.Value)
+	}
+}
+
 func TestDashedReplacesUnderscores(t *testing.T) {
 	s := Slug{Value: "proj_1234", Source: SourceTicket}
 	if s.Dashed() != "proj-1234" {

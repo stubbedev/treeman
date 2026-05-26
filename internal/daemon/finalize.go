@@ -60,14 +60,42 @@ func FinalizeWorktree(
 		return err
 	}
 	branch := detectBranch(wtRoot)
-	sl := slug.For(wtRoot, branch)
 
 	repoName := filepath.Base(repoRoot)
 	repoID, err := st.Store.EnsureRepo(ctx, repoRoot, repoName)
 	if err != nil {
 		return err
 	}
-	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wtRoot, sl.Value, branch)
+
+	// Main-wt routing: when the worktree path equals the repo root AND
+	// either the repo config opts in OR an existing main row is
+	// already enrolled, use slug.ForMain so a non-ticket branch like
+	// `develop` produces a branch-specific slug instead of collapsing
+	// to the repo's path hash. Falling back to the existing-row check
+	// covers the case where the user has flipped `main_worktree.enabled`
+	// off but a deletion hasn't run yet — we honour the live row.
+	isMain := false
+	if wtRoot == repoRoot {
+		if cfg.MainWorktree.Enabled {
+			isMain = true
+		} else if existing, err := st.Store.LookupMainWorktree(ctx, repoID); err == nil && existing.ID != 0 {
+			isMain = true
+		}
+	}
+
+	var sl slug.Slug
+	if isMain {
+		sl = slug.ForMain(wtRoot, branch)
+	} else {
+		sl = slug.For(wtRoot, branch)
+	}
+
+	var wtID int64
+	if isMain {
+		wtID, err = st.Store.EnsureMainWorktree(ctx, repoID, wtRoot, sl.Value, branch)
+	} else {
+		wtID, err = st.Store.EnsureWorktree(ctx, repoID, wtRoot, sl.Value, branch)
+	}
 	if err != nil {
 		return err
 	}

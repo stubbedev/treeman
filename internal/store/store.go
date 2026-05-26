@@ -422,6 +422,71 @@ func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path,
 	return res.LastInsertId()
 }
 
+// EnsureMainWorktree upserts the repo's main-worktree row (is_main=1)
+// for the repo root path. Behaves like EnsureWorktree but forces
+// is_main on insert AND on resurrect — flipping the main_worktree
+// config off, then back on, must restore the row's main-ness even
+// when the path already matches a soft-deleted linked-wt row.
+//
+// The partial unique index `idx_worktrees_one_main_per_repo`
+// guarantees at most one active main row per repo; if a caller
+// somehow tries to insert a second, the INSERT fails loud — better
+// to crash than silently bind two main rows to the same repo.
+func (s *Store) EnsureMainWorktree(ctx context.Context, repoID int64, path, slug, branch string) (int64, error) {
+	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
+	var id int64
+	if err := row.Scan(&id); err == nil {
+		var br interface{}
+		if branch != "" {
+			br = branch
+		}
+		if _, err := s.DB.ExecContext(ctx, `
+			UPDATE worktrees
+			SET slug = ?,
+			    branch = COALESCE(?, branch),
+			    deleted_at = NULL,
+			    is_main = 1
+			WHERE id = ?`, slug, br, id); err != nil {
+			return 0, err
+		}
+		return id, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	var br interface{}
+	if branch != "" {
+		br = branch
+	}
+	res, err := s.DB.ExecContext(ctx,
+		"INSERT INTO worktrees(repo_id, path, slug, branch, created_at, is_main) VALUES (?, ?, ?, ?, ?, 1)",
+		repoID, path, slug, br, nowMillis())
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// LookupMainWorktree returns the active main-wt row for repoID, or a
+// zero-value row when none is enrolled. Used by the daemon's boot
+// resume + config-reload paths to decide whether to spawn watchers
+// against the repo root.
+func (s *Store) LookupMainWorktree(ctx context.Context, repoID int64) (WorktreeRow, error) {
+	row := s.DB.QueryRowContext(ctx, `
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), 0, is_main
+		FROM worktrees
+		WHERE repo_id = ? AND is_main = 1 AND deleted_at IS NULL
+		ORDER BY id DESC LIMIT 1`, repoID)
+	var w WorktreeRow
+	var deleted int
+	if err := row.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &deleted, &w.IsMain); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WorktreeRow{}, nil
+		}
+		return WorktreeRow{}, err
+	}
+	return w, nil
+}
+
 // SetWorktreeAdminDir stamps the per-worktree git administrative
 // directory on an existing row. Used by the lifecycle reconcile pass
 // to backfill rows that were created before the column existed.
@@ -443,11 +508,11 @@ func (s *Store) SetWorktreeAdminDir(ctx context.Context, id int64, adminDir stri
 // file locks.
 func (s *Store) LookupActiveWorktreeByPath(ctx context.Context, path string) (WorktreeRow, error) {
 	row := s.DB.QueryRowContext(ctx, `
-		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), 0
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), 0, is_main
 		FROM worktrees WHERE path = ? COLLATE NOCASE AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`, path)
 	var w WorktreeRow
 	var deleted int
-	if err := row.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &deleted); err != nil {
+	if err := row.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &deleted, &w.IsMain); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return WorktreeRow{}, nil
 		}
@@ -460,11 +525,11 @@ func (s *Store) LookupActiveWorktreeByPath(ctx context.Context, path string) (Wo
 // row. Returns 0 + nil when no row matches.
 func (s *Store) LookupWorktreeByAdminDir(ctx context.Context, adminDir string) (WorktreeRow, error) {
 	row := s.DB.QueryRowContext(ctx, `
-		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL, is_main
 		FROM worktrees WHERE admin_dir = ? ORDER BY id DESC LIMIT 1`, adminDir)
 	var w WorktreeRow
 	var deleted bool
-	if err := row.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &deleted); err != nil {
+	if err := row.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &deleted, &w.IsMain); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return WorktreeRow{}, nil
 		}
@@ -483,6 +548,7 @@ type WorktreeRow struct {
 	Branch   string
 	AdminDir string
 	Deleted  bool
+	IsMain   bool
 }
 
 // ListWorktreesForRepo returns every worktree row attached to repoID,
@@ -490,7 +556,7 @@ type WorktreeRow struct {
 // diff the DB against the filesystem.
 func (s *Store) ListWorktreesForRepo(ctx context.Context, repoID int64) ([]WorktreeRow, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL, is_main
 		FROM worktrees WHERE repo_id = ? ORDER BY id`, repoID)
 	if err != nil {
 		return nil, err
@@ -499,7 +565,7 @@ func (s *Store) ListWorktreesForRepo(ctx context.Context, repoID int64) ([]Workt
 	var out []WorktreeRow
 	for rows.Next() {
 		var w WorktreeRow
-		if err := rows.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &w.Deleted); err != nil {
+		if err := rows.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &w.Deleted, &w.IsMain); err != nil {
 			return nil, err
 		}
 		out = append(out, w)

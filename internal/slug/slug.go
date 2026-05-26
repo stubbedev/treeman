@@ -25,6 +25,12 @@ const (
 	// SourcePathHash — fallback when no ticket was found; slug is a
 	// stable `wt_<blake3(path)[:8]>`.
 	SourcePathHash
+	// SourceMain — derived by ForMain() for a repo's main worktree.
+	// Always branch-driven (`main_<sanitised_branch>`) so a non-ticket
+	// branch like `develop` doesn't collapse to the repo's path hash,
+	// which would share a DB across every branch ever checked out at
+	// the repo root.
+	SourceMain
 )
 
 // Slug is the worktree identifier feeding every per-engine template
@@ -74,6 +80,63 @@ func For(worktreePath string, branch string) Slug {
 	sum := blake3.Sum256([]byte(canonical))
 	hex := hexEncode(sum[:])
 	return Slug{Value: "wt_" + hex[:8], Source: SourcePathHash}
+}
+
+// ForMain derives the slug for a repo's main worktree (the repo root
+// checkout). Unlike For(), the branch is mandatory and there's no
+// path-hash fallback — checking out a non-ticket branch like `develop`
+// at the repo root must produce a branch-specific slug (`main_develop`)
+// so per-branch DBs in the main wt actually diverge instead of all
+// pointing at one shared path-hash slug.
+//
+// Detached HEAD (empty branch) gets `main_detached_<hex>` keyed off
+// the repo path so two detached repos don't collide. Empty branch is
+// the edge case at boot before the daemon has detected HEAD.
+func ForMain(worktreePath string, branch string) Slug {
+	if branch == "" {
+		sum := blake3.Sum256([]byte(worktreePath))
+		return Slug{Value: "main_detached_" + hexEncode(sum[:])[:8], Source: SourceMain}
+	}
+	sanitised := sanitiseBranch(branch)
+	if sanitised == "" {
+		// Branch was symbol-only (`@`, `###`, etc — git allows it).
+		// Falling through with an empty sanitised string would produce
+		// `main_` which collides for every odd branch in this repo;
+		// hash the raw branch instead so each one gets a stable slug.
+		sum := blake3.Sum256([]byte(branch))
+		return Slug{Value: "main_sym_" + hexEncode(sum[:])[:8], Source: SourceMain}
+	}
+	v := "main_" + sanitised
+	if len(v) > 32 {
+		// Same naive-truncation trap as extractTicket: collide-prone
+		// without a hash suffix when the branch name is long.
+		sum := blake3.Sum256([]byte(v))
+		tag := hexEncode(sum[:])[:6]
+		v = v[:32-1-len(tag)] + "_" + tag
+	}
+	return Slug{Value: v, Source: SourceMain}
+}
+
+// sanitiseBranch lowercases the branch name and replaces every
+// non-alphanumeric run with a single underscore so the result is a
+// valid identifier across MySQL/Postgres/Redis prefixes. Leading and
+// trailing underscores are trimmed.
+func sanitiseBranch(branch string) string {
+	var b strings.Builder
+	prevUnderscore := true
+	for _, r := range strings.ToLower(branch) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevUnderscore = false
+		default:
+			if !prevUnderscore {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "_")
 }
 
 func extractTicket(s string) (string, bool) {
