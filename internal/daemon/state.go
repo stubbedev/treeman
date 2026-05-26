@@ -46,9 +46,14 @@ type State struct {
 	// onRemove consults this so the fsnotify REMOVE event fired by
 	// `git worktree remove` doesn't spawn a duplicate orphan teardown
 	// behind the primary's mutex.
+	//
+	// inFlightFinalizes maps wtPath → cancel func of the FinalizeWorktree
+	// goroutine running for that path. Teardown calls CancelFinalize
+	// before its own work so a late-arriving prepare can't resurrect
+	// state (DB + registry row) after the worktree has been deleted.
 	inFlightMu        sync.Mutex
 	inFlightTeardowns map[string]struct{}
-	inFlightFinalizes map[string]struct{}
+	inFlightFinalizes map[string]context.CancelFunc
 
 	// reapQueuesMu guards reapQueues. Each repo gets a single worker
 	// goroutine draining a buffered channel of trash paths — bursty
@@ -109,7 +114,7 @@ func NewState(bg context.Context, s *store.Store) *State {
 		lifecycleWatchers: map[string]*WatcherEntry{},
 		teardownLks:       map[string]*sync.Mutex{},
 		inFlightTeardowns: map[string]struct{}{},
-		inFlightFinalizes: map[string]struct{}{},
+		inFlightFinalizes: map[string]context.CancelFunc{},
 		reapQueues:        map[string]chan string{},
 		dropQueues:        map[string]chan DBDropJob{},
 	}
@@ -147,7 +152,8 @@ func (st *State) IsTeardownInFlight(wtPath string) bool {
 }
 
 // MarkFinalizeInFlight records that a FinalizeWorktree goroutine is
-// running for wtPath. Returns false when another finalize is
+// running for wtPath and stores its cancel func so a concurrent
+// teardown can preempt it. Returns false when another finalize is
 // already in flight for the same wtPath — caller should return
 // early to avoid double-firing setup hooks. The caller MUST
 // invoke UnmarkFinalizeInFlight on exit.
@@ -160,13 +166,16 @@ func (st *State) IsTeardownInFlight(wtPath string) bool {
 // parallel — both fire setup hooks (composer install, npm
 // install, …) and both call prepare, fighting each other on file
 // locks.
-func (st *State) MarkFinalizeInFlight(wtPath string) bool {
+func (st *State) MarkFinalizeInFlight(wtPath string, cancel context.CancelFunc) bool {
 	st.inFlightMu.Lock()
 	defer st.inFlightMu.Unlock()
 	if _, exists := st.inFlightFinalizes[wtPath]; exists {
 		return false
 	}
-	st.inFlightFinalizes[wtPath] = struct{}{}
+	if cancel == nil {
+		cancel = func() {}
+	}
+	st.inFlightFinalizes[wtPath] = cancel
 	return true
 }
 
@@ -186,6 +195,47 @@ func (st *State) IsFinalizeInFlight(wtPath string) bool {
 	_, ok := st.inFlightFinalizes[wtPath]
 	st.inFlightMu.Unlock()
 	return ok
+}
+
+// CancelFinalize fires the cancel func registered for wtPath if a
+// FinalizeWorktree is currently in flight. Idempotent — safe to call
+// when no finalize is running. Returns true when a cancel was fired.
+//
+// Called by TeardownWorktree to preempt any in-flight finalize so
+// `prepare.Run` doesn't race the cleanup and resurrect databases
+// after the worktree has been removed.
+func (st *State) CancelFinalize(wtPath string) bool {
+	st.inFlightMu.Lock()
+	cancel, ok := st.inFlightFinalizes[wtPath]
+	st.inFlightMu.Unlock()
+	if !ok || cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+// WaitFinalizeCleared blocks until no FinalizeWorktree is in flight
+// for wtPath or `timeout` elapses. Returns an error when the
+// finalize slot is still occupied after the deadline. Used by
+// TeardownWorktree to serialise after a cancelled finalize so the
+// cleanup observes a stable, post-finalize state of the DB and
+// registry.
+func (st *State) WaitFinalizeCleared(ctx context.Context, wtPath string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !st.IsFinalizeInFlight(wtPath) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("finalize still in flight for %s after %s", wtPath, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // safeGo runs fn in a new goroutine, recovering any panic so a

@@ -35,6 +35,13 @@ func FinalizeWorktree(
 	repoRoot := repoPath
 	wtRoot := worktreePath
 
+	// Derive a cancellable ctx that TeardownWorktree can preempt via
+	// CancelFinalize. ctx.Err() is consulted at each phase boundary
+	// below so a concurrent `wt delete` preempts before prepare.Run
+	// creates databases the cleanup would then have to chase.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// Dedup against concurrent finalize attempts on the same wtPath
 	// — both the CLI's wt-create dispatch AND the lifecycle watcher
 	// can race to call this for the same worktree when the watcher
@@ -43,7 +50,7 @@ func FinalizeWorktree(
 	// slips through (e.g. an explicit `treeman wt finalize` while
 	// one is still running), it returns immediately instead of
 	// re-running setup hooks in parallel.
-	if !st.MarkFinalizeInFlight(wtRoot) {
+	if !st.MarkFinalizeInFlight(wtRoot, cancel) {
 		return nil
 	}
 	defer st.UnmarkFinalizeInFlight(wtRoot)
@@ -108,15 +115,37 @@ func FinalizeWorktree(
 	// engine prepare → on-create-after-engines actions. Each step waits
 	// for the previous on the daemon side; the CLI never sees this
 	// (it already returned).
+	//
+	// Phase boundaries double as cancellation checkpoints: a
+	// concurrent TeardownWorktree fires `cancel` via CancelFinalize,
+	// and the next check bails before prepare creates databases.
+	if err := ctx.Err(); err != nil {
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
+			"finalize aborted before pre-hooks", repoID, wtID, "", 0, nil)
+		return nil
+	}
 	if err := runTriggerActions(ctx, st, "on-create-before-engines",
 		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
 		repoID, wtID, inheritedEnv); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
+			"finalize aborted before prepare", repoID, wtID, "", 0, nil)
+		return nil
+	}
 	if len(cfg.Databases) > 0 {
 		if _, err := prepare.Run(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return fmt.Errorf("prepare: %w", err)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
+			"finalize aborted before post-hooks", repoID, wtID, "", 0, nil)
+		return nil
 	}
 	if err := runTriggerActions(ctx, st, "on-create-after-engines",
 		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
@@ -160,7 +189,9 @@ func FinalizeWorktreeForWatch(
 	repoRoot := repoPath
 	wtRoot := worktreePath
 
-	if !st.MarkFinalizeInFlight(wtRoot) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if !st.MarkFinalizeInFlight(wtRoot, cancel) {
 		return nil
 	}
 	defer st.UnmarkFinalizeInFlight(wtRoot)
@@ -194,6 +225,9 @@ func FinalizeWorktreeForWatch(
 	if len(cfg.Databases) == 0 {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
 	// The fingerprint hashes every declared input + dump + the
 	// migrate/seed run-strings. If anything changed, prepare cold-
 	// builds; otherwise cache-hits. No separate force-rebuild knob.
@@ -203,6 +237,9 @@ func FinalizeWorktreeForWatch(
 		opts.OnlyDBIndex = dbIdx
 	}
 	if _, err := prepare.RunFiltered(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv, opts); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return fmt.Errorf("prepare (watch-trigger): %w", err)
 	}
 	return nil
@@ -246,6 +283,22 @@ func TeardownWorktree(
 		return nil
 	}
 	defer st.UnmarkTeardownInFlight(wtRoot)
+
+	// Preempt any in-flight FinalizeWorktree for this path so its
+	// late-arriving prepare doesn't resurrect databases or the
+	// registry row after teardown completes. Then block until the
+	// finalize goroutine has actually exited (its phase boundaries
+	// observe ctx.Err() and bail) before we read state and start
+	// dropping things. The wait is generous because setup hooks can
+	// be slow (npm install, composer install) and the cancel only
+	// takes effect at the next phase boundary.
+	if st.CancelFinalize(wtRoot) {
+		slog.Info("teardown: cancelled in-flight finalize", "wt", wtRoot)
+		if err := st.WaitFinalizeCleared(ctx, wtRoot, 5*time.Minute); err != nil {
+			slog.Warn("teardown: finalize did not clear in time, proceeding anyway",
+				"wt", wtRoot, "err", err)
+		}
+	}
 
 	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
 	if err != nil {
