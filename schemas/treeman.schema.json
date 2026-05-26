@@ -56,6 +56,14 @@
         "interval_minutes": {
           "type": "integer",
           "description": "Cadence in minutes. Default 15. Minimum 1 (values below are\nclamped at use-site to avoid a runaway tight loop on a typo)."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "ff",
+            "rebase"
+          ],
+          "description": "Mode controls how a worktree's HEAD is advanced after fetch.\n  - \"ff\" (default): `git merge --ff-only @{u}`. Refuses on\n    divergence; user's unpushed commits are never touched.\n  - \"rebase\": `git rebase --autostash @{u}`. Replays local\n    commits on top of upstream. Auto-aborts on conflict so the\n    working tree never lands in a half-rebased state.\nOpt-in only — keep the safe ff path as the default."
         }
       },
       "additionalProperties": false,

@@ -212,6 +212,16 @@ ensure → dump → migrate → snapshot → replicate (foreground)
 | `-r`, `--repo` |  |
 | `--json` |  |
 
+### `treeman sync`
+
+fetch + advance worktrees to upstream (manual override of auto-fetch)
+
+| Flag | Usage |
+|---|---|
+| `--all` | sync every registered repo |
+| `--json` | emit one JSON object per repo |
+| `--status` | print sync status only; do not fetch |
+
 ### `treeman hook`
 
 run a hook phase
