@@ -13,6 +13,12 @@ import (
 	"strings"
 )
 
+// Validator is an optional second-stage check a Spec can use when its
+// Markers are ambiguous (e.g. `go.mod` matches every Go repo, not just
+// repos that use golang-migrate). Returns true iff the repo really
+// looks like the framework in question.
+type Validator func(repoRoot string) bool
+
 // HashMode determines how migration files are fingerprinted.
 type HashMode string
 
@@ -57,6 +63,12 @@ type Spec struct {
 	// per-run template DB name. Empty for frameworks that read the
 	// target DB from their own config rather than env.
 	MigrateEnv map[string]string
+	// Validate, when non-nil, runs after the marker check and must
+	// also pass for Detect to return true. Used to disambiguate
+	// frameworks whose Markers are too coarse on their own (e.g.
+	// `go.mod` for golang-migrate, which would otherwise match every
+	// Go repo).
+	Validate Validator `yaml:"-"`
 }
 
 // Detect returns true iff every marker group in spec.Markers has at
@@ -80,6 +92,9 @@ func (s Spec) Detect(repoRoot string) bool {
 		if !matched {
 			return false
 		}
+	}
+	if s.Validate != nil && !s.Validate(repoRoot) {
+		return false
 	}
 	return true
 }
@@ -121,6 +136,25 @@ func (r *Registry) DetectAll(repoRoot string) []Spec {
 		}
 	}
 	return out
+}
+
+// hasGolangMigrateEvidence reports whether repoRoot shows a signal
+// that the project actually uses golang-migrate — beyond merely being
+// a Go repo. Checks `go.sum` for the module import, then walks a few
+// plausible migration locations looking for *.up.sql files.
+func hasGolangMigrateEvidence(repoRoot string) bool {
+	if b, err := os.ReadFile(filepath.Join(repoRoot, "go.sum")); err == nil {
+		if strings.Contains(string(b), "github.com/golang-migrate/migrate") {
+			return true
+		}
+	}
+	for _, dir := range []string{"migrations", "db/migrations", "internal/migrations"} {
+		matches, _ := filepath.Glob(filepath.Join(repoRoot, dir, "*.up.sql"))
+		if len(matches) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func builtins() []Spec {
@@ -181,6 +215,11 @@ func builtins() []Spec {
 			OnModify:      OnRebuild,
 			MigrateRun:    "migrate up",
 			MigrateEnv:    map[string]string{"MIGRATE_DATABASE_NAME": "{target_db}"},
+			// go.mod alone matches every Go repo, so require a second
+			// signal: either the golang-migrate module is imported, or
+			// the repo contains at least one *.up.sql file (the
+			// framework's distinctive naming convention).
+			Validate: hasGolangMigrateEvidence,
 		},
 		{
 			Name:          "sqlx-cli",

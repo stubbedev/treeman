@@ -657,6 +657,29 @@ func daemonUninstallLaunchd(ctx context.Context) error {
 	return nil
 }
 
+// daemonAutoStartInstalled reports whether a systemd-user or launchd
+// auto-start unit for treemand is already on disk. Used by `treeman
+// init` to suppress the "install the daemon" hint when the user has
+// already set it up (or has it managed declaratively, e.g. by
+// home-manager). Existence-only — does not check whether the unit is
+// currently active.
+func daemonAutoStartInstalled() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	candidates := []string{
+		filepath.Join(home, ".config", "systemd", "user", "treemand.service"),
+		filepath.Join(home, "Library", "LaunchAgents", daemonctl.LaunchdLabel+".plist"),
+	}
+	for _, p := range candidates {
+		if _, err := os.Lstat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func mustResolveTreemand() string {
 	if p, err := exec.LookPath("treemand"); err == nil {
 		return p
@@ -801,7 +824,9 @@ func InitCmd() *cli.Command {
 			}
 			PrintOK("wrote %s", target)
 			PrintHint("review the generated databases:/hooks: blocks before first create")
-			PrintHint("install the daemon (one-time): treeman daemon install")
+			if !daemonAutoStartInstalled() {
+				PrintHint("install the daemon (one-time): treeman daemon install")
+			}
 			PrintHint("create a worktree:               treeman wt create <branch>")
 			PrintHint("install JSON Schema (editors):   treeman schema install")
 			return nil
