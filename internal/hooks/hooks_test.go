@@ -43,7 +43,7 @@ func TestGroupRunsSequenceWithin(t *testing.T) {
 			"touch b",
 		}},
 	}
-	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), false)
+	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestGroupsRunParallelAcross(t *testing.T) {
 		{Run: []string{"sleep 0.5 && touch one"}},
 		{Run: []string{"sleep 0.5 && touch two"}},
 	}
-	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), false)
+	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestRunHooksReturnsFastRegardlessOfCommandDuration(t *testing.T) {
 	wt := t.TempDir()
 	entries := []config.Action{{Run: []string{"sleep 10"}}}
 	started := time.Now()
-	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), false)
+	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestRunHooksWaitBlocksUntilGroupsExit(t *testing.T) {
 		{Run: []string{"sleep 0.3 && touch b"}},
 	}
 	started := time.Now()
-	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), true)
+	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestRunHooksWaitSurfacesNonZeroExit(t *testing.T) {
 		{Run: []string{"true"}},
 		{Run: []string{"exit 7"}},
 	}
-	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", emptyEnv(), true)
+	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestInheritedEnvReachesSubprocess(t *testing.T) {
 	entries := []config.Action{
 		{Run: []string{"printenv TREEMAN_TEST_PATH_PROBE > probe.out"}},
 	}
-	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", env, false)
+	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, env, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestRenderActionNoContainerPassesThrough(t *testing.T) {
 // PATH, no override. The user's PATH is authoritative because it
 // carries their version-manager shims (asdf, nvm, mise, …).
 func TestBuildEnvUserPathWins(t *testing.T) {
-	env := buildEnv(map[string]string{"PATH": "/user/shims:/user/bin"}, "/repo", "/wt", "slug")
+	env := buildEnv(map[string]string{"PATH": "/user/shims:/user/bin"}, "/repo", "/wt", "slug", false)
 	pathLine := ""
 	for _, kv := range env {
 		if len(kv) > 5 && kv[:5] == "PATH=" {
@@ -295,7 +295,7 @@ func TestBuildEnvFallsBackToDaemonPath(t *testing.T) {
 	if os.Getenv("PATH") == "" {
 		t.Skip("test runner has no PATH set; skipping fallback assertion")
 	}
-	env := buildEnv(nil, "/repo", "/wt", "slug") // no inheritedEnv, no PATH
+	env := buildEnv(nil, "/repo", "/wt", "slug", false) // no inheritedEnv, no PATH
 	foundPath := false
 	for _, kv := range env {
 		if len(kv) > 5 && kv[:5] == "PATH=" {

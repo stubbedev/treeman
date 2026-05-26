@@ -130,7 +130,9 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 			return
 		}
 		started := hooks.EmitHookStart(ctx, st, repoID, wtID, trigger, len(actions))
-		out, _ := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, sl.Value, env, true)
+		// Local delete path (CLI-direct teardown) is always against a
+		// linked worktree — main wt teardown goes through the daemon.
+		out, _ := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, sl.Value, false, env, true)
 		hooks.PersistOutcome(ctx, st, repoID, wtID, trigger, started, time.Now().UnixMilli(), out)
 	}
 	runTrigger("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)

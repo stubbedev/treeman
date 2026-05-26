@@ -52,7 +52,7 @@ main_worktree:
   enabled: true
 hooks:
   on-checkout:
-    - run: echo "$TREEMAN_SLUG" > ` + witnessDir + `/slug
+    - run: echo "$TREEMAN_SLUG|$TREEMAN_IS_MAIN" > ` + witnessDir + `/slug
 `
 	writeFile(t, repoRoot, ".treeman.yaml", yaml)
 	mustGit(t, repoRoot, "add", "-A")
@@ -77,8 +77,8 @@ hooks:
 	witness := filepath.Join(witnessDir, "slug")
 	body := waitForFile(t, witness, 15*time.Second)
 	got := strings.TrimSpace(body)
-	if got != "main_feature_x" {
-		t.Fatalf("TREEMAN_SLUG witness = %q, want main_feature_x (the dispatcher leaked a path-hash slug)", got)
+	if got != "main_feature_x|1" {
+		t.Fatalf("on-checkout witness = %q, want \"main_feature_x|1\" (dispatcher slug or $TREEMAN_IS_MAIN regressed)", got)
 	}
 
 	// Row's slug column must reflect the post-checkout branch — and
@@ -169,7 +169,7 @@ databases:
 hooks:
   on-file-change:
     - match: migrations
-      run: 'echo "$TREEMAN_SLUG|$TREEMAN_WATCH_DB_NAME|$TREEMAN_WATCH_LABEL|$TREEMAN_WATCH_ENGINE" > ` + witnessDir + `/event'
+      run: 'echo "$TREEMAN_SLUG|$TREEMAN_WATCH_DB_NAME|$TREEMAN_WATCH_LABEL|$TREEMAN_WATCH_ENGINE|$TREEMAN_IS_MAIN" > ` + witnessDir + `/event'
 `
 			writeFile(t, repoRoot, ".treeman.yaml", yaml)
 			mustGit(t, repoRoot, "add", "-A")
@@ -190,10 +190,10 @@ hooks:
 			witness := filepath.Join(witnessDir, "event")
 			body := waitForFile(t, witness, 15*time.Second)
 			parts := strings.Split(strings.TrimSpace(body), "|")
-			if len(parts) != 4 {
-				t.Fatalf("witness body %q: want 4 |-separated fields, got %d", body, len(parts))
+			if len(parts) != 5 {
+				t.Fatalf("witness body %q: want 5 |-separated fields, got %d", body, len(parts))
 			}
-			gotSlug, gotDBName, gotLabel, gotEngine := parts[0], parts[1], parts[2], parts[3]
+			gotSlug, gotDBName, gotLabel, gotEngine, gotIsMain := parts[0], parts[1], parts[2], parts[3], parts[4]
 
 			if gotSlug != "main_main" {
 				t.Errorf("TREEMAN_SLUG = %q, want main_main (dispatcher used wrong slug for main-wt)", gotSlug)
@@ -208,9 +208,69 @@ hooks:
 			if gotEngine != "mysql" {
 				t.Errorf("TREEMAN_WATCH_ENGINE = %q, want mysql", gotEngine)
 			}
+			if gotIsMain != "1" {
+				t.Errorf("TREEMAN_IS_MAIN = %q, want 1 for main-wt-driven on-file-change", gotIsMain)
+			}
 
 			assertMainRow(t, st, repoRoot, tc.wantSlugInDB, tc.branch)
 		})
+	}
+}
+
+// TestMainWorktreeEnableFiresOnCreateHooks mimics what
+// `treeman main enable` does end-to-end: enroll the main row, then
+// dispatch FinalizeWorktree against the repo root. Both on-create-
+// before-engines and on-create-after-engines must fire with
+// $TREEMAN_IS_MAIN=1 — pre-change, neither fired because EnrollMain
+// Worktree only wrote a row and the user had to manually run
+// `treeman wt finalize .` to get setup hooks.
+func TestMainWorktreeEnableFiresOnCreateHooks(t *testing.T) {
+	requireGit(t)
+
+	repoRoot := t.TempDir()
+	witnessDir := filepath.Join(repoRoot, "touch")
+	if err := os.MkdirAll(witnessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustGit(t, "", "init", "-q", "-b", "develop", repoRoot)
+	mustGit(t, repoRoot, "config", "user.email", "t@t")
+	mustGit(t, repoRoot, "config", "user.name", "t")
+	writeFile(t, repoRoot, "README", "hi")
+
+	// No databases declared so prepare.Run short-circuits — the hooks
+	// dispatcher fires before prepare anyway, but skipping it keeps
+	// this test independent of any engine reachability.
+	yaml := `
+main_worktree:
+  enabled: true
+hooks:
+  on-create-before-engines:
+    - run: 'echo "$TREEMAN_SLUG|$TREEMAN_IS_MAIN" > ` + witnessDir + `/before'
+  on-create-after-engines:
+    - run: 'echo "$TREEMAN_SLUG|$TREEMAN_IS_MAIN" > ` + witnessDir + `/after'
+`
+	writeFile(t, repoRoot, ".treeman.yaml", yaml)
+	mustGit(t, repoRoot, "add", "-A")
+	mustGit(t, repoRoot, "commit", "-q", "-m", "init")
+
+	_, state := bootDaemon(t, repoRoot)
+
+	if _, err := daemon.EnrollMainWorktree(context.Background(), state, repoRoot); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	// This is what mainEnableAction's requestWorktreeFinalize triggers
+	// — the daemon-side handler call. Same code path, no RPC layer.
+	if err := daemon.FinalizeWorktree(context.Background(), state, repoRoot, repoRoot, map[string]string{"PATH": os.Getenv("PATH")}); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	for _, name := range []string{"before", "after"} {
+		path := filepath.Join(witnessDir, name)
+		body := strings.TrimSpace(waitForFile(t, path, 15*time.Second))
+		if body != "main_develop|1" {
+			t.Errorf("on-create-%s-engines witness = %q, want \"main_develop|1\"", name, body)
+		}
 	}
 }
 

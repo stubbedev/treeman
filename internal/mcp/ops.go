@@ -217,7 +217,11 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	}
 
 	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, len(entries))
-	out, rErr := hooks.RunHooks(ctx, phase, entries, repoRoot, wt, sl.Value, env, true)
+	// MCP-driven hook firing isn't main-wt-aware yet — surface as
+	// non-main so $TREEMAN_IS_MAIN reads "0". When MCP wants to opt
+	// into main-wt routing it needs to thread through the daemon's
+	// resolveWorktreeIdentity helper the way FinalizeWorktree does.
+	out, rErr := hooks.RunHooks(ctx, phase, entries, repoRoot, wt, sl.Value, false, env, true)
 	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, started, time.Now().UnixMilli(), out)
 	return out, rErr
 }

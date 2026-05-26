@@ -72,7 +72,7 @@ func FinalizeWorktree(
 	// `main disable` writing YAML and the reload soft-deleting the
 	// row would create a fresh path-hash-keyed DB and orphan every
 	// per-branch DB the main slug owns.
-	sl, wtID, _, _, err := resolveWorktreeIdentity(ctx, st, &cfg, repoRoot, wtRoot, repoID)
+	sl, wtID, _, isMain, err := resolveWorktreeIdentity(ctx, st, &cfg, repoRoot, wtRoot, repoID)
 	if err != nil {
 		return err
 	}
@@ -131,7 +131,7 @@ func FinalizeWorktree(
 	}
 	if err := runTriggerActions(ctx, st, "on-create-before-engines",
 		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
-		repoID, wtID, inheritedEnv); err != nil {
+		isMain, repoID, wtID, inheritedEnv); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -154,7 +154,7 @@ func FinalizeWorktree(
 	}
 	if err := runTriggerActions(ctx, st, "on-create-after-engines",
 		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
-		repoID, wtID, inheritedEnv); err != nil {
+		isMain, repoID, wtID, inheritedEnv); err != nil {
 		return err
 	}
 
@@ -364,7 +364,7 @@ func TeardownWorktree(
 	// failures are logged but don't abort the rest.
 	_ = runTriggerActions(ctx, st, "on-delete-before-engines",
 		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, slugVal,
-		repoID, wtID, inheritedEnv)
+		row.IsMain, repoID, wtID, inheritedEnv)
 	if len(cfg.Databases) > 0 {
 		if err := prepare.TeardownDatabases(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
 			slog.Warn("teardown DB drop", "wt", wtRoot, "err", err)
@@ -372,7 +372,7 @@ func TeardownWorktree(
 	}
 	_ = runTriggerActions(ctx, st, "on-delete-after-engines",
 		cfg.Hooks.OnDeleteAfterEngines, repoRoot, wtRoot, slugVal,
-		repoID, wtID, inheritedEnv)
+		row.IsMain, repoID, wtID, inheritedEnv)
 
 	// Acquire the per-repo mutex only for the git operations — they
 	// touch the shared <common>/worktrees/ admin tree and aren't
@@ -485,6 +485,7 @@ func runTriggerActions(
 	trigger string,
 	actions []config.Action,
 	repoRoot, wtRoot, slugVal string,
+	isMain bool,
 	repoID, wtID int64,
 	inheritedEnv map[string]string,
 ) error {
@@ -492,7 +493,7 @@ func runTriggerActions(
 		return nil
 	}
 	started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, trigger, len(actions))
-	out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtRoot, slugVal, inheritedEnv, true)
+	out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtRoot, slugVal, isMain, inheritedEnv, true)
 	hooks.PersistOutcome(ctx, st.Store, repoID, wtID, trigger, started, nowMillis(), out)
 	if err != nil {
 		return fmt.Errorf("%s: %w", trigger, err)

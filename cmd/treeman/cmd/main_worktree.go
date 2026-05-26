@@ -67,7 +67,17 @@ func mainEnableAction(ctx context.Context, c *cli.Command) error {
 		ui.Hint("config written; restart treemand to apply")
 		return nil
 	}
-	PrintOK("main worktree enabled (%s)", repoRoot)
+	// Kick off setup hooks + prepare for the freshly-enrolled main row.
+	// The reload above is synchronous: by the time it returns, Enroll
+	// MainWorktree has run and the row exists, so FinalizeWorktree
+	// routes through the main-wt path (slug.ForMain + overlay) and
+	// fires on-create-* hooks with $TREEMAN_IS_MAIN=1.
+	if err := requestWorktreeFinalize(ctx, repoRoot, repoRoot); err != nil {
+		ui.Warn("daemon finalize dispatch failed: %v", err)
+		ui.Hint("run `treeman wt finalize .` at the repo root to retry")
+		return nil
+	}
+	PrintOK("main worktree enabled (%s) — setup hooks + prepare queued (see `treeman logs tail --follow`)", repoRoot)
 	return nil
 }
 
@@ -163,6 +173,30 @@ func patchMainWorktreeConfig(repoRoot string, enabled bool) error {
 		return err
 	}
 	return yamlpatch.AtomicWriteWithBackup(target, body, 5)
+}
+
+// requestWorktreeFinalize dispatches a finalize RPC for wtPath under
+// repoRoot. Used by `main enable` to kick off on-create-* hooks +
+// prepare against the freshly-enrolled main row without making the
+// user manually run `treeman wt finalize .`. The CLI captures the
+// user's env here because the daemon goroutine wouldn't otherwise
+// see PATH / nvm shims / etc.
+func requestWorktreeFinalize(ctx context.Context, repoRoot, wtPath string) error {
+	resp, err := rpc.Call(ctx, rpc.Request{
+		Method: rpc.MethodWorktreeFinalize,
+		WorktreeFinalize: &rpc.WorktreeFinalizeArgs{
+			RepoPath:     repoRoot,
+			WorktreePath: wtPath,
+			InheritedEnv: CaptureInheritedEnv(),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Kind == rpc.KindError {
+		return fmt.Errorf("daemon: %s", resp.Message)
+	}
+	return nil
 }
 
 // requestConfigReload tells the daemon to re-evaluate this repo's

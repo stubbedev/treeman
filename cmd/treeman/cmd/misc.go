@@ -187,7 +187,8 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	entries = len(hookEntries)
 
 	startedMs = hooks.EmitHookStart(ctx, st, repoID, wtID, phase, entries)
-	out, runErr = hooks.RunHooks(ctx, phase, hookEntries, repoRoot, wt, sl.Value, env, true)
+	// CLI-direct hook fire (not main-wt-aware; matches MCP today).
+	out, runErr = hooks.RunHooks(ctx, phase, hookEntries, repoRoot, wt, sl.Value, false, env, true)
 	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, startedMs, time.Now().UnixMilli(), out)
 	return out, runErr
 }

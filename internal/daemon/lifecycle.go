@@ -395,7 +395,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 		}
 		started := hooks.EmitHookStart(ctx, st.Store, repoID, row.ID, trigger, len(actions))
 		out, _ := hooks.RunHooksOrphan(ctx, trigger, actions,
-			repoPath, wtPath, row.Slug, logDir, map[string]string{}, true)
+			repoPath, wtPath, row.Slug, logDir, row.IsMain, map[string]string{}, true)
 		hooks.PersistOutcome(ctx, st.Store, repoID, row.ID, trigger, started, nowMillis(), out)
 	}
 	runOrphan("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)

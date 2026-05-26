@@ -71,6 +71,7 @@ func RunHooksOrphan(
 	phase string,
 	entries []config.Action,
 	repoRoot, worktreePath, slug, logDir string,
+	isMain bool,
 	inheritedEnv map[string]string,
 	wait bool,
 ) (RunOutcome, error) {
@@ -96,7 +97,7 @@ func RunHooksOrphan(
 		if err != nil {
 			return out, err
 		}
-		c, err := spawnDetached(cmdStr, repoRoot, worktreePath, repoRoot, slug, logPath, inheritedEnv, wait)
+		c, err := spawnDetached(cmdStr, repoRoot, worktreePath, repoRoot, slug, isMain, logPath, inheritedEnv, wait)
 		if err != nil {
 			return out, err
 		}
@@ -138,6 +139,7 @@ func RunHooks(
 	phase string,
 	entries []config.Action,
 	repoRoot, worktreePath, slug string,
+	isMain bool,
 	inheritedEnv map[string]string,
 	wait bool,
 ) (RunOutcome, error) {
@@ -160,7 +162,7 @@ func RunHooks(
 		if err != nil {
 			return out, err
 		}
-		c, err := spawnDetached(cmdStr, worktreePath, worktreePath, repoRoot, slug, logPath, inheritedEnv, wait)
+		c, err := spawnDetached(cmdStr, worktreePath, worktreePath, repoRoot, slug, isMain, logPath, inheritedEnv, wait)
 		if err != nil {
 			return out, err
 		}
@@ -299,17 +301,18 @@ func shellSingleQuote(s string) string {
 
 // spawnDetached forks a `setsid /bin/sh -c <cmd>` child with
 // stdout+stderr redirected to logPath. Env is cleared then layered
-// with the caller's inheritedEnv plus the three standard overlay
-// vars (TREEMAN_MAIN_ROOT, TREEMAN_WORKTREE, TREEMAN_SLUG). Returns
-// the *exec.Cmd so the caller can either reap it inline (`Wait()`
-// on the wait=true path) or fire-and-forget via a detached goroutine.
+// with the caller's inheritedEnv plus the four standard overlay
+// vars (TREEMAN_MAIN_ROOT, TREEMAN_WORKTREE, TREEMAN_SLUG,
+// TREEMAN_IS_MAIN). Returns the *exec.Cmd so the caller can either
+// reap it inline (`Wait()` on the wait=true path) or fire-and-forget
+// via a detached goroutine.
 //
 // `cwd` is the child's working directory. For the normal flow this
 // equals `worktreePath`; for the lifecycle-orphan flow (worktree
 // already deleted) it is the repo root, while `worktreePath` is the
 // deleted absolute path — surfaced in the env so user scripts can
 // still reference it.
-func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug, logPath string, inheritedEnv map[string]string, wait bool) (*exec.Cmd, error) {
+func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug string, isMain bool, logPath string, inheritedEnv map[string]string, wait bool) (*exec.Cmd, error) {
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open hook log %s: %w", logPath, err)
@@ -318,7 +321,7 @@ func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug, logPath string, in
 
 	c := exec.Command("/bin/sh", "-c", cmdStr)
 	c.Dir = cwd
-	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug)
+	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug, isMain)
 	c.Stdout = logFile
 	c.Stderr = logFile
 	c.Stdin = nil
@@ -338,10 +341,10 @@ func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug, logPath string, in
 
 // runForeground runs one step synchronously, captures tails, returns
 // a GroupOutcome.
-func runForeground(ctx context.Context, cmdStr, cwd, repoRoot, worktreePath, slug string, inheritedEnv map[string]string) (GroupOutcome, error) {
+func runForeground(ctx context.Context, cmdStr, cwd, repoRoot, worktreePath, slug string, isMain bool, inheritedEnv map[string]string) (GroupOutcome, error) {
 	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmdStr)
 	c.Dir = cwd
-	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug)
+	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug, isMain)
 	stdoutPipe, _ := c.StdoutPipe()
 	stderrPipe, _ := c.StderrPipe()
 	if err := c.Start(); err != nil {
@@ -387,12 +390,16 @@ func captureTail(r io.Reader, cap int) string {
 //     and any session-specific overrides take precedence over the
 //     daemon's floor.
 //  3. Overlay the treeman scoping vars (TREEMAN_MAIN_ROOT, _WORKTREE,
-//     _SLUG) so user scripts can address them. These always win.
+//     _SLUG, _IS_MAIN) so user scripts can address them. These always
+//     win. _IS_MAIN is "1" when this hook is firing for the repo
+//     root's main-wt enrollment, "0" for any linked worktree — lets a
+//     shared on-create-* hook branch behaviour (e.g. skip the dev .env
+//     copy on linked wts).
 //
 // Layering order means the lifecycle watcher's empty `inheritedEnv`
 // is still safe (the daemon's env fills the floor), and a user with a
 // rich shell setup still gets their PATH / shims propagated.
-func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug string) []string {
+func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug string, isMain bool) []string {
 	merged := make(map[string]string, len(inheritedEnv)+32)
 	for _, kv := range os.Environ() {
 		for i := 0; i < len(kv); i++ {
@@ -408,6 +415,11 @@ func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug strin
 	merged["TREEMAN_MAIN_ROOT"] = repoRoot
 	merged["TREEMAN_WORKTREE"] = worktreePath
 	merged["TREEMAN_SLUG"] = slug
+	if isMain {
+		merged["TREEMAN_IS_MAIN"] = "1"
+	} else {
+		merged["TREEMAN_IS_MAIN"] = "0"
+	}
 	out := make([]string, 0, len(merged))
 	for k, v := range merged {
 		out = append(out, k+"="+v)

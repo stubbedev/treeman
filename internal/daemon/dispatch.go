@@ -528,7 +528,7 @@ func fireOnFileChange(
 	if err != nil {
 		return
 	}
-	sl, wtID, _, _, err := resolveWorktreeIdentity(ctx, st, &cfg, repoPath, wtPath, repoID)
+	sl, wtID, _, isMain, err := resolveWorktreeIdentity(ctx, st, &cfg, repoPath, wtPath, repoID)
 	if err != nil {
 		return
 	}
@@ -553,7 +553,7 @@ func fireOnFileChange(
 	env["TREEMAN_WATCH_LABEL"] = label
 	env["TREEMAN_WATCH_ENGINE"] = engine
 	env["TREEMAN_WATCH_DB_NAME"] = dbName
-	_ = runTriggerActions(ctx, st, "on-file-change", matched, repoPath, wtPath, sl.Value, repoID, wtID, env)
+	_ = runTriggerActions(ctx, st, "on-file-change", matched, repoPath, wtPath, sl.Value, isMain, repoID, wtID, env)
 }
 
 // fireTriggerActions loads the resolved config for a worktree and
@@ -587,9 +587,9 @@ func fireTriggerActions(
 	if err != nil {
 		return
 	}
-	sl, wtID, _, _, err := resolveWorktreeIdentity(ctx, st, &cfg, repoPath, wtPath, repoID)
+	sl, wtID, _, isMain, err := resolveWorktreeIdentity(ctx, st, &cfg, repoPath, wtPath, repoID)
 	if err != nil {
 		return
 	}
-	_ = runTriggerActions(ctx, st, trigger, actions, repoPath, wtPath, sl.Value, repoID, wtID, inheritedEnv)
+	_ = runTriggerActions(ctx, st, trigger, actions, repoPath, wtPath, sl.Value, isMain, repoID, wtID, inheritedEnv)
 }
