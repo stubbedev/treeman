@@ -195,6 +195,71 @@ hooks:
 inside the container's filesystem). Leave unset to use the
 container's `WORKDIR`.
 
+### Hook environment variables
+
+Every hook subprocess inherits the user's `wt create`-time env (PATH,
+shims, `.env`-loaded vars) plus four scoping variables treeman sets
+unconditionally:
+
+| Variable           | Value                                                                  |
+| ------------------ | ---------------------------------------------------------------------- |
+| `TREEMAN_MAIN_ROOT`| Absolute path of the repo root (`git rev-parse --show-toplevel`).      |
+| `TREEMAN_WORKTREE` | Absolute path of the worktree firing the hook.                         |
+| `TREEMAN_SLUG`     | The slug used to name resources for this run (e.g. `feature_x`, `main_develop`). |
+| `TREEMAN_IS_MAIN`  | `"1"` when the firing worktree is the repo root with main-wt enabled, else `"0"`. Branch on this to skip dev-only setup on linked worktrees, or vice versa. |
+
+`on-file-change` hooks additionally receive `TREEMAN_WATCH_PATH`,
+`TREEMAN_WATCH_LABEL`, `TREEMAN_WATCH_ENGINE`, `TREEMAN_WATCH_DB_NAME`
+so the script can branch on the trigger details.
+
+```yaml
+hooks:
+  on-create-after-engines:
+    - run: |
+        if [ "$TREEMAN_IS_MAIN" = "1" ]; then
+          composer install --no-dev
+        else
+          composer install
+        fi
+```
+
+## Main worktree
+
+By default, treeman only manages **linked** worktrees under
+`worktrees.root`. The repo root checkout is invisible to the
+watcher — branch switches there don't trigger prepare, and the
+checkout doesn't get its own per-branch databases.
+
+`main_worktree:` opts the repo root into the same lifecycle. Once
+enabled, flipping a branch at the repo root produces per-branch
+databases keyed by `main_<branch>` (instead of every non-ticket
+branch collapsing to one path-hash slug), and the on-checkout /
+on-file-change / on-create-* hooks fire against the repo root the
+same way they do for linked worktrees.
+
+```yaml
+main_worktree:
+  enabled: true
+  # Optional: per-context overlay for the databases[] block.
+  # Sparse, index-aligned with databases[]. Set fields replace the
+  # base entry's field; unset fields inherit.
+  databases:
+    - name_template: "app_dev_{slug}"       # different DB name in main wt
+      test_clones:
+        clones: 0                            # no paratest fanout in main
+        name_template: ""
+```
+
+Flip on with `treeman main enable` — this patches `.treeman.yaml`,
+asks the daemon to reload, then dispatches a finalize against the
+repo root so `on-create-*` hooks run immediately. Reverse with
+`treeman main disable` (config flag flips, watcher stops, databases
+remain). Add `--purge` to drop every per-branch DB the
+`main_<branch>` slug owns across all local branches.
+
+`treeman main status` reports the current enrollment state +
+branch-aware slug.
+
 ## Example: per-stack `databases:` blocks
 
 `treeman init` writes these for you when it detects the matching

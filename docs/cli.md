@@ -209,6 +209,7 @@ remove the repo root from the watcher lifecycle
 | Flag | Usage |
 |---|---|
 | `-r`, `--repo` |  |
+| `--purge` | after disabling, drop every per-branch DB the main_<branch> slug owns (current branch + every local branch). Engine resources only — the worktrees row stays soft-deleted for resurrection. |
 
 ### `treeman main status`
 
