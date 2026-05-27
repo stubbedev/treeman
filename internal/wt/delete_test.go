@@ -38,3 +38,20 @@ func TestDeleteNoMatchWithoutForce(t *testing.T) {
 		t.Errorf("error should hint at --force, got: %v", err)
 	}
 }
+
+// TestDeleteRefusesMainWorktree guards against dropping the repo's
+// primary checkout (and, for branch_scoped configs, the bare app DB):
+// deleting a path equal to the repo root must be refused before any
+// teardown runs — even with --force.
+func TestDeleteRefusesMainWorktree(t *testing.T) {
+	withTempStore(t)
+	repoRoot := t.TempDir()
+	_, err := Delete(context.Background(), DeleteRequest{
+		RepoRoot: repoRoot,
+		Target:   repoRoot,
+		Force:    true, // force must NOT bypass the main-worktree guard
+	}, NoopSink{})
+	if err == nil || !strings.Contains(err.Error(), "main worktree") {
+		t.Fatalf("deleting the repo root must be refused, got %v", err)
+	}
+}

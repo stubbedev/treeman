@@ -52,7 +52,6 @@ const (
 
 func TestWorktreeSwapMySQL(t *testing.T) {
 	harness.SkipIfNoDocker(t)
-	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
 	waitMySQL(t)
 
 	wtPath := t.TempDir()
@@ -98,7 +97,6 @@ func TestWorktreeSwapMySQL(t *testing.T) {
 
 func TestWorktreeSwapRedis(t *testing.T) {
 	harness.SkipIfNoDocker(t)
-	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
 	waitRedis(t)
 
 	wtPath := t.TempDir()
@@ -148,7 +146,6 @@ func TestWorktreeSwapRedis(t *testing.T) {
 func TestMainSwapViaDaemon(t *testing.T) {
 	harness.SkipIfNoDocker(t)
 	requireGit(t)
-	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
 	waitMySQL(t)
 
 	repoRoot := t.TempDir()
@@ -385,24 +382,6 @@ func waitForDB(t *testing.T, dbName string, timeout time.Duration) {
 		time.Sleep(300 * time.Millisecond)
 	}
 	t.Fatalf("database %s never appeared within %s", dbName, timeout)
-}
-
-func waitForItems(t *testing.T, dbName string, timeout time.Duration, want ...string) {
-	t.Helper()
-	sort.Strings(want)
-	deadline := time.Now().Add(timeout)
-	var last []string
-	for time.Now().Before(deadline) {
-		got, err := itemsOf(t, dbName)
-		if err == nil {
-			last = got
-			if strings.Join(got, ",") == strings.Join(want, ",") {
-				return
-			}
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	t.Fatalf("%s items = %v, want %v within %s (swap did not converge)", dbName, last, want, timeout)
 }
 
 func redisClient(t *testing.T) *redis.Client {

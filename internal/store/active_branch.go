@@ -7,15 +7,9 @@ import (
 	"time"
 )
 
-// ActiveBranchMarker records which branch's data currently occupies a
-// branch-scoped database's active namespace (`db_key`). See the
-// 0007_active_branch_db migration for the full rationale.
-type ActiveBranchMarker struct {
-	WorktreeID int64
-	DBKey      string
-	Branch     string
-	Engine     string
-}
+// The active_branch_db table records which branch's data currently
+// occupies a branch-scoped database's active namespace (`db_key`).
+// See the 0006_active_branch_db migration for the full rationale.
 
 // GetActiveBranch returns the branch currently occupying `dbKey`'s
 // active namespace for `worktreeID`, and ok=false when no marker exists

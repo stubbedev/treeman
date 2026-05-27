@@ -474,7 +474,10 @@ func worktreeRowFromCwd(ctx context.Context, st *store.Store) (worktreeRow, erro
 	if err != nil {
 		return worktreeRow{}, err
 	}
-	dir := cwd
+	dir, err := filepath.Abs(cwd)
+	if err != nil {
+		return worktreeRow{}, err
+	}
 	for {
 		row, err := st.LookupActiveWorktreeByPath(ctx, dir)
 		if err != nil {
@@ -490,7 +493,7 @@ func worktreeRowFromCwd(ctx context.Context, st *store.Store) (worktreeRow, erro
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return worktreeRow{}, fmt.Errorf("not inside a tracked worktree (pass name)")
+			return worktreeRow{}, fmt.Errorf("not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)")
 		}
 		dir = parent
 	}

@@ -323,6 +323,10 @@ type branchScopedArgs struct {
 	eng *branchEngine
 	// loadDump loads the static fallback dump into the active namespace.
 	loadDump func(ctx context.Context, active, dumpPath string) error
+	// resolveParent, when non-nil, overrides the default git-upstream +
+	// store base-branch resolver. Only tests set it; production leaves it
+	// nil so `fill` uses resolveBaseSourceDB.
+	resolveParent func(ctx context.Context, branch string) (string, bool, error)
 }
 
 // runBranchScoped is the unified swap lifecycle for one branch-scoped
@@ -458,7 +462,7 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 		}
 		return true, "resume", nil
 	}
-	parent, ok, err := resolveBaseSourceDB(ctx, a.st, a.cfg, a.repoPath(ctx), a.repoID, a.dbIdx, a.eng.scope, branch)
+	parent, ok, err := a.parentDB(ctx, branch)
 	if err != nil {
 		return false, "", err
 	}
@@ -476,6 +480,16 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 func (a branchScopedArgs) repoPath(ctx context.Context) string {
 	p, _ := a.st.RepoPath(ctx, a.repoID)
 	return p
+}
+
+// parentDB resolves the live database to seed `branch` from. Production
+// uses the git-upstream + store resolver; tests inject `resolveParent` to
+// drive `fill`'s parent path deterministically without a git repo.
+func (a branchScopedArgs) parentDB(ctx context.Context, branch string) (string, bool, error) {
+	if a.resolveParent != nil {
+		return a.resolveParent(ctx, branch)
+	}
+	return resolveBaseSourceDB(ctx, a.st, a.cfg, a.repoPath(ctx), a.repoID, a.dbIdx, a.eng.scope, branch)
 }
 
 func (a branchScopedArgs) runStep(ctx context.Context, spec runner.Spec, active, label string) error {
@@ -581,7 +595,7 @@ func ResetBranchScoped(
 	st *store.Store,
 	engineFilter string,
 ) error {
-	for i, d := range cfg.Databases {
+	for _, d := range cfg.Databases {
 		if !d.BranchScoped {
 			continue
 		}
@@ -603,20 +617,38 @@ func ResetBranchScoped(
 		if eng == nil {
 			continue
 		}
-		// Drop the durable copy for whatever branch currently owns the
-		// active slot (so a re-seed can't restore the stale copy).
-		if branch, has, _ := st.GetActiveBranch(ctx, worktreeID, active); has && branch != "" {
-			_ = eng.drv.DropDurable(ctx, eng.durable(active, branch))
-		}
-		_ = eng.drv.Empty(ctx, active)
+		rerr := resetActiveNamespace(ctx, eng, st, worktreeID, active)
 		closeEng()
-		if err := st.ClearActiveBranch(ctx, worktreeID, active); err != nil {
-			return err
+		if rerr != nil {
+			return rerr
 		}
 		_ = st.WriteEvent(ctx, store.LevelInfo, "db_reset",
 			fmt.Sprintf("%s: cleared active %s + durable copy", d.Engine, active),
 			repoID, worktreeID, "", 0, map[string]string{"engine": d.Engine, "active": active})
-		_ = i
 	}
 	return nil
+}
+
+// resetActiveNamespace drops the current branch's durable copy and the
+// active namespace itself, then clears the active-branch marker.
+//
+// Dropping (NOT emptying) the active namespace is deliberate and load-
+// bearing: the follow-up prepare must observe a NON-EXISTENT active slot
+// so its seed path (`!exists` → fill from durable/parent) fires. Emptying
+// would leave a present-but-empty namespace, which prepare then treats as
+// an unmarked existing DB and "adopts" as-is — leaving the database empty
+// instead of re-seeded from the live parent. For name-scoped engines
+// (MySQL/Postgres) `Empty` recreates the database, so that adopt-empty
+// outcome was a silent data bug; `Drop` keeps reset reseeding correctly
+// across all engines.
+func resetActiveNamespace(ctx context.Context, eng *branchEngine, st *store.Store, worktreeID int64, active string) error {
+	// Drop the durable copy for whatever branch currently owns the active
+	// slot (so a re-seed can't restore the stale copy).
+	if branch, has, _ := st.GetActiveBranch(ctx, worktreeID, active); has && branch != "" {
+		_ = eng.drv.DropDurable(ctx, eng.durable(active, branch))
+	}
+	if err := eng.drv.Drop(ctx, active); err != nil {
+		return err
+	}
+	return st.ClearActiveBranch(ctx, worktreeID, active)
 }

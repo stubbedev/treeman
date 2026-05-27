@@ -8,8 +8,6 @@ import (
 	"github.com/stubbedev/treeman/internal/template"
 )
 
-func sortStrings(s []string) { sort.Strings(s) }
-
 // Validate runs cross-field consistency checks that can't be
 // expressed in YAML tags or per-type UnmarshalYAML hooks. Caller is
 // expected to invoke this after LoadLayered / LoadLayeredForWorktree
@@ -76,7 +74,7 @@ func (c *Config) PortSlotNames() []string {
 	for name := range c.Ports {
 		names = append(names, name)
 	}
-	sortStrings(names)
+	sort.Strings(names)
 	return names
 }
 

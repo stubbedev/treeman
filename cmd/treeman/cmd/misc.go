@@ -80,7 +80,6 @@ func RunPrepareOnWorktree(ctx context.Context, worktree, repoOverride string) ([
 		return nil, err
 	}
 	branch := detectBranchOfWorktree(wt)
-	sl := slug.For(wt, branch)
 	dbPath, _ := store.DefaultDBPath()
 	st, err := store.Open(ctx, dbPath)
 	if err != nil {
@@ -88,14 +87,20 @@ func RunPrepareOnWorktree(ctx context.Context, worktree, repoOverride string) ([
 	}
 	defer st.Close()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	wtID, _ := st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
-	return prepare.Run(ctx, &cfg, wt, sl, st, repoID, wtID, CaptureInheritedEnv())
+	// Route through ResolveIdentity so this manual path matches the daemon:
+	// the main-worktree overlay is applied (bare active DB name) and a linked
+	// worktree's slug is its branch-independent path slug.
+	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, CaptureInheritedEnv())
 }
 
-// DbCmd — `treeman db reset` re-syncs a worktree's
-// branch_scoped databases from the live base branch. Drops
-// the per-slug divergent snapshot + the current per-worktree DB,
-// then re-runs prepare so the DB is repopulated from the base.
+// DbCmd — `treeman db reset` re-syncs a worktree's branch_scoped
+// databases from the live base branch. Drops the current branch's
+// durable copy + the active namespace, then re-runs prepare so each
+// is repopulated from the live parent branch.
 func DbCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "db",
@@ -133,8 +138,8 @@ func DbCmd() *cli.Command {
 }
 
 // RunDbResetOnWorktree resolves the worktree + repo, drops every
-// branch_scoped database (and its per-slug snapshot), then
-// re-runs prepare so each is repopulated from the live base branch.
+// branch_scoped database's active namespace + current durable copy,
+// then re-runs prepare so each is repopulated from the live base branch.
 func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.Outcome, error) {
 	wt := worktree
 	if wt == "" {
@@ -154,7 +159,6 @@ func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFil
 		return nil, err
 	}
 	branch := detectBranchOfWorktree(wt)
-	sl := slug.For(wt, branch)
 	dbPath, _ := store.DefaultDBPath()
 	st, err := store.Open(ctx, dbPath)
 	if err != nil {
@@ -162,11 +166,18 @@ func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFil
 	}
 	defer st.Close()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	wtID, _ := st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
-	if err := prepare.ResetBranchScoped(ctx, &cfg, wt, repoID, wtID, st, engineFilter); err != nil {
+	// Route through ResolveIdentity so the main-worktree overlay is applied
+	// (bare active DB name) and the slug matches the daemon's branch-
+	// independent value — reset operates on the same active namespace the
+	// swap lifecycle created.
+	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
 		return nil, err
 	}
-	outs, err := prepare.Run(ctx, &cfg, wt, sl, st, repoID, wtID, CaptureInheritedEnv())
+	if err := prepare.ResetBranchScoped(ctx, &cfg, wt, repoID, id.WtID, st, engineFilter); err != nil {
+		return nil, err
+	}
+	outs, err := prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, CaptureInheritedEnv())
 	if err != nil {
 		return outs, err
 	}
