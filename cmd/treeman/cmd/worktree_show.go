@@ -69,6 +69,11 @@ func wtShow() *cli.Command {
 			if portMap, _ := st.LoadWorktreePorts(ctx, wt.ID); len(portMap) > 0 {
 				fmt.Fprintf(ui.Out, "  ports:  %s\n", formatPortMap(portMap))
 			}
+			if bs, _ := st.ListActiveBranches(ctx, wt.ID); len(bs) > 0 {
+				for _, r := range bs {
+					fmt.Fprintf(ui.Out, "  branch_scoped: %s (%s) → active branch %s\n", r.DBKey, r.Engine, r.Branch)
+				}
+			}
 			fmt.Fprintln(ui.Out)
 
 			// Recent events.

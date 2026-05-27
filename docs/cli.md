@@ -256,6 +256,15 @@ re-sync branch_scoped databases from the live base branch (defaults to the cwd's
 | `--engine` | restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted) |
 | `--json` |  |
 
+### `treeman db status`
+
+show branch_scoped state: active namespace, current branch, and resumable branches (defaults to the cwd's worktree)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--json` |  |
+
 ### `treeman sync`
 
 fetch + advance worktrees to upstream (manual override of auto-fetch)

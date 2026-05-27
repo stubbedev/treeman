@@ -63,7 +63,8 @@ allow rules, etc.), not here.
 |---|---|
 | `doctor`, `daemon_status` | Health checks. |
 | `config_get`, `config_validate`, `config_schema` | Read/validate the YAML config. `config_get` output is redacted (passwords in resolved connection strings). |
-| `worktree_list`, `worktree_show`, `snapshots_list` | Registry + snapshot-cache queries. |
+| `worktree_list`, `worktree_show`, `snapshots_list` | Registry + snapshot-cache queries. `worktree_show` also reports allocated ports and branch_scoped active-namespace state. |
+| `branch_scoped_status` | Per branch_scoped database: active namespace, which branch's data occupies it now, and which local branches have a resumable durable copy. |
 | `logs_query`, `logs_hooks` | Event log + hook run history. Output is run through a secret-redaction pass (URI userinfo, AWS/GitHub tokens, JWTs, `KEY=value` for password/secret/token-shaped keys) before returning to the client. |
 | `fw_detect`, `slug_compute` | Detection helpers. |
 | `config_write`, `config_set`, `hook_run`, `prepare_run` | Replace the whole YAML body, patch a single field by dotted path, run a hook phase, run the prepare pipeline. |

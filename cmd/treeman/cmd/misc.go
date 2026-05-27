@@ -133,8 +133,75 @@ func DbCmd() *cli.Command {
 					return nil
 				},
 			},
+			{
+				Name:      "status",
+				Usage:     "show branch_scoped state: active namespace, current branch, and resumable branches (defaults to the cwd's worktree)",
+				ArgsUsage: "[worktree]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+					&cli.BoolFlag{Name: "json"},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					dbs, err := RunDbStatusOnWorktree(ctx, c.Args().First(), c.String("repo"))
+					if err != nil {
+						return err
+					}
+					if c.Bool("json") {
+						return jsonStream(map[string]any{"databases": dbs})
+					}
+					if len(dbs) == 0 {
+						PrintInfo("no branch_scoped databases configured")
+						return nil
+					}
+					for _, d := range dbs {
+						active := d.ActiveBranch
+						if active == "" {
+							active = "(none)"
+						}
+						fmt.Printf("[%s] %s — active branch: %s; resumable: %s\n",
+							d.Engine, d.Active, active, strings.Join(d.ResumableBranches, ", "))
+					}
+					return nil
+				},
+			},
 		},
 	}
+}
+
+// RunDbStatusOnWorktree resolves the worktree + repo and reports the
+// branch_scoped swap state per database. Shared by `treeman db status`
+// and the MCP branch_scoped_status tool.
+func RunDbStatusOnWorktree(ctx context.Context, worktree, repoOverride string) ([]prepare.BranchScopedDB, error) {
+	wt := worktree
+	if wt == "" {
+		cwd, _ := os.Getwd()
+		wt = cwd
+	}
+	wt = MustAbs(wt)
+	repoRoot, err := resolveRepo(repoOverride)
+	if err != nil {
+		repoRoot, err = DiscoverRepoRoot(wt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	branch := detectBranchOfWorktree(wt)
+	dbPath, _ := store.DefaultDBPath()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return prepare.BranchScopedStatus(ctx, &cfg, repoRoot, wt, id.WtID, st)
 }
 
 // RunDbResetOnWorktree resolves the worktree + repo, drops every

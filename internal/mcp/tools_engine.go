@@ -121,7 +121,7 @@ func probeMySQL(ctx context.Context, cfg *config.Config) engineProbeResult {
 	r.Reachable = true
 	r.Version, _ = drv.EngineVersion(ctx)
 	dbs, _ := listMysqlDatabases(ctx, drv)
-	r.Detail = map[string]any{"databases": dbs}
+	r.Detail = databasesDetail(dbs)
 	return r
 }
 
@@ -140,7 +140,7 @@ func probePostgres(ctx context.Context, cfg *config.Config) engineProbeResult {
 	r.Reachable = true
 	r.Version, _ = drv.EngineVersion(ctx)
 	dbs, _ := listPostgresDatabases(ctx, drv)
-	r.Detail = map[string]any{"databases": dbs}
+	r.Detail = databasesDetail(dbs)
 	return r
 }
 
@@ -160,7 +160,7 @@ func probeMongo(ctx context.Context, cfg *config.Config) engineProbeResult {
 	r.Version, _ = drv.EngineVersion(ctx)
 	dbs, err := drv.Client.ListDatabaseNames(ctx, bson.D{})
 	if err == nil {
-		r.Detail = map[string]any{"databases": dbs}
+		r.Detail = databasesDetail(dbs)
 	}
 	return r
 }
@@ -201,7 +201,13 @@ func probeES(ctx context.Context, cfg *config.Config) engineProbeResult {
 	r.Reachable = true
 	r.Version, _ = drv.EngineVersion(ctx)
 	indices, _ := drv.ListMatching(ctx, "")
-	r.Detail = map[string]any{"indices": indices}
+	// ES templates are `tm_<fp>_` and branch_scoped durables `tmbs_<h>_`.
+	app, internal := splitTreemanNamespaces(indices, "tm_", "tmbs_", "_tm")
+	r.Detail = map[string]any{"indices": app}
+	if len(internal) > 0 {
+		r.Detail["internal_count"] = len(internal)
+		r.Detail["internal"] = internal
+	}
 	return r
 }
 
@@ -660,6 +666,44 @@ func loadCfgForRepo(repo string) (*config.Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// splitTreemanNamespaces partitions engine namespace names into the
+// app-visible set and treeman-managed internals (snapshot templates +
+// branch_scoped durable copies), so engine_status surfaces app data
+// without burying it under treeman bookkeeping — which branch_scoped
+// multiplies (one durable per branch). internalPrefixes are the leading
+// markers treeman reserves: `_tm` covers `_tm_` templates and `_tmbs_`
+// durables for name-scoped engines; ES indices use `tm_`/`tmbs_`.
+func splitTreemanNamespaces(names []string, internalPrefixes ...string) (app, internal []string) {
+	for _, n := range names {
+		isInternal := false
+		for _, p := range internalPrefixes {
+			if strings.HasPrefix(n, p) {
+				isInternal = true
+				break
+			}
+		}
+		if isInternal {
+			internal = append(internal, n)
+		} else {
+			app = append(app, n)
+		}
+	}
+	return app, internal
+}
+
+// databasesDetail builds the engine_status Detail map for a name-scoped
+// engine's database list, separating treeman-managed internals out of
+// the headline `databases` list.
+func databasesDetail(names []string) map[string]any {
+	app, internal := splitTreemanNamespaces(names, "_tm")
+	d := map[string]any{"databases": app}
+	if len(internal) > 0 {
+		d["internal_count"] = len(internal)
+		d["internal"] = internal
+	}
+	return d
 }
 
 func listMysqlDatabases(ctx context.Context, drv *dbmysql.Driver) ([]string, error) {

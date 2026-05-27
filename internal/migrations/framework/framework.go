@@ -68,7 +68,13 @@ type Spec struct {
 	// frameworks whose Markers are too coarse on their own (e.g.
 	// `go.mod` for golang-migrate, which would otherwise match every
 	// Go repo).
-	Validate Validator `yaml:"-"`
+	//
+	// `json:"-"` is load-bearing, not cosmetic: a func type has no JSON
+	// schema, and the MCP server reflects Spec into the `fw_detect`
+	// output schema at startup (go-sdk AddTool). Without the tag that
+	// reflection panics and the entire `treeman mcp` server fails to
+	// boot. Mirrors testfw.Spec.Detect.
+	Validate Validator `yaml:"-" json:"-"`
 }
 
 // Detect returns true iff every marker group in spec.Markers has at

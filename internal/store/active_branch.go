@@ -11,6 +11,40 @@ import (
 // occupies a branch-scoped database's active namespace (`db_key`).
 // See the 0006_active_branch_db migration for the full rationale.
 
+// ActiveBranchRow is one active-namespace marker: which branch's data
+// currently occupies `DBKey` for a worktree, and the engine family.
+type ActiveBranchRow struct {
+	DBKey  string `json:"db_key"`
+	Branch string `json:"branch"`
+	Engine string `json:"engine"`
+}
+
+// ListActiveBranches returns every active-namespace marker for a
+// worktree, ordered by db_key for stable output. Empty (not nil) when
+// the worktree has no branch_scoped databases swapped in yet, so callers
+// can range without a nil check.
+func (s *Store) ListActiveBranches(ctx context.Context, worktreeID int64) ([]ActiveBranchRow, error) {
+	out := []ActiveBranchRow{}
+	if worktreeID <= 0 {
+		return out, nil
+	}
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT db_key, branch, engine FROM active_branch_db WHERE worktree_id = ? ORDER BY db_key`,
+		worktreeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r ActiveBranchRow
+		if err := rows.Scan(&r.DBKey, &r.Branch, &r.Engine); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // GetActiveBranch returns the branch currently occupying `dbKey`'s
 // active namespace for `worktreeID`, and ok=false when no marker exists
 // (the active slot has never been swapped into for this worktree).

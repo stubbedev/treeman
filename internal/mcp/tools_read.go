@@ -13,6 +13,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
+	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/schema"
@@ -57,9 +58,15 @@ func registerReadTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_show",
-		Description: "Show details for one worktree: slug, branch, path, created-at, and the most recent finalize event. Use this to confirm a worktree exists and reached finalize before driving prepare_run or hook_run against it.",
+		Description: "Show details for one worktree: slug, branch, path, created-at, allocated ports, branch_scoped active-namespace state (which branch's data occupies each), and the most recent finalize event. Use this to confirm a worktree exists and reached finalize before driving prepare_run or hook_run against it.",
 		Annotations: readOnlyAnno("Show worktree", false),
 	}, worktreeShowTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "branch_scoped_status",
+		Description: "Inspect a worktree's branch_scoped databases. For each: the active namespace (DB name / key prefix the app connects to), which branch's data currently occupies it, and which local git branches have a durable copy a swap could resume from. Connects each engine to probe the deterministic durable names. Use to answer \"what branches can I resume?\" or to debug why a swap re-seeded instead of resuming. No-op (empty) when no databases are branch_scoped.",
+		Annotations: readOnlyAnno("Branch-scoped status", true),
+	}, branchScopedStatusTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_query",
@@ -418,7 +425,11 @@ type worktreeShowIn struct {
 type worktreeShowOut struct {
 	Worktree worktreeRow       `json:"worktree"`
 	Ports    map[string]uint16 `json:"ports,omitempty"`
-	Recent   []store.Event     `json:"recent_events"`
+	// BranchScoped lists each branch_scoped database's active namespace
+	// and which branch's data currently occupies it — the swap state an
+	// agent needs to reason about resume/seed behaviour.
+	BranchScoped []store.ActiveBranchRow `json:"branch_scoped,omitempty"`
+	Recent       []store.Event           `json:"recent_events"`
 }
 
 func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeShowIn) (*mcpsdk.CallToolResult, worktreeShowOut, error) {
@@ -459,11 +470,30 @@ func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 	}
 
 	ports, _ := st.LoadWorktreePorts(ctx, id)
+	branchScoped, _ := st.ListActiveBranches(ctx, id)
 	events, err := st.QueryEvents(ctx, store.EventFilter{WorktreeID: id, Limit: 50, HydrateWT: false})
 	if err != nil {
 		return nil, worktreeShowOut{}, err
 	}
-	return nil, worktreeShowOut{Worktree: w, Ports: ports, Recent: events}, nil
+	return nil, worktreeShowOut{Worktree: w, Ports: ports, BranchScoped: branchScoped, Recent: events}, nil
+}
+
+// ─── branch_scoped_status ─────────────────────────────────────────
+
+type branchScopedStatusIn struct {
+	Worktree string `json:"worktree,omitempty" jsonschema:"defaults to cwd's worktree"`
+	Repo     string `json:"repo,omitempty"`
+}
+type branchScopedStatusOut struct {
+	Databases []prepare.BranchScopedDB `json:"databases"`
+}
+
+func branchScopedStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in branchScopedStatusIn) (*mcpsdk.CallToolResult, branchScopedStatusOut, error) {
+	dbs, err := runBranchScopedStatus(ctx, in.Worktree, in.Repo)
+	if err != nil {
+		return nil, branchScopedStatusOut{}, err
+	}
+	return nil, branchScopedStatusOut{Databases: dbs}, nil
 }
 
 // worktreeRowFromCwd resolves the worktree row containing the current

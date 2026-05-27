@@ -254,6 +254,36 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 	return seeded, nil
 }
 
+// runBranchScopedStatus reports the swap state of a worktree's
+// branch_scoped databases. Routes through ResolveIdentity so the active
+// namespace renders the same name the swap lifecycle uses (bare on the
+// main worktree).
+func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) ([]prepare.BranchScopedDB, error) {
+	wt, branch := resolveWorktree(worktree)
+	repoRoot, err := resolveRepo(repoOverride)
+	if err != nil {
+		repoRoot, err = gitenv.MainRoot(wt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	id, err := wtpkg.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return prepare.BranchScopedStatus(ctx, &cfg, repoRoot, wt, id.WtID, st)
+}
+
 // runHookPhase synchronously executes one hook phase. Mirrors cmd's
 // RunHookPhase but with no CLI surface.
 func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome, error) {

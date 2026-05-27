@@ -14,6 +14,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -491,7 +492,7 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 		fmt.Sprintf("branch_scoped decision=%s active=%s branch=%s duration=%dms", decision, active, branch, ms),
 		map[string]string{"duration_ms": fmt.Sprintf("%d", ms), "decision": decision})
 
-	return Outcome{Engine: a.eng.engine, SourceDB: active}, nil
+	return Outcome{Engine: a.eng.engine, SourceDB: active, Decision: decision}, nil
 }
 
 // fill populates `active` with `branch`'s data. Order: the branch's own
@@ -705,4 +706,94 @@ func resetActiveNamespace(ctx context.Context, eng *branchEngine, st *store.Stor
 		return err
 	}
 	return st.ClearActiveBranch(ctx, worktreeID, active)
+}
+
+// BranchScopedDB reports the swap state of one branch_scoped database.
+type BranchScopedDB struct {
+	Engine string `json:"engine"`
+	// Active is the rendered active namespace (DB name / key prefix) the
+	// app connects to — stable across branch switches.
+	Active string `json:"active"`
+	// ActiveBranch is the branch whose data currently occupies Active
+	// (the marker). Empty when nothing has been swapped in yet.
+	ActiveBranch string `json:"active_branch,omitempty"`
+	// ResumableBranches are the local git branches that have a durable
+	// copy for this database — switching to one resumes its preserved
+	// data instead of re-seeding from the parent.
+	ResumableBranches []string `json:"resumable_branches"`
+}
+
+// BranchScopedStatus inspects every branch_scoped database for a worktree
+// and reports, per DB: the active namespace, which branch currently
+// occupies it (the marker), and which local git branches have a durable
+// copy a swap could resume from. Durable copies aren't tracked in SQLite
+// — their names are deterministic — so this probes the engine for the
+// durable of each local branch. `cfg` must already have the main-worktree
+// overlay applied (callers route through wt.ResolveIdentity) so the
+// active namespace renders the same name the swap lifecycle created.
+func BranchScopedStatus(
+	ctx context.Context,
+	cfg *config.Config,
+	repoRoot, worktreePath string,
+	worktreeID int64,
+	st *store.Store,
+) ([]BranchScopedDB, error) {
+	branches := localBranches(ctx, repoRoot)
+	out := []BranchScopedDB{}
+	for _, d := range cfg.Databases {
+		if !d.BranchScoped {
+			continue
+		}
+		scope, _, ok := branchScopeFor(d.Engine)
+		if !ok {
+			continue
+		}
+		active, err := activeNamespace(d, scope, worktreePath)
+		if err != nil {
+			return nil, fmt.Errorf("render active namespace for %s: %w", d.Engine, err)
+		}
+		eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine)
+		if cerr != nil {
+			return nil, cerr
+		}
+		if eng == nil {
+			continue
+		}
+		activeBranch, _, _ := st.GetActiveBranch(ctx, worktreeID, active)
+		resumable := []string{}
+		for _, b := range branches {
+			exists, perr := eng.drv.Exists(ctx, eng.durable(active, b))
+			if perr != nil {
+				continue
+			}
+			if exists {
+				resumable = append(resumable, b)
+			}
+		}
+		closeEng()
+		out = append(out, BranchScopedDB{
+			Engine:            eng.engine,
+			Active:            active,
+			ActiveBranch:      activeBranch,
+			ResumableBranches: resumable,
+		})
+	}
+	return out, nil
+}
+
+// localBranches lists the repo's local branch names. Best-effort: an
+// error (not a git repo, git missing) yields an empty list so status
+// degrades to "no resumable branches" rather than failing.
+func localBranches(ctx context.Context, repoRoot string) []string {
+	out, err := gitcmd.Output(ctx, repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/")
+	if err != nil {
+		return nil
+	}
+	var branches []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if b := strings.TrimSpace(line); b != "" {
+			branches = append(branches, b)
+		}
+	}
+	return branches
 }
