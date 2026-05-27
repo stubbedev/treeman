@@ -246,6 +246,70 @@ func TestBranchScopedSameBranchNoop(t *testing.T) {
 	f.assertActive("a", "b")
 }
 
+// TestConnectBranchEngineMissingConn locks the error message for the
+// "DB marked branch_scoped but connections.<engine> is unset" path —
+// the most common misconfiguration. Every swappable engine must
+// surface a clear, engine-specific error before any dial is attempted.
+//
+// Postgres alias `postgresql` and ES alias `opensearch` are covered
+// via CanonicalEngine in [TestCanonicalEngine]; only the
+// canonical-name dispatch is exercised here.
+func TestConnectBranchEngineMissingConn(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		engine string
+		want   string
+	}{
+		{"mysql", "connections.mysql not configured"},
+		{"postgres", "connections.postgres not configured"},
+		{"mongodb", "connections.mongodb not configured"},
+		{"redis", "connections.redis not configured"},
+		{"elasticsearch", "connections.elasticsearch not configured"},
+	}
+	for _, c := range cases {
+		t.Run(c.engine, func(t *testing.T) {
+			eng, closeFn, err := connectBranchEngine(ctx, &config.Config{}, c.engine)
+			if err == nil || err.Error() != c.want {
+				t.Fatalf("err = %v, want %q", err, c.want)
+			}
+			if eng != nil {
+				t.Errorf("eng must be nil on error, got %+v", eng)
+			}
+			// Close must always be safe to invoke, even on the error
+			// path — callers defer it unconditionally.
+			if closeFn == nil {
+				t.Error("closeFn must never be nil; defer-close pattern relies on it")
+			} else {
+				closeFn()
+			}
+		})
+	}
+}
+
+// TestConnectBranchEngineUnswappable: a non-swappable engine (sqlite,
+// or any string CanonicalEngine rejects) must return (nil, no-op, nil)
+// — NOT an error. ResetBranchScoped relies on the nil-eng signal to
+// skip such databases silently.
+func TestConnectBranchEngineUnswappable(t *testing.T) {
+	ctx := context.Background()
+	for _, engine := range []string{"sqlite", "", "made-up"} {
+		t.Run(engine, func(t *testing.T) {
+			eng, closeFn, err := connectBranchEngine(ctx, &config.Config{}, engine)
+			if err != nil {
+				t.Fatalf("unswappable engine must not error, got %v", err)
+			}
+			if eng != nil {
+				t.Errorf("unswappable engine must return nil branchEngine, got %+v", eng)
+			}
+			if closeFn == nil {
+				t.Error("closeFn must never be nil")
+			} else {
+				closeFn()
+			}
+		})
+	}
+}
+
 // TestCanonicalEngine locks the engine-family mapping that `db reset
 // --engine` filtering relies on: aliases collapse to the canonical
 // label, and non-swappable engines report ok=false.

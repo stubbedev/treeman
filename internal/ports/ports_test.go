@@ -136,6 +136,52 @@ func TestAllocateExhaustsRange(t *testing.T) {
 	}
 }
 
+// TestAllocateReleasesEarlierSlotsOnLaterFailure locks the cleanup
+// contract: when allocation succeeds for one slot but a later slot
+// exhausts its range, the earlier slot's row MUST be released so the
+// worktree doesn't end up half-populated. Without this rollback, a
+// `wt create` that fails midway leaves stale rows that permanently
+// shrink the pool of allocatable ports.
+func TestAllocateReleasesEarlierSlotsOnLaterFailure(t *testing.T) {
+	ctx := context.Background()
+	st, repoID, wtID := openStore(t)
+
+	// alpha: a single free port — succeeds.
+	// beta:  a single port we hold for the test duration — exhausts.
+	a := pickFreePort(t)
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	_, p, _ := net.SplitHostPort(l.Addr().String())
+	pn, _ := strconv.Atoi(p)
+	held := uint16(pn)
+	if held == a {
+		t.Skipf("test prerequisite: free port (%d) collided with held port (%d)", a, held)
+	}
+
+	cfg := &config.Config{
+		Ports: map[string]config.PortSpec{
+			"alpha": {Range: config.PortRange{Min: a, Max: a}},
+			"beta":  {Range: config.PortRange{Min: held, Max: held}},
+		},
+	}
+	if _, err := New().Allocate(ctx, st, cfg, repoID, wtID); !errors.Is(err, ErrExhausted) {
+		t.Fatalf("want ErrExhausted from beta, got %v", err)
+	}
+
+	// alpha's row must NOT remain — otherwise the next retry leaks a
+	// permanently-allocated port.
+	leftover, err := st.LoadWorktreePorts(ctx, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftover) != 0 {
+		t.Fatalf("mid-allocation failure must release earlier slots; leftover=%v", leftover)
+	}
+}
+
 func max16(a, b uint16) uint16 {
 	if a > b {
 		return a

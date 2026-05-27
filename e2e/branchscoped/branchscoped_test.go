@@ -136,6 +136,109 @@ func TestWorktreeSwapRedis(t *testing.T) {
 	assertRedisVals(t, prefix, map[string]string{"a": "develop", "b": "feature"})
 }
 
+// ─── TestTeardownPreservesBranchData: capture-before-drop on delete ─
+//
+// Locks the data-loss invariant for `wt delete` on a branch_scoped
+// database: teardown MUST capture the active namespace into the
+// current branch's durable copy BEFORE dropping the active. A
+// re-created worktree at the same path on the same branch must then
+// resume the diverged data instead of starting blank.
+//
+// A regression here would silently destroy every row of branch-local
+// divergent state on the first `wt delete`, so the assertion is split:
+//
+//  1. The active namespace is gone after teardown (drop happened).
+//  2. A `_tmbs_*` durable database appeared during teardown (capture
+//     happened — distinguishes "drop without capture" from the
+//     correct "capture then drop").
+//  3. Re-running prepare at the same path restores the row (the
+//     durable holds the data, not just metadata).
+func TestTeardownPreservesBranchData(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitMySQL(t)
+
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mysql: &config.MysqlConn{Host: "127.0.0.1", Port: 13390, User: "root", Password: "rootpw"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mysql",
+			NameTemplate: "tm_bstd_{slug}",
+			BranchScoped: true,
+		}},
+	}
+
+	// develop: seed schema + a sentinel row.
+	active := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop")
+	t.Cleanup(func() { dropMySQL(t, active) })
+	mustExec(t, active, "CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(32))")
+	mustExec(t, active, "INSERT INTO items(v) VALUES('preserved')")
+
+	// Snapshot existing _tmbs_* databases so the post-teardown diff
+	// isolates the durable copy created by THIS teardown.
+	before := listMySQLDBsWithPrefix(t, "_tmbs_")
+
+	// Simulate `wt delete`: TeardownDatabases is what wt/delete.go runs.
+	sl := slug.For(wtPath, "")
+	if err := prepare.TeardownDatabases(context.Background(), cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+
+	if mysqlDBExists(t, active) {
+		t.Fatalf("teardown must drop active %q", active)
+	}
+	after := listMySQLDBsWithPrefix(t, "_tmbs_")
+	newDurables := diffStrings(after, before)
+	if len(newDurables) == 0 {
+		t.Fatal("teardown must capture active into a durable copy BEFORE dropping it; no new _tmbs_* database appeared")
+	}
+	t.Cleanup(func() {
+		for _, d := range newDurables {
+			dropMySQL(t, d)
+		}
+	})
+
+	// Simulate `wt create` at the same path on the same branch: prepare
+	// must resume from the durable copy, restoring the row.
+	if got := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop"); got != active {
+		t.Fatalf("active namespace drifted across teardown+recreate: %s → %s", active, got)
+	}
+	assertItems(t, active, "preserved")
+}
+
+// TestTeardownNoOpWhenNeverPrepared: teardownBranchScoped must exit
+// cleanly when the worktree's active namespace was never created (e.g.
+// `wt create` failed before prepare ran). No active to drop, no marker
+// to clear, no error.
+func TestTeardownNoOpWhenNeverPrepared(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitMySQL(t)
+
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mysql: &config.MysqlConn{Host: "127.0.0.1", Port: 13390, User: "root", Password: "rootpw"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mysql",
+			NameTemplate: "tm_bstd_noop_{slug}",
+			BranchScoped: true,
+		}},
+	}
+
+	sl := slug.For(wtPath, "")
+	if err := prepare.TeardownDatabases(context.Background(), cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("teardown on never-prepared worktree must be a no-op, got %v", err)
+	}
+}
+
 // ─── TestMainSwapViaDaemon: main worktree, real HEAD watcher ─────────
 //
 // Proves the full main-worktree path: enroll the repo root, attach the
@@ -366,6 +469,48 @@ func assertItems(t *testing.T, dbName string, want ...string) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("%s items = %v, want %v", dbName, got, want)
 	}
+}
+
+// listMySQLDBsWithPrefix returns every schema whose name starts with
+// `prefix`. Uses LIKE with the SQL underscore wildcard escaped so a
+// caller-passed `_tmbs_` matches literally instead of "any char".
+func listMySQLDBsWithPrefix(t *testing.T, prefix string) []string {
+	t.Helper()
+	db := mysqlDB(t, "")
+	defer db.Close()
+	esc := strings.NewReplacer(`\`, `\\`, `_`, `\_`, `%`, `\%`).Replace(prefix)
+	rows, err := db.Query(`SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE ? ESCAPE '\\'`, esc+"%")
+	if err != nil {
+		t.Fatalf("list schemas like %q: %v", prefix, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// diffStrings returns elements in `a` that are not in `b`.
+func diffStrings(a, b []string) []string {
+	seen := make(map[string]struct{}, len(b))
+	for _, s := range b {
+		seen[s] = struct{}{}
+	}
+	var out []string
+	for _, s := range a {
+		if _, ok := seen[s]; !ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func waitForDB(t *testing.T, dbName string, timeout time.Duration) {
