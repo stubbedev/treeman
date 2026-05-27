@@ -179,11 +179,12 @@ func (s *Store) ListSnapshotsOlderThan(ctx context.Context, cutoffMillis int64) 
 }
 
 // SumSnapshotBytes returns COALESCE(SUM(size_bytes),0) across the
-// table — used by the total-size sweep to decide whether eviction
-// is needed.
+// template pool — used by the total-size sweep to decide whether
+// eviction is needed.
 func (s *Store) SumSnapshotBytes(ctx context.Context) (int64, error) {
 	var sum int64
-	row := s.DB.QueryRowContext(ctx, `SELECT COALESCE(SUM(size_bytes),0) FROM snapshots`)
+	row := s.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(size_bytes),0) FROM snapshots`)
 	if err := row.Scan(&sum); err != nil {
 		return 0, err
 	}

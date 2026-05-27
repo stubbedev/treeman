@@ -80,7 +80,6 @@ func RunPrepareOnWorktree(ctx context.Context, worktree, repoOverride string) ([
 		return nil, err
 	}
 	branch := detectBranchOfWorktree(wt)
-	sl := slug.For(wt, branch)
 	dbPath, _ := store.DefaultDBPath()
 	st, err := store.Open(ctx, dbPath)
 	if err != nil {
@@ -88,8 +87,197 @@ func RunPrepareOnWorktree(ctx context.Context, worktree, repoOverride string) ([
 	}
 	defer st.Close()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	wtID, _ := st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
-	return prepare.Run(ctx, &cfg, wt, sl, st, repoID, wtID, CaptureInheritedEnv())
+	// Route through ResolveIdentity so this manual path matches the daemon:
+	// the main-worktree overlay is applied (bare active DB name) and a linked
+	// worktree's slug is its branch-independent path slug.
+	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, CaptureInheritedEnv())
+}
+
+// DbCmd — `treeman db reset` re-syncs a worktree's branch_scoped
+// databases from the live base branch. Drops the current branch's
+// durable copy + the active namespace, then re-runs prepare so each
+// is repopulated from the live parent branch.
+func DbCmd() *cli.Command {
+	return &cli.Command{
+		Name:  "db",
+		Usage: "per-worktree database operations",
+		Commands: []*cli.Command{
+			{
+				Name:      "reset",
+				Usage:     "re-sync branch_scoped databases from the live base branch (defaults to the cwd's worktree)",
+				ArgsUsage: "[worktree]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+					&cli.StringFlag{Name: "engine", Usage: "restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted)"},
+					&cli.BoolFlag{Name: "json"},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					wt := c.Args().First()
+					outs, err := RunDbResetOnWorktree(ctx, wt, c.String("repo"), strings.ToLower(c.String("engine")))
+					if err != nil {
+						return err
+					}
+					if c.Bool("json") {
+						return jsonStream(map[string]any{"outcomes": outs})
+					}
+					for _, o := range outs {
+						fmt.Printf("[%s] %s re-seeded from base\n", o.Engine, o.SourceDB)
+					}
+					if len(outs) == 0 {
+						PrintInfo("no branch_scoped databases configured")
+					}
+					return nil
+				},
+			},
+			{
+				Name:      "status",
+				Usage:     "show branch_scoped state: active namespace, current branch, and resumable branches (defaults to the cwd's worktree)",
+				ArgsUsage: "[worktree]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+					&cli.BoolFlag{Name: "json"},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					dbs, err := RunDbStatusOnWorktree(ctx, c.Args().First(), c.String("repo"))
+					if err != nil {
+						return err
+					}
+					if c.Bool("json") {
+						return jsonStream(map[string]any{"databases": dbs})
+					}
+					if len(dbs) == 0 {
+						PrintInfo("no branch_scoped databases configured")
+						return nil
+					}
+					for _, d := range dbs {
+						active := d.ActiveBranch
+						if active == "" {
+							active = "(none)"
+						}
+						fmt.Printf("[%s] %s — active branch: %s; resumable: %s\n",
+							d.Engine, d.Active, active, strings.Join(d.ResumableBranches, ", "))
+					}
+					return nil
+				},
+			},
+		},
+	}
+}
+
+// RunDbStatusOnWorktree resolves the worktree + repo and reports the
+// branch_scoped swap state per database. Shared by `treeman db status`
+// and the MCP branch_scoped_status tool.
+func RunDbStatusOnWorktree(ctx context.Context, worktree, repoOverride string) ([]prepare.BranchScopedDB, error) {
+	wt := worktree
+	if wt == "" {
+		cwd, _ := os.Getwd()
+		wt = cwd
+	}
+	wt = MustAbs(wt)
+	repoRoot, err := resolveRepo(repoOverride)
+	if err != nil {
+		repoRoot, err = DiscoverRepoRoot(wt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	branch := detectBranchOfWorktree(wt)
+	dbPath, _ := store.DefaultDBPath()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return prepare.BranchScopedStatus(ctx, &cfg, repoRoot, wt, id.WtID, st)
+}
+
+// RunDbResetOnWorktree resolves the worktree + repo, drops every
+// branch_scoped database's active namespace + current durable copy,
+// then re-runs prepare so each is repopulated from the live base branch.
+func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.Outcome, error) {
+	wt := worktree
+	if wt == "" {
+		cwd, _ := os.Getwd()
+		wt = cwd
+	}
+	wt = MustAbs(wt)
+	repoRoot, err := resolveRepo(repoOverride)
+	if err != nil {
+		repoRoot, err = DiscoverRepoRoot(wt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	branch := detectBranchOfWorktree(wt)
+	dbPath, _ := store.DefaultDBPath()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	// Route through ResolveIdentity so the main-worktree overlay is applied
+	// (bare active DB name) and the slug matches the daemon's branch-
+	// independent value — reset operates on the same active namespace the
+	// swap lifecycle created.
+	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
+		return nil, err
+	}
+	if err := prepare.ResetBranchScoped(ctx, &cfg, wt, repoID, id.WtID, st, engineFilter); err != nil {
+		return nil, err
+	}
+	outs, err := prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, CaptureInheritedEnv())
+	if err != nil {
+		return outs, err
+	}
+	// Surface only the seeded databases the reset actually touched.
+	// Match on the canonical engine family so an alias (mariadb, tidb,
+	// postgresql, opensearch) lines up with the canonical Outcome.Engine
+	// and an `--engine` filter written as the family name still hits.
+	filterLabel := engineFilter
+	if engineFilter != "" {
+		if lbl, ok := prepare.CanonicalEngine(engineFilter); ok {
+			filterLabel = lbl
+		}
+	}
+	var seeded []prepare.Outcome
+	for _, o := range outs {
+		for _, d := range cfg.Databases {
+			if !d.BranchScoped {
+				continue
+			}
+			label, ok := prepare.CanonicalEngine(d.Engine)
+			if !ok {
+				continue
+			}
+			if filterLabel != "" && label != filterLabel {
+				continue
+			}
+			if label == o.Engine {
+				seeded = append(seeded, o)
+				break
+			}
+		}
+	}
+	return seeded, nil
 }
 
 // HookCmd — `treeman hook run <phase>` runs the configured hooks

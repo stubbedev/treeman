@@ -26,9 +26,10 @@ import (
 	"github.com/stubbedev/treeman/internal/version"
 )
 
-// Serve boots the MCP server on stdio and blocks until the client
-// disconnects or ctx is cancelled. Returns nil on clean shutdown.
-func Serve(ctx context.Context) error {
+// newServer builds the fully-registered MCP server without starting a
+// transport. Extracted from Serve so tests can introspect the tool +
+// resource surface over an in-memory transport.
+func newServer() *mcpsdk.Server {
 	srv := mcpsdk.NewServer(&mcpsdk.Implementation{
 		Name:    "treeman",
 		Version: version.Version,
@@ -43,8 +44,13 @@ func Serve(ctx context.Context) error {
 	registerResources(srv)
 	registerWriteTools(srv)
 	registerPrompts(srv)
+	return srv
+}
 
-	if err := srv.Run(ctx, &mcpsdk.StdioTransport{}); err != nil {
+// Serve boots the MCP server on stdio and blocks until the client
+// disconnects or ctx is cancelled. Returns nil on clean shutdown.
+func Serve(ctx context.Context) error {
+	if err := newServer().Run(ctx, &mcpsdk.StdioTransport{}); err != nil {
 		return fmt.Errorf("mcp server: %w", err)
 	}
 	return nil

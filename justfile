@@ -74,19 +74,21 @@ test-e2e:
 
 check: lint test sync-schema sync-docs sync-flake
 
-# Regenerate `docs/cli.md` from the live cli.Command tree. Catches
-# command/flag drift in PRs by comparing the rewrite against what's
-# in git. Same pattern as sync-schema — cheap enough to run on
-# every `just check`.
+# Regenerate the generated docs from the live binary: `docs/cli.md`
+# from the cli.Command tree and `docs/config-reference.md` from the
+# config.Config types. Catches command/flag/config drift in PRs by
+# comparing the rewrite against what's in git. Same pattern as
+# sync-schema — cheap enough to run on every `just check`.
 sync-docs:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p docs
     go run ./cmd/treeman-gen-docs docs/cli.md
-    if [ -n "$(git status --porcelain docs/cli.md)" ]; then
-        echo "sync-docs: regenerated docs/cli.md"
+    go run ./cmd/treeman-gen-config-docs docs/config-reference.md
+    if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md)" ]; then
+        echo "sync-docs: regenerated generated docs"
     else
-        echo "sync-docs: docs/cli.md already in sync"
+        echo "sync-docs: generated docs already in sync"
     fi
 
 # Regenerate `schemas/treeman.schema.json` from the current

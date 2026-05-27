@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -20,8 +22,8 @@ func wtShow() *cli.Command {
 	return &cli.Command{
 		Name:      "show",
 		Aliases:   []string{"info"},
-		Usage:     "show details, recent events, and hook runs for a worktree",
-		ArgsUsage: "<worktree>",
+		Usage:     "show details, recent events, and hook runs for a worktree (defaults to the worktree containing the current directory)",
+		ArgsUsage: "[worktree]",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.IntFlag{Name: "events", Value: 10, Usage: "number of recent events to show"},
@@ -29,10 +31,6 @@ func wtShow() *cli.Command {
 			&cli.BoolFlag{Name: "no-pager", Usage: "disable the pager even when stdout is a TTY"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman wt show <worktree>")
-			}
-			name := c.Args().First()
 			pager := newPagerIfEligible(c, false, false)
 			if pager != nil {
 				_ = pager.Start()
@@ -52,7 +50,14 @@ func wtShow() *cli.Command {
 					repoID, _ = lookupRepoID(ctx, st, root)
 				}
 			}
-			wt, err := loadWorktreeRow(ctx, st, repoID, name)
+
+			var wt worktreeRow
+			if c.NArg() >= 1 {
+				wt, err = loadWorktreeRow(ctx, st, repoID, c.Args().First())
+			} else {
+				// No argument — resolve the worktree containing cwd.
+				wt, err = worktreeFromCwd(ctx, st)
+			}
 			if err != nil {
 				return err
 			}
@@ -61,6 +66,14 @@ func wtShow() *cli.Command {
 			fmt.Fprintf(ui.Out, "  branch: %s\n", wt.Branch)
 			fmt.Fprintf(ui.Out, "  path:   %s\n", wt.Path)
 			fmt.Fprintf(ui.Out, "  state:  %s\n", finalizeStatusLine(ctx, st, wt.ID))
+			if portMap, _ := st.LoadWorktreePorts(ctx, wt.ID); len(portMap) > 0 {
+				fmt.Fprintf(ui.Out, "  ports:  %s\n", formatPortMap(portMap))
+			}
+			if bs, _ := st.ListActiveBranches(ctx, wt.ID); len(bs) > 0 {
+				for _, r := range bs {
+					fmt.Fprintf(ui.Out, "  branch_scoped: %s (%s) → active branch %s\n", r.DBKey, r.Engine, r.Branch)
+				}
+			}
 			fmt.Fprintln(ui.Out)
 
 			// Recent events.
@@ -267,6 +280,50 @@ type worktreeRow struct {
 	Branch    string
 	Path      string
 	CreatedAt int64
+}
+
+// worktreeFromCwd resolves the worktree row whose path contains the
+// current working directory. Walks parent directories from cwd up to
+// the filesystem root, returning the first that matches an active
+// worktree row. Lets `treeman wt show` (and friends) run argument-
+// free from anywhere inside a worktree.
+func worktreeFromCwd(ctx context.Context, st *store.Store) (worktreeRow, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return worktreeRow{}, err
+	}
+	dir := MustAbs(cwd)
+	for {
+		row, err := st.LookupActiveWorktreeByPath(ctx, dir)
+		if err != nil {
+			return worktreeRow{}, err
+		}
+		if row.ID != 0 {
+			return worktreeRow{
+				ID:     row.ID,
+				Slug:   row.Slug,
+				Branch: row.Branch,
+				Path:   row.Path,
+			}, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return worktreeRow{}, fmt.Errorf("not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)")
+}
+
+// formatPortMap renders a slot→port map as "name=port name=port" in
+// stable alphabetical order.
+func formatPortMap(ports map[string]uint16) string {
+	names := store.SortedSlotNames(ports)
+	parts := make([]string, 0, len(names))
+	for _, n := range names {
+		parts = append(parts, fmt.Sprintf("%s=%d", n, ports[n]))
+	}
+	return strings.Join(parts, " ")
 }
 
 func loadWorktreeRow(ctx context.Context, st *store.Store, repoID int64, name string) (worktreeRow, error) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -89,6 +90,17 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 		}
 	}
 
+	// Refuse to delete the repo's primary checkout. The main worktree IS
+	// the repo root; `git worktree remove` can't remove it anyway, and the
+	// teardown that runs first would drop its databases — for a
+	// branch_scoped config that's the bare, overlay-resolved app DB the
+	// repo-root `.env` points at. Linked worktrees live under the
+	// worktrees dir, never at the repo root, so this only trips on a
+	// main-worktree target.
+	if pathsEqual(wtPath, req.RepoRoot) {
+		return DeleteResult{}, fmt.Errorf("refusing to delete %q: it is the repo's main worktree (primary checkout), not a linked worktree", wtPath)
+	}
+
 	if req.Detached {
 		if err := inlineTeardown(ctx, req.RepoRoot, wtPath, req.Force, req.Env, sink); err != nil {
 			return DeleteResult{WtPath: wtPath}, err
@@ -105,6 +117,13 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 	}
 	sink.OK("queued: teardown + DB drop + git remove detached (daemon unreachable — log: %s)", logPath)
 	return DeleteResult{WtPath: wtPath, Status: DeleteDetached, LogPath: logPath}, nil
+}
+
+// pathsEqual reports whether two paths point at the same directory.
+// Case-insensitive to match the store's NOCASE path keys (an
+// APFS/Windows case-insensitive FS treats them as one location).
+func pathsEqual(a, b string) bool {
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
 }
 
 // inlineTeardown runs the full teardown sequence locally without
@@ -139,6 +158,14 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 	runTrigger("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
 	_ = prepare.TeardownDatabases(ctx, &cfg, id.Slug.Value, repoID, id.WtID, st)
 	runTrigger("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
+	// Release the per-worktree port reservations back into the pool
+	// so a future `wt create` can re-use them.
+	_ = st.ReleaseWorktreePorts(ctx, id.WtID)
+	// Drop every active-branch marker for this worktree. teardownBranchScoped
+	// only clears markers for currently-configured branch_scoped databases;
+	// this bulk clear also reaps markers for databases since removed from
+	// config, so a re-created worktree at the same path starts clean.
+	_ = st.ClearActiveBranchesForWorktree(ctx, id.WtID)
 	_ = st.MarkWorktreeDeleted(ctx, id.WtID)
 	args := []string{"worktree", "remove"}
 	if force {

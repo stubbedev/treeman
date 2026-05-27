@@ -227,6 +227,10 @@
           "maximum": 64,
           "minimum": 0,
           "description": "Outer concurrency cap for clone restore + DropMatching.\nDefaults to the per-engine safe value from internal/prepare.\nRange 0–64. Raise only if the server is provisioned\n(max_connections, PG pg_database lock contention, etc.)."
+        },
+        "branch_scoped": {
+          "type": "boolean",
+          "description": "BranchScoped turns this database into a git-for-databases\nworking copy: the app always talks to one stable ACTIVE\nnamespace, while treeman keeps a DURABLE per-branch copy of its\ncontents and swaps them in/out as the branch changes. One flag,\nthe whole lifecycle — no per-feature sub-fields, no\nuser-configured durable names (treeman derives them internally).\n\nThe active namespace is fixed per checkout, so the app's\nconnection string (`.env`) is patched once and never churns:\n  - main worktree → the `main_worktree.databases[].name_template`\n    overlay (typically a bare, unprefixed name the repo-root app\n    already points at, e.g. `kontainer`).\n  - linked worktree → `name_template` (or `key_prefix` for\n    prefix-scoped engines) rendered against the worktree's\n    branch-independent slug, so switching branches inside the\n    worktree doesn't rename its DB.\n\nLifecycle, driven by HEAD changes + create/delete:\n  - create / first switch onto a branch → seed the active\n    namespace from the branch's own durable copy (resume) or,\n    failing that, from its parent branch's data (tracked\n    upstream, via the main overlay or a sibling worktree), or\n    `dump.path`, or empty.\n  - switch off a branch → capture the active namespace into that\n    branch's durable copy first (manual data changes live on).\n  - switch back → restore that durable copy. `treeman db reset`\n    drops the durable copy + re-seeds from the live parent.\n\nEngine-agnostic: name-scoped engines (MySQL, Postgres, MongoDB)\nswap whole databases; prefix-scoped engines (Redis,\nElasticsearch/OpenSearch) swap the key/index namespace under the\nrendered `key_prefix`. All five participate.\n\nMutually exclusive with `test_clones` / `fanout`: a branch_scoped\ndatabase is a stateful per-branch snapshot the app mutates in\nplace, not a reproducible source for throwaway parallel-test\nclones. Config-load rejects the combination.\n\nPostgres caveats (both stem from `CREATE DATABASE … TEMPLATE`,\nwhich needs exclusive access to its source):\n  - Capturing a branch on a switch briefly force-disconnects every\n    session on the active database (the swap fences it and\n    terminates backends), so the app momentarily loses its DB\n    connections and must reconnect. Expected; not data loss.\n  - Seeding a branch from its parent branch's LIVE database fails\n    while other sessions are connected to the parent (treeman does\n    NOT force-terminate another worktree's connections). Close\n    those connections, or set `dump.path` to seed from the dump.\nMySQL/MongoDB copy logically and have neither constraint."
         }
       },
       "additionalProperties": false,
@@ -615,6 +619,43 @@
       ],
       "description": "Patch — one entry in the top-level `patches:` block. Each entry\ntargets one file under the worktree root and rewrites it with\nper-worktree values via the `set:` map. Values are template\nstrings that accept `{slug}`, `{slug_dash}`,\n`{slug_redis_queue}`, `{slug_redis_cache}`. Validated at\nconfig-load time — unknown keys fail loud.\n\nThe driver is picked from `format:` when set, otherwise auto-\ndetected from the file extension:\n\n\tdotenv  — `.env`, `.env.*`\n\tphpunit — `.xml`, `.xml.dist` (phpunit.xml `\u003cenv\u003e` blocks)\n\tyaml    — `.yaml`, `.yml`\n\tjson    — `.json`\n\ttoml    — `.toml`\n\tini     — `.ini`, `.cfg`\n\nPath syntax inside `set:` is uniform across drivers:\n\n\tdotenv / phpunit  — flat key (e.g. `DB_DATABASE`)\n\tini               — `section.key` (top-level keys allowed too)\n\tyaml / json / toml — dotted path, optionally with `[N]` indices\n\t                    (e.g. `services[0].host`)\n\nWhen `skip_worktree` is true (default), treeman calls\n`git update-index --skip-worktree` on the patched file so the\nrewrite doesn't show up as a dirty file. The file must be tracked\nby git for the skip-worktree call to do anything; gitignored\nfiles are patched in-place without any git interaction."
     },
+    "PortSpec": {
+      "oneOf": [
+        {
+          "items": {
+            "type": "integer",
+            "maximum": 65535,
+            "minimum": 1
+          },
+          "type": "array",
+          "maxItems": 2,
+          "minItems": 2,
+          "description": "Inclusive [min, max] TCP port range."
+        },
+        {
+          "properties": {
+            "range": {
+              "items": {
+                "type": "integer",
+                "maximum": 65535,
+                "minimum": 1
+              },
+              "type": "array",
+              "maxItems": 2,
+              "minItems": 2,
+              "description": "Inclusive [min, max] TCP port range."
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "range"
+          ],
+          "description": "Structured port-spec mapping."
+        }
+      ],
+      "description": "Per-worktree port slot: an inclusive [min, max] range. Shorthand `[min, max]` is accepted; the long form is `{range: [min, max]}`."
+    },
     "PostgresConn": {
       "oneOf": [
         {
@@ -856,6 +897,13 @@
     "main_worktree": {
       "$ref": "#/$defs/MainWorktreeConfig",
       "description": "MainWorktree opts the repo's main checkout (repo root) into the\nsame watcher-driven prepare/migrate/teardown lifecycle that\nlinked `.worktrees/\u003cslug\u003e` checkouts already get. Off by default\n— flipping it on for an existing repo will start creating\nper-branch databases when the user switches branches at the\nrepo root."
+    },
+    "ports": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PortSpec"
+      },
+      "type": "object",
+      "description": "Ports declares per-worktree port slots. Each entry is a named\nslot with a port range; treeman allocates a free port per slot\nat `wt create` time and exposes it via the `{port_\u003cname\u003e}`\ntemplate token (usable in `patches[].set[*]` values).\nPersisted in SQLite so the assignment survives across daemon\nrestarts; freed on `wt delete`.\n\nUse slot names that match the role they fill in your app (e.g.\n`octane`, `webpack`, `reverb`) — the name shows up in every\n`{port_\u003cname\u003e}` reference and in `wt show` output."
     }
   },
   "additionalProperties": false,

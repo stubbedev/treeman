@@ -63,15 +63,17 @@ allow rules, etc.), not here.
 |---|---|
 | `doctor`, `daemon_status` | Health checks. |
 | `config_get`, `config_validate`, `config_schema` | Read/validate the YAML config. `config_get` output is redacted (passwords in resolved connection strings). |
-| `worktree_list`, `worktree_show`, `snapshots_list` | Registry + snapshot-cache queries. |
+| `worktree_list`, `worktree_show`, `snapshots_list` | Registry + snapshot-cache queries. `worktree_show` also reports allocated ports and branch_scoped active-namespace state. |
+| `branch_scoped_status` | Per branch_scoped database: active namespace, which branch's data occupies it now, and which local branches have a resumable durable copy. |
 | `logs_query`, `logs_hooks` | Event log + hook run history. Output is run through a secret-redaction pass (URI userinfo, AWS/GitHub tokens, JWTs, `KEY=value` for password/secret/token-shaped keys) before returning to the client. |
 | `fw_detect`, `slug_compute` | Detection helpers. |
 | `config_write`, `config_set`, `hook_run`, `prepare_run` | Replace the whole YAML body, patch a single field by dotted path, run a hook phase, run the prepare pipeline. |
+| `db_reset` | Re-sync a worktree's `branch_scoped` databases from the live base branch: drop each one's active namespace + the current branch's durable copy, then re-seed from the parent. Destructive for the current branch's working data; other branches' durable copies are kept. Optional `engine` restricts it to one family. |
 | `init_repo`, `schema_install` | Scaffold `.treeman.yaml`; install the JSON Schema (`target=repo` / `target=global` / `target=url`) and wire its modeline. Both in-process. |
 | `registry_register`, `registry_unregister`, `registry_repair` | Mutate the SQLite worktree registry directly. `repair` diffs `git worktree list` vs SQLite and auto-reconciles drift. |
 | `snapshots_purge`, `logs_purge` | Wipe the snapshot cache (forces next prepare to rebuild) / delete event-log rows by filter (at least one filter required). |
 | `daemon_control` | Start / stop treemand. Prefers the installed systemd/launchd unit; otherwise forks the `treemand` binary (start) or sends the shutdown RPC (stop). |
-| `worktree_create`, `worktree_delete` | Run the full git + hooks + prepare lifecycle in-process via `internal/wt`. The heavy tail (hooks + prepare for create; teardown for delete) is dispatched to the daemon; on daemon-unreachable the orchestrator spawns a detached `treeman wt finalize --local` / `wt delete --detached` child and returns immediately. Returns a structured result (`wt_path`, `status`, `slug`, `worktree_id`, `log_path`). |
+| `worktree_create`, `worktree_delete` | Run the full git + hooks + prepare lifecycle in-process via `internal/wt`. The heavy tail (hooks + prepare for create; teardown for delete) is dispatched to the daemon; on daemon-unreachable the orchestrator spawns a detached `treeman wt finalize --local` / `wt delete --detached` child and returns immediately. Returns a structured result (`wt_path`, `status`, `slug`, `worktree_id`, `log_path`, `ports`). |
 
 ## Claude Code
 

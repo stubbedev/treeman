@@ -42,6 +42,12 @@ func registerWriteTools(srv *mcpsdk.Server) {
 	}, prepareTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "db_reset",
+		Description: "Re-sync a worktree's branch_scoped databases from the live base branch. Drops each branch_scoped DB's active namespace + the current branch's durable copy, then re-runs prepare so each is re-seeded from the parent branch's data (discarding local divergence on the current branch). DESTRUCTIVE for the current branch's working data — other branches' durable copies are kept. Only touches databases declared `branch_scoped: true`; no-op otherwise. Use when a branch_scoped DB has drifted and the user wants a clean copy of the base. Optional `engine` restricts the reset to one family (mysql|postgres|mongodb|redis|elasticsearch; aliases accepted).",
+		Annotations: writeAnno("Reset branch_scoped DBs", true, true, true),
+	}, dbResetTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "hook_run",
 		Description: "Execute one configured hook phase (setup|teardown) synchronously for a worktree. Returns per-group exit codes and stdout/stderr tails. Use this to re-run a flaky setup phase without recreating the worktree.",
 		Annotations: writeAnno("Run hook phase", true, false, true),
@@ -148,6 +154,25 @@ func prepareTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in prepareIn) (
 		return nil, prepareOut{}, err
 	}
 	return nil, prepareOut{Outcomes: outs}, nil
+}
+
+// ─── db_reset ─────────────────────────────────────────────────────
+
+type dbResetIn struct {
+	Worktree string `json:"worktree,omitempty" jsonschema:"defaults to cwd's worktree"`
+	Repo     string `json:"repo,omitempty"`
+	Engine   string `json:"engine,omitempty" jsonschema:"restrict to one engine family: mysql|postgres|mongodb|redis|elasticsearch (aliases like mariadb/postgresql accepted); omit to reset all branch_scoped databases"`
+}
+type dbResetOut struct {
+	Outcomes []prepare.Outcome `json:"outcomes"`
+}
+
+func dbResetTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbResetIn) (*mcpsdk.CallToolResult, dbResetOut, error) {
+	outs, err := runDbReset(ctx, in.Worktree, in.Repo, strings.ToLower(in.Engine))
+	if err != nil {
+		return nil, dbResetOut{}, err
+	}
+	return nil, dbResetOut{Outcomes: outs}, nil
 }
 
 // ─── hook_run ─────────────────────────────────────────────────────

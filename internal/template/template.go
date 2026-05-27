@@ -15,6 +15,9 @@
 //	                     (only valid when `.WithTargetDB()` was used —
 //	                     i.e. inside `migrate.env:` / `seed.env:` values
 //	                     after `name_template` / `key_prefix` rendered)
+//	{port_<name>}       — per-worktree port for the slot named `<name>`
+//	                     declared in the top-level `ports:` block. Only
+//	                     valid when `.WithPorts()` populated the context.
 //
 // Unknown keys fail loudly (RenderError.UnknownKey) so a YAML typo
 // doesn't silently render as empty and quietly break some downstream
@@ -39,6 +42,12 @@ type Context struct {
 	HasN           bool
 	TargetDB       string // valid only when HasTargetDB is true
 	HasTargetDB    bool
+	// Ports holds per-worktree port assignments keyed by the slot
+	// name declared in the top-level `ports:` block. Tokens of the
+	// form `{port_<name>}` resolve to ports[name]. Empty map means
+	// "no ports allocated for this context"; rendering a `{port_*}`
+	// token against an empty map returns RenderError.UnknownKey.
+	Ports map[string]uint16
 }
 
 // FromSlug builds a Context from a Slug. The `N` field stays unset
@@ -67,6 +76,21 @@ func (c Context) WithN(n int) Context {
 func (c Context) WithTargetDB(db string) Context {
 	c.TargetDB = db
 	c.HasTargetDB = true
+	return c
+}
+
+// WithPorts returns a copy with the per-worktree port slots set.
+// A nil/empty map clears any previously-set ports.
+func (c Context) WithPorts(ports map[string]uint16) Context {
+	if len(ports) == 0 {
+		c.Ports = nil
+		return c
+	}
+	dup := make(map[string]uint16, len(ports))
+	for k, v := range ports {
+		dup[k] = v
+	}
+	c.Ports = dup
 	return c
 }
 
@@ -116,17 +140,21 @@ func Render(tmpl string, ctx Context) (string, error) {
 // `key_prefix` strings render before the per-run DB name exists, so
 // `{target_db}` is illegal there; `migrate.env:` / `seed.env:`
 // values render after, so it's legal. `{n}` is only valid in
-// templates the paratest fan-out renders per replica.
+// templates the paratest fan-out renders per replica. AllowedPorts
+// lists the slot names that `{port_<name>}` tokens may reference;
+// nil means "no port tokens allowed in this scope".
 type Scope struct {
 	AllowN        bool
 	AllowTargetDB bool
+	AllowedPorts  []string
 }
 
 // Validate checks that `tmpl` only references known keys allowed by
 // `sc`. Returns nil when the template would render cleanly with the
-// matching `WithN` / `WithTargetDB` already applied. Use this at
-// config-load time so a YAML typo (`{target-db}`, `{slag}`) is
-// caught before a worktree create / prepare run trips over it.
+// matching `WithN` / `WithTargetDB` / `WithPorts` already applied.
+// Use this at config-load time so a YAML typo (`{target-db}`,
+// `{slag}`, `{port_typo}`) is caught before a worktree create /
+// prepare run trips over it.
 func Validate(tmpl string, sc Scope) error {
 	ctx := Context{
 		Slug:           "x",
@@ -139,6 +167,13 @@ func Validate(tmpl string, sc Scope) error {
 	}
 	if sc.AllowTargetDB {
 		ctx = ctx.WithTargetDB("x")
+	}
+	if len(sc.AllowedPorts) > 0 {
+		ports := make(map[string]uint16, len(sc.AllowedPorts))
+		for _, name := range sc.AllowedPorts {
+			ports[name] = 1
+		}
+		ctx = ctx.WithPorts(ports)
 	}
 	_, err := Render(tmpl, ctx)
 	return err
@@ -164,7 +199,12 @@ func lookup(key string, ctx Context) (string, bool) {
 			return "", false
 		}
 		return ctx.TargetDB, true
-	default:
+	}
+	if name, ok := strings.CutPrefix(key, "port_"); ok {
+		if port, exists := ctx.Ports[name]; exists {
+			return strconv.Itoa(int(port)), true
+		}
 		return "", false
 	}
+	return "", false
 }

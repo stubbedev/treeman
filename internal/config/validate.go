@@ -3,6 +3,8 @@ package config
 import (
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/stubbedev/treeman/internal/template"
 )
@@ -49,11 +51,92 @@ func (c *Config) Validate() error {
 			fmt.Sprintf("main_worktree.databases[%d]", i)))
 	}
 
+	// branch_scoped on the main worktree only works when its active
+	// namespace is slug-free. The main checkout's `.env` is NOT patched
+	// (patches are skipped for the main worktree), so the app keeps
+	// connecting to the bare name the repo-root `.env` already targets —
+	// treeman must swap that exact name. A slug-bearing main template (or
+	// no main overlay at all) renders a per-slug name the app never
+	// connects to, so the swap lifecycle runs against a database nothing
+	// uses and branch_scoped silently does nothing on the main worktree.
+	// Catch the misconfiguration at load instead of failing silently.
+	if c.MainWorktree.Enabled {
+		for i := range c.Databases {
+			if !c.Databases[i].BranchScoped {
+				continue
+			}
+			tmpl, field := mainActiveTemplate(c, i)
+			if strings.Contains(tmpl, "{slug") {
+				errs = appendIfErr(errs, fmt.Errorf(
+					"databases[%d]: branch_scoped + main_worktree.enabled requires a slug-free main_worktree.databases[%d].%s (got %q) — the main worktree's .env is not patched, so treeman must swap the bare name the app already connects to",
+					i, i, field, tmpl))
+			}
+		}
+	}
+
+	allowedPorts := c.PortSlotNames()
+	for name, spec := range c.Ports {
+		errs = appendIfErr(errs, validatePortSlot(name, spec))
+	}
+
 	for i := range c.Patches {
-		errs = appendIfErr(errs, validatePatch(c.Patches[i], fmt.Sprintf("patches[%d]", i)))
+		errs = appendIfErr(errs, validatePatch(c.Patches[i], fmt.Sprintf("patches[%d]", i), allowedPorts))
 	}
 
 	return errors.Join(errs...)
+}
+
+// PortSlotNames returns the declared port slot names in stable
+// (sorted) order. Used by config-load validation to decide which
+// `{port_<name>}` tokens patches may reference, and by the
+// allocator to drive its per-slot allocation loop.
+func (c *Config) PortSlotNames() []string {
+	if len(c.Ports) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(c.Ports))
+	for name := range c.Ports {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// mainActiveTemplate returns the effective main-worktree active-namespace
+// template for databases[i] — the overlay value when set, else the base
+// — plus the field name it came from (`name_template` for name-scoped
+// engines, `key_prefix` for prefix-scoped). Used to check the main
+// worktree's branch_scoped active namespace is slug-free.
+func mainActiveTemplate(c *Config, i int) (tmpl, field string) {
+	d := c.Databases[i]
+	prefixScoped := d.Engine == "redis" || d.Engine == "elasticsearch" || d.Engine == "opensearch"
+	var ov DatabaseOverlay
+	if i < len(c.MainWorktree.Databases) {
+		ov = c.MainWorktree.Databases[i]
+	}
+	if prefixScoped {
+		if ov.KeyPrefix != "" {
+			return ov.KeyPrefix, "key_prefix"
+		}
+		return d.KeyPrefix, "key_prefix"
+	}
+	if ov.NameTemplate != "" {
+		return ov.NameTemplate, "name_template"
+	}
+	return d.NameTemplate, "name_template"
+}
+
+func validatePortSlot(name string, spec PortSpec) error {
+	if name == "" {
+		return fmt.Errorf("ports: slot name must be non-empty")
+	}
+	if spec.Range.Min == 0 || spec.Range.Max == 0 {
+		return fmt.Errorf("ports[%s]: range [min, max] must be non-zero", name)
+	}
+	if spec.Range.Min > spec.Range.Max {
+		return fmt.Errorf("ports[%s]: range invalid (min %d > max %d)", name, spec.Range.Min, spec.Range.Max)
+	}
+	return nil
 }
 
 // validateTemplate wraps template.Validate with a path-prefixed error
@@ -65,11 +148,11 @@ func validateTemplate(path, tmpl string, sc template.Scope) error {
 	return nil
 }
 
-func validatePatch(p Patch, path string) error {
+func validatePatch(p Patch, path string, allowedPorts []string) error {
 	var errs []error
 	for k, v := range p.Set {
 		errs = appendIfErr(errs, validateTemplate(
-			fmt.Sprintf("%s.set[%s]", path, k), v, template.Scope{}))
+			fmt.Sprintf("%s.set[%s]", path, k), v, template.Scope{AllowedPorts: allowedPorts}))
 	}
 	return errors.Join(errs...)
 }
@@ -157,6 +240,24 @@ func (d DatabaseConfig) validate(path string) error {
 		errs = appendIfErr(errs, validateTemplate(
 			path+".test_clones.name_template", d.TestClones.NameTemplate,
 			template.Scope{AllowN: true}))
+	}
+
+	// branch_scoped and the test-clone fanout are mutually exclusive. A
+	// branch_scoped database is a stateful per-branch snapshot the app
+	// mutates in place; test clones are throwaway, reproducible copies
+	// pre-warmed for parallel test workers. The two models contradict
+	// each other (one swaps live data per branch, the other fans a
+	// migrations-only template into N disposable replicas), so reject
+	// the combination at config-load instead of silently ignoring one.
+	if d.BranchScoped {
+		if d.TestClones != nil {
+			errs = appendIfErr(errs, fmt.Errorf(
+				"%s: branch_scoped and test_clones are mutually exclusive — a branch_scoped database is a stateful per-branch snapshot, not a reproducible test-clone source", path))
+		}
+		if d.Fanout > 0 {
+			errs = appendIfErr(errs, fmt.Errorf(
+				"%s: branch_scoped databases do not fan out — remove `fanout` (it only applies to the test-clone path)", path))
+		}
 	}
 	return errors.Join(errs...)
 }

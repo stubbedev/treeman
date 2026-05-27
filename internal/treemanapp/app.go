@@ -29,6 +29,7 @@ func New() *cli.Command {
 			cmd.MainCmd(),
 			cmd.BranchesCmd(),
 			cmd.PrepareCmd(),
+			cmd.DbCmd(),
 			cmd.SyncCmd(),
 			cmd.HookCmd(),
 			cmd.LogsCmd(),

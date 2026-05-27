@@ -122,6 +122,11 @@ type Outcome struct {
 	Fingerprint  string
 	CacheHit     bool
 	Clones       []string
+	// Decision is set only for branch_scoped databases: how the active
+	// namespace was filled this run — `seed:empty`, `seed:dump`,
+	// `seed:parent`, `swap:resume`, `swap:parent`, `swap:branch-point`,
+	// `adopt`, or `noop`. Empty for the template/clone path.
+	Decision string
 }
 
 // cloneRestorer is the engine-specific `SnapshotRestore` signature
@@ -431,15 +436,15 @@ func RunFiltered(
 			)
 			switch d.Engine {
 			case "mysql", "mariadb", "tidb":
-				o, err = prepareMySQL(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+				o, err = prepareMySQL(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "postgres", "postgresql":
-				o, err = preparePostgres(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+				o, err = preparePostgres(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "mongodb":
-				o, err = prepareMongo(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+				o, err = prepareMongo(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "redis":
-				o, err = prepareRedis(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+				o, err = prepareRedis(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "elasticsearch", "opensearch":
-				o, err = prepareES(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+				o, err = prepareES(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			default:
 				// Engine not recognised. Surface via event so the
 				// user notices, but don't fail the whole prepare run.
@@ -480,6 +485,7 @@ func prepareMySQL(
 	ctx context.Context,
 	cfg *config.Config,
 	d config.DatabaseConfig,
+	dbIdx int,
 	tplCtx template.Context,
 	worktreePath string,
 	st *store.Store,
@@ -503,6 +509,22 @@ func prepareMySQL(
 
 	version, _ := drv.EngineVersion(ctx)
 	maxConns, _ := drv.MaxConnections(ctx)
+
+	// branch_scoped databases bypass the fingerprint template cache
+	// entirely — their content is per-branch live data swapped through
+	// the active namespace, not a migrations-only template shared
+	// across worktrees.
+	if d.BranchScoped {
+		return runBranchScoped(ctx, branchScopedArgs{
+			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
+			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
+			eng: &branchEngine{drv: mysqlNS{drv}, scope: scopeName, engine: "mysql"},
+			loadDump: func(ctx context.Context, active, dumpPath string) error {
+				_, e := dumpload.LoadMySQL(ctx, drv.DB, active, dumpPath)
+				return e
+			},
+		})
+	}
 
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourceDB, version)
 	templateName := key.TemplateName()
@@ -705,6 +727,7 @@ func preparePostgres(
 	ctx context.Context,
 	cfg *config.Config,
 	d config.DatabaseConfig,
+	dbIdx int,
 	tplCtx template.Context,
 	worktreePath string,
 	st *store.Store,
@@ -728,6 +751,23 @@ func preparePostgres(
 
 	version, _ := drv.EngineVersion(ctx)
 	maxConns, _ := drv.MaxConnections(ctx)
+
+	if d.BranchScoped {
+		return runBranchScoped(ctx, branchScopedArgs{
+			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
+			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
+			eng: &branchEngine{drv: postgresNS{drv}, scope: scopeName, engine: "postgres"},
+			loadDump: func(ctx context.Context, active, dumpPath string) error {
+				scoped, e := drv.OpenScoped(ctx, active)
+				if e != nil {
+					return e
+				}
+				defer scoped.Close()
+				_, e = dumpload.LoadPostgres(ctx, scoped, active, dumpPath)
+				return e
+			},
+		})
+	}
 
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourceDB, version)
 	templateName := key.TemplateName()
@@ -906,6 +946,7 @@ func prepareMongo(
 	ctx context.Context,
 	cfg *config.Config,
 	d config.DatabaseConfig,
+	dbIdx int,
 	tplCtx template.Context,
 	worktreePath string,
 	st *store.Store,
@@ -927,6 +968,22 @@ func prepareMongo(
 	defer drv.Close(ctx)
 
 	version, _ := drv.EngineVersion(ctx)
+
+	if d.BranchScoped {
+		dumpSourceDB := ""
+		if d.Dump != nil {
+			dumpSourceDB = d.Dump.SourceDB
+		}
+		return runBranchScoped(ctx, branchScopedArgs{
+			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
+			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
+			eng: &branchEngine{drv: mongoNS{drv}, scope: scopeName, engine: "mongodb"},
+			loadDump: func(ctx context.Context, active, dumpPath string) error {
+				return dbmongo.Restore(ctx, cfg.Connections.Mongodb.URI, active, dumpSourceDB, dumpPath)
+			},
+		})
+	}
+
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourceDB, version)
 	templateName := key.TemplateName()
 
@@ -1083,6 +1140,7 @@ func prepareRedis(
 	ctx context.Context,
 	cfg *config.Config,
 	d config.DatabaseConfig,
+	dbIdx int,
 	tplCtx template.Context,
 	worktreePath string,
 	st *store.Store,
@@ -1100,6 +1158,14 @@ func prepareRedis(
 		return Outcome{}, err
 	}
 	defer drv.Close()
+
+	if d.BranchScoped {
+		return runBranchScoped(ctx, branchScopedArgs{
+			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
+			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
+			eng: &branchEngine{drv: redisNS{drv}, scope: scopePrefix, engine: "redis"},
+		})
+	}
 
 	return prepareRedisPrefix(ctx, cfg, d, drv, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 }
@@ -1279,6 +1345,7 @@ func prepareES(
 	ctx context.Context,
 	cfg *config.Config,
 	d config.DatabaseConfig,
+	dbIdx int,
 	tplCtx template.Context,
 	worktreePath string,
 	st *store.Store,
@@ -1299,6 +1366,17 @@ func prepareES(
 	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 	if err != nil {
 		return Outcome{}, err
+	}
+
+	if d.BranchScoped {
+		return runBranchScoped(ctx, branchScopedArgs{
+			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
+			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
+			eng: &branchEngine{drv: esNS{drv}, scope: scopePrefix, engine: "elasticsearch"},
+			loadDump: func(ctx context.Context, active, dumpPath string) error {
+				return drv.Restore(ctx, active, dumpPath)
+			},
+		})
 	}
 
 	version, _ := drv.EngineVersion(ctx)
@@ -1740,6 +1818,12 @@ func teardownOne(
 	repoID, worktreeID int64,
 	st *store.Store,
 ) error {
+	// branch_scoped databases tear down through the engine-agnostic
+	// swap layer: capture the current branch into its durable copy,
+	// drop the active namespace, keep the per-branch durable copies.
+	if d.BranchScoped {
+		return teardownBranchScoped(ctx, cfg, d, repoID, worktreeID, st)
+	}
 	switch d.Engine {
 	case "mysql", "mariadb", "tidb":
 		if cfg.Connections.Mysql == nil {

@@ -51,3 +51,44 @@ func TestNTokenRequiredWhenUsed(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestPortTokensRenderFromMap(t *testing.T) {
+	c := ctx().WithPorts(map[string]uint16{"octane": 8042, "webpack": 3042})
+	got, err := Render("http://app.test:{port_octane}/assets:{port_webpack}", c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "http://app.test:8042/assets:3042" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestPortTokenUnknownSlotErrors(t *testing.T) {
+	c := ctx().WithPorts(map[string]uint16{"octane": 8042})
+	_, err := Render("{port_typo}", c)
+	if err == nil {
+		t.Fatal("want error for unknown port slot")
+	}
+	re, ok := err.(*RenderError)
+	if !ok || re.UnknownKey != "port_typo" {
+		t.Errorf("wrong error: %v", err)
+	}
+}
+
+func TestPortTokenWithoutAnyPortsErrors(t *testing.T) {
+	if _, err := Render("{port_octane}", ctx()); err == nil {
+		t.Fatal("want error when ports map empty")
+	}
+}
+
+func TestValidateAllowedPorts(t *testing.T) {
+	if err := Validate("{port_octane}", Scope{AllowedPorts: []string{"octane"}}); err != nil {
+		t.Errorf("want valid, got %v", err)
+	}
+	if err := Validate("{port_unlisted}", Scope{AllowedPorts: []string{"octane"}}); err == nil {
+		t.Errorf("want error for unlisted port slot")
+	}
+	if err := Validate("{port_anything}", Scope{}); err == nil {
+		t.Errorf("want error when scope disallows port tokens")
+	}
+}

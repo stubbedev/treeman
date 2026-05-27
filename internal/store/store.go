@@ -763,6 +763,57 @@ func (s *Store) PrevVisitedWorktree(ctx context.Context, repoID int64, exceptPat
 	return p, true
 }
 
+// RepoPath resolves a repo row id back to its absolute path. Returns
+// "" + nil when no row matches.
+func (s *Store) RepoPath(ctx context.Context, repoID int64) (string, error) {
+	if repoID <= 0 {
+		return "", nil
+	}
+	row := s.DB.QueryRowContext(ctx, "SELECT path FROM repos WHERE id = ?", repoID)
+	var p string
+	if err := row.Scan(&p); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return p, nil
+}
+
+// WorktreePathByID returns the path column for a worktree row, or ""
+// when the row is missing.
+func (s *Store) WorktreePathByID(ctx context.Context, worktreeID int64) (string, error) {
+	if worktreeID <= 0 {
+		return "", nil
+	}
+	row := s.DB.QueryRowContext(ctx, "SELECT path FROM worktrees WHERE id = ?", worktreeID)
+	var p string
+	if err := row.Scan(&p); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return p, nil
+}
+
+// WorktreeBranch returns the branch column for a worktree row, or ""
+// when the row is missing or the branch is NULL.
+func (s *Store) WorktreeBranch(ctx context.Context, worktreeID int64) (string, error) {
+	if worktreeID <= 0 {
+		return "", nil
+	}
+	row := s.DB.QueryRowContext(ctx, "SELECT COALESCE(branch,'') FROM worktrees WHERE id = ?", worktreeID)
+	var b string
+	if err := row.Scan(&b); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return b, nil
+}
+
 // LookupRepoID resolves a repo path to its row id. Returns 0 + nil
 // when no row matches (caller treats this as "unknown").
 func (s *Store) LookupRepoID(ctx context.Context, path string) (int64, error) {

@@ -91,6 +91,15 @@ func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
 	return d.Client.Database(template).Drop(ctx)
 }
 
+// DropDatabase drops EXACTLY the named database — never a prefix match.
+// Unlike DropMatching (which reaps every db whose name starts with the
+// given prefix), this touches only the single name given. branch_scoped
+// teardown/reset/empty must use it so dropping a bare active namespace
+// can't take out sibling worktrees' prefixed databases.
+func (d *Driver) DropDatabase(ctx context.Context, name string) error {
+	return d.Client.Database(name).Drop(ctx)
+}
+
 // cloneDatabase is the shared inner loop for SnapshotCreate /
 // SnapshotRestore: list source collections, fan out the per-
 // collection clones (limit 6 — same as DropMatching), copy indexes.
