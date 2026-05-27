@@ -21,7 +21,6 @@ worktrees:
   links: [".env"]                 # symlink from main repo into the worktree
   async_create: true              # default — postcreate + prepare detach to daemon
   async_delete: true              # default
-  skip_worktree: true             # mark .env.testing skip-worktree after patching
 
 env_sources:                       # credential-resolver READ list
   - .env

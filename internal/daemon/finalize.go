@@ -95,10 +95,11 @@ func FinalizeWorktree(
 
 	// Re-apply top-level patches: every finalize evaluates them
 	// against the current HEAD's slug. Idempotent — Unchanged is a
-	// no-op write, and the skip-worktree bit is re-asserted whether
-	// or not the content changed (re-run after `git pull` must
-	// re-enforce). Failures are logged but non-fatal so a broken
-	// patch driver doesn't block the rest of finalize.
+	// no-op write, and EnsureFilter re-asserts the git clean/smudge
+	// config + info/attributes whether or not the content changed
+	// (re-run after `git pull` must re-enforce in case the user
+	// fiddled with .git/config). Failures are logged but non-fatal
+	// so a broken patch driver doesn't block the rest of finalize.
 	//
 	// Skipped for the main worktree: `patches:` describe how to derive
 	// a per-worktree checkout (rewriting its `.env` DB name, ports,
@@ -110,7 +111,9 @@ func FinalizeWorktree(
 	if len(cfg.Patches) > 0 && !isMain {
 		portMap, _ := st.Store.LoadWorktreePorts(ctx, wtID)
 		tplCtx := template.FromSlug(sl).WithPorts(portMap)
+		files := make([]string, 0, len(cfg.Patches))
 		for _, p := range cfg.Patches {
+			files = append(files, p.File)
 			res, err := patcher.Apply(p, wtRoot, tplCtx)
 			if err != nil {
 				slog.Warn("patch failed", "wt", wtRoot, "file", p.File, "err", err)
@@ -124,6 +127,9 @@ func FinalizeWorktree(
 						"file":   res.File,
 					})
 			}
+		}
+		if err := patcher.EnsureFilter(ctx, wtRoot, files); err != nil {
+			slog.Warn("install patch filter", "wt", wtRoot, "err", err)
 		}
 	}
 

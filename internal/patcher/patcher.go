@@ -1,22 +1,24 @@
 // Package patcher rewrites individual files inside a worktree with
 // per-worktree values (slug-substituted DB names, cache prefixes,
-// etc.). Four drivers are supported, one per file format:
+// etc.). Six drivers are supported:
 //
-//   - dotenv      : `KEY=value` lines (PatchEnvFile)
-//   - phpunit_env : `<env name="KEY" value="..."/>` inside `<php>`
-//     (PatchPhpunitFile)
-//   - yaml        : dotted-path key set, preserving comments (PatchYAMLFile)
-//   - json        : dotted-path key set on a JSON document (PatchJSONFile)
+//   - dotenv  : `KEY=value` lines
+//   - phpunit : `<env name="KEY" value="..."/>` inside `<php>`
+//   - yaml    : dotted-path key set, preserving comments
+//   - json    : dotted-path key set on a JSON document
+//   - toml    : dotted-path key set on a TOML document
+//   - ini     : `section.key` set on an INI file
 //
-// `SkipWorktree` calls `git update-index --skip-worktree` so each
-// rewritten file doesn't show as dirty in `git status`. Re-pull of
-// the file (e.g. after a `git pull` that changes it upstream)
-// requires the user to manually `git update-index --no-skip-worktree`
-// first.
+// Each rewritten file is wired through git's clean/smudge filter
+// (EnsureFilter) so `git pull` / `git checkout` can overwrite
+// patched content without the "would be overwritten by merge"
+// refusal. Smudge re-applies the patch on the way back to the
+// working tree, so per-worktree values survive the pull. See
+// filter.go for the clean/smudge semantics and install.go for the
+// git config + info/attributes wiring.
 package patcher
 
 import (
-	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -28,7 +30,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
 
@@ -320,31 +321,6 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// SkipWorktree shells out to `git update-index --skip-worktree
-// <file>` from `gitDir`. Returns false (no error) if the file is
-// not tracked by git — typical for `.env.testing` which is
-// gitignored.
-//
-// `gitDir` MUST be the worktree the file lives in, not the main
-// repo. Linked worktrees have a per-worktree index; running git
-// from the main repo would update the wrong index (and `ls-files`
-// from there wouldn't even find the file). Idempotent: re-running
-// against an already-skipped file exits 0 with no change.
-//
-// We shell out instead of pulling in a libgit2 binding because git
-// is already required by treeman anyway.
-func SkipWorktree(gitDir, file string) (bool, error) {
-	// Probe first: `git ls-files --error-unmatch <file>` exits 0
-	// when the path is tracked, non-zero otherwise.
-	if err := gitcmd.RunOptional(context.Background(), gitDir, "ls-files", "--error-unmatch", file); err != nil {
-		return false, nil
-	}
-	if _, err := gitcmd.OutputRW(context.Background(), gitDir, false, "update-index", "--skip-worktree", file); err != nil {
-		return false, fmt.Errorf("git update-index --skip-worktree %s: %w", file, err)
-	}
-	return true, nil
 }
 
 func readFile(path string) (string, error) {
