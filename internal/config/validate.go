@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/stubbedev/treeman/internal/template"
 )
@@ -50,6 +51,29 @@ func (c *Config) Validate() error {
 			fmt.Sprintf("main_worktree.databases[%d]", i)))
 	}
 
+	// branch_scoped on the main worktree only works when its active
+	// namespace is slug-free. The main checkout's `.env` is NOT patched
+	// (patches are skipped for the main worktree), so the app keeps
+	// connecting to the bare name the repo-root `.env` already targets —
+	// treeman must swap that exact name. A slug-bearing main template (or
+	// no main overlay at all) renders a per-slug name the app never
+	// connects to, so the swap lifecycle runs against a database nothing
+	// uses and branch_scoped silently does nothing on the main worktree.
+	// Catch the misconfiguration at load instead of failing silently.
+	if c.MainWorktree.Enabled {
+		for i := range c.Databases {
+			if !c.Databases[i].BranchScoped {
+				continue
+			}
+			tmpl, field := mainActiveTemplate(c, i)
+			if strings.Contains(tmpl, "{slug") {
+				errs = appendIfErr(errs, fmt.Errorf(
+					"databases[%d]: branch_scoped + main_worktree.enabled requires a slug-free main_worktree.databases[%d].%s (got %q) — the main worktree's .env is not patched, so treeman must swap the bare name the app already connects to",
+					i, i, field, tmpl))
+			}
+		}
+	}
+
 	allowedPorts := c.PortSlotNames()
 	for name, spec := range c.Ports {
 		errs = appendIfErr(errs, validatePortSlot(name, spec))
@@ -76,6 +100,30 @@ func (c *Config) PortSlotNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// mainActiveTemplate returns the effective main-worktree active-namespace
+// template for databases[i] — the overlay value when set, else the base
+// — plus the field name it came from (`name_template` for name-scoped
+// engines, `key_prefix` for prefix-scoped). Used to check the main
+// worktree's branch_scoped active namespace is slug-free.
+func mainActiveTemplate(c *Config, i int) (tmpl, field string) {
+	d := c.Databases[i]
+	prefixScoped := d.Engine == "redis" || d.Engine == "elasticsearch" || d.Engine == "opensearch"
+	var ov DatabaseOverlay
+	if i < len(c.MainWorktree.Databases) {
+		ov = c.MainWorktree.Databases[i]
+	}
+	if prefixScoped {
+		if ov.KeyPrefix != "" {
+			return ov.KeyPrefix, "key_prefix"
+		}
+		return d.KeyPrefix, "key_prefix"
+	}
+	if ov.NameTemplate != "" {
+		return ov.NameTemplate, "name_template"
+	}
+	return d.NameTemplate, "name_template"
 }
 
 func validatePortSlot(name string, spec PortSpec) error {

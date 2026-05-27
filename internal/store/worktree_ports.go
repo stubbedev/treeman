@@ -43,7 +43,7 @@ func (s *Store) AllocateWorktreePort(ctx context.Context, repoID, worktreeID int
 		// (worktree, name). The former is recoverable (caller picks
 		// the next port); the latter is a programming bug.
 		if isUniqueConflict(err) {
-			if held, herr := s.LookupWorktreePort(ctx, worktreeID, name); herr == nil && held != 0 {
+			if held, herr := s.LookupWorktreePort(ctx, worktreeID, name); herr == nil && held > 0 {
 				return fmt.Errorf("allocate worktree port: worktree %d already holds slot %q (port=%d)", worktreeID, name, held)
 			}
 			return ErrPortInUse

@@ -1139,10 +1139,17 @@ type DatabaseConfig struct {
 	// place, not a reproducible source for throwaway parallel-test
 	// clones. Config-load rejects the combination.
 	//
-	// Postgres caveat: seeding a branch from its parent branch's LIVE
-	// database uses `CREATE DATABASE … TEMPLATE`, which Postgres refuses
-	// while other sessions are connected to the parent. Close those
-	// connections, or set `dump.path` to seed from the dump instead.
+	// Postgres caveats (both stem from `CREATE DATABASE … TEMPLATE`,
+	// which needs exclusive access to its source):
+	//   - Capturing a branch on a switch briefly force-disconnects every
+	//     session on the active database (the swap fences it and
+	//     terminates backends), so the app momentarily loses its DB
+	//     connections and must reconnect. Expected; not data loss.
+	//   - Seeding a branch from its parent branch's LIVE database fails
+	//     while other sessions are connected to the parent (treeman does
+	//     NOT force-terminate another worktree's connections). Close
+	//     those connections, or set `dump.path` to seed from the dump.
+	// MySQL/MongoDB copy logically and have neither constraint.
 	BranchScoped bool `yaml:"branch_scoped,omitempty"`
 }
 

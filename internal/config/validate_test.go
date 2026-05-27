@@ -156,6 +156,71 @@ func TestValidate(t *testing.T) {
 			},
 			want: "",
 		},
+		{
+			name: "branch_scoped + main_worktree.enabled with no overlay rejects slug-bearing main name",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "mysql",
+					NameTemplate: "app_{slug}",
+					BranchScoped: true,
+				}},
+				MainWorktree: MainWorktreeConfig{Enabled: true},
+			},
+			want: "requires a slug-free main_worktree.databases[0].name_template",
+		},
+		{
+			name: "branch_scoped + main_worktree.enabled with slug-bearing overlay still rejected",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "mysql",
+					NameTemplate: "app_{slug}",
+					BranchScoped: true,
+				}},
+				MainWorktree: MainWorktreeConfig{
+					Enabled:   true,
+					Databases: []DatabaseOverlay{{NameTemplate: "app_{slug}_main"}},
+				},
+			},
+			want: "slug-free",
+		},
+		{
+			name: "branch_scoped + main_worktree.enabled with bare overlay is valid",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "mysql",
+					NameTemplate: "app_{slug}",
+					BranchScoped: true,
+				}},
+				MainWorktree: MainWorktreeConfig{
+					Enabled:   true,
+					Databases: []DatabaseOverlay{{NameTemplate: "app"}},
+				},
+			},
+			want: "",
+		},
+		{
+			name: "branch_scoped redis + main_worktree.enabled requires slug-free key_prefix",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "redis",
+					KeyPrefix:    "{slug}:",
+					BranchScoped: true,
+				}},
+				MainWorktree: MainWorktreeConfig{Enabled: true},
+			},
+			want: "key_prefix",
+		},
+		{
+			name: "non-branch_scoped slug name on main worktree is fine",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "mysql",
+					NameTemplate: "app_{slug}",
+				}},
+				MainWorktree: MainWorktreeConfig{Enabled: true},
+			},
+			want: "",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
