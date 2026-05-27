@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"golang.org/x/sync/errgroup"
 	"lukechampine.com/blake3"
 
@@ -1470,7 +1471,13 @@ func computeSnapshotKey(
 				inputHashes[in.Glob] = h
 			}
 		default: // checksum
-			matches, _ := filepath.Glob(filepath.Join(worktreePath, in.Glob))
+			// doublestar (not stdlib filepath.Glob) so `**` matches
+			// zero-or-more path segments — including files sitting
+			// directly in the glob base dir (e.g. database/migrations/
+			// *.php under a database/migrations/**/*.php input). stdlib
+			// treats `**` as a single-segment `*`, silently dropping
+			// those files from the fingerprint.
+			matches, _ := doublestar.FilepathGlob(filepath.Join(worktreePath, in.Glob))
 			if len(matches) == 0 {
 				continue
 			}
@@ -1576,7 +1583,7 @@ func staticGlobPrefix(glob string) string {
 	out := ""
 	for i, c := range glob {
 		switch c {
-		case '*', '?', '[':
+		case '*', '?', '[', '{':
 			return out
 		case '/':
 			out = glob[:i]

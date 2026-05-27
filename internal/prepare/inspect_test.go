@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -125,5 +126,59 @@ func TestInspectFingerprint_VersionChangesFlipFingerprint(t *testing.T) {
 	b := InspectFingerprint(ctx, s, d, dir, "x", "8.0.1")
 	if a.Fingerprint == b.Fingerprint {
 		t.Errorf("fingerprint should differ between engine versions; both = %q", a.Fingerprint)
+	}
+}
+
+// TestInspectFingerprint_DoublestarChecksumGlobFoldsBaseDirFiles is a
+// regression guard for the bug where a checksum-mode `**/*.php` input
+// silently dropped migrations sitting DIRECTLY in the glob base dir.
+// Stdlib filepath.Glob treats `**` as a single-segment `*`, so
+// database/migrations/init.php never matched database/migrations/**/
+// *.php and never reached the fingerprint — adding/editing it could
+// not bust the snapshot cache. computeSnapshotKey now uses
+// doublestar, where `**` matches zero-or-more segments.
+func TestInspectFingerprint_DoublestarChecksumGlobFoldsBaseDirFiles(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	// One migration directly in the base dir, one nested a level down —
+	// both must contribute.
+	base := filepath.Join(dir, "database", "migrations", "init.php")
+	nested := filepath.Join(dir, "database", "migrations", "sub", "later.php")
+	_ = os.MkdirAll(filepath.Dir(nested), 0o755)
+	_ = os.WriteFile(base, []byte("<?php // a"), 0o644)
+	_ = os.WriteFile(nested, []byte("<?php // b"), 0o644)
+
+	glob := "database/migrations/**/*.php"
+	d := config.DatabaseConfig{
+		Engine:       "mysql",
+		NameTemplate: "app_{slug}",
+		Inputs:       []config.Input{{Glob: glob, Hash: "checksum"}},
+		Migrate:      &config.Step{Run: "php artisan migrate"},
+	}
+
+	s, err := store.Open(ctx, filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	r1 := InspectFingerprint(ctx, s, d, dir, "app_test", "8.0.36")
+	agg, ok := r1.InputHashes[glob]
+	if !ok {
+		t.Fatalf("checksum glob produced no input hash: %#v", r1.InputHashes)
+	}
+	// Both files must appear in the per-glob aggregate, keyed by basename.
+	if !strings.Contains(agg, "init.php") {
+		t.Errorf("base-dir migration init.php not folded into fingerprint: %q", agg)
+	}
+	if !strings.Contains(agg, "later.php") {
+		t.Errorf("nested migration later.php not folded into fingerprint: %q", agg)
+	}
+
+	// Editing the base-dir file must flip the fingerprint (cache bust).
+	_ = os.WriteFile(base, []byte("<?php // a CHANGED"), 0o644)
+	r2 := InspectFingerprint(ctx, s, d, dir, "app_test", "8.0.36")
+	if r1.Fingerprint == r2.Fingerprint {
+		t.Errorf("editing a base-dir migration did not change the fingerprint (%q) — cache would never bust", r1.Fingerprint)
 	}
 }

@@ -84,6 +84,57 @@ func TestBringInFilesIdempotent(t *testing.T) {
 	}
 }
 
+// TestBringInFilesDoublestarGlobMatchesBaseAndNested guards the same
+// `**`-silent-drop bug class fixed in the snapshot fingerprint: a
+// `config/**/*.local.php` copy glob must bring in files sitting
+// directly in the base dir AND nested deeper. stdlib filepath.Glob
+// would silently drop the base-dir file.
+func TestBringInFilesDoublestarGlobMatchesBaseAndNested(t *testing.T) {
+	main := t.TempDir()
+	wtDir := t.TempDir()
+	base := filepath.Join(main, "config", "app.local.php")
+	nested := filepath.Join(main, "config", "modules", "mod.local.php")
+	if err := os.MkdirAll(filepath.Dir(nested), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(base, []byte("base"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nested, []byte("nested"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := BringInFiles(main, wtDir, []string{"config/**/*.local.php"}, "copy", NoopSink{}); err != nil {
+		t.Fatalf("BringInFiles: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(wtDir, "config", "app.local.php")); string(got) != "base" {
+		t.Errorf("base-dir file not brought in (stdlib ** drop bug): %q", got)
+	}
+	if got, _ := os.ReadFile(filepath.Join(wtDir, "config", "modules", "mod.local.php")); string(got) != "nested" {
+		t.Errorf("nested file not brought in: %q", got)
+	}
+}
+
+// TestBringInFilesBraceGlob guards brace alternation (`{a,b}`), which
+// doublestar supports but stdlib filepath.Glob does not — and which
+// the old `*?[` meta check would have treated as a literal path.
+func TestBringInFilesBraceGlob(t *testing.T) {
+	main := t.TempDir()
+	wtDir := t.TempDir()
+	for _, n := range []string{".env", ".env.local"} {
+		if err := os.WriteFile(filepath.Join(main, n), []byte(n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := BringInFiles(main, wtDir, []string{"{.env,.env.local}"}, "copy", NoopSink{}); err != nil {
+		t.Fatalf("BringInFiles: %v", err)
+	}
+	for _, n := range []string{".env", ".env.local"} {
+		if got, _ := os.ReadFile(filepath.Join(wtDir, n)); string(got) != n {
+			t.Errorf("brace glob did not bring in %s: %q", n, got)
+		}
+	}
+}
+
 func TestBringInFilesCopiesDirectoryRecursively(t *testing.T) {
 	main := t.TempDir()
 	wtDir := t.TempDir()

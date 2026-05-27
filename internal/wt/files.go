@@ -6,22 +6,37 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/bmatcuk/doublestar/v4"
 )
+
+// hasGlobMeta reports whether `p` carries any glob meta-character we
+// support — including `{` (brace alternation) and the second `*` of a
+// `**` recursive segment. Kept in sync with the doublestar matcher
+// used to expand it, so a pattern is never treated as a literal path
+// when doublestar would have expanded it.
+func hasGlobMeta(p string) bool {
+	return strings.ContainsAny(p, "*?[{")
+}
 
 // BringInFiles brings each entry in `paths` from repoRoot into
 // wtPath via either symlink (mode="link") or recursive copy
-// (mode="copy"). Glob meta-characters (`*?[`) expand against
-// repoRoot. Idempotent — if the destination already exists the
-// entry is skipped. Missing non-glob sources are reported via the
-// sink as warnings; missing glob expansions are silent.
+// (mode="copy"). Glob meta-characters (`*?[{` plus `**` recursion)
+// expand against repoRoot via doublestar. Idempotent — if the
+// destination already exists the entry is skipped. Missing non-glob
+// sources are reported via the sink as warnings; missing glob
+// expansions are silent.
 func BringInFiles(repoRoot, wtPath string, paths []string, mode string, sink Sink) error {
 	if sink == nil {
 		sink = NoopSink{}
 	}
 	for _, rel := range paths {
 		var matches []string
-		if strings.ContainsAny(rel, "*?[") {
-			m, _ := filepath.Glob(filepath.Join(repoRoot, rel))
+		if hasGlobMeta(rel) {
+			// doublestar (not stdlib filepath.Glob) so `**` matches
+			// zero-or-more path segments and `{a,b}` alternation works,
+			// matching the semantics documented for links/copies globs.
+			m, _ := doublestar.FilepathGlob(filepath.Join(repoRoot, rel))
 			matches = m
 		} else {
 			matches = []string{filepath.Join(repoRoot, rel)}
@@ -32,7 +47,7 @@ func BringInFiles(repoRoot, wtPath string, paths []string, mode string, sink Sin
 		for _, src := range matches {
 			info, err := os.Stat(src)
 			if err != nil {
-				if !strings.ContainsAny(rel, "*?[") {
+				if !hasGlobMeta(rel) {
 					sink.Warn("%s source missing, skipping: %s", mode, src)
 				}
 				continue
