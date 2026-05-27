@@ -96,7 +96,7 @@ list active worktrees
 
 Aliases: `info`
 
-show details, recent events, and hook runs for a worktree
+show details, recent events, and hook runs for a worktree (defaults to the worktree containing the current directory)
 
 | Flag | Usage |
 |---|---|
@@ -240,6 +240,20 @@ ensure → dump → migrate → snapshot → replicate (foreground)
 |---|---|
 | `-w`, `--worktree` |  |
 | `-r`, `--repo` |  |
+| `--json` |  |
+
+### `treeman db`
+
+per-worktree database operations
+
+### `treeman db reset`
+
+re-sync branch_scoped databases from the live base branch (defaults to the cwd's worktree)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--engine` | restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted) |
 | `--json` |  |
 
 ### `treeman sync`

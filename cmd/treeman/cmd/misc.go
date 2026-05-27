@@ -112,7 +112,7 @@ func DbCmd() *cli.Command {
 				ArgsUsage: "[worktree]",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
-					&cli.StringFlag{Name: "engine", Usage: "restrict the reset to one engine (mysql|postgres|mongodb)"},
+					&cli.StringFlag{Name: "engine", Usage: "restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted)"},
 					&cli.BoolFlag{Name: "json"},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
@@ -182,16 +182,29 @@ func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFil
 		return outs, err
 	}
 	// Surface only the seeded databases the reset actually touched.
+	// Match on the canonical engine family so an alias (mariadb, tidb,
+	// postgresql, opensearch) lines up with the canonical Outcome.Engine
+	// and an `--engine` filter written as the family name still hits.
+	filterLabel := engineFilter
+	if engineFilter != "" {
+		if lbl, ok := prepare.CanonicalEngine(engineFilter); ok {
+			filterLabel = lbl
+		}
+	}
 	var seeded []prepare.Outcome
 	for _, o := range outs {
 		for _, d := range cfg.Databases {
 			if !d.BranchScoped {
 				continue
 			}
-			if engineFilter != "" && d.Engine != engineFilter {
+			label, ok := prepare.CanonicalEngine(d.Engine)
+			if !ok {
 				continue
 			}
-			if d.Engine == o.Engine {
+			if filterLabel != "" && label != filterLabel {
+				continue
+			}
+			if label == o.Engine {
 				seeded = append(seeded, o)
 				break
 			}

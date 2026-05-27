@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestActiveBranchMarkerRoundTrip(t *testing.T) {
+func TestActiveBranchRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	st, repoID, wtID := openTestStoreWithWt(t)
 

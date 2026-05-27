@@ -238,6 +238,33 @@ func TestBranchScopedSameBranchNoop(t *testing.T) {
 	f.assertActive("a", "b")
 }
 
+// TestCanonicalEngine locks the engine-family mapping that `db reset
+// --engine` filtering relies on: aliases collapse to the canonical
+// label, and non-swappable engines report ok=false.
+func TestCanonicalEngine(t *testing.T) {
+	cases := map[string]struct {
+		want string
+		ok   bool
+	}{
+		"mysql":         {"mysql", true},
+		"mariadb":       {"mysql", true},
+		"tidb":          {"mysql", true},
+		"postgres":      {"postgres", true},
+		"postgresql":    {"postgres", true},
+		"mongodb":       {"mongodb", true},
+		"redis":         {"redis", true},
+		"elasticsearch": {"elasticsearch", true},
+		"opensearch":    {"elasticsearch", true},
+		"sqlite":        {"", false},
+	}
+	for in, want := range cases {
+		got, ok := CanonicalEngine(in)
+		if ok != want.ok || (ok && got != want.want) {
+			t.Errorf("CanonicalEngine(%q) = (%q, %t), want (%q, %t)", in, got, ok, want.want, want.ok)
+		}
+	}
+}
+
 // TestResetReseedsFromParent locks the db-reset regression: reset must
 // DROP the active namespace (not empty it) so the follow-up prepare
 // re-seeds from the live parent. With the old Empty() behaviour the

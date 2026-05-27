@@ -28,17 +28,26 @@ import (
 // by `treeman init` (modeline default) and the `--url` install mode.
 const URL = "https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json"
 
-// Render returns the JSON Schema for config.Config as pretty-printed
-// bytes. Generated via reflection so adding a Go field automatically
-// flows into editor hinting.
-func Render() ([]byte, error) {
+// Reflect returns the live *jsonschema.Schema for config.Config,
+// generated via reflection over the Go types + their doc comments.
+// Single source of truth for both the JSON Schema (Render) and the
+// generated markdown config reference (cmd/treeman-gen-config-docs),
+// so neither can drift from the structs.
+func Reflect() *jsonschema.Schema {
 	r := &jsonschema.Reflector{
 		Anonymous:      true,
 		ExpandedStruct: true,
 		FieldNameTag:   "yaml",
 		CommentMap:     config.CommentMap(),
 	}
-	return json.MarshalIndent(r.Reflect(&config.Config{}), "", "  ")
+	return r.Reflect(&config.Config{})
+}
+
+// Render returns the JSON Schema for config.Config as pretty-printed
+// bytes. Generated via reflection so adding a Go field automatically
+// flows into editor hinting.
+func Render() ([]byte, error) {
+	return json.MarshalIndent(Reflect(), "", "  ")
 }
 
 // GlobalPath returns the OS-conventional user-global path

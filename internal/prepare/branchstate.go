@@ -207,6 +207,17 @@ func (a esNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
 
+// CanonicalEngine maps a configured engine identifier to the canonical
+// branch-scoped family label (mariadb/tidb → mysql, postgresql →
+// postgres, opensearch → elasticsearch), reporting ok=false for engines
+// that don't participate in branch-scoped swapping. Used to match the
+// `db reset --engine` filter against config entries regardless of which
+// alias the user wrote.
+func CanonicalEngine(engine string) (string, bool) {
+	_, label, ok := branchScopeFor(engine)
+	return label, ok
+}
+
 // branchScopeFor reports the scope + canonical engine label for a
 // configured engine, and ok=false for engines that don't participate
 // in branch-scoped swapping.
@@ -595,15 +606,24 @@ func ResetBranchScoped(
 	st *store.Store,
 	engineFilter string,
 ) error {
+	// Canonicalize the filter so `--engine mysql` also matches a DB
+	// declared as `mariadb`/`tidb`, `--engine postgres` matches
+	// `postgresql`, etc.
+	filterLabel := engineFilter
+	if engineFilter != "" {
+		if lbl, ok := CanonicalEngine(engineFilter); ok {
+			filterLabel = lbl
+		}
+	}
 	for _, d := range cfg.Databases {
 		if !d.BranchScoped {
 			continue
 		}
-		if engineFilter != "" && d.Engine != engineFilter {
+		scope, label, ok := branchScopeFor(d.Engine)
+		if !ok {
 			continue
 		}
-		scope, _, ok := branchScopeFor(d.Engine)
-		if !ok {
+		if filterLabel != "" && label != filterLabel {
 			continue
 		}
 		active, err := activeNamespace(d, scope, worktreePath)
