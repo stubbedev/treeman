@@ -75,6 +75,52 @@ func TestValidate(t *testing.T) {
 			},
 			want: "",
 		},
+		{
+			name: "port range min greater than max",
+			cfg: Config{
+				Ports: map[string]PortSpec{"octane": {Range: PortRange{Min: 9000, Max: 8000}}},
+			},
+			want: "range invalid",
+		},
+		{
+			name: "port range zero",
+			cfg: Config{
+				Ports: map[string]PortSpec{"octane": {Range: PortRange{Min: 0, Max: 0}}},
+			},
+			want: "must be non-zero",
+		},
+		{
+			name: "patch may reference declared port slot",
+			cfg: Config{
+				Ports: map[string]PortSpec{"octane": {Range: PortRange{Min: 8000, Max: 8999}}},
+				Patches: []Patch{{
+					File: ".env",
+					Set:  map[string]string{"OCTANE_PORT": "{port_octane}"},
+				}},
+			},
+			want: "",
+		},
+		{
+			name: "patch referencing undeclared port slot fails",
+			cfg: Config{
+				Ports: map[string]PortSpec{"octane": {Range: PortRange{Min: 8000, Max: 8999}}},
+				Patches: []Patch{{
+					File: ".env",
+					Set:  map[string]string{"WEBPACK_PORT": "{port_webpack}"},
+				}},
+			},
+			want: "unknown template key: port_webpack",
+		},
+		{
+			name: "patch port token without any ports declared fails",
+			cfg: Config{
+				Patches: []Patch{{
+					File: ".env",
+					Set:  map[string]string{"OCTANE_PORT": "{port_octane}"},
+				}},
+			},
+			want: "unknown template key: port_octane",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

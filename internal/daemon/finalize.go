@@ -99,8 +99,17 @@ func FinalizeWorktree(
 	// or not the content changed (re-run after `git pull` must
 	// re-enforce). Failures are logged but non-fatal so a broken
 	// patch driver doesn't block the rest of finalize.
-	if len(cfg.Patches) > 0 {
-		tplCtx := template.FromSlug(sl)
+	//
+	// Skipped for the main worktree: `patches:` describe how to derive
+	// a per-worktree checkout (rewriting its `.env` DB name, ports,
+	// etc.) from the canonical repo-root clone. The main checkout IS
+	// that clone — rewriting its files would clobber the developer's
+	// real `.env` (e.g. point `DB_DATABASE` at a per-branch name when
+	// the main worktree's branch_scoped active DB is the bare,
+	// overlay-resolved name the root `.env` already targets).
+	if len(cfg.Patches) > 0 && !isMain {
+		portMap, _ := st.Store.LoadWorktreePorts(ctx, wtID)
+		tplCtx := template.FromSlug(sl).WithPorts(portMap)
 		for _, p := range cfg.Patches {
 			res, err := patcher.Apply(p, wtRoot, tplCtx)
 			if err != nil {
@@ -225,8 +234,11 @@ func FinalizeWorktreeForWatch(
 	sl, wtID := id.Slug, id.WtID
 
 	// Re-apply patches. Cheap; idempotent for unchanged content.
-	if len(cfg.Patches) > 0 {
-		tplCtx := template.FromSlug(sl)
+	// Skipped for the main worktree — see FinalizeWorktree for why
+	// the canonical clone's files are left untouched.
+	if len(cfg.Patches) > 0 && !id.IsMain {
+		portMap, _ := st.Store.LoadWorktreePorts(ctx, wtID)
+		tplCtx := template.FromSlug(sl).WithPorts(portMap)
 		for _, p := range cfg.Patches {
 			if _, err := patcher.Apply(p, wtRoot, tplCtx); err != nil {
 				slog.Warn("patch failed (watch-trigger)", "wt", wtRoot, "file", p.File, "err", err)

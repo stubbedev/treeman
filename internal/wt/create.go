@@ -8,6 +8,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/patcher"
+	"github.com/stubbedev/treeman/internal/ports"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -52,12 +53,13 @@ const (
 // JSON tags are snake_case to match the rest of the MCP tool surface
 // (callers parse this directly off MCP's structuredContent).
 type CreateResult struct {
-	WtPath     string       `json:"wt_path"`
-	Slug       string       `json:"slug"`
-	RepoID     int64        `json:"repo_id"`
-	WorktreeID int64        `json:"worktree_id"`
-	Status     CreateStatus `json:"status"`
-	LogPath    string       `json:"log_path,omitempty"`
+	WtPath     string            `json:"wt_path"`
+	Slug       string            `json:"slug"`
+	RepoID     int64             `json:"repo_id"`
+	WorktreeID int64             `json:"worktree_id"`
+	Status     CreateStatus      `json:"status"`
+	LogPath    string            `json:"log_path,omitempty"`
+	Ports      map[string]uint16 `json:"ports,omitempty"`
 }
 
 // Create runs the full worktree-create lifecycle: git worktree add,
@@ -149,20 +151,11 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 	}
 
 	sl := slug.For(wtPath, req.Branch)
-	tplCtx := template.FromSlug(sl)
 
-	// Top-level patches: dotenv / phpunit.xml / yaml / json rewrites.
-	for _, p := range cfg.Patches {
-		res, err := patcher.Apply(p, wtPath, tplCtx)
-		if err != nil {
-			return CreateResult{}, err
-		}
-		if res.Outcome == patcher.Updated {
-			sink.Info("patched %s (%s)", filepath.Join(wtPath, res.File), res.Driver)
-		}
-	}
-
-	// Register in SQLite.
+	// Open the store BEFORE patching so we can register the worktree
+	// row and allocate ports — the ports map has to flow into the
+	// template context before patch render so `{port_<name>}` tokens
+	// resolve to their freshly assigned values.
 	dbPath, _ := store.DefaultDBPath()
 	st, err := store.Open(ctx, dbPath)
 	if err != nil {
@@ -177,13 +170,39 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 	if err != nil {
 		return CreateResult{}, err
 	}
+
+	allocs, err := ports.New().Allocate(ctx, st, &cfg, repoID, wtID)
+	if err != nil {
+		return CreateResult{}, fmt.Errorf("port allocation: %w", err)
+	}
+	portMap := map[string]uint16{}
+	for _, a := range allocs {
+		portMap[a.Name] = a.Port
+	}
+	tplCtx := template.FromSlug(sl).WithPorts(portMap)
+
+	// Top-level patches: dotenv / phpunit.xml / yaml / json rewrites.
+	for _, p := range cfg.Patches {
+		res, err := patcher.Apply(p, wtPath, tplCtx)
+		if err != nil {
+			return CreateResult{}, err
+		}
+		if res.Outcome == patcher.Updated {
+			sink.Info("patched %s (%s)", filepath.Join(wtPath, res.File), res.Driver)
+		}
+	}
+
 	sink.OK("created worktree #%d slug=%s path=%s", wtID, sl.Value, wtPath)
+	if summary := ports.FormatSummary(allocs); summary != "" {
+		sink.Info("%s", summary)
+	}
 
 	result := CreateResult{
 		WtPath:     wtPath,
 		Slug:       sl.Value,
 		RepoID:     repoID,
 		WorktreeID: wtID,
+		Ports:      portMap,
 	}
 
 	if req.SkipHooks {

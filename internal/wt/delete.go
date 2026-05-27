@@ -139,6 +139,9 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 	runTrigger("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
 	_ = prepare.TeardownDatabases(ctx, &cfg, id.Slug.Value, repoID, id.WtID, st)
 	runTrigger("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
+	// Release the per-worktree port reservations back into the pool
+	// so a future `wt create` can re-use them.
+	_ = st.ReleaseWorktreePorts(ctx, id.WtID)
 	_ = st.MarkWorktreeDeleted(ctx, id.WtID)
 	args := []string{"worktree", "remove"}
 	if force {

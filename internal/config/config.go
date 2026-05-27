@@ -102,6 +102,18 @@ type Config struct {
 	// per-branch databases when the user switches branches at the
 	// repo root.
 	MainWorktree MainWorktreeConfig `yaml:"main_worktree,omitempty"`
+
+	// Ports declares per-worktree port slots. Each entry is a named
+	// slot with a port range; treeman allocates a free port per slot
+	// at `wt create` time and exposes it via the `{port_<name>}`
+	// template token (usable in `patches[].set[*]` values).
+	// Persisted in SQLite so the assignment survives across daemon
+	// restarts; freed on `wt delete`.
+	//
+	// Use slot names that match the role they fill in your app (e.g.
+	// `octane`, `webpack`, `reverb`) — the name shows up in every
+	// `{port_<name>}` reference and in `wt show` output.
+	Ports map[string]PortSpec `yaml:"ports,omitempty"`
 }
 
 // AutoFetchConfig — `auto_fetch:` block. Periodic daemon-side
@@ -628,6 +640,102 @@ type SnapshotsConfig struct {
 	GcIntervalMinutes uint32 `yaml:"gc_interval_minutes,omitempty"`
 }
 
+// PortSpec — one entry in the top-level `ports:` block. Declares the
+// inclusive `[min, max]` TCP port range treeman will allocate from
+// when assigning this slot to a new worktree. Treeman picks the
+// first free port in the range that is both (a) not bound by an
+// active TCP listener on `127.0.0.1` and (b) not already recorded
+// in the `worktree_ports` table for another live worktree.
+//
+// YAML shape:
+//
+//	ports:
+//	  octane:
+//	    range: [8000, 8999]
+//	  webpack:
+//	    range: [3000, 3999]
+//
+// or the shorthand form:
+//
+//	ports:
+//	  reverb: [6001, 6999]
+type PortSpec struct {
+	// Range is the inclusive [min, max] port range. Min and max must
+	// satisfy 1 ≤ min ≤ max ≤ 65535. Required.
+	Range PortRange `yaml:"range"`
+}
+
+// PortRange is an inclusive `[min, max]` port range.
+type PortRange struct {
+	Min uint16
+	Max uint16
+}
+
+// UnmarshalYAML accepts either the structured `{range: [min, max]}`
+// form or the shorthand `[min, max]` two-element sequence.
+func (p *PortSpec) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.SequenceNode:
+		return p.Range.UnmarshalYAML(node)
+	case yaml.MappingNode:
+		type alias PortSpec
+		return node.Decode((*alias)(p))
+	default:
+		return fmt.Errorf("port spec (line %d): want a mapping or [min, max] sequence", node.Line)
+	}
+}
+
+// UnmarshalYAML accepts a `[min, max]` two-element sequence.
+func (r *PortRange) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.SequenceNode || len(node.Content) != 2 {
+		return fmt.Errorf("port range (line %d): want a [min, max] two-element sequence", node.Line)
+	}
+	var nums [2]uint16
+	for i, child := range node.Content {
+		if child.Kind != yaml.ScalarNode {
+			return fmt.Errorf("port range (line %d): entries must be integers", child.Line)
+		}
+		n, err := strconv.ParseUint(child.Value, 10, 16)
+		if err != nil {
+			return fmt.Errorf("port range (line %d): %q: %w", child.Line, child.Value, err)
+		}
+		nums[i] = uint16(n)
+	}
+	r.Min, r.Max = nums[0], nums[1]
+	return nil
+}
+
+// JSONSchema documents the shorthand-or-mapping shape.
+func (PortSpec) JSONSchema() *jsonschema.Schema {
+	rangeSchema := &jsonschema.Schema{
+		Type:        "array",
+		Items:       &jsonschema.Schema{Type: "integer", Minimum: json.Number("1"), Maximum: json.Number("65535")},
+		MinItems:    intp(2),
+		MaxItems:    intp(2),
+		Description: "Inclusive [min, max] TCP port range.",
+	}
+	props := orderedmap.New[string, *jsonschema.Schema]()
+	props.Set("range", rangeSchema)
+	return &jsonschema.Schema{
+		OneOf: []*jsonschema.Schema{
+			rangeSchema,
+			{
+				Type:                 "object",
+				Properties:           props,
+				Required:             []string{"range"},
+				AdditionalProperties: jsonschema.FalseSchema,
+				Description:          "Structured port-spec mapping.",
+			},
+		},
+		Description: "Per-worktree port slot: an inclusive [min, max] range. Shorthand `[min, max]` is accepted; the long form is `{range: [min, max]}`.",
+	}
+}
+
+// intp is a small helper for jsonschema.Schema's *uint64 minimum /
+// maximum fields. (json.Number can be used for unbounded ints; intp
+// is used for MinItems / MaxItems which take *uint64.)
+func intp(v uint64) *uint64 { return &v }
+
 // WorktreesConfig — `worktrees:` block.
 type WorktreesConfig struct {
 	// Path (relative to the main worktree) where new worktrees are
@@ -992,6 +1100,40 @@ type DatabaseConfig struct {
 	// Range 0–64. Raise only if the server is provisioned
 	// (max_connections, PG pg_database lock contention, etc.).
 	Fanout uint32 `yaml:"fanout,omitempty" jsonschema:"minimum=0,maximum=64"`
+
+	// BranchScoped turns this database into a git-for-databases
+	// working copy: the app always talks to one stable ACTIVE
+	// namespace, while treeman keeps a DURABLE per-branch copy of its
+	// contents and swaps them in/out as the branch changes. One flag,
+	// the whole lifecycle — no per-feature sub-fields, no
+	// user-configured durable names (treeman derives them internally).
+	//
+	// The active namespace is fixed per checkout, so the app's
+	// connection string (`.env`) is patched once and never churns:
+	//   - main worktree → the `main_worktree.databases[].name_template`
+	//     overlay (typically a bare, unprefixed name the repo-root app
+	//     already points at, e.g. `kontainer`).
+	//   - linked worktree → `name_template` (or `key_prefix` for
+	//     prefix-scoped engines) rendered against the worktree's
+	//     branch-independent slug, so switching branches inside the
+	//     worktree doesn't rename its DB.
+	//
+	// Lifecycle, driven by HEAD changes + create/delete:
+	//   - create / first switch onto a branch → seed the active
+	//     namespace from the branch's own durable copy (resume) or,
+	//     failing that, from its parent branch's data (tracked
+	//     upstream, via the main overlay or a sibling worktree), or
+	//     `dump.path`, or empty.
+	//   - switch off a branch → capture the active namespace into that
+	//     branch's durable copy first (manual data changes live on).
+	//   - switch back → restore that durable copy. `treeman db reset`
+	//     drops the durable copy + re-seeds from the live parent.
+	//
+	// Engine-agnostic: name-scoped engines (MySQL, Postgres, MongoDB)
+	// swap whole databases; prefix-scoped engines (Redis,
+	// Elasticsearch/OpenSearch) swap the key/index namespace under the
+	// rendered `key_prefix`. All five participate.
+	BranchScoped bool `yaml:"branch_scoped,omitempty"`
 }
 
 // Input declares one source of file state that contributes to the

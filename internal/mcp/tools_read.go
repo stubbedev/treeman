@@ -413,45 +413,87 @@ func worktreeListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 
 type worktreeShowIn struct {
 	Repo string `json:"repo,omitempty"`
-	Name string `json:"name" jsonschema:"slug, branch, or basename of the worktree"`
+	Name string `json:"name,omitempty" jsonschema:"slug, branch, or basename of the worktree; omit to resolve the worktree containing the current directory"`
 }
 type worktreeShowOut struct {
-	Worktree worktreeRow   `json:"worktree"`
-	Recent   []store.Event `json:"recent_events"`
+	Worktree worktreeRow       `json:"worktree"`
+	Ports    map[string]uint16 `json:"ports,omitempty"`
+	Recent   []store.Event     `json:"recent_events"`
 }
 
 func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeShowIn) (*mcpsdk.CallToolResult, worktreeShowOut, error) {
-	if in.Name == "" {
-		return nil, worktreeShowOut{}, fmt.Errorf("name is required")
-	}
-	repoRoot, err := resolveRepo(in.Repo)
-	if err != nil {
-		return nil, worktreeShowOut{}, err
-	}
 	st, err := openStore(ctx)
 	if err != nil {
 		return nil, worktreeShowOut{}, err
 	}
 	defer st.Close()
-	var repoID int64
-	if err := st.DB.QueryRowContext(ctx, `SELECT id FROM repos WHERE path = ?`, repoRoot).Scan(&repoID); err != nil {
-		return nil, worktreeShowOut{}, fmt.Errorf("lookup repo %s: %w", repoRoot, err)
-	}
-	id, _ := st.LookupWorktreeID(ctx, repoID, in.Name)
-	if id == 0 {
-		return nil, worktreeShowOut{}, fmt.Errorf("no worktree matches %q", in.Name)
-	}
+
 	var w worktreeRow
-	w.RepoPath = repoRoot
-	if err := st.DB.QueryRowContext(ctx, `SELECT id, slug, COALESCE(branch,''), path, created_at FROM worktrees WHERE id = ?`, id).
-		Scan(&w.ID, &w.Slug, &w.Branch, &w.Path, &w.CreatedAt); err != nil {
-		return nil, worktreeShowOut{}, err
+	var id int64
+	if in.Name == "" {
+		// No name — resolve the worktree containing the current dir.
+		row, rerr := worktreeRowFromCwd(ctx, st)
+		if rerr != nil {
+			return nil, worktreeShowOut{}, rerr
+		}
+		id = row.ID
+		w = row
+	} else {
+		repoRoot, rerr := resolveRepo(in.Repo)
+		if rerr != nil {
+			return nil, worktreeShowOut{}, rerr
+		}
+		var repoID int64
+		if err := st.DB.QueryRowContext(ctx, `SELECT id FROM repos WHERE path = ?`, repoRoot).Scan(&repoID); err != nil {
+			return nil, worktreeShowOut{}, fmt.Errorf("lookup repo %s: %w", repoRoot, err)
+		}
+		id, _ = st.LookupWorktreeID(ctx, repoID, in.Name)
+		if id == 0 {
+			return nil, worktreeShowOut{}, fmt.Errorf("no worktree matches %q", in.Name)
+		}
+		w.RepoPath = repoRoot
+		if err := st.DB.QueryRowContext(ctx, `SELECT id, slug, COALESCE(branch,''), path, created_at FROM worktrees WHERE id = ?`, id).
+			Scan(&w.ID, &w.Slug, &w.Branch, &w.Path, &w.CreatedAt); err != nil {
+			return nil, worktreeShowOut{}, err
+		}
 	}
+
+	ports, _ := st.LoadWorktreePorts(ctx, id)
 	events, err := st.QueryEvents(ctx, store.EventFilter{WorktreeID: id, Limit: 50, HydrateWT: false})
 	if err != nil {
 		return nil, worktreeShowOut{}, err
 	}
-	return nil, worktreeShowOut{Worktree: w, Recent: events}, nil
+	return nil, worktreeShowOut{Worktree: w, Ports: ports, Recent: events}, nil
+}
+
+// worktreeRowFromCwd resolves the worktree row containing the current
+// working directory by walking parent dirs. Mirrors the CLI's
+// argument-free `wt show`.
+func worktreeRowFromCwd(ctx context.Context, st *store.Store) (worktreeRow, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return worktreeRow{}, err
+	}
+	dir := cwd
+	for {
+		row, err := st.LookupActiveWorktreeByPath(ctx, dir)
+		if err != nil {
+			return worktreeRow{}, err
+		}
+		if row.ID != 0 {
+			return worktreeRow{
+				ID:     row.ID,
+				Slug:   row.Slug,
+				Branch: row.Branch,
+				Path:   row.Path,
+			}, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return worktreeRow{}, fmt.Errorf("not inside a tracked worktree (pass name)")
+		}
+		dir = parent
+	}
 }
 
 // ─── logs_query / logs_hooks ──────────────────────────────────────

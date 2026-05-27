@@ -31,6 +31,7 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 	got := dump(t, raw)
 	wantTables := []string{
 		"_treeman_migrations",
+		"active_branch_db",
 		"dir_hashes",
 		"events",
 		"file_hashes",
@@ -38,6 +39,7 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 		"hook_runs",
 		"repos",
 		"snapshots",
+		"worktree_ports",
 		"worktrees",
 	}
 	if !equalLists(got.tables, wantTables) {
@@ -46,6 +48,7 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 	// Indexes from 0001_init.sql. Auto-generated sqlite_autoindex_* are
 	// filtered out — only user-declared CREATE INDEXes show up here.
 	wantIndexes := []string{
+		"idx_active_branch_db_repo",
 		"idx_events_ts",
 		"idx_events_type",
 		"idx_events_worktree",
@@ -56,6 +59,10 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 		"idx_repos_path_nocase",
 		"idx_snapshots_lru",
 		"idx_snapshots_repo_lru",
+		"idx_snapshots_slug_origin",
+		"idx_worktree_ports_one_per_port",
+		"idx_worktree_ports_one_per_slot",
+		"idx_worktree_ports_repo",
 		"idx_worktrees_admin_dir",
 		"idx_worktrees_one_main_per_repo",
 		"idx_worktrees_path_nocase",

@@ -3,9 +3,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/stubbedev/treeman/internal/template"
 )
+
+func sortStrings(s []string) { sort.Strings(s) }
 
 // Validate runs cross-field consistency checks that can't be
 // expressed in YAML tags or per-type UnmarshalYAML hooks. Caller is
@@ -49,11 +52,45 @@ func (c *Config) Validate() error {
 			fmt.Sprintf("main_worktree.databases[%d]", i)))
 	}
 
+	allowedPorts := c.PortSlotNames()
+	for name, spec := range c.Ports {
+		errs = appendIfErr(errs, validatePortSlot(name, spec))
+	}
+
 	for i := range c.Patches {
-		errs = appendIfErr(errs, validatePatch(c.Patches[i], fmt.Sprintf("patches[%d]", i)))
+		errs = appendIfErr(errs, validatePatch(c.Patches[i], fmt.Sprintf("patches[%d]", i), allowedPorts))
 	}
 
 	return errors.Join(errs...)
+}
+
+// PortSlotNames returns the declared port slot names in stable
+// (sorted) order. Used by config-load validation to decide which
+// `{port_<name>}` tokens patches may reference, and by the
+// allocator to drive its per-slot allocation loop.
+func (c *Config) PortSlotNames() []string {
+	if len(c.Ports) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(c.Ports))
+	for name := range c.Ports {
+		names = append(names, name)
+	}
+	sortStrings(names)
+	return names
+}
+
+func validatePortSlot(name string, spec PortSpec) error {
+	if name == "" {
+		return fmt.Errorf("ports: slot name must be non-empty")
+	}
+	if spec.Range.Min == 0 || spec.Range.Max == 0 {
+		return fmt.Errorf("ports[%s]: range [min, max] must be non-zero", name)
+	}
+	if spec.Range.Min > spec.Range.Max {
+		return fmt.Errorf("ports[%s]: range invalid (min %d > max %d)", name, spec.Range.Min, spec.Range.Max)
+	}
+	return nil
 }
 
 // validateTemplate wraps template.Validate with a path-prefixed error
@@ -65,11 +102,11 @@ func validateTemplate(path, tmpl string, sc template.Scope) error {
 	return nil
 }
 
-func validatePatch(p Patch, path string) error {
+func validatePatch(p Patch, path string, allowedPorts []string) error {
 	var errs []error
 	for k, v := range p.Set {
 		errs = appendIfErr(errs, validateTemplate(
-			fmt.Sprintf("%s.set[%s]", path, k), v, template.Scope{}))
+			fmt.Sprintf("%s.set[%s]", path, k), v, template.Scope{AllowedPorts: allowedPorts}))
 	}
 	return errors.Join(errs...)
 }

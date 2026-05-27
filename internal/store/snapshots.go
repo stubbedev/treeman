@@ -23,21 +23,32 @@ type SnapshotRecord struct {
 	LastUsedAt     int64
 	UseCount       int64
 	RepoID         int64
+	// SlugOrigin disambiguates per-worktree divergent snapshots from
+	// the regular fingerprint-keyed templates. Empty string = the
+	// legacy fingerprint-keyed template (default). "wt:<slug>" = a
+	// per-worktree snapshot captured at `wt delete`. The LRU
+	// eviction paths exclude rows with a non-empty SlugOrigin so the
+	// per-slug snapshot pool is governed separately.
+	SlugOrigin string
 }
 
 // LookupSnapshot returns the snapshot row for `fingerprint`, or
 // (nil, nil) if no row exists. Errors only on DB faults.
+//
+// Per-worktree divergent snapshots (slug_origin <> ”) are filtered
+// out — callers looking those up should use LookupSlugSnapshot.
 func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*SnapshotRecord, error) {
 	row := s.DB.QueryRowContext(ctx, `
 		SELECT fingerprint, engine, engine_version, source_db, template_name,
 		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
-		       COALESCE(size_bytes,0), created_at, last_used_at, use_count
-		FROM snapshots WHERE fingerprint = ?`, fingerprint)
+		       COALESCE(size_bytes,0), created_at, last_used_at, use_count,
+		       COALESCE(slug_origin,'')
+		FROM snapshots WHERE fingerprint = ? AND COALESCE(slug_origin,'') = ''`, fingerprint)
 	var r SnapshotRecord
 	var lockJSON string
 	err := row.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
 		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON,
-		&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount)
+		&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount, &r.SlugOrigin)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -50,6 +61,57 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 		}
 	}
 	return &r, nil
+}
+
+// SlugSnapshotKey is the slug_origin value stored on per-worktree
+// divergent snapshots. The {engine, source_db} pair is mixed in so
+// one worktree with several `branch_scoped: true` databases
+// gets one snapshot per database, not one shared blob.
+func SlugSnapshotKey(slug, engine, sourceDB string) string {
+	return fmt.Sprintf("wt:%s|%s|%s", slug, engine, sourceDB)
+}
+
+// LookupSlugSnapshot returns the per-worktree divergent snapshot for
+// (slug, engine, sourceDB) or (nil, nil) when no row exists.
+func (s *Store) LookupSlugSnapshot(ctx context.Context, slug, engine, sourceDB string) (*SnapshotRecord, error) {
+	key := SlugSnapshotKey(slug, engine, sourceDB)
+	row := s.DB.QueryRowContext(ctx, `
+		SELECT fingerprint, engine, engine_version, source_db, template_name,
+		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
+		       COALESCE(size_bytes,0), created_at, last_used_at, use_count,
+		       COALESCE(slug_origin,'')
+		FROM snapshots WHERE slug_origin = ?`, key)
+	var r SnapshotRecord
+	var lockJSON string
+	err := row.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
+		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON,
+		&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount, &r.SlugOrigin)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lockJSON != "" {
+		if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
+			return nil, fmt.Errorf("decode lockfile_hashes_json for slug snapshot %s: %w", key, err)
+		}
+	}
+	return &r, nil
+}
+
+// DeleteSlugSnapshot drops a per-worktree divergent snapshot row.
+// Returns true when a row was deleted, false when none matched.
+// Caller is responsible for dropping the underlying template DB on
+// the engine — this only touches the SQLite bookkeeping.
+func (s *Store) DeleteSlugSnapshot(ctx context.Context, slug, engine, sourceDB string) (bool, error) {
+	key := SlugSnapshotKey(slug, engine, sourceDB)
+	res, err := s.DB.ExecContext(ctx, `DELETE FROM snapshots WHERE slug_origin = ?`, key)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // RecordSnapshot inserts (or updates on conflict) the snapshots row
@@ -77,21 +139,22 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 		INSERT INTO snapshots(fingerprint, engine, engine_version, source_db,
 		                      template_name, migrations_hash, dump_hash,
 		                      lockfile_hashes_json, size_bytes, created_at,
-		                      last_used_at, use_count, repo_id)
-		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, NULLIF(?,0), ?, ?, ?, ?)
+		                      last_used_at, use_count, repo_id, slug_origin)
+		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, NULLIF(?,0), ?, ?, ?, ?, ?)
 		ON CONFLICT(fingerprint) DO UPDATE SET
 		    template_name        = excluded.template_name,
 		    engine_version       = excluded.engine_version,
 		    source_db            = excluded.source_db,
 		    migrations_hash      = excluded.migrations_hash,
-		    dump_hash            = excluded.dump_hash,
+		    dump_hash             = excluded.dump_hash,
 		    lockfile_hashes_json = excluded.lockfile_hashes_json,
 		    size_bytes           = excluded.size_bytes,
 		    last_used_at         = excluded.last_used_at,
-		    repo_id              = excluded.repo_id`,
+		    repo_id              = excluded.repo_id,
+		    slug_origin          = excluded.slug_origin`,
 		r.Fingerprint, r.Engine, r.EngineVersion, r.SourceDB,
 		r.TemplateName, r.MigrationsHash, r.DumpHash, string(lockJSON),
-		r.SizeBytes, r.CreatedAt, r.LastUsedAt, r.UseCount, repoID)
+		r.SizeBytes, r.CreatedAt, r.LastUsedAt, r.UseCount, repoID, r.SlugOrigin)
 	return err
 }
 
@@ -107,7 +170,10 @@ type SnapshotEvictionCandidate struct {
 
 // ListLRUEvictable returns the snapshots above `cap` for a given
 // repo, ordered by LRU (`last_used_at` ascending). Used by the
-// inline GC fired after a fresh RecordSnapshot.
+// inline GC fired after a fresh RecordSnapshot. Per-worktree
+// divergent snapshots (slug_origin <> ”) are excluded — they live
+// outside the LRU template pool and are dropped only on `wt delete`
+// re-create or explicit `treeman db reset`.
 //
 // `cap == 0` is treated as "no cap" and returns an empty slice
 // (defense against a misconfigured config that would otherwise wipe
@@ -119,7 +185,7 @@ func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, cap uint32) 
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT fingerprint, engine, template_name, source_db
 		FROM snapshots
-		WHERE repo_id = ?
+		WHERE repo_id = ? AND COALESCE(slug_origin,'') = ''
 		ORDER BY last_used_at DESC
 		LIMIT -1 OFFSET ?`, repoID, cap)
 	if err != nil {
@@ -156,12 +222,13 @@ func (s *Store) DeleteSnapshot(ctx context.Context, fingerprint string) error {
 
 // ListSnapshotsOlderThan returns every snapshot whose
 // `last_used_at` is before `cutoffMillis`. Used by the
-// max-age sweep.
+// max-age sweep. Per-worktree divergent snapshots are excluded —
+// the age sweep applies to the LRU template pool only.
 func (s *Store) ListSnapshotsOlderThan(ctx context.Context, cutoffMillis int64) ([]SnapshotEvictionCandidate, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT fingerprint, engine, template_name, source_db
 		FROM snapshots
-		WHERE last_used_at < ?
+		WHERE last_used_at < ? AND COALESCE(slug_origin,'') = ''
 		ORDER BY last_used_at ASC`, cutoffMillis)
 	if err != nil {
 		return nil, err
@@ -179,11 +246,14 @@ func (s *Store) ListSnapshotsOlderThan(ctx context.Context, cutoffMillis int64) 
 }
 
 // SumSnapshotBytes returns COALESCE(SUM(size_bytes),0) across the
-// table — used by the total-size sweep to decide whether eviction
-// is needed.
+// template pool — used by the total-size sweep to decide whether
+// eviction is needed. Per-worktree divergent snapshots are excluded
+// from this count so a worktree's divergent state can't push the
+// LRU pool over its size cap.
 func (s *Store) SumSnapshotBytes(ctx context.Context) (int64, error) {
 	var sum int64
-	row := s.DB.QueryRowContext(ctx, `SELECT COALESCE(SUM(size_bytes),0) FROM snapshots`)
+	row := s.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(size_bytes),0) FROM snapshots WHERE COALESCE(slug_origin,'') = ''`)
 	if err := row.Scan(&sum); err != nil {
 		return 0, err
 	}
@@ -220,11 +290,13 @@ func (s *Store) ListSnapshotsForRepo(ctx context.Context, repoID int64) ([]Snaps
 
 // ListSnapshotsLargestLRU returns every snapshot ordered by
 // (size_bytes DESC, last_used_at ASC). The size-sweep iterates and
-// drops from the top until total falls below the cap.
+// drops from the top until total falls below the cap. Per-worktree
+// divergent snapshots are excluded from the size sweep.
 func (s *Store) ListSnapshotsLargestLRU(ctx context.Context) ([]SnapshotEvictionCandidate, []int64, error) {
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT fingerprint, engine, template_name, source_db, COALESCE(size_bytes,0)
 		FROM snapshots
+		WHERE COALESCE(slug_origin,'') = ''
 		ORDER BY COALESCE(size_bytes,0) DESC, last_used_at ASC`)
 	if err != nil {
 		return nil, nil, err

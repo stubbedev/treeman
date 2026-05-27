@@ -1,0 +1,622 @@
+package prepare
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"lukechampine.com/blake3"
+
+	"github.com/stubbedev/treeman/internal/config"
+	dbes "github.com/stubbedev/treeman/internal/db/es"
+	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
+	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
+	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
+	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/migrations/runner"
+	"github.com/stubbedev/treeman/internal/slug"
+	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/template"
+)
+
+// ─── engine-agnostic namespace adapter ──────────────────────────────
+//
+// A "namespace" is the unit a branch-scoped database swaps. For
+// name-scoped engines (mysql/postgres/mongo) it's a database name; for
+// prefix-scoped engines (redis/es) it's a key/index prefix. Every
+// driver already exposes the four primitives below — the adapter just
+// erases the name-vs-prefix distinction so the swap orchestrator is
+// written once.
+
+// nsDriver is the slice of an engine driver the swap lifecycle needs.
+// Capture/Restore treat their SOURCE argument read-only and drop only
+// the TARGET, so the active namespace is never lost without first being
+// captured.
+type nsDriver interface {
+	Exists(ctx context.Context, ns string) (bool, error)
+	Capture(ctx context.Context, active, durable string) error // active → durable
+	Restore(ctx context.Context, durable, active string) error // durable → active (drops active first)
+	Empty(ctx context.Context, active string) error            // reset active to an empty, present namespace
+	Drop(ctx context.Context, ns string) error                 // remove the namespace entirely
+	DropDurable(ctx context.Context, durable string) error
+}
+
+// bsScope distinguishes how an engine carves up isolation.
+type bsScope int
+
+const (
+	scopeName   bsScope = iota // active namespace = rendered name_template (DB name)
+	scopePrefix                // active namespace = rendered key_prefix (key/index prefix)
+)
+
+// branchEngine bundles a connected adapter with its scope so the
+// orchestrator can resolve active + durable namespace names.
+type branchEngine struct {
+	drv    nsDriver
+	scope  bsScope
+	engine string
+}
+
+// durable derives the treeman-managed namespace that holds `branch`'s
+// data for this `active` namespace. Deterministic (a hash of the pair),
+// so the engine itself is the source of truth for "does this branch's
+// copy exist" — no SQLite bookkeeping required. The marker prefix is
+// disjoint from both the active namespace and the fingerprint-template
+// namespace (`_tm_`/`tm_`) so a Capture/Restore drop never collides.
+func (b *branchEngine) durable(active, branch string) string {
+	h := bsHash(active + "|" + branch)
+	switch {
+	case b.scope == scopePrefix && b.engine == "redis":
+		return "_tmbs:" + h + ":"
+	case b.scope == scopePrefix: // elasticsearch — index names can't start with `_`
+		return "tmbs_" + h + "_"
+	default:
+		return "_tmbs_" + h
+	}
+}
+
+func bsHash(s string) string {
+	sum := blake3.Sum256([]byte(s))
+	const hexDigits = "0123456789abcdef"
+	out := make([]byte, 0, 16)
+	for _, b := range sum[:8] {
+		out = append(out, hexDigits[b>>4], hexDigits[b&0x0f])
+	}
+	return string(out)
+}
+
+// ─── per-engine adapters ────────────────────────────────────────────
+
+type mysqlNS struct{ d *dbmysql.Driver }
+
+func (a mysqlNS) Exists(ctx context.Context, ns string) (bool, error) {
+	return a.d.DatabaseExists(ctx, ns)
+}
+func (a mysqlNS) Capture(ctx context.Context, active, durable string) error {
+	return a.d.SnapshotCreate(ctx, active, durable)
+}
+func (a mysqlNS) Restore(ctx context.Context, durable, active string) error {
+	return a.d.SnapshotRestore(ctx, durable, active)
+}
+func (a mysqlNS) Empty(ctx context.Context, active string) error {
+	if _, err := a.d.DropMatching(ctx, active); err != nil {
+		return err
+	}
+	return a.d.EnsureDB(ctx, active)
+}
+func (a mysqlNS) Drop(ctx context.Context, ns string) error {
+	_, err := a.d.DropMatching(ctx, ns)
+	return err
+}
+func (a mysqlNS) DropDurable(ctx context.Context, durable string) error {
+	return a.d.DropSnapshot(ctx, durable)
+}
+
+type postgresNS struct{ d *dbpostgres.Driver }
+
+func (a postgresNS) Exists(ctx context.Context, ns string) (bool, error) {
+	return a.d.DatabaseExists(ctx, ns)
+}
+func (a postgresNS) Capture(ctx context.Context, active, durable string) error {
+	return a.d.SnapshotCreate(ctx, active, durable)
+}
+func (a postgresNS) Restore(ctx context.Context, durable, active string) error {
+	return a.d.SnapshotRestore(ctx, durable, active)
+}
+func (a postgresNS) Empty(ctx context.Context, active string) error {
+	if _, err := a.d.DropMatching(ctx, active); err != nil {
+		return err
+	}
+	return a.d.EnsureDB(ctx, active)
+}
+func (a postgresNS) Drop(ctx context.Context, ns string) error {
+	_, err := a.d.DropMatching(ctx, ns)
+	return err
+}
+func (a postgresNS) DropDurable(ctx context.Context, durable string) error {
+	return a.d.DropSnapshot(ctx, durable)
+}
+
+type mongoNS struct{ d *dbmongo.Driver }
+
+func (a mongoNS) Exists(ctx context.Context, ns string) (bool, error) {
+	return a.d.DatabaseExists(ctx, ns)
+}
+func (a mongoNS) Capture(ctx context.Context, active, durable string) error {
+	return a.d.SnapshotCreate(ctx, active, durable)
+}
+func (a mongoNS) Restore(ctx context.Context, durable, active string) error {
+	return a.d.SnapshotRestore(ctx, durable, active)
+}
+func (a mongoNS) Empty(ctx context.Context, active string) error {
+	_, err := a.d.DropMatching(ctx, active)
+	return err
+}
+func (a mongoNS) Drop(ctx context.Context, ns string) error {
+	_, err := a.d.DropMatching(ctx, ns)
+	return err
+}
+func (a mongoNS) DropDurable(ctx context.Context, durable string) error {
+	return a.d.DropSnapshot(ctx, durable)
+}
+
+type redisNS struct{ d *dbredis.Driver }
+
+func (a redisNS) Exists(ctx context.Context, ns string) (bool, error) {
+	return a.d.PrefixExists(ctx, ns)
+}
+func (a redisNS) Capture(ctx context.Context, active, durable string) error {
+	return a.d.SnapshotCreate(ctx, active, durable)
+}
+func (a redisNS) Restore(ctx context.Context, durable, active string) error {
+	return a.d.SnapshotRestore(ctx, durable, active)
+}
+func (a redisNS) Empty(ctx context.Context, active string) error {
+	_, err := a.d.DropPrefix(ctx, active)
+	return err
+}
+func (a redisNS) Drop(ctx context.Context, ns string) error {
+	_, err := a.d.DropPrefix(ctx, ns)
+	return err
+}
+func (a redisNS) DropDurable(ctx context.Context, durable string) error {
+	return a.d.DropSnapshot(ctx, durable)
+}
+
+type esNS struct{ d *dbes.Driver }
+
+func (a esNS) Exists(ctx context.Context, ns string) (bool, error) {
+	m, err := a.d.ListMatching(ctx, ns)
+	return len(m) > 0, err
+}
+func (a esNS) Capture(ctx context.Context, active, durable string) error {
+	return a.d.SnapshotCreate(ctx, active, durable)
+}
+func (a esNS) Restore(ctx context.Context, durable, active string) error {
+	return a.d.SnapshotRestore(ctx, durable, active)
+}
+func (a esNS) Empty(ctx context.Context, active string) error {
+	_, err := a.d.DropMatching(ctx, active)
+	return err
+}
+func (a esNS) Drop(ctx context.Context, ns string) error {
+	_, err := a.d.DropMatching(ctx, ns)
+	return err
+}
+func (a esNS) DropDurable(ctx context.Context, durable string) error {
+	return a.d.DropSnapshot(ctx, durable)
+}
+
+// branchScopeFor reports the scope + canonical engine label for a
+// configured engine, and ok=false for engines that don't participate
+// in branch-scoped swapping.
+func branchScopeFor(engine string) (bsScope, string, bool) {
+	switch engine {
+	case "mysql", "mariadb", "tidb":
+		return scopeName, "mysql", true
+	case "postgres", "postgresql":
+		return scopeName, "postgres", true
+	case "mongodb":
+		return scopeName, "mongodb", true
+	case "redis":
+		return scopePrefix, "redis", true
+	case "elasticsearch", "opensearch":
+		return scopePrefix, "elasticsearch", true
+	default:
+		return scopeName, engine, false
+	}
+}
+
+// connectBranchEngine dials `engine` and wraps it in a branchEngine.
+// Used by `treeman db reset`, which connects fresh (the prepare path
+// builds the adapter from its already-connected driver instead). The
+// returned close func releases the connection.
+func connectBranchEngine(ctx context.Context, cfg *config.Config, engine string) (*branchEngine, func(), error) {
+	scope, label, ok := branchScopeFor(engine)
+	if !ok {
+		return nil, func() {}, nil
+	}
+	switch label {
+	case "mysql":
+		if cfg.Connections.Mysql == nil {
+			return nil, func() {}, fmt.Errorf("connections.mysql not configured")
+		}
+		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return &branchEngine{drv: mysqlNS{drv}, scope: scope, engine: label}, func() { drv.Close() }, nil
+	case "postgres":
+		if cfg.Connections.Postgres == nil {
+			return nil, func() {}, fmt.Errorf("connections.postgres not configured")
+		}
+		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return &branchEngine{drv: postgresNS{drv}, scope: scope, engine: label}, func() { drv.Close() }, nil
+	case "mongodb":
+		if cfg.Connections.Mongodb == nil {
+			return nil, func() {}, fmt.Errorf("connections.mongodb not configured")
+		}
+		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return &branchEngine{drv: mongoNS{drv}, scope: scope, engine: label}, func() { drv.Close(ctx) }, nil
+	case "redis":
+		if cfg.Connections.Redis == nil {
+			return nil, func() {}, fmt.Errorf("connections.redis not configured")
+		}
+		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return &branchEngine{drv: redisNS{drv}, scope: scope, engine: label}, func() { drv.Close() }, nil
+	case "elasticsearch":
+		if cfg.Connections.Elasticsearch == nil {
+			return nil, func() {}, fmt.Errorf("connections.elasticsearch not configured")
+		}
+		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return &branchEngine{drv: esNS{drv}, scope: scope, engine: label}, func() {}, nil
+	default:
+		return nil, func() {}, nil
+	}
+}
+
+// activeNamespace renders the branch-INDEPENDENT active namespace for a
+// branch-scoped database: the DB name / key prefix the app connects to,
+// which must stay stable as the branch changes underneath it. It keys
+// off the worktree's path (not the current branch) so an in-worktree
+// `git checkout` doesn't rename the database.
+//
+// For the main worktree the caller passes a `cfg`/`d` that already has
+// the main_worktree overlay applied (a bare, slug-free template), so
+// the rendered name is constant regardless of the slug.
+func activeNamespace(d config.DatabaseConfig, scope bsScope, worktreePath string) (string, error) {
+	tmpl := d.NameTemplate
+	if scope == scopePrefix {
+		tmpl = d.KeyPrefix
+	}
+	stable := slug.For(worktreePath, "") // branch-independent
+	return template.Render(tmpl, template.FromSlug(stable))
+}
+
+// branchScopedArgs bundles the inputs to runBranchScoped. The adapter
+// (`eng`) is built from the prepare path's already-connected driver, so
+// no second connection is opened. `loadDump` is optional — engines
+// without a static-dump path (e.g. redis) pass nil.
+type branchScopedArgs struct {
+	cfg          *config.Config
+	d            config.DatabaseConfig
+	dbIdx        int
+	tplCtx       template.Context
+	worktreePath string
+	st           *store.Store
+	repoID       int64
+	worktreeID   int64
+	inheritedEnv map[string]string
+
+	eng *branchEngine
+	// loadDump loads the static fallback dump into the active namespace.
+	loadDump func(ctx context.Context, active, dumpPath string) error
+}
+
+// runBranchScoped is the unified swap lifecycle for one branch-scoped
+// database. It runs on every prepare (create + HEAD-switch finalize):
+//
+//   - active doesn't exist → seed it (this branch's durable copy, else
+//     the parent branch's live data, else dump, else empty).
+//   - active exists but unmarked → adopt: back it up as this branch's
+//     durable copy, leave the data in place (first-enable / migrating
+//     an existing DB into the branch-scoped world).
+//   - active exists, marked for a DIFFERENT branch → SWAP: capture the
+//     old branch's data into its durable copy, then fill active with
+//     this branch's data (durable resume, else parent, else leave the
+//     just-captured data as the branch point for a new branch).
+//   - active exists, marked for THIS branch → no-op (just migrate).
+//
+// Migrate runs afterward (idempotent). The `seed:` step runs only when
+// the active namespace was built empty/from-dump — never after a
+// durable/parent restore, which would double-insert.
+func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
+	started := time.Now()
+	active, err := activeNamespace(a.d, a.eng.scope, a.worktreePath)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("render active namespace: %w", err)
+	}
+	branch, _ := a.st.WorktreeBranch(ctx, a.worktreeID)
+	if branch == "" {
+		branch = "_detached"
+	}
+
+	old, hasOld, err := a.st.GetActiveBranch(ctx, a.worktreeID, active)
+	if err != nil {
+		return Outcome{}, err
+	}
+	exists, err := a.eng.drv.Exists(ctx, active)
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	a.event(ctx, "prepare_start", fmt.Sprintf("engine=%s active=%s branch=%s branch_scoped", a.eng.engine, active, branch), nil)
+
+	builtEmpty := false
+	decision := "noop"
+	switch {
+	case !exists:
+		// Fresh: nothing in the active slot. Seed this branch's data.
+		filled, how, ferr := a.fill(ctx, active, branch)
+		if ferr != nil {
+			return Outcome{}, ferr
+		}
+		if !filled {
+			if err := a.eng.drv.Empty(ctx, active); err != nil {
+				return Outcome{}, fmt.Errorf("empty active %s: %w", active, err)
+			}
+			builtEmpty = true
+			if dp, ok, derr := dumpReady(a.d.Dump, a.worktreePath); derr != nil {
+				return Outcome{}, derr
+			} else if ok && a.loadDump != nil {
+				if err := a.loadDump(ctx, active, dp); err != nil {
+					return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
+				}
+				how = "dump"
+			} else {
+				how = "empty"
+			}
+		}
+		decision = "seed:" + how
+
+	case !hasOld:
+		// Active exists but treeman never recorded who owns it — adopt
+		// the current contents as THIS branch's data. Back it up; leave
+		// the data in place. (First-enable on a pre-existing DB.)
+		if err := a.eng.drv.Capture(ctx, active, a.eng.durable(active, branch)); err != nil {
+			return Outcome{}, fmt.Errorf("adopt-capture %s: %w", active, err)
+		}
+		decision = "adopt"
+
+	case old != branch:
+		// Branch switch. Preserve the OLD branch's data, then fill the
+		// active slot with THIS branch's data.
+		if err := a.eng.drv.Capture(ctx, active, a.eng.durable(active, old)); err != nil {
+			return Outcome{}, fmt.Errorf("capture old branch %q: %w", old, err)
+		}
+		filled, how, ferr := a.fill(ctx, active, branch)
+		if ferr != nil {
+			return Outcome{}, ferr
+		}
+		if !filled {
+			// No durable copy and no resolvable parent: the data we just
+			// captured (old branch's state) IS the branch point for a
+			// new branch forked off old. Leave it in place.
+			how = "branch-point"
+		}
+		decision = "swap:" + how
+
+	default:
+		// old == branch: same branch already loaded. Nothing to swap.
+		decision = "noop"
+	}
+
+	if err := a.st.SetActiveBranch(ctx, a.repoID, a.worktreeID, active, branch, a.eng.engine); err != nil {
+		return Outcome{}, fmt.Errorf("record active-branch marker: %w", err)
+	}
+
+	if a.d.Migrate != nil {
+		if err := a.runStep(ctx, runner.FromMigrate(*a.d.Migrate), active, "migrate"); err != nil {
+			return Outcome{}, err
+		}
+	}
+	if a.d.Seed != nil && builtEmpty {
+		if err := a.runStep(ctx, runner.FromSeed(*a.d.Seed), active, "seed"); err != nil {
+			return Outcome{}, err
+		}
+	}
+
+	ms := time.Since(started).Milliseconds()
+	a.event(ctx, "prepare_done",
+		fmt.Sprintf("branch_scoped decision=%s active=%s branch=%s duration=%dms", decision, active, branch, ms),
+		map[string]string{"duration_ms": fmt.Sprintf("%d", ms), "decision": decision})
+
+	return Outcome{Engine: a.eng.engine, SourceDB: active}, nil
+}
+
+// fill populates `active` with `branch`'s data. Order: the branch's own
+// durable copy (resume) → the parent branch's live namespace (seed from
+// upstream). Returns (filled, how) — filled=false means neither source
+// was available and the caller decides the fallback.
+func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool, string, error) {
+	dur := a.eng.durable(active, branch)
+	if ok, _ := a.eng.drv.Exists(ctx, dur); ok {
+		if err := a.eng.drv.Restore(ctx, dur, active); err != nil {
+			return false, "", fmt.Errorf("restore durable copy for %q: %w", branch, err)
+		}
+		return true, "resume", nil
+	}
+	parent, ok, err := resolveBaseSourceDB(ctx, a.st, a.cfg, a.repoPath(ctx), a.repoID, a.dbIdx, a.eng.scope, branch)
+	if err != nil {
+		return false, "", err
+	}
+	if ok && parent != "" && parent != active {
+		if pe, _ := a.eng.drv.Exists(ctx, parent); pe {
+			if err := a.eng.drv.Restore(ctx, parent, active); err != nil {
+				return false, "", fmt.Errorf("seed from parent %q: %w", parent, err)
+			}
+			return true, "parent", nil
+		}
+	}
+	return false, "", nil
+}
+
+func (a branchScopedArgs) repoPath(ctx context.Context) string {
+	p, _ := a.st.RepoPath(ctx, a.repoID)
+	return p
+}
+
+func (a branchScopedArgs) runStep(ctx context.Context, spec runner.Spec, active, label string) error {
+	out, err := runner.Run(ctx, spec, a.worktreePath, active, a.tplCtx, a.inheritedEnv)
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", label, active, err)
+	}
+	if out.ExitCode != 0 {
+		return fmt.Errorf("%s %s exit %d: %s", label, active, out.ExitCode, out.StderrTail)
+	}
+	return nil
+}
+
+func (a branchScopedArgs) event(ctx context.Context, typ, msg string, extra map[string]string) {
+	fields := map[string]string{"engine": a.eng.engine, "mode": "branch_scoped"}
+	for k, v := range extra {
+		fields[k] = v
+	}
+	_ = a.st.WriteEvent(ctx, store.LevelInfo, typ, msg, a.repoID, a.worktreeID, "", 0, fields)
+}
+
+// captureBranchScopedOnTeardown snapshots a worktree's current active
+// namespace into the current branch's durable copy before the worktree
+// is deleted, so re-creating it (or another worktree that later swaps to
+// the same branch) can resume. Best-effort: a failure must not block
+// teardown. The active namespace itself is dropped by the normal
+// teardown path afterward.
+func captureBranchScopedOnTeardown(ctx context.Context, eng *branchEngine, st *store.Store, worktreeID int64, active string) error {
+	branch, ok, err := st.GetActiveBranch(ctx, worktreeID, active)
+	if err != nil || !ok || branch == "" {
+		return err
+	}
+	exists, err := eng.drv.Exists(ctx, active)
+	if err != nil || !exists {
+		return err
+	}
+	return eng.drv.Capture(ctx, active, eng.durable(active, branch))
+}
+
+// teardownBranchScoped handles `wt delete` for one branch_scoped
+// database. It captures the active namespace into the current branch's
+// durable copy (so a re-created worktree at the same path resumes),
+// then drops the active namespace. Durable per-branch copies are
+// intentionally KEPT — they're the whole point of "lives on". Resolves
+// the active namespace from the worktree PATH (branch-independent), so
+// it drops the same name the swap lifecycle created regardless of which
+// branch the worktree currently sits on.
+func teardownBranchScoped(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	scope, _, ok := branchScopeFor(d.Engine)
+	if !ok {
+		return nil
+	}
+	wtPath, err := st.WorktreePathByID(ctx, worktreeID)
+	if err != nil {
+		return err
+	}
+	if wtPath == "" {
+		return nil
+	}
+	active, err := activeNamespace(d, scope, wtPath)
+	if err != nil {
+		return err
+	}
+	eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine)
+	if cerr != nil {
+		return cerr
+	}
+	if eng == nil {
+		return nil
+	}
+	defer closeEng()
+
+	if capErr := captureBranchScopedOnTeardown(ctx, eng, st, worktreeID, active); capErr != nil {
+		_ = st.WriteEvent(ctx, store.LevelWarn, "branch_capture_error",
+			capErr.Error(), repoID, worktreeID, "", 0, nil)
+	}
+	if err := eng.drv.Drop(ctx, active); err != nil {
+		return err
+	}
+	_ = st.ClearActiveBranch(ctx, worktreeID, active)
+	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+		fmt.Sprintf("%s: dropped active %s (branch_scoped; durable copies kept)", d.Engine, active),
+		repoID, worktreeID, "", 0, map[string]any{"engine": d.Engine, "active": active})
+	return nil
+}
+
+// ResetBranchScoped drops the current branch's durable copy AND clears
+// the active-branch marker for every branch_scoped database, so the
+// next prepare re-seeds the active namespace from the live parent
+// branch. Backs `treeman db reset`. `engineFilter` (lowercased)
+// restricts the reset to one engine when non-empty.
+func ResetBranchScoped(
+	ctx context.Context,
+	cfg *config.Config,
+	worktreePath string,
+	repoID, worktreeID int64,
+	st *store.Store,
+	engineFilter string,
+) error {
+	for i, d := range cfg.Databases {
+		if !d.BranchScoped {
+			continue
+		}
+		if engineFilter != "" && d.Engine != engineFilter {
+			continue
+		}
+		scope, _, ok := branchScopeFor(d.Engine)
+		if !ok {
+			continue
+		}
+		active, err := activeNamespace(d, scope, worktreePath)
+		if err != nil {
+			return fmt.Errorf("render active namespace for %s: %w", d.Engine, err)
+		}
+		eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine)
+		if cerr != nil {
+			return cerr
+		}
+		if eng == nil {
+			continue
+		}
+		// Drop the durable copy for whatever branch currently owns the
+		// active slot (so a re-seed can't restore the stale copy).
+		if branch, has, _ := st.GetActiveBranch(ctx, worktreeID, active); has && branch != "" {
+			_ = eng.drv.DropDurable(ctx, eng.durable(active, branch))
+		}
+		_ = eng.drv.Empty(ctx, active)
+		closeEng()
+		if err := st.ClearActiveBranch(ctx, worktreeID, active); err != nil {
+			return err
+		}
+		_ = st.WriteEvent(ctx, store.LevelInfo, "db_reset",
+			fmt.Sprintf("%s: cleared active %s + durable copy", d.Engine, active),
+			repoID, worktreeID, "", 0, map[string]string{"engine": d.Engine, "active": active})
+		_ = i
+	}
+	return nil
+}

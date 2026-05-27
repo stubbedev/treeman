@@ -92,6 +92,103 @@ func RunPrepareOnWorktree(ctx context.Context, worktree, repoOverride string) ([
 	return prepare.Run(ctx, &cfg, wt, sl, st, repoID, wtID, CaptureInheritedEnv())
 }
 
+// DbCmd — `treeman db reset` re-syncs a worktree's
+// branch_scoped databases from the live base branch. Drops
+// the per-slug divergent snapshot + the current per-worktree DB,
+// then re-runs prepare so the DB is repopulated from the base.
+func DbCmd() *cli.Command {
+	return &cli.Command{
+		Name:  "db",
+		Usage: "per-worktree database operations",
+		Commands: []*cli.Command{
+			{
+				Name:      "reset",
+				Usage:     "re-sync branch_scoped databases from the live base branch (defaults to the cwd's worktree)",
+				ArgsUsage: "[worktree]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+					&cli.StringFlag{Name: "engine", Usage: "restrict the reset to one engine (mysql|postgres|mongodb)"},
+					&cli.BoolFlag{Name: "json"},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					wt := c.Args().First()
+					outs, err := RunDbResetOnWorktree(ctx, wt, c.String("repo"), strings.ToLower(c.String("engine")))
+					if err != nil {
+						return err
+					}
+					if c.Bool("json") {
+						return jsonStream(map[string]any{"outcomes": outs})
+					}
+					for _, o := range outs {
+						fmt.Printf("[%s] %s re-seeded from base\n", o.Engine, o.SourceDB)
+					}
+					if len(outs) == 0 {
+						PrintInfo("no branch_scoped databases configured")
+					}
+					return nil
+				},
+			},
+		},
+	}
+}
+
+// RunDbResetOnWorktree resolves the worktree + repo, drops every
+// branch_scoped database (and its per-slug snapshot), then
+// re-runs prepare so each is repopulated from the live base branch.
+func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.Outcome, error) {
+	wt := worktree
+	if wt == "" {
+		cwd, _ := os.Getwd()
+		wt = cwd
+	}
+	wt = MustAbs(wt)
+	repoRoot, err := resolveRepo(repoOverride)
+	if err != nil {
+		repoRoot, err = DiscoverRepoRoot(wt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	branch := detectBranchOfWorktree(wt)
+	sl := slug.For(wt, branch)
+	dbPath, _ := store.DefaultDBPath()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	wtID, _ := st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
+	if err := prepare.ResetBranchScoped(ctx, &cfg, wt, repoID, wtID, st, engineFilter); err != nil {
+		return nil, err
+	}
+	outs, err := prepare.Run(ctx, &cfg, wt, sl, st, repoID, wtID, CaptureInheritedEnv())
+	if err != nil {
+		return outs, err
+	}
+	// Surface only the seeded databases the reset actually touched.
+	var seeded []prepare.Outcome
+	for _, o := range outs {
+		for _, d := range cfg.Databases {
+			if !d.BranchScoped {
+				continue
+			}
+			if engineFilter != "" && d.Engine != engineFilter {
+				continue
+			}
+			if d.Engine == o.Engine {
+				seeded = append(seeded, o)
+				break
+			}
+		}
+	}
+	return seeded, nil
+}
+
 // HookCmd — `treeman hook run <phase>` runs the configured hooks
 // for that phase against the cwd's repo + worktree.
 func HookCmd() *cli.Command {

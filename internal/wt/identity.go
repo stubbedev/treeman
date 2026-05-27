@@ -61,7 +61,15 @@ func ResolveIdentity(
 		wtID, err := st.EnsureMainWorktree(ctx, repoID, wtPath, sl.Value, branch)
 		return Identity{Slug: sl, WtID: wtID, Branch: branch, IsMain: true}, err
 	}
-	sl := slug.For(wtPath, branch)
+	// A linked worktree's slug is keyed off its PATH, not its current
+	// branch: the directory is fixed for the worktree's lifetime, so
+	// `slug.For(wtPath, "")` is stable across an in-worktree
+	// `git checkout`. This keeps a worktree's DB names / patched `.env`
+	// / ports fixed while the branch swaps underneath it — the
+	// foundation `branch_scoped` swapping relies on. For the common
+	// case (the worktree directory was named after its branch at
+	// `wt create`) this is identical to `slug.For(wtPath, branch)`.
+	sl := slug.For(wtPath, "")
 	wtID, err := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, branch)
 	return Identity{Slug: sl, WtID: wtID, Branch: branch, IsMain: false}, err
 }
