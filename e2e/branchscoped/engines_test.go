@@ -287,6 +287,66 @@ func TestDbResetReseedsFromParentMySQL(t *testing.T) {
 	assertItems(t, active, "base")
 }
 
+// ─── TestDbResetDropsActiveExactNotPrefixMySQL ───────────────────────
+//
+// The data-loss regression: `db reset` must drop the EXACT active
+// database, never a `LIKE 'name%'` prefix family. On the main worktree
+// the branch_scoped active DB is the bare, overlay-resolved app name
+// (e.g. `tm_bsexact`), which is a prefix of every linked worktree's
+// `tm_bsexact_<slug>`. The pre-fix code routed the active drop through
+// DropMatching (prefix), so a reset at the repo root wiped every sibling
+// worktree's database. Here a reset on the bare-name active must leave
+// the prefix-sharing sibling DB untouched.
+func TestDbResetDropsActiveExactNotPrefixMySQL(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitMySQL(t)
+	ctx := context.Background()
+
+	const mainDB = "tm_bsexact"            // bare active (main worktree, overlay-resolved)
+	const siblingDB = "tm_bsexact_feature" // a linked worktree's active — shares the prefix
+	for _, db := range []string{mainDB, siblingDB} {
+		db := db
+		dropMySQL(t, db)
+		mustExec(t, mysqlAdmin, "CREATE DATABASE "+db)
+		t.Cleanup(func() { dropMySQL(t, db) })
+	}
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mysql: &config.MysqlConn{Host: "127.0.0.1", Port: 13390, User: "root", Password: "rootpw"},
+		},
+		// No `{slug}` in the template → renders to the bare constant name,
+		// modelling the main worktree's overlay-resolved active DB.
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mysql",
+			NameTemplate: mainDB,
+			BranchScoped: true,
+		}},
+	}
+
+	st := openStore(t)
+	repoRoot := t.TempDir()
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtID, err := st.EnsureWorktree(ctx, repoID, repoRoot, "main", "develop")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := prepare.ResetBranchScoped(ctx, cfg, repoRoot, repoID, wtID, st, ""); err != nil {
+		t.Fatalf("ResetBranchScoped: %v", err)
+	}
+
+	if mysqlDBExists(t, mainDB) {
+		t.Fatalf("reset should have dropped the exact active db %q", mainDB)
+	}
+	if !mysqlDBExists(t, siblingDB) {
+		t.Fatalf("reset dropped sibling %q via a prefix match — exact-drop regression", siblingDB)
+	}
+}
+
 // ─── TestWorktreeDeleteKeepsDurableMySQL ─────────────────────────────
 //
 // `wt delete` teardown must capture the active namespace into the current

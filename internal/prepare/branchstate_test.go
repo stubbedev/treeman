@@ -16,7 +16,12 @@ import (
 // the namespace "exists" iff a map is present for its name. It models
 // the four swap primitives so the swap orchestrator can be tested
 // without a real engine.
-type fakeNS struct{ data map[string]map[string]string }
+type fakeNS struct {
+	data map[string]map[string]string
+	// restoreErr, when set, makes Restore fail without mutating — models
+	// a crash partway through filling the active namespace.
+	restoreErr error
+}
 
 func newFakeNS() *fakeNS { return &fakeNS{data: map[string]map[string]string{}} }
 
@@ -41,6 +46,9 @@ func (f *fakeNS) Capture(_ context.Context, active, durable string) error {
 	return nil
 }
 func (f *fakeNS) Restore(_ context.Context, durable, active string) error {
+	if f.restoreErr != nil {
+		return f.restoreErr
+	}
 	src, ok := f.data[durable]
 	if !ok {
 		return fmt.Errorf("restore: durable %q missing", durable)
@@ -299,4 +307,51 @@ func TestResetReseedsFromParent(t *testing.T) {
 	f.run("develop")
 	f.assertActive("base")
 	f.assertMarker("develop")
+}
+
+// TestBranchScopedSwapAdvancesMarkerBeforeFill locks the crash-safety
+// ordering: on a branch switch the active-branch marker must advance to
+// the NEW branch the moment the OLD branch's data is safe in its durable
+// copy — BEFORE fill mutates the active slot. Otherwise a daemon crash
+// between fill and the (old) end-of-function marker write would leave the
+// marker pointing at the old branch while the active slot holds the new
+// branch's data; the next prepare would then re-capture that new data
+// into the old branch's durable copy and destroy it.
+//
+// Here Restore is rigged to fail (a crash partway through fill). With the
+// fixed ordering the marker is already "feature" and develop's durable
+// copy is intact; the pre-fix ordering would leave the marker at
+// "develop".
+func TestBranchScopedSwapAdvancesMarkerBeforeFill(t *testing.T) {
+	ctx := context.Background()
+	f := newBSFixture(t)
+
+	// develop diverged with real data, adopted (durable + marker).
+	f.set(f.active, map[string]string{"develop": "1"})
+	f.run("develop")
+
+	// Switch to feature, but fill fails partway (simulated crash).
+	f.set("parentdb", map[string]string{"base": "1"})
+	f.parent = func(string) (string, bool, error) { return "parentdb", true, nil }
+	f.fake.restoreErr = fmt.Errorf("simulated crash mid-fill")
+	if _, err := f.st.EnsureWorktree(ctx, f.repoID, f.worktreePath, "wtslug", "feature"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := runBranchScoped(ctx, branchScopedArgs{
+		cfg: f.cfg, d: f.d, dbIdx: 0, worktreePath: f.worktreePath,
+		st: f.st, repoID: f.repoID, worktreeID: f.worktreeID, eng: f.eng,
+		resolveParent: func(_ context.Context, b string) (string, bool, error) { return f.parent(b) },
+	})
+	if err == nil {
+		t.Fatal("expected the rigged fill failure to surface")
+	}
+
+	// Marker advanced to feature before fill (pre-fix: still "develop").
+	if got, _, _ := f.st.GetActiveBranch(ctx, f.worktreeID, f.active); got != "feature" {
+		t.Fatalf("marker must advance to feature before fill so a re-run can't clobber develop's durable copy; got %q", got)
+	}
+	// develop's durable copy survived the failed swap intact.
+	if dd := f.fake.data[f.durable("develop")]; dd["develop"] != "1" {
+		t.Fatalf("durable(develop) must survive a failed swap, got %v", dd)
+	}
 }

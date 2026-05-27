@@ -521,3 +521,19 @@ func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
 	_, err = d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
 	return err
 }
+
+// DropDatabase drops EXACTLY the named database — never a prefix match.
+// Unlike DropMatching (which is `LIKE 'name%'` and used to reap a
+// worktree's whole clone family), this touches only the single name
+// given. branch_scoped teardown/reset/empty must use it: the active
+// namespace there is often a bare app DB name (e.g. `kontainer`) that
+// is a prefix of every linked worktree's `kontainer_<slug>`, so a
+// prefix drop would wipe sibling worktrees' databases. Idempotent.
+func (d *Driver) DropDatabase(ctx context.Context, name string) error {
+	qn, err := ident.QuoteMySQL(name)
+	if err != nil {
+		return err
+	}
+	_, err = d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qn)
+	return err
+}

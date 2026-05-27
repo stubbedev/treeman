@@ -405,6 +405,16 @@ swap whole databases; prefix-scoped engines (Redis,
 Elasticsearch/OpenSearch) swap the key/index namespace under the
 rendered `key_prefix`. All five participate.
 
+Mutually exclusive with `test_clones` / `fanout`: a branch_scoped
+database is a stateful per-branch snapshot the app mutates in
+place, not a reproducible source for throwaway parallel-test
+clones. Config-load rejects the combination.
+
+Postgres caveat: seeding a branch from its parent branch's LIVE
+database uses `CREATE DATABASE … TEMPLATE`, which Postgres refuses
+while other sessions are connected to the parent. Close those
+connections, or set `dump.path` to seed from the dump instead.
+
 ### DatabaseOverlay
 
 DatabaseOverlay holds the subset of `DatabaseConfig` fields that

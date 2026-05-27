@@ -121,6 +121,41 @@ func TestValidate(t *testing.T) {
 			},
 			want: "unknown template key: port_octane",
 		},
+		{
+			name: "branch_scoped and test_clones are mutually exclusive",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "mysql",
+					NameTemplate: "app_{slug}",
+					BranchScoped: true,
+					TestClones:   &TestClonesSpec{NameTemplate: "app_{slug}_test_{n}"},
+				}},
+			},
+			want: "branch_scoped and test_clones are mutually exclusive",
+		},
+		{
+			name: "branch_scoped rejects fanout",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "postgres",
+					NameTemplate: "app_{slug}",
+					BranchScoped: true,
+					Fanout:       8,
+				}},
+			},
+			want: "branch_scoped databases do not fan out",
+		},
+		{
+			name: "branch_scoped alone is valid",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "mysql",
+					NameTemplate: "app_{slug}",
+					BranchScoped: true,
+				}},
+			},
+			want: "",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

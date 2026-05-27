@@ -193,5 +193,23 @@ func (d DatabaseConfig) validate(path string) error {
 			path+".test_clones.name_template", d.TestClones.NameTemplate,
 			template.Scope{AllowN: true}))
 	}
+
+	// branch_scoped and the test-clone fanout are mutually exclusive. A
+	// branch_scoped database is a stateful per-branch snapshot the app
+	// mutates in place; test clones are throwaway, reproducible copies
+	// pre-warmed for parallel test workers. The two models contradict
+	// each other (one swaps live data per branch, the other fans a
+	// migrations-only template into N disposable replicas), so reject
+	// the combination at config-load instead of silently ignoring one.
+	if d.BranchScoped {
+		if d.TestClones != nil {
+			errs = appendIfErr(errs, fmt.Errorf(
+				"%s: branch_scoped and test_clones are mutually exclusive — a branch_scoped database is a stateful per-branch snapshot, not a reproducible test-clone source", path))
+		}
+		if d.Fanout > 0 {
+			errs = appendIfErr(errs, fmt.Errorf(
+				"%s: branch_scoped databases do not fan out — remove `fanout` (it only applies to the test-clone path)", path))
+		}
+	}
 	return errors.Join(errs...)
 }

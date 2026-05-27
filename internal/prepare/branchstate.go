@@ -3,6 +3,7 @@ package prepare
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"lukechampine.com/blake3"
@@ -37,7 +38,7 @@ type nsDriver interface {
 	Capture(ctx context.Context, active, durable string) error // active → durable
 	Restore(ctx context.Context, durable, active string) error // durable → active (drops active first)
 	Empty(ctx context.Context, active string) error            // reset active to an empty, present namespace
-	Drop(ctx context.Context, ns string) error                 // remove the namespace entirely
+	Drop(ctx context.Context, ns string) error                 // remove the namespace entirely (EXACT for name-scoped; prefix for prefix-scoped)
 	DropDurable(ctx context.Context, durable string) error
 }
 
@@ -75,6 +76,26 @@ func (b *branchEngine) durable(active, branch string) string {
 	}
 }
 
+// parentSeedHint appends actionable guidance to a parent-seed failure.
+// Seeding a branch_scoped DB from its parent branch's LIVE database is
+// a whole-database copy. Postgres implements that copy as
+// `CREATE DATABASE … TEMPLATE parent`, which the server refuses while
+// any other session is connected to `parent` ("is being accessed by
+// other users") — the common case when the app or another worktree is
+// pointed at the base-branch DB. Surface the fix rather than leaking the
+// raw driver error.
+func parentSeedHint(engine string, err error) string {
+	if engine != "postgres" || err == nil {
+		return ""
+	}
+	if strings.Contains(err.Error(), "being accessed by other users") {
+		return " (postgres copies the parent db with CREATE DATABASE … TEMPLATE, " +
+			"which fails while other sessions are connected to it — close connections " +
+			"to the base-branch database, or set `dump.path` so seeding uses the dump instead)"
+	}
+	return ""
+}
+
 func bsHash(s string) string {
 	sum := blake3.Sum256([]byte(s))
 	const hexDigits = "0123456789abcdef"
@@ -99,14 +120,16 @@ func (a mysqlNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
 func (a mysqlNS) Empty(ctx context.Context, active string) error {
-	if _, err := a.d.DropMatching(ctx, active); err != nil {
+	// EXACT drop, not DropMatching: a branch_scoped DB never fans out
+	// into a clone family, and the active name (bare on the main
+	// worktree) is a prefix of sibling worktrees' DBs.
+	if err := a.d.DropDatabase(ctx, active); err != nil {
 		return err
 	}
 	return a.d.EnsureDB(ctx, active)
 }
 func (a mysqlNS) Drop(ctx context.Context, ns string) error {
-	_, err := a.d.DropMatching(ctx, ns)
-	return err
+	return a.d.DropDatabase(ctx, ns)
 }
 func (a mysqlNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
@@ -124,14 +147,14 @@ func (a postgresNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
 func (a postgresNS) Empty(ctx context.Context, active string) error {
-	if _, err := a.d.DropMatching(ctx, active); err != nil {
+	// EXACT drop, not DropMatching — see mysqlNS.Empty.
+	if err := a.d.DropDatabase(ctx, active); err != nil {
 		return err
 	}
 	return a.d.EnsureDB(ctx, active)
 }
 func (a postgresNS) Drop(ctx context.Context, ns string) error {
-	_, err := a.d.DropMatching(ctx, ns)
-	return err
+	return a.d.DropDatabase(ctx, ns)
 }
 func (a postgresNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
@@ -149,12 +172,12 @@ func (a mongoNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
 func (a mongoNS) Empty(ctx context.Context, active string) error {
-	_, err := a.d.DropMatching(ctx, active)
-	return err
+	// EXACT drop, not DropMatching — see mysqlNS.Empty. Mongo creates
+	// databases lazily on first write, so a dropped name is "empty".
+	return a.d.DropDatabase(ctx, active)
 }
 func (a mongoNS) Drop(ctx context.Context, ns string) error {
-	_, err := a.d.DropMatching(ctx, ns)
-	return err
+	return a.d.DropDatabase(ctx, ns)
 }
 func (a mongoNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
@@ -421,6 +444,16 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 		if err := a.eng.drv.Capture(ctx, active, a.eng.durable(active, old)); err != nil {
 			return Outcome{}, fmt.Errorf("capture old branch %q: %w", old, err)
 		}
+		// Advance the marker to the NEW branch the instant old's data is
+		// safe in its durable copy — BEFORE fill mutates the active slot.
+		// If the daemon dies mid-fill, the next prepare sees old==branch
+		// and takes the noop path instead of re-capturing the (now
+		// new-branch) active back into durable(old) and clobbering it.
+		// The trade-off is a possibly-stale active on crash, recoverable
+		// with `treeman db reset`; no durable copy is ever destroyed.
+		if err := a.st.SetActiveBranch(ctx, a.repoID, a.worktreeID, active, branch, a.eng.engine); err != nil {
+			return Outcome{}, fmt.Errorf("record active-branch marker (pre-fill): %w", err)
+		}
 		filled, how, ferr := a.fill(ctx, active, branch)
 		if ferr != nil {
 			return Outcome{}, ferr
@@ -480,7 +513,8 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 	if ok && parent != "" && parent != active {
 		if pe, _ := a.eng.drv.Exists(ctx, parent); pe {
 			if err := a.eng.drv.Restore(ctx, parent, active); err != nil {
-				return false, "", fmt.Errorf("seed from parent %q: %w", parent, err)
+				return false, "", fmt.Errorf("seed %q from parent branch's live db %q: %w%s",
+					active, parent, err, parentSeedHint(a.eng.engine, err))
 			}
 			return true, "parent", nil
 		}

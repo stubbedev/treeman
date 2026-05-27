@@ -291,6 +291,22 @@ func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
 	return err
 }
 
+// DropDatabase drops EXACTLY the named database — never a prefix match.
+// Unlike DropMatching (`LIKE 'name%'`, used to reap a worktree's whole
+// clone family), this touches only the single name given. branch_scoped
+// teardown/reset/empty must use it: the active namespace there is often
+// a bare app DB name that is a prefix of every linked worktree's
+// `name_<slug>`, so a prefix drop would wipe sibling worktrees'
+// databases. Idempotent.
+func (d *Driver) DropDatabase(ctx context.Context, name string) error {
+	qn, err := ident.QuotePostgres(name)
+	if err != nil {
+		return err
+	}
+	_, err = d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qn)
+	return err
+}
+
 // DatabaseExists returns true iff the named DB is present in
 // pg_database. Mirrors the MySQL driver's same-named method so the
 // snapshot cache hit path is engine-agnostic at the call-site.
