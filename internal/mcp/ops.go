@@ -167,15 +167,91 @@ func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.O
 	if err != nil {
 		return nil, err
 	}
-	sl := slug.For(wt, branch)
 	st, err := openStore(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer st.Close()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	wtID, _ := st.EnsureWorktree(ctx, repoID, wt, sl.Value, branch)
-	return prepare.Run(ctx, &cfg, wt, sl, st, repoID, wtID, captureEnv())
+	// Route through ResolveIdentity so MCP matches the daemon + CLI: the
+	// main-worktree overlay is applied (bare active DB name) and a linked
+	// worktree's slug is its branch-independent path slug. Required for
+	// branch_scoped to keep a stable active namespace across an in-worktree
+	// checkout — bare slug.For(wt, branch) would churn the namespace.
+	id, err := wtpkg.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, captureEnv())
+}
+
+// runDbReset is the self-contained equivalent of cmd's
+// RunDbResetOnWorktree: drops every branch_scoped database's active
+// namespace + current durable copy, then re-runs prepare so each is
+// re-seeded from the live base branch. engineFilter (lowercased)
+// restricts the reset to one engine family when non-empty. Returns only
+// the branch_scoped outcomes the reset actually re-seeded.
+func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.Outcome, error) {
+	wt, branch := resolveWorktree(worktree)
+	repoRoot, err := resolveRepo(repoOverride)
+	if err != nil {
+		repoRoot, err = gitenv.MainRoot(wt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	// Same identity routing as runPrepare — reset must operate on the very
+	// active namespace the swap lifecycle created (bare on the main worktree).
+	id, err := wtpkg.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
+		return nil, err
+	}
+	if err := prepare.ResetBranchScoped(ctx, &cfg, wt, repoID, id.WtID, st, engineFilter); err != nil {
+		return nil, err
+	}
+	outs, err := prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, captureEnv())
+	if err != nil {
+		return outs, err
+	}
+	// Surface only the branch_scoped databases the reset touched, matched on
+	// the canonical engine family so an alias (mariadb/postgresql/…) and an
+	// `--engine` filter written as the family name both line up.
+	filterLabel := engineFilter
+	if engineFilter != "" {
+		if lbl, ok := prepare.CanonicalEngine(engineFilter); ok {
+			filterLabel = lbl
+		}
+	}
+	var seeded []prepare.Outcome
+	for _, o := range outs {
+		for _, d := range cfg.Databases {
+			if !d.BranchScoped {
+				continue
+			}
+			label, ok := prepare.CanonicalEngine(d.Engine)
+			if !ok {
+				continue
+			}
+			if filterLabel != "" && label != filterLabel {
+				continue
+			}
+			if label == o.Engine {
+				seeded = append(seeded, o)
+				break
+			}
+		}
+	}
+	return seeded, nil
 }
 
 // runHookPhase synchronously executes one hook phase. Mirrors cmd's
