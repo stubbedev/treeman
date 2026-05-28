@@ -97,11 +97,11 @@ func TestMainWorktreeOnFileChange(t *testing.T) {
 	requireGit(t)
 
 	cases := []struct {
-		name          string
-		overlayBlock  string // YAML under `main_worktree:` (after `enabled: true`)
-		wantDBPrefix  string // TREEMAN_WATCH_DB_NAME prefix the witness must start with
-		wantSlugInDB  string // The main row's slug column post-event
-		branch        string // git branch at which the event fires
+		name         string
+		overlayBlock string // YAML under `main_worktree:` (after `enabled: true`)
+		wantDBPrefix string // TREEMAN_WATCH_DB_NAME prefix the witness must start with
+		wantSlugInDB string // The main row's slug column post-event
+		branch       string // git branch at which the event fires
 	}{
 		{
 			name:         "NoOverlay",
@@ -371,4 +371,3 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) string {
 	t.Fatalf("file %s never appeared (or stayed empty) within %s", path, timeout)
 	return ""
 }
-

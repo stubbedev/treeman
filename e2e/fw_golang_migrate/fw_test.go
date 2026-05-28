@@ -6,11 +6,11 @@
 // $GOPATH/bin.
 //
 // Flow:
-//   1. boot postgres
-//   2. install migrate binary into tempdir
-//   3. write treeman config with migrate.run = "<tempdir>/migrate up"
-//   4. run prepare → expect migrate to apply *.up.sql
-//   5. verify the created table exists
+//  1. boot postgres
+//  2. install migrate binary into tempdir
+//  3. write treeman config with migrate.run = "<tempdir>/migrate up"
+//  4. run prepare → expect migrate to apply *.up.sql
+//  5. verify the created table exists
 package fw_golang_migrate_e2e
 
 import (

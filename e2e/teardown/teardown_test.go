@@ -3,8 +3,8 @@
 // Package teardown_e2e verifies what TeardownWorktree actually
 // removes from the engine. Specifically:
 //
-//   • Source DB and all paratest clone DBs are DROPPED.
-//   • The fingerprint-keyed TEMPLATE remains so the next worktree
+//   - Source DB and all paratest clone DBs are DROPPED.
+//   - The fingerprint-keyed TEMPLATE remains so the next worktree
 //     with the same inputs hits the cache.
 //
 // This is the production guarantee — `treeman wt delete` must clean

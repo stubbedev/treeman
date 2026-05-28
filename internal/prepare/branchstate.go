@@ -233,17 +233,6 @@ func (a esNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
 
-// CanonicalEngine maps a configured engine identifier to the canonical
-// branch-scoped family label (mariadb/tidb → mysql, postgresql →
-// postgres, opensearch → elasticsearch), reporting ok=false for
-// unrecognised engines. Thin wrapper over engine.Canonical kept for
-// the existing callers in cmd/, mcp/, and within this package. New
-// code should call engine.Canonical directly.
-func CanonicalEngine(eng string) (string, bool) {
-	fam, ok := engine.Canonical(eng)
-	return string(fam), ok
-}
-
 // branchScopeFor reports the scope + canonical engine label for a
 // configured engine, ok=false for unrecognised engines.
 func branchScopeFor(eng string) (bsScope, string, bool) {
@@ -649,8 +638,8 @@ func ResetBranchScoped(
 	// `postgresql`, etc.
 	filterLabel := engineFilter
 	if engineFilter != "" {
-		if lbl, ok := CanonicalEngine(engineFilter); ok {
-			filterLabel = lbl
+		if fam, ok := engine.Canonical(engineFilter); ok {
+			filterLabel = string(fam)
 		}
 	}
 	for _, d := range cfg.Databases {

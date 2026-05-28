@@ -3,9 +3,9 @@
 // Package containerref_e2e drives treeman against MySQL containers
 // referenced by NAME (not host:port), exercising containerip.ResolveAddr:
 //
-//   • TestPublishedPort       — container has -p 13366:3306; treeman
+//   - TestPublishedPort       — container has -p 13366:3306; treeman
 //     must dial 127.0.0.1:13366.
-//   • TestBridgeNetworkIP     — container has no ports: block;
+//   - TestBridgeNetworkIP     — container has no ports: block;
 //     treeman must dial the bridge-network IP + internal 3306.
 //
 // Both omit `host:` from the YAML to force the resolution path.

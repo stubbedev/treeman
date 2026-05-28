@@ -66,7 +66,7 @@ func buildConfig() *config.Config {
 			{
 				Engine:       "redis",
 				NameTemplate: "treeman_e2e_{slug}",
-				KeyPrefix: "wte2e:{slug}:",
+				KeyPrefix:    "wte2e:{slug}:",
 				Seed: &config.Step{
 					Run: "./fixtures/seed.sh",
 					Env: map[string]string{

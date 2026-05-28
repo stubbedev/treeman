@@ -3,9 +3,9 @@
 // Package fanout_e2e exercises test_clones: building N parallel
 // clone DBs from the cached template. Asserts:
 //
-//   • Each declared clone DB exists.
-//   • Each clone has the same schema as the source.
-//   • Clones are populated from the template (no fresh migrate).
+//   - Each declared clone DB exists.
+//   - Each clone has the same schema as the source.
+//   - Clones are populated from the template (no fresh migrate).
 package fanout_e2e
 
 import (

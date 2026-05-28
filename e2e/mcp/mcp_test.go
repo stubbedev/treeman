@@ -3,11 +3,11 @@
 // Package mcp_e2e drives the `treeman mcp` server over its stdio
 // JSON-RPC transport. Sequence:
 //
-//   1. Spawn `treeman mcp` with stdin/stdout pipes.
-//   2. Send `initialize` → expect `result.serverInfo.name == "treeman"`.
-//   3. Send `tools/list` → expect a non-empty tool list including
-//      at least one well-known tool (`status` or `worktree_list`).
-//   4. Send `tools/call` for `status` → expect a structured result.
+//  1. Spawn `treeman mcp` with stdin/stdout pipes.
+//  2. Send `initialize` → expect `result.serverInfo.name == "treeman"`.
+//  3. Send `tools/list` → expect a non-empty tool list including
+//     at least one well-known tool (`status` or `worktree_list`).
+//  4. Send `tools/call` for `status` → expect a structured result.
 //
 // Validates that the binary exposes a working MCP transport — the
 // integration point IDEs and other clients depend on.

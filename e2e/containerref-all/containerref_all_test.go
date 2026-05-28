@@ -3,8 +3,8 @@
 // Package containerref_all_e2e covers containerip.ResolveAddr against
 // every engine in both modes:
 //
-//   • published-port (-p HOST:CONTAINER) — most common dev setup
-//   • bridge-network IP (no ports: block) — Linux-routable fallback
+//   - published-port (-p HOST:CONTAINER) — most common dev setup
+//   - bridge-network IP (no ports: block) — Linux-routable fallback
 //
 // 10 containers boot once (one compose), 10 subtests run against
 // them. The non-mysql engines run the same minimal happy path: drop
