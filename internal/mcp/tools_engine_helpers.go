@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -10,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/klauspost/compress/gzip"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/stubbedev/treeman/internal/config"

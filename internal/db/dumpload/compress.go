@@ -6,11 +6,11 @@ package dumpload
 import (
 	"bufio"
 	"compress/bzip2"
-	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
 
+	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 )
