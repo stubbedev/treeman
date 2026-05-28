@@ -122,6 +122,132 @@ func TestCleanLeavesNonPatchedKeys(t *testing.T) {
 	}
 }
 
+// TestCleanStripsKeysAbsentFromHEAD_Dotenv is the regression test
+// for the bug that caused kontainer `.env.testing` to show as
+// modified on every fresh worktree: `patches[].set` listed
+// `DB_DATABASE`, `REDIS_CACHE_DATABASE`, `REDIS_QUEUE_DATABASE` —
+// none of which existed in HEAD's `.env.testing`. Apply appended
+// them on smudge, but Clean only restored keys that HEAD already
+// had. The appended lines stayed in the index after
+// `git add --renormalize`, leaving the file permanently dirty.
+//
+// Fix contract: any `set:` key absent from HEAD must be STRIPPED
+// from clean's output, so clean(working) == HEAD verbatim.
+func TestCleanStripsKeysAbsentFromHEAD_Dotenv(t *testing.T) {
+	canonical := "FOO=bar\n"
+	working := "FOO=bar\nDB_DATABASE=app_feat-x\nREDIS_QUEUE_DATABASE=13\n"
+	p := config.Patch{File: ".env", Set: map[string]string{
+		"DB_DATABASE":          "app_{slug}",
+		"REDIS_QUEUE_DATABASE": "{slug_redis_queue}",
+	}}
+
+	clean, err := Clean(p, working, canonical)
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if clean != canonical {
+		t.Fatalf("clean(working) != canonical\nwant: %q\ngot:  %q", canonical, clean)
+	}
+}
+
+func TestCleanStripsKeysAbsentFromHEAD_Phpunit(t *testing.T) {
+	canonical := `<?xml version="1.0"?>
+<phpunit>
+	<php>
+		<env name="FOO" value="kept" force="true"/>
+	</php>
+</phpunit>
+`
+	working := `<?xml version="1.0"?>
+<phpunit>
+	<php>
+		<env name="FOO" value="kept" force="true"/>
+		<env name="DB_DATABASE" value="app_feat-x" force="true"/>
+	</php>
+</phpunit>
+`
+	p := config.Patch{File: "phpunit.xml", Format: "phpunit", Set: map[string]string{
+		"DB_DATABASE": "app_{slug}",
+	}}
+	clean, err := Clean(p, working, canonical)
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if clean != canonical {
+		t.Fatalf("clean(working) != canonical\nwant: %q\ngot:  %q", canonical, clean)
+	}
+}
+
+func TestCleanStripsKeysAbsentFromHEAD_Mixed(t *testing.T) {
+	// Half the patched keys exist in HEAD (restore to HEAD), half don't
+	// (strip). End state must equal HEAD verbatim — modulo the
+	// non-patched user line that's also present in HEAD.
+	canonical := "EXISTING=v1\nKEPT=user\n"
+	working := "EXISTING=v1_feat-x\nKEPT=user\nAPPENDED=feat-x\n"
+	p := config.Patch{File: ".env", Set: map[string]string{
+		"EXISTING": "v1_{slug}",
+		"APPENDED": "{slug}",
+	}}
+	clean, err := Clean(p, working, canonical)
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if clean != canonical {
+		t.Fatalf("clean(working) != canonical\nwant: %q\ngot:  %q", canonical, clean)
+	}
+}
+
+func TestCleanStripsKeysAbsentFromHEAD_YAML(t *testing.T) {
+	canonical := "kept: v1\n"
+	working := "kept: v1\nappended: feat-x\n"
+	p := config.Patch{File: "config.yml", Set: map[string]string{
+		"appended": "{slug}",
+	}}
+	clean, err := Clean(p, working, canonical)
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if strings.TrimSpace(clean) != strings.TrimSpace(canonical) {
+		t.Fatalf("clean(working) != canonical\nwant: %q\ngot:  %q", canonical, clean)
+	}
+}
+
+func TestCleanStripsKeysAbsentFromHEAD_JSON(t *testing.T) {
+	canonical := `{"kept":"v1"}`
+	working := `{"kept":"v1","appended":"feat-x"}`
+	p := config.Patch{File: "config.json", Set: map[string]string{
+		"appended": "{slug}",
+	}}
+	clean, err := Clean(p, working, canonical)
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if !strings.Contains(clean, `"kept": "v1"`) {
+		t.Errorf("kept key missing: %q", clean)
+	}
+	if strings.Contains(clean, "appended") {
+		t.Errorf("appended key not stripped: %q", clean)
+	}
+}
+
+func TestCleanStripsKeysAbsentFromHEAD_INI(t *testing.T) {
+	canonical := "[database]\nkept = v1\n"
+	working := "[database]\nkept = v1\nappended = feat-x\n"
+	p := config.Patch{File: "config.ini", Set: map[string]string{
+		"database.appended": "{slug}",
+	}}
+	clean, err := Clean(p, working, canonical)
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if !strings.Contains(clean, "kept") {
+		t.Errorf("kept key missing: %q", clean)
+	}
+	if strings.Contains(clean, "appended") {
+		t.Errorf("appended key not stripped: %q", clean)
+	}
+}
+
 // TestCleanWithoutHEADContentLeavesWorkingTree covers the
 // brand-new-file case: nothing committed upstream yet means no
 // canonical to project onto. Clean must pass the working tree

@@ -14,8 +14,9 @@ import (
 // baseBranchOf resolves a branch's tracked upstream and strips the
 // remote prefix, yielding the local base branch the new worktree was
 // forked off (e.g. "develop"). Returns "" when the branch has no
-// upstream configured — `branch_scoped` then falls back to
-// the static `dump.path`.
+// upstream configured — `resolveBaseBranch` then tries the
+// main-worktree fallback, and `branch_scoped` ultimately falls back
+// to the static `dump.path`.
 //
 // Why upstream: treeman creates worktrees with
 // `git worktree add -b feature/x <path> origin/<base>`. Git's
@@ -23,7 +24,7 @@ import (
 // `origin/<base>` when the start point is a remote-tracking branch,
 // so `@{upstream}` recovers the base. Branches cut from a purely
 // local ref (no remote-tracking start point) won't have an upstream;
-// those fall through to the dump path.
+// those fall through to the main-worktree fallback below.
 func baseBranchOf(ctx context.Context, repoRoot, branch string) string {
 	if branch == "" {
 		return ""
@@ -33,6 +34,69 @@ func baseBranchOf(ctx context.Context, repoRoot, branch string) string {
 		return ""
 	}
 	return stripRemotePrefix(ctx, repoRoot, out)
+}
+
+// resolveBaseBranch returns the local branch a new worktree's
+// branch_scoped seed should mirror. Two-tier resolution:
+//
+//  1. Tracked upstream (`baseBranchOf`). Hits when treeman created
+//     the worktree off a remote-tracking start point — `@{upstream}`
+//     points to it directly.
+//  2. Main-worktree branch + merge-base sanity. Hits when the
+//     feature branch has no upstream (cut from a local ref, GitFlow
+//     branch where `branch.<name>.merge` points back at itself, or a
+//     fresh `git worktree add -b X` without a start point). The main
+//     worktree's active branch is the canonical "parent" candidate;
+//     `git merge-base newBranch mainBranch` proves shared history
+//     before we seed from a potentially unrelated DB.
+//
+// Main-wt lookup: prefer the enrolled `LookupMainWorktree` row
+// (`main_worktree.enabled: true` repos). Fall back to the repo
+// root's checkout for repos that don't enroll. Mirrors the same
+// split `resolveBaseSourceDB` uses for the post-resolve render path.
+//
+// Issue #7 regression fix: GitFlow feature branches off `develop`
+// were getting `seed:empty` because their `branch.<name>.merge`
+// pointed at `develop` on the remote but the worktree's
+// `@{upstream}` was unset. The main-wt fallback fills that gap.
+func resolveBaseBranch(ctx context.Context, st *store.Store, repoRoot string, repoID int64, newBranch string) string {
+	if b := baseBranchOf(ctx, repoRoot, newBranch); b != "" {
+		return b
+	}
+	mainBranch := lookupMainBranch(ctx, st, repoRoot, repoID)
+	if mainBranch == "" || mainBranch == newBranch {
+		return ""
+	}
+	// Shared history check — without it we'd happily seed an
+	// orphan branch from an unrelated DB. `git merge-base` returns
+	// non-empty stdout + exit 0 iff a common ancestor exists.
+	mb, err := gitcmd.String(ctx, repoRoot, "merge-base", newBranch, mainBranch)
+	if err != nil || strings.TrimSpace(mb) == "" {
+		return ""
+	}
+	return mainBranch
+}
+
+// lookupMainBranch returns the local branch the main worktree is
+// currently on. Enrolled (`main_worktree.enabled: true`) repos
+// expose this via the store; un-enrolled repos still have a repo-root
+// checkout we can read directly with `git rev-parse`.
+func lookupMainBranch(ctx context.Context, st *store.Store, repoRoot string, repoID int64) string {
+	if st != nil && repoID > 0 {
+		row, err := st.LookupMainWorktree(ctx, repoID)
+		if err == nil && !row.Deleted && row.Branch != "" {
+			return row.Branch
+		}
+	}
+	out, err := gitcmd.String(ctx, repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return ""
+	}
+	cur := strings.TrimSpace(out)
+	if cur == "HEAD" { // detached
+		return ""
+	}
+	return cur
 }
 
 // stripRemotePrefix removes a leading `<remote>/` from `ref` when the
@@ -82,7 +146,7 @@ func resolveBaseSourceDB(
 	scope bsScope,
 	newBranch string,
 ) (string, bool, error) {
-	baseBranch := baseBranchOf(ctx, repoRoot, newBranch)
+	baseBranch := resolveBaseBranch(ctx, st, repoRoot, repoID, newBranch)
 	if baseBranch == "" {
 		return "", false, nil
 	}
