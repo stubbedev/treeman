@@ -47,7 +47,11 @@ func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 			return nil, err
 		}
 	}
-	c, err := mongo.Connect(options.Client().ApplyURI(uri))
+	clientOpts := options.Client().ApplyURI(uri)
+	if cfg.PoolMax > 0 {
+		clientOpts.SetMaxPoolSize(uint64(cfg.PoolMax))
+	}
+	c, err := mongo.Connect(clientOpts)
 	if err != nil {
 		return nil, fmt.Errorf("mongo connect: %w", err)
 	}

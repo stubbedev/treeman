@@ -1127,6 +1127,19 @@ mongoColdBuild:
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
 	}
+	if d.Migrate != nil {
+		stepStart := time.Now()
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "mongodb", "migrate", sourceDB))
+		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
+		if err != nil {
+			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
+		}
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, "mongodb", sourceDB, "migrate", out)
+			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
+	}
 	if d.Seed != nil {
 		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, tplCtx, inheritedEnv)
@@ -1345,6 +1358,19 @@ redisColdBuild:
 	}
 	emitColdBuildDrop(ctx, st, repoID, worktreeID, "redis",
 		fmt.Sprintf("%s* (%d)", sourcePrefix, droppedCount))
+	if d.Migrate != nil {
+		stepStart := time.Now()
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "redis", "migrate", sourcePrefix))
+		out, err := runner.Run(ctx, spec, worktreePath, sourcePrefix, tplCtx, inheritedEnv)
+		if err != nil {
+			return Outcome{}, fmt.Errorf("migrate redis %s: %w", sourcePrefix, err)
+		}
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, "redis", sourcePrefix, "migrate", out)
+			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate redis", sourcePrefix, out))
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "migrate", stepStart)
+	}
 	if d.Seed != nil {
 		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
@@ -1545,6 +1571,19 @@ esColdBuild:
 			return Outcome{}, fmt.Errorf("es restore %s: %w", dp, err)
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "dump-load", stepStart)
+	}
+	if d.Migrate != nil {
+		stepStart := time.Now()
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "elasticsearch", "migrate", sourcePrefix))
+		out, err := runner.Run(ctx, spec, worktreePath, sourcePrefix, tplCtx, inheritedEnv)
+		if err != nil {
+			return Outcome{}, fmt.Errorf("migrate es %s: %w", sourcePrefix, err)
+		}
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, "elasticsearch", sourcePrefix, "migrate", out)
+			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate es", sourcePrefix, out))
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "migrate", stepStart)
 	}
 	if d.Seed != nil {
 		stepStart := time.Now()

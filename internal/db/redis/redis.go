@@ -60,6 +60,9 @@ func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("redis url: %w", err)
 	}
+	if cfg.PoolMax > 0 {
+		opts.PoolSize = int(cfg.PoolMax)
+	}
 	return &Driver{baseOpts: opts, clients: map[int]*redis.Client{}}, nil
 }
 

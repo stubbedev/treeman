@@ -1,0 +1,17 @@
+# MongoDB (auth-enabled) for the per-engine option matrix. Root creds so
+# the password-ref test is meaningful. Distinct port.
+services:
+  mongodb:
+    image: mongo:7
+    container_name: treeman-e2e-mxmongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: mongopw
+    ports:
+      - "27130:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "-u", "root", "-p", "mongopw", "--authenticationDatabase", "admin", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s

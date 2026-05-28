@@ -530,7 +530,12 @@ type MongoConn struct {
 	// MongoDB connection URI (`mongodb://[user:pass@]host:port/[...]`).
 	// Required. When a ContainerRef is set, host/port are rewritten
 	// at dial time using the container's published mapping or IP.
-	URI          string `yaml:"uri"`
+	URI string `yaml:"uri"`
+
+	// Maximum open connections in the driver's pool (maxPoolSize).
+	// Defaults to the driver's own default when unset. Same knob as
+	// the SQL engines' pool_max.
+	PoolMax      uint32 `yaml:"pool_max,omitempty"`
 	ContainerRef `yaml:",inline"`
 }
 
@@ -549,7 +554,12 @@ func (MongoConn) JSONSchema() *jsonschema.Schema { return uriOrMap("mongodb", "u
 type RedisConn struct {
 	// Redis connection URL (`redis://[:pass@]host:port[/db]`).
 	// Required. ContainerRef rewrites host/port at dial time.
-	URL          string `yaml:"url"`
+	URL string `yaml:"url"`
+
+	// Maximum connections in the driver's pool (PoolSize). Defaults to
+	// the driver's own default when unset. Same knob as the SQL
+	// engines' pool_max.
+	PoolMax      uint32 `yaml:"pool_max,omitempty"`
 	ContainerRef `yaml:",inline"`
 }
 
@@ -570,7 +580,12 @@ type EsConn struct {
 	// Elasticsearch / OpenSearch HTTP URL
 	// (`http://host:9200` or `https://...`). Required.
 	// ContainerRef rewrites host/port at dial time.
-	URL          string `yaml:"url"`
+	URL string `yaml:"url"`
+
+	// Maximum simultaneous HTTP connections to the cluster
+	// (http.Transport.MaxConnsPerHost). Defaults to the Go HTTP
+	// default when unset. Same knob as the SQL engines' pool_max.
+	PoolMax      uint32 `yaml:"pool_max,omitempty"`
 	ContainerRef `yaml:",inline"`
 }
 
@@ -591,6 +606,7 @@ func (EsConn) JSONSchema() *jsonschema.Schema { return uriOrMap("elasticsearch",
 func uriOrMap(engine, urlField string) *jsonschema.Schema {
 	objProps := orderedmap.New[string, *jsonschema.Schema]()
 	objProps.Set(urlField, &jsonschema.Schema{Type: "string"})
+	objProps.Set("pool_max", &jsonschema.Schema{Type: "integer", Minimum: json.Number("0"), Description: "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency."})
 	objProps.Set("container", &jsonschema.Schema{Type: "string"})
 	objProps.Set("compose_service", &jsonschema.Schema{Type: "string"})
 	objProps.Set("compose_project", &jsonschema.Schema{Type: "string"})

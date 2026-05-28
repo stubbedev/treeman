@@ -1,0 +1,19 @@
+# Elasticsearch for the per-engine option matrix. No auth (matches the
+# other ES suites); the secret-from-env path is covered by the
+# env-derived connection (ELASTICSEARCH_URL) rather than basic auth.
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: treeman-e2e-mxes
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "19210:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"\\(green\\|yellow\\)\"'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s

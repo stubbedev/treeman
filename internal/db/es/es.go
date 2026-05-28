@@ -49,9 +49,18 @@ func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 	if err := reachability.ProbeURLCtx(ctx, "elasticsearch", url); err != nil {
 		return nil, err
 	}
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	if cfg.PoolMax > 0 {
+		// Cap simultaneous + idle HTTP connections to the cluster, the
+		// HTTP analogue of the SQL engines' pool_max.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.MaxConnsPerHost = int(cfg.PoolMax)
+		tr.MaxIdleConnsPerHost = int(cfg.PoolMax)
+		httpClient.Transport = tr
+	}
 	return &Driver{
 		Base: strings.TrimRight(url, "/"),
-		HTTP: &http.Client{Timeout: 30 * time.Second},
+		HTTP: httpClient,
 	}, nil
 }
 

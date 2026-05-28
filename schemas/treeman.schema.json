@@ -301,6 +301,11 @@
             "url": {
               "type": "string"
             },
+            "pool_max": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency."
+            },
             "container": {
               "type": "string"
             },
@@ -512,6 +517,11 @@
             "uri": {
               "type": "string"
             },
+            "pool_max": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency."
+            },
             "container": {
               "type": "string"
             },
@@ -715,6 +725,11 @@
           "properties": {
             "url": {
               "type": "string"
+            },
+            "pool_max": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency."
             },
             "container": {
               "type": "string"
