@@ -6,6 +6,7 @@
 //     when no daemon is up)
 //   - `sync` / `sync --status` (clean error when no daemon is reachable)
 //   - `prepare` with no databases (loads config, runs the no-op prepare)
+//
 // The full engine-backed paths live in e2e/cli (real daemon + MySQL).
 package cli_surface_e2e
 

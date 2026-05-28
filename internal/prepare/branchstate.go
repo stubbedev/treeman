@@ -396,7 +396,7 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 	a.event(ctx, "prepare_start", fmt.Sprintf("engine=%s active=%s branch=%s branch_scoped", a.eng.engine, active, branch), nil)
 
 	builtEmpty := false
-	decision := "noop"
+	var decision string
 	switch {
 	case !exists:
 		// Fresh: nothing in the active slot. Seed this branch's data.

@@ -1,15 +1,20 @@
 version: "2"
 
-# Focused lint config: enforce that every returned error is handled.
-# Deliberate discards are written as `_ = expr` — errcheck treats an
-# explicit blank assignment as "handled", so intent stays visible at
-# the call site. Scoped to error returns only: type-assertion and
-# blank-identifier checks are left off, and the other default linters
-# are disabled so this config does exactly one job.
+# Focused lint config for error-handling hygiene:
+#   - errcheck:    every returned error is handled. Deliberate discards
+#                  are written `_ = expr` so intent stays visible.
+#   - errorlint:   errors are wrapped (%w) and matched with errors.Is /
+#                  errors.As, not == / != / bare type assertions, so the
+#                  checks survive a wrapped error.
+#   - ineffassign: no dead stores (assignments overwritten before use).
+# Scoped deliberately: errcheck type-assertion and blank checks are off,
+# and the other default linters stay disabled so this config does one job.
 linters:
   default: none
   enable:
     - errcheck
+    - errorlint
+    - ineffassign
   settings:
     errcheck:
       check-type-assertions: false

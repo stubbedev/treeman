@@ -365,7 +365,7 @@ func runDumpCmd(cmd *exec.Cmd, outPath string, gzipOut bool) (*mcpsdk.CallToolRe
 			_ = w.Close()
 		}
 		_ = f.Close()
-		return nil, dbDumpOut{}, fmt.Errorf("%s: %v: %s", cmd.Path, err, stderr.String())
+		return nil, dbDumpOut{}, fmt.Errorf("%s: %w: %s", cmd.Path, err, stderr.String())
 	}
 	// Flush+close on the success path with the error checked: a
 	// failed gzip footer or final file write would otherwise leave a

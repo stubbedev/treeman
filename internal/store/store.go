@@ -315,7 +315,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		}
 		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
 			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-				return fmt.Errorf("apply migration %s: %w (rollback: %v)", e.Name(), err, rbErr)
+				return fmt.Errorf("apply migration %s: %w (rollback: %w)", e.Name(), err, rbErr)
 			}
 			return fmt.Errorf("apply migration %s: %w", e.Name(), err)
 		}
@@ -323,7 +323,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			"INSERT INTO _treeman_migrations(version, filename, applied_at) VALUES (?,?,?)",
 			version, e.Name(), nowMillis()); err != nil {
 			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-				return fmt.Errorf("%w (rollback: %v)", err, rbErr)
+				return fmt.Errorf("%w (rollback: %w)", err, rbErr)
 			}
 			return err
 		}

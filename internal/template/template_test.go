@@ -1,6 +1,7 @@
 package template
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/slug"
@@ -33,7 +34,8 @@ func TestUnknownKeyErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error")
 	}
-	if re, ok := err.(*RenderError); !ok || re.UnknownKey != "nope" {
+	var re *RenderError
+	if !errors.As(err, &re) || re.UnknownKey != "nope" {
 		t.Errorf("wrong error: %v", err)
 	}
 }
@@ -69,8 +71,8 @@ func TestPortTokenUnknownSlotErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error for unknown port slot")
 	}
-	re, ok := err.(*RenderError)
-	if !ok || re.UnknownKey != "port_typo" {
+	var re *RenderError
+	if !errors.As(err, &re) || re.UnknownKey != "port_typo" {
 		t.Errorf("wrong error: %v", err)
 	}
 }

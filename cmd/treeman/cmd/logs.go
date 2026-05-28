@@ -305,7 +305,7 @@ included, so the original terminal colors round-trip.`,
 			}
 			tbl := ui.NewTable(cols...)
 			for _, h := range runs {
-				exit := "—"
+				var exit string
 				if h.ExitCode.Valid {
 					code := fmt.Sprintf("%d", h.ExitCode.Int64)
 					if h.ExitCode.Int64 == 0 {

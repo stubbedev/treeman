@@ -5,13 +5,13 @@
 //
 //   - max_age_days   → SweepByAge drops templates older than the cutoff.
 //   - max_total_gb   → SweepBySize evicts the largest templates until the
-//                      recorded total falls below the cap.
+//     recorded total falls below the cap.
 //   - keep_per_source → SweepBySource keeps the N most-recently-used
-//                      templates per source (migrations_hash) and evicts
-//                      the older ones.
+//     templates per source (migrations_hash) and evicts
+//     the older ones.
 //   - gc_interval_minutes → the daemon SnapshotGCLoop fires the sweep on
-//                      its configured cadence (forced to 1 minute here so
-//                      a tick lands inside the test).
+//     its configured cadence (forced to 1 minute here so
+//     a tick lands inside the test).
 //
 // cap_per_repo (the inline-on-write eviction) is covered by e2e/retention.
 //
@@ -31,8 +31,8 @@ import (
 
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
-	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	"github.com/stubbedev/treeman/internal/daemon"
+	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
 )

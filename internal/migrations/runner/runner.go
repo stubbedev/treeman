@@ -8,6 +8,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -180,7 +181,8 @@ func Run(
 		StderrTail: stderr.String(),
 		LogPath:    spec.LogPath,
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
 		out.ExitCode = exitErr.ExitCode()
 		return out, nil
 	}

@@ -13,6 +13,7 @@ package hooks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -112,7 +113,8 @@ func RunHooksOrphan(
 	if wait {
 		for idx, c := range cmds {
 			if err := c.Wait(); err != nil {
-				if exitErr, ok := err.(*exec.ExitError); ok {
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
 					out.Groups[idx].ExitCode = exitErr.ExitCode()
 				} else {
 					out.Groups[idx].ExitCode = -1
@@ -181,7 +183,8 @@ func RunHooks(
 				// exit code on the outcome and let the caller
 				// decide. The same group's stdout/stderr are
 				// already in its log file.
-				if exitErr, ok := err.(*exec.ExitError); ok {
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
 					out.Groups[idx].ExitCode = exitErr.ExitCode()
 				} else {
 					out.Groups[idx].ExitCode = -1
@@ -341,7 +344,8 @@ func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug string, isMain bool
 			if err == nil {
 				return
 			}
-			if exitErr, ok := err.(*exec.ExitError); ok {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
 				slog.Warn("background hook non-zero exit",
 					"cmd", cmdStr, "exit_code", exitErr.ExitCode())
 				return
@@ -368,7 +372,8 @@ func runForeground(ctx context.Context, cmdStr, cwd, repoRoot, worktreePath, slu
 	stderrTail := captureTail(stderrPipe, 16*1024)
 	err := c.Wait()
 	g := GroupOutcome{Command: cmdStr, StdoutTail: stdoutTail, StderrTail: stderrTail}
-	if exitErr, ok := err.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
 		g.ExitCode = exitErr.ExitCode()
 	} else if err != nil {
 		g.ExitCode = -1

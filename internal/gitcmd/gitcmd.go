@@ -29,6 +29,7 @@ package gitcmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -164,7 +165,8 @@ func command(ctx context.Context, dir string, readOnly bool, args ...string) *ex
 
 func wrap(args []string, err error, stderr string) error {
 	code := 0
-	if exitErr, ok := err.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
 		code = exitErr.ExitCode()
 	}
 	return &Error{
