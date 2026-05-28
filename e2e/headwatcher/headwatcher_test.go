@@ -39,8 +39,8 @@ func TestHeadWatcherFiresOnCheckout(t *testing.T) {
 	mustGit(t, wt, "commit", "-q", "-am", "feature work")
 
 	var (
-		mu      sync.Mutex
-		seen    []string
+		mu   sync.Mutex
+		seen []string
 	)
 	hw, err := daemon.NewHeadWatcher(wt, 50*time.Millisecond, func(_ context.Context, ref string) {
 		mu.Lock()

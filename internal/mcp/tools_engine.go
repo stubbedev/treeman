@@ -25,6 +25,7 @@ import (
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/resolve"
 )
 
@@ -72,7 +73,7 @@ func registerEngineWriteTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_dump",
-		Description: "Generate a dump of a live engine database to disk. mysql → mysqldump; postgres → pg_dump --format=plain --clean --if-exists; mongodb → mongodump --archive; elasticsearch — not yet supported. output_dir defaults to <repo>/storage/dumps. Use this to refresh the seed dump treeman uses for cold builds (commit the new file then trigger prepare_run). Returns the absolute path + byte count.",
+		Description: "Generate a dump of a live engine database to disk. Supported engines: mysql (and mariadb/tidb aliases) -> mysqldump; postgres (and postgresql alias) -> pg_dump --format=plain --clean --if-exists; mongodb -> mongodump --archive; elasticsearch (and opensearch alias) -> scroll API NDJSON _bulk with {target_db} prefix substitution. Redis dumps are intentionally not implemented (redis cold-build uses a seed step, not a dump file, so there is no restore counterpart). output_dir defaults to <repo>/storage/dumps. Use this to refresh the seed dump treeman uses for cold builds (commit the new file then trigger prepare_run). Returns the absolute path + byte count.",
 		Annotations: writeAnno("Dump database", false, false, true),
 	}, dbDumpTool)
 }
@@ -597,6 +598,7 @@ type snapshotDropIn struct {
 type snapshotDropOut struct {
 	Dropped       bool   `json:"dropped"`
 	EngineDropped bool   `json:"engine_dropped"`
+	EngineDropErr string `json:"engine_drop_err,omitempty"`
 	Engine        string `json:"engine,omitempty"`
 	Template      string `json:"template,omitempty"`
 }
@@ -619,9 +621,16 @@ func snapshotDropTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapsho
 	}
 	out := snapshotDropOut{Engine: rec.Engine, Template: rec.TemplateName}
 
-	cfg, err := loadCfgForRepo(in.Repo)
-	if err == nil {
-		out.EngineDropped = dropTemplate(ctx, cfg, rec.Engine, rec.TemplateName)
+	cfg, cfgErr := loadCfgForRepo(in.Repo)
+	if cfgErr == nil {
+		if dropErr := dropTemplate(ctx, cfg, rec.Engine, rec.TemplateName); dropErr != nil {
+			out.EngineDropped = false
+			out.EngineDropErr = dropErr.Error()
+		} else {
+			out.EngineDropped = true
+		}
+	} else {
+		out.EngineDropErr = "load config: " + cfgErr.Error()
 	}
 	if err := st.DeleteSnapshot(ctx, in.Fingerprint); err != nil {
 		return nil, out, fmt.Errorf("delete snapshot row: %w", err)
@@ -703,27 +712,40 @@ func dbDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbDumpIn) (*m
 		return nil, dbDumpOut{}, err
 	}
 	ts := time.Now().UTC().Format("20060102-150405")
-	switch in.Engine {
-	case "mysql", "mariadb", "tidb":
+	fam, ok := engine.Canonical(in.Engine)
+	if !ok {
+		return nil, dbDumpOut{}, fmt.Errorf("db_dump: unknown engine %q (allowed: %s)", in.Engine, engine.KnownList())
+	}
+	switch fam {
+	case engine.FamilyMySQL:
 		p := filepath.Join(outDir, fmt.Sprintf("%s-%s.sql", in.DB, ts))
 		if in.Gzip {
 			p += ".gz"
 		}
 		return runMysqldump(ctx, cfg.Connections.Mysql, in.DB, p, in.Gzip)
-	case "postgres", "postgresql":
+	case engine.FamilyPostgres:
 		p := filepath.Join(outDir, fmt.Sprintf("%s-%s.sql", in.DB, ts))
 		if in.Gzip {
 			p += ".gz"
 		}
 		return runPgDump(ctx, cfg.Connections.Postgres, in.DB, p, in.Gzip)
-	case "mongodb":
+	case engine.FamilyMongo:
 		p := filepath.Join(outDir, fmt.Sprintf("%s-%s.archive", in.DB, ts))
 		if in.Gzip {
 			p += ".gz"
 		}
 		return runMongoDump(ctx, cfg.Connections.Mongodb, in.DB, p, in.Gzip)
+	case engine.FamilyES:
+		p := filepath.Join(outDir, fmt.Sprintf("%s-%s.ndjson", in.DB, ts))
+		if in.Gzip {
+			p += ".gz"
+		}
+		return runESDump(ctx, cfg.Connections.Elasticsearch, in.DB, p, in.Gzip)
+	case engine.FamilyRedis:
+		return nil, dbDumpOut{}, fmt.Errorf("db_dump: redis dump is not implemented — redis cold-build uses a `seed:` step rather than a dump file, so there is no restore counterpart. If you need a redis snapshot, use redis-cli BGSAVE / SAVE manually and reference the resulting RDB out-of-band")
+	default:
+		return nil, dbDumpOut{}, fmt.Errorf("db_dump: engine family %q has no dump runner", fam)
 	}
-	return nil, dbDumpOut{}, fmt.Errorf("db_dump: engine %s not supported", in.Engine)
 }
 
 // ─── helpers ────────────────────────────────────────────────────────

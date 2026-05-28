@@ -27,12 +27,16 @@ const attrsHeader = "# treeman-managed: clean/smudge for patches: DO NOT EDIT �
 //     `git config --local` so the filter program is bound to this
 //     repo's `.git/config` (not the user's global, where it could
 //     leak into unrelated repos).
-//   - Writes per-worktree info/attributes (under each linked
-//     worktree's own GIT_DIR) listing each patched path with
-//     `filter=<FilterName>`. The main worktree gets no attribute
-//     entries — patches don't apply to it, and adding the filter
-//     there would force every plain `git status` in the repo root
-//     through the treeman binary unnecessarily.
+//   - Writes `info/attributes` under the shared git common dir
+//     (`<repo>/.git/info/attributes`) listing each patched path
+//     with `filter=<FilterName>`. Git only consults the common-dir
+//     `info/attributes` — a per-linked-worktree copy is silently
+//     ignored (verified empirically on git 2.54). Common-dir bleed
+//     into the main worktree and sibling linked worktrees is
+//     harmless: the filter program (`treeman patch-filter`)
+//     resolves config from cwd and falls through as pass-through
+//     for any file that the current worktree doesn't actually
+//     patch (see filter.go fallback).
 //   - Clears any legacy `--skip-worktree` bit on patched files so
 //     `git pull` no longer refuses to overwrite them. Filter mode
 //     supersedes skip-worktree entirely.
@@ -44,24 +48,40 @@ func EnsureFilter(ctx context.Context, worktreePath string, files []string) erro
 	if len(files) == 0 {
 		return nil
 	}
-	// Resolve GIT_DIR for this worktree. For a linked worktree this
-	// points at `<repo>/.git/worktrees/<name>` — the per-worktree
-	// info/attributes lives under there. For the main worktree it's
-	// the shared `<repo>/.git`.
-	gd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-dir")
+	// Resolve the shared git common dir. Git reads `info/attributes`
+	// from $GIT_COMMON_DIR for every worktree (main + linked); a
+	// per-worktree `<GIT_DIR>/info/attributes` is not consulted, so
+	// writing there leaves the filter unwired and `git status` shows
+	// patched files as modified.
+	gcd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-common-dir")
 	if err != nil {
-		return fmt.Errorf("rev-parse --git-dir: %w", err)
+		return fmt.Errorf("rev-parse --git-common-dir: %w", err)
 	}
-	gitDir := strings.TrimSpace(gd)
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(worktreePath, gitDir)
+	commonDir := strings.TrimSpace(gcd)
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(worktreePath, commonDir)
 	}
 
 	if err := ensureFilterConfig(ctx, worktreePath); err != nil {
 		return err
 	}
-	if err := writeAttributes(gitDir, files); err != nil {
+	if err := writeAttributes(commonDir, files); err != nil {
 		return err
+	}
+	// Legacy migration: treeman <= 2.4.1 wrote `info/attributes`
+	// under the per-linked-worktree GIT_DIR, which git silently
+	// ignored. Strip the treeman-managed block from there so
+	// upgrading users don't see two stale copies of the file
+	// drifting from the live common-dir one. Best-effort: a missing
+	// per-wt file is fine, write errors are non-fatal.
+	if gd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-dir"); err == nil {
+		perWtGitDir := strings.TrimSpace(gd)
+		if !filepath.IsAbs(perWtGitDir) {
+			perWtGitDir = filepath.Join(worktreePath, perWtGitDir)
+		}
+		if perWtGitDir != commonDir {
+			_ = stripTreemanBlock(filepath.Join(perWtGitDir, "info", "attributes"))
+		}
 	}
 	// Best-effort legacy migration: clear --skip-worktree on any
 	// patched file that still carries it from treeman < 2.5.
@@ -115,10 +135,13 @@ func ensureFilterConfig(ctx context.Context, worktreePath string) error {
 	return nil
 }
 
-// writeAttributes rewrites `<gitDir>/info/attributes`, replacing the
-// treeman-managed block (between attrsHeader and the next blank
-// line / EOF) with one filter=<FilterName> line per file. Other
-// users' attributes are left untouched.
+// writeAttributes rewrites `<gitCommonDir>/info/attributes`,
+// replacing the treeman-managed block (between attrsHeader and the
+// next blank line / EOF) with one filter=<FilterName> line per file.
+// Other users' attributes are left untouched. Caller must pass the
+// common dir (e.g. from `git rev-parse --git-common-dir`); the
+// per-linked-worktree GIT_DIR is not consulted by git for
+// `info/attributes`.
 func writeAttributes(gitDir string, files []string) error {
 	infoDir := filepath.Join(gitDir, "info")
 	if err := os.MkdirAll(infoDir, 0o755); err != nil {
@@ -127,23 +150,7 @@ func writeAttributes(gitDir string, files []string) error {
 	attrPath := filepath.Join(infoDir, "attributes")
 	body, _ := os.ReadFile(attrPath)
 
-	var out strings.Builder
-	skipping := false
-	for _, line := range strings.Split(string(body), "\n") {
-		if line == attrsHeader {
-			skipping = true
-			continue
-		}
-		if skipping {
-			if strings.TrimSpace(line) == "" {
-				skipping = false
-			}
-			continue
-		}
-		out.WriteString(line)
-		out.WriteString("\n")
-	}
-	tail := out.String()
+	tail := dropTreemanBlock(string(body))
 	tail = strings.TrimRight(tail, "\n")
 	if tail != "" {
 		tail += "\n\n"
@@ -162,4 +169,50 @@ func writeAttributes(gitDir string, files []string) error {
 	}
 	tail += "\n"
 	return os.WriteFile(attrPath, []byte(tail), 0o644)
+}
+
+// dropTreemanBlock returns `body` with the treeman-managed block
+// (header line through the next blank line / EOF) removed. Other
+// users' attributes are left intact.
+func dropTreemanBlock(body string) string {
+	var out strings.Builder
+	skipping := false
+	for _, line := range strings.Split(body, "\n") {
+		if line == attrsHeader {
+			skipping = true
+			continue
+		}
+		if skipping {
+			if strings.TrimSpace(line) == "" {
+				skipping = false
+			}
+			continue
+		}
+		out.WriteString(line)
+		out.WriteString("\n")
+	}
+	return out.String()
+}
+
+// stripTreemanBlock rewrites `attrPath` with the treeman-managed
+// block removed. Used to clean up stale per-linked-worktree
+// `info/attributes` files written by treeman <= 2.4.1 (which git
+// silently ignored). If the file would be empty after the strip, it
+// is deleted outright; if it contained only treeman content the
+// caller is left with no orphan to discover later. Missing file or
+// write errors are non-fatal — they signal "nothing to migrate" or
+// "user managed the file manually, leave it alone".
+func stripTreemanBlock(attrPath string) error {
+	body, err := os.ReadFile(attrPath)
+	if err != nil {
+		return err
+	}
+	cleaned := dropTreemanBlock(string(body))
+	if !strings.Contains(string(body), attrsHeader) {
+		return nil // nothing treeman-owned to strip
+	}
+	if strings.TrimSpace(cleaned) == "" {
+		return os.Remove(attrPath)
+	}
+	return os.WriteFile(attrPath, []byte(strings.TrimRight(cleaned, "\n")+"\n"), 0o644)
 }

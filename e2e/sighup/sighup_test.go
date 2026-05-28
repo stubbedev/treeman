@@ -3,12 +3,12 @@
 // Package sighup_e2e drives the daemon's SIGHUP config-reload
 // signal handler. Sequence:
 //
-//   1. Boot treemand with a worktree registered + a watched glob A.
-//   2. Touch a file under glob A → confirm watcher dispatches.
-//   3. Edit .treeman.yaml to add glob B, drop glob A.
-//   4. Send SIGHUP to the daemon.
-//   5. Touch a file under glob B → confirm new watcher dispatches.
-//   6. Touch a file under glob A → confirm OLD watcher is gone.
+//  1. Boot treemand with a worktree registered + a watched glob A.
+//  2. Touch a file under glob A → confirm watcher dispatches.
+//  3. Edit .treeman.yaml to add glob B, drop glob A.
+//  4. Send SIGHUP to the daemon.
+//  5. Touch a file under glob B → confirm new watcher dispatches.
+//  6. Touch a file under glob A → confirm OLD watcher is gone.
 //
 // This proves SIGHUP triggers config reload AND that worktree
 // watchers are re-spawned with the new globs.

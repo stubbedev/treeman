@@ -83,13 +83,40 @@ func (d *Driver) EngineVersion(ctx context.Context) (string, error) {
 // fields concurrent admin requests up to thread_pool.management's
 // queue size.
 func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
-	names, err := d.ListMatching(ctx, prefix)
+	return d.DropMatchingFiltered(ctx, prefix, nil)
+}
+
+// DropMatchingFiltered is DropMatching with an optional `keep`
+// predicate: only indices for which keep(name) returns true are
+// dropped. A nil predicate is "keep everything matching", i.e. the
+// classic DropMatching behaviour.
+//
+// Cold-build uses this so sibling worktrees' branch-scoped indices
+// that share the current worktree's source prefix (e.g. main wt
+// prefix `kho` is also a prefix of every other wt's `kho_<slug>_*`)
+// survive the eager pre-build drop.
+func (d *Driver) DropMatchingFiltered(ctx context.Context, prefix string, keep func(string) bool) ([]string, error) {
+	all, err := d.ListMatching(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
+	var names []string
+	if keep == nil {
+		names = all
+	} else {
+		names = make([]string, 0, len(all))
+		for _, n := range all {
+			if keep(n) {
+				names = append(names, n)
+			}
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
 	g, gctx := errgroup.WithContext(ctx)
 	limit := 8
-	if limit > len(names) && len(names) > 0 {
+	if limit > len(names) {
 		limit = len(names)
 	}
 	if limit < 1 {

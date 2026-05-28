@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -333,8 +334,21 @@ func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug string, isMain bool
 	if !wait {
 		// Caller doesn't want to block on completion. Reap the child
 		// asynchronously so zombies don't pile up against this
-		// daemon process.
-		go func() { _ = c.Wait() }()
+		// daemon process. Log non-zero exits at WARN so a background
+		// hook that's silently failing on every fire has a trail.
+		go func() {
+			err := c.Wait()
+			if err == nil {
+				return
+			}
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				slog.Warn("background hook non-zero exit",
+					"cmd", cmdStr, "exit_code", exitErr.ExitCode())
+				return
+			}
+			slog.Warn("background hook wait failed",
+				"cmd", cmdStr, "err", err)
+		}()
 	}
 	return c, nil
 }

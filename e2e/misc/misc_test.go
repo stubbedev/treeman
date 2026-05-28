@@ -2,8 +2,8 @@
 
 // Package misc_e2e covers small features that don't justify their
 // own docker-compose stack:
-//   • Daemon.LogLevel actually affects slog verbosity.
-//   • Reachability probe surfaces a clean error against an
+//   - Daemon.LogLevel actually affects slog verbosity.
+//   - Reachability probe surfaces a clean error against an
 //     unreachable host:port.
 package misc_e2e
 

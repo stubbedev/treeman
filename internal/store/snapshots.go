@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/stubbedev/treeman/internal/engine"
 )
 
 // SnapshotRecord mirrors a row in the `snapshots` table.
@@ -54,7 +56,16 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 
 // RecordSnapshot inserts (or updates on conflict) the snapshots row
 // for a freshly built template. `sizeBytes` may be 0 if unknown.
+//
+// Engine is canonicalised on write so downstream switches (gc.go,
+// branchstate.go, MCP tools) read the canonical Family label
+// regardless of which alias the user wrote in `databases[].engine`.
+// Pre-canonical rows still work because every reader runs
+// engine.Canonical, but new writes converge on one form.
 func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
+	if fam, ok := engine.Canonical(r.Engine); ok {
+		r.Engine = string(fam)
+	}
 	if r.LockfileHashes == nil {
 		r.LockfileHashes = map[string]string{}
 	}

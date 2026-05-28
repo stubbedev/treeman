@@ -349,4 +349,3 @@ func TestTopLevelFlags(t *testing.T) {
 		}
 	})
 }
-

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -228,8 +229,8 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 	// `--engine` filter written as the family name both line up.
 	filterLabel := engineFilter
 	if engineFilter != "" {
-		if lbl, ok := prepare.CanonicalEngine(engineFilter); ok {
-			filterLabel = lbl
+		if fam, ok := engine.Canonical(engineFilter); ok {
+			filterLabel = string(fam)
 		}
 	}
 	var seeded []prepare.Outcome
@@ -238,10 +239,11 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 			if !d.BranchScoped {
 				continue
 			}
-			label, ok := prepare.CanonicalEngine(d.Engine)
+			fam, ok := engine.Canonical(d.Engine)
 			if !ok {
 				continue
 			}
+			label := string(fam)
 			if filterLabel != "" && label != filterLabel {
 				continue
 			}

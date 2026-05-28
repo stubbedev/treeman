@@ -3,11 +3,11 @@
 // Package ctrrestart_e2e exercises treeman's containerip cache
 // eviction on container restart. Flow:
 //
-//   1. Resolve MySQL by container name → cached IP_old
-//   2. Restart the container → docker assigns a new bridge IP
-//   3. Resolve again → driver Connect() trips the reachability
-//      probe (IP_old is unreachable), calls RefreshOpts, retries
-//      via the fresh address, and reconnects successfully.
+//  1. Resolve MySQL by container name → cached IP_old
+//  2. Restart the container → docker assigns a new bridge IP
+//  3. Resolve again → driver Connect() trips the reachability
+//     probe (IP_old is unreachable), calls RefreshOpts, retries
+//     via the fresh address, and reconnects successfully.
 package ctrrestart_e2e
 
 import (

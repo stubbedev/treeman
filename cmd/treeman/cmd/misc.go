@@ -16,6 +16,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemonctl"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/initgen"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
@@ -254,8 +255,8 @@ func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFil
 	// and an `--engine` filter written as the family name still hits.
 	filterLabel := engineFilter
 	if engineFilter != "" {
-		if lbl, ok := prepare.CanonicalEngine(engineFilter); ok {
-			filterLabel = lbl
+		if fam, ok := engine.Canonical(engineFilter); ok {
+			filterLabel = string(fam)
 		}
 	}
 	var seeded []prepare.Outcome
@@ -264,10 +265,11 @@ func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFil
 			if !d.BranchScoped {
 				continue
 			}
-			label, ok := prepare.CanonicalEngine(d.Engine)
+			fam, ok := engine.Canonical(d.Engine)
 			if !ok {
 				continue
 			}
+			label := string(fam)
 			if filterLabel != "" && label != filterLabel {
 				continue
 			}

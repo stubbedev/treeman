@@ -4,12 +4,12 @@
 // end-to-end through the daemon's watcher to a fresh engine
 // snapshot. Sequence:
 //
-//   1. Initial FinalizeWorktree → fingerprint F1, snapshot row F1
-//   2. Edit migration file under a watched glob
-//   3. FinalizeWorktreeForWatch fires (simulated via direct call,
-//      matching the watcher.Dispatcher callback signature)
-//   4. New fingerprint F2 ≠ F1; new snapshot row exists; old still
-//      present until cap eviction
+//  1. Initial FinalizeWorktree → fingerprint F1, snapshot row F1
+//  2. Edit migration file under a watched glob
+//  3. FinalizeWorktreeForWatch fires (simulated via direct call,
+//     matching the watcher.Dispatcher callback signature)
+//  4. New fingerprint F2 ≠ F1; new snapshot row exists; old still
+//     present until cap eviction
 package deltawatch_e2e
 
 import (

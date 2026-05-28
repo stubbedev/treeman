@@ -4,15 +4,15 @@
 // that didn't justify their own compose stack — each subtest reuses
 // the shared MySQL container.
 //
-//   • TestDumpOptionalSkipsMissing — dump path missing + optional:true
+//   - TestDumpOptionalSkipsMissing — dump path missing + optional:true
 //     must skip the load step without erroring.
-//   • TestDumpRequiredFailsCleanly — dump path missing + optional:false
+//   - TestDumpRequiredFailsCleanly — dump path missing + optional:false
 //     must produce a clear "dump … no such file" error.
-//   • TestFanoutCapIsHonored — explicit databases[].fanout caps
+//   - TestFanoutCapIsHonored — explicit databases[].fanout caps
 //     concurrent clone restore.
-//   • TestActionContainerWrap — hooks.on-create-after-engines with a
+//   - TestActionContainerWrap — hooks.on-create-after-engines with a
 //     container: ref runs the action inside that container.
-//   • TestOnFileChangeMatchList — hooks.on-file-change match: [a,b]
+//   - TestOnFileChangeMatchList — hooks.on-file-change match: [a,b]
 //     fires for both labels and not for non-listed labels.
 package extras_e2e
 

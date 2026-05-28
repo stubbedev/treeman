@@ -3,12 +3,12 @@
 // Package mongo_dump_e2e exercises treeman's real mongorestore path
 // (vs the seed-script path the mongo/ suite uses). Sequence:
 //
-//   1. boot mongo container
-//   2. seed source data via mongosh
-//   3. mongodump --archive into a fixture file
-//   4. drop the seeded data
-//   5. point treeman's prepare at the archive
-//   6. confirm the rehydrated DB has the expected docs
+//  1. boot mongo container
+//  2. seed source data via mongosh
+//  3. mongodump --archive into a fixture file
+//  4. drop the seeded data
+//  5. point treeman's prepare at the archive
+//  6. confirm the rehydrated DB has the expected docs
 //
 // Tests both uncompressed AND gzip-compressed archives.
 package mongo_dump_e2e

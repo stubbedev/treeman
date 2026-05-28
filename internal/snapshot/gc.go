@@ -7,8 +7,12 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	dbes "github.com/stubbedev/treeman/internal/db/es"
+	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
+	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -98,8 +102,12 @@ func PurgeRepo(ctx context.Context, cfg *config.Config, st *store.Store, repoID 
 }
 
 func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvictionCandidate) error {
-	switch c.Engine {
-	case "mysql", "mariadb", "tidb":
+	fam, ok := engine.Canonical(c.Engine)
+	if !ok {
+		return fmt.Errorf("eviction: unsupported engine %q", c.Engine)
+	}
+	switch fam {
+	case engine.FamilyMySQL:
 		if cfg.Connections.Mysql == nil {
 			return fmt.Errorf("connections.mysql not configured")
 		}
@@ -109,7 +117,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		}
 		defer drv.Close()
 		return drv.DropSnapshot(ctx, c.TemplateName)
-	case "postgres", "postgresql":
+	case engine.FamilyPostgres:
 		if cfg.Connections.Postgres == nil {
 			return fmt.Errorf("connections.postgres not configured")
 		}
@@ -119,11 +127,46 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		}
 		defer drv.Close()
 		return drv.DropSnapshot(ctx, c.TemplateName)
+	case engine.FamilyMongo:
+		if cfg.Connections.Mongodb == nil {
+			return fmt.Errorf("connections.mongodb not configured")
+		}
+		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+		if err != nil {
+			return err
+		}
+		defer drv.Close(ctx)
+		return drv.DropSnapshot(ctx, c.TemplateName)
+	case engine.FamilyES:
+		if cfg.Connections.Elasticsearch == nil {
+			return fmt.Errorf("connections.elasticsearch not configured")
+		}
+		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+		if err != nil {
+			return err
+		}
+		return drv.DropSnapshot(ctx, c.TemplateName)
+	case engine.FamilyRedis:
+		if cfg.Connections.Redis == nil {
+			return fmt.Errorf("connections.redis not configured")
+		}
+		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
+		if err != nil {
+			return err
+		}
+		defer drv.Close()
+		return drv.DropSnapshot(ctx, c.TemplateName)
+	case engine.FamilyS3:
+		if cfg.Connections.S3 == nil {
+			return fmt.Errorf("connections.s3 not configured")
+		}
+		// validate.go rejects branch_scoped/test_clones/dump for s3, so
+		// no `engine: s3` snapshot row is ever persisted. If one exists
+		// (stale row from a future feature), drop silently rather than
+		// wedging the GC sweep — the s3 driver has no DropSnapshot.
+		return nil
 	default:
-		// Mongo/redis/es don't keep template snapshots on the cache
-		// hot path yet — when they land, their engine-specific drop
-		// calls go here.
-		return fmt.Errorf("eviction: unsupported engine %q", c.Engine)
+		return fmt.Errorf("eviction: unsupported engine family %q (alias %q)", fam, c.Engine)
 	}
 }
 
@@ -148,7 +191,10 @@ func SweepByAge(ctx context.Context, cfg *config.Config, st *store.Store) {
 			slog.Warn("snapshot age sweep drop", "template", c.TemplateName, "err", err)
 			continue
 		}
-		_ = st.DeleteSnapshot(ctx, c.Fingerprint)
+		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
+			slog.Warn("snapshot age sweep delete row",
+				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
+		}
 		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_age_evict",
 			fmt.Sprintf("evicted %s (older than %dd)", c.TemplateName, days),
 			0, 0, "", 0, map[string]string{
@@ -191,7 +237,10 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 			slog.Warn("snapshot size sweep drop", "template", c.TemplateName, "err", err)
 			continue
 		}
-		_ = st.DeleteSnapshot(ctx, c.Fingerprint)
+		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
+			slog.Warn("snapshot size sweep delete row",
+				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
+		}
 		total -= sizes[i]
 		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_size_evict",
 			fmt.Sprintf("evicted %s (size=%d)", c.TemplateName, sizes[i]),

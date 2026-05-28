@@ -8,14 +8,14 @@
 // user-experience test.
 //
 // Exercises in one run:
-//   • `treeman init` produces a parseable .treeman.yaml
-//   • `treeman wt create <branch>` creates the worktree
-//   • worktree.Links symlinks resolve correctly
-//   • worktree.Copies files are duplicated
-//   • patches block rewrites .env-style file
-//   • patches.skip_worktree applies git update-index
-//   • engine prepare completes (DB exists with expected table)
-//   • `treeman wt delete` tears down DB + clones + git worktree
+//   - `treeman init` produces a parseable .treeman.yaml
+//   - `treeman wt create <branch>` creates the worktree
+//   - worktree.Links symlinks resolve correctly
+//   - worktree.Copies files are duplicated
+//   - patches block rewrites .env-style file
+//   - patches.skip_worktree applies git update-index
+//   - engine prepare completes (DB exists with expected table)
+//   - `treeman wt delete` tears down DB + clones + git worktree
 package cli_e2e
 
 import (

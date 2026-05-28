@@ -3,10 +3,10 @@
 // Package onfilechange_e2e drives the full daemon-managed watcher
 // against a real engine + on-file-change hook. Each file edit must:
 //
-//   1. Fire the matching on-file-change action with env vars
-//      describing the event (TREEMAN_WATCH_PATH, _LABEL, _ENGINE,
-//      _DB_NAME).
-//   2. Trigger FinalizeWorktreeForWatch → new fingerprint in store.
+//  1. Fire the matching on-file-change action with env vars
+//     describing the event (TREEMAN_WATCH_PATH, _LABEL, _ENGINE,
+//     _DB_NAME).
+//  2. Trigger FinalizeWorktreeForWatch → new fingerprint in store.
 package onfilechange_e2e
 
 import (

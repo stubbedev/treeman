@@ -71,13 +71,13 @@ func WaitForReady(t *testing.T, label string, timeout time.Duration, check func(
 // Env bundles everything a prepare-layer test needs: a writable
 // store, a registered repo+worktree, and a synthetic slug.
 type Env struct {
-	Ctx       context.Context
-	Store     *store.Store
-	RepoID    int64
-	WTID      int64
-	Slug      slug.Slug
-	RepoPath  string
-	WTPath    string
+	Ctx      context.Context
+	Store    *store.Store
+	RepoID   int64
+	WTID     int64
+	Slug     slug.Slug
+	RepoPath string
+	WTPath   string
 }
 
 // NewEnv sets up an in-memory store, registers `wtPath` as both the

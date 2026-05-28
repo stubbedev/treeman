@@ -80,8 +80,8 @@ func buildConfig() *config.Config {
 			{
 				Engine:       "elasticsearch",
 				NameTemplate: "treeman_e2e_{slug}",
-				KeyPrefix: "wte2e_{slug}_",
-				Dump: &config.DumpSpec{Path: "fixtures/dump.ndjson"},
+				KeyPrefix:    "wte2e_{slug}_",
+				Dump:         &config.DumpSpec{Path: "fixtures/dump.ndjson"},
 			},
 		},
 	}

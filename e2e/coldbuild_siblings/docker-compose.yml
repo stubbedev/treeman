@@ -1,0 +1,53 @@
+# Sibling-survival e2e fixture. Unique ports + container names so this
+# can run in parallel with the per-engine e2e suites without colliding.
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: treeman-e2e-siblings-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+    ports:
+      - "13326:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+  mongo:
+    image: mongo:7
+    container_name: treeman-e2e-siblings-mongo
+    ports:
+      - "27127:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping: 1}).ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+  redis:
+    image: redis:7
+    container_name: treeman-e2e-siblings-redis
+    ports:
+      - "16399:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: treeman-e2e-siblings-es
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms256m -Xmx256m"
+    ports:
+      - "19299:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:9200/_cluster/health || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 15s

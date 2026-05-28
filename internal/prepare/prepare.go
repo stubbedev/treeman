@@ -35,6 +35,7 @@ import (
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
@@ -627,9 +628,17 @@ mysqlColdBuild:
 
 	// Cold build: drop+recreate source, load dump, run migrate,
 	// snapshot for cache, fan out paratest clones.
-	if _, err := drv.DropMatching(ctx, sourceDB); err != nil {
+	//
+	// DropDatabase, NOT DropMatching: sourceDB under the main-wt
+	// overlay (e.g. `kontainer_testing`) is a prefix of every linked
+	// worktree's `<sourceDB>_<slug>` source + per-test clones, so a
+	// prefix drop would wipe sibling worktrees. Stale per-test
+	// clones from a prior cold-build get overwritten by exact name
+	// in SnapshotRestore during fanout below.
+	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "mysql", sourceDB)
 	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
@@ -857,10 +866,12 @@ func preparePostgres(
 	}
 
 pgColdBuild:
-	// Cold build.
-	if _, err := drv.DropMatching(ctx, sourceDB); err != nil {
+	// Cold build. DropDatabase, NOT DropMatching — see the comment
+	// on the matching mysql cold-build site.
+	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "postgres", sourceDB)
 	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
@@ -1057,9 +1068,13 @@ mongoColdBuild:
 	// Cold build: drop source, optionally mongorestore a dump
 	// archive, run the seed step, snapshot template, fan out
 	// clones.
-	if _, err := drv.DropMatching(ctx, sourceDB); err != nil {
+	//
+	// DropDatabase, NOT DropMatching — see the comment on the
+	// matching mysql cold-build site.
+	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
 		return Outcome{}, fmt.Errorf("mongo drop %s: %w", sourceDB, err)
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "mongodb", sourceDB)
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
@@ -1273,9 +1288,20 @@ func prepareRedisPrefix(
 
 redisColdBuild:
 	// Cold build: drop source, run seed, snapshot template, fanout.
-	if _, err := drv.DropPrefix(ctx, sourcePrefix); err != nil {
+	//
+	// DropPrefixFiltered, NOT DropPrefix: under the main-wt overlay
+	// sourcePrefix can prefix every other worktree's
+	// `<sourcePrefix><slug>_*` keys. Skip keys containing
+	// `_<otherslug>` as a whole token so sibling worktrees'
+	// branch-scoped keys survive.
+	redisOthers := siblingSlugs(ctx, st, repoID, worktreeID)
+	keepRedisKey := func(k string) bool { return !nameOwnedByOtherSlug(k, redisOthers) }
+	droppedCount, err := drv.DropPrefixFiltered(ctx, sourcePrefix, keepRedisKey)
+	if err != nil {
 		return Outcome{}, fmt.Errorf("redis drop %s*: %w", sourcePrefix, err)
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "redis",
+		fmt.Sprintf("%s* (%d)", sourcePrefix, droppedCount))
 	if d.Seed != nil {
 		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
@@ -1454,9 +1480,20 @@ func prepareES(
 esColdBuild:
 	// Cold build: drop, optionally bulk-load a dump NDJSON, run
 	// seed, snapshot, fanout.
-	if _, err := drv.DropMatching(ctx, sourcePrefix); err != nil {
+	//
+	// DropMatchingFiltered, NOT DropMatching: under the main-wt
+	// overlay sourcePrefix can prefix every other worktree's
+	// `<sourcePrefix>_<slug>_*` indices. Skip names containing
+	// `_<otherslug>` as a whole token so sibling worktrees'
+	// branch-scoped indices survive.
+	others := siblingSlugs(ctx, st, repoID, worktreeID)
+	keep := func(n string) bool { return !nameOwnedByOtherSlug(n, others) }
+	dropped, err := drv.DropMatchingFiltered(ctx, sourcePrefix, keep)
+	if err != nil {
 		return Outcome{}, fmt.Errorf("es drop %s*: %w", sourcePrefix, err)
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "elasticsearch",
+		fmt.Sprintf("%s* (%d)", sourcePrefix, len(dropped)))
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
@@ -2032,5 +2069,14 @@ func teardownOne(
 			})
 		return nil
 	}
+	// Unknown engine — log + event so a typo'd `engine: postgress`
+	// doesn't turn worktree teardown into a silent no-op (same
+	// shape as the cold-build sibling-wipe that originally hid in
+	// the event log).
+	_ = st.WriteEvent(ctx, store.LevelWarn, "db_teardown_skipped",
+		fmt.Sprintf("teardown skipped: unknown engine %q (allowed: %s)", d.Engine, engine.KnownList()),
+		repoID, worktreeID, "", 0, map[string]any{
+			"engine": d.Engine, "slug": sl,
+		})
 	return nil
 }

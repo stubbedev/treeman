@@ -252,8 +252,8 @@ func TestBranchScopedSameBranchNoop(t *testing.T) {
 // surface a clear, engine-specific error before any dial is attempted.
 //
 // Postgres alias `postgresql` and ES alias `opensearch` are covered
-// via CanonicalEngine in [TestCanonicalEngine]; only the
-// canonical-name dispatch is exercised here.
+// via engine.Canonical in [TestCanonical] (internal/engine);
+// only the canonical-name dispatch is exercised here.
 func TestConnectBranchEngineMissingConn(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
@@ -287,9 +287,9 @@ func TestConnectBranchEngineMissingConn(t *testing.T) {
 }
 
 // TestConnectBranchEngineUnswappable: a non-swappable engine (sqlite,
-// or any string CanonicalEngine rejects) must return (nil, no-op, nil)
-// — NOT an error. ResetBranchScoped relies on the nil-eng signal to
-// skip such databases silently.
+// or any string engine.Canonical rejects) must return (nil, no-op,
+// nil) — NOT an error. ResetBranchScoped relies on the nil-eng signal
+// to skip such databases silently.
 func TestConnectBranchEngineUnswappable(t *testing.T) {
 	ctx := context.Background()
 	for _, engine := range []string{"sqlite", "", "made-up"} {
@@ -307,33 +307,6 @@ func TestConnectBranchEngineUnswappable(t *testing.T) {
 				closeFn()
 			}
 		})
-	}
-}
-
-// TestCanonicalEngine locks the engine-family mapping that `db reset
-// --engine` filtering relies on: aliases collapse to the canonical
-// label, and non-swappable engines report ok=false.
-func TestCanonicalEngine(t *testing.T) {
-	cases := map[string]struct {
-		want string
-		ok   bool
-	}{
-		"mysql":         {"mysql", true},
-		"mariadb":       {"mysql", true},
-		"tidb":          {"mysql", true},
-		"postgres":      {"postgres", true},
-		"postgresql":    {"postgres", true},
-		"mongodb":       {"mongodb", true},
-		"redis":         {"redis", true},
-		"elasticsearch": {"elasticsearch", true},
-		"opensearch":    {"elasticsearch", true},
-		"sqlite":        {"", false},
-	}
-	for in, want := range cases {
-		got, ok := CanonicalEngine(in)
-		if ok != want.ok || (ok && got != want.want) {
-			t.Errorf("CanonicalEngine(%q) = (%q, %t), want (%q, %t)", in, got, ok, want.want, want.ok)
-		}
 	}
 }
 

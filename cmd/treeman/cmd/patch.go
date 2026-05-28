@@ -88,9 +88,11 @@ func runPatchFilter(ctx context.Context, mode, relPath string, in io.Reader, out
 		return passthrough(out, body)
 	}
 
-	// Main worktree: patches don't apply. The filter must still be
-	// invoked because info/attributes is shared via .git/config; just
-	// hand back the bytes verbatim.
+	// Main worktree: patches don't apply. The filter still fires
+	// because git reads `info/attributes` from $GIT_COMMON_DIR
+	// (shared with every linked worktree), so the attribute lines
+	// installed for a linked wt match the same paths in the main
+	// checkout too. Hand back the bytes verbatim.
 	if isMainWorktreePath(repoRoot, worktreePath) {
 		return passthrough(out, body)
 	}
