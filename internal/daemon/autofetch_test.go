@@ -7,9 +7,31 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/store"
 )
+
+// auto_fetch.interval_minutes maps minutes → ticker duration, with a
+// sub-minute clamp so interval_minutes: 0 can't spin a tight ticker.
+func TestAutoFetchInterval(t *testing.T) {
+	cases := []struct {
+		minutes uint32
+		want    time.Duration
+	}{
+		{0, time.Minute}, // clamp: 0 would hammer every remote
+		{1, time.Minute}, // exact floor
+		{15, 15 * time.Minute},
+		{60, time.Hour},
+	}
+	for _, c := range cases {
+		got := autoFetchInterval(config.AutoFetchConfig{IntervalMinutes: c.minutes})
+		if got != c.want {
+			t.Errorf("interval_minutes=%d → %v, want %v", c.minutes, got, c.want)
+		}
+	}
+}
 
 // requireGit skips when the host doesn't have git on PATH.
 func requireGitAutofetch(t *testing.T) {

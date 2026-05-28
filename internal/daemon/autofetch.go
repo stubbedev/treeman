@@ -69,6 +69,18 @@ func repoJitter(repoPath string) time.Duration {
 	return time.Duration(off)
 }
 
+// autoFetchInterval maps the configured `auto_fetch.interval_minutes`
+// to a ticker duration, clamping sub-minute values up to 1m so a
+// misconfigured `interval_minutes: 0` can't spin a tight ticker that
+// hammers every remote on every tick.
+func autoFetchInterval(cfg config.AutoFetchConfig) time.Duration {
+	d := time.Duration(cfg.IntervalMinutes) * time.Minute
+	if d < time.Minute {
+		d = time.Minute
+	}
+	return d
+}
+
 // AutoFetchLoop runs a periodic `git fetch --all --prune` against
 // every registered repo, then advances every active worktree (main +
 // linked) by either fast-forward or rebase depending on
@@ -95,13 +107,7 @@ func AutoFetchLoop(ctx context.Context, st *State) {
 		slog.Info("auto_fetch_loop disabled by global config")
 		return
 	}
-	interval := time.Duration(cfg.AutoFetch.IntervalMinutes) * time.Minute
-	if interval < time.Minute {
-		// Defensive clamp — a misconfigured `interval_minutes: 0`
-		// would otherwise spin a tight ticker that hammers every
-		// remote on every tick.
-		interval = time.Minute
-	}
+	interval := autoFetchInterval(cfg.AutoFetch)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	slog.Info("auto_fetch_loop started", "interval", interval)
