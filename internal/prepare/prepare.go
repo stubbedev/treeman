@@ -1284,9 +1284,20 @@ func prepareRedisPrefix(
 
 redisColdBuild:
 	// Cold build: drop source, run seed, snapshot template, fanout.
-	if _, err := drv.DropPrefix(ctx, sourcePrefix); err != nil {
+	//
+	// DropPrefixFiltered, NOT DropPrefix: under the main-wt overlay
+	// sourcePrefix can prefix every other worktree's
+	// `<sourcePrefix><slug>_*` keys. Skip keys containing
+	// `_<otherslug>` as a whole token so sibling worktrees'
+	// branch-scoped keys survive.
+	redisOthers := siblingSlugs(ctx, st, repoID, worktreeID)
+	keepRedisKey := func(k string) bool { return !nameOwnedByOtherSlug(k, redisOthers) }
+	droppedCount, err := drv.DropPrefixFiltered(ctx, sourcePrefix, keepRedisKey)
+	if err != nil {
 		return Outcome{}, fmt.Errorf("redis drop %s*: %w", sourcePrefix, err)
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "redis",
+		fmt.Sprintf("%s* (%d)", sourcePrefix, droppedCount))
 	if d.Seed != nil {
 		stepStart := time.Now()
 		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)

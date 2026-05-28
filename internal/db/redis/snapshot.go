@@ -48,6 +48,18 @@ func (d *Driver) PrefixExists(ctx context.Context, prefix string) (bool, error) 
 // single-threaded Redis event loop for tens of ms; the batch cap
 // keeps the worst-case pause bounded.
 func (d *Driver) DropPrefix(ctx context.Context, prefix string) (int, error) {
+	return d.DropPrefixFiltered(ctx, prefix, nil)
+}
+
+// DropPrefixFiltered is DropPrefix with an optional `keep` predicate:
+// only keys for which keep(key) returns true are deleted. A nil
+// predicate is the classic DropPrefix behaviour.
+//
+// Cold-build uses this so sibling worktrees' branch-scoped keys that
+// share the current worktree's source prefix (e.g. main wt prefix
+// `app_` is also a prefix of every other wt's `app_<slug>_*`) survive
+// the eager pre-build drop.
+func (d *Driver) DropPrefixFiltered(ctx context.Context, prefix string, keep func(string) bool) (int, error) {
 	if prefix == "" {
 		return 0, fmt.Errorf("redis: refusing to drop empty prefix (would wipe every key)")
 	}
@@ -67,7 +79,11 @@ func (d *Driver) DropPrefix(ctx context.Context, prefix string) (int, error) {
 		return nil
 	}
 	for iter.Next(ctx) {
-		batch = append(batch, iter.Val())
+		k := iter.Val()
+		if keep != nil && !keep(k) {
+			continue
+		}
+		batch = append(batch, k)
 		if len(batch) >= 1000 {
 			if err := flush(); err != nil {
 				return deleted, err

@@ -12,6 +12,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -101,8 +102,12 @@ func PurgeRepo(ctx context.Context, cfg *config.Config, st *store.Store, repoID 
 }
 
 func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvictionCandidate) error {
-	switch c.Engine {
-	case "mysql", "mariadb", "tidb":
+	fam, ok := engine.Canonical(c.Engine)
+	if !ok {
+		return fmt.Errorf("eviction: unsupported engine %q", c.Engine)
+	}
+	switch fam {
+	case engine.FamilyMySQL:
 		if cfg.Connections.Mysql == nil {
 			return fmt.Errorf("connections.mysql not configured")
 		}
@@ -112,7 +117,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		}
 		defer drv.Close()
 		return drv.DropSnapshot(ctx, c.TemplateName)
-	case "postgres", "postgresql":
+	case engine.FamilyPostgres:
 		if cfg.Connections.Postgres == nil {
 			return fmt.Errorf("connections.postgres not configured")
 		}
@@ -122,7 +127,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		}
 		defer drv.Close()
 		return drv.DropSnapshot(ctx, c.TemplateName)
-	case "mongodb":
+	case engine.FamilyMongo:
 		if cfg.Connections.Mongodb == nil {
 			return fmt.Errorf("connections.mongodb not configured")
 		}
@@ -132,7 +137,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		}
 		defer drv.Close(ctx)
 		return drv.DropSnapshot(ctx, c.TemplateName)
-	case "elasticsearch":
+	case engine.FamilyES:
 		if cfg.Connections.Elasticsearch == nil {
 			return fmt.Errorf("connections.elasticsearch not configured")
 		}
@@ -141,7 +146,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 			return err
 		}
 		return drv.DropSnapshot(ctx, c.TemplateName)
-	case "redis":
+	case engine.FamilyRedis:
 		if cfg.Connections.Redis == nil {
 			return fmt.Errorf("connections.redis not configured")
 		}
@@ -152,7 +157,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		defer drv.Close()
 		return drv.DropSnapshot(ctx, c.TemplateName)
 	default:
-		return fmt.Errorf("eviction: unsupported engine %q", c.Engine)
+		return fmt.Errorf("eviction: unsupported engine family %q (alias %q)", fam, c.Engine)
 	}
 }
 
