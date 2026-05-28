@@ -9,8 +9,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -20,10 +22,17 @@ import (
 // Spec is the shape the runner accepts: a shell command + env-var
 // overrides + a label used in error messages so callers know which
 // YAML block produced the failure.
+//
+// LogPath (optional): when non-empty, the merged stdout+stderr stream
+// is teed to this file so a post-mortem can read the full output after
+// the in-memory tails roll over. Parent directories are created. The
+// file is truncated on each invocation — callers wanting history
+// should rotate the path themselves.
 type Spec struct {
-	Run   string
-	Env   map[string]string
-	Label string // e.g. "migrations.migrate" or "seed"
+	Run     string
+	Env     map[string]string
+	Label   string // e.g. "migrations.migrate" or "seed"
+	LogPath string
 }
 
 // FromMigrate converts a `databases[].migrate` block to a Spec.
@@ -36,11 +45,54 @@ func FromSeed(s config.Step) Spec {
 	return Spec{Run: s.Run, Env: s.Env, Label: "seed"}
 }
 
+// WithLogPath returns a copy of the Spec with LogPath set. Lets call
+// sites stay fluent without mutating the source Spec.
+func (s Spec) WithLogPath(p string) Spec {
+	s.LogPath = p
+	return s
+}
+
 // Outcome is the result of one runner invocation.
 type Outcome struct {
 	ExitCode   int
 	StdoutTail string
 	StderrTail string
+	LogPath    string // mirror of Spec.LogPath; empty when no log was teed
+}
+
+// FormatError builds the canonical "<label> <target> exit N: …" string
+// used by every prepare call site. Includes both stderr and stdout tails
+// because frameworks like Laravel/Symfony Console write failure
+// diagnostics to stdout, not stderr — earlier versions formatted only
+// StderrTail and turned exit 1 into an empty diagnostic. Trailing
+// whitespace is trimmed and empty streams are skipped. When a LogPath
+// was teed, append a pointer to the full log.
+func FormatError(label, target string, out Outcome) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s exit %d", label, target, out.ExitCode)
+	stderrTrim := strings.TrimSpace(out.StderrTail)
+	stdoutTrim := strings.TrimSpace(out.StdoutTail)
+	wrote := false
+	if stderrTrim != "" {
+		fmt.Fprintf(&b, ": stderr=%q", stderrTrim)
+		wrote = true
+	}
+	if stdoutTrim != "" {
+		if wrote {
+			b.WriteString(" ")
+		} else {
+			b.WriteString(": ")
+		}
+		fmt.Fprintf(&b, "stdout=%q", stdoutTrim)
+		wrote = true
+	}
+	if !wrote {
+		b.WriteString(": <no output captured>")
+	}
+	if out.LogPath != "" {
+		fmt.Fprintf(&b, " (full log: %s)", out.LogPath)
+	}
+	return b.String()
 }
 
 // Run executes `spec.Run` via `sh -c` against `targetDB`.
@@ -104,13 +156,29 @@ func Run(
 	c.Env = env
 
 	var stdout, stderr bytes.Buffer
-	c.Stdout = tailWriter(&stdout, 16*1024)
-	c.Stderr = tailWriter(&stderr, 16*1024)
+	var stdoutW io.Writer = tailWriter(&stdout, 16*1024)
+	var stderrW io.Writer = tailWriter(&stderr, 16*1024)
+
+	if spec.LogPath != "" {
+		if mkErr := os.MkdirAll(filepath.Dir(spec.LogPath), 0o755); mkErr != nil {
+			return Outcome{ExitCode: -1}, fmt.Errorf("%s log dir: %w", spec.Label, mkErr)
+		}
+		f, fErr := os.Create(spec.LogPath)
+		if fErr != nil {
+			return Outcome{ExitCode: -1}, fmt.Errorf("%s log open: %w", spec.Label, fErr)
+		}
+		defer f.Close()
+		stdoutW = io.MultiWriter(stdoutW, f)
+		stderrW = io.MultiWriter(stderrW, f)
+	}
+	c.Stdout = stdoutW
+	c.Stderr = stderrW
 
 	err := c.Run()
 	out := Outcome{
 		StdoutTail: stdout.String(),
 		StderrTail: stderr.String(),
+		LogPath:    spec.LogPath,
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		out.ExitCode = exitErr.ExitCode()

@@ -531,12 +531,14 @@ func (a branchScopedArgs) parentDB(ctx context.Context, branch string) (string, 
 }
 
 func (a branchScopedArgs) runStep(ctx context.Context, spec runner.Spec, active, label string) error {
+	spec = spec.WithLogPath(runnerLogPath(a.worktreePath, a.eng.engine, label, active))
 	out, err := runner.Run(ctx, spec, a.worktreePath, active, a.tplCtx, a.inheritedEnv)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", label, active, err)
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("%s %s exit %d: %s", label, active, out.ExitCode, out.StderrTail)
+		emitRunnerError(ctx, a.st, a.repoID, a.worktreeID, a.eng.engine, active, label, out)
+		return fmt.Errorf("%s", runner.FormatError(label, active, out))
 	}
 	return nil
 }

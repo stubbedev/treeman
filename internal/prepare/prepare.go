@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,6 +72,43 @@ func (f frameworkHashCache) UpsertDirHashes(ctx context.Context, entries []frame
 		se[i] = store.DirHashKey(e)
 	}
 	return f.Store.UpsertDirHashes(ctx, se, hashes)
+}
+
+// runnerLogPath builds the disk path the runner should tee
+// stdout+stderr into for a given prepare step. Lives alongside the
+// hook logs under `<worktree>/.treeman-hooks/` so existing tooling and
+// log-purge code picks it up automatically. Returns "" when the
+// worktree path is empty so the runner skips disk teeing.
+func runnerLogPath(worktreePath, engine, label, target string) string {
+	if worktreePath == "" {
+		return ""
+	}
+	safeTarget := strings.ReplaceAll(target, "/", "_")
+	return filepath.Join(worktreePath, ".treeman-hooks",
+		fmt.Sprintf("prepare-%s-%s-%s.log", engine, label, safeTarget))
+}
+
+// emitRunnerError records a runner failure (migrate/seed exit !=0)
+// as a structured `prepare_error` event so the daemon's log query
+// surfaces both stderr AND stdout tails. Earlier versions only logged
+// stderr — Laravel/Symfony Console writes failure output to stdout, so
+// the stderr-only event payload was empty and the failure reason was
+// lost. Mirrors emitPhaseDone's shape: the run_id is auto-injected.
+func emitRunnerError(ctx context.Context, st *store.Store, repoID, worktreeID int64,
+	engine, sourceDB, label string, out runner.Outcome) {
+	if st == nil {
+		return
+	}
+	_ = st.WriteEvent(ctx, store.LevelError, "prepare_error",
+		fmt.Sprintf("%s/%s phase=%s exit=%d", engine, sourceDB, label, out.ExitCode),
+		repoID, worktreeID, label, 0, map[string]string{
+			"engine":      engine,
+			"source_db":   sourceDB,
+			"exit_code":   fmt.Sprintf("%d", out.ExitCode),
+			"stderr_tail": out.StderrTail,
+			"stdout_tail": out.StdoutTail,
+			"log_path":    out.LogPath,
+		})
 }
 
 // emitPhaseDone writes a `prepare_phase` event tagged with the step
@@ -650,23 +688,27 @@ mysqlColdBuild:
 	}
 	if d.Migrate != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, tplCtx, inheritedEnv)
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "mysql", "migrate", sourceDB))
+		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
 		if out.ExitCode != 0 {
-			return Outcome{}, fmt.Errorf("migrate source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
+			emitRunnerError(ctx, st, repoID, worktreeID, "mysql", sourceDB, "migrate", out)
+			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
 	}
 	if d.Seed != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, tplCtx, inheritedEnv)
+		spec := runner.FromSeed(*d.Seed).WithLogPath(runnerLogPath(worktreePath, "mysql", "seed", sourceDB))
+		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
 		}
 		if out.ExitCode != 0 {
-			return Outcome{}, fmt.Errorf("seed source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
+			emitRunnerError(ctx, st, repoID, worktreeID, "mysql", sourceDB, "seed", out)
+			return Outcome{}, fmt.Errorf("%s", runner.FormatError("seed source", sourceDB, out))
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
@@ -891,23 +933,27 @@ pgColdBuild:
 	}
 	if d.Migrate != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromMigrate(*d.Migrate), worktreePath, sourceDB, tplCtx, inheritedEnv)
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "postgres", "migrate", sourceDB))
+		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
 		if out.ExitCode != 0 {
-			return Outcome{}, fmt.Errorf("migrate source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
+			emitRunnerError(ctx, st, repoID, worktreeID, "postgres", sourceDB, "migrate", out)
+			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
 	}
 	if d.Seed != nil {
 		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, tplCtx, inheritedEnv)
+		spec := runner.FromSeed(*d.Seed).WithLogPath(runnerLogPath(worktreePath, "postgres", "seed", sourceDB))
+		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
 			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
 		}
 		if out.ExitCode != 0 {
-			return Outcome{}, fmt.Errorf("seed source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
+			emitRunnerError(ctx, st, repoID, worktreeID, "postgres", sourceDB, "seed", out)
+			return Outcome{}, fmt.Errorf("%s", runner.FormatError("seed source", sourceDB, out))
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
