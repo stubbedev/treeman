@@ -27,12 +27,16 @@ const attrsHeader = "# treeman-managed: clean/smudge for patches: DO NOT EDIT �
 //     `git config --local` so the filter program is bound to this
 //     repo's `.git/config` (not the user's global, where it could
 //     leak into unrelated repos).
-//   - Writes per-worktree info/attributes (under each linked
-//     worktree's own GIT_DIR) listing each patched path with
-//     `filter=<FilterName>`. The main worktree gets no attribute
-//     entries — patches don't apply to it, and adding the filter
-//     there would force every plain `git status` in the repo root
-//     through the treeman binary unnecessarily.
+//   - Writes `info/attributes` under the shared git common dir
+//     (`<repo>/.git/info/attributes`) listing each patched path
+//     with `filter=<FilterName>`. Git only consults the common-dir
+//     `info/attributes` — a per-linked-worktree copy is silently
+//     ignored (verified empirically on git 2.54). Common-dir bleed
+//     into the main worktree and sibling linked worktrees is
+//     harmless: the filter program (`treeman patch-filter`)
+//     resolves config from cwd and falls through as pass-through
+//     for any file that the current worktree doesn't actually
+//     patch (see filter.go fallback).
 //   - Clears any legacy `--skip-worktree` bit on patched files so
 //     `git pull` no longer refuses to overwrite them. Filter mode
 //     supersedes skip-worktree entirely.
@@ -44,13 +48,14 @@ func EnsureFilter(ctx context.Context, worktreePath string, files []string) erro
 	if len(files) == 0 {
 		return nil
 	}
-	// Resolve GIT_DIR for this worktree. For a linked worktree this
-	// points at `<repo>/.git/worktrees/<name>` — the per-worktree
-	// info/attributes lives under there. For the main worktree it's
-	// the shared `<repo>/.git`.
-	gd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-dir")
+	// Resolve the shared git common dir. Git reads `info/attributes`
+	// from $GIT_COMMON_DIR for every worktree (main + linked); a
+	// per-worktree `<GIT_DIR>/info/attributes` is not consulted, so
+	// writing there leaves the filter unwired and `git status` shows
+	// patched files as modified.
+	gd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-common-dir")
 	if err != nil {
-		return fmt.Errorf("rev-parse --git-dir: %w", err)
+		return fmt.Errorf("rev-parse --git-common-dir: %w", err)
 	}
 	gitDir := strings.TrimSpace(gd)
 	if !filepath.IsAbs(gitDir) {
@@ -115,10 +120,13 @@ func ensureFilterConfig(ctx context.Context, worktreePath string) error {
 	return nil
 }
 
-// writeAttributes rewrites `<gitDir>/info/attributes`, replacing the
-// treeman-managed block (between attrsHeader and the next blank
-// line / EOF) with one filter=<FilterName> line per file. Other
-// users' attributes are left untouched.
+// writeAttributes rewrites `<gitCommonDir>/info/attributes`,
+// replacing the treeman-managed block (between attrsHeader and the
+// next blank line / EOF) with one filter=<FilterName> line per file.
+// Other users' attributes are left untouched. Caller must pass the
+// common dir (e.g. from `git rev-parse --git-common-dir`); the
+// per-linked-worktree GIT_DIR is not consulted by git for
+// `info/attributes`.
 func writeAttributes(gitDir string, files []string) error {
 	infoDir := filepath.Join(gitDir, "info")
 	if err := os.MkdirAll(infoDir, 0o755); err != nil {
