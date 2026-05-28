@@ -78,6 +78,102 @@ func TestEnsureFilter_LinkedWorktreeAttributesVisible(t *testing.T) {
 	}
 }
 
+// TestEnsureFilter_StripsLegacyPerWorktreeAttributes:
+// treeman <= 2.4.1 wrote `info/attributes` under the per-linked-
+// worktree GIT_DIR. Git silently ignored it. On upgrade, EnsureFilter
+// must move the wiring to common-dir AND strip the orphan so users
+// don't see two copies drifting. Unrelated user lines in the per-wt
+// file (unlikely but possible) survive.
+func TestEnsureFilter_StripsLegacyPerWorktreeAttributes(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	tmp := t.TempDir()
+	main := filepath.Join(tmp, "main")
+	mustRun(t, tmp, "git", "init", "-q", "-b", "master", main)
+	mustRun(t, main, "git", "config", "user.email", "t@t")
+	mustRun(t, main, "git", "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(main, ".env.testing"), []byte("DB=v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, main, "git", "add", ".env.testing")
+	mustRun(t, main, "git", "commit", "-q", "-m", "v1")
+	mustRun(t, main, "git", "branch", "feature")
+	linked := filepath.Join(tmp, "linked")
+	mustRun(t, main, "git", "worktree", "add", "-q", linked, "feature")
+
+	// Seed a legacy per-worktree attributes file as treeman 2.4.1
+	// would have produced it. Drop a real user line in there too so
+	// we can prove migration is surgical.
+	perWtAttrs := filepath.Join(main, ".git", "worktrees", "linked", "info", "attributes")
+	if err := os.MkdirAll(filepath.Dir(perWtAttrs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := "*.log diff=foo\n" + attrsHeader + "\n.env.testing filter=" + FilterName + "\n"
+	if err := os.WriteFile(perWtAttrs, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureFilter(context.Background(), linked, []string{".env.testing"}); err != nil {
+		t.Fatalf("EnsureFilter: %v", err)
+	}
+
+	// User line survived; treeman block stripped.
+	body, err := os.ReadFile(perWtAttrs)
+	if err != nil {
+		t.Fatalf("per-wt attrs gone but it had user content: %v", err)
+	}
+	got := string(body)
+	if !strings.Contains(got, "*.log diff=foo") {
+		t.Errorf("user line clobbered:\n%s", got)
+	}
+	if strings.Contains(got, attrsHeader) || strings.Contains(got, "filter="+FilterName) {
+		t.Errorf("treeman block not stripped from per-wt file:\n%s", got)
+	}
+
+	// Common-dir attrs has the live wiring.
+	out := runCapture(t, linked, "git", "check-attr", "filter", ".env.testing")
+	if !strings.Contains(out, "filter: "+FilterName) {
+		t.Fatalf("filter not wired in common dir, got: %q", out)
+	}
+}
+
+// TestEnsureFilter_DeletesEmptyLegacyPerWorktreeAttributes: when the
+// legacy per-wt file ONLY contained the treeman block (the common
+// case), strip+empty → delete the file outright so no orphan remains.
+func TestEnsureFilter_DeletesEmptyLegacyPerWorktreeAttributes(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	tmp := t.TempDir()
+	main := filepath.Join(tmp, "main")
+	mustRun(t, tmp, "git", "init", "-q", "-b", "master", main)
+	mustRun(t, main, "git", "config", "user.email", "t@t")
+	mustRun(t, main, "git", "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(main, ".env.testing"), []byte("DB=v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, main, "git", "add", ".env.testing")
+	mustRun(t, main, "git", "commit", "-q", "-m", "v1")
+	mustRun(t, main, "git", "branch", "feature")
+	linked := filepath.Join(tmp, "linked")
+	mustRun(t, main, "git", "worktree", "add", "-q", linked, "feature")
+	perWtAttrs := filepath.Join(main, ".git", "worktrees", "linked", "info", "attributes")
+	if err := os.MkdirAll(filepath.Dir(perWtAttrs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(perWtAttrs, []byte(attrsHeader+"\n.env.testing filter="+FilterName+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureFilter(context.Background(), linked, []string{".env.testing"}); err != nil {
+		t.Fatalf("EnsureFilter: %v", err)
+	}
+	if _, err := os.Stat(perWtAttrs); err == nil {
+		t.Fatalf("legacy per-wt attrs file should be deleted: %s", perWtAttrs)
+	}
+}
+
 // TestEnsureFilter_ReplacesTreemanBlock guards block replacement so
 // repeated finalize runs don't leak stale filter lines for files no
 // longer in `patches[]`.

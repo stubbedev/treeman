@@ -53,20 +53,35 @@ func EnsureFilter(ctx context.Context, worktreePath string, files []string) erro
 	// per-worktree `<GIT_DIR>/info/attributes` is not consulted, so
 	// writing there leaves the filter unwired and `git status` shows
 	// patched files as modified.
-	gd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-common-dir")
+	gcd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return fmt.Errorf("rev-parse --git-common-dir: %w", err)
 	}
-	gitDir := strings.TrimSpace(gd)
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(worktreePath, gitDir)
+	commonDir := strings.TrimSpace(gcd)
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(worktreePath, commonDir)
 	}
 
 	if err := ensureFilterConfig(ctx, worktreePath); err != nil {
 		return err
 	}
-	if err := writeAttributes(gitDir, files); err != nil {
+	if err := writeAttributes(commonDir, files); err != nil {
 		return err
+	}
+	// Legacy migration: treeman <= 2.4.1 wrote `info/attributes`
+	// under the per-linked-worktree GIT_DIR, which git silently
+	// ignored. Strip the treeman-managed block from there so
+	// upgrading users don't see two stale copies of the file
+	// drifting from the live common-dir one. Best-effort: a missing
+	// per-wt file is fine, write errors are non-fatal.
+	if gd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-dir"); err == nil {
+		perWtGitDir := strings.TrimSpace(gd)
+		if !filepath.IsAbs(perWtGitDir) {
+			perWtGitDir = filepath.Join(worktreePath, perWtGitDir)
+		}
+		if perWtGitDir != commonDir {
+			_ = stripTreemanBlock(filepath.Join(perWtGitDir, "info", "attributes"))
+		}
 	}
 	// Best-effort legacy migration: clear --skip-worktree on any
 	// patched file that still carries it from treeman < 2.5.
@@ -135,23 +150,7 @@ func writeAttributes(gitDir string, files []string) error {
 	attrPath := filepath.Join(infoDir, "attributes")
 	body, _ := os.ReadFile(attrPath)
 
-	var out strings.Builder
-	skipping := false
-	for _, line := range strings.Split(string(body), "\n") {
-		if line == attrsHeader {
-			skipping = true
-			continue
-		}
-		if skipping {
-			if strings.TrimSpace(line) == "" {
-				skipping = false
-			}
-			continue
-		}
-		out.WriteString(line)
-		out.WriteString("\n")
-	}
-	tail := out.String()
+	tail := dropTreemanBlock(string(body))
 	tail = strings.TrimRight(tail, "\n")
 	if tail != "" {
 		tail += "\n\n"
@@ -170,4 +169,50 @@ func writeAttributes(gitDir string, files []string) error {
 	}
 	tail += "\n"
 	return os.WriteFile(attrPath, []byte(tail), 0o644)
+}
+
+// dropTreemanBlock returns `body` with the treeman-managed block
+// (header line through the next blank line / EOF) removed. Other
+// users' attributes are left intact.
+func dropTreemanBlock(body string) string {
+	var out strings.Builder
+	skipping := false
+	for _, line := range strings.Split(body, "\n") {
+		if line == attrsHeader {
+			skipping = true
+			continue
+		}
+		if skipping {
+			if strings.TrimSpace(line) == "" {
+				skipping = false
+			}
+			continue
+		}
+		out.WriteString(line)
+		out.WriteString("\n")
+	}
+	return out.String()
+}
+
+// stripTreemanBlock rewrites `attrPath` with the treeman-managed
+// block removed. Used to clean up stale per-linked-worktree
+// `info/attributes` files written by treeman <= 2.4.1 (which git
+// silently ignored). If the file would be empty after the strip, it
+// is deleted outright; if it contained only treeman content the
+// caller is left with no orphan to discover later. Missing file or
+// write errors are non-fatal — they signal "nothing to migrate" or
+// "user managed the file manually, leave it alone".
+func stripTreemanBlock(attrPath string) error {
+	body, err := os.ReadFile(attrPath)
+	if err != nil {
+		return err
+	}
+	cleaned := dropTreemanBlock(string(body))
+	if !strings.Contains(string(body), attrsHeader) {
+		return nil // nothing treeman-owned to strip
+	}
+	if strings.TrimSpace(cleaned) == "" {
+		return os.Remove(attrPath)
+	}
+	return os.WriteFile(attrPath, []byte(strings.TrimRight(cleaned, "\n")+"\n"), 0o644)
 }
