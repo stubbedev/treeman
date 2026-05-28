@@ -90,9 +90,11 @@ func RenderTemplate(cwd string) string {
 	}
 
 	// patches: — generic file-rewriting block. For Laravel projects
-	// the canonical patch is `.env.testing` → DB_TEST_DATABASE, with
-	// skip-worktree so it doesn't appear dirty in git. Driver is
-	// auto-detected from the `.env` extension.
+	// the canonical patch is `.env.testing` → DB_TEST_DATABASE.
+	// Each patched file is wired through git's clean/smudge filter
+	// so it doesn't appear dirty in `git status` but pulls can still
+	// overwrite it. Driver is auto-detected from the `.env`
+	// extension.
 	if hasFrameworkNamed(detected, "laravel") {
 		setMap := mapNode(
 			"DB_TEST_DATABASE", scalar(name+"_testing_{slug}"),

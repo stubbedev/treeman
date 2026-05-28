@@ -168,8 +168,8 @@ host=127.0.0.1
 			if err != nil {
 				t.Fatalf("Apply: %v", err)
 			}
-			t.Logf("%s: driver=%s outcome=%v skipped=%t", c.name,
-				res.Driver, res.Outcome, res.Skipped)
+			t.Logf("%s: driver=%s outcome=%v", c.name,
+				res.Driver, res.Outcome)
 
 			body, err := os.ReadFile(full)
 			if err != nil {

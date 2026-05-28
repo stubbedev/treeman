@@ -588,10 +588,6 @@
           "type": "string",
           "description": "File path relative to the worktree root. Required."
         },
-        "skip_worktree": {
-          "type": "boolean",
-          "description": "When true (default), apply `git update-index --skip-worktree`\nafter patching so the file doesn't show in `git status`."
-        },
         "format": {
           "type": "string",
           "enum": [
@@ -617,7 +613,7 @@
       "required": [
         "file"
       ],
-      "description": "Patch — one entry in the top-level `patches:` block. Each entry\ntargets one file under the worktree root and rewrites it with\nper-worktree values via the `set:` map. Values are template\nstrings that accept `{slug}`, `{slug_dash}`,\n`{slug_redis_queue}`, `{slug_redis_cache}`. Validated at\nconfig-load time — unknown keys fail loud.\n\nThe driver is picked from `format:` when set, otherwise auto-\ndetected from the file extension:\n\n\tdotenv  — `.env`, `.env.*`\n\tphpunit — `.xml`, `.xml.dist` (phpunit.xml `\u003cenv\u003e` blocks)\n\tyaml    — `.yaml`, `.yml`\n\tjson    — `.json`\n\ttoml    — `.toml`\n\tini     — `.ini`, `.cfg`\n\nPath syntax inside `set:` is uniform across drivers:\n\n\tdotenv / phpunit  — flat key (e.g. `DB_DATABASE`)\n\tini               — `section.key` (top-level keys allowed too)\n\tyaml / json / toml — dotted path, optionally with `[N]` indices\n\t                    (e.g. `services[0].host`)\n\nWhen `skip_worktree` is true (default), treeman calls\n`git update-index --skip-worktree` on the patched file so the\nrewrite doesn't show up as a dirty file. The file must be tracked\nby git for the skip-worktree call to do anything; gitignored\nfiles are patched in-place without any git interaction."
+      "description": "Patch — one entry in the top-level `patches:` block. Each entry\ntargets one file under the worktree root and rewrites it with\nper-worktree values via the `set:` map. Values are template\nstrings that accept `{slug}`, `{slug_dash}`,\n`{slug_redis_queue}`, `{slug_redis_cache}`. Validated at\nconfig-load time — unknown keys fail loud.\n\nThe driver is picked from `format:` when set, otherwise auto-\ndetected from the file extension:\n\n\tdotenv  — `.env`, `.env.*`\n\tphpunit — `.xml`, `.xml.dist` (phpunit.xml `\u003cenv\u003e` blocks)\n\tyaml    — `.yaml`, `.yml`\n\tjson    — `.json`\n\ttoml    — `.toml`\n\tini     — `.ini`, `.cfg`\n\nPath syntax inside `set:` is uniform across drivers:\n\n\tdotenv / phpunit  — flat key (e.g. `DB_DATABASE`)\n\tini               — `section.key` (top-level keys allowed too)\n\tyaml / json / toml — dotted path, optionally with `[N]` indices\n\t                    (e.g. `services[0].host`)\n\nEach patched file is wired through git's clean/smudge filter so\nthe rewrite is hidden from `git status` while still letting\n`git pull` / `git checkout` overwrite the file on incoming\nchanges — the daemon's HEAD watcher (or the smudge filter itself)\nre-applies the patch after. The file must be tracked by git for\nthe filter to engage; gitignored files are patched in-place\nwithout any git interaction."
     },
     "PortSpec": {
       "oneOf": [
@@ -862,7 +858,7 @@
         "$ref": "#/$defs/Patch"
       },
       "type": "array",
-      "description": "Files to rewrite inside each worktree with per-worktree values\n(slug-substituted DB names, cache prefixes, etc.). Supports\ndotenv key=value files, phpunit.xml `\u003cenv\u003e` blocks, generic\nYAML, and generic JSON. When `skip_worktree: true` (default)\neach patched file gets `git update-index --skip-worktree`\napplied so the rewrite doesn't show up as a dirty file.\n\nRe-applied on every `treeman wt finalize` so a branch switch\ninside an existing worktree re-evaluates each patch against\nthe new HEAD's slug."
+      "description": "Files to rewrite inside each worktree with per-worktree values\n(slug-substituted DB names, cache prefixes, etc.). Supports\ndotenv key=value files, phpunit.xml `\u003cenv\u003e` blocks, generic\nYAML, JSON, TOML, and INI. Each patched file is wired through\ngit's clean/smudge filter so the rewrite is hidden from\n`git status` while still letting `git pull` / `git checkout`\noverwrite the file on incoming changes (the smudge filter\nre-applies the per-worktree value on the way back to the\nworking tree).\n\nRe-applied on every `treeman wt finalize` so a branch switch\ninside an existing worktree re-evaluates each patch against\nthe new HEAD's slug."
     },
     "databases": {
       "items": {

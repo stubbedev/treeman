@@ -45,9 +45,12 @@ Per-worktree rewriting of these files lives in `patches:`.
 Files to rewrite inside each worktree with per-worktree values
 (slug-substituted DB names, cache prefixes, etc.). Supports
 dotenv key=value files, phpunit.xml `<env>` blocks, generic
-YAML, and generic JSON. When `skip_worktree: true` (default)
-each patched file gets `git update-index --skip-worktree`
-applied so the rewrite doesn't show up as a dirty file.
+YAML, JSON, TOML, and INI. Each patched file is wired through
+git's clean/smudge filter so the rewrite is hidden from
+`git status` while still letting `git pull` / `git checkout`
+overwrite the file on incoming changes (the smudge filter
+re-applies the per-worktree value on the way back to the
+working tree).
 
 Re-applied on every `treeman wt finalize` so a branch switch
 inside an existing worktree re-evaluates each patch against
@@ -653,20 +656,17 @@ Path syntax inside `set:` is uniform across drivers:
 	yaml / json / toml — dotted path, optionally with `[N]` indices
 	                    (e.g. `services[0].host`)
 
-When `skip_worktree` is true (default), treeman calls
-`git update-index --skip-worktree` on the patched file so the
-rewrite doesn't show up as a dirty file. The file must be tracked
-by git for the skip-worktree call to do anything; gitignored
-files are patched in-place without any git interaction.
+Each patched file is wired through git's clean/smudge filter so
+the rewrite is hidden from `git status` while still letting
+`git pull` / `git checkout` overwrite the file on incoming
+changes — the daemon's HEAD watcher (or the smudge filter itself)
+re-applies the patch after. The file must be tracked by git for
+the filter to engage; gitignored files are patched in-place
+without any git interaction.
 
 #### `file` *(string)* — **required**
 
 File path relative to the worktree root. Required.
-
-#### `skip_worktree` *(boolean)*
-
-When true (default), apply `git update-index --skip-worktree`
-after patching so the file doesn't show in `git status`.
 
 #### `format` *(string)*
 

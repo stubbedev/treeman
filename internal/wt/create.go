@@ -182,6 +182,9 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 	tplCtx := template.FromSlug(sl).WithPorts(portMap)
 
 	// Top-level patches: dotenv / phpunit.xml / yaml / json rewrites.
+	// Apply does the actual rewrite; EnsureFilter wires git's
+	// clean/smudge for the same files so `git pull` can overwrite
+	// them without tripping "would be overwritten by merge".
 	for _, p := range cfg.Patches {
 		res, err := patcher.Apply(p, wtPath, tplCtx)
 		if err != nil {
@@ -189,6 +192,15 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 		}
 		if res.Outcome == patcher.Updated {
 			sink.Info("patched %s (%s)", filepath.Join(wtPath, res.File), res.Driver)
+		}
+	}
+	if len(cfg.Patches) > 0 {
+		files := make([]string, 0, len(cfg.Patches))
+		for _, p := range cfg.Patches {
+			files = append(files, p.File)
+		}
+		if err := patcher.EnsureFilter(ctx, wtPath, files); err != nil {
+			sink.Warn("install patch filter: %v", err)
 		}
 	}
 

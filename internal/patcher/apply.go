@@ -1,7 +1,10 @@
 // Apply orchestrates one top-level `patches:` entry: pick the driver
 // (explicit `format:` or extension auto-detect), render every value
-// template through the template package, dispatch, and apply
-// skip-worktree.
+// template through the template package, dispatch the in-memory
+// rewrite, and write the result to disk. Git's clean/smudge filter
+// is wired separately by EnsureFilter — Apply just produces the
+// patched file content; the filter handles `git status` / `git
+// pull` interactions.
 package patcher
 
 import (
@@ -18,7 +21,6 @@ type ApplyResult struct {
 	File    string  // relative path from the YAML
 	Outcome Outcome // Updated / Unchanged / Missing
 	Driver  string  // dotenv | phpunit | yaml | json | toml | ini
-	Skipped bool    // true when SkipWorktree applied + git was happy
 }
 
 // Apply executes one Patch against the given worktree. Returns
@@ -61,15 +63,7 @@ func Apply(p config.Patch, worktreePath string, tplCtx template.Context) (ApplyR
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("patch %s: %w", p.File, err)
 	}
-	res := ApplyResult{File: p.File, Outcome: outcome, Driver: driver}
-
-	skip := p.SkipWorktree == nil || *p.SkipWorktree
-	if skip && outcome != Missing {
-		if ok, _ := SkipWorktree(worktreePath, abs); ok {
-			res.Skipped = true
-		}
-	}
-	return res, nil
+	return ApplyResult{File: p.File, Outcome: outcome, Driver: driver}, nil
 }
 
 // detectFormat picks a driver from a file path. Returns "" when the
