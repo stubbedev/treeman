@@ -542,7 +542,16 @@ func fireOnFileChange(
 	if dbIdx >= 0 && dbIdx < len(cfg.Databases) {
 		d := cfg.Databases[dbIdx]
 		engine = d.Engine
-		if rendered, err := template.Render(d.NameTemplate, template.FromSlug(sl)); err == nil {
+		// Prefix-scoped engines (redis/elasticsearch) have no
+		// name_template — their per-worktree namespace is the
+		// key_prefix. Fall back to it so TREEMAN_WATCH_DB_NAME isn't
+		// empty for those engines (and so a main_worktree key_prefix
+		// overlay, already merged into cfg, reaches the hook).
+		tmpl := d.NameTemplate
+		if tmpl == "" {
+			tmpl = d.KeyPrefix
+		}
+		if rendered, err := template.Render(tmpl, template.FromSlug(sl)); err == nil {
 			dbName = rendered
 		}
 	}

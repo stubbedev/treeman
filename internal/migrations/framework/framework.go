@@ -10,7 +10,10 @@ package framework
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"github.com/stubbedev/treeman/internal/config"
 )
 
 // Validator is an optional second-stage check a Spec can use when its
@@ -131,6 +134,40 @@ func LookupBuiltin(name string) (Spec, bool) {
 		}
 	}
 	return Spec{}, false
+}
+
+// RegistryFor returns the built-in detectors PLUS any user-defined
+// frameworks from `cfg.Frameworks` (the `frameworks:` YAML block). A
+// custom entry detects when all its markers are present (Spec.Detect).
+// This is what makes the `frameworks:` block live — `treeman fw detect`
+// and the doctor consult it so a project on a framework treeman doesn't
+// ship a preset for is still recognised.
+func RegistryFor(cfg *config.Config) *Registry {
+	r := DefaultRegistry()
+	if cfg == nil || len(cfg.Frameworks) == 0 {
+		return r
+	}
+	names := make([]string, 0, len(cfg.Frameworks))
+	for n := range cfg.Frameworks {
+		names = append(names, n)
+	}
+	sort.Strings(names) // deterministic detection order
+	for _, name := range names {
+		cf := cfg.Frameworks[name]
+		spec := Spec{
+			Name:          name,
+			Markers:       cf.Markers,
+			MigrationDirs: cf.MigrationDirs,
+			Lockfiles:     cf.Lockfiles,
+			HashMode:      HashMode(cf.HashMode),
+			EngineHint:    cf.EngineHint,
+		}
+		if cf.FilePattern != "" {
+			spec.FileGlobs = []string{cf.FilePattern}
+		}
+		r.Specs = append(r.Specs, spec)
+	}
+	return r
 }
 
 // DetectAll returns every Spec whose markers match.

@@ -274,6 +274,10 @@
             "optional": {
               "type": "boolean",
               "description": "When true, missing dump is not an error."
+            },
+            "source_db": {
+              "type": "string",
+              "description": "MongoDB only: the database the archive was dumped from; remapped into the per-worktree target DB via mongorestore --nsFrom/--nsTo. Ignored by other engines."
             }
           },
           "additionalProperties": false,
@@ -281,10 +285,10 @@
           "required": [
             "path"
           ],
-          "description": "Full dump mapping with optional `optional` flag."
+          "description": "Full dump mapping with optional `optional` + `source_db`."
         }
       ],
-      "description": "Source dump file. Bare string OR `{path, optional}` mapping."
+      "description": "Source dump file. Bare string OR `{path, optional, source_db}` mapping."
     },
     "EsConn": {
       "oneOf": [

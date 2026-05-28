@@ -217,6 +217,80 @@ hooks:
 	}
 }
 
+// TestMainWorktreeKeyPrefixOverlay covers the prefix-scoped overlay
+// field: a redis database whose main-worktree overlay replaces the
+// key_prefix. Asserts the on-file-change hook receives
+// TREEMAN_WATCH_DB_NAME rendered from the OVERLAY key_prefix (not the
+// base one) — which also pins the fix for prefix engines reporting an
+// empty TREEMAN_WATCH_DB_NAME (dispatch rendered name_template only, but
+// redis/es carry key_prefix). No docker: the hook fires off the file
+// watcher independent of any redis connection.
+func TestMainWorktreeKeyPrefixOverlay(t *testing.T) {
+	requireGit(t)
+
+	repoRoot := t.TempDir()
+	witnessDir := filepath.Join(repoRoot, "touch")
+	if err := os.MkdirAll(witnessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "db/migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoRoot, "db/migrations/000_init.sql", "-- init")
+
+	mustGit(t, "", "init", "-q", "-b", "main", repoRoot)
+	mustGit(t, repoRoot, "config", "user.email", "t@t")
+	mustGit(t, repoRoot, "config", "user.name", "t")
+	yaml := `
+main_worktree:
+  enabled: true
+  databases:
+    - key_prefix: "mainpfx_{slug}_"
+debounce_ms: 100
+databases:
+  - engine: redis
+    key_prefix: "basepfx_{slug}_"
+    inputs:
+      - { glob: "db/migrations/*.sql", label: migrations }
+hooks:
+  on-file-change:
+    - match: migrations
+      run: 'echo "$TREEMAN_WATCH_DB_NAME|$TREEMAN_WATCH_ENGINE" > ` + witnessDir + `/event'
+`
+	writeFile(t, repoRoot, ".treeman.yaml", yaml)
+	mustGit(t, repoRoot, "add", "-A")
+	mustGit(t, repoRoot, "commit", "-q", "-m", "init")
+
+	_, state := bootDaemon(t, repoRoot)
+	if _, err := daemon.EnrollMainWorktree(context.Background(), state, repoRoot); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	if err := daemon.ResumeWorktreeWatcher(context.Background(), state, repoRoot, repoRoot); err != nil {
+		t.Fatalf("resume wt watcher: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	writeFile(t, repoRoot, "db/migrations/001_new.sql", "-- new")
+
+	body := strings.TrimSpace(waitForFile(t, filepath.Join(witnessDir, "event"), 15*time.Second))
+	parts := strings.SplitN(body, "|", 2)
+	if len(parts) != 2 {
+		t.Fatalf("witness %q: want db_name|engine", body)
+	}
+	gotDB, gotEngine := parts[0], parts[1]
+	// Main slug is main_main → overlay "mainpfx_{slug}_" renders
+	// "mainpfx_main_main_". The base "basepfx_" must NOT appear.
+	if !strings.HasPrefix(gotDB, "mainpfx_main") {
+		t.Errorf("TREEMAN_WATCH_DB_NAME = %q, want overlay key_prefix (mainpfx_main…); base key_prefix leaked or prefix-engine name was empty", gotDB)
+	}
+	if strings.Contains(gotDB, "basepfx") {
+		t.Errorf("TREEMAN_WATCH_DB_NAME = %q used the BASE key_prefix, overlay did not apply", gotDB)
+	}
+	if gotEngine != "redis" {
+		t.Errorf("TREEMAN_WATCH_ENGINE = %q, want redis", gotEngine)
+	}
+}
+
 // TestMainWorktreeEnableFiresOnCreateHooks mimics what
 // `treeman main enable` does end-to-end: enroll the main row, then
 // dispatch FinalizeWorktree against the repo root. Both on-create-

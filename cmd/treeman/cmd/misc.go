@@ -904,7 +904,10 @@ func FwCmd() *cli.Command {
 				if err != nil {
 					return err
 				}
-				r := framework.DefaultRegistry()
+				// Honour the user's `frameworks:` block alongside the
+				// built-in detectors.
+				cfg, _ := resolve.LoadResolved(repoRoot)
+				r := framework.RegistryFor(&cfg)
 				detected := r.DetectAll(repoRoot)
 				if c.Bool("json") {
 					return jsonStream(map[string]any{

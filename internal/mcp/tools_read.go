@@ -214,7 +214,8 @@ func checkSchema(repoRoot string) doctorResult {
 }
 
 func checkFrameworks(repoRoot string) doctorResult {
-	detected := framework.DefaultRegistry().DetectAll(repoRoot)
+	cfg, _ := resolve.LoadResolved(repoRoot)
+	detected := framework.RegistryFor(&cfg).DetectAll(repoRoot)
 	if len(detected) == 0 {
 		return doctorResult{Name: "framework", Status: "warn", Detail: "no migration framework detected"}
 	}

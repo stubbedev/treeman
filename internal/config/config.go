@@ -1382,6 +1382,7 @@ func (DumpSpec) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
 	props.Set("path", &jsonschema.Schema{Type: "string", Description: "Dump file path, repo-root-relative. Required."})
 	props.Set("optional", &jsonschema.Schema{Type: "boolean", Description: "When true, missing dump is not an error."})
+	props.Set("source_db", &jsonschema.Schema{Type: "string", Description: "MongoDB only: the database the archive was dumped from; remapped into the per-worktree target DB via mongorestore --nsFrom/--nsTo. Ignored by other engines."})
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
 			{Type: "string", Description: "Bare path string. Equivalent to `{path: <this string>}`."},
@@ -1390,10 +1391,10 @@ func (DumpSpec) JSONSchema() *jsonschema.Schema {
 				Properties:           props,
 				Required:             []string{"path"},
 				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Full dump mapping with optional `optional` flag.",
+				Description:          "Full dump mapping with optional `optional` + `source_db`.",
 			},
 		},
-		Description: "Source dump file. Bare string OR `{path, optional}` mapping.",
+		Description: "Source dump file. Bare string OR `{path, optional, source_db}` mapping.",
 	}
 }
 
