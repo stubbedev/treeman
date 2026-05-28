@@ -624,9 +624,17 @@ mysqlColdBuild:
 
 	// Cold build: drop+recreate source, load dump, run migrate,
 	// snapshot for cache, fan out paratest clones.
-	if _, err := drv.DropMatching(ctx, sourceDB); err != nil {
+	//
+	// DropDatabase, NOT DropMatching: sourceDB under the main-wt
+	// overlay (e.g. `kontainer_testing`) is a prefix of every linked
+	// worktree's `<sourceDB>_<slug>` source + per-test clones, so a
+	// prefix drop would wipe sibling worktrees. Stale per-test
+	// clones from a prior cold-build get overwritten by exact name
+	// in SnapshotRestore during fanout below.
+	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "mysql", sourceDB)
 	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
@@ -854,10 +862,12 @@ func preparePostgres(
 	}
 
 pgColdBuild:
-	// Cold build.
-	if _, err := drv.DropMatching(ctx, sourceDB); err != nil {
+	// Cold build. DropDatabase, NOT DropMatching — see the comment
+	// on the matching mysql cold-build site.
+	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "postgres", sourceDB)
 	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
 		return Outcome{}, err
 	}
@@ -1054,9 +1064,13 @@ mongoColdBuild:
 	// Cold build: drop source, optionally mongorestore a dump
 	// archive, run the seed step, snapshot template, fan out
 	// clones.
-	if _, err := drv.DropMatching(ctx, sourceDB); err != nil {
+	//
+	// DropDatabase, NOT DropMatching — see the comment on the
+	// matching mysql cold-build site.
+	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
 		return Outcome{}, fmt.Errorf("mongo drop %s: %w", sourceDB, err)
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "mongodb", sourceDB)
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
@@ -1451,9 +1465,20 @@ func prepareES(
 esColdBuild:
 	// Cold build: drop, optionally bulk-load a dump NDJSON, run
 	// seed, snapshot, fanout.
-	if _, err := drv.DropMatching(ctx, sourcePrefix); err != nil {
+	//
+	// DropMatchingFiltered, NOT DropMatching: under the main-wt
+	// overlay sourcePrefix can prefix every other worktree's
+	// `<sourcePrefix>_<slug>_*` indices. Skip names containing
+	// `_<otherslug>` as a whole token so sibling worktrees'
+	// branch-scoped indices survive.
+	others := siblingSlugs(ctx, st, repoID, worktreeID)
+	keep := func(n string) bool { return !nameOwnedByOtherSlug(n, others) }
+	dropped, err := drv.DropMatchingFiltered(ctx, sourcePrefix, keep)
+	if err != nil {
 		return Outcome{}, fmt.Errorf("es drop %s*: %w", sourcePrefix, err)
 	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "elasticsearch",
+		fmt.Sprintf("%s* (%d)", sourcePrefix, len(dropped)))
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
 		return Outcome{}, err
 	} else if ok {
