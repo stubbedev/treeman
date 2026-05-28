@@ -21,7 +21,7 @@ func seedStoreForCompletion(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/foo", "foo")
 	_, _ = s.EnsureWorktree(ctx, repoID, "/r/foo/.wt/feature-x", "feature-x", "feat/x")
 	_, _ = s.EnsureWorktree(ctx, repoID, "/r/foo/.wt/feature-y", "feature-y", "feat/y")

@@ -23,7 +23,7 @@ func TestSyncNowAdvancesTargetedRepo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	st := NewState(ctx, s)
 	if _, err := s.EnsureRepo(ctx, work, "work"); err != nil {
 		t.Fatal(err)
@@ -72,7 +72,7 @@ func TestSyncNowReportsSkipReason(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	st := NewState(ctx, s)
 	if _, err := s.EnsureRepo(ctx, work, "work"); err != nil {
 		t.Fatal(err)

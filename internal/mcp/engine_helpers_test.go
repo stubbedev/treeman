@@ -21,7 +21,7 @@ func TestSnapshotLookupByEngineSource_PrefersMostRecentlyUsed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	older := store.SnapshotRecord{
 		Fingerprint: "old", Engine: "mysql", SourceDB: "app",
@@ -56,7 +56,7 @@ func TestSnapshotLookupByEngineSource_NoMatchReturnsNil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	got, err := snapshotLookupByEngineSource(ctx, s, "mysql", "nope")
 	if err != nil {
 		t.Fatalf("missing row should be (nil, nil), got err %v", err)

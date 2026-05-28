@@ -130,7 +130,7 @@ func ProbeRef(repoRoot, ref string) (bool, string) {
 		if err != nil {
 			return false, fmt.Sprintf("unreachable: %v", err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 			return true, ref
 		}

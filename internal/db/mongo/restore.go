@@ -38,7 +38,7 @@ func Restore(ctx context.Context, uri, targetDB, sourceDB, dumpPath string) erro
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	args := []string{
 		"--uri=" + uri,

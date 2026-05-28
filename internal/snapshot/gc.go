@@ -151,7 +151,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		if err != nil {
 			return err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		return drv.DropSnapshot(ctx, c.TemplateName)
 	case engine.FamilyPostgres:
 		if cfg.Connections.Postgres == nil {
@@ -161,7 +161,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		if err != nil {
 			return err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		return drv.DropSnapshot(ctx, c.TemplateName)
 	case engine.FamilyMongo:
 		if cfg.Connections.Mongodb == nil {
@@ -171,7 +171,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		if err != nil {
 			return err
 		}
-		defer drv.Close(ctx)
+		defer func() { _ = drv.Close(ctx) }()
 		return drv.DropSnapshot(ctx, c.TemplateName)
 	case engine.FamilyES:
 		if cfg.Connections.Elasticsearch == nil {
@@ -190,7 +190,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		if err != nil {
 			return err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		return drv.DropSnapshot(ctx, c.TemplateName)
 	default:
 		return fmt.Errorf("eviction: unsupported engine family %q (alias %q)", fam, c.Engine)

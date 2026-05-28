@@ -139,7 +139,7 @@ func (cr *ConfigReloader) removeDirLocked(dir string) {
 }
 
 func (cr *ConfigReloader) loop(ctx context.Context) {
-	defer cr.fsw.Close()
+	defer func() { _ = cr.fsw.Close() }()
 	for {
 		select {
 		case <-ctx.Done():

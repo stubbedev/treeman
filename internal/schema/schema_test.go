@@ -95,7 +95,7 @@ func TestSetModelineMissingFileIsNoop(t *testing.T) {
 func TestReadModeline(t *testing.T) {
 	dir := t.TempDir()
 	repo := filepath.Join(dir, ".treeman.yaml")
-	os.WriteFile(repo, []byte("# yaml-language-server: $schema=https://example.com/s.json\n"), 0o644)
+	_ = os.WriteFile(repo, []byte("# yaml-language-server: $schema=https://example.com/s.json\n"), 0o644)
 	got := ReadModeline(dir)
 	if got != "https://example.com/s.json" {
 		t.Errorf("ReadModeline = %q, want https://example.com/s.json", got)
@@ -104,7 +104,7 @@ func TestReadModeline(t *testing.T) {
 
 func TestInstallTargetURLSkipsFileWrite(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, ".treeman.yaml"), []byte("repo: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".treeman.yaml"), []byte("repo: {}\n"), 0o644)
 	resolved, _, err := Install(dir, TargetURL)
 	if err != nil {
 		t.Fatal(err)
@@ -120,7 +120,7 @@ func TestInstallTargetURLSkipsFileWrite(t *testing.T) {
 
 func TestInstallTargetRepoWritesFile(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, ".treeman.yaml"), []byte("repo: {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".treeman.yaml"), []byte("repo: {}\n"), 0o644)
 	resolved, _, err := Install(dir, TargetRepo)
 	if err != nil {
 		t.Fatal(err)

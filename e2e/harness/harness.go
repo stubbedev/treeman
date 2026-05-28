@@ -92,7 +92,7 @@ func NewEnv(t *testing.T, wtPath string) *Env {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	repoID, err := st.EnsureRepo(ctx, wtPath, filepath.Base(wtPath))
 	if err != nil {
 		t.Fatalf("ensure repo: %v", err)

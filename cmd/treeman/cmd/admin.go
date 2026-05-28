@@ -46,7 +46,7 @@ func RegistryCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
-					defer st.Close()
+					defer func() { _ = st.Close() }()
 					res, err := wtreg.Repair(ctx, st, repoRoot, detectBranchOfWorktree)
 					if err != nil {
 						return err
@@ -137,7 +137,7 @@ Examples:
 			if err != nil {
 				return err
 			}
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 			repoID, err := st.LookupRepoID(ctx, repoRoot)
 			if err != nil {
 				return err
@@ -203,7 +203,7 @@ func SnapshotsCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
-					defer st.Close()
+					defer func() { _ = st.Close() }()
 					repoID, err := lookupRepoID(ctx, st, repoRoot)
 					if err != nil {
 						if c.Bool("json") {
@@ -251,7 +251,7 @@ func SnapshotsCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
-					defer st.Close()
+					defer func() { _ = st.Close() }()
 					repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 					if err != nil {
 						return fmt.Errorf("ensure repo: %w", err)
@@ -315,7 +315,7 @@ never wipe the whole table.
 			if err != nil {
 				return err
 			}
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 			if c.String("repo") != "" || c.String("worktree") != "" {
 				repoRoot, err := resolveRepo(c.String("repo"))
 				if err == nil && repoRoot != "" {

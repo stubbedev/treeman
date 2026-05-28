@@ -136,7 +136,7 @@ func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, cap uint32) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SnapshotEvictionCandidate
 	for rows.Next() {
 		var c SnapshotEvictionCandidate
@@ -177,7 +177,7 @@ func (s *Store) ListSnapshotsOlderThan(ctx context.Context, cutoffMillis int64) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SnapshotEvictionCandidate
 	for rows.Next() {
 		var c SnapshotEvictionCandidate
@@ -218,7 +218,7 @@ func (s *Store) ListSnapshotsForRepo(ctx context.Context, repoID int64) ([]Snaps
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SnapshotEvictionCandidate
 	for rows.Next() {
 		var c SnapshotEvictionCandidate
@@ -262,7 +262,7 @@ func (s *Store) ListSnapshotsBeyondPerSource(ctx context.Context, keep uint32) (
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SnapshotEvictionCandidate
 	for rows.Next() {
 		var c SnapshotEvictionCandidate
@@ -285,7 +285,7 @@ func (s *Store) ListSnapshotsLargestLRU(ctx context.Context) ([]SnapshotEviction
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var (
 		cands []SnapshotEvictionCandidate
 		sizes []int64

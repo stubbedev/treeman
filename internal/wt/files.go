@@ -123,14 +123,21 @@ func copyRegularFile(src, dst string, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	defer sf.Close()
+	defer func() { _ = sf.Close() }()
 	df, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 	if err != nil {
 		return err
 	}
-	defer df.Close()
-	_, err = io.Copy(df, sf)
-	return err
+	if _, err := io.Copy(df, sf); err != nil {
+		_ = df.Close()
+		return err
+	}
+	// Check the close: a deferred close would swallow a failed final
+	// flush, leaving dst silently truncated.
+	if err := df.Close(); err != nil {
+		return fmt.Errorf("finalize copy %s: %w", dst, err)
+	}
+	return nil
 }
 
 // PruneEmptyParents walks up from `start` removing now-empty

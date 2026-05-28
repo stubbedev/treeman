@@ -318,7 +318,7 @@ func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug string, isMain bool
 	if err != nil {
 		return nil, fmt.Errorf("open hook log %s: %w", logPath, err)
 	}
-	defer logFile.Close()
+	defer func() { _ = logFile.Close() }()
 
 	c := exec.Command("/bin/sh", "-c", cmdStr)
 	c.Dir = cwd

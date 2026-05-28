@@ -142,7 +142,7 @@ func purgeMainDatabases(ctx context.Context, repoRoot string, cfg *config.Config
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	// Apply the main-wt overlay so prepare.TeardownDatabases sees the
 	// same templates the main-wt finalize path used to create the
@@ -334,7 +334,7 @@ func lookupMainStatus(ctx context.Context, repoRoot string) (store.WorktreeRow, 
 	if err != nil {
 		return store.WorktreeRow{}, branch
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	if err != nil || repoID == 0 {
 		return store.WorktreeRow{}, branch

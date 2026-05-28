@@ -163,7 +163,7 @@ func branchOccupancy(ctx context.Context, repoRoot string) map[string]string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT COALESCE(w.branch, ''), w.path
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
@@ -171,7 +171,7 @@ func branchOccupancy(ctx context.Context, repoRoot string) map[string]string {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make(map[string]string)
 	for rows.Next() {
 		var branch, path string

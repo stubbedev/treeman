@@ -180,7 +180,7 @@ func (d *Driver) get(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: read body: %w", path, err)
@@ -197,7 +197,7 @@ func (d *Driver) delete(ctx context.Context, path string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode == http.StatusNotFound {
 		// Already gone — treat as success for idempotent teardown.

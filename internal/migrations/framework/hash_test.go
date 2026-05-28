@@ -242,6 +242,80 @@ func TestMigrationsHash_NoCacheStillWorks(t *testing.T) {
 	}
 }
 
+// sqlSpec is a single-dir spec parameterised by hash mode, used by the
+// content-edit semantics tests below. nil cache forces a fresh compute
+// each call so we measure the hash mode, not the cache.
+func sqlSpec(mode HashMode) Spec {
+	return Spec{
+		Name:          "generic",
+		MigrationDirs: []string{"migrations"},
+		FileGlobs:     []string{"*.sql"},
+		HashMode:      mode,
+	}
+}
+
+func writeOneMigration(t *testing.T, root, body string) string {
+	t.Helper()
+	dir := filepath.Join(root, "migrations")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(dir, "001_up.sql")
+	if err := os.WriteFile(f, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// hash: checksum (default) must detect an in-place content edit to an
+// existing file (same name) — this is why lockfiles / seeders use it.
+func TestMigrationsHash_ChecksumModeDetectsContentEdit(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	f := writeOneMigration(t, root, "-- v1")
+	spec := sqlSpec(HashChecksum)
+
+	h1, err := MigrationsHashWithCache(ctx, nil, root, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f, []byte("-- v2 changed contents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h2, err := MigrationsHashWithCache(ctx, nil, root, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 == h2 {
+		t.Errorf("checksum mode must change hash on a content edit: still %s", h1)
+	}
+}
+
+// hash: filename must IGNORE an in-place content edit — append-only
+// migration dirs (Laravel/Rails/Django) rely on this so re-touching a
+// committed migration doesn't force a needless rebuild.
+func TestMigrationsHash_FilenameModeIgnoresContentEdit(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	f := writeOneMigration(t, root, "-- v1")
+	spec := sqlSpec(HashFilename)
+
+	h1, err := MigrationsHashWithCache(ctx, nil, root, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f, []byte("-- v2 changed contents"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h2, err := MigrationsHashWithCache(ctx, nil, root, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 != h2 {
+		t.Errorf("filename mode must ignore a content edit: %s != %s", h1, h2)
+	}
+}
+
 func TestEnumerateMigrations_OrderedAndFiltered(t *testing.T) {
 	root := setupLaravelRoot(t)
 	dir := filepath.Join(root, "database", "migrations")

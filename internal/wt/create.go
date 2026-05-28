@@ -161,7 +161,7 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 	if err != nil {
 		return CreateResult{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := st.EnsureRepo(ctx, req.RepoRoot, filepath.Base(req.RepoRoot))
 	if err != nil {
 		return CreateResult{}, err

@@ -447,7 +447,7 @@ func lookupWorktreeByPath(ctx context.Context, s *store.Store, path string) (sto
 	if err != nil {
 		return store.WorktreeRow{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	if !rows.Next() {
 		return store.WorktreeRow{}, nil
 	}

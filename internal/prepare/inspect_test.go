@@ -41,7 +41,7 @@ func TestInspectFingerprint_DerivesPerInputHashes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	rep := InspectFingerprint(ctx, s, d, dir, "app_test", "8.0.36")
 
@@ -81,7 +81,7 @@ func TestInspectFingerprint_DetectsCachedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	r1 := InspectFingerprint(ctx, s, d, dir, "x", "8.0")
 	if r1.CacheHitAvailable {
@@ -120,7 +120,7 @@ func TestInspectFingerprint_VersionChangesFlipFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	a := InspectFingerprint(ctx, s, d, dir, "x", "8.0.0")
 	b := InspectFingerprint(ctx, s, d, dir, "x", "8.0.1")
@@ -160,7 +160,7 @@ func TestInspectFingerprint_DoublestarChecksumGlobFoldsBaseDirFiles(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	r1 := InspectFingerprint(ctx, s, d, dir, "app_test", "8.0.36")
 	agg, ok := r1.InputHashes[glob]

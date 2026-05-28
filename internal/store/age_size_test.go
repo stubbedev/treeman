@@ -16,7 +16,7 @@ func TestListSnapshotsOlderThan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	now := time.Now().UnixMilli()
 	for i, age := range []int64{40, 31, 29, 5, 0} {
@@ -55,7 +55,7 @@ func TestListSnapshotsLargestLRU(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	type row struct {
 		fp   string
 		size int64
@@ -101,7 +101,7 @@ func TestSumSnapshotBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	for i := 0; i < 3; i++ {
 		_ = st.RecordSnapshot(ctx, SnapshotRecord{
 			Fingerprint: "fp" + itoaTest(i), Engine: "mysql", EngineVersion: "8.0",

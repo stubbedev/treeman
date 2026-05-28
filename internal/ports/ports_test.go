@@ -19,7 +19,7 @@ func openStore(t *testing.T) (*store.Store, int64, int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	repoID, err := st.EnsureRepo(ctx, "/repos/test", "test")
 	if err != nil {
 		t.Fatal(err)
@@ -40,7 +40,7 @@ func pickFreePort(t *testing.T) uint16 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	_, p, err := net.SplitHostPort(l.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -88,7 +88,7 @@ func TestAllocateSkipsHeldPortAndPicksNext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	pn, _ := strconv.Atoi(p)
 	held := uint16(pn)
@@ -121,7 +121,7 @@ func TestAllocateExhaustsRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	pn, _ := strconv.Atoi(p)
 	port := uint16(pn)
@@ -153,7 +153,7 @@ func TestAllocateReleasesEarlierSlotsOnLaterFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	pn, _ := strconv.Atoi(p)
 	held := uint16(pn)

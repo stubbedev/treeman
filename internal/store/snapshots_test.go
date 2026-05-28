@@ -15,7 +15,7 @@ func TestListLRUEvictable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	repoID, err := st.EnsureRepo(ctx, "/tmp/myrepo", "myrepo")
 	if err != nil {
@@ -63,7 +63,7 @@ func TestListLRUEvictableZeroCapNoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, "/tmp/myrepo", "myrepo")
 	_ = st.RecordSnapshot(ctx, SnapshotRecord{
 		Fingerprint: "f", Engine: "mysql", EngineVersion: "8.0", SourceDB: "src",

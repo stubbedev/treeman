@@ -352,7 +352,7 @@ func registryRegisterTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in reg
 	if err != nil {
 		return nil, registryRegisterOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	if err != nil {
 		return nil, registryRegisterOut{}, fmt.Errorf("ensure repo: %w", err)
@@ -397,7 +397,7 @@ func registryUnregisterTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in r
 	if err != nil {
 		return nil, registryUnregisterOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := lookupRepoID(ctx, st, repoRoot)
 	if err != nil {
 		return nil, registryUnregisterOut{}, fmt.Errorf("lookup repo %s: %w", repoRoot, err)
@@ -457,7 +457,7 @@ func registryRemoveTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in regis
 	if err != nil {
 		return nil, registryRemoveOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := st.LookupRepoID(ctx, repoRoot)
 	if err != nil {
 		return nil, registryRemoveOut{}, err
@@ -497,7 +497,7 @@ func registryRepairTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in regis
 	if err != nil {
 		return nil, wtreg.RepairResult{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	res, err := wtreg.Repair(ctx, st, repoRoot, detectBranch)
 	if err == nil && (len(res.Registered) > 0 || len(res.Unregistered) > 0) {
 		writeMCPEvent(context.Background(), "registry_repair",
@@ -531,7 +531,7 @@ func snapshotsPurgeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snaps
 	if err != nil {
 		return nil, snapshotsPurgeOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	if err != nil {
 		return nil, snapshotsPurgeOut{}, fmt.Errorf("ensure repo: %w", err)
@@ -581,7 +581,7 @@ func logsPurgeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsPurgeI
 	if err != nil {
 		return nil, logsPurgeOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	if in.Repo != "" || in.Worktree != "" {
 		repoRoot, err := resolveRepo(in.Repo)
 		if err == nil && repoRoot != "" {

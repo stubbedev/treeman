@@ -92,7 +92,7 @@ func TestResolveBaseBranch_FallsBackToMainWhenNoUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	got := resolveBaseBranch(ctx, st, repo, 0, "feature/KON-1")
 	if got != "develop" {
@@ -126,7 +126,7 @@ func TestResolveBaseBranch_PrefersEnrolledMainWorktreeRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := st.EnsureRepo(ctx, repo, "test-repo")
 	if err != nil {
 		t.Fatalf("EnsureRepo: %v", err)
@@ -164,7 +164,7 @@ func TestResolveBaseBranch_EmptyWhenNoSharedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	got := resolveBaseBranch(ctx, st, repo, 0, "orphan")
 	if got != "" {
 		t.Fatalf("want empty (no common ancestor), got %q", got)
@@ -189,7 +189,7 @@ func TestResolveBaseBranch_EmptyWhenBranchEqualsMain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	if got := resolveBaseBranch(ctx, st, repo, 0, "develop"); got != "" {
 		t.Fatalf("want empty (self-base), got %q", got)
 	}

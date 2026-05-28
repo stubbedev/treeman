@@ -99,12 +99,12 @@ func OpenDump(path string) (io.ReadCloser, Format, error) {
 	}
 	format, sniffed, err := SniffFormat(f)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, FormatNone, fmt.Errorf("sniff %s: %w", path, err)
 	}
 	dec, err := Decompress(sniffed, format)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, FormatNone, fmt.Errorf("decompress %s as %s: %w", path, format, err)
 	}
 	return &fileCloser{rc: dec, f: f}, format, nil

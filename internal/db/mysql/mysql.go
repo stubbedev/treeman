@@ -80,7 +80,7 @@ func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
 	}
 	adapter.ConfigurePool(db, int(cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ping mysql: %w", err)
 	}
 	return &Driver{DB: db, cfg: cfg}, nil
@@ -179,7 +179,7 @@ func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, err
 	if err != nil {
 		return nil, fmt.Errorf("list mysql databases: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var s string
@@ -260,7 +260,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	type t struct{ name, kind string }
 	var tables, views []t
 	for rows.Next() {
@@ -292,7 +292,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 		if err != nil {
 			return fmt.Errorf("acquire DDL connection: %w", err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		if err := applyCloneSession(ctx, conn); err != nil {
 			return err
 		}
@@ -356,7 +356,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 		if err != nil {
 			return err
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		if err := applyCloneSession(ctx, conn); err != nil {
 			return err
 		}
@@ -442,7 +442,7 @@ func copyOneTableData(ctx context.Context, db *sql.DB, source, template, name st
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := applyCloneSession(ctx, conn); err != nil {
 		return err
 	}
@@ -468,7 +468,7 @@ func nonGeneratedColumns(ctx context.Context, conn *sql.Conn, schema, table stri
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var c string

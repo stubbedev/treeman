@@ -20,13 +20,13 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer raw.Close()
+	defer func() { _ = raw.Close() }()
 
 	got := dump(t, raw)
 	wantTables := []string{
@@ -98,7 +98,7 @@ func dump(t *testing.T, db *sql.DB) schemaSnapshot {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var s schemaSnapshot
 	for rows.Next() {
 		var typ, name string

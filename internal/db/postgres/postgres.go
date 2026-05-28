@@ -79,7 +79,7 @@ func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 	}
 	adapter.ConfigurePool(db, int(cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 	return &Driver{DB: db, cfg: cfg}, nil
@@ -115,7 +115,7 @@ func (d *Driver) OpenScoped(ctx context.Context, dbName string) (*sql.DB, error)
 		return nil, fmt.Errorf("open postgres %s: %w", dbName, err)
 	}
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres %s: %w", dbName, err)
 	}
 	return db, nil
@@ -210,7 +210,7 @@ func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var s string
@@ -332,6 +332,6 @@ func (d *Driver) execOutsideTx(ctx context.Context, stmt string) (sql.Result, er
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	return conn.ExecContext(ctx, stmt)
 }

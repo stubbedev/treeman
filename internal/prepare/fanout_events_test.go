@@ -20,7 +20,7 @@ func TestFanOutClonesEmitsLifecycleEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/foo", "foo")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/r/foo/.wt/x", "x", "main")
 
@@ -66,7 +66,7 @@ func TestFanOutClonesEmitsErrorEventOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/foo", "foo")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/r/foo/.wt/y", "y", "main")
 

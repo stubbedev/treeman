@@ -135,7 +135,7 @@ func writeMCPEvent(ctx context.Context, action, message string, repoID int64, pa
 	if err != nil {
 		return
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	if payload == nil {
 		payload = map[string]string{}
 	}
@@ -172,7 +172,7 @@ func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.O
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	// Route through ResolveIdentity so MCP matches the daemon + CLI: the
 	// main-worktree overlay is applied (bare active DB name) and a linked
@@ -209,7 +209,7 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	// Same identity routing as runPrepare — reset must operate on the very
 	// active namespace the swap lifecycle created (bare on the main worktree).
@@ -277,7 +277,7 @@ func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) (
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	id, err := wtpkg.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
 	if err != nil {
@@ -305,7 +305,7 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	var sl slug.Slug
 	var isMain bool
 	if dbErr == nil {
-		defer st.Close()
+		defer func() { _ = st.Close() }()
 		repoID, _ = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 		id, idErr := wtpkg.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
 		if idErr != nil {

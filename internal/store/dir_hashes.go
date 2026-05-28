@@ -71,7 +71,7 @@ func (s *Store) BatchDirHashes(ctx context.Context, dirs []string, specName, has
 			}
 			out[dir] = DirHashRecord{MtimeNs: mt, MemberCount: mc, MemberHash: h}
 		}
-		rows.Close()
+		_ = rows.Close()
 	}
 	return out, nil
 }
@@ -85,7 +85,7 @@ func (s *Store) UpsertDirHashes(ctx context.Context, entries []DirHashKey, hashe
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO dir_hashes(dir, spec_name, hash_mode, mtime_ns, member_count, member_hash, cached_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -97,7 +97,7 @@ func (s *Store) UpsertDirHashes(ctx context.Context, entries []DirHashKey, hashe
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 	now := nowMillis()
 	for _, e := range entries {
 		h, ok := hashes[e.Dir]

@@ -91,7 +91,7 @@ func (s *Store) LoadWorktreePorts(ctx context.Context, worktreeID int64) (map[st
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var name string
 		var port uint16
@@ -125,7 +125,7 @@ func (s *Store) ListUsedPorts(ctx context.Context, repoID int64, name string) (m
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var p uint16
 		if err := rows.Scan(&p); err != nil {

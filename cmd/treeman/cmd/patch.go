@@ -169,7 +169,7 @@ func buildTemplateContext(ctx context.Context, repoRoot, worktreePath string) (t
 		// renders deterministically; ports unavailable.
 		return template.FromSlug(slug.For(worktreePath, "")), nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	repoID, err := st.LookupRepoID(ctx, repoRoot)
 	if err != nil || repoID == 0 {

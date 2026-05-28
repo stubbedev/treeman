@@ -130,7 +130,7 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 	if err != nil {
 		return nil, fmt.Errorf("query events: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []Event
 	for rows.Next() {
 		var e Event
@@ -204,7 +204,7 @@ func (s *Store) QueryHookRuns(ctx context.Context, worktreeID int64, limit int) 
 	if err != nil {
 		return nil, fmt.Errorf("query hook_runs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []HookRun
 	for rows.Next() {
 		var h HookRun
@@ -296,7 +296,7 @@ func (s *Store) QueryHookLog(ctx context.Context, hookRunID int64) ([]HookLogChu
 	if err != nil {
 		return nil, fmt.Errorf("query hook_log_chunks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []HookLogChunk
 	for rows.Next() {
 		var c HookLogChunk

@@ -52,18 +52,18 @@ func (t *Table) Render(w io.Writer) {
 	for i, h := range t.headers {
 		writeCell(w, Bold(h), widths[i])
 		if i < len(t.headers)-1 {
-			fmt.Fprint(w, t.gap)
+			_, _ = fmt.Fprint(w, t.gap)
 		}
 	}
-	fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w)
 	// Separator (dim)
 	for i, wi := range widths {
-		fmt.Fprint(w, Dim(strings.Repeat("─", wi)))
+		_, _ = fmt.Fprint(w, Dim(strings.Repeat("─", wi)))
 		if i < len(widths)-1 {
-			fmt.Fprint(w, t.gap)
+			_, _ = fmt.Fprint(w, t.gap)
 		}
 	}
-	fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w)
 	// Body
 	for _, row := range t.rows {
 		for i, cell := range row {
@@ -72,10 +72,10 @@ func (t *Table) Render(w io.Writer) {
 			}
 			writeCell(w, cell, widths[i])
 			if i < len(row)-1 && i < len(widths)-1 {
-				fmt.Fprint(w, t.gap)
+				_, _ = fmt.Fprint(w, t.gap)
 			}
 		}
-		fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w)
 	}
 }
 
@@ -83,9 +83,9 @@ func (t *Table) Render(w io.Writer) {
 // the column width. Padding is computed against the ANSI-stripped
 // width so colored cells don't drift.
 func writeCell(w io.Writer, cell string, width int) {
-	fmt.Fprint(w, cell)
+	_, _ = fmt.Fprint(w, cell)
 	pad := width - Width(cell)
 	if pad > 0 {
-		fmt.Fprint(w, strings.Repeat(" ", pad))
+		_, _ = fmt.Fprint(w, strings.Repeat(" ", pad))
 	}
 }

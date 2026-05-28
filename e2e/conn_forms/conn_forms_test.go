@@ -12,8 +12,10 @@ import (
 	"context"
 	"database/sql"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -29,6 +31,8 @@ const (
 	mysqlAddr = "127.0.0.1:13344"
 	pgAddr    = "127.0.0.1:15434"
 	redisAddr = "127.0.0.1:16380"
+	mongoAddr = "127.0.0.1:27027"
+	esAddr    = "127.0.0.1:9244"
 )
 
 func TestConnectionScalarForms(t *testing.T) {
@@ -38,6 +42,8 @@ func TestConnectionScalarForms(t *testing.T) {
 	waitTCP(t, "mysql", mysqlAddr)
 	waitTCP(t, "postgres", pgAddr)
 	waitTCP(t, "redis", redisAddr)
+	waitTCP(t, "mongo", mongoAddr)
+	waitHTTP(t, "elasticsearch", "http://"+esAddr+"/_cluster/health")
 
 	t.Run("mysql DSN string", func(t *testing.T) {
 		wt := setupRepo(t, `connections:
@@ -82,6 +88,37 @@ databases:
 		o := prepareLoaded(t, wt, "redis")
 		if o.Engine != "redis" {
 			t.Errorf("redis URL-string form: unexpected outcome engine %q", o.Engine)
+		}
+	})
+
+	t.Run("mongo URI string", func(t *testing.T) {
+		wt := setupRepo(t, `connections:
+  mongodb: "mongodb://127.0.0.1:27027"
+databases:
+  - engine: mongodb
+    name_template: tmcf_mo_{slug}
+`)
+		// A successful prepare proves the scalar URI parsed + dialed:
+		// prepareMongo connects (ListMatching) before snapshot, so a bad
+		// URI would fail RunPrepare.
+		o := prepareLoaded(t, wt, "mongodb")
+		if o.Engine != "mongodb" {
+			t.Errorf("mongo URI-string form: unexpected outcome engine %q", o.Engine)
+		}
+	})
+
+	t.Run("elasticsearch URL string", func(t *testing.T) {
+		wt := setupRepo(t, `connections:
+  elasticsearch: "http://127.0.0.1:9244"
+databases:
+  - engine: elasticsearch
+    key_prefix: "tmcf_es_{slug}_"
+`)
+		// A successful prepare proves the scalar URL parsed + reached the
+		// cluster: prepare probes ES (ListMatching) before any build.
+		o := prepareLoaded(t, wt, "elasticsearch")
+		if o.Engine != "elasticsearch" {
+			t.Errorf("es URL-string form: unexpected outcome engine %q", o.Engine)
 		}
 	})
 }
@@ -158,6 +195,30 @@ func waitTCP(t *testing.T, name, addr string) {
 		}
 	})
 }
+
+func waitHTTP(t *testing.T, name, url string) {
+	t.Helper()
+	harness.WaitForReady(t, name+":"+url, 90*time.Second, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return mkHTTPErr(resp.StatusCode)
+		}
+		return nil
+	})
+}
+
+func mkHTTPErr(code int) error { return &httpErr{code} }
+
+type httpErr struct{ code int }
+
+func (e *httpErr) Error() string { return "http status " + strconv.Itoa(e.code) }
 
 func write(t *testing.T, dir, rel, body string) {
 	t.Helper()

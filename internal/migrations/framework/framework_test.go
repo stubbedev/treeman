@@ -25,8 +25,8 @@ func TestDetectLaravelInTempdir(t *testing.T) {
 
 func TestPlainJsProjectDoesNotMatchOrms(t *testing.T) {
 	d := t.TempDir()
-	os.WriteFile(filepath.Join(d, "package.json"), []byte(`{"name":"plain"}`), 0o644)
-	os.WriteFile(filepath.Join(d, "yarn.lock"), nil, 0o644)
+	_ = os.WriteFile(filepath.Join(d, "package.json"), []byte(`{"name":"plain"}`), 0o644)
+	_ = os.WriteFile(filepath.Join(d, "yarn.lock"), nil, 0o644)
 	r := DefaultRegistry()
 	names := make([]string, 0)
 	for _, s := range r.DetectAll(d) {
@@ -43,8 +43,8 @@ func TestPlainJsProjectDoesNotMatchOrms(t *testing.T) {
 
 func TestTypeormMatchesOnlyOnDatasourceConfig(t *testing.T) {
 	d := t.TempDir()
-	os.WriteFile(filepath.Join(d, "package.json"), []byte(`{"name":"app"}`), 0o644)
-	os.WriteFile(filepath.Join(d, "data-source.ts"), []byte("export default {}"), 0o644)
+	_ = os.WriteFile(filepath.Join(d, "package.json"), []byte(`{"name":"app"}`), 0o644)
+	_ = os.WriteFile(filepath.Join(d, "data-source.ts"), []byte("export default {}"), 0o644)
 	r := DefaultRegistry()
 	hasTypeorm := false
 	hasDrizzle := false
@@ -66,7 +66,7 @@ func TestTypeormMatchesOnlyOnDatasourceConfig(t *testing.T) {
 
 func TestKnexMatchesTypescriptConfig(t *testing.T) {
 	d := t.TempDir()
-	os.WriteFile(filepath.Join(d, "knexfile.ts"), []byte("export default {}"), 0o644)
+	_ = os.WriteFile(filepath.Join(d, "knexfile.ts"), []byte("export default {}"), 0o644)
 	r := DefaultRegistry()
 	hasKnex := false
 	for _, s := range r.DetectAll(d) {
@@ -81,7 +81,7 @@ func TestKnexMatchesTypescriptConfig(t *testing.T) {
 
 func TestDrizzleMatchesMjsConfig(t *testing.T) {
 	d := t.TempDir()
-	os.WriteFile(filepath.Join(d, "drizzle.config.mjs"), []byte("export default {}"), 0o644)
+	_ = os.WriteFile(filepath.Join(d, "drizzle.config.mjs"), []byte("export default {}"), 0o644)
 	r := DefaultRegistry()
 	hasDrizzle := false
 	for _, s := range r.DetectAll(d) {

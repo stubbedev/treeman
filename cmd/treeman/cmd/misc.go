@@ -86,7 +86,7 @@ func RunPrepareOnWorktree(ctx context.Context, worktree, repoOverride string) ([
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	// Route through ResolveIdentity so this manual path matches the daemon:
 	// the main-worktree overlay is applied (bare active DB name) and a linked
@@ -196,7 +196,7 @@ func RunDbStatusOnWorktree(ctx context.Context, worktree, repoOverride string) (
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
 	if err != nil {
@@ -232,7 +232,7 @@ func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFil
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	// Route through ResolveIdentity so the main-worktree overlay is applied
 	// (bare active DB name) and the slug matches the daemon's branch-
@@ -355,7 +355,7 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	if dbPath != "" {
 		if s, oerr := store.Open(ctx, dbPath); oerr == nil {
 			st = s
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 			repoID, _ = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 			id, idErr := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
 			if idErr != nil {
@@ -488,11 +488,11 @@ func ConfigCmd() *cli.Command {
 						defer pager.Close()
 					}
 					b, _ := yaml.Marshal(cfg)
-					fmt.Fprint(ui.Out, string(b))
+					_, _ = fmt.Fprint(ui.Out, string(b))
 					if c.Bool("resolved") {
 						r := resolve.Resolve(&cfg, repoRoot)
-						fmt.Fprintln(ui.Out)
-						fmt.Fprintln(ui.Out, "# resolved connections")
+						_, _ = fmt.Fprintln(ui.Out)
+						_, _ = fmt.Fprintln(ui.Out, "# resolved connections")
 						printResolved("mysql", r.Mysql)
 						printResolved("postgres", r.Postgres)
 						printResolved("mongodb", r.Mongodb)
@@ -513,11 +513,11 @@ func printResolved(name string, c any) {
 	// is good enough. Write through ui.Out so the pager wrap in
 	// `config show` captures these lines too.
 	if isNil(c) {
-		fmt.Fprintf(ui.Out, "# %s <- (none)\n", name)
+		_, _ = fmt.Fprintf(ui.Out, "# %s <- (none)\n", name)
 		return
 	}
 	b, _ := json.Marshal(c)
-	fmt.Fprintf(ui.Out, "# %s <- %s\n", name, string(b))
+	_, _ = fmt.Fprintf(ui.Out, "# %s <- %s\n", name, string(b))
 }
 
 func isNil(v any) bool {

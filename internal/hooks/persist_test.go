@@ -17,7 +17,7 @@ func TestPersistOutcomeWritesRowsAndEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/foo", "foo")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/r/foo/.wt/a", "a", "main")
 
@@ -68,7 +68,7 @@ func TestPersistOutcomeAllZerosWritesInfoLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/bar", "bar")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/r/bar/.wt/a", "a", "main")
 	PersistOutcome(ctx, s, repoID, wtID, "setup", 0, 10,

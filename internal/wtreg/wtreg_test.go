@@ -51,7 +51,7 @@ func TestRepairRegistersMissingWorktrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	res, err := Repair(ctx, st, repo, nil)
 	if err != nil {
@@ -84,7 +84,7 @@ func TestRepairUnregistersMissingFromGit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	repoID, _ := st.EnsureRepo(ctx, repo, "repo")
 	_, _ = st.EnsureWorktree(ctx, repoID, "/nonexistent-wt", "slug", "branch")

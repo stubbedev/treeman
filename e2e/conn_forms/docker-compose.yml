@@ -38,3 +38,29 @@ services:
       timeout: 3s
       retries: 30
       start_period: 3s
+  mongo:
+    image: mongo:7
+    container_name: treeman-e2e-connforms-mongo
+    ports:
+      - "27027:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: treeman-e2e-connforms-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9244:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 15s

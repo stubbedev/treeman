@@ -24,7 +24,7 @@ func TestRenderTemplateContainsModeline(t *testing.T) {
 
 func TestRenderTemplateEmitsGroupForGoMod(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module foo\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module foo\n"), 0o644)
 	body := RenderTemplate(dir)
 	if !strings.Contains(body, "go mod download") {
 		t.Errorf("missing go mod download hook:\n%s", body)
@@ -33,8 +33,8 @@ func TestRenderTemplateEmitsGroupForGoMod(t *testing.T) {
 
 func TestRenderTemplateEmitsNpmGroup(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}\n"), 0o644)
-	os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte("{}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "package-lock.json"), []byte("{}\n"), 0o644)
 	body := RenderTemplate(dir)
 	if !strings.Contains(body, "npm ci") {
 		t.Errorf("missing npm ci hook:\n%s", body)
@@ -53,7 +53,7 @@ func TestRenderTemplateParsesAsYAML(t *testing.T) {
 func TestWriteYAMLRefusesOverwriteWithoutForce(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, ".treeman.yaml")
-	os.WriteFile(target, []byte("existing\n"), 0o644)
+	_ = os.WriteFile(target, []byte("existing\n"), 0o644)
 	_, _, _, err := WriteYAML(dir, false)
 	if err == nil {
 		t.Error("WriteYAML(force=false) should error when file exists")
@@ -63,7 +63,7 @@ func TestWriteYAMLRefusesOverwriteWithoutForce(t *testing.T) {
 func TestWriteYAMLOverwritesWithForce(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, ".treeman.yaml")
-	os.WriteFile(target, []byte("existing\n"), 0o644)
+	_ = os.WriteFile(target, []byte("existing\n"), 0o644)
 	_, created, body, err := WriteYAML(dir, true)
 	if err != nil {
 		t.Fatal(err)
@@ -174,9 +174,9 @@ func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 
 func TestDetectJSPkgMgrPrecedence(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}\n"), 0o644)
-	os.WriteFile(filepath.Join(dir, "yarn.lock"), []byte("\n"), 0o644)
-	os.WriteFile(filepath.Join(dir, "pnpm-lock.yaml"), []byte("\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "yarn.lock"), []byte("\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "pnpm-lock.yaml"), []byte("\n"), 0o644)
 	// pnpm beats yarn
 	if got := detectJSPkgMgr(dir); got != "pnpm" {
 		t.Errorf("detectJSPkgMgr = %q, want pnpm", got)

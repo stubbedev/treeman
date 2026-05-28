@@ -167,7 +167,7 @@ func Run(
 		if fErr != nil {
 			return Outcome{ExitCode: -1}, fmt.Errorf("%s log open: %w", spec.Label, fErr)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		stdoutW = io.MultiWriter(stdoutW, f)
 		stderrW = io.MultiWriter(stderrW, f)
 	}

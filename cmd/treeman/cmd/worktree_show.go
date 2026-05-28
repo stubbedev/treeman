@@ -62,19 +62,19 @@ func wtShow() *cli.Command {
 				return err
 			}
 
-			fmt.Fprintln(ui.Out, ui.Bold(wt.Slug)+ui.Dim("  #"+fmt.Sprintf("%d", wt.ID)))
-			fmt.Fprintf(ui.Out, "  branch: %s\n", wt.Branch)
-			fmt.Fprintf(ui.Out, "  path:   %s\n", wt.Path)
-			fmt.Fprintf(ui.Out, "  state:  %s\n", finalizeStatusLine(ctx, st, wt.ID))
+			_, _ = fmt.Fprintln(ui.Out, ui.Bold(wt.Slug)+ui.Dim("  #"+fmt.Sprintf("%d", wt.ID)))
+			_, _ = fmt.Fprintf(ui.Out, "  branch: %s\n", wt.Branch)
+			_, _ = fmt.Fprintf(ui.Out, "  path:   %s\n", wt.Path)
+			_, _ = fmt.Fprintf(ui.Out, "  state:  %s\n", finalizeStatusLine(ctx, st, wt.ID))
 			if portMap, _ := st.LoadWorktreePorts(ctx, wt.ID); len(portMap) > 0 {
-				fmt.Fprintf(ui.Out, "  ports:  %s\n", formatPortMap(portMap))
+				_, _ = fmt.Fprintf(ui.Out, "  ports:  %s\n", formatPortMap(portMap))
 			}
 			if bs, _ := st.ListActiveBranches(ctx, wt.ID); len(bs) > 0 {
 				for _, r := range bs {
-					fmt.Fprintf(ui.Out, "  branch_scoped: %s (%s) → active branch %s\n", r.DBKey, r.Engine, r.Branch)
+					_, _ = fmt.Fprintf(ui.Out, "  branch_scoped: %s (%s) → active branch %s\n", r.DBKey, r.Engine, r.Branch)
 				}
 			}
-			fmt.Fprintln(ui.Out)
+			_, _ = fmt.Fprintln(ui.Out)
 
 			// Recent events.
 			evs, _ := st.QueryEvents(ctx, store.EventFilter{
@@ -84,17 +84,17 @@ func wtShow() *cli.Command {
 			})
 			reverseEvents(evs)
 			if len(evs) > 0 {
-				fmt.Fprintln(ui.Out, ui.Bold("recent events"))
+				_, _ = fmt.Fprintln(ui.Out, ui.Bold("recent events"))
 				for _, e := range evs {
 					printEvent(false, e)
 				}
-				fmt.Fprintln(ui.Out)
+				_, _ = fmt.Fprintln(ui.Out)
 			}
 
 			// Recent hook runs.
 			runs, _ := st.QueryHookRuns(ctx, wt.ID, int(c.Int("hooks")))
 			if len(runs) > 0 {
-				fmt.Fprintln(ui.Out, ui.Bold("recent hook runs"))
+				_, _ = fmt.Fprintln(ui.Out, ui.Bold("recent hook runs"))
 				tbl := ui.NewTable("STARTED", "PHASE", "EXIT", "DURATION")
 				for _, h := range runs {
 					exit := ui.Yellow("running")
@@ -113,7 +113,7 @@ func wtShow() *cli.Command {
 					tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), exit, dur)
 				}
 				tbl.Render(nil)
-				fmt.Fprintln(ui.Out)
+				_, _ = fmt.Fprintln(ui.Out)
 			}
 
 			ui.Hint("follow live events: treeman wt logs %s --follow", wt.Slug)

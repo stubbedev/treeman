@@ -18,7 +18,7 @@ func TestEnsureMainWorktreeInsertsAndResurrects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	repoID, _ := s.EnsureRepo(ctx, "/repos/x", "x")
 	id1, err := s.EnsureMainWorktree(ctx, repoID, "/repos/x", "main_develop", "develop")
@@ -64,7 +64,7 @@ func TestEnsureMainWorktreeUniquePerRepo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	repoID, _ := s.EnsureRepo(ctx, "/repos/x", "x")
 	if _, err := s.EnsureMainWorktree(ctx, repoID, "/repos/x", "main_a", "a"); err != nil {

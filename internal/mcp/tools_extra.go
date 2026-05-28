@@ -71,7 +71,7 @@ func logsWaitTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsWaitIn)
 	if err != nil {
 		return nil, logsWaitOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	// Build the filter once. WorktreeID resolution mirrors logs_query.
 	f := store.EventFilter{
@@ -422,7 +422,7 @@ func inputsFingerprintTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in in
 	if err != nil {
 		return nil, inputsFingerprintOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	sl := slug.For(wt, "")
 	tplCtx := template.FromSlug(sl)
@@ -473,7 +473,7 @@ func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) 
 		if err != nil {
 			return ""
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		v, _ := drv.EngineVersion(ctx)
 		return v
 	case "postgres", "postgresql":
@@ -484,7 +484,7 @@ func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) 
 		if err != nil {
 			return ""
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		v, _ := drv.EngineVersion(ctx)
 		return v
 	case "mongodb":
@@ -495,7 +495,7 @@ func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) 
 		if err != nil {
 			return ""
 		}
-		defer drv.Close(ctx)
+		defer func() { _ = drv.Close(ctx) }()
 		v, _ := drv.EngineVersion(ctx)
 		return v
 	case "redis":
@@ -506,7 +506,7 @@ func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) 
 		if err != nil {
 			return ""
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		v, _ := drv.EngineVersion(ctx)
 		return v
 	case "elasticsearch", "opensearch":
@@ -532,7 +532,7 @@ func branchOccupancyFromStore(ctx context.Context, repoRoot string) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT COALESCE(w.branch, ''), w.path
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
@@ -540,7 +540,7 @@ func branchOccupancyFromStore(ctx context.Context, repoRoot string) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := map[string]string{}
 	for rows.Next() {
 		var branch, path string

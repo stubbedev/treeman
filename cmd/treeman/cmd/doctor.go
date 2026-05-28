@@ -79,7 +79,7 @@ func DoctorCmd() *cli.Command {
 			}
 			// One-line summary so the user knows the verdict + next step
 			// without re-reading the per-check list.
-			fmt.Fprintln(ui.Out)
+			_, _ = fmt.Fprintln(ui.Out)
 			switch {
 			case failed > 0:
 				ui.Error("%d check(s) failed, %d warning(s)", failed, warned)
@@ -142,11 +142,11 @@ func applyDoctorFixes(ctx context.Context, results []DoctorResult) []DoctorResul
 				continue
 			}
 			if _, err := wtreg.Repair(ctx, st, repoRoot, detectBranchOfWorktree); err != nil {
-				st.Close()
+				_ = st.Close()
 				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
 				continue
 			}
-			st.Close()
+			_ = st.Close()
 			results[i] = checkRegistry(ctx, repoRoot)
 		}
 	}
@@ -339,7 +339,7 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 			Detail: err.Error(),
 		}
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `SELECT w.path FROM worktrees w
 		JOIN repos r ON r.id = w.repo_id WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL`, repoRoot)
 	if err != nil {
@@ -349,7 +349,7 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 			Detail: err.Error(),
 		}
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	dbPaths := map[string]bool{}
 	for rows.Next() {
 		var p string

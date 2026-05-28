@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -142,7 +141,7 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 				hash  string
 			}{sz, mt, h}
 		}
-		rows.Close()
+		_ = rows.Close()
 	}
 
 	now := nowMillis()
@@ -165,25 +164,77 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 		misses = append(misses, p)
 	}
 
-	// Secondary (content-addressable) lookup for misses: same
-	// (size, mtime_ns) elsewhere → reuse hash without disk read.
+	// Secondary (content-addressable) lookup for misses: any row with
+	// the same (size, mtime_ns) lets us reuse its hash without a disk
+	// read. Resolved in one batched query per chunk of distinct pairs
+	// rather than a QueryRow per miss — on a cold prepare every file is
+	// a miss, so the per-miss form fired N round trips (each returning
+	// nothing while the table is still empty).
 	if len(misses) > 0 {
+		type pair struct{ size, mtime int64 }
+		// byPair maps a distinct (size,mtime) to its reusable hash
+		// ("" once seen, filled when the query finds a match).
+		byPair := make(map[pair]string, len(misses))
+		distinct := make([]pair, 0, len(misses))
+		for _, p := range misses {
+			st := stats[p]
+			k := pair{st.size, st.mtime}
+			if _, ok := byPair[k]; !ok {
+				byPair[k] = ""
+				distinct = append(distinct, k)
+			}
+		}
+		// 2 placeholders per pair; cap each chunk well under SQLite's
+		// 32766 variable limit.
+		const pairChunk = 400
+		for i := 0; i < len(distinct); i += pairChunk {
+			j := i + pairChunk
+			if j > len(distinct) {
+				j = len(distinct)
+			}
+			batch := distinct[i:j]
+			clauses := make([]string, len(batch))
+			args := make([]any, 0, len(batch)*2)
+			for k, pr := range batch {
+				clauses[k] = "(size = ? AND mtime_ns = ?)"
+				args = append(args, pr.size, pr.mtime)
+			}
+			q := "SELECT size, mtime_ns, hash FROM file_hashes WHERE " + strings.Join(clauses, " OR ")
+			rows, err := s.DB.QueryContext(ctx, q, args...)
+			if err != nil {
+				// Advisory — fall through and hash these as true misses.
+				slog.Warn("file_hashes secondary batch lookup failed", "err", err)
+				break
+			}
+			for rows.Next() {
+				var sz, mt int64
+				var h string
+				if err := rows.Scan(&sz, &mt, &h); err != nil {
+					continue
+				}
+				if h == "" {
+					continue
+				}
+				k := pair{sz, mt}
+				if cur, ok := byPair[k]; ok && cur == "" {
+					byPair[k] = h
+				}
+			}
+			_ = rows.Close()
+		}
+		// Map each miss back to its pair's hash, preserving order. In-
+		// place filter (stillMissing aliases misses' backing array) is
+		// safe: append never outruns the read cursor.
 		stillMissing := misses[:0]
 		for _, p := range misses {
 			st := stats[p]
-			row := s.DB.QueryRowContext(ctx,
-				`SELECT hash FROM file_hashes WHERE size = ? AND mtime_ns = ? LIMIT 1`,
-				st.size, st.mtime)
-			var h string
-			if err := row.Scan(&h); err == nil && h != "" {
+			if h := byPair[pair{st.size, st.mtime}]; h != "" {
 				out[p] = h
 				secondHi = append(secondHi, struct {
 					path, hash string
 					size, mt   int64
 				}{p, h, st.size, st.mtime})
 				continue
-			} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				slog.Warn("file_hashes secondary lookup failed", "path", p, "err", err)
 			}
 			stillMissing = append(stillMissing, p)
 		}
@@ -267,7 +318,7 @@ func (s *Store) upsertHashRows(ctx context.Context, hashes map[string]string,
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO file_hashes(path, size, mtime_ns, hash, cached_at)
 		VALUES (?, ?, ?, ?, ?)
@@ -279,7 +330,7 @@ func (s *Store) upsertHashRows(ctx context.Context, hashes map[string]string,
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 	for p, h := range hashes {
 		st := stats[p]
 		if _, err := stmt.ExecContext(ctx, p, st.size, st.mtime, h, now); err != nil {
@@ -297,12 +348,12 @@ func (s *Store) touchHashRows(ctx context.Context, paths []string, now int64) er
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	stmt, err := tx.PrepareContext(ctx, `UPDATE file_hashes SET cached_at = ? WHERE path = ?`)
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 	for _, p := range paths {
 		if _, err := stmt.ExecContext(ctx, now, p); err != nil {
 			return err
@@ -318,7 +369,7 @@ func hashFileBLAKE3(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := blake3.New(32, nil)
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err

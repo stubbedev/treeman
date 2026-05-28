@@ -34,7 +34,7 @@ func (s *Store) ListActiveBranches(ctx context.Context, worktreeID int64) ([]Act
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var r ActiveBranchRow
 		if err := rows.Scan(&r.DBKey, &r.Branch, &r.Engine); err != nil {

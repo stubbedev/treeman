@@ -105,7 +105,7 @@ Examples:
 				return err
 			}
 			if printPathOnly {
-				fmt.Fprintln(os.Stdout, res.WtPath)
+				_, _ = fmt.Fprintln(os.Stdout, res.WtPath)
 			}
 			return nil
 		},
@@ -212,7 +212,7 @@ func wtRegister() *cli.Command {
 			if err != nil {
 				return err
 			}
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 			repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 			if err != nil {
 				return err
@@ -242,7 +242,7 @@ func wtUnregister() *cli.Command {
 			if err != nil {
 				return err
 			}
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 			row := st.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
 			var id int64
 			if err := row.Scan(&id); err != nil {
@@ -271,7 +271,7 @@ func wtList() *cli.Command {
 			if err != nil {
 				return err
 			}
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 
 			var (
 				args    []any
@@ -300,7 +300,7 @@ func wtList() *cli.Command {
 			if err != nil {
 				return err
 			}
-			defer rows.Close()
+			defer func() { _ = rows.Close() }()
 			type wtRow struct {
 				ID          int64  `json:"id"`
 				Slug        string `json:"slug"`
@@ -431,7 +431,7 @@ func headCommitTs(path string) int64 {
 		return 0
 	}
 	var ts int64
-	fmt.Sscanf(out, "%d", &ts)
+	_, _ = fmt.Sscanf(out, "%d", &ts)
 	return ts
 }
 
@@ -537,7 +537,7 @@ func wtFinalize() *cli.Command {
 				if err != nil {
 					return err
 				}
-				defer st.Close()
+				defer func() { _ = st.Close() }()
 				repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 				branch := detectBranchOfWorktree(wtPath)
 				id, err := wt.ResolveIdentity(ctx, st, &cfg, repoRoot, wtPath, branch, repoID)
@@ -804,7 +804,7 @@ func wtPrev() *cli.Command {
 			if err != nil {
 				return err
 			}
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 			repoID, _ := st.LookupRepoID(ctx, repoRoot)
 			if repoID == 0 {
 				return fmt.Errorf("repo %s not registered yet", repoRoot)
@@ -970,7 +970,7 @@ func registryWorktreeForBranch(ctx context.Context, repoRoot, branch string) (st
 	if err != nil {
 		return "", false
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	row := st.DB.QueryRowContext(ctx, `
 		SELECT w.path FROM worktrees w JOIN repos r ON r.id = w.repo_id
 		WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL AND w.branch = ?
@@ -994,6 +994,6 @@ func touchVisitedByPath(ctx context.Context, path string) {
 	if err != nil {
 		return
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	_ = st.TouchWorktreeVisitedByPath(ctx, path)
 }

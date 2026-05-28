@@ -15,7 +15,7 @@ func TestListSnapshotsBeyondPerSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	// Source A: 4 templates, last_used 10/20/30/40 (40 = most recent).
 	for i, used := range []int64{10, 20, 30, 40} {

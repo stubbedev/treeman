@@ -235,13 +235,13 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 	if err != nil {
 		return doctorResult{Name: "registry", Status: "fail", Detail: err.Error()}
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `SELECT w.path FROM worktrees w
 		JOIN repos r ON r.id = w.repo_id WHERE r.path = ? AND w.deleted_at IS NULL`, repoRoot)
 	if err != nil {
 		return doctorResult{Name: "registry", Status: "fail", Detail: err.Error()}
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	dbPaths := map[string]bool{}
 	for rows.Next() {
 		var p string
@@ -389,7 +389,7 @@ func worktreeListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 	if err != nil {
 		return nil, worktreeListOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	q := `SELECT w.id, r.path, w.path, w.slug, COALESCE(w.branch,''), w.created_at
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
 		WHERE w.deleted_at IS NULL`
@@ -407,7 +407,7 @@ func worktreeListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 	if err != nil {
 		return nil, worktreeListOut{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []worktreeRow
 	for rows.Next() {
 		var w worktreeRow
@@ -438,7 +438,7 @@ func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 	if err != nil {
 		return nil, worktreeShowOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	var w worktreeRow
 	var id int64
@@ -575,7 +575,7 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 	if err != nil {
 		return nil, logsQueryOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	if in.Repo != "" || in.Worktree != "" {
 		repoRoot, err := resolveRepo(in.Repo)
 		if err == nil && repoRoot != "" {
@@ -659,7 +659,7 @@ func logsHooksTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsHooksI
 	if err != nil {
 		return nil, logsHooksOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		return nil, logsHooksOut{}, err
@@ -766,7 +766,7 @@ func snapshotsListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapsh
 	if err != nil {
 		return nil, snapshotsListOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := lookupRepoID(ctx, st, repoRoot)
 	if err != nil {
 		return nil, snapshotsListOut{Repo: repoRoot}, nil

@@ -544,7 +544,7 @@ func prepareMySQL(
 	if err != nil {
 		return Outcome{}, err
 	}
-	defer drv.Close()
+	defer func() { _ = drv.Close() }()
 
 	version, _ := drv.EngineVersion(ctx)
 	maxConns, _ := drv.MaxConnections(ctx)
@@ -798,7 +798,7 @@ func preparePostgres(
 	if err != nil {
 		return Outcome{}, err
 	}
-	defer drv.Close()
+	defer func() { _ = drv.Close() }()
 
 	version, _ := drv.EngineVersion(ctx)
 	maxConns, _ := drv.MaxConnections(ctx)
@@ -813,7 +813,7 @@ func preparePostgres(
 				if e != nil {
 					return e
 				}
-				defer scoped.Close()
+				defer func() { _ = scoped.Close() }()
 				_, e = dumpload.LoadPostgres(ctx, scoped, active, dumpPath)
 				return e
 			},
@@ -925,10 +925,10 @@ pgColdBuild:
 			return Outcome{}, err
 		}
 		if _, err := dumpload.LoadPostgres(ctx, scoped, sourceDB, dp); err != nil {
-			scoped.Close()
+			_ = scoped.Close()
 			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
 		}
-		scoped.Close()
+		_ = scoped.Close()
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
 	}
 	if d.Migrate != nil {
@@ -1022,7 +1022,7 @@ func prepareMongo(
 	if err != nil {
 		return Outcome{}, err
 	}
-	defer drv.Close(ctx)
+	defer func() { _ = drv.Close(ctx) }()
 
 	version, _ := drv.EngineVersion(ctx)
 
@@ -1231,7 +1231,7 @@ func prepareRedis(
 	if err != nil {
 		return Outcome{}, err
 	}
-	defer drv.Close()
+	defer func() { _ = drv.Close() }()
 
 	if d.BranchScoped {
 		return runBranchScoped(ctx, branchScopedArgs{
@@ -1955,7 +1955,7 @@ func teardownOne(
 		if err != nil {
 			return err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		name, err := template.Render(d.NameTemplate, tplCtx)
 		if err != nil {
 			return err
@@ -1978,7 +1978,7 @@ func teardownOne(
 		if err != nil {
 			return err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		name, err := template.Render(d.NameTemplate, tplCtx)
 		if err != nil {
 			return err
@@ -2001,7 +2001,7 @@ func teardownOne(
 		if err != nil {
 			return err
 		}
-		defer drv.Close(ctx)
+		defer func() { _ = drv.Close(ctx) }()
 		name, err := template.Render(d.NameTemplate, tplCtx)
 		if err != nil {
 			return err
@@ -2027,7 +2027,7 @@ func teardownOne(
 		if err != nil {
 			return err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		prefix, err := template.Render(d.KeyPrefix, tplCtx)
 		if err != nil {
 			return err

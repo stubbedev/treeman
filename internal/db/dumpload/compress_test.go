@@ -83,7 +83,7 @@ func TestSniffFormatRecognisesAllSupported(t *testing.T) {
 				t.Fatalf("decompress: %v", err)
 			}
 			out, err := io.ReadAll(dec)
-			dec.Close()
+			_ = dec.Close()
 			if err != nil {
 				t.Fatalf("read: %v", err)
 			}
@@ -114,7 +114,7 @@ func TestSniffFormatBzip2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decompress: %v", err)
 	}
-	defer dec.Close()
+	defer func() { _ = dec.Close() }()
 	out, err := io.ReadAll(dec)
 	if err != nil {
 		t.Fatal(err)
@@ -141,7 +141,7 @@ func TestOpenDumpEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	if f != FormatGzip {
 		t.Errorf("format=%v want gzip", f)
 	}

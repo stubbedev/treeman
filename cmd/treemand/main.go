@@ -80,7 +80,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	s.StartEventBatcher(ctx)
 	slog.Info("treemand starting", "db", dbPath)
 
@@ -266,7 +266,7 @@ func acceptLoop(ctx context.Context, ln net.Listener, st *daemon.State, shutdown
 		}
 		if err := daemon.CheckPeerUID(conn); err != nil {
 			slog.Warn("rejecting peer", "err", err)
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		go handleConn(ctx, conn, st, shutdown)
@@ -274,7 +274,7 @@ func acceptLoop(ctx context.Context, ln net.Listener, st *daemon.State, shutdown
 }
 
 func handleConn(ctx context.Context, conn net.Conn, st *daemon.State, shutdown chan struct{}) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	dec := json.NewDecoder(conn)
 	enc := json.NewEncoder(conn)
 	for {

@@ -38,7 +38,7 @@ func (d *Driver) IndexExists(ctx context.Context, name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode == http.StatusOK {
 		return true, nil
@@ -165,7 +165,7 @@ func (d *Driver) cloneAPICall(ctx context.Context, src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("POST /%s/_clone/%s: %w", src, dst, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("POST /%s/_clone/%s: read body: %w", src, dst, err)
@@ -194,7 +194,7 @@ func (d *Driver) setIndexBlock(ctx context.Context, name string, readOnly bool) 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("PUT /%s/_settings: read body: %w", name, err)

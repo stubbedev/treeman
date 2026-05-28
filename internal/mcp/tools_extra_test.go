@@ -99,7 +99,7 @@ func TestNewestMatchingID_PicksLatestEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/foo", "foo")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/r/foo/.wt/x", "x", "main")
 	for i := 0; i < 5; i++ {
@@ -135,7 +135,7 @@ func TestLogsWaitTool_TimesOutWhenNoMatch(t *testing.T) {
 	}
 	repoID, _ := s.EnsureRepo(ctx, "/r/foo", "foo")
 	_, _ = s.EnsureWorktree(ctx, repoID, "/r/foo/.wt/x", "x", "main")
-	s.Close()
+	_ = s.Close()
 	t.Setenv("TREEMAN_DB_PATH", dbFile)
 
 	t0 := time.Now()
@@ -171,7 +171,7 @@ func TestLogsWaitTool_RunIDFilterPlumbed(t *testing.T) {
 	// Two events; only one carries the matching run_id (via ctx).
 	_ = s.WriteEvent(ctx, store.LevelInfo, "phase_a", "hit", repoID, 0, "", 0, nil)
 	_ = s.WriteEvent(context.Background(), store.LevelInfo, "phase_b", "miss", repoID, 0, "", 0, nil)
-	s.Close()
+	_ = s.Close()
 
 	_, out, err := logsWaitTool(context.Background(), nil, logsWaitIn{
 		Repo:           "/r/foo",
@@ -206,7 +206,7 @@ func TestEventFilter_RunIDMatchesOnlyTaggedRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/foo", "foo")
 
 	// Tagged event: ctx carries run_id, store auto-injects it.

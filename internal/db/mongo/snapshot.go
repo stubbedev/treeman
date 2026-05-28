@@ -165,7 +165,7 @@ func copyIndexes(ctx context.Context, src, dst *mongo.Collection) error {
 	if err != nil {
 		return fmt.Errorf("list indexes: %w", err)
 	}
-	defer cur.Close(ctx)
+	defer func() { _ = cur.Close(ctx) }()
 
 	var models []mongo.IndexModel
 	for cur.Next(ctx) {

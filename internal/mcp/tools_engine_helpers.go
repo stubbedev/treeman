@@ -80,7 +80,7 @@ func probeTemplate(ctx context.Context, cfg *config.Config, engine, template str
 		if err != nil {
 			return false, 0, ""
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		exists, _ := drv.DatabaseExists(ctx, template)
 		ver, _ := drv.EngineVersion(ctx)
 		if !exists {
@@ -102,7 +102,7 @@ func probeTemplate(ctx context.Context, cfg *config.Config, engine, template str
 		if err != nil {
 			return false, 0, ""
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		exists, _ := drv.DatabaseExists(ctx, template)
 		ver, _ := drv.EngineVersion(ctx)
 		if !exists {
@@ -119,7 +119,7 @@ func probeTemplate(ctx context.Context, cfg *config.Config, engine, template str
 		if err != nil {
 			return false, 0, ""
 		}
-		defer drv.Close(ctx)
+		defer func() { _ = drv.Close(ctx) }()
 		exists, _ := drv.DatabaseExists(ctx, template)
 		ver, _ := drv.EngineVersion(ctx)
 		return exists, 0, ver
@@ -131,7 +131,7 @@ func probeTemplate(ctx context.Context, cfg *config.Config, engine, template str
 		if err != nil {
 			return false, 0, ""
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		ok, _ := drv.PrefixExists(ctx, template)
 		ver, _ := drv.EngineVersion(ctx)
 		return ok, 0, ver
@@ -193,7 +193,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 		if err != nil {
 			return err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		_, err = drv.DropMatching(ctx, template)
 		return err
 	case engine.FamilyPostgres:
@@ -204,7 +204,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 		if err != nil {
 			return err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		_, err = drv.DropMatching(ctx, template)
 		return err
 	case engine.FamilyMongo:
@@ -215,7 +215,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 		if err != nil {
 			return err
 		}
-		defer drv.Close(ctx)
+		defer func() { _ = drv.Close(ctx) }()
 		_, err = drv.DropMatching(ctx, template)
 		return err
 	case engine.FamilyRedis:
@@ -226,7 +226,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 		if err != nil {
 			return err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		_, err = drv.DropPrefix(ctx, template)
 		return err
 	case engine.FamilyES:
@@ -293,17 +293,27 @@ func runESDump(ctx context.Context, conn *config.EsConn, prefix, outPath string,
 	if err != nil {
 		return nil, dbDumpOut{}, err
 	}
-	defer f.Close()
 	var w io.WriteCloser = f
 	if gzipOut {
 		w = gzip.NewWriter(f)
-		defer w.Close()
 	}
 	if err := drv.Dump(ctx, prefix, w); err != nil {
+		if gzipOut {
+			_ = w.Close()
+		}
+		_ = f.Close()
 		return nil, dbDumpOut{}, fmt.Errorf("es dump: %w", err)
 	}
+	// Flush+close on the success path with the error checked: a
+	// failed gzip footer or final file write would otherwise leave a
+	// truncated dump that we'd report as a success.
 	if gzipOut {
-		_ = w.Close()
+		if err := w.Close(); err != nil {
+			return nil, dbDumpOut{}, fmt.Errorf("finalize gzip dump %s: %w", outPath, err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return nil, dbDumpOut{}, fmt.Errorf("finalize dump %s: %w", outPath, err)
 	}
 	info, err := os.Stat(outPath)
 	if err != nil {
@@ -343,20 +353,30 @@ func runDumpCmd(cmd *exec.Cmd, outPath string, gzipOut bool) (*mcpsdk.CallToolRe
 	if err != nil {
 		return nil, dbDumpOut{}, err
 	}
-	defer f.Close()
 	var w io.WriteCloser = f
 	if gzipOut {
 		w = gzip.NewWriter(f)
-		defer w.Close()
 	}
 	var stderr bytes.Buffer
 	cmd.Stdout = w
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if gzipOut {
+			_ = w.Close()
+		}
+		_ = f.Close()
 		return nil, dbDumpOut{}, fmt.Errorf("%s: %v: %s", cmd.Path, err, stderr.String())
 	}
+	// Flush+close on the success path with the error checked: a
+	// failed gzip footer or final file write would otherwise leave a
+	// truncated dump that we'd report as a success.
 	if gzipOut {
-		_ = w.Close()
+		if err := w.Close(); err != nil {
+			return nil, dbDumpOut{}, fmt.Errorf("finalize gzip dump %s: %w", outPath, err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return nil, dbDumpOut{}, fmt.Errorf("finalize dump %s: %w", outPath, err)
 	}
 	info, err := os.Stat(outPath)
 	if err != nil {

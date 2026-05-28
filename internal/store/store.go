@@ -109,7 +109,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(8)
 	if err := migrate(ctx, db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return &Store{DB: db}, nil
@@ -561,7 +561,7 @@ func (s *Store) ListWorktreesForRepo(ctx context.Context, repoID int64) ([]Workt
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []WorktreeRow
 	for rows.Next() {
 		var w WorktreeRow
@@ -600,7 +600,7 @@ func (s *Store) RemoveRepo(ctx context.Context, repoID int64) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	stmts := []string{
 		`DELETE FROM hook_runs WHERE worktree_id IN (SELECT id FROM worktrees WHERE repo_id = ?)`,
@@ -632,7 +632,7 @@ func (s *Store) ListRepoRefs(ctx context.Context) ([]RepoRef, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []RepoRef
 	for rows.Next() {
 		var r RepoRef
@@ -848,7 +848,7 @@ func (s *Store) ListActiveWorktrees(ctx context.Context) ([]ActiveWorktree, erro
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []ActiveWorktree
 	for rows.Next() {
 		var a ActiveWorktree
@@ -867,7 +867,7 @@ func (s *Store) ListRepoPaths(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var p string

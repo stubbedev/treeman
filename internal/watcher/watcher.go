@@ -90,7 +90,7 @@ func New(repoPath string, paths []config.WatcherPath, debounceMs uint64, dispatc
 // to fsnotify on first call (fsnotify is non-recursive on Linux);
 // new subdirectories are picked up via the Create event handler.
 func (w *Watcher) Start(ctx context.Context) error {
-	defer w.fsw.Close()
+	defer func() { _ = w.fsw.Close() }()
 
 	if len(w.paths) == 0 {
 		// No globs declared — nothing to watch. Sleep until ctx
@@ -104,8 +104,19 @@ func (w *Watcher) Start(ctx context.Context) error {
 		return fmt.Errorf("watcher add dirs: %w", err)
 	}
 
-	ticker := time.NewTicker(w.debounceMs)
-	defer ticker.Stop()
+	// Debounce timer, armed only on the first event of a burst and
+	// disarmed after each flush. This coalesces a burst (e.g. a `git
+	// pull` dropping 40 migration files) into one flush ~debounceMs
+	// after the first event — the same bounded latency the previous
+	// always-on ticker gave, minus a wakeup every debounceMs while the
+	// repo sits idle (which, across many watched worktrees, was pure
+	// scheduler churn). Start the timer disarmed.
+	timer := time.NewTimer(w.debounceMs)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	armed := false
 
 	for {
 		select {
@@ -133,6 +144,15 @@ func (w *Watcher) Start(ctx context.Context) error {
 				RepoPath: w.repoPath, Path: ev.Name, DBIndex: dbIdx, Label: label,
 			}
 			w.mu.Unlock()
+			// Arm the debounce window on the first event of a burst.
+			// Subsequent events ride the same window (no reset) so a
+			// steady stream can't starve the flush past debounceMs.
+			// Resetting only when disarmed keeps the timer channel
+			// drained, so Reset never races a pending tick.
+			if !armed {
+				timer.Reset(w.debounceMs)
+				armed = true
+			}
 
 		case err, ok := <-w.fsw.Errors:
 			if !ok {
@@ -140,7 +160,8 @@ func (w *Watcher) Start(ctx context.Context) error {
 			}
 			slog.Warn("fsnotify error", "repo", w.repoPath, "err", err)
 
-		case <-ticker.C:
+		case <-timer.C:
+			armed = false
 			w.flush(ctx)
 		}
 	}

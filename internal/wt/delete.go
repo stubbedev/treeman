@@ -141,7 +141,7 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	branch := gitenv.DetectBranch(wtPath)
 	id, err := ResolveIdentity(ctx, st, &cfg, repoRoot, wtPath, branch, repoID)

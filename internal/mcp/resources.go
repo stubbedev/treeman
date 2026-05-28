@@ -143,7 +143,7 @@ func worktreeEventsResource(ctx context.Context, req *mcpsdk.ReadResourceRequest
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	wid, _ := st.LookupWorktreeID(ctx, 0, slug)
 	if wid == 0 {
 		return nil, mcpsdk.ResourceNotFoundError(req.Params.URI)
@@ -179,7 +179,7 @@ func worktreeHooksResource(ctx context.Context, req *mcpsdk.ReadResourceRequest)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	wid, _ := st.LookupWorktreeID(ctx, 0, slug)
 	if wid == 0 {
 		return nil, mcpsdk.ResourceNotFoundError(req.Params.URI)
@@ -203,7 +203,7 @@ func recentLogsResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	events, err := st.QueryEvents(ctx, store.EventFilter{Limit: 200, HydrateWT: true, OldestFirst: true})
 	if err != nil {
 		return nil, err

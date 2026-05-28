@@ -272,7 +272,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		if err != nil {
 			return nil, func() {}, err
 		}
-		return &branchEngine{drv: mysqlNS{drv}, scope: scope, engine: label}, func() { drv.Close() }, nil
+		return &branchEngine{drv: mysqlNS{drv}, scope: scope, engine: label}, func() { _ = drv.Close() }, nil
 	case "postgres":
 		if cfg.Connections.Postgres == nil {
 			return nil, func() {}, fmt.Errorf("connections.postgres not configured")
@@ -281,7 +281,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		if err != nil {
 			return nil, func() {}, err
 		}
-		return &branchEngine{drv: postgresNS{drv}, scope: scope, engine: label}, func() { drv.Close() }, nil
+		return &branchEngine{drv: postgresNS{drv}, scope: scope, engine: label}, func() { _ = drv.Close() }, nil
 	case "mongodb":
 		if cfg.Connections.Mongodb == nil {
 			return nil, func() {}, fmt.Errorf("connections.mongodb not configured")
@@ -290,7 +290,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		if err != nil {
 			return nil, func() {}, err
 		}
-		return &branchEngine{drv: mongoNS{drv}, scope: scope, engine: label}, func() { drv.Close(ctx) }, nil
+		return &branchEngine{drv: mongoNS{drv}, scope: scope, engine: label}, func() { _ = drv.Close(ctx) }, nil
 	case "redis":
 		if cfg.Connections.Redis == nil {
 			return nil, func() {}, fmt.Errorf("connections.redis not configured")
@@ -299,7 +299,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		if err != nil {
 			return nil, func() {}, err
 		}
-		return &branchEngine{drv: redisNS{drv}, scope: scope, engine: label}, func() { drv.Close() }, nil
+		return &branchEngine{drv: redisNS{drv}, scope: scope, engine: label}, func() { _ = drv.Close() }, nil
 	case "elasticsearch":
 		if cfg.Connections.Elasticsearch == nil {
 			return nil, func() {}, fmt.Errorf("connections.elasticsearch not configured")

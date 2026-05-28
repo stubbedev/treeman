@@ -16,7 +16,7 @@ func TestPruneOldLogsByCutoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	repoID, _ := st.EnsureRepo(ctx, "/r", "r")
 	wtID, _ := st.EnsureWorktree(ctx, repoID, "/r/w", "w", "main")
@@ -80,7 +80,7 @@ func TestPurgeEventsRequiresFilter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	// Insert a couple of events so we can verify selective purge.
 	for i := 0; i < 5; i++ {
@@ -112,7 +112,7 @@ func TestListSnapshotsForRepoZeroRepoReturnsNil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	got, err := st.ListSnapshotsForRepo(ctx, 0)
 	if err != nil {
@@ -129,7 +129,7 @@ func TestListSnapshotsForRepoReturnsOnlyMatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	repoA, _ := st.EnsureRepo(ctx, "/a", "a")
 	repoB, _ := st.EnsureRepo(ctx, "/b", "b")

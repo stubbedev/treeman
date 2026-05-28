@@ -98,7 +98,7 @@ func NewHeadWatcher(worktreePath string, debounce time.Duration, onChange func(c
 // ctx is cancelled. The first read seeds `lastSeen`, so the initial
 // HEAD state never fires `onChange` — only subsequent edits do.
 func (h *HeadWatcher) Start(ctx context.Context) error {
-	defer h.fsw.Close()
+	defer func() { _ = h.fsw.Close() }()
 
 	if err := h.fsw.Add(h.headDir); err != nil {
 		return fmt.Errorf("watcher add %s: %w", h.headDir, err)

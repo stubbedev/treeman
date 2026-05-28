@@ -22,7 +22,7 @@ func TestLockRepoSerialisesConcurrentReloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	st := NewState(ctx, s)
 	cr, err := NewConfigReloader(st)
 	if err != nil {
@@ -64,7 +64,7 @@ func TestLockRepoDifferentReposParallelise(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	st := NewState(ctx, s)
 	cr, err := NewConfigReloader(st)
 	if err != nil {

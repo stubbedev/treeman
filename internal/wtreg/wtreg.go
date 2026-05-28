@@ -83,7 +83,7 @@ func Repair(ctx context.Context, st *store.Store, repoRoot string, detectBranch 
 			dbWTs[p] = id
 		}
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	out := RepairResult{}
 	gitSet := map[string]bool{}

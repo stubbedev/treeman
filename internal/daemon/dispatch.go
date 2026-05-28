@@ -219,7 +219,7 @@ func listWorktreePaths(ctx context.Context, st *State, repoPath string) ([]strin
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var p string

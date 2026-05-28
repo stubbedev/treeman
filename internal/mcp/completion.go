@@ -94,14 +94,14 @@ func worktreeSlugCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT slug FROM worktrees WHERE deleted_at IS NULL AND slug IS NOT NULL
 		ORDER BY slug`)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var s string
@@ -124,7 +124,7 @@ func branchCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT DISTINCT branch FROM worktrees
 		WHERE deleted_at IS NULL AND branch IS NOT NULL AND branch != ''
@@ -132,7 +132,7 @@ func branchCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var b string
@@ -152,7 +152,7 @@ func recentRunIDCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	// run_id lives inside payload_json; pull it out via a string-scan
 	// pattern. Cheap because payload_json is small (kilobytes) and
 	// we limit to the 200 most recent rows.
@@ -163,7 +163,7 @@ func recentRunIDCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	seen := map[string]struct{}{}
 	var out []string
 	for rows.Next() {
@@ -205,13 +205,13 @@ func snapshotFingerprintCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT fingerprint FROM snapshots ORDER BY last_used_at DESC LIMIT 100`)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var f string

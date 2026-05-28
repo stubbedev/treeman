@@ -22,7 +22,7 @@ func TestResolveIdentityLinkedWtPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, err := s.EnsureRepo(ctx, "/repo", "repo")
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +60,7 @@ func TestResolveIdentityMainWtNoOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, repo, "repo")
 	cfg := &config.Config{
 		MainWorktree: config.MainWorktreeConfig{Enabled: true},
@@ -102,7 +102,7 @@ func TestResolveIdentityMainWtPartialOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, repo, "repo")
 	cfg := &config.Config{
 		MainWorktree: config.MainWorktreeConfig{
@@ -148,7 +148,7 @@ func TestResolveIdentityMainWtFullOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, repo, "repo")
 	zero := uint32(0)
 	cfg := &config.Config{
@@ -211,7 +211,7 @@ func TestResolveIdentityRowFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, repo, "repo")
 	if _, err := s.EnsureMainWorktree(ctx, repoID, repo, "main_old", "main"); err != nil {
 		t.Fatal(err)

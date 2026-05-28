@@ -36,7 +36,7 @@ func (d *Driver) Restore(ctx context.Context, sourcePrefix, dumpPath string) err
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	const maxBatch = 10 << 20 // 10 MiB
 
@@ -59,7 +59,7 @@ func (d *Driver) Restore(ctx context.Context, sourcePrefix, dumpPath string) err
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return fmt.Errorf("es _bulk: read body: %w", err)
@@ -121,7 +121,7 @@ func (d *Driver) refresh(ctx context.Context, pattern string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusNotFound {
 		body, _ := io.ReadAll(resp.Body) // best-effort body for the error message
 		return fmt.Errorf("%s: %s", resp.Status, string(body))

@@ -1,0 +1,22 @@
+version: "2"
+
+# Focused lint config: enforce that every returned error is handled.
+# Deliberate discards are written as `_ = expr` — errcheck treats an
+# explicit blank assignment as "handled", so intent stays visible at
+# the call site. Scoped to error returns only: type-assertion and
+# blank-identifier checks are left off, and the other default linters
+# are disabled so this config does exactly one job.
+linters:
+  default: none
+  enable:
+    - errcheck
+  settings:
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+
+issues:
+  # Report every finding, not golangci-lint's default capped subset,
+  # so a regression can't hide behind the per-linter / per-message cap.
+  max-issues-per-linter: 0
+  max-same-issues: 0

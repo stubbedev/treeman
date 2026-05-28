@@ -499,7 +499,7 @@ func lookupWorktreeContainingCwd(ctx context.Context, st *store.Store, cwd strin
 	if err != nil {
 		return store.WorktreeRow{}
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	if rows.Next() {
 		var w store.WorktreeRow
 		var deleted int
@@ -561,7 +561,7 @@ func openLogStore(ctx context.Context) (*store.Store, func(), error) {
 	if err != nil {
 		return nil, func() {}, err
 	}
-	return st, func() { st.Close() }, nil
+	return st, func() { _ = st.Close() }, nil
 }
 
 func lookupRepoID(ctx context.Context, st *store.Store, root string) (int64, error) {
@@ -603,7 +603,7 @@ func printEvent(asJSON bool, e store.Event) {
 		dur = " " + ui.Dim(fmt.Sprintf("(%dms)", e.DurationMs.Int64))
 	}
 	msg := e.Message
-	fmt.Fprintf(ui.Out, "%s %s %s%s%s %s%s\n", ts, padRight(level, 5), padRight(et, 24), wt, phase, msg, dur)
+	_, _ = fmt.Fprintf(ui.Out, "%s %s %s%s%s %s%s\n", ts, padRight(level, 5), padRight(et, 24), wt, phase, msg, dur)
 }
 
 // jsonStream marshals each row as one JSON line.

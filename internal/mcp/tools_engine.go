@@ -119,7 +119,7 @@ func probeMySQL(ctx context.Context, cfg *config.Config) engineProbeResult {
 		r.Error = err.Error()
 		return r
 	}
-	defer drv.Close()
+	defer func() { _ = drv.Close() }()
 	r.Reachable = true
 	r.Version, _ = drv.EngineVersion(ctx)
 	dbs, _ := listMysqlDatabases(ctx, drv)
@@ -138,7 +138,7 @@ func probePostgres(ctx context.Context, cfg *config.Config) engineProbeResult {
 		r.Error = err.Error()
 		return r
 	}
-	defer drv.Close()
+	defer func() { _ = drv.Close() }()
 	r.Reachable = true
 	r.Version, _ = drv.EngineVersion(ctx)
 	dbs, _ := listPostgresDatabases(ctx, drv)
@@ -157,7 +157,7 @@ func probeMongo(ctx context.Context, cfg *config.Config) engineProbeResult {
 		r.Error = err.Error()
 		return r
 	}
-	defer drv.Close(ctx)
+	defer func() { _ = drv.Close(ctx) }()
 	r.Reachable = true
 	r.Version, _ = drv.EngineVersion(ctx)
 	dbs, err := drv.Client.ListDatabaseNames(ctx, bson.D{})
@@ -178,7 +178,7 @@ func probeRedis(ctx context.Context, cfg *config.Config) engineProbeResult {
 		r.Error = err.Error()
 		return r
 	}
-	defer drv.Close()
+	defer func() { _ = drv.Close() }()
 	r.Reachable = true
 	r.Version, _ = drv.EngineVersion(ctx)
 	c := drv.Client()
@@ -247,7 +247,7 @@ func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchem
 		if err != nil {
 			return nil, out, err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		out.Schema, err = mysqlSchema(ctx, drv, in.DB)
 		if err != nil {
 			return nil, out, err
@@ -260,7 +260,7 @@ func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchem
 		if err != nil {
 			return nil, out, err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		out.Schema, err = postgresSchema(ctx, drv, in.DB)
 		if err != nil {
 			return nil, out, err
@@ -273,7 +273,7 @@ func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchem
 		if err != nil {
 			return nil, out, err
 		}
-		defer drv.Close(ctx)
+		defer func() { _ = drv.Close(ctx) }()
 		out.Schema, err = mongoSchema(ctx, drv, in.DB)
 		if err != nil {
 			return nil, out, err
@@ -298,7 +298,7 @@ func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchem
 		if err != nil {
 			return nil, out, err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		out.Schema, err = redisSchema(ctx, drv, in.DB)
 		if err != nil {
 			return nil, out, err
@@ -346,7 +346,7 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 		if err != nil {
 			return nil, out, err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		qdb, err := ident.QuoteMySQL(in.DB)
 		if err != nil {
 			return nil, out, fmt.Errorf("db %q: %w", in.DB, err)
@@ -367,12 +367,12 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 		if err != nil {
 			return nil, out, err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		scoped, err := drv.OpenScoped(ctx, in.DB)
 		if err != nil {
 			return nil, out, err
 		}
-		defer scoped.Close()
+		defer func() { _ = scoped.Close() }()
 		rows, cols, err := runSQLQuery(ctx, scoped, in.Query, in.Limit)
 		if err != nil {
 			return nil, out, err
@@ -386,7 +386,7 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 		if err != nil {
 			return nil, out, err
 		}
-		defer drv.Close(ctx)
+		defer func() { _ = drv.Close(ctx) }()
 		filter := bson.D{}
 		if strings.TrimSpace(in.FilterJSON) != "" {
 			if err := bson.UnmarshalExtJSON([]byte(in.FilterJSON), false, &filter); err != nil {
@@ -399,7 +399,7 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 		if err != nil {
 			return nil, out, err
 		}
-		defer cur.Close(ctx)
+		defer func() { _ = cur.Close(ctx) }()
 		for cur.Next(ctx) {
 			if len(out.Rows) >= in.Limit {
 				break
@@ -433,7 +433,7 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 		if err != nil {
 			return nil, out, err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		buf, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode >= 400 {
 			return nil, out, fmt.Errorf("es _search: %s: %s", resp.Status, string(buf))
@@ -460,7 +460,7 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 		if err != nil {
 			return nil, out, err
 		}
-		defer drv.Close()
+		defer func() { _ = drv.Close() }()
 		args := strings.Fields(in.Query)
 		anyArgs := make([]any, len(args))
 		for i, a := range args {
@@ -498,7 +498,7 @@ func snapshotInspectTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snap
 	if err != nil {
 		return nil, snapshotInspectOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	var rec *store_SnapshotRecord
 	if in.Fingerprint != "" {
 		rec, err = snapshotLookupByFingerprint(ctx, st, in.Fingerprint)
@@ -546,7 +546,7 @@ func snapshotDropTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapsho
 	if err != nil {
 		return nil, snapshotDropOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rec, err := snapshotLookupByFingerprint(ctx, st, in.Fingerprint)
 	if err != nil {
 		return nil, snapshotDropOut{}, err
@@ -603,7 +603,7 @@ func hookLogReadTool(_ context.Context, _ *mcpsdk.CallToolRequest, in hookLogRea
 	if err != nil {
 		return nil, hookLogReadOut{}, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	out := hookLogReadOut{Path: p, SizeBytes: info.Size()}
 	if in.MaxBytes > 0 && info.Size() > int64(in.MaxBytes) {
 		if _, err := f.Seek(info.Size()-int64(in.MaxBytes), io.SeekStart); err != nil {
@@ -760,7 +760,7 @@ func listMysqlDatabases(ctx context.Context, drv *dbmysql.Driver) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var s string
@@ -779,7 +779,7 @@ func listPostgresDatabases(ctx context.Context, drv *dbpostgres.Driver) ([]strin
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var s string
@@ -802,7 +802,7 @@ func mysqlSchema(ctx context.Context, drv *dbmysql.Driver, db string) (map[strin
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	tables := map[string]string{}
 	var names []string
 	for rows.Next() {
@@ -833,7 +833,7 @@ func postgresSchema(ctx context.Context, drv *dbpostgres.Driver, db string) (map
 	if err != nil {
 		return nil, err
 	}
-	defer scoped.Close()
+	defer func() { _ = scoped.Close() }()
 	rows, err := scoped.QueryContext(ctx, `
 		SELECT table_schema, table_name
 		FROM information_schema.tables
@@ -843,7 +843,7 @@ func postgresSchema(ctx context.Context, drv *dbpostgres.Driver, db string) (map
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	type tablePair struct{ schema, name string }
 	var tables []tablePair
 	for rows.Next() {
@@ -873,7 +873,7 @@ func postgresSchema(ctx context.Context, drv *dbpostgres.Driver, db string) (map
 				"default":  def.String,
 			})
 		}
-		colRows.Close()
+		_ = colRows.Close()
 		schema[t.schema+"."+t.name] = cols
 	}
 	return map[string]any{"tables": schema}, nil
@@ -907,7 +907,7 @@ func esSchema(ctx context.Context, drv *dbes.Driver, indexPattern string) (map[s
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	var parsed map[string]any
 	_ = json.Unmarshal(body, &parsed)
@@ -980,7 +980,7 @@ func runSQLQuery(ctx context.Context, db *sql.DB, q string, limit int) ([]any, [
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	cols, _ := rows.Columns()
 	out := []any{}
 	for rows.Next() {
