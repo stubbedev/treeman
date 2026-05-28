@@ -454,7 +454,7 @@ Field semantics:
 
 ### DumpSpec
 
-Source dump file. Bare string OR `{path, optional}` mapping.
+Source dump file. Bare string OR `{path, optional, source_db}` mapping.
 
 ### EsConn
 
