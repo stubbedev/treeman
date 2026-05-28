@@ -127,6 +127,56 @@ func TestContainerRefBridgeIP(t *testing.T) {
 	t.Logf("bridge-IP path resolved → source=%s", o.SourceDB)
 }
 
+// TestContainerRefComposeService resolves the engine container by its
+// docker-compose service label (compose_service + compose_project)
+// rather than by container name — the other half of ContainerRef that
+// had no e2e coverage. Targets the published service so it resolves to
+// 127.0.0.1:13366 on any host OS.
+func TestContainerRefComposeService(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	bothUp(t)
+
+	// Read the real compose project label off the running container so
+	// the lookup is deterministic regardless of how the project name was
+	// derived (dir basename / COMPOSE_PROJECT_NAME).
+	out, err := exec.Command("docker", "inspect", "--format",
+		`{{index .Config.Labels "com.docker.compose.project"}}`,
+		"treeman-e2e-ctr-published").CombinedOutput()
+	if err != nil {
+		t.Fatalf("read compose project label: %v\n%s", err, out)
+	}
+	project := strings.TrimSpace(string(out))
+	if project == "" {
+		t.Fatal("no com.docker.compose.project label on the container")
+	}
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "seed.sql"),
+		[]byte("CREATE TABLE t (id INT); INSERT INTO t VALUES (1),(2);"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mysql: &config.MysqlConn{
+				User:     "root",
+				Password: "rootpw",
+				ContainerRef: config.ContainerRef{
+					ComposeService: "mysql-published", // the compose service key
+					ComposeProject: project,
+				},
+			},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mysql",
+			NameTemplate: "tm_ctr_svc_{slug}",
+			Dump:         &config.DumpSpec{Path: "seed.sql"},
+		}},
+	}
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mysql", false)
+	t.Logf("compose_service resolved (project=%s) → source=%s", project, o.SourceDB)
+}
+
 func mkErr(s string) error { return &strErr{s} }
 
 type strErr struct{ s string }
