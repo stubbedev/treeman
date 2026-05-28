@@ -21,7 +21,7 @@
           # any `go get` / `go mod tidy` that changes go.sum — `nix
           # build` will print the expected hash on mismatch.
           # go-sum: 5980445213f7e36709c4eb8fa3ab76dad936eeda0f49a4d48de053ce69fa831b
-          vendorHash = "sha256-wdjBBsuVezbXxqxB7dm6ZIaKsCzSN3zZTU9R1OCBv3E=";
+          vendorHash = "sha256-DtnqngOquNn8eSW7kbB7vH/JBoZ4yiFq6LD9NSVuGsU=";
           # subPackages also scopes the default checkPhase — `go test`
           # only runs against these two paths (neither has test files),
           # so `nix build` / `nix profile install` finishes the check
