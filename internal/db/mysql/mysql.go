@@ -299,6 +299,15 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 		if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
 			return fmt.Errorf("USE %s: %w", qtemplate, err)
 		}
+		// One schema-wide column lookup instead of a per-table query in
+		// the loop: collapses N information_schema.COLUMNS round trips
+		// into one on the cold-build critical path. Same gating (EXTRA
+		// NOT LIKE '%GENERATED%') and ordinal ordering as the per-table
+		// form, so each table's column list is byte-identical.
+		colsByTable, err := nonGeneratedColumnsBySchema(ctx, conn, source)
+		if err != nil {
+			return fmt.Errorf("list columns for %s: %w", qsource, err)
+		}
 		for _, tbl := range tables {
 			qtbl, err := ident.QuoteMySQL(tbl.name)
 			if err != nil {
@@ -312,11 +321,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
 				return fmt.Errorf("recreate %s: %w", qtbl, err)
 			}
-			cols, err := nonGeneratedColumns(ctx, conn, source, tbl.name)
-			if err != nil {
-				return fmt.Errorf("list columns for %s: %w", qtbl, err)
-			}
-			jobs = append(jobs, tableJob{name: tbl.name, cols: cols})
+			jobs = append(jobs, tableJob{name: tbl.name, cols: colsByTable[tbl.name]})
 		}
 		return nil
 	}(); err != nil {
@@ -454,28 +459,39 @@ func copyOneTableData(ctx context.Context, db *sql.DB, source, template, name st
 	return nil
 }
 
-// nonGeneratedColumns lists the columns of `<schema>.<table>` whose
-// EXTRA does not mark them as generated (STORED or VIRTUAL). Returned
-// in ordinal-position order so the INSERT column list matches the
-// SELECT projection one-to-one.
-func nonGeneratedColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]string, error) {
+// nonGeneratedColumnsBySchema lists, for every table in `schema`, the
+// columns whose EXTRA does not mark them generated (STORED or
+// VIRTUAL), keyed by table name. Each list is in ordinal-position
+// order so the INSERT column list matches the SELECT projection
+// one-to-one. One query for the whole schema replaces the former
+// per-table lookup in SnapshotCreate's serial DDL pass.
+func nonGeneratedColumnsBySchema(ctx context.Context, conn *sql.Conn, schema string) (map[string][]string, error) {
 	rows, err := conn.QueryContext(ctx, `
-		SELECT CONVERT(COLUMN_NAME USING utf8mb4)
+		SELECT CONVERT(TABLE_NAME USING utf8mb4), CONVERT(COLUMN_NAME USING utf8mb4)
 		FROM information_schema.COLUMNS
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		WHERE TABLE_SCHEMA = ?
 		  AND EXTRA NOT LIKE '%GENERATED%'
-		ORDER BY ORDINAL_POSITION`, schema, table)
+		ORDER BY TABLE_NAME, ORDINAL_POSITION`, schema)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var out []string
+	return scanColumnsByTable(rows)
+}
+
+// scanColumnsByTable groups a (table_name, column_name) result set
+// into a per-table column slice, preserving the row order so each
+// table's list keeps the source's ordinal-position ordering (the
+// query's ORDER BY guarantees that order). Split out from the query so
+// the grouping is unit-testable without a live MySQL.
+func scanColumnsByTable(rows *sql.Rows) (map[string][]string, error) {
+	out := map[string][]string{}
 	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
+		var tbl, col string
+		if err := rows.Scan(&tbl, &col); err != nil {
 			return nil, err
 		}
-		out = append(out, c)
+		out[tbl] = append(out[tbl], col)
 	}
 	return out, rows.Err()
 }

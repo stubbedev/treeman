@@ -346,7 +346,11 @@ func hashFileBLAKE3(path string) (string, error) {
 	}
 	defer func() { _ = f.Close() }()
 	h := blake3.New(32, nil)
-	if _, err := io.Copy(h, f); err != nil {
+	// 1 MiB buffer: BLAKE3 hashes far faster than the default 32 KiB
+	// io.Copy chunk can feed it, so a bigger buffer cuts read syscalls
+	// on large migration files. Mirrors store.hashFileBLAKE3.
+	buf := make([]byte, 1<<20)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

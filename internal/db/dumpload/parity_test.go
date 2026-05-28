@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -76,7 +77,7 @@ func streamStatementsRef(ctx context.Context, r io.Reader, onStmt func(stmt stri
 			if b == '-' {
 				if peek, _ := br.Peek(1); len(peek) == 1 && peek[0] == '-' {
 					_, _ = br.Discard(1)
-					if err := skipUntil('\n'); err != nil && err != io.EOF {
+					if err := skipUntil('\n'); err != nil && !errors.Is(err, io.EOF) {
 						return applied, err
 					}
 					continue
@@ -85,7 +86,7 @@ func streamStatementsRef(ctx context.Context, r io.Reader, onStmt func(stmt stri
 			if b == '/' {
 				if peek, _ := br.Peek(1); len(peek) == 1 && peek[0] == '*' {
 					_, _ = br.Discard(1)
-					if err := skipBlockComment(); err != nil && err != io.EOF {
+					if err := skipBlockComment(); err != nil && !errors.Is(err, io.EOF) {
 						return applied, err
 					}
 					continue
