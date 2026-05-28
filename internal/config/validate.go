@@ -36,6 +36,9 @@ func (c *Config) Validate() error {
 	if c.Connections.Elasticsearch != nil {
 		errs = appendIfErr(errs, c.Connections.Elasticsearch.ContainerRef.validate("connections.elasticsearch"))
 	}
+	if c.Connections.S3 != nil {
+		errs = appendIfErr(errs, c.Connections.S3.ContainerRef.validate("connections.s3"))
+	}
 
 	for i := range c.Databases {
 		errs = appendIfErr(errs, c.Databases[i].validate(fmt.Sprintf("databases[%d]", i)))
@@ -109,7 +112,7 @@ func (c *Config) PortSlotNames() []string {
 // worktree's branch_scoped active namespace is slug-free.
 func mainActiveTemplate(c *Config, i int) (tmpl, field string) {
 	d := c.Databases[i]
-	prefixScoped := d.Engine == "redis" || d.Engine == "elasticsearch" || d.Engine == "opensearch"
+	prefixScoped := d.Engine == "redis" || d.Engine == "elasticsearch" || d.Engine == "opensearch" || d.Engine == "s3"
 	var ov DatabaseOverlay
 	if i < len(c.MainWorktree.Databases) {
 		ov = c.MainWorktree.Databases[i]
@@ -202,7 +205,7 @@ func (r ContainerRef) validate(path string) error {
 func (d DatabaseConfig) validate(path string) error {
 	var errs []error
 	if d.Engine == "" {
-		return fmt.Errorf("%s: engine is required (one of: mysql, mariadb, tidb, postgres, postgresql, mongodb, redis, elasticsearch, opensearch)", path)
+		return fmt.Errorf("%s: engine is required (one of: mysql, mariadb, tidb, postgres, postgresql, mongodb, redis, elasticsearch, opensearch, s3)", path)
 	}
 	switch d.Engine {
 	case "mysql", "mariadb", "tidb", "postgres", "postgresql", "mongodb":
@@ -211,8 +214,31 @@ func (d DatabaseConfig) validate(path string) error {
 		}
 	case "redis", "elasticsearch", "opensearch":
 		// Prefix-scoped engines — name_template doesn't apply.
+	case "s3":
+		// Prefix-scoped: key_prefix renders the per-worktree bucket
+		// name. Lifecycle-only support — snapshot/restore not
+		// implemented, so dump/branch_scoped/test_clones are rejected
+		// below.
+		if d.KeyPrefix == "" {
+			return fmt.Errorf("%s: key_prefix is required for engine \"s3\" (renders the per-worktree bucket name; AWS bucket-naming rules apply)", path)
+		}
+		if d.Dump != nil {
+			return fmt.Errorf("%s: engine \"s3\" does not support `dump:` yet (bucket lifecycle only)", path)
+		}
+		if d.BranchScoped {
+			return fmt.Errorf("%s: engine \"s3\" does not support `branch_scoped: true` yet (bucket lifecycle only — no object copy)", path)
+		}
+		if d.TestClones != nil {
+			return fmt.Errorf("%s: engine \"s3\" does not support `test_clones:` (no snapshot fan-out)", path)
+		}
+		if d.Migrate != nil {
+			return fmt.Errorf("%s: engine \"s3\" does not support `migrate:` (object stores have no schema; use a postcreate hook to populate)", path)
+		}
+		if d.Seed != nil {
+			return fmt.Errorf("%s: engine \"s3\" does not support `seed:` (use a postcreate hook to populate the bucket with fixtures)", path)
+		}
 	default:
-		return fmt.Errorf("%s: unknown engine %q (allowed: mysql, mariadb, tidb, postgres, postgresql, mongodb, redis, elasticsearch, opensearch)",
+		return fmt.Errorf("%s: unknown engine %q (allowed: mysql, mariadb, tidb, postgres, postgresql, mongodb, redis, elasticsearch, opensearch, s3)",
 			path, d.Engine)
 	}
 

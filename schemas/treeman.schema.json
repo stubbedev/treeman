@@ -108,6 +108,10 @@
         "elasticsearch": {
           "$ref": "#/$defs/EsConn",
           "description": "Elasticsearch / OpenSearch connection. HTTP URL form."
+        },
+        "s3": {
+          "$ref": "#/$defs/S3Conn",
+          "description": "S3-compatible object storage connection (AWS S3, MinIO, Garage,\nCeph RGW, Backblaze B2, Cloudflare R2, ...). Required when any\n`databases:` entry uses `engine: s3`. One connection serves many\nper-worktree buckets named via the entry's `key_prefix`."
         }
       },
       "additionalProperties": false,
@@ -187,7 +191,8 @@
             "mongodb",
             "redis",
             "elasticsearch",
-            "opensearch"
+            "opensearch",
+            "s3"
           ],
           "description": "Engine discriminator. Gates which connection block is dialed\nand which sub-fields (dump, migrations, namespaces) are valid.\n`postgresql` is an alias for `postgres`; `opensearch` is an\nalias for `elasticsearch`."
         },
@@ -736,6 +741,43 @@
         }
       ],
       "description": "redis connection — bare URL string OR structured object."
+    },
+    "S3Conn": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "endpoint": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "access_key": {
+          "type": "string"
+        },
+        "secret_key": {
+          "type": "string"
+        },
+        "use_path_style": {
+          "type": "boolean"
+        },
+        "container": {
+          "type": "string"
+        },
+        "compose_service": {
+          "type": "string"
+        },
+        "compose_project": {
+          "type": "string"
+        },
+        "container_engine": {
+          "type": "string"
+        },
+        "container_network": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
     },
     "SnapshotsConfig": {
       "properties": {

@@ -1,0 +1,352 @@
+// Package s3 is the treeman driver for S3-compatible object stores
+// (AWS S3, MinIO, Garage, Ceph RGW, Backblaze B2, Cloudflare R2,
+// anything that speaks the S3 API).
+//
+// Scope is intentionally narrow: per-worktree BUCKET lifecycle —
+// create on prepare, drop (with all keys) on teardown. No object-level
+// snapshot/restore, no branch-scoped swap, no dump/load. The
+// "namespace" for a treeman s3 entry is a BUCKET NAME RENDERED FROM
+// `key_prefix`; this driver's prefix operations match buckets whose
+// names begin with that string.
+package s3
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+
+	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
+	"github.com/stubbedev/treeman/internal/db/reachability"
+)
+
+// Driver wraps an aws-sdk-go-v2 S3 client. Buckets are addressed by
+// rendered name; there's no per-bucket session state to carry.
+type Driver struct {
+	Client *awss3.Client
+	Region string
+}
+
+// Connect builds an S3 client from cfg and probes the endpoint for
+// reachability. When `cfg.Container` / `cfg.ComposeService` is set,
+// the endpoint URL's host/port are rewritten using the container's
+// published port or bridge IP (same machinery as the ES driver).
+//
+// Reachability probe is best-effort: a TCP connect against the
+// endpoint's host:port. For AWS S3 (no explicit endpoint) the probe
+// is skipped — the SDK's regional endpoint is discovered lazily.
+func Connect(ctx context.Context, cfg config.S3Conn) (*Driver, error) {
+	region := cfg.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	endpoint := cfg.Endpoint
+	if cfg.Container != "" || cfg.ComposeService != "" {
+		opts := containerip.Opts{
+			Container:      cfg.Container,
+			ComposeService: cfg.ComposeService,
+			ComposeProject: cfg.ComposeProject,
+			Engine:         cfg.ContainerEngine,
+			Network:        cfg.Network,
+			InternalPort:   containerip.URIPort(endpoint, 9000),
+		}
+		addr, err := containerip.ResolveAddr(opts)
+		if err != nil {
+			return nil, fmt.Errorf("resolve container: %w", err)
+		}
+		if addr != nil {
+			endpoint = containerip.RewriteHostPortInURIWithPort(endpoint, addr.Host, addr.Port)
+		}
+	}
+
+	if endpoint != "" {
+		if err := reachability.ProbeURLCtx(ctx, "s3", endpoint); err != nil {
+			return nil, err
+		}
+	}
+
+	loadOpts := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithRegion(region),
+	}
+	if cfg.AccessKey != "" || cfg.SecretKey != "" {
+		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""),
+		))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("s3: load aws config: %w", err)
+	}
+
+	client := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
+		if endpoint != "" {
+			o.BaseEndpoint = &endpoint
+		}
+		o.UsePathStyle = cfg.UsePathStyle
+		o.HTTPClient = http30s
+	})
+	return &Driver{Client: client, Region: region}, nil
+}
+
+// EngineVersion returns "" + nil — S3 has no version endpoint, and
+// the observed `Server` header varies wildly between AWS, MinIO,
+// Garage, R2, etc. Stubbed so the engine fits the same shape as the
+// other drivers' status output.
+func (d *Driver) EngineVersion(_ context.Context) (string, error) {
+	return "", nil
+}
+
+// BucketExists reports whether `name` exists and is accessible to
+// the configured credentials.
+func (d *Driver) BucketExists(ctx context.Context, name string) (bool, error) {
+	_, err := d.Client.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: &name})
+	if err == nil {
+		return true, nil
+	}
+	if isNotFound(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("s3: head bucket %q: %w", name, err)
+}
+
+// EnsureBucket creates `name` if it doesn't already exist. The
+// "already owned by you" / "already exists" responses are treated as
+// success — this is the idempotent prepare path.
+//
+// AWS S3 quirks: CreateBucket in us-east-1 must NOT set a
+// LocationConstraint; every other region requires one. MinIO and
+// Garage accept either. We follow the AWS rule when the configured
+// region is us-east-1.
+func (d *Driver) EnsureBucket(ctx context.Context, name string) error {
+	in := &awss3.CreateBucketInput{Bucket: &name}
+	if d.Region != "" && d.Region != "us-east-1" {
+		in.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
+			LocationConstraint: s3types.BucketLocationConstraint(d.Region),
+		}
+	}
+	_, err := d.Client.CreateBucket(ctx, in)
+	if err == nil {
+		return nil
+	}
+	if isAlreadyOwned(err) {
+		return nil
+	}
+	return fmt.Errorf("s3: create bucket %q: %w", name, err)
+}
+
+// ListMatching returns every bucket whose name starts with `prefix`.
+// Buckets are an account-wide flat namespace, so this is a simple
+// `ListBuckets` + filter — there's no `ListBuckets(prefix=...)` API.
+func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, error) {
+	out, err := d.Client.ListBuckets(ctx, &awss3.ListBucketsInput{})
+	if err != nil {
+		return nil, fmt.Errorf("s3: list buckets: %w", err)
+	}
+	var matches []string
+	for _, b := range out.Buckets {
+		if b.Name == nil {
+			continue
+		}
+		if strings.HasPrefix(*b.Name, prefix) {
+			matches = append(matches, *b.Name)
+		}
+	}
+	return matches, nil
+}
+
+// DropMatching deletes every bucket whose name starts with `prefix`,
+// emptying each one first (S3 forbids DeleteBucket while the bucket
+// is non-empty). Returns the names that were removed. Errors short-
+// circuit, leaving the remaining buckets in place so the caller can
+// retry without losing track of which got dropped.
+func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
+	matches, err := d.ListMatching(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var dropped []string
+	for _, name := range matches {
+		if err := d.emptyBucket(ctx, name); err != nil {
+			return dropped, err
+		}
+		if _, err := d.Client.DeleteBucket(ctx, &awss3.DeleteBucketInput{Bucket: &name}); err != nil {
+			if isNotFound(err) {
+				dropped = append(dropped, name)
+				continue
+			}
+			return dropped, fmt.Errorf("s3: delete bucket %q: %w", name, err)
+		}
+		dropped = append(dropped, name)
+	}
+	return dropped, nil
+}
+
+// emptyBucket lists every object + every object version + every
+// in-progress multipart upload in `name` and deletes them in
+// 1000-key batches (the S3 limit). Both versioned and unversioned
+// buckets are handled — `ListObjectVersions` returns the current
+// (only) version for unversioned buckets, so one code path covers
+// both.
+func (d *Driver) emptyBucket(ctx context.Context, name string) error {
+	if err := d.abortMultiparts(ctx, name); err != nil {
+		return err
+	}
+	var (
+		keyMarker     *string
+		versionMarker *string
+	)
+	for {
+		out, err := d.Client.ListObjectVersions(ctx, &awss3.ListObjectVersionsInput{
+			Bucket:          &name,
+			KeyMarker:       keyMarker,
+			VersionIdMarker: versionMarker,
+		})
+		if err != nil {
+			if isNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("s3: list versions %q: %w", name, err)
+		}
+
+		var batch []s3types.ObjectIdentifier
+		for _, v := range out.Versions {
+			batch = append(batch, s3types.ObjectIdentifier{Key: v.Key, VersionId: v.VersionId})
+		}
+		for _, m := range out.DeleteMarkers {
+			batch = append(batch, s3types.ObjectIdentifier{Key: m.Key, VersionId: m.VersionId})
+		}
+		if err := d.deleteBatch(ctx, name, batch); err != nil {
+			return err
+		}
+
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return nil
+		}
+		keyMarker = out.NextKeyMarker
+		versionMarker = out.NextVersionIdMarker
+	}
+}
+
+// deleteBatch issues one DeleteObjects call (cap 1000 keys). Splits
+// larger batches into chunks. Per-key errors are aggregated; the
+// first one short-circuits the caller's loop.
+func (d *Driver) deleteBatch(ctx context.Context, bucket string, ids []s3types.ObjectIdentifier) error {
+	const max = 1000
+	for len(ids) > 0 {
+		n := len(ids)
+		if n > max {
+			n = max
+		}
+		chunk := ids[:n]
+		ids = ids[n:]
+		out, err := d.Client.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
+			Bucket: &bucket,
+			Delete: &s3types.Delete{Objects: chunk, Quiet: ptrTrue()},
+		})
+		if err != nil {
+			return fmt.Errorf("s3: delete objects in %q: %w", bucket, err)
+		}
+		for _, e := range out.Errors {
+			key, code, msg := "", "", ""
+			if e.Key != nil {
+				key = *e.Key
+			}
+			if e.Code != nil {
+				code = *e.Code
+			}
+			if e.Message != nil {
+				msg = *e.Message
+			}
+			return fmt.Errorf("s3: delete object %s/%s: %s (%s)", bucket, key, msg, code)
+		}
+	}
+	return nil
+}
+
+func (d *Driver) abortMultiparts(ctx context.Context, name string) error {
+	var (
+		keyMarker      *string
+		uploadIDMarker *string
+	)
+	for {
+		out, err := d.Client.ListMultipartUploads(ctx, &awss3.ListMultipartUploadsInput{
+			Bucket:         &name,
+			KeyMarker:      keyMarker,
+			UploadIdMarker: uploadIDMarker,
+		})
+		if err != nil {
+			if isNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("s3: list multipart uploads %q: %w", name, err)
+		}
+		for _, u := range out.Uploads {
+			if _, abErr := d.Client.AbortMultipartUpload(ctx, &awss3.AbortMultipartUploadInput{
+				Bucket:   &name,
+				Key:      u.Key,
+				UploadId: u.UploadId,
+			}); abErr != nil {
+				return fmt.Errorf("s3: abort multipart in %q: %w", name, abErr)
+			}
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return nil
+		}
+		keyMarker = out.NextKeyMarker
+		uploadIDMarker = out.NextUploadIdMarker
+	}
+}
+
+func isNotFound(err error) bool {
+	var nsk *s3types.NoSuchBucket
+	if errors.As(err, &nsk) {
+		return true
+	}
+	var nf *s3types.NotFound
+	if errors.As(err, &nf) {
+		return true
+	}
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		switch ae.ErrorCode() {
+		case "NoSuchBucket", "NoSuchKey", "NotFound", "404":
+			return true
+		}
+	}
+	return false
+}
+
+func isAlreadyOwned(err error) bool {
+	var owned *s3types.BucketAlreadyOwnedByYou
+	if errors.As(err, &owned) {
+		return true
+	}
+	var exists *s3types.BucketAlreadyExists
+	if errors.As(err, &exists) {
+		return true
+	}
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		switch ae.ErrorCode() {
+		case "BucketAlreadyOwnedByYou", "BucketAlreadyExists":
+			return true
+		}
+	}
+	return false
+}
+
+func ptrTrue() *bool { b := true; return &b }
+
+// http30s is the shared HTTP client tuned for the S3 API: 30s
+// per-request ceiling, default transport otherwise. Mirrors the
+// timeout the ES driver uses.
+var http30s = &http.Client{Timeout: 30 * time.Second}

@@ -24,6 +24,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/resolve"
 )
 
@@ -104,6 +105,7 @@ func engineStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in engineS
 	out.Engines = append(out.Engines, probeMongo(ctx, cfg))
 	out.Engines = append(out.Engines, probeRedis(ctx, cfg))
 	out.Engines = append(out.Engines, probeES(ctx, cfg))
+	out.Engines = append(out.Engines, probeS3(ctx, cfg))
 	return nil, out, nil
 }
 
@@ -215,6 +217,28 @@ func probeES(ctx context.Context, cfg *config.Config) engineProbeResult {
 		r.Detail["internal_count"] = len(internal)
 		r.Detail["internal"] = internal
 	}
+	return r
+}
+
+func probeS3(ctx context.Context, cfg *config.Config) engineProbeResult {
+	r := engineProbeResult{Engine: "s3"}
+	if cfg.Connections.S3 == nil {
+		return r
+	}
+	r.Configured = true
+	drv, err := dbs3.Connect(ctx, *cfg.Connections.S3)
+	if err != nil {
+		r.Error = err.Error()
+		return r
+	}
+	r.Reachable = true
+	r.Version, _ = drv.EngineVersion(ctx)
+	buckets, err := drv.ListMatching(ctx, "")
+	if err != nil {
+		r.Error = err.Error()
+		return r
+	}
+	r.Detail = map[string]any{"buckets": buckets}
 	return r
 }
 

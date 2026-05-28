@@ -34,6 +34,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
@@ -445,6 +446,8 @@ func RunFiltered(
 				o, err = prepareRedis(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "elasticsearch", "opensearch":
 				o, err = prepareES(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+			case "s3":
+				o, err = prepareS3(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID)
 			default:
 				// Engine not recognised. Surface via event so the
 				// user notices, but don't fail the whole prepare run.
@@ -1516,6 +1519,62 @@ esColdBuild:
 	}, nil
 }
 
+// prepareS3 ensures the per-worktree bucket exists. S3 support is
+// intentionally narrow (see internal/db/s3 doc): no snapshot/restore,
+// no migrate/seed, no test_clones, no branch_scoped — config-load
+// validation rejects those combinations, so by the time we land here
+// the only work is `EnsureBucket(rendered key_prefix)`.
+//
+// The rendered prefix IS the bucket name (bucket-per-worktree model).
+// AWS bucket-naming rules apply (3-63 chars, lowercase, dns-safe);
+// failures surface at CreateBucket time rather than at template
+// rendering, so a misnamed key_prefix produces a clear "InvalidBucketName"
+// error from the engine rather than a silent treeman-side reject.
+func prepareS3(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+) (Outcome, error) {
+	_ = worktreePath
+	started := time.Now()
+	if cfg.Connections.S3 == nil {
+		return Outcome{}, fmt.Errorf("connections.s3 not configured")
+	}
+	if d.KeyPrefix == "" {
+		return Outcome{}, fmt.Errorf("s3: key_prefix required (renders the bucket name)")
+	}
+	bucket, err := template.Render(d.KeyPrefix, tplCtx)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("render key_prefix: %w", err)
+	}
+	drv, err := dbs3.Connect(ctx, *cfg.Connections.S3)
+	if err != nil {
+		return Outcome{}, err
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
+		fmt.Sprintf("engine=s3 bucket=%s", bucket),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine":    "s3",
+			"source_db": bucket,
+		})
+	if err := drv.EnsureBucket(ctx, bucket); err != nil {
+		return Outcome{}, err
+	}
+	ms := time.Since(started).Milliseconds()
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+		fmt.Sprintf("s3 bucket=%s duration=%dms", bucket, ms),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine":      "s3",
+			"source_db":   bucket,
+			"duration_ms": fmt.Sprintf("%d", ms),
+		})
+	return Outcome{Engine: "s3", SourceDB: bucket}, nil
+}
+
 // computeSnapshotKey hashes every input the snapshot fingerprint
 // depends on (migration files, dump file, lockfile contents) and
 // returns the canonical Key + the engine version it was built
@@ -1943,6 +2002,31 @@ func teardownOne(
 			fmt.Sprintf("elasticsearch: %s (%d)", prefix, len(dropped)),
 			repoID, worktreeID, "", 0, map[string]any{
 				"engine": "elasticsearch", "slug": sl, "target": prefix, "count": len(dropped),
+			})
+		return nil
+	case "s3":
+		if cfg.Connections.S3 == nil {
+			return fmt.Errorf("connections.s3 not configured")
+		}
+		if d.KeyPrefix == "" {
+			return fmt.Errorf("s3: missing key_prefix")
+		}
+		drv, err := dbs3.Connect(ctx, *cfg.Connections.S3)
+		if err != nil {
+			return err
+		}
+		prefix, err := template.Render(d.KeyPrefix, tplCtx)
+		if err != nil {
+			return err
+		}
+		dropped, err := drv.DropMatching(ctx, prefix)
+		if err != nil {
+			return err
+		}
+		_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+			fmt.Sprintf("s3: %s (%d)", prefix, len(dropped)),
+			repoID, worktreeID, "", 0, map[string]any{
+				"engine": "s3", "slug": sl, "target": prefix, "count": len(dropped),
 			})
 		return nil
 	}
