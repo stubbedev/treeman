@@ -395,6 +395,74 @@ func TestWorktreeDeleteKeepsDurableMySQL(t *testing.T) {
 	assertItems(t, active, "feature-data") // durable kept → resumed
 }
 
+// ─── TestReapBranchDurablesMySQL ─────────────────────────────────────
+//
+// Complement to TestWorktreeDeleteKeepsDurableMySQL: when a branch is
+// DELETED (the daemon's auto-fetch prune of a merged, gone-upstream
+// branch), ReapBranchDurables must drop that branch's durable copy — but
+// ONLY that durable. The active namespace (live data the app connects to)
+// and any other branch's durable must survive. A regression that dropped
+// the active namespace would be silent live-data loss.
+func TestReapBranchDurablesMySQL(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitMySQL(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mysql: &config.MysqlConn{Host: "127.0.0.1", Port: 13390, User: "root", Password: "rootpw"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mysql",
+			NameTemplate: "tm_bsreap_{slug}",
+			BranchScoped: true,
+		}},
+	}
+
+	// develop: seed schema + a row.
+	active := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop")
+	t.Cleanup(func() { dropMySQL(t, active) })
+	mustExec(t, active, "CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(32))")
+	mustExec(t, active, "INSERT INTO items(v) VALUES('develop-data')")
+
+	// Switch develop→feature so develop's data is captured into its durable
+	// copy. The diff isolates the durable this switch created.
+	before := listMySQLDBsWithPrefix(t, "_tmbs_")
+	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	mustExec(t, active, "INSERT INTO items(v) VALUES('feature-data')")
+	newDurables := diffStrings(listMySQLDBsWithPrefix(t, "_tmbs_"), before)
+	if len(newDurables) != 1 {
+		t.Fatalf("expected exactly one durable from the develop→feature switch, got %v", newDurables)
+	}
+	developDurable := newDurables[0]
+	t.Cleanup(func() { dropMySQL(t, developDurable) })
+
+	// Reaping a branch with no durable (feature is live in active) is a
+	// no-op: it must touch neither the active namespace nor develop's durable.
+	prepare.ReapBranchDurables(ctx, cfg, st, repoID, "feature")
+	if !mysqlDBExists(t, active) {
+		t.Fatal("reaping a live branch must not drop the active namespace")
+	}
+	if !mysqlDBExists(t, developDurable) {
+		t.Fatalf("reaping %q must not touch develop's durable %s", "feature", developDurable)
+	}
+
+	// Reaping the deleted branch drops ITS durable, and only that — the
+	// active namespace and its live data survive.
+	prepare.ReapBranchDurables(ctx, cfg, st, repoID, "develop")
+	if mysqlDBExists(t, developDurable) {
+		t.Fatalf("ReapBranchDurables(develop) must drop develop's durable %s", developDurable)
+	}
+	if !mysqlDBExists(t, active) {
+		t.Fatal("reap must never drop the active namespace (live data)")
+	}
+	assertItems(t, active, "develop-data", "feature-data")
+}
+
 // ─── TestWorktreeDeleteKeepsDurablePostgres ──────────────────────────
 //
 // Postgres mirror of TestWorktreeDeleteKeepsDurableMySQL: `wt delete`

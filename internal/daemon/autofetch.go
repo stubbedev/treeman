@@ -12,6 +12,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
+	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/wtreg"
@@ -220,6 +221,16 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 			return nil
 		}
 		_ = SyncWorktree(ctx, st, r.ID, wtPath, mode)
+	}
+
+	// After the mainline branch has advanced, prune local branches whose
+	// upstream was deleted and that are provably merged, then reap the
+	// branch_scoped durable databases those deleted branches left behind.
+	for _, branch := range pruneGoneLocals(ctx, r.Path) {
+		prepare.ReapBranchDurables(ctx, cfg, st.Store, r.ID, branch)
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, "branch_pruned",
+			"pruned merged branch with deleted upstream: "+branch,
+			r.ID, 0, "", 0, map[string]string{"branch": branch})
 	}
 	return nil
 }
