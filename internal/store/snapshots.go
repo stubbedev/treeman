@@ -230,6 +230,50 @@ func (s *Store) ListSnapshotsForRepo(ctx context.Context, repoID int64) ([]Snaps
 	return out, rows.Err()
 }
 
+// ListSnapshotsBeyondPerSource returns the snapshots that exceed `keep`
+// per source, where a "source" is the migration-content key
+// (`migrations_hash`) — templates that share migration content but
+// differ in dump/lockfile/engine-version pile up under one source as a
+// project's deps churn. Within each source the `keep` most-recently-used
+// rows are retained; the rest (LRU) are returned for eviction.
+//
+// `keep == 0` is treated as "no limit" and returns an empty slice — a
+// guard against a misconfigured 0 wiping every cached template (mirrors
+// ListLRUEvictable's cap==0 guard).
+//
+// Implemented with a correlated count rather than a window function so
+// it works regardless of the bundled SQLite version: a row is beyond the
+// limit when at least `keep` siblings in the same source are strictly
+// newer (ties broken deterministically by fingerprint).
+func (s *Store) ListSnapshotsBeyondPerSource(ctx context.Context, keep uint32) ([]SnapshotEvictionCandidate, error) {
+	if keep == 0 {
+		return nil, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT fingerprint, engine, template_name, source_db
+		FROM snapshots s
+		WHERE (
+			SELECT COUNT(*) FROM snapshots s2
+			WHERE s2.migrations_hash = s.migrations_hash
+			  AND (s2.last_used_at > s.last_used_at
+			       OR (s2.last_used_at = s.last_used_at AND s2.fingerprint > s.fingerprint))
+		) >= ?
+		ORDER BY migrations_hash, last_used_at ASC`, keep)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SnapshotEvictionCandidate
+	for rows.Next() {
+		var c SnapshotEvictionCandidate
+		if err := rows.Scan(&c.Fingerprint, &c.Engine, &c.TemplateName, &c.SourceDB); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // ListSnapshotsLargestLRU returns every snapshot ordered by
 // (size_bytes DESC, last_used_at ASC). The size-sweep iterates and
 // drops from the top until total falls below the cap.

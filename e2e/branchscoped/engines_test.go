@@ -395,6 +395,176 @@ func TestWorktreeDeleteKeepsDurableMySQL(t *testing.T) {
 	assertItems(t, active, "feature-data") // durable kept → resumed
 }
 
+// ─── TestWorktreeDeleteKeepsDurablePostgres ──────────────────────────
+//
+// Postgres mirror of TestWorktreeDeleteKeepsDurableMySQL: `wt delete`
+// teardown captures the active DB into the current branch's durable copy
+// and drops the active, so re-creating the worktree on the same branch
+// resumes the diverged data.
+func TestWorktreeDeleteKeepsDurablePostgres(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitPostgres(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+	sl := slug.For(wtPath, "")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Postgres: &config.PostgresConn{Host: "127.0.0.1", Port: 15490, User: "postgres", Password: "pgpw"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "postgres",
+			NameTemplate: "tm_bsdelpg_{slug}",
+			BranchScoped: true,
+		}},
+	}
+
+	active := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	pgExec(t, active, "CREATE TABLE items (id SERIAL PRIMARY KEY, v TEXT)")
+	pgExec(t, active, "INSERT INTO items(v) VALUES('feature-data')")
+	pgAssertItems(t, active, "feature-data")
+
+	// Teardown (the `wt delete` DB path): captures durable, drops active.
+	if err := prepare.TeardownDatabases(ctx, cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	if pgDBExists(t, active) {
+		t.Fatalf("teardown should have dropped the active DB %s", active)
+	}
+
+	// Re-prepare on the same branch → resumes from the durable copy.
+	if got := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature"); got != active {
+		t.Fatalf("active namespace drifted after re-create: %s → %s", active, got)
+	}
+	pgAssertItems(t, active, "feature-data") // durable kept → resumed
+}
+
+// ─── TestWorktreeDeleteKeepsDurableMongo ─────────────────────────────
+//
+// MongoDB mirror of the MySQL/Postgres delete case.
+func TestWorktreeDeleteKeepsDurableMongo(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitMongo(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+	sl := slug.For(wtPath, "")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mongodb: &config.MongoConn{URI: mongoURI},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mongodb",
+			NameTemplate: "tm_bsdelmongo_{slug}",
+			BranchScoped: true,
+		}},
+	}
+
+	active := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	mongoInsert(t, active, "feature-data")
+	mongoAssert(t, active, "feature-data")
+
+	if err := prepare.TeardownDatabases(ctx, cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	if mongoDBExists(t, active) {
+		t.Fatalf("teardown should have dropped the active DB %s", active)
+	}
+
+	if got := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature"); got != active {
+		t.Fatalf("active namespace drifted after re-create: %s → %s", active, got)
+	}
+	mongoAssert(t, active, "feature-data") // durable kept → resumed
+}
+
+// ─── TestWorktreeDeleteKeepsDurableRedis ─────────────────────────────
+//
+// Redis mirror, prefix-scoped: teardown drops every key under the active
+// prefix but keeps the per-branch durable copy.
+func TestWorktreeDeleteKeepsDurableRedis(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitRedis(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+	sl := slug.For(wtPath, "")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Redis: &config.RedisConn{URL: "redis://" + redisAddr},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "redis",
+			KeyPrefix:    "bsdel:{slug}:",
+			BranchScoped: true,
+		}},
+	}
+
+	prefix := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	rset(t, prefix+"a", "feature-data")
+	assertRedisVals(t, prefix, map[string]string{"a": "feature-data"})
+
+	if err := prepare.TeardownDatabases(ctx, cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	assertRedisVals(t, prefix, map[string]string{}) // active keys dropped
+
+	if got := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature"); got != prefix {
+		t.Fatalf("active prefix drifted after re-create: %s → %s", prefix, got)
+	}
+	assertRedisVals(t, prefix, map[string]string{"a": "feature-data"}) // durable kept → resumed
+}
+
+// ─── TestWorktreeDeleteKeepsDurableElasticsearch ─────────────────────
+//
+// Elasticsearch mirror, prefix-scoped: teardown drops every index under
+// the active prefix but keeps the per-branch durable copy.
+func TestWorktreeDeleteKeepsDurableElasticsearch(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitES(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+	sl := slug.For(wtPath, "")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Elasticsearch: &config.EsConn{URL: esURL},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "elasticsearch",
+			KeyPrefix:    "bsdeles_{slug}_",
+			BranchScoped: true,
+		}},
+	}
+
+	prefix := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	esIndex(t, prefix, "a", "feature-data")
+	esAssertVals(t, prefix, map[string]string{"a": "feature-data"})
+
+	if err := prepare.TeardownDatabases(ctx, cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	if n := esCount(t, prefix+"*"); n != 0 {
+		t.Fatalf("teardown should have dropped active indices under %s*, found %d docs", prefix, n)
+	}
+
+	if got := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature"); got != prefix {
+		t.Fatalf("active prefix drifted after re-create: %s → %s", prefix, got)
+	}
+	esAssertVals(t, prefix, map[string]string{"a": "feature-data"}) // durable kept → resumed
+}
+
 // ─── helpers: shared ─────────────────────────────────────────────────
 
 func renderName(t *testing.T, tmpl string, sl slug.Slug) string {
@@ -466,6 +636,20 @@ func pgAssertItems(t *testing.T, dbName string, want ...string) {
 	}
 }
 
+// pgDBExists reports whether a database named `name` lives in the
+// cluster — checked from the `postgres` maintenance DB so it works even
+// after `name` has been dropped.
+func pgDBExists(t *testing.T, name string) bool {
+	t.Helper()
+	db := pgConn(t, "postgres")
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pg_database WHERE datname = $1", name).Scan(&n); err != nil {
+		t.Fatalf("pg exists %s: %v", name, err)
+	}
+	return n == 1
+}
+
 func waitPostgres(t *testing.T) {
 	harness.WaitForReady(t, "postgres:"+pgAddr, 60*time.Second, func() error {
 		c, err := net.DialTimeout("tcp", pgAddr, time.Second)
@@ -522,6 +706,18 @@ func mongoAssert(t *testing.T, dbName string, want ...string) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("mongo %s items = %v, want %v", dbName, got, want)
 	}
+}
+
+// mongoDBExists reports whether a database named `name` is listed by the
+// server. Mongo creates databases lazily, so a dropped name is absent.
+func mongoDBExists(t *testing.T, name string) bool {
+	t.Helper()
+	c := mongoConn(t)
+	names, err := c.ListDatabaseNames(context.Background(), bson.M{"name": name})
+	if err != nil {
+		t.Fatalf("mongo list dbs: %v", err)
+	}
+	return len(names) == 1
 }
 
 func waitMongo(t *testing.T) {
@@ -600,6 +796,30 @@ func esAssertVals(t *testing.T, prefix string, want map[string]string) {
 			t.Fatalf("es %s key %q = %q, want %q (full: %v)", index, k, got[k], v, got)
 		}
 	}
+}
+
+// esCount returns the document count across every index matching the
+// wildcard `pattern` (e.g. "bsdeles_<slug>_*"). A pattern that matches no
+// index returns 0 (wildcard expansion to empty is allowed), which is the
+// clean "namespace is gone" signal after a teardown.
+func esCount(t *testing.T, pattern string) int {
+	t.Helper()
+	resp, err := http.Get(esURL + "/" + pattern + "/_count")
+	if err != nil {
+		t.Fatalf("es count %s: %v", pattern, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("es count %s: %s: %s", pattern, resp.Status, body)
+	}
+	var out struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("es count parse %s: %v: %s", pattern, err, body)
+	}
+	return out.Count
 }
 
 func waitES(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/prepare"
 )
 
 func TestPostgresEndToEnd(t *testing.T) {
@@ -56,6 +57,58 @@ func TestPostgresEndToEnd(t *testing.T) {
 		t.Errorf("fingerprint unchanged after edit")
 	}
 	assertTables(t, "127.0.0.1:15432", o3.SourceDB, []string{"products", "orders", "shipments"})
+
+	// Fanout setup permutation: the 2 declared clones exist and carry the
+	// seeded+migrated schema (restored from the template).
+	if len(o3.Clones) != 2 {
+		t.Fatalf("fanout: got %d clones, want 2 (%v)", len(o3.Clones), o3.Clones)
+	}
+	for _, c := range o3.Clones {
+		if !pgDBExists(t, "127.0.0.1:15432", c) {
+			t.Errorf("clone DB %s missing after fanout", c)
+		}
+		assertTables(t, "127.0.0.1:15432", c, []string{"products", "orders", "shipments"})
+	}
+
+	// ── teardown: `wt delete` drops the per-worktree DBs, keeps the cache ──
+	// TeardownDatabases is the DB layer of `treeman wt delete`. It must DROP
+	// the source database AND every clone while leaving the fingerprint-keyed
+	// template intact, so the next prepare with the same inputs is a cache hit.
+	if err := prepare.TeardownDatabases(env.Ctx, cfg, env.Slug.Value, env.RepoID, env.WTID, env.Store); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	if pgDBExists(t, "127.0.0.1:15432", o3.SourceDB) {
+		t.Errorf("source DB %s still exists after teardown", o3.SourceDB)
+	}
+	for _, c := range o3.Clones {
+		if pgDBExists(t, "127.0.0.1:15432", c) {
+			t.Errorf("clone DB %s still exists after teardown", c)
+		}
+	}
+	// The fingerprint-keyed template must SURVIVE teardown so the next
+	// worktree with the same inputs still hits the cache.
+	if !pgDBExists(t, "127.0.0.1:15432", o3.TemplateName) {
+		t.Errorf("template DB %s was dropped by teardown (cache must survive)", o3.TemplateName)
+	}
+}
+
+// pgDBExists reports whether a database named `name` lives in the
+// cluster — checked from the `postgres` maintenance DB so it works even
+// after `name` has been dropped.
+func pgDBExists(t *testing.T, addr, name string) bool {
+	t.Helper()
+	dsn := fmt.Sprintf("postgres://postgres:pgpw@%s/postgres?sslmode=disable", addr)
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open pg maintenance db: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM pg_database WHERE datname = $1", name).Scan(&n); err != nil {
+		t.Fatalf("pg exists %s: %v", name, err)
+	}
+	return n == 1
 }
 
 func buildConfig() *config.Config {
@@ -82,6 +135,12 @@ func buildConfig() *config.Config {
 				},
 				Inputs: []config.Input{
 					{Glob: "fixtures/migrations/*.sql", Label: "migrations", Hash: "filename"},
+				},
+				// Fanout: pre-warm 2 paratest clones so teardown's
+				// per-worktree cleanup (source + clones) is exercised.
+				TestClones: &config.TestClonesSpec{
+					Clones:       config.ClonesSetting{Fixed: 2},
+					NameTemplate: "treeman_e2e_{slug}_w{n}",
 				},
 			},
 		},

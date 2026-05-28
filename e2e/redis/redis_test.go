@@ -14,6 +14,7 @@ import (
 
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/prepare"
 )
 
 func TestRedisEndToEnd(t *testing.T) {
@@ -55,6 +56,52 @@ func TestRedisEndToEnd(t *testing.T) {
 	if o3.Fingerprint == o1.Fingerprint {
 		t.Errorf("fingerprint unchanged after schema.txt edit")
 	}
+
+	// ── teardown: `wt delete` drops the per-worktree keys, keeps the cache ──
+	// TeardownDatabases is the DB layer of `treeman wt delete`: for redis it
+	// DROPs every key under the worktree's prefix while leaving the
+	// fingerprint-keyed template prefix intact, so the next prepare with the
+	// same inputs is a cache hit.
+	if err := prepare.TeardownDatabases(env.Ctx, cfg, env.Slug.Value, env.RepoID, env.WTID, env.Store); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	assertKeyCount(t, o3.SourceDB, 0) // per-worktree keys dropped
+	// The fingerprint-keyed template prefix must SURVIVE teardown so the
+	// next worktree with the same inputs still hits the cache.
+	assertKeyCount(t, o3.TemplateName, 3)
+
+	// ── fanout + teardown permutation ──
+	// Pre-warm clones (paratest workers). Clone prefixes nest under the
+	// source prefix, so the single source-prefix DropPrefix on teardown
+	// reaps source + clones together. A distinct slug (fresh worktree)
+	// keeps these prefixes from overlapping the assertions above.
+	t.Run("fanout_teardown", func(t *testing.T) {
+		wt2 := t.TempDir()
+		copyTree(t, "fixtures", filepath.Join(wt2, "fixtures"))
+		fcfg := buildConfig()
+		fcfg.Databases[0].KeyPrefix = "wtfan:{slug}:"
+		fcfg.Databases[0].TestClones = &config.TestClonesSpec{
+			Clones:       config.ClonesSetting{Fixed: 2},
+			NameTemplate: "wtfan:{slug}:w{n}:",
+		}
+		env2 := harness.NewEnv(t, wt2)
+		fo := harness.AssertOutcome(t, env2.RunPrepare(t, fcfg), "redis", false)
+		if len(fo.Clones) != 2 {
+			t.Fatalf("fanout: got %d clones, want 2 (%v)", len(fo.Clones), fo.Clones)
+		}
+		for _, c := range fo.Clones {
+			assertKeyCount(t, c, 3) // each clone pre-warmed from the template
+		}
+
+		if err := prepare.TeardownDatabases(env2.Ctx, fcfg, env2.Slug.Value, env2.RepoID, env2.WTID, env2.Store); err != nil {
+			t.Fatalf("TeardownDatabases: %v", err)
+		}
+		assertKeyCount(t, fo.SourceDB, 0) // source + nested clones all dropped
+		for _, c := range fo.Clones {
+			assertKeyCount(t, c, 0)
+		}
+		assertKeyCount(t, fo.TemplateName, 3) // cache survives
+	})
 }
 
 func buildConfig() *config.Config {

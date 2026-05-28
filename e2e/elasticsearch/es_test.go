@@ -16,6 +16,7 @@ import (
 
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/prepare"
 )
 
 func TestElasticsearchEndToEnd(t *testing.T) {
@@ -69,6 +70,55 @@ func TestElasticsearchEndToEnd(t *testing.T) {
 	if o3.Fingerprint == o1.Fingerprint {
 		t.Errorf("fingerprint unchanged after dump edit")
 	}
+
+	// ── teardown: `wt delete` drops the per-worktree indices, keeps the cache ──
+	// TeardownDatabases is the DB layer of `treeman wt delete`: for ES it
+	// DELETEs every index under the worktree's prefix while leaving the
+	// fingerprint-keyed template indices intact, so the next prepare with the
+	// same inputs is a cache hit.
+	if err := prepare.TeardownDatabases(env.Ctx, cfg, env.Slug.Value, env.RepoID, env.WTID, env.Store); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	// Wildcard _count over the (now-empty) worktree prefix returns 0 when no
+	// index matches — the clean "namespace is gone" signal.
+	assertDocCount(t, o3.SourceDB+"*", 0)
+	// The fingerprint-keyed template indices must SURVIVE teardown so the
+	// next worktree with the same inputs still hits the cache. After the
+	// dump edit the template holds a single products doc.
+	assertDocCount(t, o3.TemplateName+"*", 1)
+
+	// ── fanout + teardown permutation ──
+	// Pre-warm clones (paratest workers). Clone index prefixes nest under
+	// the source prefix, so the single source-prefix DropMatching on
+	// teardown reaps source + clones together. A distinct slug (fresh
+	// worktree, unedited dump) keeps these indices off the assertions above.
+	t.Run("fanout_teardown", func(t *testing.T) {
+		wt2 := t.TempDir()
+		copyTree(t, "fixtures", filepath.Join(wt2, "fixtures"))
+		fcfg := buildConfig()
+		fcfg.Databases[0].KeyPrefix = "wtfan_{slug}_"
+		fcfg.Databases[0].TestClones = &config.TestClonesSpec{
+			Clones:       config.ClonesSetting{Fixed: 2},
+			NameTemplate: "wtfan_{slug}_w{n}_",
+		}
+		env2 := harness.NewEnv(t, wt2)
+		fo := harness.AssertOutcome(t, env2.RunPrepare(t, fcfg), "elasticsearch", false)
+		if len(fo.Clones) != 2 {
+			t.Fatalf("fanout: got %d clones, want 2 (%v)", len(fo.Clones), fo.Clones)
+		}
+		for _, c := range fo.Clones {
+			assertDocCount(t, c+"*", 3) // each clone: products(2) + orders(1)
+		}
+
+		if err := prepare.TeardownDatabases(env2.Ctx, fcfg, env2.Slug.Value, env2.RepoID, env2.WTID, env2.Store); err != nil {
+			t.Fatalf("TeardownDatabases: %v", err)
+		}
+		assertDocCount(t, fo.SourceDB+"*", 0) // source + nested clones all dropped
+		for _, c := range fo.Clones {
+			assertDocCount(t, c+"*", 0)
+		}
+		assertDocCount(t, fo.TemplateName+"*", 3) // cache survives
+	})
 }
 
 func buildConfig() *config.Config {

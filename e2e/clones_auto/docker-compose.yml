@@ -1,0 +1,16 @@
+# MySQL fixture for the test_clones `clones: auto` e2e. Port 13340 is
+# distinct from the other suites so they can run concurrently.
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: treeman-e2e-clones-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+    ports:
+      - "13340:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s

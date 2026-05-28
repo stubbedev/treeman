@@ -101,6 +101,42 @@ func PurgeRepo(ctx context.Context, cfg *config.Config, st *store.Store, repoID 
 	return dropped, errs
 }
 
+// SweepBySource evicts cached templates that exceed
+// `cfg.Snapshots.KeepPerSource` per source, where a "source" is the
+// migration-content key (`migrations_hash`). Within each source the N
+// most-recently-used templates are kept; older ones are dropped. Bounds
+// the per-source template fan-out that accumulates as a project's
+// dump/lockfile/engine-version churn while migration content holds
+// steady. Runs as part of the daemon's periodic GC tick.
+func SweepBySource(ctx context.Context, cfg *config.Config, st *store.Store) {
+	keep := cfg.Snapshots.KeepPerSource
+	if keep == 0 {
+		return
+	}
+	cands, err := st.ListSnapshotsBeyondPerSource(ctx, keep)
+	if err != nil {
+		slog.Warn("snapshot source sweep query", "err", err)
+		return
+	}
+	for _, c := range cands {
+		if err := dropTemplate(ctx, cfg, c); err != nil {
+			slog.Warn("snapshot source sweep drop", "template", c.TemplateName, "err", err)
+			continue
+		}
+		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
+			slog.Warn("snapshot source sweep delete row",
+				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
+		}
+		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_source_evict",
+			fmt.Sprintf("evicted %s (over keep_per_source=%d)", c.TemplateName, keep),
+			0, 0, "", 0, map[string]string{
+				"engine":      c.Engine,
+				"template":    c.TemplateName,
+				"fingerprint": c.Fingerprint,
+			})
+	}
+}
+
 func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvictionCandidate) error {
 	fam, ok := engine.Canonical(c.Engine)
 	if !ok {

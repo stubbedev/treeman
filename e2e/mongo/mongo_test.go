@@ -4,17 +4,18 @@ package mongo_e2e
 
 import (
 	"context"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/prepare"
 )
 
 func TestMongoEndToEnd(t *testing.T) {
@@ -22,13 +23,19 @@ func TestMongoEndToEnd(t *testing.T) {
 	composeDir := harness.MustAbs(".")
 	t.Cleanup(harness.ComposeUp(t, composeDir))
 
+	// A real connect+ping, not just a TCP dial: a fresh mongod accepts
+	// connections a beat before it durably serves writes, and the seed
+	// races that window under load. Gate on an actual ping so prepare
+	// (and its seed) only runs once mongod is truly serving.
 	harness.WaitForReady(t, "mongo:27117", 60*time.Second, func() error {
-		c, err := net.DialTimeout("tcp", "127.0.0.1:27117", 1*time.Second)
+		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		c, err := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27117"))
 		if err != nil {
 			return err
 		}
-		_ = c.Close()
-		return nil
+		defer c.Disconnect(pingCtx)
+		return c.Ping(pingCtx, nil)
 	})
 
 	wt := t.TempDir()
@@ -60,6 +67,57 @@ func TestMongoEndToEnd(t *testing.T) {
 	if o3.Fingerprint == o1.Fingerprint {
 		t.Errorf("fingerprint unchanged after schema.txt edit")
 	}
+
+	// Fanout setup permutation: the 2 declared clones exist with the
+	// seeded products (restored from the template).
+	if len(o3.Clones) != 2 {
+		t.Fatalf("fanout: got %d clones, want 2 (%v)", len(o3.Clones), o3.Clones)
+	}
+	for _, c := range o3.Clones {
+		if !mongoDBExists(t, c) {
+			t.Errorf("clone DB %s missing after fanout", c)
+		}
+		assertProductCount(t, c, 3)
+	}
+
+	// ── teardown: `wt delete` drops the per-worktree DBs, keeps the cache ──
+	// TeardownDatabases is the DB layer of `treeman wt delete`: it must DROP
+	// the source database AND every clone while leaving the fingerprint-keyed
+	// template intact, so the next prepare with the same inputs is a cache hit.
+	if err := prepare.TeardownDatabases(env.Ctx, cfg, env.Slug.Value, env.RepoID, env.WTID, env.Store); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	if mongoDBExists(t, o3.SourceDB) {
+		t.Errorf("source DB %s still exists after teardown", o3.SourceDB)
+	}
+	for _, c := range o3.Clones {
+		if mongoDBExists(t, c) {
+			t.Errorf("clone DB %s still exists after teardown", c)
+		}
+	}
+	// The fingerprint-keyed template must SURVIVE teardown so the next
+	// worktree with the same inputs still hits the cache.
+	if !mongoDBExists(t, o3.TemplateName) {
+		t.Errorf("template DB %s was dropped by teardown (cache must survive)", o3.TemplateName)
+	}
+}
+
+// mongoDBExists reports whether a database named `name` is listed by the
+// server. Mongo creates databases lazily, so a dropped name is absent.
+func mongoDBExists(t *testing.T, name string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27117"))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer c.Disconnect(ctx)
+	names, err := c.ListDatabaseNames(ctx, bson.M{"name": name})
+	if err != nil {
+		t.Fatalf("mongo list dbs: %v", err)
+	}
+	return len(names) == 1
 }
 
 func buildConfig() *config.Config {
@@ -80,6 +138,12 @@ func buildConfig() *config.Config {
 				},
 				Inputs: []config.Input{
 					{Glob: "fixtures/schema.txt", Label: "schema"},
+				},
+				// Fanout: pre-warm 2 clones so teardown's per-worktree
+				// cleanup (source + clones) is exercised.
+				TestClones: &config.TestClonesSpec{
+					Clones:       config.ClonesSetting{Fixed: 2},
+					NameTemplate: "treeman_e2e_{slug}_w{n}",
 				},
 			},
 		},
