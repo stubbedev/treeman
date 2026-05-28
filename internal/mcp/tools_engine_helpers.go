@@ -277,6 +277,41 @@ func runPgDump(ctx context.Context, conn *config.PostgresConn, db, outPath strin
 	return runDumpCmd(cmd, outPath, gzipOut)
 }
 
+// runESDump writes a `_bulk`-format NDJSON dump of every doc under
+// `<prefix>*` indices. Round-trips through Driver.Restore (which
+// substitutes `{target_db}` back to the destination worktree's
+// prefix at load time).
+func runESDump(ctx context.Context, conn *config.EsConn, prefix, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
+	if conn == nil {
+		return nil, dbDumpOut{}, fmt.Errorf("connections.elasticsearch not configured")
+	}
+	drv, err := dbes.Connect(ctx, *conn)
+	if err != nil {
+		return nil, dbDumpOut{}, err
+	}
+	f, err := os.Create(outPath)
+	if err != nil {
+		return nil, dbDumpOut{}, err
+	}
+	defer f.Close()
+	var w io.WriteCloser = f
+	if gzipOut {
+		w = gzip.NewWriter(f)
+		defer w.Close()
+	}
+	if err := drv.Dump(ctx, prefix, w); err != nil {
+		return nil, dbDumpOut{}, fmt.Errorf("es dump: %w", err)
+	}
+	if gzipOut {
+		_ = w.Close()
+	}
+	info, err := os.Stat(outPath)
+	if err != nil {
+		return nil, dbDumpOut{}, err
+	}
+	return nil, dbDumpOut{Path: outPath, SizeBytes: info.Size()}, nil
+}
+
 func runMongoDump(ctx context.Context, conn *config.MongoConn, db, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
 	if _, err := exec.LookPath("mongodump"); err != nil {
 		return nil, dbDumpOut{}, fmt.Errorf("mongodump not on PATH: %w", err)

@@ -72,7 +72,7 @@ func registerEngineWriteTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_dump",
-		Description: "Generate a dump of a live engine database to disk. Supported engines: mysql (and mariadb/tidb aliases) -> mysqldump; postgres (and postgresql alias) -> pg_dump --format=plain --clean --if-exists; mongodb -> mongodump --archive. Redis and elasticsearch/opensearch dumps are not yet implemented and will return an explicit error. output_dir defaults to <repo>/storage/dumps. Use this to refresh the seed dump treeman uses for cold builds (commit the new file then trigger prepare_run). Returns the absolute path + byte count.",
+		Description: "Generate a dump of a live engine database to disk. Supported engines: mysql (and mariadb/tidb aliases) -> mysqldump; postgres (and postgresql alias) -> pg_dump --format=plain --clean --if-exists; mongodb -> mongodump --archive; elasticsearch (and opensearch alias) -> scroll API NDJSON _bulk with {target_db} prefix substitution. Redis dumps are intentionally not implemented (redis cold-build uses a seed step, not a dump file, so there is no restore counterpart). output_dir defaults to <repo>/storage/dumps. Use this to refresh the seed dump treeman uses for cold builds (commit the new file then trigger prepare_run). Returns the absolute path + byte count.",
 		Annotations: writeAnno("Dump database", false, false, true),
 	}, dbDumpTool)
 }
@@ -670,8 +670,14 @@ func dbDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbDumpIn) (*m
 			p += ".gz"
 		}
 		return runMongoDump(ctx, cfg.Connections.Mongodb, in.DB, p, in.Gzip)
-	case engine.FamilyRedis, engine.FamilyES:
-		return nil, dbDumpOut{}, fmt.Errorf("db_dump: engine family %q is not yet implemented (only mysql / postgres / mongodb dumps are supported); contribute a runner or pre-build the seed dump out of band", fam)
+	case engine.FamilyES:
+		p := filepath.Join(outDir, fmt.Sprintf("%s-%s.ndjson", in.DB, ts))
+		if in.Gzip {
+			p += ".gz"
+		}
+		return runESDump(ctx, cfg.Connections.Elasticsearch, in.DB, p, in.Gzip)
+	case engine.FamilyRedis:
+		return nil, dbDumpOut{}, fmt.Errorf("db_dump: redis dump is not implemented — redis cold-build uses a `seed:` step rather than a dump file, so there is no restore counterpart. If you need a redis snapshot, use redis-cli BGSAVE / SAVE manually and reference the resulting RDB out-of-band")
 	default:
 		return nil, dbDumpOut{}, fmt.Errorf("db_dump: engine family %q has no dump runner", fam)
 	}
