@@ -233,13 +233,54 @@ func probeS3(ctx context.Context, cfg *config.Config) engineProbeResult {
 	}
 	r.Reachable = true
 	r.Version, _ = drv.EngineVersion(ctx)
-	buckets, err := drv.ListMatching(ctx, "")
-	if err != nil {
-		r.Error = err.Error()
-		return r
+
+	// Restrict the listing to the literal prefix(es) carried by the
+	// configured s3 databases. ListBuckets returns the whole AWS
+	// account, so listing under "" would leak every unrelated bucket
+	// the credentials can see into the MCP response.
+	prefixes := s3LiteralPrefixes(cfg)
+	seen := map[string]bool{}
+	var buckets []string
+	for _, p := range prefixes {
+		matches, err := drv.ListMatching(ctx, p)
+		if err != nil {
+			r.Error = err.Error()
+			return r
+		}
+		for _, b := range matches {
+			if seen[b] {
+				continue
+			}
+			seen[b] = true
+			buckets = append(buckets, b)
+		}
 	}
-	r.Detail = map[string]any{"buckets": buckets}
+	r.Detail = map[string]any{"buckets": buckets, "scanned_prefixes": prefixes}
 	return r
+}
+
+// s3LiteralPrefixes returns the deduplicated literal portion (text
+// before the first `{`) of every `engine: s3` entry's key_prefix.
+// Used by probeS3 to scope ListBuckets so unrelated buckets in the
+// same AWS account don't leak into MCP responses.
+func s3LiteralPrefixes(cfg *config.Config) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, d := range cfg.Databases {
+		if d.Engine != "s3" || d.KeyPrefix == "" {
+			continue
+		}
+		lit := d.KeyPrefix
+		if i := strings.Index(lit, "{"); i >= 0 {
+			lit = lit[:i]
+		}
+		if lit == "" || seen[lit] {
+			continue
+		}
+		seen[lit] = true
+		out = append(out, lit)
+	}
+	return out
 }
 
 // ─── db_schema_dump ─────────────────────────────────────────────────

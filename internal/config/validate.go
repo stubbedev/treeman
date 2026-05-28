@@ -222,6 +222,20 @@ func (d DatabaseConfig) validate(path string) error {
 		if d.KeyPrefix == "" {
 			return fmt.Errorf("%s: key_prefix is required for engine \"s3\" (renders the per-worktree bucket name; AWS bucket-naming rules apply)", path)
 		}
+		// Enforce a non-trivial literal prefix (everything before the
+		// first `{` template token). Teardown matches buckets by literal
+		// prefix across the whole AWS account, so a generic "dev" /
+		// "test" would reap unrelated buckets. Mirrors the runtime
+		// guard in s3.Driver.DropMatching.
+		literal := d.KeyPrefix
+		if i := strings.Index(literal, "{"); i >= 0 {
+			literal = literal[:i]
+		}
+		const minLiteral = 6
+		if len(literal) < minLiteral {
+			return fmt.Errorf("%s: key_prefix literal portion %q is too short (%d < %d) — S3 buckets share an account-wide namespace; use a project-specific literal like \"myapp-{slug}\" so teardown can't reap unrelated buckets",
+				path, literal, len(literal), minLiteral)
+		}
 		if d.Dump != nil {
 			return fmt.Errorf("%s: engine \"s3\" does not support `dump:` yet (bucket lifecycle only)", path)
 		}

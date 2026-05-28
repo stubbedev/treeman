@@ -15,9 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -32,8 +34,9 @@ import (
 // Driver wraps an aws-sdk-go-v2 S3 client. Buckets are addressed by
 // rendered name; there's no per-bucket session state to carry.
 type Driver struct {
-	Client *awss3.Client
-	Region string
+	Client      *awss3.Client
+	Region      string
+	EndpointSet bool
 }
 
 // Connect builds an S3 client from cfg and probes the endpoint for
@@ -74,10 +77,22 @@ func Connect(ctx context.Context, cfg config.S3Conn) (*Driver, error) {
 		}
 	}
 
+	// Both creds must be supplied together. Passing one half to the
+	// static-cred provider produces a cryptic SigV4 signing error at
+	// the first API call; surface the misconfig here instead.
+	hasAK, hasSK := cfg.AccessKey != "", cfg.SecretKey != ""
+	if hasAK != hasSK {
+		which := "secret_key"
+		if hasSK {
+			which = "access_key"
+		}
+		return nil, fmt.Errorf("s3: %s is empty but the other half is set — provide both, or neither (to use the SDK default credential chain)", which)
+	}
+
 	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(region),
 	}
-	if cfg.AccessKey != "" || cfg.SecretKey != "" {
+	if hasAK && hasSK {
 		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""),
 		))
@@ -87,14 +102,15 @@ func Connect(ctx context.Context, cfg config.S3Conn) (*Driver, error) {
 		return nil, fmt.Errorf("s3: load aws config: %w", err)
 	}
 
+	endpointSet := endpoint != ""
 	client := awss3.NewFromConfig(awsCfg, func(o *awss3.Options) {
-		if endpoint != "" {
+		if endpointSet {
 			o.BaseEndpoint = &endpoint
 		}
 		o.UsePathStyle = cfg.UsePathStyle
-		o.HTTPClient = http30s
+		o.HTTPClient = defaultHTTPClient
 	})
-	return &Driver{Client: client, Region: region}, nil
+	return &Driver{Client: client, Region: region, EndpointSet: endpointSet}, nil
 }
 
 // EngineVersion returns "" + nil — S3 has no version endpoint, and
@@ -123,12 +139,13 @@ func (d *Driver) BucketExists(ctx context.Context, name string) (bool, error) {
 // success — this is the idempotent prepare path.
 //
 // AWS S3 quirks: CreateBucket in us-east-1 must NOT set a
-// LocationConstraint; every other region requires one. MinIO and
-// Garage accept either. We follow the AWS rule when the configured
-// region is us-east-1.
+// LocationConstraint; every other AWS region requires one. Self-hosted
+// implementations (MinIO, Garage, Ceph RGW) interpret region freely
+// and reject arbitrary LocationConstraint values, so we only emit the
+// constraint when the SDK is talking to AWS (no explicit endpoint).
 func (d *Driver) EnsureBucket(ctx context.Context, name string) error {
 	in := &awss3.CreateBucketInput{Bucket: &name}
-	if d.Region != "" && d.Region != "us-east-1" {
+	if !d.EndpointSet && d.Region != "" && d.Region != "us-east-1" {
 		in.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
 			LocationConstraint: s3types.BucketLocationConstraint(d.Region),
 		}
@@ -168,7 +185,17 @@ func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, err
 // is non-empty). Returns the names that were removed. Errors short-
 // circuit, leaving the remaining buckets in place so the caller can
 // retry without losing track of which got dropped.
+//
+// SAFETY: bucket namespace is account-wide and prefix matching is
+// literal — a short or generic prefix (e.g. "dev") will drop unrelated
+// buckets in the same account. Callers must enforce a sufficiently
+// specific prefix; the package-level minimum is `MinDropPrefixLen`,
+// enforced here as a defense-in-depth guard.
 func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
+	if len(prefix) < MinDropPrefixLen {
+		return nil, fmt.Errorf("s3: refusing to drop with prefix %q: length %d < MinDropPrefixLen=%d (would risk reaping unrelated buckets in the account)",
+			prefix, len(prefix), MinDropPrefixLen)
+	}
 	matches, err := d.ListMatching(ctx, prefix)
 	if err != nil {
 		return nil, err
@@ -231,14 +258,20 @@ func (d *Driver) emptyBucket(ctx context.Context, name string) error {
 		if out.IsTruncated == nil || !*out.IsTruncated {
 			return nil
 		}
+		// Defense against non-conforming impls that report truncated
+		// without advancing the markers — would otherwise loop forever.
+		if eqStrPtr(out.NextKeyMarker, keyMarker) && eqStrPtr(out.NextVersionIdMarker, versionMarker) {
+			return fmt.Errorf("s3: list versions %q: pagination stuck (IsTruncated=true but markers unchanged)", name)
+		}
 		keyMarker = out.NextKeyMarker
 		versionMarker = out.NextVersionIdMarker
 	}
 }
 
-// deleteBatch issues one DeleteObjects call (cap 1000 keys). Splits
-// larger batches into chunks. Per-key errors are aggregated; the
-// first one short-circuits the caller's loop.
+// deleteBatch issues one DeleteObjects call per 1000-key chunk (the
+// S3 limit). Per-key errors within a chunk are aggregated via
+// errors.Join so the caller sees every failure in a single response,
+// not just the first.
 func (d *Driver) deleteBatch(ctx context.Context, bucket string, ids []s3types.ObjectIdentifier) error {
 	const max = 1000
 	for len(ids) > 0 {
@@ -250,11 +283,12 @@ func (d *Driver) deleteBatch(ctx context.Context, bucket string, ids []s3types.O
 		ids = ids[n:]
 		out, err := d.Client.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
 			Bucket: &bucket,
-			Delete: &s3types.Delete{Objects: chunk, Quiet: ptrTrue()},
+			Delete: &s3types.Delete{Objects: chunk, Quiet: quietTrue},
 		})
 		if err != nil {
 			return fmt.Errorf("s3: delete objects in %q: %w", bucket, err)
 		}
+		var perKey []error
 		for _, e := range out.Errors {
 			key, code, msg := "", "", ""
 			if e.Key != nil {
@@ -266,7 +300,10 @@ func (d *Driver) deleteBatch(ctx context.Context, bucket string, ids []s3types.O
 			if e.Message != nil {
 				msg = *e.Message
 			}
-			return fmt.Errorf("s3: delete object %s/%s: %s (%s)", bucket, key, msg, code)
+			perKey = append(perKey, fmt.Errorf("s3: delete object %s/%s: %s (%s)", bucket, key, msg, code))
+		}
+		if len(perKey) > 0 {
+			return errors.Join(perKey...)
 		}
 	}
 	return nil
@@ -301,6 +338,9 @@ func (d *Driver) abortMultiparts(ctx context.Context, name string) error {
 		if out.IsTruncated == nil || !*out.IsTruncated {
 			return nil
 		}
+		if eqStrPtr(out.NextKeyMarker, keyMarker) && eqStrPtr(out.NextUploadIdMarker, uploadIDMarker) {
+			return fmt.Errorf("s3: list multipart uploads %q: pagination stuck (IsTruncated=true but markers unchanged)", name)
+		}
 		keyMarker = out.NextKeyMarker
 		uploadIDMarker = out.NextUploadIdMarker
 	}
@@ -318,7 +358,7 @@ func isNotFound(err error) bool {
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
 		switch ae.ErrorCode() {
-		case "NoSuchBucket", "NoSuchKey", "NotFound", "404":
+		case "NoSuchBucket", "NoSuchKey", "NotFound":
 			return true
 		}
 	}
@@ -344,9 +384,51 @@ func isAlreadyOwned(err error) bool {
 	return false
 }
 
-func ptrTrue() *bool { b := true; return &b }
+func eqStrPtr(a, b *string) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
 
-// http30s is the shared HTTP client tuned for the S3 API: 30s
-// per-request ceiling, default transport otherwise. Mirrors the
-// timeout the ES driver uses.
-var http30s = &http.Client{Timeout: 30 * time.Second}
+// MinDropPrefixLen is the shortest prefix DropMatching will accept.
+// S3 buckets share an account-wide namespace, so a generic prefix
+// like "dev" or "test" would reap unrelated buckets. Callers should
+// also enforce this at config-load time on the literal portion of
+// `key_prefix` (everything before the first template token).
+const MinDropPrefixLen = 6
+
+var (
+	quietTrue = aws.Bool(true)
+
+	// defaultHTTPClient — shared HTTP client tuned for the S3 API:
+	// 30s per-request ceiling, default transport otherwise. Mirrors
+	// the timeout the ES driver uses.
+	defaultHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+	// Bucket naming: lowercase letters, digits, hyphens. Must start
+	// and end with alphanumeric. 3-63 chars. We deliberately reject
+	// dots (legal on AWS in path-style but break virtual-host SSL
+	// and are disallowed by several non-AWS impls).
+	bucketNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
+)
+
+// ValidateBucketName checks a rendered bucket name against the
+// conservative subset of S3 naming rules: 3-63 chars, lowercase
+// alphanumeric + hyphen, starts and ends alphanumeric. Called from
+// prepareS3 after `key_prefix` template render so a slug-derived
+// uppercase / overlong / dotted bucket name fails with a clear
+// treeman error instead of a downstream `InvalidBucketName` from
+// CreateBucket.
+func ValidateBucketName(name string) error {
+	if n := len(name); n < 3 || n > 63 {
+		return fmt.Errorf("bucket name %q: length %d, must be 3-63 chars", name, n)
+	}
+	if !bucketNameRE.MatchString(name) {
+		return fmt.Errorf("bucket name %q: must be lowercase alphanumeric with hyphens, starting and ending alphanumeric (no dots, no uppercase, no underscores)", name)
+	}
+	return nil
+}

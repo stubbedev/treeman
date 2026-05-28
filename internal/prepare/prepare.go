@@ -447,7 +447,7 @@ func RunFiltered(
 			case "elasticsearch", "opensearch":
 				o, err = prepareES(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case "s3":
-				o, err = prepareS3(gctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID)
+				o, err = prepareS3(gctx, cfg, d, tplCtx, st, repoID, worktreeID)
 			default:
 				// Engine not recognised. Surface via event so the
 				// user notices, but don't fail the whole prepare run.
@@ -1526,20 +1526,19 @@ esColdBuild:
 // the only work is `EnsureBucket(rendered key_prefix)`.
 //
 // The rendered prefix IS the bucket name (bucket-per-worktree model).
-// AWS bucket-naming rules apply (3-63 chars, lowercase, dns-safe);
-// failures surface at CreateBucket time rather than at template
-// rendering, so a misnamed key_prefix produces a clear "InvalidBucketName"
-// error from the engine rather than a silent treeman-side reject.
+// `dbs3.ValidateBucketName` enforces AWS naming rules (3-63 chars,
+// lowercase, dns-safe) on the rendered name before hitting the API
+// so a misconfigured template surfaces with a clear treeman-side
+// error pointing at the offending name, not a downstream
+// `InvalidBucketName` from CreateBucket.
 func prepareS3(
 	ctx context.Context,
 	cfg *config.Config,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
-	worktreePath string,
 	st *store.Store,
 	repoID, worktreeID int64,
 ) (Outcome, error) {
-	_ = worktreePath
 	started := time.Now()
 	if cfg.Connections.S3 == nil {
 		return Outcome{}, fmt.Errorf("connections.s3 not configured")
@@ -1550,6 +1549,9 @@ func prepareS3(
 	bucket, err := template.Render(d.KeyPrefix, tplCtx)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("render key_prefix: %w", err)
+	}
+	if err := dbs3.ValidateBucketName(bucket); err != nil {
+		return Outcome{}, fmt.Errorf("s3: rendered key_prefix produced invalid %w (check the template in databases[].key_prefix)", err)
 	}
 	drv, err := dbs3.Connect(ctx, *cfg.Connections.S3)
 	if err != nil {
