@@ -19,7 +19,6 @@
 package patcher
 
 import (
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"os"
@@ -194,33 +193,17 @@ func PatchJSONFile(path string, pairs map[string]string) (Outcome, error) {
 		}
 		return Missing, fmt.Errorf("read %s: %w", path, err)
 	}
-	var doc any
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return Missing, fmt.Errorf("parse %s: %w", path, err)
-	}
-	changed := false
-	for _, k := range sortedKeys(pairs) {
-		segs, err := yamlpatch.ParsePath(k)
-		if err != nil {
-			return Missing, fmt.Errorf("json driver: path %q: %w", k, err)
-		}
-		prev, err := setJSONPath(doc, segs, jsonScalar(pairs[k]))
-		if err != nil {
-			return Missing, fmt.Errorf("json driver: set %q: %w", k, err)
-		}
-		if !jsonEqual(prev, jsonScalar(pairs[k])) {
-			changed = true
-		}
+	// Byte-preserving value splice for existing keys (create falls back
+	// to the reordering marshal). Keeps clean(apply(HEAD)) == HEAD so the
+	// patched file never shows as modified in `git status`.
+	out, changed, err := setJSONInPlace(string(body), pairs)
+	if err != nil {
+		return Missing, fmt.Errorf("json driver %s: %w", path, err)
 	}
 	if !changed {
 		return Unchanged, nil
 	}
-	out, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return Updated, fmt.Errorf("json driver: marshal %s: %w", path, err)
-	}
-	out = append(out, '\n')
-	if err := os.WriteFile(path, out, 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
 		return Updated, fmt.Errorf("write %s: %w", path, err)
 	}
 	return Updated, nil

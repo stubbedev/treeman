@@ -882,7 +882,17 @@ func yamlScalarAt(doc *yaml.Node, segs []yamlpatch.Segment) (string, bool) {
 
 // ─── json ────────────────────────────────────────────────────────────
 
+// applyJSONContent rewrites the patched values, preserving the file's
+// byte layout (key order, indentation) for keys that already exist so
+// the clean/smudge round-trip stays byte-stable and git sees no
+// modification. Only a create-missing-key falls through to the
+// reordering marshal path.
 func applyJSONContent(content string, pairs map[string]string) (string, error) {
+	out, _, err := setJSONInPlace(content, pairs)
+	return out, err
+}
+
+func applyJSONMarshal(content string, pairs map[string]string) (string, error) {
 	var doc any
 	if err := json.Unmarshal([]byte(content), &doc); err != nil {
 		return "", fmt.Errorf("json driver: parse: %w", err)
@@ -963,7 +973,15 @@ func scalarAtJSONPath(root any, segs []yamlpatch.Segment) (string, bool) {
 
 // ─── toml ────────────────────────────────────────────────────────────
 
+// applyTOMLContent — byte-preserving value splice for existing keys;
+// see applyJSONContent. Marshal fallback (applyTOMLMarshal) only for a
+// create-missing-key.
 func applyTOMLContent(content string, pairs map[string]string) (string, error) {
+	out, _, err := setTOMLInPlace(content, pairs)
+	return out, err
+}
+
+func applyTOMLMarshal(content string, pairs map[string]string) (string, error) {
 	var doc map[string]any
 	if err := toml.Unmarshal([]byte(content), &doc); err != nil {
 		return "", fmt.Errorf("toml driver: parse: %w", err)
@@ -1007,7 +1025,15 @@ func extractTOML(content string, keys []string) (map[string]string, error) {
 
 // ─── ini ─────────────────────────────────────────────────────────────
 
+// applyINIContent — byte-preserving value splice for existing keys; see
+// applyJSONContent. Marshal fallback (applyINIMarshal) only for a
+// create-missing-key.
 func applyINIContent(content string, pairs map[string]string) (string, error) {
+	out, _, err := setINIInPlace(content, pairs)
+	return out, err
+}
+
+func applyINIMarshal(content string, pairs map[string]string) (string, error) {
 	cfg, err := ini.Load([]byte(content))
 	if err != nil {
 		return "", fmt.Errorf("ini driver: parse: %w", err)

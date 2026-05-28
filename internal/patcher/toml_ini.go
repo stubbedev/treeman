@@ -1,16 +1,12 @@
 package patcher
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 
-	toml "github.com/pelletier/go-toml/v2"
 	ini "gopkg.in/ini.v1"
-
-	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
 
 // PatchTOMLFile sets each (dotted-path, value) pair inside the TOML
@@ -29,36 +25,17 @@ func PatchTOMLFile(path string, pairs map[string]string) (Outcome, error) {
 		}
 		return Missing, fmt.Errorf("read %s: %w", path, err)
 	}
-	var doc map[string]any
-	if err := toml.Unmarshal(body, &doc); err != nil {
-		return Missing, fmt.Errorf("parse %s: %w", path, err)
-	}
-	root := any(doc)
-	changed := false
-	for _, k := range sortedKeys(pairs) {
-		segs, err := yamlpatch.ParsePath(k)
-		if err != nil {
-			return Missing, fmt.Errorf("toml driver: path %q: %w", k, err)
-		}
-		newVal := tomlScalar(pairs[k])
-		prev, err := setJSONPath(root, segs, newVal)
-		if err != nil {
-			return Missing, fmt.Errorf("toml driver: set %q: %w", k, err)
-		}
-		if !jsonEqual(prev, newVal) {
-			changed = true
-		}
+	// Byte-preserving value splice for existing keys (create falls back
+	// to the reformatting marshal). Keeps clean(apply(HEAD)) == HEAD so
+	// the patched file never shows as modified in `git status`.
+	out, changed, err := setTOMLInPlace(string(body), pairs)
+	if err != nil {
+		return Missing, fmt.Errorf("toml driver %s: %w", path, err)
 	}
 	if !changed {
 		return Unchanged, nil
 	}
-	var buf bytes.Buffer
-	enc := toml.NewEncoder(&buf)
-	enc.SetIndentTables(true)
-	if err := enc.Encode(doc); err != nil {
-		return Updated, fmt.Errorf("toml driver: marshal %s: %w", path, err)
-	}
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
 		return Updated, fmt.Errorf("write %s: %w", path, err)
 	}
 	return Updated, nil
@@ -93,39 +70,18 @@ func PatchINIFile(path string, pairs map[string]string) (Outcome, error) {
 	if err != nil {
 		return Missing, fmt.Errorf("read %s: %w", path, err)
 	}
-	cfg, err := ini.Load(original)
+	// Byte-preserving value splice for existing keys (create falls back
+	// to ini.WriteTo). Keeps clean(apply(HEAD)) == HEAD so the patched
+	// file never shows as modified in `git status` — ini.WriteTo
+	// otherwise normalizes `k=v` → `k = v` on every key.
+	out, changed, err := setINIInPlace(string(original), pairs)
 	if err != nil {
-		return Missing, fmt.Errorf("parse %s: %w", path, err)
-	}
-	changed := false
-	for _, k := range sortedKeys(pairs) {
-		section, key, err := splitINIPath(k)
-		if err != nil {
-			return Missing, fmt.Errorf("ini driver: %w", err)
-		}
-		s, err := cfg.GetSection(section)
-		if err != nil {
-			s, _ = cfg.NewSection(section)
-		}
-		if !s.HasKey(key) {
-			_, _ = s.NewKey(key, pairs[k])
-			changed = true
-			continue
-		}
-		existing := s.Key(key).Value()
-		if existing != pairs[k] {
-			s.Key(key).SetValue(pairs[k])
-			changed = true
-		}
+		return Missing, fmt.Errorf("ini driver %s: %w", path, err)
 	}
 	if !changed {
 		return Unchanged, nil
 	}
-	var buf bytes.Buffer
-	if _, err := cfg.WriteTo(&buf); err != nil {
-		return Updated, fmt.Errorf("ini driver: marshal %s: %w", path, err)
-	}
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
 		return Updated, fmt.Errorf("write %s: %w", path, err)
 	}
 	return Updated, nil
