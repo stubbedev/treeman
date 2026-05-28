@@ -7,8 +7,11 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	dbes "github.com/stubbedev/treeman/internal/db/es"
+	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
+	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -119,10 +122,36 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		}
 		defer drv.Close()
 		return drv.DropSnapshot(ctx, c.TemplateName)
+	case "mongodb":
+		if cfg.Connections.Mongodb == nil {
+			return fmt.Errorf("connections.mongodb not configured")
+		}
+		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+		if err != nil {
+			return err
+		}
+		defer drv.Close(ctx)
+		return drv.DropSnapshot(ctx, c.TemplateName)
+	case "elasticsearch":
+		if cfg.Connections.Elasticsearch == nil {
+			return fmt.Errorf("connections.elasticsearch not configured")
+		}
+		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+		if err != nil {
+			return err
+		}
+		return drv.DropSnapshot(ctx, c.TemplateName)
+	case "redis":
+		if cfg.Connections.Redis == nil {
+			return fmt.Errorf("connections.redis not configured")
+		}
+		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
+		if err != nil {
+			return err
+		}
+		defer drv.Close()
+		return drv.DropSnapshot(ctx, c.TemplateName)
 	default:
-		// Mongo/redis/es don't keep template snapshots on the cache
-		// hot path yet — when they land, their engine-specific drop
-		// calls go here.
 		return fmt.Errorf("eviction: unsupported engine %q", c.Engine)
 	}
 }
