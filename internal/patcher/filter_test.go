@@ -248,6 +248,50 @@ func TestCleanStripsKeysAbsentFromHEAD_INI(t *testing.T) {
 	}
 }
 
+// TestCleanRestoresPhpunitElementBytesVerbatim is the regression
+// test for kontainer phpunit.xml showing as modified on every fresh
+// worktree even after the absent-from-HEAD strip landed. HEAD carried
+// `<env name="DB_DATABASE" value="kontainer_testing"/>` WITHOUT
+// `force="true"`; Apply's smudge always emits the element WITH
+// `force="true"`. Old Clean ran applyPhpunitContent on the working
+// tree using HEAD's scalar, but applyPhpunit always re-renders the
+// element with `force="true"` glued on — so clean output had
+// `force="true"` and `git diff --cached` showed the attribute being
+// added forever.
+//
+// Fix contract: for phpunit, clean must splice HEAD's exact element
+// bytes back in — whatever attribute set HEAD has, preserved
+// verbatim, so clean(working) == HEAD byte-for-byte.
+func TestCleanRestoresPhpunitElementBytesVerbatim(t *testing.T) {
+	canonical := `<?xml version="1.0"?>
+<phpunit>
+	<php>
+		<env name="DB_DATABASE" value="kontainer_testing"/>
+		<env name="MONGO_DB_DATABASE" value="mongodb_testing"/>
+	</php>
+</phpunit>
+`
+	working := `<?xml version="1.0"?>
+<phpunit>
+	<php>
+		<env name="DB_DATABASE" value="kontainer_testing_feat-x" force="true"/>
+		<env name="MONGO_DB_DATABASE" value="mongodb_testing_feat-x" force="true"/>
+	</php>
+</phpunit>
+`
+	p := config.Patch{File: "phpunit.xml", Format: "phpunit", Set: map[string]string{
+		"DB_DATABASE":       "kontainer_testing_{slug}",
+		"MONGO_DB_DATABASE": "mongodb_testing_{slug}",
+	}}
+	clean, err := Clean(p, working, canonical)
+	if err != nil {
+		t.Fatalf("clean: %v", err)
+	}
+	if clean != canonical {
+		t.Fatalf("clean(working) != canonical (force=\"true\" leaked)\nwant: %q\ngot:  %q", canonical, clean)
+	}
+}
+
 // TestCleanWithoutHEADContentLeavesWorkingTree covers the
 // brand-new-file case: nothing committed upstream yet means no
 // canonical to project onto. Clean must pass the working tree

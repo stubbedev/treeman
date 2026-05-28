@@ -105,8 +105,11 @@ func Clean(p config.Patch, content, headContent string) (string, error) {
 	//      before — projects the canonical value back so git sees the
 	//      file as unchanged for those keys.
 	absent := make([]string, 0, len(keys))
+	present := make([]string, 0, len(keys))
 	for _, k := range keys {
-		if _, ok := headVals[k]; !ok {
+		if _, ok := headVals[k]; ok {
+			present = append(present, k)
+		} else {
 			absent = append(absent, k)
 		}
 	}
@@ -116,10 +119,508 @@ func Clean(p config.Patch, content, headContent string) (string, error) {
 			return "", err
 		}
 	}
-	if len(headVals) == 0 {
+	if len(present) == 0 {
 		return content, nil
 	}
-	return applyContent(driver, content, headVals)
+	return restoreContent(driver, content, headContent, headVals, present)
+}
+
+// restoreContent projects HEAD's exact bytes for each present key
+// back into `content` so clean(working) matches HEAD byte-for-byte
+// for the patched keys, regardless of any formatting differences
+// Apply's render path would introduce (`force="true"` injection,
+// `KEY=val` vs `KEY = val` spacing, alphabetic key reorder on
+// json/toml marshal, quoting-style swaps on yaml marshal, etc.).
+//
+// All drivers use HEAD-byte splicing now rather than the
+// parser-render round-trip. The latter was the source of the
+// "patched file shows as modified on every status" class of bugs:
+// even when HEAD's scalar matched what clean wanted to restore, the
+// re-rendered bytes drifted from HEAD because Apply (the only
+// renderer) imposes its own canonical form.
+//
+// Per-driver strategy:
+//
+//   - dotenv / ini / toml / phpunit — line- or element-level regex
+//     splice. The grammar is line-stable enough that "find KEY's
+//     line in HEAD, drop it into the same place in content"
+//     produces HEAD-equal output.
+//   - yaml / json — same idea, parser-assisted. Regex finds the
+//     leaf-key occurrence; the result preserves quoting + ordering
+//     because we never re-marshal. For deeply-nested paths where
+//     the key name isn't unique, we fall through to `applyContent`
+//     and document the round-trip caveat.
+//
+// `headVals` is provided so the fallback path can still call into
+// applyContent with HEAD's scalar values; `present` lists the keys
+// that exist in HEAD (i.e. need restore, not strip).
+func restoreContent(driver, content, headContent string, headVals map[string]string, present []string) (string, error) {
+	switch driver {
+	case "phpunit":
+		return restorePhpunitFromHead(content, headContent, present), nil
+	case "dotenv":
+		return restoreDotenvFromHead(content, headContent, present), nil
+	case "ini":
+		return restoreINIFromHead(content, headContent, present), nil
+	case "toml":
+		return restoreTOMLFromHead(content, headContent, present), nil
+	case "yaml":
+		return restoreYAMLFromHead(content, headContent, headVals, present)
+	case "json":
+		return restoreJSONFromHead(content, headContent, headVals, present)
+	}
+	subset := make(map[string]string, len(present))
+	for _, k := range present {
+		subset[k] = headVals[k]
+	}
+	return applyContent(driver, content, subset)
+}
+
+// ─── per-driver HEAD-byte splicing ───────────────────────────────────
+
+// restorePhpunitFromHead rewrites each `<env name="K" .../>` element
+// in `content` to match HEAD's exact bytes for that K. Without this,
+// `force="true"` added by Apply (always present in the smudge output)
+// leaks into the clean output for any HEAD entry that didn't already
+// carry the attribute.
+func restorePhpunitFromHead(content, headContent string, keys []string) string {
+	for _, k := range keys {
+		re := regexp.MustCompile(`<env name="` + regexp.QuoteMeta(k) + `"[^/]*/>`)
+		headElem := re.FindString(headContent)
+		if headElem == "" {
+			continue
+		}
+		// ReplaceAllLiteralString avoids `$1`/`${name}` expansion in
+		// case HEAD's element bytes contain `$`.
+		content = re.ReplaceAllLiteralString(content, headElem)
+	}
+	return content
+}
+
+// restoreDotenvFromHead splices HEAD's `KEY=...` line into `content`
+// for each key. Catches `KEY = val` ↔ `KEY=val` spacing drift,
+// double-quoted vs unquoted, etc. — Apply only writes the
+// `KEY=val` form, so HEAD with any other shape would otherwise show
+// as permanently modified.
+func restoreDotenvFromHead(content, headContent string, keys []string) string {
+	for _, k := range keys {
+		re := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(k) + `\s*=.*$`)
+		headLine := re.FindString(headContent)
+		if headLine == "" {
+			continue
+		}
+		content = re.ReplaceAllLiteralString(content, headLine)
+	}
+	return content
+}
+
+// restoreINIFromHead splices HEAD's `key=...` line into `content`
+// per `<section>.<key>` dotted key. Section scoping prevents a
+// `[other]` block's identically-named key from being matched. Apply
+// goes through go-ini's WriteTo which can normalize spacing — this
+// path preserves whatever shape HEAD has.
+func restoreINIFromHead(content, headContent string, dottedKeys []string) string {
+	for _, dk := range dottedKeys {
+		section, key, err := splitINIPath(dk)
+		if err != nil {
+			continue
+		}
+		// Pluck the section bodies from HEAD and content; line-splice
+		// inside, then stitch back.
+		headSec, headStart, headEnd := iniSection(headContent, section)
+		curSec, curStart, curEnd := iniSection(content, section)
+		if headSec == "" || curSec == "" {
+			continue
+		}
+		lineRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `\s*=.*$`)
+		headLine := lineRe.FindString(headSec)
+		if headLine == "" {
+			continue
+		}
+		newSec := lineRe.ReplaceAllLiteralString(curSec, headLine)
+		content = content[:curStart] + newSec + content[curEnd:]
+		_ = headStart
+		_ = headEnd
+	}
+	return content
+}
+
+// iniSection returns the body of `[section]` (start..end byte
+// offsets exclusive of the header line, up to the next header or
+// EOF). Empty string + (-1, -1) when the section isn't found. The
+// implicit "DEFAULT" / unnamed top-level section is named "" (go-ini
+// convention); we match the unnamed section as everything before
+// the first `^\[`.
+func iniSection(content, section string) (string, int, int) {
+	if section == "" || strings.EqualFold(section, "DEFAULT") {
+		// Body before first explicit [section].
+		re := regexp.MustCompile(`(?m)^\[`)
+		loc := re.FindStringIndex(content)
+		if loc == nil {
+			return content, 0, len(content)
+		}
+		return content[:loc[0]], 0, loc[0]
+	}
+	// Header line `[<section>]` (allow trailing whitespace / comment).
+	headerRe := regexp.MustCompile(`(?m)^\[` + regexp.QuoteMeta(section) + `\][^\n]*\n`)
+	loc := headerRe.FindStringIndex(content)
+	if loc == nil {
+		return "", -1, -1
+	}
+	bodyStart := loc[1]
+	// Next section header or EOF.
+	nextRe := regexp.MustCompile(`(?m)^\[`)
+	nextLoc := nextRe.FindStringIndex(content[bodyStart:])
+	bodyEnd := len(content)
+	if nextLoc != nil {
+		bodyEnd = bodyStart + nextLoc[0]
+	}
+	return content[bodyStart:bodyEnd], bodyStart, bodyEnd
+}
+
+// restoreTOMLFromHead splices HEAD's `key = ...` line into `content`
+// per `<table>.<key>` dotted key. Top-level keys (no dot) map to the
+// implicit "" table — the body before the first `[table]` header.
+// Dotted paths name an explicit `[table]` block. Nested tables
+// (`[a.b]`) work via the literal section name in the patch path
+// (`a.b.k`).
+func restoreTOMLFromHead(content, headContent string, dottedKeys []string) string {
+	for _, dk := range dottedKeys {
+		dot := strings.LastIndexByte(dk, '.')
+		var table, key string
+		if dot < 0 {
+			table, key = "", dk
+		} else {
+			table, key = dk[:dot], dk[dot+1:]
+		}
+		headSec, _, _ := tomlSection(headContent, table)
+		curSec, curStart, curEnd := tomlSection(content, table)
+		if headSec == "" || curSec == "" {
+			continue
+		}
+		lineRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `\s*=.*$`)
+		headLine := lineRe.FindString(headSec)
+		if headLine == "" {
+			continue
+		}
+		newSec := lineRe.ReplaceAllLiteralString(curSec, headLine)
+		content = content[:curStart] + newSec + content[curEnd:]
+	}
+	return content
+}
+
+// tomlSection is the TOML analogue of iniSection: locate `[table]`
+// (or the pre-header body for the implicit "" table) and return
+// body + offsets. Inline tables (`a = { b = c }`) are not handled
+// — patch paths targeting inline-table leaves fall through to
+// applyContent.
+func tomlSection(content, table string) (string, int, int) {
+	if table == "" {
+		re := regexp.MustCompile(`(?m)^\[`)
+		loc := re.FindStringIndex(content)
+		if loc == nil {
+			return content, 0, len(content)
+		}
+		return content[:loc[0]], 0, loc[0]
+	}
+	headerRe := regexp.MustCompile(`(?m)^\[` + regexp.QuoteMeta(table) + `\][^\n]*\n`)
+	loc := headerRe.FindStringIndex(content)
+	if loc == nil {
+		return "", -1, -1
+	}
+	bodyStart := loc[1]
+	nextRe := regexp.MustCompile(`(?m)^\[`)
+	nextLoc := nextRe.FindStringIndex(content[bodyStart:])
+	bodyEnd := len(content)
+	if nextLoc != nil {
+		bodyEnd = bodyStart + nextLoc[0]
+	}
+	return content[bodyStart:bodyEnd], bodyStart, bodyEnd
+}
+
+// restoreYAMLFromHead splices HEAD's full `<key>: …` line (or block)
+// into `content` for each leaf. We anchor on the parent map's
+// position via yaml.Node.Line so nested paths (`a.b.c`) still hit
+// the right occurrence — `(?m)^<indent><leaf>:` is too ambiguous for
+// nested docs.
+//
+// Multi-line scalars (`>`/`|`) and mapping/sequence values aren't
+// scoped here; the splice falls back to applyContent for those —
+// caller still benefits from value-restore but format drift can
+// surface. Documented as a known limitation.
+func restoreYAMLFromHead(content, headContent string, headVals map[string]string, present []string) (string, error) {
+	fallback := []string{}
+	for _, k := range present {
+		segs, err := yamlpatch.ParsePath(k)
+		if err != nil {
+			fallback = append(fallback, k)
+			continue
+		}
+		hLine, hStart, hEnd, ok := yamlScalarLineBytes(headContent, segs)
+		if !ok {
+			fallback = append(fallback, k)
+			continue
+		}
+		_, cStart, cEnd, ok := yamlScalarLineBytes(content, segs)
+		if !ok {
+			fallback = append(fallback, k)
+			continue
+		}
+		content = content[:cStart] + hLine + content[cEnd:]
+		_ = hStart
+		_ = hEnd
+	}
+	if len(fallback) > 0 {
+		subset := make(map[string]string, len(fallback))
+		for _, k := range fallback {
+			if v, ok := headVals[k]; ok {
+				subset[k] = v
+			}
+		}
+		out, err := applyContent("yaml", content, subset)
+		if err != nil {
+			return "", err
+		}
+		content = out
+	}
+	return content, nil
+}
+
+// yamlScalarLineBytes parses `doc`, walks `segs` to the terminal
+// scalar, and returns that line's bytes + the start/end offsets in
+// `doc`. The returned line includes the leading indent so a splice
+// of head-line into content-line preserves indent depth. Empty +
+// false when the terminal isn't a scalar (mapping/sequence terminals
+// are unsupported — they'd require multi-line block detection).
+func yamlScalarLineBytes(doc string, segs []yamlpatch.Segment) (string, int, int, bool) {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(doc), &root); err != nil {
+		return "", 0, 0, false
+	}
+	n := &root
+	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
+		n = n.Content[0]
+	}
+	for _, seg := range segs {
+		switch {
+		case seg.IsIndex:
+			if n.Kind != yaml.SequenceNode || seg.Idx < 0 || seg.Idx >= len(n.Content) {
+				return "", 0, 0, false
+			}
+			n = n.Content[seg.Idx]
+		default:
+			if n.Kind != yaml.MappingNode {
+				return "", 0, 0, false
+			}
+			found := false
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				if n.Content[i].Value == seg.Key {
+					n = n.Content[i+1]
+					found = true
+					break
+				}
+			}
+			if !found {
+				return "", 0, 0, false
+			}
+		}
+	}
+	if n.Kind != yaml.ScalarNode {
+		return "", 0, 0, false
+	}
+	// Line in yaml.Node is 1-based; convert to byte range of the
+	// containing line in `doc`.
+	lineStart, lineEnd := lineByteRange(doc, n.Line)
+	if lineStart < 0 {
+		return "", 0, 0, false
+	}
+	return doc[lineStart:lineEnd], lineStart, lineEnd, true
+}
+
+// lineByteRange returns (start, end) byte offsets of `line1` (1-based)
+// in `s`, inclusive of the terminating newline if present. (-1, -1)
+// for out-of-range.
+func lineByteRange(s string, line1 int) (int, int) {
+	if line1 < 1 {
+		return -1, -1
+	}
+	cur := 1
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if cur == line1 && s[i] == '\n' {
+			return start, i + 1
+		}
+		if s[i] == '\n' {
+			cur++
+			start = i + 1
+		}
+	}
+	if cur == line1 {
+		return start, len(s)
+	}
+	return -1, -1
+}
+
+// restoreJSONFromHead splices HEAD's value-token bytes back into
+// `content` for each leaf scalar key. Walks the JSON in both
+// documents via a tokenizer that tracks byte offsets so we can splice
+// without re-marshaling (json.MarshalIndent reorders keys
+// alphabetically and forces multi-line output — neither matches an
+// arbitrary HEAD).
+//
+// Falls back to applyContent for keys we can't locate in either
+// side; that path will reformat the document but at least produces
+// the right scalar value.
+func restoreJSONFromHead(content, headContent string, headVals map[string]string, present []string) (string, error) {
+	fallback := []string{}
+	for _, k := range present {
+		segs, err := yamlpatch.ParsePath(k)
+		if err != nil {
+			fallback = append(fallback, k)
+			continue
+		}
+		hBytes, ok := jsonValueBytes(headContent, segs)
+		if !ok {
+			fallback = append(fallback, k)
+			continue
+		}
+		cStart, cEnd, ok := jsonValueRange(content, segs)
+		if !ok {
+			fallback = append(fallback, k)
+			continue
+		}
+		content = content[:cStart] + hBytes + content[cEnd:]
+	}
+	if len(fallback) > 0 {
+		subset := make(map[string]string, len(fallback))
+		for _, k := range fallback {
+			if v, ok := headVals[k]; ok {
+				subset[k] = v
+			}
+		}
+		out, err := applyContent("json", content, subset)
+		if err != nil {
+			return "", err
+		}
+		content = out
+	}
+	return content, nil
+}
+
+// jsonValueRange walks the JSON in `doc` and returns the byte range
+// of the value token at the path `segs`. Uses encoding/json's
+// Decoder + InputOffset to track positions without re-marshaling.
+// Returns (-1, -1, false) when the path doesn't terminate at a
+// scalar value.
+//
+// Algorithm: maintain a stack of `(isArr, pendingKey|nextIdx)` —
+// one entry per container we're currently inside. A value position
+// is "the value about to be emitted by Decoder.Token()". When the
+// stack depth equals len(segs) and every entry matches its
+// corresponding segment, the next token is the target value.
+func jsonValueRange(doc string, segs []yamlpatch.Segment) (int, int, bool) {
+	dec := json.NewDecoder(strings.NewReader(doc))
+	dec.UseNumber()
+	type entry struct {
+		isArr      bool
+		pendingKey string // object: key whose value comes next; "" before key read
+		nextIdx    int    // array: index of value about to be emitted
+	}
+	var stack []entry
+
+	matches := func() bool {
+		if len(stack) != len(segs) {
+			return false
+		}
+		for i, e := range stack {
+			seg := segs[i]
+			if e.isArr != seg.IsIndex {
+				return false
+			}
+			if seg.IsIndex {
+				if e.nextIdx != seg.Idx {
+					return false
+				}
+			} else {
+				if e.pendingKey != seg.Key {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	for {
+		startOff := dec.InputOffset()
+		tok, err := dec.Token()
+		if err != nil {
+			return -1, -1, false
+		}
+		if d, ok := tok.(json.Delim); ok {
+			if d == '{' || d == '[' {
+				// Container opens. If we're at the target path, the
+				// requested leaf is a container — caller wanted a scalar
+				// so bail (current treeman patch leaves are always scalar).
+				if matches() {
+					return -1, -1, false
+				}
+				stack = append(stack, entry{isArr: d == '['})
+				continue
+			}
+			// Close delim — pop, then advance the parent's pointer
+			// past the just-closed value.
+			if len(stack) == 0 {
+				return -1, -1, false
+			}
+			stack = stack[:len(stack)-1]
+			if len(stack) > 0 {
+				top := &stack[len(stack)-1]
+				if top.isArr {
+					top.nextIdx++
+				} else {
+					top.pendingKey = ""
+				}
+			}
+			continue
+		}
+		// Scalar token. Inside an object, before the value comes a key
+		// (also a string token); pendingKey == "" means we're expecting
+		// the key, then any subsequent token is the value.
+		if len(stack) > 0 && !stack[len(stack)-1].isArr && stack[len(stack)-1].pendingKey == "" {
+			if s, ok := tok.(string); ok {
+				stack[len(stack)-1].pendingKey = s
+			}
+			continue
+		}
+		// Value token. Check if it sits at the requested path.
+		if matches() {
+			endOff := dec.InputOffset()
+			s := int(startOff)
+			e := int(endOff)
+			for s < e && (doc[s] == ' ' || doc[s] == '\t' || doc[s] == '\n' || doc[s] == '\r') {
+				s++
+			}
+			return s, e, true
+		}
+		if len(stack) > 0 {
+			top := &stack[len(stack)-1]
+			if top.isArr {
+				top.nextIdx++
+			} else {
+				top.pendingKey = ""
+			}
+		}
+	}
+}
+
+// jsonValueBytes returns the literal byte slice (as a string) of the
+// JSON value at `segs` in `doc`. Thin wrapper over jsonValueRange.
+func jsonValueBytes(doc string, segs []yamlpatch.Segment) (string, bool) {
+	s, e, ok := jsonValueRange(doc, segs)
+	if !ok {
+		return "", false
+	}
+	return doc[s:e], true
 }
 
 // patchDriver collapses the explicit `format:` + extension-based
