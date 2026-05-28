@@ -3,6 +3,7 @@ package wt
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,7 +157,15 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 		hooks.PersistOutcome(ctx, st, repoID, id.WtID, trigger, started, time.Now().UnixMilli(), out)
 	}
 	runTrigger("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
-	_ = prepare.TeardownDatabases(ctx, &cfg, id.Slug.Value, repoID, id.WtID, st)
+	if err := prepare.TeardownDatabases(ctx, &cfg, id.Slug.Value, repoID, id.WtID, st); err != nil {
+		slog.Warn("wt delete: teardown databases",
+			"slug", id.Slug.Value, "repo", repoRoot, "wt", wtPath, "err", err)
+		_ = st.WriteEvent(ctx, store.LevelWarn, "wt_teardown_db_error",
+			fmt.Sprintf("teardown databases: %v", err),
+			repoID, id.WtID, "", 0, map[string]any{
+				"slug": id.Slug.Value, "err": err.Error(),
+			})
+	}
 	runTrigger("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
 	// Release the per-worktree port reservations back into the pool
 	// so a future `wt create` can re-use them.

@@ -182,7 +182,10 @@ func SweepByAge(ctx context.Context, cfg *config.Config, st *store.Store) {
 			slog.Warn("snapshot age sweep drop", "template", c.TemplateName, "err", err)
 			continue
 		}
-		_ = st.DeleteSnapshot(ctx, c.Fingerprint)
+		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
+			slog.Warn("snapshot age sweep delete row",
+				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
+		}
 		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_age_evict",
 			fmt.Sprintf("evicted %s (older than %dd)", c.TemplateName, days),
 			0, 0, "", 0, map[string]string{
@@ -225,7 +228,10 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 			slog.Warn("snapshot size sweep drop", "template", c.TemplateName, "err", err)
 			continue
 		}
-		_ = st.DeleteSnapshot(ctx, c.Fingerprint)
+		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
+			slog.Warn("snapshot size sweep delete row",
+				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
+		}
 		total -= sizes[i]
 		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_size_evict",
 			fmt.Sprintf("evicted %s (size=%d)", c.TemplateName, sizes[i]),

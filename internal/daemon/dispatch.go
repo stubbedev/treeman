@@ -587,11 +587,18 @@ func fireTriggerActions(
 	}
 	repoID, err := st.Store.EnsureRepo(ctx, repoPath, filepath.Base(repoPath))
 	if err != nil {
+		slog.Warn("trigger actions: ensure repo",
+			"trigger", trigger, "wt", wtPath, "repo", repoPath, "err", err)
 		return
 	}
 	id, err := wt.ResolveIdentity(ctx, st.Store, &cfg, repoPath, wtPath, detectBranch(wtPath), repoID)
 	if err != nil {
+		slog.Warn("trigger actions: resolve identity",
+			"trigger", trigger, "wt", wtPath, "err", err)
 		return
 	}
-	_ = runTriggerActions(ctx, st, trigger, actions, repoPath, wtPath, id.Slug.Value, id.IsMain, repoID, id.WtID, inheritedEnv)
+	if err := runTriggerActions(ctx, st, trigger, actions, repoPath, wtPath, id.Slug.Value, id.IsMain, repoID, id.WtID, inheritedEnv); err != nil {
+		slog.Warn("trigger actions: run",
+			"trigger", trigger, "wt", wtPath, "err", err)
+	}
 }

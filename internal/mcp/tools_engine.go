@@ -24,6 +24,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/resolve"
 )
 
@@ -71,7 +72,7 @@ func registerEngineWriteTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_dump",
-		Description: "Generate a dump of a live engine database to disk. mysql → mysqldump; postgres → pg_dump --format=plain --clean --if-exists; mongodb → mongodump --archive; elasticsearch — not yet supported. output_dir defaults to <repo>/storage/dumps. Use this to refresh the seed dump treeman uses for cold builds (commit the new file then trigger prepare_run). Returns the absolute path + byte count.",
+		Description: "Generate a dump of a live engine database to disk. Supported engines: mysql (and mariadb/tidb aliases) -> mysqldump; postgres (and postgresql alias) -> pg_dump --format=plain --clean --if-exists; mongodb -> mongodump --archive. Redis and elasticsearch/opensearch dumps are not yet implemented and will return an explicit error. output_dir defaults to <repo>/storage/dumps. Use this to refresh the seed dump treeman uses for cold builds (commit the new file then trigger prepare_run). Returns the absolute path + byte count.",
 		Annotations: writeAnno("Dump database", false, false, true),
 	}, dbDumpTool)
 }
@@ -532,6 +533,7 @@ type snapshotDropIn struct {
 type snapshotDropOut struct {
 	Dropped       bool   `json:"dropped"`
 	EngineDropped bool   `json:"engine_dropped"`
+	EngineDropErr string `json:"engine_drop_err,omitempty"`
 	Engine        string `json:"engine,omitempty"`
 	Template      string `json:"template,omitempty"`
 }
@@ -554,9 +556,16 @@ func snapshotDropTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapsho
 	}
 	out := snapshotDropOut{Engine: rec.Engine, Template: rec.TemplateName}
 
-	cfg, err := loadCfgForRepo(in.Repo)
-	if err == nil {
-		out.EngineDropped = dropTemplate(ctx, cfg, rec.Engine, rec.TemplateName)
+	cfg, cfgErr := loadCfgForRepo(in.Repo)
+	if cfgErr == nil {
+		if dropErr := dropTemplate(ctx, cfg, rec.Engine, rec.TemplateName); dropErr != nil {
+			out.EngineDropped = false
+			out.EngineDropErr = dropErr.Error()
+		} else {
+			out.EngineDropped = true
+		}
+	} else {
+		out.EngineDropErr = "load config: " + cfgErr.Error()
 	}
 	if err := st.DeleteSnapshot(ctx, in.Fingerprint); err != nil {
 		return nil, out, fmt.Errorf("delete snapshot row: %w", err)
@@ -638,27 +647,34 @@ func dbDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbDumpIn) (*m
 		return nil, dbDumpOut{}, err
 	}
 	ts := time.Now().UTC().Format("20060102-150405")
-	switch in.Engine {
-	case "mysql", "mariadb", "tidb":
+	fam, ok := engine.Canonical(in.Engine)
+	if !ok {
+		return nil, dbDumpOut{}, fmt.Errorf("db_dump: unknown engine %q (allowed: %s)", in.Engine, engine.KnownList())
+	}
+	switch fam {
+	case engine.FamilyMySQL:
 		p := filepath.Join(outDir, fmt.Sprintf("%s-%s.sql", in.DB, ts))
 		if in.Gzip {
 			p += ".gz"
 		}
 		return runMysqldump(ctx, cfg.Connections.Mysql, in.DB, p, in.Gzip)
-	case "postgres", "postgresql":
+	case engine.FamilyPostgres:
 		p := filepath.Join(outDir, fmt.Sprintf("%s-%s.sql", in.DB, ts))
 		if in.Gzip {
 			p += ".gz"
 		}
 		return runPgDump(ctx, cfg.Connections.Postgres, in.DB, p, in.Gzip)
-	case "mongodb":
+	case engine.FamilyMongo:
 		p := filepath.Join(outDir, fmt.Sprintf("%s-%s.archive", in.DB, ts))
 		if in.Gzip {
 			p += ".gz"
 		}
 		return runMongoDump(ctx, cfg.Connections.Mongodb, in.DB, p, in.Gzip)
+	case engine.FamilyRedis, engine.FamilyES:
+		return nil, dbDumpOut{}, fmt.Errorf("db_dump: engine family %q is not yet implemented (only mysql / postgres / mongodb dumps are supported); contribute a runner or pre-build the seed dump out of band", fam)
+	default:
+		return nil, dbDumpOut{}, fmt.Errorf("db_dump: engine family %q has no dump runner", fam)
 	}
-	return nil, dbDumpOut{}, fmt.Errorf("db_dump: engine %s not supported", in.Engine)
 }
 
 // ─── helpers ────────────────────────────────────────────────────────

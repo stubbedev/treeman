@@ -34,6 +34,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
@@ -1982,5 +1983,14 @@ func teardownOne(
 			})
 		return nil
 	}
+	// Unknown engine — log + event so a typo'd `engine: postgress`
+	// doesn't turn worktree teardown into a silent no-op (same
+	// shape as the cold-build sibling-wipe that originally hid in
+	// the event log).
+	_ = st.WriteEvent(ctx, store.LevelWarn, "db_teardown_skipped",
+		fmt.Sprintf("teardown skipped: unknown engine %q (allowed: %s)", d.Engine, engine.KnownList()),
+		repoID, worktreeID, "", 0, map[string]any{
+			"engine": d.Engine, "slug": sl,
+		})
 	return nil
 }

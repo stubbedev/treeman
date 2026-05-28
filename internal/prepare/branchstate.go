@@ -3,6 +3,7 @@ package prepare
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/slug"
@@ -233,42 +235,43 @@ func (a esNS) DropDurable(ctx context.Context, durable string) error {
 
 // CanonicalEngine maps a configured engine identifier to the canonical
 // branch-scoped family label (mariadb/tidb → mysql, postgresql →
-// postgres, opensearch → elasticsearch), reporting ok=false for engines
-// that don't participate in branch-scoped swapping. Used to match the
-// `db reset --engine` filter against config entries regardless of which
-// alias the user wrote.
-func CanonicalEngine(engine string) (string, bool) {
-	_, label, ok := branchScopeFor(engine)
-	return label, ok
+// postgres, opensearch → elasticsearch), reporting ok=false for
+// unrecognised engines. Thin wrapper over engine.Canonical kept for
+// the existing callers in cmd/, mcp/, and within this package. New
+// code should call engine.Canonical directly.
+func CanonicalEngine(eng string) (string, bool) {
+	fam, ok := engine.Canonical(eng)
+	return string(fam), ok
 }
 
 // branchScopeFor reports the scope + canonical engine label for a
-// configured engine, and ok=false for engines that don't participate
-// in branch-scoped swapping.
-func branchScopeFor(engine string) (bsScope, string, bool) {
-	switch engine {
-	case "mysql", "mariadb", "tidb":
-		return scopeName, "mysql", true
-	case "postgres", "postgresql":
-		return scopeName, "postgres", true
-	case "mongodb":
-		return scopeName, "mongodb", true
-	case "redis":
-		return scopePrefix, "redis", true
-	case "elasticsearch", "opensearch":
-		return scopePrefix, "elasticsearch", true
-	default:
-		return scopeName, engine, false
+// configured engine, ok=false for unrecognised engines.
+func branchScopeFor(eng string) (bsScope, string, bool) {
+	fam, ok := engine.Canonical(eng)
+	if !ok {
+		return scopeName, eng, false
 	}
+	if fam.Scope() == engine.ScopePrefix {
+		return scopePrefix, string(fam), true
+	}
+	return scopeName, string(fam), true
 }
 
 // connectBranchEngine dials `engine` and wraps it in a branchEngine.
 // Used by `treeman db reset`, which connects fresh (the prepare path
 // builds the adapter from its already-connected driver instead). The
 // returned close func releases the connection.
-func connectBranchEngine(ctx context.Context, cfg *config.Config, engine string) (*branchEngine, func(), error) {
-	scope, label, ok := branchScopeFor(engine)
+//
+// Unrecognised engines return (nil, no-op, nil) so iteration over a
+// mixed-engine config can skip non-participating entries quietly,
+// BUT log a warning so a typo'd engine name doesn't disappear
+// without a trace. Same observability principle as TeardownDatabases'
+// unknown-engine arm.
+func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*branchEngine, func(), error) {
+	scope, label, ok := branchScopeFor(eng)
 	if !ok {
+		slog.Warn("connect branch engine: skipping unrecognised engine",
+			"engine", eng, "allowed", engine.KnownList())
 		return nil, func() {}, nil
 	}
 	switch label {

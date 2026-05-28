@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -17,6 +18,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -148,67 +150,98 @@ func probeTemplate(ctx context.Context, cfg *config.Config, engine, template str
 	return false, 0, ""
 }
 
+// reservedTemplatePrefixes are the namespace markers treeman owns:
+// cache templates (`_tm_<hex>` / `tm_<hex>` for ES) and branch-scoped
+// durable copies (`_tmbs_<hex>` / `tmbs_<hex>` for ES). MCP
+// snapshot_drop must refuse anything else so a hand-crafted or
+// typo'd template arg can't reach DropMatching's prefix LIKE and
+// reap unrelated app databases.
+var reservedTemplatePrefixes = []string{"_tm_", "_tmbs_", "tm_", "tmbs_"}
+
+func isReservedTemplateName(name string) bool {
+	for _, p := range reservedTemplatePrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // dropTemplate removes the engine-side template for one fingerprint.
 // Mirrors the per-engine teardown in internal/prepare but keyed by
 // the cached template name rather than a worktree slug.
-func dropTemplate(ctx context.Context, cfg *config.Config, engine, template string) bool {
-	switch engine {
-	case "mysql", "mariadb", "tidb":
+//
+// Refuses to act on names that don't carry a treeman-reserved prefix
+// (`_tm_`, `_tmbs_`, `tm_`, `tmbs_`). DropMatching/DropPrefix do a
+// prefix LIKE/scan; an MCP caller passing a non-reserved string
+// would otherwise reap whatever app namespaces happen to share that
+// prefix.
+func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string) error {
+	if !isReservedTemplateName(template) {
+		return fmt.Errorf("refusing to drop %q: not a treeman-reserved template name (expected one of %v)", template, reservedTemplatePrefixes)
+	}
+	fam, ok := engine.Canonical(eng)
+	if !ok {
+		return fmt.Errorf("unknown engine %q (allowed: %s)", eng, engine.KnownList())
+	}
+	switch fam {
+	case engine.FamilyMySQL:
 		if cfg.Connections.Mysql == nil {
-			return false
+			return fmt.Errorf("connections.mysql not configured")
 		}
 		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
 		if err != nil {
-			return false
+			return err
 		}
 		defer drv.Close()
 		_, err = drv.DropMatching(ctx, template)
-		return err == nil
-	case "postgres", "postgresql":
+		return err
+	case engine.FamilyPostgres:
 		if cfg.Connections.Postgres == nil {
-			return false
+			return fmt.Errorf("connections.postgres not configured")
 		}
 		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
 		if err != nil {
-			return false
+			return err
 		}
 		defer drv.Close()
 		_, err = drv.DropMatching(ctx, template)
-		return err == nil
-	case "mongodb":
+		return err
+	case engine.FamilyMongo:
 		if cfg.Connections.Mongodb == nil {
-			return false
+			return fmt.Errorf("connections.mongodb not configured")
 		}
 		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
 		if err != nil {
-			return false
+			return err
 		}
 		defer drv.Close(ctx)
 		_, err = drv.DropMatching(ctx, template)
-		return err == nil
-	case "redis":
+		return err
+	case engine.FamilyRedis:
 		if cfg.Connections.Redis == nil {
-			return false
+			return fmt.Errorf("connections.redis not configured")
 		}
 		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 		if err != nil {
-			return false
+			return err
 		}
 		defer drv.Close()
 		_, err = drv.DropPrefix(ctx, template)
-		return err == nil
-	case "elasticsearch", "opensearch":
+		return err
+	case engine.FamilyES:
 		if cfg.Connections.Elasticsearch == nil {
-			return false
+			return fmt.Errorf("connections.elasticsearch not configured")
 		}
 		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 		if err != nil {
-			return false
+			return err
 		}
 		_, err = drv.DropMatching(ctx, template)
-		return err == nil
+		return err
+	default:
+		return fmt.Errorf("unsupported engine family %q", fam)
 	}
-	return false
 }
 
 // ─── dump generators ────────────────────────────────────────────────

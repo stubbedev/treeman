@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/template"
 )
 
@@ -109,7 +110,8 @@ func (c *Config) PortSlotNames() []string {
 // worktree's branch_scoped active namespace is slug-free.
 func mainActiveTemplate(c *Config, i int) (tmpl, field string) {
 	d := c.Databases[i]
-	prefixScoped := d.Engine == "redis" || d.Engine == "elasticsearch" || d.Engine == "opensearch"
+	fam, _ := engine.Canonical(d.Engine)
+	prefixScoped := fam.Scope() == engine.ScopePrefix
 	var ov DatabaseOverlay
 	if i < len(c.MainWorktree.Databases) {
 		ov = c.MainWorktree.Databases[i]
@@ -202,18 +204,14 @@ func (r ContainerRef) validate(path string) error {
 func (d DatabaseConfig) validate(path string) error {
 	var errs []error
 	if d.Engine == "" {
-		return fmt.Errorf("%s: engine is required (one of: mysql, mariadb, tidb, postgres, postgresql, mongodb, redis, elasticsearch, opensearch)", path)
+		return fmt.Errorf("%s: engine is required (one of: %s)", path, engine.KnownList())
 	}
-	switch d.Engine {
-	case "mysql", "mariadb", "tidb", "postgres", "postgresql", "mongodb":
-		if d.NameTemplate == "" {
-			return fmt.Errorf("%s: name_template is required for engine %q (used to compute the per-worktree database name)", path, d.Engine)
-		}
-	case "redis", "elasticsearch", "opensearch":
-		// Prefix-scoped engines — name_template doesn't apply.
-	default:
-		return fmt.Errorf("%s: unknown engine %q (allowed: mysql, mariadb, tidb, postgres, postgresql, mongodb, redis, elasticsearch, opensearch)",
-			path, d.Engine)
+	fam, ok := engine.Canonical(d.Engine)
+	if !ok {
+		return fmt.Errorf("%s: unknown engine %q (allowed: %s)", path, d.Engine, engine.KnownList())
+	}
+	if fam.Scope() == engine.ScopeName && d.NameTemplate == "" {
+		return fmt.Errorf("%s: name_template is required for engine %q (used to compute the per-worktree database name)", path, d.Engine)
 	}
 
 	if d.NameTemplate != "" {

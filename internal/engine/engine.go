@@ -9,6 +9,8 @@
 // edit.
 package engine
 
+import "strings"
+
 // Family is the canonical engine label (one driver per family —
 // aliases collapse to it).
 type Family string
@@ -34,6 +36,12 @@ var Known = []string{
 	"elasticsearch", "opensearch",
 }
 
+// KnownList returns the engine alias list joined as ", " — used in
+// error messages so the wording lives in one place.
+func KnownList() string {
+	return strings.Join(Known, ", ")
+}
+
 // Canonical maps any engine alias to its Family. Returns ok=false
 // for engines treeman does not recognise so callers can distinguish
 // "unsupported" from "no-op for this family".
@@ -51,5 +59,25 @@ func Canonical(eng string) (Family, bool) {
 		return FamilyES, true
 	default:
 		return "", false
+	}
+}
+
+// Scope reports whether the engine family scopes by full database
+// name (mysql/postgres/mongo) or by key/index prefix (redis/es).
+// Prefix-scoped engines don't accept a `name_template`.
+type Scope int
+
+const (
+	ScopeName Scope = iota
+	ScopePrefix
+)
+
+// Scope returns whether the family scopes by name or by prefix.
+func (f Family) Scope() Scope {
+	switch f {
+	case FamilyRedis, FamilyES:
+		return ScopePrefix
+	default:
+		return ScopeName
 	}
 }
