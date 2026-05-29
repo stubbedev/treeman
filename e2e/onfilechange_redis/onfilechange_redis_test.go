@@ -59,7 +59,7 @@ databases:
   - engine: redis
     key_prefix: "tm_ofcr_{slug}:"
     inputs:
-      - { glob: "seeds/*.txt", label: seeds, hash: filename }
+      - { glob: "seeds/*.txt", label: seeds }
 hooks:
   on-file-change:
     - match: seeds

@@ -134,14 +134,6 @@
           "type": "string",
           "description": "Glob pattern for individual migration files within\n`migration_dirs`. Example: `[0-9]*_*.py` (alembic) or\n`V*__*.sql` (flyway)."
         },
-        "hash_mode": {
-          "type": "string",
-          "enum": [
-            "filename",
-            "checksum"
-          ],
-          "description": "Hash strategy applied to the migration files: `filename`\n(default) or `checksum`. Maps to the `hash:` field on each\nemitted Input."
-        },
         "lockfiles": {
           "items": {
             "type": "string"
@@ -481,7 +473,7 @@
       "oneOf": [
         {
           "type": "string",
-          "description": "Bare glob string. Equivalent to `{glob: \u003cthis string\u003e}` with default hash mode."
+          "description": "Bare glob string. Equivalent to `{glob: \u003cthis string\u003e}`."
         },
         {
           "properties": {
@@ -492,14 +484,6 @@
             "label": {
               "type": "string",
               "description": "Optional label for `hooks.on-file-change` matchers."
-            },
-            "hash": {
-              "type": "string",
-              "enum": [
-                "checksum",
-                "filename"
-              ],
-              "description": "Hash mode: checksum (default) or filename (append-only files)."
             }
           },
           "additionalProperties": false,
@@ -507,7 +491,7 @@
           "required": [
             "glob"
           ],
-          "description": "Full input mapping with optional label + hash mode."
+          "description": "Full input mapping with optional label."
         }
       ],
       "description": "One source of file state for the template fingerprint. Bare string OR full mapping."

@@ -940,9 +940,9 @@ func FwCmd() *cli.Command {
 						"auto_clone_target": testfw.DetectedCloneCount(repoRoot),
 					})
 				}
-				migs := ui.NewTable("MIGRATION_FW", "HASH_MODE", "ON_MODIFY", "DIRS")
+				migs := ui.NewTable("MIGRATION_FW", "ON_MODIFY", "DIRS")
 				for _, s := range detected {
-					migs.Row(ui.Cyan(s.Name), string(s.HashMode), string(s.OnModify), ui.Dim(strings.Join(s.MigrationDirs, ",")))
+					migs.Row(ui.Cyan(s.Name), string(s.OnModify), ui.Dim(strings.Join(s.MigrationDirs, ",")))
 				}
 				if len(detected) == 0 {
 					ui.Info("no migration framework detected in %s", repoRoot)

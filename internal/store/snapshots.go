@@ -10,6 +10,20 @@ import (
 	"github.com/stubbedev/treeman/internal/engine"
 )
 
+// FileHash is one entry in an InputVector: the relpath of a file under
+// an input glob plus its content hash. Ordered by Path within a vector
+// so prefix comparisons are well-defined.
+type FileHash struct {
+	Path string `json:"path"`
+	Hash string `json:"hash"`
+}
+
+// InputVector is the ordered per-input file list (path + content hash)
+// captured at snapshot time. Used by FindAncestorSnapshot to detect a
+// cached template whose vectors are prefixes of the current run's —
+// the building block for incremental cold builds.
+type InputVector []FileHash
+
 // SnapshotRecord mirrors a row in the `snapshots` table.
 type SnapshotRecord struct {
 	Fingerprint    string
@@ -20,11 +34,16 @@ type SnapshotRecord struct {
 	MigrationsHash string
 	DumpHash       string
 	LockfileHashes map[string]string
-	SizeBytes      int64
-	CreatedAt      int64
-	LastUsedAt     int64
-	UseCount       int64
-	RepoID         int64
+	// Inputs is the per-input ordered file vector captured at build
+	// time. Keys are input globs (matching the keys used in
+	// LockfileHashes). Empty for snapshots predating the inputs_json
+	// column (those can't participate as ancestors).
+	Inputs     map[string]InputVector
+	SizeBytes  int64
+	CreatedAt  int64
+	LastUsedAt int64
+	UseCount   int64
+	RepoID     int64
 }
 
 // LookupSnapshot returns the snapshot row for `fingerprint`, or
@@ -33,12 +52,13 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 	row := s.DB.QueryRowContext(ctx, `
 		SELECT fingerprint, engine, engine_version, source_db, template_name,
 		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
+		       COALESCE(inputs_json,'{}'),
 		       COALESCE(size_bytes,0), created_at, last_used_at, use_count
 		FROM snapshots WHERE fingerprint = ?`, fingerprint)
 	var r SnapshotRecord
-	var lockJSON string
+	var lockJSON, inputsJSON string
 	err := row.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
-		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON,
+		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
 		&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -49,6 +69,11 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 	if lockJSON != "" {
 		if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
 			return nil, fmt.Errorf("decode lockfile_hashes_json for %s: %w", fingerprint, err)
+		}
+	}
+	if inputsJSON != "" && inputsJSON != "{}" {
+		if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
+			return nil, fmt.Errorf("decode inputs_json for %s: %w", fingerprint, err)
 		}
 	}
 	return &r, nil
@@ -73,6 +98,13 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	if err != nil {
 		return fmt.Errorf("encode lockfile_hashes: %w", err)
 	}
+	if r.Inputs == nil {
+		r.Inputs = map[string]InputVector{}
+	}
+	inputsJSON, err := json.Marshal(r.Inputs)
+	if err != nil {
+		return fmt.Errorf("encode inputs_json: %w", err)
+	}
 	now := nowMillis()
 	if r.CreatedAt == 0 {
 		r.CreatedAt = now
@@ -87,23 +119,158 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	_, err = s.DB.ExecContext(ctx, `
 		INSERT INTO snapshots(fingerprint, engine, engine_version, source_db,
 		                      template_name, migrations_hash, dump_hash,
-		                      lockfile_hashes_json, size_bytes, created_at,
+		                      lockfile_hashes_json, inputs_json,
+		                      size_bytes, created_at,
 		                      last_used_at, use_count, repo_id)
-		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, NULLIF(?,0), ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, ?, NULLIF(?,0), ?, ?, ?, ?)
 		ON CONFLICT(fingerprint) DO UPDATE SET
 		    template_name        = excluded.template_name,
 		    engine_version       = excluded.engine_version,
 		    source_db            = excluded.source_db,
 		    migrations_hash      = excluded.migrations_hash,
-		    dump_hash            = excluded.dump_hash,
+		    dump_hash             = excluded.dump_hash,
 		    lockfile_hashes_json = excluded.lockfile_hashes_json,
+		    inputs_json          = excluded.inputs_json,
 		    size_bytes           = excluded.size_bytes,
 		    last_used_at         = excluded.last_used_at,
 		    repo_id              = excluded.repo_id`,
 		r.Fingerprint, r.Engine, r.EngineVersion, r.SourceDB,
-		r.TemplateName, r.MigrationsHash, r.DumpHash, string(lockJSON),
+		r.TemplateName, r.MigrationsHash, r.DumpHash, string(lockJSON), string(inputsJSON),
 		r.SizeBytes, r.CreatedAt, r.LastUsedAt, r.UseCount, repoID)
 	return err
+}
+
+// CommandsHashKey is the well-known LockfileHashes map key that
+// computeSnapshotKey stuffs the migrate+seed run/env hash under. It's
+// the only non-input fold-in today; pulling it out as a constant lets
+// FindAncestorSnapshot compare commands explicitly without having to
+// distinguish "real input glob" entries from this synthetic one.
+const CommandsHashKey = "__commands__"
+
+// FindAncestorSnapshot returns the cached snapshot that is the LONGEST
+// content-prefix ancestor of the current run, or (nil, nil) when none
+// qualifies. An ancestor is a row in the same repo with identical
+// (engine, engine_version, dump_hash, commands_hash) where every input
+// glob present in the candidate also appears in the current run AND
+// the candidate's vector is a PREFIX of the current run's vector for
+// that glob. The current run may carry additional entries at the end
+// of any vector or additional input globs entirely — those represent
+// the new files an incremental migrate will apply on top of the
+// ancestor template.
+//
+// "Best" = the candidate whose Inputs collectively cover the most
+// files (longest total vector). Returns (nil, nil) when no candidate
+// is a STRICT ancestor — exact-equality matches are the
+// LookupSnapshot cache-hit path, not an incremental case.
+//
+// Pure read: callers decide whether to act on the result.
+func (s *Store) FindAncestorSnapshot(
+	ctx context.Context,
+	repoID int64,
+	eng, engineVersion, dumpHash, currentCommandsHash string,
+	currentInputs map[string]InputVector,
+) (*SnapshotRecord, error) {
+	if fam, ok := engine.Canonical(eng); ok {
+		eng = string(fam)
+	}
+	dumpArg := sql.NullString{String: dumpHash, Valid: dumpHash != ""}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT fingerprint, engine, engine_version, source_db, template_name,
+		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
+		       COALESCE(inputs_json,'{}'),
+		       COALESCE(size_bytes,0), created_at, last_used_at, use_count
+		FROM snapshots
+		WHERE repo_id = ?
+		  AND engine = ?
+		  AND engine_version = ?
+		  AND COALESCE(dump_hash,'') = COALESCE(?,'')`, repoID, eng, engineVersion, dumpArg)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	currentTotal := vectorTotalLen(currentInputs)
+	var best *SnapshotRecord
+	bestLen := -1
+	for rows.Next() {
+		var r SnapshotRecord
+		var lockJSON, inputsJSON string
+		if err := rows.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
+			&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
+			&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount); err != nil {
+			return nil, err
+		}
+		if lockJSON != "" {
+			if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
+				continue
+			}
+		}
+		if inputsJSON != "" && inputsJSON != "{}" {
+			if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
+				continue
+			}
+		}
+		// Commands must match exactly. A different migrate/seed run-
+		// string or env would change which migrations get applied, so
+		// the ancestor isn't a safe clone target.
+		if r.LockfileHashes[CommandsHashKey] != currentCommandsHash {
+			continue
+		}
+		if !vectorsAreAncestor(r.Inputs, currentInputs) {
+			continue
+		}
+		total := vectorTotalLen(r.Inputs)
+		// A candidate with the same total as current is an exact match
+		// — that's the LookupSnapshot path. Strict prefix only.
+		if total >= currentTotal {
+			continue
+		}
+		if total > bestLen {
+			bestCopy := r
+			best = &bestCopy
+			bestLen = total
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return best, nil
+}
+
+// vectorTotalLen sums the lengths of every input vector — the metric
+// used to pick the "longest" ancestor when more than one qualifies.
+func vectorTotalLen(m map[string]InputVector) int {
+	n := 0
+	for _, v := range m {
+		n += len(v)
+	}
+	return n
+}
+
+// vectorsAreAncestor reports whether `cand` is a per-input prefix of
+// `current`. Every input glob present in `cand` must also be present
+// in `current` with the candidate's entries appearing at the same
+// positions; `current` may carry additional entries at the end or
+// additional input globs entirely (those represent the new files an
+// incremental migrate would apply on top of the ancestor).
+func vectorsAreAncestor(cand, current map[string]InputVector) bool {
+	for glob, cVec := range cand {
+		curVec, ok := current[glob]
+		if !ok {
+			// Candidate has an input the current run doesn't — it's
+			// not a subset of current's state, so not an ancestor.
+			return false
+		}
+		if len(cVec) > len(curVec) {
+			return false
+		}
+		for i := range cVec {
+			if cVec[i] != curVec[i] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // SnapshotEvictionCandidate is the slim view returned by

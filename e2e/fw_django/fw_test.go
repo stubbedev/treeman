@@ -76,7 +76,7 @@ func TestDjangoEndToEnd(t *testing.T) {
 					Env: map[string]string{"DB_NAME": "{target_db}"},
 				},
 				Inputs: []config.Input{
-					{Glob: "core/migrations/*.py", Label: "migrations", Hash: "filename"},
+					{Glob: "core/migrations/*.py", Label: "migrations"},
 				},
 			},
 		},

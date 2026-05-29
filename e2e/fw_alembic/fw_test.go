@@ -68,7 +68,7 @@ func TestAlembicEndToEnd(t *testing.T) {
 					Env: map[string]string{"DB_NAME": "{target_db}"},
 				},
 				Inputs: []config.Input{
-					{Glob: "migrations/versions/*.py", Label: "migrations", Hash: "filename"},
+					{Glob: "migrations/versions/*.py", Label: "migrations"},
 				},
 			},
 		},

@@ -132,7 +132,7 @@ databases:
   - engine: mysql
     name_template: "app_{slug}"
     inputs:
-      - { glob: "db/migrations/**/*.sql", label: migrations, hash: filename }
+      - { glob: "db/migrations/**/*.sql", label: migrations }
       - { glob: "db/seeders/**/*.sql",    label: seeders }
   - engine: elasticsearch
     key_prefix: "app_{slug}_"

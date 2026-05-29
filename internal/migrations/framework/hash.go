@@ -101,7 +101,10 @@ func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot stri
 	// digest without a per-file check.
 	var cached map[string]DirHashCacheRecord
 	if cache != nil {
-		cached, _ = cache.BatchDirHashes(ctx, statDirs, spec.Name, string(spec.HashMode))
+		// `cacheHashModeColumn` is the legacy DirHashKey.HashMode column
+		// value. The column is preserved (no store migration) but is now
+		// constant — all inputs are content-hashed.
+		cached, _ = cache.BatchDirHashes(ctx, statDirs, spec.Name, cacheHashModeColumn)
 	}
 
 	freshHashes := make(map[string]string)
@@ -122,7 +125,7 @@ func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot stri
 			continue
 		}
 
-		digest, err := computeDirDigest(ctx, cache, d.absDir, matches, spec)
+		digest, err := computeDirDigest(ctx, cache, d.absDir, matches)
 		if err != nil {
 			return "", err
 		}
@@ -131,7 +134,7 @@ func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot stri
 		freshKeys = append(freshKeys, DirHashCacheKey{
 			Dir:       d.absDir,
 			SpecName:  spec.Name,
-			HashMode:  string(spec.HashMode),
+			HashMode:  cacheHashModeColumn,
 			MtimeNs:   d.mtime,
 			MemberCnt: memberCount,
 		})
@@ -158,10 +161,19 @@ func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot stri
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// computeDirDigest produces the per-directory digest. HashChecksum
-// hashes file bytes (cache-assisted via BatchHashedFiles when
-// available); HashFilename skips bytes entirely.
-func computeDirDigest(ctx context.Context, cache HashCache, absDir string, matches []os.DirEntry, spec Spec) (string, error) {
+// cacheHashModeColumn is the constant value written into the legacy
+// DirHashKey.HashMode column. The column predates the removal of the
+// per-input hash mode (`filename`/`checksum`) and is kept for storage
+// schema compatibility — every fresh row uses this single value so the
+// cache key remains stable and pre-existing rows are still found.
+const cacheHashModeColumn = "checksum"
+
+// computeDirDigest produces the per-directory digest by content-hashing
+// every migration file in sorted order. The historical `filename` mode
+// (hash filenames only) is gone — it relied on an append-only
+// convention that wasn't enforced, so an in-place edit could silently
+// keep an old cached template alive.
+func computeDirDigest(ctx context.Context, cache HashCache, absDir string, matches []os.DirEntry) (string, error) {
 	if len(matches) == 0 {
 		// Stable empty-dir digest so an empty migrations folder
 		// contributes a constant per-dir hash.
@@ -171,17 +183,7 @@ func computeDirDigest(ctx context.Context, cache HashCache, absDir string, match
 
 	sort.SliceStable(matches, func(i, j int) bool { return matches[i].Name() < matches[j].Name() })
 
-	if spec.HashMode != HashChecksum {
-		h := blake3.New(32, nil)
-		for _, e := range matches {
-			_, _ = h.Write([]byte(e.Name()))
-			_, _ = h.Write([]byte{0})
-			_, _ = h.Write([]byte{'\n'})
-		}
-		return hex.EncodeToString(h.Sum(nil)), nil
-	}
-
-	// HashChecksum: collect absolute paths, batch-lookup hashes
+	// Content hash: collect absolute paths, batch-lookup hashes
 	// (single SELECT IN + parallel-compute misses), then fold.
 	paths := make([]string, 0, len(matches))
 	for _, e := range matches {

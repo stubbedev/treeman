@@ -188,38 +188,32 @@ func migrateBlock(spec framework.Spec) *yaml.Node {
 
 // inputNodes builds the `databases[].inputs:` sequence from a
 // detected framework. Each (migration_dir, file_glob) pair becomes
-// one entry with hash mode `filename` (migrations are append-only
-// in every framework we ship). Each lockfile becomes a bare-string
-// entry (default checksum hash).
+// one entry; each lockfile becomes another. All entries are content-
+// hashed — there is no per-entry hash mode anymore.
 func inputNodes(spec framework.Spec) *yaml.Node {
-	type entry struct {
-		glob, label, hash string
-	}
+	type entry struct{ glob, label string }
 	var entries []entry
 	seen := map[string]struct{}{}
-	add := func(glob, label, hash string) {
+	add := func(glob, label string) {
 		if _, dup := seen[glob]; dup {
 			return
 		}
 		seen[glob] = struct{}{}
-		entries = append(entries, entry{glob: glob, label: label, hash: hash})
+		entries = append(entries, entry{glob: glob, label: label})
 	}
 	for _, dir := range spec.MigrationDirs {
 		for _, pat := range spec.FileGlobs {
-			add(dir+"/**/"+pat, "migrations", "filename")
+			add(dir+"/**/"+pat, "migrations")
 		}
 	}
 	for _, lf := range spec.Lockfiles {
-		add(lf, "lockfile", "")
+		add(lf, "lockfile")
 	}
 	seq := seqNode()
 	for _, e := range entries {
 		m := mapNode("glob", scalar(e.glob))
 		if e.label != "" {
 			mapSet(m, "label", scalar(e.label))
-		}
-		if e.hash != "" {
-			mapSet(m, "hash", scalar(e.hash))
 		}
 		seq.Content = append(seq.Content, m)
 	}

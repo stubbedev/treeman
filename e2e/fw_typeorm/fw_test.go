@@ -68,7 +68,7 @@ func TestTypeORMEndToEnd(t *testing.T) {
 					Env: map[string]string{"DB_NAME": "{target_db}"},
 				},
 				Inputs: []config.Input{
-					{Glob: "migrations/*.ts", Label: "migrations", Hash: "filename"},
+					{Glob: "migrations/*.ts", Label: "migrations"},
 				},
 			},
 		},

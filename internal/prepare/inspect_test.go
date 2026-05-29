@@ -31,7 +31,7 @@ func TestInspectFingerprint_DerivesPerInputHashes(t *testing.T) {
 		Engine:       "mysql",
 		NameTemplate: "app_{slug}",
 		Inputs: []config.Input{
-			{Glob: "db/migrations/*.sql", Hash: "filename"},
+			{Glob: "db/migrations/*.sql"},
 			{Glob: "composer.lock"}, // default checksum
 		},
 		Migrate: &config.Step{Run: "echo migrate"},
@@ -152,7 +152,7 @@ func TestInspectFingerprint_DoublestarChecksumGlobFoldsBaseDirFiles(t *testing.T
 	d := config.DatabaseConfig{
 		Engine:       "mysql",
 		NameTemplate: "app_{slug}",
-		Inputs:       []config.Input{{Glob: glob, Hash: "checksum"}},
+		Inputs:       []config.Input{{Glob: glob}},
 		Migrate:      &config.Step{Run: "php artisan migrate"},
 	}
 

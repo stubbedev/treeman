@@ -224,7 +224,7 @@ func buildConfig() *config.Config {
 					},
 				},
 				Inputs: []config.Input{
-					{Glob: "fixtures/migrations/*.sql", Label: "migrations", Hash: "filename"},
+					{Glob: "fixtures/migrations/*.sql", Label: "migrations"},
 				},
 				// Fanout: pre-warm 2 paratest clones so teardown's
 				// per-worktree cleanup (source + clones) is exercised.

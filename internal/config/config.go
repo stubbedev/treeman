@@ -1291,40 +1291,26 @@ type Input struct {
 	// against via their `match:` field. Multiple entries can share a
 	// label so one action handles a logical group of file types.
 	Label string `yaml:"label,omitempty"`
-
-	// Hash mode for files matching this glob:
-	//   `checksum` (default) — full content hash. Detects edits.
-	//     Right for lockfiles, seeders, factories, fixtures.
-	//   `filename`            — hash of the filename only. Cheaper.
-	//     Right for append-only directories (Laravel/Rails/Django
-	//     migrations where existing files never change).
-	Hash string `yaml:"hash,omitempty" jsonschema:"enum=checksum,enum=filename"`
 }
 
 // JSONSchema documents the polymorphic shape: an Input is either a
 // bare glob string (shorthand for `{glob: <string>}`) or a full
-// `{glob, label, hash}` mapping.
+// `{glob, label}` mapping. All inputs are content-hashed; there is no
+// per-entry hash mode (the historical `filename` shortcut relied on an
+// append-only-migrations assumption that wasn't actually enforced).
 func (Input) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
 	props.Set("glob", &jsonschema.Schema{Type: "string", Description: "Glob pattern (repo-root-relative). Required."})
 	props.Set("label", &jsonschema.Schema{Type: "string", Description: "Optional label for `hooks.on-file-change` matchers."})
-	props.Set(
-		"hash",
-		&jsonschema.Schema{
-			Type:        "string",
-			Enum:        []any{"checksum", "filename"},
-			Description: "Hash mode: checksum (default) or filename (append-only files).",
-		},
-	)
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
-			{Type: "string", Description: "Bare glob string. Equivalent to `{glob: <this string>}` with default hash mode."},
+			{Type: "string", Description: "Bare glob string. Equivalent to `{glob: <this string>}`."},
 			{
 				Type:                 "object",
 				Properties:           props,
 				Required:             []string{"glob"},
 				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Full input mapping with optional label + hash mode.",
+				Description:          "Full input mapping with optional label.",
 			},
 		},
 		Description: "One source of file state for the template fingerprint. Bare string OR full mapping.",
@@ -1691,11 +1677,6 @@ type CustomFramework struct {
 	// `migration_dirs`. Example: `[0-9]*_*.py` (alembic) or
 	// `V*__*.sql` (flyway).
 	FilePattern string `yaml:"file_pattern"`
-
-	// Hash strategy applied to the migration files: `filename`
-	// (default) or `checksum`. Maps to the `hash:` field on each
-	// emitted Input.
-	HashMode string `yaml:"hash_mode,omitempty" jsonschema:"enum=filename,enum=checksum"`
 
 	// Lockfiles whose contents are folded into the snapshot hash
 	// (e.g. `requirements.txt`, `pyproject.toml`, `composer.lock`).

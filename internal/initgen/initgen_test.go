@@ -82,6 +82,8 @@ func TestWriteYAMLOverwritesWithForce(t *testing.T) {
 // should emit a top-level `migrate:` block on the db, an `inputs:` list
 // covering both migration globs and the lockfile, and no `framework:`,
 // `migrations:`, or `watcher:` blocks.
+//
+//nolint:cyclop // end-to-end scaffolding test: many small assertions on one fixture is exactly the shape this needs; splitting would just spread the same conditions across helper functions
 func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	must := func(p string, body string) {
@@ -143,22 +145,27 @@ func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 	if !ok || len(inputs) == 0 {
 		t.Fatalf("databases[0].inputs: missing or empty\n%s", body)
 	}
-	type entry struct{ label, hash string }
+	type entry struct{ label string }
 	wantInputs := map[string]entry{
-		"database/migrations/**/*.php":               {label: "migrations", hash: "filename"},
-		"app/Modules/*/Database/Migrations/**/*.php": {label: "migrations", hash: "filename"},
-		"app/Modules/*/Database/migrations/**/*.php": {label: "migrations", hash: "filename"},
-		"Modules/*/Database/Migrations/**/*.php":     {label: "migrations", hash: "filename"},
-		"Modules/*/Database/migrations/**/*.php":     {label: "migrations", hash: "filename"},
-		"composer.lock":                              {label: "lockfile", hash: ""},
+		"database/migrations/**/*.php":               {label: "migrations"},
+		"app/Modules/*/Database/Migrations/**/*.php": {label: "migrations"},
+		"app/Modules/*/Database/migrations/**/*.php": {label: "migrations"},
+		"Modules/*/Database/Migrations/**/*.php":     {label: "migrations"},
+		"Modules/*/Database/migrations/**/*.php":     {label: "migrations"},
+		"composer.lock":                              {label: "lockfile"},
 	}
 	gotInputs := map[string]entry{}
 	for _, in := range inputs {
 		m, _ := in.(map[string]any)
 		g, _ := m["glob"].(string)
 		lbl, _ := m["label"].(string)
-		h, _ := m["hash"].(string)
-		gotInputs[g] = entry{label: lbl, hash: h}
+		gotInputs[g] = entry{label: lbl}
+	}
+	// Scaffolded YAML must not carry a `hash:` field anymore (filename
+	// mode removed; all inputs are content-hashed). A single raw-body
+	// substring check covers every input at once.
+	if strings.Contains(body, "hash:") {
+		t.Errorf("scaffolded yaml leaks a `hash:` field; expected none:\n%s", body)
 	}
 	for g, want := range wantInputs {
 		got, ok := gotInputs[g]

@@ -99,7 +99,7 @@ func buildConfig() *config.Config {
 					},
 				},
 				Inputs: []config.Input{
-					{Glob: "fixtures/migrations/*.sql", Label: "migrations", Hash: "filename"},
+					{Glob: "fixtures/migrations/*.sql", Label: "migrations"},
 				},
 			},
 		},
@@ -139,9 +139,9 @@ func copyTree(t *testing.T, src, dst string) {
 
 func editMigration(t *testing.T, wt string) {
 	t.Helper()
-	// Add a new migration file — hash mode is "filename", so a new
-	// filename in the dir flips the fingerprint regardless of
-	// content. We add content too for realism.
+	// Add a new migration file. Inputs are content-hashed (no more
+	// `filename` mode), so a new file in the dir flips the
+	// fingerprint via its content hash.
 	body := `CREATE TABLE shipments (
   id INT PRIMARY KEY AUTO_INCREMENT,
   order_id INT NOT NULL,
@@ -152,6 +152,59 @@ func editMigration(t *testing.T, wt string) {
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestIncrementalAncestorBuild proves task #4: adding a new migration on
+// top of an already-cached template builds incrementally from the cached
+// ancestor (clone + migrate the new file only) instead of cold-rebuilding
+// from the dump + replaying every migration. Same env as the end-to-end
+// test so the SQLite store carries the pass-1 snapshot row when pass-2
+// runs — that's the row the ancestor lookup picks up.
+func TestIncrementalAncestorBuild(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	env := harness.NewEnv(t, wt)
+
+	// Pass 1 — cold build off the fixture migrations. This records the
+	// snapshot row + Inputs vector that pass 2's ancestor lookup will
+	// match against.
+	o1 := harness.AssertOutcome(t, env.RunPrepare(t, buildConfig()), "mysql", false)
+	if o1.IncrementalBase != "" {
+		t.Fatalf("pass 1 (first cold build) should not be incremental; got base=%s", o1.IncrementalBase)
+	}
+	t.Logf("pass1 cold: fp=%s tmpl=%s", o1.Fingerprint[:12], o1.TemplateName)
+
+	// Add a new migration on top — content-hashed Inputs vector now
+	// extends pass 1's by exactly one entry, so pass 1's template is
+	// the longest strict prefix ancestor.
+	editMigration(t, wt)
+
+	o2 := harness.AssertOutcome(t, env.RunPrepare(t, buildConfig()), "mysql", false)
+	if o2.IncrementalBase != o1.Fingerprint {
+		t.Errorf("pass 2 should build incrementally from pass 1; got IncrementalBase=%q want %q",
+			o2.IncrementalBase, o1.Fingerprint)
+	}
+	if o2.Fingerprint == o1.Fingerprint {
+		t.Errorf("pass 2 must produce a NEW fingerprint (extra migration): still %s", o1.Fingerprint[:12])
+	}
+	t.Logf("pass2 incremental: fp=%s tmpl=%s base=%s",
+		o2.Fingerprint[:12], o2.TemplateName, o2.IncrementalBase[:12])
+
+	// All three tables present — the framework's own migrations ledger
+	// inside the cloned ancestor template skipped the already-applied
+	// files and ran only the new 2024_02_01 migration.
+	assertTablesPresent(t, "127.0.0.1:13306", o2.SourceDB, []string{"products", "orders", "shipments"})
 }
 
 func assertTablesPresent(t *testing.T, addr, dbName string, want []string) {

@@ -84,7 +84,7 @@ INSERT INTO widgets (name) VALUES ('alpha'), ('beta'), ('gamma');`), 0o644); err
 					},
 				},
 				Inputs: []config.Input{
-					{Glob: "db/migrations/*.up.sql", Label: "migrations", Hash: "filename"},
+					{Glob: "db/migrations/*.up.sql", Label: "migrations"},
 				},
 			},
 		},

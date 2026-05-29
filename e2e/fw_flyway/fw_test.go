@@ -59,7 +59,7 @@ func TestFlywayEndToEnd(t *testing.T) {
 					Env: map[string]string{"DB_NAME": "{target_db}"},
 				},
 				Inputs: []config.Input{
-					{Glob: "sql/V*.sql", Label: "migrations", Hash: "filename"},
+					{Glob: "sql/V*.sql", Label: "migrations"},
 				},
 			},
 		},

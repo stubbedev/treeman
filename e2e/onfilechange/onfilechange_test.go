@@ -71,7 +71,7 @@ databases:
   - engine: mysql
     name_template: tm_ofc_{slug}
     inputs:
-      - { glob: "db/migrations/*.sql", label: migrations, hash: filename }
+      - { glob: "db/migrations/*.sql", label: migrations }
 hooks:
   on-file-change:
     - match: migrations

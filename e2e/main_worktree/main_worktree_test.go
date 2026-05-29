@@ -165,7 +165,7 @@ databases:
       name_template: "tm_mw_{slug}_t{n}"
     fanout: 4
     inputs:
-      - { glob: "db/migrations/*.sql", label: migrations, hash: filename }
+      - { glob: "db/migrations/*.sql", label: migrations }
 hooks:
   on-file-change:
     - match: migrations

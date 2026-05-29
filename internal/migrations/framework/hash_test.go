@@ -91,16 +91,14 @@ func (f *fakeCache) UpsertDirHashes(_ context.Context, entries []DirHashCacheKey
 	return nil
 }
 
-// laravelSpec is the smallest Spec needed to exercise the
-// dir-mtime gate. Migrations live in a single directory and use
-// HashFilename so file bytes are irrelevant.
+// laravelSpec is the smallest Spec needed to exercise the dir-mtime
+// gate: a single directory of migrations content-hashed.
 func laravelSpec(root string) Spec {
 	_ = root
 	return Spec{
 		Name:          "laravel",
 		MigrationDirs: []string{"database/migrations"},
 		FileGlobs:     []string{"*.php"},
-		HashMode:      HashFilename,
 	}
 }
 
@@ -204,7 +202,6 @@ func TestMigrationsHash_ChecksumModeReusesFileCache(t *testing.T) {
 		Name:          "sqlx-cli",
 		MigrationDirs: []string{"migrations"},
 		FileGlobs:     []string{"*.sql"},
-		HashMode:      HashChecksum,
 	}
 	cache := newFakeCache()
 
@@ -242,15 +239,14 @@ func TestMigrationsHash_NoCacheStillWorks(t *testing.T) {
 	}
 }
 
-// sqlSpec is a single-dir spec parameterised by hash mode, used by the
-// content-edit semantics tests below. nil cache forces a fresh compute
-// each call so we measure the hash mode, not the cache.
-func sqlSpec(mode HashMode) Spec {
+// sqlSpec is a single-dir spec used by the content-edit semantics
+// tests below. nil cache forces a fresh compute each call so we
+// measure the hashing path, not the cache.
+func sqlSpec() Spec {
 	return Spec{
 		Name:          "generic",
 		MigrationDirs: []string{"migrations"},
 		FileGlobs:     []string{"*.sql"},
-		HashMode:      mode,
 	}
 }
 
@@ -267,13 +263,15 @@ func writeOneMigration(t *testing.T, root, body string) string {
 	return f
 }
 
-// hash: checksum (default) must detect an in-place content edit to an
-// existing file (same name) — this is why lockfiles / seeders use it.
-func TestMigrationsHash_ChecksumModeDetectsContentEdit(t *testing.T) {
+// MigrationsHash must detect an in-place content edit on every input
+// — there is no longer a `filename` mode that ignored bytes. Pins the
+// content-only invariant: editing an existing migration always flips
+// the fingerprint.
+func TestMigrationsHash_DetectsContentEdit(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	f := writeOneMigration(t, root, "-- v1")
-	spec := sqlSpec(HashChecksum)
+	spec := sqlSpec()
 
 	h1, err := MigrationsHashWithCache(ctx, nil, root, spec)
 	if err != nil {
@@ -287,32 +285,7 @@ func TestMigrationsHash_ChecksumModeDetectsContentEdit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if h1 == h2 {
-		t.Errorf("checksum mode must change hash on a content edit: still %s", h1)
-	}
-}
-
-// hash: filename must IGNORE an in-place content edit — append-only
-// migration dirs (Laravel/Rails/Django) rely on this so re-touching a
-// committed migration doesn't force a needless rebuild.
-func TestMigrationsHash_FilenameModeIgnoresContentEdit(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	f := writeOneMigration(t, root, "-- v1")
-	spec := sqlSpec(HashFilename)
-
-	h1, err := MigrationsHashWithCache(ctx, nil, root, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(f, []byte("-- v2 changed contents"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	h2, err := MigrationsHashWithCache(ctx, nil, root, spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h1 != h2 {
-		t.Errorf("filename mode must ignore a content edit: %s != %s", h1, h2)
+		t.Errorf("content-only hashing must flip the hash on an in-place edit: still %s", h1)
 	}
 }
 

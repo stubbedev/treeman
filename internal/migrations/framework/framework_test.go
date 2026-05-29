@@ -132,7 +132,6 @@ func TestRegistryForMapsCustomFrameworkFields(t *testing.T) {
 				Markers:       []string{"acme.config"},
 				MigrationDirs: []string{"db/acme"},
 				FilePattern:   "*.sql",
-				HashMode:      "filename",
 				Lockfiles:     []string{"acme.lock"},
 				EngineHint:    "postgres",
 			},
@@ -158,9 +157,6 @@ func TestRegistryForMapsCustomFrameworkFields(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.FileGlobs, []string{"*.sql"}) {
 		t.Errorf("FileGlobs = %v, want [*.sql] (from file_pattern)", got.FileGlobs)
-	}
-	if got.HashMode != HashFilename {
-		t.Errorf("HashMode = %q, want filename", got.HashMode)
 	}
 	if !reflect.DeepEqual(got.Lockfiles, []string{"acme.lock"}) {
 		t.Errorf("Lockfiles = %v, want [acme.lock]", got.Lockfiles)

@@ -38,7 +38,6 @@ import (
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	"github.com/stubbedev/treeman/internal/engine"
-	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/runid"
@@ -47,38 +46,6 @@ import (
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
 )
-
-// frameworkHashCache adapts *store.Store to framework.HashCache.
-// store.BatchDirHashes / UpsertDirHashes use store-defined types
-// (DirHashRecord, DirHashKey) that the framework package can't
-// import (store depends on framework's caller chain, not the other
-// way round). Field shapes match exactly, so a single struct
-// conversion bridges the boundary at zero allocation cost.
-type frameworkHashCache struct{ *store.Store }
-
-func (f frameworkHashCache) BatchDirHashes(
-	ctx context.Context,
-	dirs []string,
-	specName, hashMode string,
-) (map[string]framework.DirHashCacheRecord, error) {
-	raw, err := f.Store.BatchDirHashes(ctx, dirs, specName, hashMode)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]framework.DirHashCacheRecord, len(raw))
-	for k, v := range raw {
-		out[k] = framework.DirHashCacheRecord(v)
-	}
-	return out, nil
-}
-
-func (f frameworkHashCache) UpsertDirHashes(ctx context.Context, entries []framework.DirHashCacheKey, hashes map[string]string) error {
-	se := make([]store.DirHashKey, len(entries))
-	for i, e := range entries {
-		se[i] = store.DirHashKey(e)
-	}
-	return f.Store.UpsertDirHashes(ctx, se, hashes)
-}
 
 // runnerLogPath builds the disk path the runner should tee
 // stdout+stderr into for a given prepare step. Lives alongside the
@@ -221,6 +188,12 @@ type Outcome struct {
 	// stale errors on every finalize.
 	Skipped    bool
 	SkipReason string
+	// IncrementalBase is the fingerprint of the ancestor template this
+	// run was built from when the incremental path was taken. Empty
+	// otherwise. Lets callers (and tests) distinguish a full cold
+	// build from an incremental build that ran migrate-only on top of
+	// a cached ancestor.
+	IncrementalBase string
 }
 
 // emitPrepareSkipped writes the `prepare_skipped` info event used by
@@ -710,6 +683,23 @@ func prepareMySQL(
 		return out, err
 	}
 
+	// Per-input vectors used for ancestor lookup AND persisted into
+	// the new snapshot row so future preps can build incrementally
+	// off this one.
+	inputs := computeInputVectors(ctx, st, d, worktreePath)
+
+	// Incremental path: try to find a content-PREFIX ancestor template
+	// (same engine/version/dump/commands; every input vector a prefix
+	// of this run's) and clone + migrate from there instead of a full
+	// cold build. The migration framework's own ledger skips the
+	// already-applied files so only the new ones run.
+	out, done, err = mysqlIncrementalBuild(ctx, drv, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
+		inheritedEnv, started)
+	if done || err != nil {
+		return out, err
+	}
+
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
 		fmt.Sprintf("engine=mysql source=%s template=%s", sourceDB, templateName),
 		repoID, worktreeID, "", 0, map[string]string{
@@ -733,7 +723,7 @@ func prepareMySQL(
 	}
 
 	// Build the template snapshot, then clone it into paratest DBs.
-	if err := mysqlSnapshotAndRecord(ctx, drv, cfg, d, st, repoID, worktreeID, sourceDB, templateName, version, key); err != nil {
+	if err := mysqlSnapshotAndRecord(ctx, drv, cfg, d, st, repoID, worktreeID, sourceDB, templateName, version, key, inputs); err != nil {
 		return Outcome{}, err
 	}
 
@@ -936,6 +926,7 @@ func mysqlSnapshotAndRecord(
 	repoID, worktreeID int64,
 	sourceDB, templateName, version string,
 	key snapshot.Key,
+	inputs map[string]store.InputVector,
 ) error {
 	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
@@ -951,6 +942,7 @@ func mysqlSnapshotAndRecord(
 		MigrationsHash: key.MigrationsHashHex,
 		DumpHash:       key.DumpHashHex,
 		LockfileHashes: key.LockfileHashes,
+		Inputs:         inputs,
 		RepoID:         repoID,
 	})
 	// Fire-and-forget LRU eviction for this repo. Uses a fresh
@@ -963,6 +955,156 @@ func mysqlSnapshotAndRecord(
 		snapshot.EvictExcess(evictCtx, cfg, st, repoID)
 	}()
 	return nil
+}
+
+// mysqlIncrementalBuild looks for a content-prefix ancestor template
+// and, when found, clones it into the source DB and runs only `migrate`
+// on top — letting the framework's own migrations ledger skip the
+// already-applied files. Dump-load and seed are skipped (the ancestor
+// template already includes them). On success it records a NEW snapshot
+// row for this run's full fingerprint and fans out the clones, then
+// returns (out, true, nil) so the caller short-circuits the cold-build
+// path. (Outcome{}, false, nil) means "no incremental possible, do the
+// full cold build."
+//
+// Contract mirrors mysqlCacheHit: any error inside is converted into
+// a fall-through so the cold-build path can still recover. The new
+// `prepare_incremental_start` / `prepare_incremental_fallback` events
+// surface why the path was taken or abandoned.
+//
+//nolint:gocyclo // one self-contained orchestrator with explicit fall-through events — splitting just spreads the same branches across helpers without simplifying review
+func mysqlIncrementalBuild(
+	ctx context.Context,
+	drv *dbmysql.Driver,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourceDB, templateName, version string,
+	maxConns int,
+	key snapshot.Key,
+	inputs map[string]store.InputVector,
+	inheritedEnv map[string]string,
+	started time.Time,
+) (Outcome, bool, error) {
+	commandsHash := key.LockfileHashes[store.CommandsHashKey]
+	anc, _ := st.FindAncestorSnapshot(ctx, repoID, "mysql", version, key.DumpHashHex, commandsHash, inputs)
+	if anc == nil {
+		return Outcome{}, false, nil
+	}
+	// Pin the ancestor so a concurrent GC can't evict it while we're
+	// in the middle of cloning + migrating from it.
+	unpinAnc := snapshot.Pin(anc.Fingerprint)
+	defer unpinAnc()
+
+	exists, _ := drv.DatabaseExists(ctx, anc.TemplateName)
+	if !exists {
+		// Ghost row: SQLite remembers the template but MySQL doesn't.
+		// Clear the row so future preps stop picking it as an ancestor
+		// and fall through to a full cold build for this run.
+		_ = st.DeleteSnapshot(ctx, anc.Fingerprint)
+		return Outcome{}, false, nil
+	}
+
+	delta := vectorDelta(anc.Inputs, inputs)
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_incremental_start",
+		fmt.Sprintf("engine=mysql ancestor=%s files_added=%d", anc.TemplateName, delta),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine":               "mysql",
+			"source_db":            sourceDB,
+			"template":             templateName,
+			"fingerprint":          key.Fingerprint(),
+			"ancestor_template":    anc.TemplateName,
+			"ancestor_fingerprint": anc.Fingerprint,
+			"files_added":          strconv.Itoa(delta),
+		})
+
+	// Restore ancestor template → source. SnapshotRestore drops the
+	// target first, so any stale source contents are cleared.
+	restoreStart := time.Now()
+	if err := drv.SnapshotRestore(ctx, anc.TemplateName, sourceDB); err != nil {
+		_ = st.WriteEvent(ctx, store.LevelWarn, "prepare_incremental_fallback",
+			fmt.Sprintf("ancestor restore failed: %v", err),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":               "mysql",
+				"ancestor_template":    anc.TemplateName,
+				"ancestor_fingerprint": anc.Fingerprint,
+				"error":                err.Error(),
+			})
+		return Outcome{}, false, nil
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "incremental-restore", restoreStart)
+
+	if d.Migrate != nil {
+		migrateStart := time.Now()
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "mysql", "migrate", sourceDB))
+		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
+		if err != nil {
+			return Outcome{}, false, fmt.Errorf("incremental migrate %s: %w", sourceDB, err)
+		}
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, "mysql", sourceDB, "migrate", out)
+			return Outcome{}, false, fmt.Errorf("%s", runner.FormatError("incremental migrate", sourceDB, out))
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", migrateStart)
+	}
+
+	if err := mysqlSnapshotAndRecord(ctx, drv, cfg, d, st, repoID, worktreeID, sourceDB, templateName, version, key, inputs); err != nil {
+		return Outcome{}, false, err
+	}
+
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	if err != nil {
+		return Outcome{}, false, err
+	}
+	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName,
+		clones, d.Engine, d.Fanout, maxConns); err != nil {
+		return Outcome{}, false, err
+	}
+
+	ms := time.Since(started).Milliseconds()
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+		fmt.Sprintf("incremental clones=%d duration=%dms ancestor=%s files_added=%d",
+			len(clones), ms, anc.TemplateName, delta),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine":               "mysql",
+			"source_db":            sourceDB,
+			"template":             templateName,
+			"clones":               strconv.Itoa(len(clones)),
+			"fingerprint":          key.Fingerprint(),
+			"cache_hit":            "false",
+			"incremental":          "true",
+			"ancestor_fingerprint": anc.Fingerprint,
+			"files_added":          strconv.Itoa(delta),
+			"duration_ms":          strconv.FormatInt(ms, 10),
+		})
+
+	return Outcome{
+		Engine:          d.Engine,
+		SourceDB:        sourceDB,
+		TemplateName:    templateName,
+		Fingerprint:     key.Fingerprint(),
+		CacheHit:        false,
+		Clones:          clones,
+		IncrementalBase: anc.Fingerprint,
+	}, true, nil
+}
+
+// vectorDelta sums the per-input file count by which the current input
+// vectors exceed the ancestor's. Used purely for observability — the
+// raw "files_added" count tells the user how many migrations got
+// applied on top of the ancestor template.
+func vectorDelta(ancestor, current map[string]store.InputVector) int {
+	n := 0
+	for glob, curVec := range current {
+		ancVec := ancestor[glob]
+		if len(curVec) > len(ancVec) {
+			n += len(curVec) - len(ancVec)
+		}
+	}
+	return n
 }
 
 // preparePostgres mirrors prepareMySQL for the PostgreSQL engine.
@@ -2057,50 +2199,28 @@ func computeSnapshotKey(
 	d config.DatabaseConfig,
 	worktreePath, engineVersion string,
 ) snapshot.Key {
-	// 1. Hash every input under databases[].inputs[]. Per-entry hash
-	//    mode: `filename` for append-only directories (migrations),
-	//    `checksum` (default) for everything else.
+	// 1. Hash every input under databases[].inputs[]. All inputs are
+	//    content-hashed — the historical `filename` shortcut for
+	//    append-only migration dirs is gone. doublestar (not stdlib
+	//    filepath.Glob) so `**` matches zero-or-more path segments,
+	//    including files sitting directly in the glob base dir.
 	inputHashes := map[string]string{}
 	for _, in := range d.Inputs {
-		mode := in.Hash
-		if mode == "" {
-			mode = "checksum"
+		matches, _ := doublestar.FilepathGlob(filepath.Join(worktreePath, in.Glob))
+		if len(matches) == 0 {
+			continue
 		}
-		switch mode {
-		case "filename":
-			spec := framework.Spec{
-				Name:          "input:" + in.Glob,
-				MigrationDirs: []string{staticGlobPrefix(in.Glob)},
-				FileGlobs:     []string{filepath.Base(in.Glob)},
-				HashMode:      framework.HashFilename,
-			}
-			if h, err := framework.MigrationsHashWithCache(ctx, frameworkHashCache{st}, worktreePath, spec); err == nil && h != "" {
-				inputHashes[in.Glob] = h
-			}
-		default: // checksum
-			// doublestar (not stdlib filepath.Glob) so `**` matches
-			// zero-or-more path segments — including files sitting
-			// directly in the glob base dir (e.g. database/migrations/
-			// *.php under a database/migrations/**/*.php input). stdlib
-			// treats `**` as a single-segment `*`, silently dropping
-			// those files from the fingerprint.
-			matches, _ := doublestar.FilepathGlob(filepath.Join(worktreePath, in.Glob))
-			if len(matches) == 0 {
-				continue
-			}
-			if hs, err := snapshot.LockfileHashesForWithCache(ctx, st, matches); err == nil {
-				// Fold per-file hashes into one entry per glob — keyed
-				// by the glob so the user can tell from the SQLite
-				// row what changed.
-				agg := ""
-				var aggSb1749 strings.Builder
-				for _, k := range sortedKeys(hs) {
-					aggSb1749.WriteString(k + ":" + hs[k] + "\n")
-				}
-				agg += aggSb1749.String()
-				inputHashes[in.Glob] = agg
-			}
+		hs, err := snapshot.LockfileHashesForWithCache(ctx, st, matches)
+		if err != nil {
+			continue
 		}
+		// Fold per-file hashes into one entry per glob — keyed by the
+		// glob so the user can tell from the SQLite row what changed.
+		var sb strings.Builder
+		for _, k := range sortedKeys(hs) {
+			sb.WriteString(k + ":" + hs[k] + "\n")
+		}
+		inputHashes[in.Glob] = sb.String()
 	}
 
 	// 2. Hash every dump file in declared ORDER and fold them into a
@@ -2209,20 +2329,37 @@ func InspectFingerprint(
 	return rep
 }
 
-// staticGlobPrefix returns the longest leading directory of `glob`
-// without glob meta-characters. Used to point the hash subsystem at
-// the right tree to walk.
-func staticGlobPrefix(glob string) string {
-	out := ""
-	for i, c := range glob {
-		switch c {
-		case '*', '?', '[', '{':
-			return out
-		case '/':
-			out = glob[:i]
+// computeInputVectors produces the per-input ordered file vectors
+// stored alongside a snapshot so FindAncestorSnapshot can detect a
+// content-prefix ancestor. Mirrors computeSnapshotKey's input walk:
+// each `databases[].inputs[]` glob is expanded via doublestar, the
+// matches are sorted by repo-relative path, and each entry carries
+// the per-file content hash (looked up by absolute path so duplicate
+// basenames in different subdirs don't collide). Empty/missing globs
+// contribute no entry.
+func computeInputVectors(ctx context.Context, st *store.Store, d config.DatabaseConfig, worktreePath string) map[string]store.InputVector {
+	out := map[string]store.InputVector{}
+	for _, in := range d.Inputs {
+		matches, _ := doublestar.FilepathGlob(filepath.Join(worktreePath, in.Glob))
+		if len(matches) == 0 {
+			continue
 		}
+		hashByAbs, err := st.BatchHashedFiles(ctx, matches)
+		if err != nil {
+			continue
+		}
+		vec := make(store.InputVector, 0, len(matches))
+		for _, abs := range matches {
+			rel, relErr := filepath.Rel(worktreePath, abs)
+			if relErr != nil {
+				rel = filepath.Base(abs)
+			}
+			vec = append(vec, store.FileHash{Path: rel, Hash: hashByAbs[abs]})
+		}
+		sort.Slice(vec, func(i, j int) bool { return vec[i].Path < vec[j].Path })
+		out[in.Glob] = vec
 	}
-	return glob
+	return out
 }
 
 // commandsHash digests the user-declared migrate/seed run strings

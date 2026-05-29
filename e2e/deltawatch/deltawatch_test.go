@@ -69,7 +69,7 @@ databases:
   - engine: mysql
     name_template: tm_dw_{slug}
     inputs:
-      - { glob: "db/migrations/*.sql", label: migrations, hash: filename }
+      - { glob: "db/migrations/*.sql", label: migrations }
 `)
 	if err := os.WriteFile(filepath.Join(repoRoot, ".treeman.yaml"),
 		[]byte(yaml), 0o644); err != nil {

@@ -1,0 +1,16 @@
+-- Add per-input file-vector storage to snapshots so the prepare layer
+-- can find the LONGEST ANCESTOR template — a cached snapshot whose
+-- per-input file lists are each a PREFIX of the current run's lists,
+-- with everything else (engine, version, dump_hash, commands_hash)
+-- identical. Incremental cold builds clone the ancestor template and
+-- run migrate (the framework's own ledger skips already-applied files)
+-- instead of dropping + reloading the dump + re-running every
+-- migration. Correct under content-only hashing: any edit to an old
+-- migration changes that file's content hash, which breaks the prefix
+-- relation and forces a full cold build.
+--
+-- Shape: JSON object keyed by input glob, value is an ordered array of
+-- {path, hash} entries sorted by path. Empty object `{}` for snapshots
+-- predating this column (existing rows can't participate as ancestors
+-- — they'll get rebuilt with the new shape on next prepare).
+ALTER TABLE snapshots ADD COLUMN inputs_json TEXT NOT NULL DEFAULT '{}';

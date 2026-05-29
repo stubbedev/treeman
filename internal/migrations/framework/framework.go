@@ -22,19 +22,6 @@ import (
 // looks like the framework in question.
 type Validator func(repoRoot string) bool
 
-// HashMode determines how migration files are fingerprinted.
-type HashMode string
-
-const (
-	// HashFilename — fingerprint the filename. Cheaper; fine when
-	// migrations are write-once-immutable (Laravel, Rails, Django,
-	// Knex, Drizzle, etc.).
-	HashFilename HashMode = "filename"
-	// HashChecksum — fingerprint the file contents. Needed for
-	// frameworks that mutate migrations in place (sqlx-cli, Flyway).
-	HashChecksum HashMode = "checksum"
-)
-
 // OnModify gates the watcher dispatch.
 type OnModify string
 
@@ -53,7 +40,6 @@ type Spec struct {
 	MigrationDirs []string // glob patterns relative to repo root
 	FileGlobs     []string // glob patterns for migration files in those dirs
 	Lockfiles     []string
-	HashMode      HashMode
 	OnModify      OnModify
 	EngineHint    string // "mysql", "postgres", "" if unknown
 	// MigrateRun is the shell command `treeman init` writes into the
@@ -159,7 +145,6 @@ func RegistryFor(cfg *config.Config) *Registry {
 			Markers:       cf.Markers,
 			MigrationDirs: cf.MigrationDirs,
 			Lockfiles:     cf.Lockfiles,
-			HashMode:      HashMode(cf.HashMode),
 			EngineHint:    cf.EngineHint,
 		}
 		if cf.FilePattern != "" {
@@ -350,7 +335,6 @@ func builtinsClassic() []Spec {
 			},
 			FileGlobs:  []string{"*.php"},
 			Lockfiles:  []string{"composer.lock"},
-			HashMode:   HashFilename,
 			OnModify:   OnRebuild,
 			EngineHint: "mysql",
 			MigrateRun: "php artisan migrate --force",
@@ -365,7 +349,6 @@ func builtinsClassic() []Spec {
 			MigrationDirs: []string{"db/migrate", "engines/*/db/migrate"},
 			FileGlobs:     []string{"*.rb"},
 			Lockfiles:     []string{"Gemfile.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "bin/rails db:migrate",
 			MigrateEnv:    dbNameEnv(),
@@ -376,7 +359,6 @@ func builtinsClassic() []Spec {
 			MigrationDirs: []string{"**/migrations"},
 			FileGlobs:     []string{"[0-9]*_*.py"},
 			Lockfiles:     []string{"Pipfile.lock", "poetry.lock", "uv.lock", "requirements.txt"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "python manage.py migrate --noinput",
 			MigrateEnv:    dbNameEnv(),
@@ -387,7 +369,6 @@ func builtinsClassic() []Spec {
 			MigrationDirs: []string{"**/migrations", "services/*/migrations", "cmd/*/migrations"},
 			FileGlobs:     []string{"*.up.sql"},
 			Lockfiles:     []string{"go.sum"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			// Bare `migrate up` is non-functional — the CLI requires
 			// -path/-source and -database flags or env. Scaffold a
@@ -412,7 +393,6 @@ func builtinsJSAndOther() []Spec {
 			MigrationDirs: []string{"migrations", "crates/*/migrations", "services/*/migrations"},
 			FileGlobs:     []string{"*.sql"},
 			Lockfiles:     []string{"Cargo.lock"},
-			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
 			MigrateRun:    "sqlx migrate run",
 			MigrateEnv:    dbURLEnv(),
@@ -423,7 +403,6 @@ func builtinsJSAndOther() []Spec {
 			MigrationDirs: []string{"migrations", "crates/*/migrations"},
 			FileGlobs:     []string{"up.sql"},
 			Lockfiles:     []string{"Cargo.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "diesel migration run",
 			MigrateEnv:    dbURLEnv(),
@@ -438,7 +417,6 @@ func builtinsJSAndOther() []Spec {
 			},
 			FileGlobs:  []string{"migration.sql"},
 			Lockfiles:  []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:   HashChecksum,
 			OnModify:   OnDelta,
 			MigrateRun: "npx prisma migrate deploy",
 			MigrateEnv: dbURLEnv(),
@@ -449,7 +427,6 @@ func builtinsJSAndOther() []Spec {
 			MigrationDirs: []string{"migrations", "apps/*/migrations", "packages/*/migrations"},
 			FileGlobs:     []string{"*.js", "*.ts", "*.cjs", "*.mjs"},
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "npx knex migrate:latest",
 			MigrateEnv:    dbNameEnv(),
@@ -460,7 +437,6 @@ func builtinsJSAndOther() []Spec {
 			MigrationDirs: []string{"**/versions"},
 			FileGlobs:     []string{"*.py"},
 			Lockfiles:     []string{"poetry.lock", "Pipfile.lock", "requirements.txt"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "alembic upgrade head",
 			MigrateEnv:    dbNameEnv(),
@@ -470,7 +446,6 @@ func builtinsJSAndOther() []Spec {
 			Markers:       []string{"flyway.conf|flyway.toml"},
 			MigrationDirs: []string{"**/db/migration", "sql"},
 			FileGlobs:     []string{"[VRU]*.sql"},
-			HashMode:      HashChecksum,
 			OnModify:      OnRebuild,
 			MigrateRun:    "flyway migrate",
 			MigrateEnv:    flywayURLEnv(),
@@ -488,7 +463,6 @@ func builtinsJSAndOther() []Spec {
 			},
 			FileGlobs: []string{"*.ts", "*.js"},
 			Lockfiles: []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:  HashFilename,
 			OnModify:  OnRebuild,
 			// v0.3+ requires -d <data-source>; bare `migration:run`
 			// fails. typeorm-ts-node-commonjs handles .ts sources
@@ -504,7 +478,6 @@ func builtinsJSAndOther() []Spec {
 			MigrationDirs: []string{"drizzle", "apps/*/drizzle", "packages/*/drizzle"},
 			FileGlobs:     []string{"*.sql"},
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
 			MigrateRun:    "npx drizzle-kit migrate",
 			MigrateEnv:    dbNameEnv(),
@@ -520,7 +493,6 @@ func builtinsExtra() []Spec {
 			MigrationDirs: []string{"migrations", "apps/*/migrations", "packages/*/migrations"},
 			FileGlobs:     []string{"*.js", "*.ts"},
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "npx sequelize-cli db:migrate",
 			MigrateEnv:    dbNameEnv(),
@@ -538,7 +510,6 @@ func builtinsExtra() []Spec {
 			},
 			FileGlobs:  []string{"Migration*.ts", "Migration*.js"},
 			Lockfiles:  []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:   HashFilename,
 			OnModify:   OnRebuild,
 			MigrateRun: "npx mikro-orm migration:up",
 			MigrateEnv: dbNameEnv(),
@@ -553,7 +524,6 @@ func builtinsExtra() []Spec {
 			MigrationDirs: []string{"migrations", "src/Migrations"},
 			FileGlobs:     []string{"Version[0-9]*.php"},
 			Lockfiles:     []string{"composer.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "php bin/console doctrine:migrations:migrate --no-interaction --all-or-nothing",
 			MigrateEnv:    dbURLEnv(),
@@ -569,7 +539,6 @@ func builtinsExtra() []Spec {
 			MigrationDirs: []string{"migrations", "db/migrations", "internal/db/migrations", "cmd/*/migrations"},
 			FileGlobs:     []string{"[0-9]*_*.sql", "[0-9]*_*.go"},
 			Lockfiles:     []string{"go.sum"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "goose -dir migrations up",
 			MigrateEnv:    gooseEnv(),
@@ -580,7 +549,6 @@ func builtinsExtra() []Spec {
 			Markers:       []string{"liquibase.properties|liquibase.yaml|liquibase.yml|liquibase.json"},
 			MigrationDirs: []string{"db/changelog", "src/main/resources/db/changelog", "changelog", "changelogs"},
 			FileGlobs:     []string{"*.xml", "*.yaml", "*.yml", "*.json", "*.sql"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "liquibase --changelog-file=db.changelog-master.xml update",
 			MigrateEnv:    liquibaseEnv(),
@@ -595,7 +563,6 @@ func builtinsExtra() []Spec {
 			MigrationDirs: []string{"Migrations", "*/Migrations", "src/*/Migrations"},
 			FileGlobs:     []string{"[0-9]*_*.cs"},
 			Lockfiles:     []string{"packages.lock.json", "global.json"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "dotnet ef database update",
 			MigrateEnv:    dbNameEnv(),
@@ -610,7 +577,6 @@ func builtinsExtra() []Spec {
 			MigrationDirs: []string{"priv/repo/migrations", "apps/*/priv/*/migrations"},
 			FileGlobs:     []string{"[0-9]*_*.exs"},
 			Lockfiles:     []string{"mix.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "mix ecto.migrate",
 			MigrateEnv:    dbNameEnv(),
@@ -624,7 +590,6 @@ func builtinsExtra() []Spec {
 			Markers:       []string{"db/migrations"},
 			MigrationDirs: []string{"db/migrations"},
 			FileGlobs:     []string{"[0-9]*_*.sql"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "dbmate up",
 			MigrateEnv:    dbURLEnv(),
@@ -638,7 +603,6 @@ func builtinsExtra() []Spec {
 			Markers:       []string{"atlas.hcl|migrations/atlas.sum"},
 			MigrationDirs: []string{"migrations"},
 			FileGlobs:     []string{"[0-9]*_*.sql"},
-			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
 			MigrateRun:    `atlas migrate apply --url "$DATABASE_URL" --dir "file://migrations"`,
 			MigrateEnv:    dbURLEnv(),

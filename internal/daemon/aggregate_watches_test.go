@@ -14,7 +14,7 @@ func TestAggregateWatchesTagsByDB(t *testing.T) {
 			{
 				Engine: "mysql",
 				Inputs: []config.Input{
-					{Glob: "db1/migrations/**/*.sql", Label: "migrations", Hash: "filename"},
+					{Glob: "db1/migrations/**/*.sql", Label: "migrations"},
 					{Glob: "db1/fixtures/**/*.yaml", Label: "fixtures"},
 				},
 			},
