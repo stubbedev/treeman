@@ -43,6 +43,12 @@ func EvictExcess(ctx context.Context, cfg *config.Config, st *store.Store, repoI
 		return
 	}
 	for _, c := range candidates {
+		if IsPinned(c.Fingerprint) {
+			// In-flight prepare holds this fingerprint. Skip — the
+			// sweep is best-effort and the next tick will pick it up
+			// once the pin clears.
+			continue
+		}
 		if err := dropTemplate(ctx, cfg, c); err != nil {
 			slog.Warn("snapshot eviction drop", "template", c.TemplateName,
 				"engine", c.Engine, "err", err)
@@ -119,6 +125,9 @@ func SweepBySource(ctx context.Context, cfg *config.Config, st *store.Store) {
 		return
 	}
 	for _, c := range cands {
+		if IsPinned(c.Fingerprint) {
+			continue
+		}
 		if err := dropTemplate(ctx, cfg, c); err != nil {
 			slog.Warn("snapshot source sweep drop", "template", c.TemplateName, "err", err)
 			continue
@@ -214,6 +223,9 @@ func SweepByAge(ctx context.Context, cfg *config.Config, st *store.Store) {
 		return
 	}
 	for _, c := range cands {
+		if IsPinned(c.Fingerprint) {
+			continue
+		}
 		if err := dropTemplate(ctx, cfg, c); err != nil {
 			slog.Warn("snapshot age sweep drop", "template", c.TemplateName, "err", err)
 			continue
@@ -259,6 +271,9 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 	for i, c := range cands {
 		if total <= cap {
 			break
+		}
+		if IsPinned(c.Fingerprint) {
+			continue
 		}
 		if err := dropTemplate(ctx, cfg, c); err != nil {
 			slog.Warn("snapshot size sweep drop", "template", c.TemplateName, "err", err)

@@ -166,6 +166,32 @@ type Outcome struct {
 	// `seed:parent`, `swap:resume`, `swap:parent`, `swap:branch-point`,
 	// `adopt`, or `noop`. Empty for the template/clone path.
 	Decision string
+	// Skipped is true when the engine's connection block is absent
+	// from the resolved config — declaring `databases: [{engine:
+	// mysql, ...}]` without `connections.mysql` is now a no-op
+	// (logged via `prepare_skipped`) instead of a wt_finalize error.
+	// Lets repos like treeman's own checkout declare a sample
+	// `.treeman.yaml` for schema-validation purposes without spawning
+	// stale errors on every finalize.
+	Skipped    bool
+	SkipReason string
+}
+
+// emitPrepareSkipped writes the `prepare_skipped` info event used by
+// the unconfigured-engine short-circuit and returns the matching
+// Outcome. Single point so the event payload stays consistent across
+// every engine.
+func emitPrepareSkipped(ctx context.Context, st *store.Store, repoID, worktreeID int64, eng, sourceDB, reason string) Outcome {
+	if st != nil {
+		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_skipped",
+			fmt.Sprintf("engine=%s reason=%s", eng, reason),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":    eng,
+				"source_db": sourceDB,
+				"reason":    reason,
+			})
+	}
+	return Outcome{Engine: eng, SourceDB: sourceDB, Skipped: true, SkipReason: reason}
 }
 
 // cloneRestorer is the engine-specific `SnapshotRestore` signature
@@ -532,12 +558,13 @@ func prepareMySQL(
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
 	started := time.Now()
-	if cfg.Connections.Mysql == nil {
-		return Outcome{}, fmt.Errorf("connections.mysql not configured")
-	}
 	sourceDB, err := template.Render(d.NameTemplate, tplCtx)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("render name_template: %w", err)
+	}
+	if cfg.Connections.Mysql == nil {
+		return emitPrepareSkipped(ctx, st, repoID, worktreeID, d.Engine, sourceDB,
+			"connections.mysql not configured"), nil
 	}
 
 	drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
@@ -567,6 +594,16 @@ func prepareMySQL(
 
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourceDB, version)
 	templateName := key.TemplateName()
+
+	// Pin the fingerprint for the lifetime of this prepare so the
+	// automated GC sweeps (EvictExcess, SweepBy*) can't drop the
+	// template we're about to use / about to create. Without the pin,
+	// a sibling worktree's cold-build that finishes between our
+	// LookupSnapshot and our SnapshotRestore/fanout can evict the
+	// row + DROP DATABASE the template, leaving us with `Unknown
+	// database '_tm_…'` mid-restore.
+	unpinTemplate := snapshot.Pin(key.Fingerprint())
+	defer unpinTemplate()
 
 	// Cache lookup: if SQLite knows a snapshot row for this
 	// fingerprint AND the template DB still exists in MySQL, skip
@@ -786,12 +823,13 @@ func preparePostgres(
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
 	started := time.Now()
-	if cfg.Connections.Postgres == nil {
-		return Outcome{}, fmt.Errorf("connections.postgres not configured")
-	}
 	sourceDB, err := template.Render(d.NameTemplate, tplCtx)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("render name_template: %w", err)
+	}
+	if cfg.Connections.Postgres == nil {
+		return emitPrepareSkipped(ctx, st, repoID, worktreeID, d.Engine, sourceDB,
+			"connections.postgres not configured"), nil
 	}
 
 	drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
@@ -822,6 +860,10 @@ func preparePostgres(
 
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourceDB, version)
 	templateName := key.TemplateName()
+
+	// See prepareMySQL's pin comment — same race, same fix.
+	unpinTemplate := snapshot.Pin(key.Fingerprint())
+	defer unpinTemplate()
 
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
 		fmt.Sprintf("engine=postgres source=%s template=%s", sourceDB, templateName),
@@ -1011,12 +1053,13 @@ func prepareMongo(
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
 	started := time.Now()
-	if cfg.Connections.Mongodb == nil {
-		return Outcome{}, fmt.Errorf("connections.mongodb not configured")
-	}
 	sourceDB, err := template.Render(d.NameTemplate, tplCtx)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("render name_template: %w", err)
+	}
+	if cfg.Connections.Mongodb == nil {
+		return emitPrepareSkipped(ctx, st, repoID, worktreeID, d.Engine, sourceDB,
+			"connections.mongodb not configured"), nil
 	}
 	drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
 	if err != nil {
@@ -1043,6 +1086,10 @@ func prepareMongo(
 
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourceDB, version)
 	templateName := key.TemplateName()
+
+	// See prepareMySQL's pin comment — same race, same fix.
+	unpinTemplate := snapshot.Pin(key.Fingerprint())
+	defer unpinTemplate()
 
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
 		fmt.Sprintf("engine=mongodb source=%s template=%s", sourceDB, templateName),
@@ -1222,7 +1269,11 @@ func prepareRedis(
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
 	if cfg.Connections.Redis == nil {
-		return Outcome{}, fmt.Errorf("connections.redis not configured")
+		// No sourceDB to render here — KeyPrefix is the source identifier
+		// for redis, and rendering it before the skip is harmless but
+		// noisy in the event payload, so pass the raw prefix template.
+		return emitPrepareSkipped(ctx, st, repoID, worktreeID, d.Engine, d.KeyPrefix,
+			"connections.redis not configured"), nil
 	}
 	if d.KeyPrefix == "" {
 		return Outcome{}, fmt.Errorf("redis: key_prefix required")
@@ -1265,6 +1316,10 @@ func prepareRedisPrefix(
 	version, _ := drv.EngineVersion(ctx)
 	key := computeSnapshotKey(ctx, st, d, worktreePath, sourcePrefix, version)
 	templatePrefix := "_tm:" + key.Fingerprint()[:16] + ":"
+
+	// See prepareMySQL's pin comment — same race, same fix.
+	unpinTemplate := snapshot.Pin(key.Fingerprint())
+	defer unpinTemplate()
 
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
 		fmt.Sprintf("engine=redis source=%s template=%s", sourcePrefix, templatePrefix),
@@ -1451,15 +1506,16 @@ func prepareES(
 	inheritedEnv map[string]string,
 ) (Outcome, error) {
 	started := time.Now()
-	if cfg.Connections.Elasticsearch == nil {
-		return Outcome{}, fmt.Errorf("connections.elasticsearch not configured")
-	}
 	if d.KeyPrefix == "" {
 		return Outcome{}, fmt.Errorf("elasticsearch: missing key_prefix")
 	}
 	sourcePrefix, err := template.Render(d.KeyPrefix, tplCtx)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("render key_prefix: %w", err)
+	}
+	if cfg.Connections.Elasticsearch == nil {
+		return emitPrepareSkipped(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix,
+			"connections.elasticsearch not configured"), nil
 	}
 	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 	if err != nil {
@@ -1482,6 +1538,10 @@ func prepareES(
 	// ES forbids index names starting with `_`, so we use a
 	// dedicated prefix (tm_<fingerprint>_) for the template indices.
 	templatePrefix := key.IndexPrefix() + "_"
+
+	// See prepareMySQL's pin comment — same race, same fix.
+	unpinTemplate := snapshot.Pin(key.Fingerprint())
+	defer unpinTemplate()
 
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
 		fmt.Sprintf("engine=elasticsearch source=%s template=%s", sourcePrefix, templatePrefix),
@@ -1949,7 +2009,10 @@ func teardownOne(
 	switch d.Engine {
 	case "mysql", "mariadb", "tidb":
 		if cfg.Connections.Mysql == nil {
-			return fmt.Errorf("connections.mysql not configured")
+			// Nothing to drop — engine isn't wired up. Silent skip
+			// (matches the prepare side; the database was never
+			// created in the first place).
+			return nil
 		}
 		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
 		if err != nil {
@@ -1972,7 +2035,7 @@ func teardownOne(
 		return nil
 	case "postgres", "postgresql":
 		if cfg.Connections.Postgres == nil {
-			return fmt.Errorf("connections.postgres not configured")
+			return nil
 		}
 		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
 		if err != nil {
@@ -1995,7 +2058,7 @@ func teardownOne(
 		return nil
 	case "mongodb":
 		if cfg.Connections.Mongodb == nil {
-			return fmt.Errorf("connections.mongodb not configured")
+			return nil
 		}
 		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
 		if err != nil {
@@ -2018,7 +2081,7 @@ func teardownOne(
 		return nil
 	case "redis":
 		if cfg.Connections.Redis == nil {
-			return fmt.Errorf("connections.redis not configured")
+			return nil
 		}
 		if d.KeyPrefix == "" {
 			return fmt.Errorf("redis: missing key_prefix")
@@ -2044,7 +2107,7 @@ func teardownOne(
 		return nil
 	case "elasticsearch", "opensearch":
 		if cfg.Connections.Elasticsearch == nil {
-			return fmt.Errorf("connections.elasticsearch not configured")
+			return nil
 		}
 		if d.KeyPrefix == "" {
 			return fmt.Errorf("es: missing key_prefix")

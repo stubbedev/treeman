@@ -9,19 +9,41 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
 	"golang.org/x/sync/errgroup"
 
-	_ "github.com/go-sql-driver/mysql"
+	gosqlmysql "github.com/go-sql-driver/mysql"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/ident"
 )
+
+// mysqlErrTableExists is MySQL/MariaDB Error 1050 ("Table '%s' already
+// exists"). Surfaces in two distinct scenarios during snapshot clone:
+//   - The target schema isn't actually empty (a prior aborted restore
+//     left tables behind that DROP DATABASE then DROP TABLE should
+//     have cleaned up but didn't on all engine versions/configurations).
+//   - An orphan InnoDB tablespace file (.ibd) exists in the schema
+//     directory without a matching data-dictionary entry. The next
+//     CREATE TABLE tries to write the same path and 1050s.
+//
+// Both are recoverable by issuing DROP TABLE IF EXISTS for the
+// specific table — that force-frees the dictionary row + tablespace
+// file — and retrying CREATE TABLE. See SnapshotCreate.
+const mysqlErrTableExists = 1050
+
+// isTableExistsErr returns true when err is a *mysql.MySQLError with
+// Number == 1050.
+func isTableExistsErr(err error) bool {
+	var me *gosqlmysql.MySQLError
+	return errors.As(err, &me) && me.Number == mysqlErrTableExists
+}
 
 // Driver wraps a *sql.DB plus the connection config used to open it.
 type Driver struct {
@@ -319,7 +341,22 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 				return fmt.Errorf("SHOW CREATE TABLE %s.%s: %w", qsource, qtbl, err)
 			}
 			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-				return fmt.Errorf("recreate %s: %w", qtbl, err)
+				// MySQL 1050 = "Table already exists". Most often
+				// caused by a prior aborted restore that left the
+				// schema half-populated (or an orphan InnoDB .ibd
+				// file post-crash). Force-drop the leftover and
+				// retry so the fanout completes instead of bailing
+				// the whole prepare. Conservative: only retry on
+				// 1050; any other CREATE TABLE failure still aborts.
+				if !isTableExistsErr(err) {
+					return fmt.Errorf("recreate %s: %w", qtbl, err)
+				}
+				if _, dropErr := conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+qtbl); dropErr != nil {
+					return fmt.Errorf("recreate %s: drop stale table: %w (after %v)", qtbl, dropErr, err)
+				}
+				if _, retryErr := conn.ExecContext(ctx, createStmt); retryErr != nil {
+					return fmt.Errorf("recreate %s after dropping stale table: %w", qtbl, retryErr)
+				}
 			}
 			jobs = append(jobs, tableJob{name: tbl.name, cols: colsByTable[tbl.name]})
 		}

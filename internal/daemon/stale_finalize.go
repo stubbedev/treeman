@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -74,7 +76,36 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 			})
 		slog.Warn("marked stuck finalize as stale",
 			"wt", w.WorktreePath, "started_ms", last.Ts)
+
+		// Auto-recover the engine state. A prepare killed mid-migrate
+		// leaves the active DB (branch_scoped) or the source DB
+		// (test-clone) half-migrated; a manual rerun without recovery
+		// trips on duplicate-column / table-exists errors. Drop the
+		// primary namespace now so the next `treeman wt finalize`
+		// re-runs cold-build / branch_scoped seed end-to-end. Durable
+		// per-branch copies are preserved (see prepare.RecoverStale-
+		// Worktree). Best-effort — config load / engine connect
+		// failures are surfaced as `wt_recovery_error` events but
+		// don't stop the sweep.
+		cfg, err := resolve.LoadResolvedForWorktree(w.RepoPath, w.WorktreePath)
+		if err != nil {
+			_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_recovery_error",
+				"load config for recovery: "+err.Error(),
+				row.RepoID, row.ID, "", 0, map[string]string{"error": err.Error()})
+			continue
+		}
+		prepare.RecoverStaleWorktree(ctx, &cfg, row.Slug, w.WorktreePath, row.RepoID, row.ID, st.Store)
 	}
+}
+
+// errString returns err.Error() or "<nil>" when err is nil; lets the
+// watchdog recovery branch quote the lookup error inside a Sprintf
+// without separate guards.
+func errString(err error) string {
+	if err == nil {
+		return "<nil>"
+	}
+	return err.Error()
 }
 
 // FinalizeWatchdogLoop is the live-daemon counterpart to
@@ -134,5 +165,25 @@ func sweepExpiredFinalizes(ctx context.Context, st *State) {
 			})
 		slog.Warn("watchdog: timed out in-flight finalize",
 			"wt", wtPath, "age", age)
+
+		// Same recovery as SweepStalePreparing: a wedged prepare that
+		// the watchdog cancels leaves the same half-applied engine
+		// state a daemon-restart leaves. Reset primary namespaces so
+		// the user's rerun starts clean.
+		repoPath, repoErr := st.Store.RepoPath(ctx, row.RepoID)
+		if repoErr != nil || repoPath == "" {
+			_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_recovery_error",
+				"lookup repo path for recovery: "+errString(repoErr),
+				row.RepoID, row.ID, "", 0, map[string]string{"error": errString(repoErr)})
+			continue
+		}
+		cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
+		if err != nil {
+			_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_recovery_error",
+				"load config for recovery: "+err.Error(),
+				row.RepoID, row.ID, "", 0, map[string]string{"error": err.Error()})
+			continue
+		}
+		prepare.RecoverStaleWorktree(ctx, &cfg, row.Slug, wtPath, row.RepoID, row.ID, st.Store)
 	}
 }
