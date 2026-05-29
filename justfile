@@ -71,15 +71,16 @@ test:
 # its own docker-compose stack.
 #
 # Suites are grouped into batches so docker doesn't drown under the
-# full ~60-suite fanout. Within a batch we run `go test -p 1` so
-# only one compose stack is up at a time. Between batches we stop
-# any leftover compose stacks under e2e/ so a flaky teardown can't
-# bleed containers into the next batch.
+# full ~60-suite fanout. Within a batch up to `parallel` compose
+# stacks run at once (default 4 — enough throughput without choking
+# the docker daemon). Between batches we stop any leftover compose
+# stacks under e2e/ so a flaky teardown can't bleed containers into
+# the next batch.
 #
-# Optional arg picks one batch (engines|fw1|fw2|matrix|watcher|features|cli).
-# Default `all` runs every batch sequentially. `just test-e2e-list`
-# prints batch membership.
-test-e2e batch="all":
+# First arg picks one batch (engines|fw1|fw2|matrix|watcher|features|cli)
+# or `all` for every batch. Second arg overrides the in-batch
+# concurrency. `just test-e2e-list` prints batch membership.
+test-e2e batch="all" parallel="4":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -89,8 +90,8 @@ test-e2e batch="all":
     BATCHES[fw2]="fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
     BATCHES[matrix]="matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
     BATCHES[watcher]="autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
-    BATCHES[features]="clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc mongo_dump patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
-    BATCHES[cli]="cli cli_engine cli_surface mcp mcp_write"
+    BATCHES[features]="clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
+    BATCHES[cli]="cli cli_engine cli_surface mcp mcp_write mongo_dump"
 
     ORDER=(engines fw1 fw2 matrix watcher features cli)
 
@@ -127,7 +128,8 @@ test-e2e batch="all":
         echo
         echo "==================== batch: $name ===================="
         echo "suites: $suites"
-        go test -tags=e2e -p 1 -timeout 30m $pkgs
+        echo "parallel: {{parallel}}"
+        go test -tags=e2e -p {{parallel}} -timeout 30m $pkgs
         echo "==================== cleanup after $name ===================="
         cleanup_e2e_stacks
     }
@@ -149,8 +151,8 @@ test-e2e-list:
     echo "fw2      : fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
     echo "matrix   : matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
     echo "watcher  : autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
-    echo "features : clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc mongo_dump patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
-    echo "cli      : cli cli_engine cli_surface mcp mcp_write"
+    echo "features : clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
+    echo "cli      : cli cli_engine cli_surface mcp mcp_write mongo_dump"
 
 check: lint test sync-schema sync-docs sync-flake
 
