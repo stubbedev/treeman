@@ -69,8 +69,88 @@ test:
 # and binds local ports 13306-13356 + 15432 + 27117 + 16379 + 19200
 # — make sure those are free. Each subtest brings up + tears down
 # its own docker-compose stack.
-test-e2e:
-    go test -tags=e2e ./e2e/... -timeout 30m
+#
+# Suites are grouped into batches so docker doesn't drown under the
+# full ~60-suite fanout. Within a batch we run `go test -p 1` so
+# only one compose stack is up at a time. Between batches we stop
+# any leftover compose stacks under e2e/ so a flaky teardown can't
+# bleed containers into the next batch.
+#
+# Optional arg picks one batch (engines|fw1|fw2|matrix|watcher|features|cli).
+# Default `all` runs every batch sequentially. `just test-e2e-list`
+# prints batch membership.
+test-e2e batch="all":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    declare -A BATCHES
+    BATCHES[engines]="mysql postgres mongo redis elasticsearch"
+    BATCHES[fw1]="fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
+    BATCHES[fw2]="fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
+    BATCHES[matrix]="matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
+    BATCHES[watcher]="autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
+    BATCHES[features]="clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc mongo_dump patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
+    BATCHES[cli]="cli cli_engine cli_surface mcp mcp_write"
+
+    ORDER=(engines fw1 fw2 matrix watcher features cli)
+
+    cleanup_e2e_stacks() {
+        for d in e2e/*/; do
+            local name
+            name=$(basename "$d")
+            [ "$name" = "harness" ] && continue
+            [ -f "$d/docker-compose.yml" ] || continue
+            local running
+            running=$(docker ps -aq --filter "label=com.docker.compose.project=$name" 2>/dev/null || true)
+            if [ -n "$running" ]; then
+                echo "  cleanup: stopping leftover stack '$name'"
+                (cd "$d" && docker compose down -v --remove-orphans >/dev/null 2>&1 || true)
+            fi
+        done
+    }
+
+    run_batch() {
+        local name=$1
+        local suites=${BATCHES[$name]:-}
+        if [ -z "$suites" ]; then
+            echo "unknown batch: $name (valid: ${ORDER[*]})" >&2
+            exit 2
+        fi
+        local pkgs=""
+        for s in $suites; do
+            if [ ! -d "e2e/$s" ]; then
+                echo "  warn: e2e/$s missing — skipping"
+                continue
+            fi
+            pkgs+=" ./e2e/$s/..."
+        done
+        echo
+        echo "==================== batch: $name ===================="
+        echo "suites: $suites"
+        go test -tags=e2e -p 1 -timeout 30m $pkgs
+        echo "==================== cleanup after $name ===================="
+        cleanup_e2e_stacks
+    }
+
+    SEL="{{batch}}"
+    if [ "$SEL" = "all" ]; then
+        cleanup_e2e_stacks
+        for b in "${ORDER[@]}"; do run_batch "$b"; done
+    else
+        run_batch "$SEL"
+    fi
+
+# List the e2e batch groupings used by `just test-e2e`.
+test-e2e-list:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "engines  : mysql postgres mongo redis elasticsearch"
+    echo "fw1      : fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
+    echo "fw2      : fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
+    echo "matrix   : matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
+    echo "watcher  : autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
+    echo "features : clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc mongo_dump patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
+    echo "cli      : cli cli_engine cli_surface mcp mcp_write"
 
 check: lint test sync-schema sync-docs sync-flake
 
