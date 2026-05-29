@@ -117,6 +117,76 @@ type Config struct {
 	// `octane`, `webpack`, `reverb`) — the name shows up in every
 	// `{port_<name>}` reference and in `wt show` output.
 	Ports map[string]PortSpec `yaml:"ports,omitempty"`
+
+	// Status configures the `treeman status` widget output (icons,
+	// labels, hover lines, custom bar formats). Lives in the global
+	// config since the widget aggregates worktrees across every repo.
+	Status StatusConfig `yaml:"status,omitempty"`
+}
+
+// StatusConfig configures `treeman status` — the bar/waybar widget
+// that aggregates worktree health across every registered repo. Each
+// active worktree falls into one of four buckets:
+//
+//	stable  — ready (last finalize succeeded, or never ran)
+//	up      — being prepared (finalize in progress)
+//	down    — being torn down (teardown in progress)
+//	failed  — last finalize errored
+//
+// All knobs below feed the `{key}` template syntax used elsewhere in
+// `.treeman.yaml` (no separate templating engine). The built-in
+// `--format` values are `icon`, `hover`, `waybar`, and `json`; entries
+// in `formats` add or override named single-line formats.
+type StatusConfig struct {
+	// Icons holds the glyph for each bucket. Exposed to format
+	// templates as `{icon_stable}` / `{icon_up}` / `{icon_down}` /
+	// `{icon_failed}`, plus `{icon}` for the worst non-empty bucket.
+	// Defaults to Nerd Font glyphs; set an icon to a single space to
+	// suppress it (an empty string falls back to the default).
+	Icons StatusBuckets `yaml:"icons,omitempty"`
+
+	// Labels holds the text label for each bucket. Exposed as
+	// `{label_stable}` etc. Defaults to the bucket name.
+	Labels StatusBuckets `yaml:"labels,omitempty"`
+
+	// Separator joins the segments of the built-in `icon` line and is
+	// exposed to templates as `{sep}`. Default " | ".
+	Separator string `yaml:"separator,omitempty"`
+
+	// Header is the `{key}` template for each repo heading in the
+	// built-in `hover` format. Tokens: `{repo}`, `{total}`,
+	// `{stable}`, `{up}`, `{down}`, `{failed}` (repo-scoped counts).
+	// Default "{repo}  ({total})".
+	Header string `yaml:"header,omitempty"`
+
+	// Row is the `{key}` template for each worktree line in the
+	// built-in `hover` format. Tokens: `{branch}`, `{slug}`,
+	// `{state}`, `{bucket}`, `{main}`, `{state_suffix}`, `{path}`,
+	// `{icon}`. Default "  {main}{branch}{state_suffix}".
+	Row string `yaml:"row,omitempty"`
+
+	// MainMarker is substituted for `{main}` on a repo's main-worktree
+	// row (empty string on linked worktrees). Default "★ ".
+	MainMarker string `yaml:"main_marker,omitempty"`
+
+	// Formats declares named single-line `{key}` templates selectable
+	// with `treeman status --format <name>`. A name matching a
+	// built-in (`icon`/`waybar`) overrides it. Available tokens match
+	// the `icon` line: `{total}`, `{stable}`, `{up}`, `{down}`,
+	// `{failed}`, `{icon_*}`, `{icon}`, `{label_*}`, `{class}`,
+	// `{sep}`. A flat template cannot express the multi-line hover
+	// body — customize that with `header` / `row` instead.
+	Formats map[string]string `yaml:"formats,omitempty"`
+}
+
+// StatusBuckets carries one string per worktree bucket. Reused for
+// both the `icons` and `labels` maps so the four bucket names stay in
+// lockstep across the schema.
+type StatusBuckets struct {
+	Stable string `yaml:"stable,omitempty"`
+	Up     string `yaml:"up,omitempty"`
+	Down   string `yaml:"down,omitempty"`
+	Failed string `yaml:"failed,omitempty"`
 }
 
 // AutoFetchConfig — `auto_fetch:` block. Periodic daemon-side
@@ -1676,6 +1746,45 @@ func applyDefaults(cfg *Config) {
 		// Set explicitly to a negative value to mean "never prune"
 		// (handled by callers as <= 0).
 		cfg.Logs.KeepDays = 14
+	}
+	if cfg.Status.Separator == "" {
+		cfg.Status.Separator = " | "
+	}
+	if cfg.Status.Header == "" {
+		cfg.Status.Header = "{repo}  ({total})"
+	}
+	if cfg.Status.Row == "" {
+		cfg.Status.Row = "  {main}{branch}{state_suffix}"
+	}
+	if cfg.Status.MainMarker == "" {
+		cfg.Status.MainMarker = "★ "
+	}
+	if cfg.Status.Labels.Stable == "" {
+		cfg.Status.Labels.Stable = "stable"
+	}
+	if cfg.Status.Labels.Up == "" {
+		cfg.Status.Labels.Up = "up"
+	}
+	if cfg.Status.Labels.Down == "" {
+		cfg.Status.Labels.Down = "down"
+	}
+	if cfg.Status.Labels.Failed == "" {
+		cfg.Status.Labels.Failed = "failed"
+	}
+	// Nerd Font glyphs per bucket (Material Design, U+F14Cx). Written
+	// as \U escapes so they survive source round-trips. Set an icon to
+	// a single space in YAML to suppress it (empty re-triggers these).
+	if cfg.Status.Icons.Stable == "" {
+		cfg.Status.Icons.Stable = "\U000f14cf" // md-circle (stable)
+	}
+	if cfg.Status.Icons.Up == "" {
+		cfg.Status.Icons.Up = "\U000f14ca" // md-arrow-up (preparing)
+	}
+	if cfg.Status.Icons.Down == "" {
+		cfg.Status.Icons.Down = "\U000f14cb" // md-arrow-down (teardown)
+	}
+	if cfg.Status.Icons.Failed == "" {
+		cfg.Status.Icons.Failed = "\U000f14cc" // md-alert (failed)
 	}
 }
 

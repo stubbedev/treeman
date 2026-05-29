@@ -18,6 +18,11 @@ import (
 // uses. Exposed so callers can mirror it from a single source.
 const LaunchdLabel = "dev.stubbe.treemand"
 
+// goos is the OS selector for Start/Stop. It mirrors runtime.GOOS in
+// production and is overridable in tests so the launchd (darwin) and
+// systemd (linux) branches can both be exercised on a single host.
+var goos = runtime.GOOS
+
 // Start brings treemand up. Tries the OS-native init first (systemd
 // --user on Linux, launchctl kickstart on macOS) so an installed
 // auto-start unit keeps managing the process; otherwise it forks
@@ -26,7 +31,7 @@ const LaunchdLabel = "dev.stubbe.treemand"
 // Returns (pid, nil) when the binary was forked; (0, nil) when the
 // init system handled it.
 func Start(ctx context.Context) (int, error) {
-	switch runtime.GOOS {
+	switch goos {
 	case "darwin":
 		uid := os.Getuid()
 		domain := fmt.Sprintf("gui/%d", uid)
@@ -59,7 +64,7 @@ func Start(ctx context.Context) (int, error) {
 // available so an auto-start unit doesn't immediately respawn the
 // process; falls back to the shutdown RPC.
 func Stop(ctx context.Context) error {
-	switch runtime.GOOS {
+	switch goos {
 	case "darwin":
 		uid := os.Getuid()
 		domain := fmt.Sprintf("gui/%d", uid)

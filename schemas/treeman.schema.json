@@ -783,6 +783,63 @@
       "type": "object",
       "description": "SnapshotsConfig — `snapshots:` block. Carries the retention /\neviction policies for cached engine templates. Snapshot state\nlives entirely in SQLite + the engines themselves (template DBs);\nno on-disk cache directory needs configuring.\n\n`CapPerRepo` is the hard cap that triggers eviction on every\n`RecordSnapshot`. LRU rows above the cap are dropped immediately\n(in a background goroutine) so a busy worktree workflow never\naccumulates unbounded cached templates per repo.\n\n`KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`\ndrive the periodic daemon-side sweep; they're not consulted by\nthe inline-on-write eviction path."
     },
+    "StatusBuckets": {
+      "properties": {
+        "stable": {
+          "type": "string"
+        },
+        "up": {
+          "type": "string"
+        },
+        "down": {
+          "type": "string"
+        },
+        "failed": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "StatusBuckets carries one string per worktree bucket. Reused for\nboth the `icons` and `labels` maps so the four bucket names stay in\nlockstep across the schema."
+    },
+    "StatusConfig": {
+      "properties": {
+        "icons": {
+          "$ref": "#/$defs/StatusBuckets",
+          "description": "Icons holds the glyph for each bucket. Exposed to format\ntemplates as `{icon_stable}` / `{icon_up}` / `{icon_down}` /\n`{icon_failed}`, plus `{icon}` for the worst non-empty bucket.\nDefaults to Nerd Font glyphs; set an icon to a single space to\nsuppress it (an empty string falls back to the default)."
+        },
+        "labels": {
+          "$ref": "#/$defs/StatusBuckets",
+          "description": "Labels holds the text label for each bucket. Exposed as\n`{label_stable}` etc. Defaults to the bucket name."
+        },
+        "separator": {
+          "type": "string",
+          "description": "Separator joins the segments of the built-in `icon` line and is\nexposed to templates as `{sep}`. Default \" | \"."
+        },
+        "header": {
+          "type": "string",
+          "description": "Header is the `{key}` template for each repo heading in the\nbuilt-in `hover` format. Tokens: `{repo}`, `{total}`,\n`{stable}`, `{up}`, `{down}`, `{failed}` (repo-scoped counts).\nDefault \"{repo}  ({total})\"."
+        },
+        "row": {
+          "type": "string",
+          "description": "Row is the `{key}` template for each worktree line in the\nbuilt-in `hover` format. Tokens: `{branch}`, `{slug}`,\n`{state}`, `{bucket}`, `{main}`, `{state_suffix}`, `{path}`,\n`{icon}`. Default \"  {main}{branch}{state_suffix}\"."
+        },
+        "main_marker": {
+          "type": "string",
+          "description": "MainMarker is substituted for `{main}` on a repo's main-worktree\nrow (empty string on linked worktrees). Default \"★ \"."
+        },
+        "formats": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Formats declares named single-line `{key}` templates selectable\nwith `treeman status --format \u003cname\u003e`. A name matching a\nbuilt-in (`icon`/`waybar`) overrides it. Available tokens match\nthe `icon` line: `{total}`, `{stable}`, `{up}`, `{down}`,\n`{failed}`, `{icon_*}`, `{icon}`, `{label_*}`, `{class}`,\n`{sep}`. A flat template cannot express the multi-line hover\nbody — customize that with `header` / `row` instead."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "StatusConfig configures `treeman status` — the bar/waybar widget\nthat aggregates worktree health across every registered repo. Each\nactive worktree falls into one of four buckets:\n\n\tstable  — ready (last finalize succeeded, or never ran)\n\tup      — being prepared (finalize in progress)\n\tdown    — being torn down (teardown in progress)\n\tfailed  — last finalize errored\n\nAll knobs below feed the `{key}` template syntax used elsewhere in\n`.treeman.yaml` (no separate templating engine). The built-in\n`--format` values are `icon`, `hover`, `waybar`, and `json`; entries\nin `formats` add or override named single-line formats."
+    },
     "Step": {
       "properties": {
         "run": {
@@ -919,6 +976,10 @@
       },
       "type": "object",
       "description": "Ports declares per-worktree port slots. Each entry is a named\nslot with a port range; treeman allocates a free port per slot\nat `wt create` time and exposes it via the `{port_\u003cname\u003e}`\ntemplate token (usable in `patches[].set[*]` values).\nPersisted in SQLite so the assignment survives across daemon\nrestarts; freed on `wt delete`.\n\nUse slot names that match the role they fill in your app (e.g.\n`octane`, `webpack`, `reverb`) — the name shows up in every\n`{port_\u003cname\u003e}` reference and in `wt show` output."
+    },
+    "status": {
+      "$ref": "#/$defs/StatusConfig",
+      "description": "Status configures the `treeman status` widget output (icons,\nlabels, hover lines, custom bar formats). Lives in the global\nconfig since the widget aggregates worktrees across every repo."
     }
   },
   "additionalProperties": false,

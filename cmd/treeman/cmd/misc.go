@@ -754,12 +754,15 @@ func daemonUninstall(ctx context.Context, c *cli.Command) error {
 	}
 }
 
-func daemonInstallSystemd(ctx context.Context) error {
-	unit := `[Install]
+// systemdUnitContent renders the treemand.service unit with the given
+// ExecStart path. Kept pure so tests can assert the generated unit
+// without touching the real systemd manager.
+func systemdUnitContent(execStart string) string {
+	return `[Install]
 WantedBy=default.target
 
 [Service]
-ExecStart=` + mustResolveTreemand() + `
+ExecStart=` + execStart + `
 Restart=on-failure
 RestartSec=2
 Type=simple
@@ -768,6 +771,39 @@ Type=simple
 After=default.target
 Description=Treeman per-worktree DB orchestrator daemon
 `
+}
+
+// launchdPlistContent renders the LaunchAgent plist for treemand. Pure
+// so tests can validate the XML + keys without invoking launchctl.
+// KeepAlive is a dict — `SuccessfulExit=false` keeps launchd from
+// respawning the daemon after `treeman daemon stop` (which exits
+// cleanly via the shutdown RPC). Crash exits (non-zero) still trigger
+// relaunch. ThrottleInterval keeps a crash-loop from pegging the CPU
+// while a misconfiguration drives the daemon to die on boot.
+func launchdPlistContent(bin, logPath string) string {
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>            <string>` + daemonctl.LaunchdLabel + `</string>
+    <key>ProgramArguments</key> <array><string>` + bin + `</string></array>
+    <key>RunAtLoad</key>        <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key> <integer>5</integer>
+    <key>StandardOutPath</key>  <string>` + logPath + `</string>
+    <key>StandardErrorPath</key><string>` + logPath + `</string>
+    <key>ProcessType</key>      <string>Background</string>
+</dict>
+</plist>
+`
+}
+
+func daemonInstallSystemd(ctx context.Context) error {
+	unit := systemdUnitContent(mustResolveTreemand())
 	home, _ := os.UserHomeDir()
 	dst := filepath.Join(home, ".config", "systemd", "user", "treemand.service")
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
@@ -801,31 +837,7 @@ func daemonInstallLaunchd(ctx context.Context) error {
 	home, _ := os.UserHomeDir()
 	logDir := filepath.Join(home, ".local", "share", "treeman")
 	_ = os.MkdirAll(logDir, 0o755)
-	// KeepAlive is a dict — `SuccessfulExit=false` keeps launchd from
-	// respawning the daemon after `treeman daemon stop` (which exits
-	// cleanly via the shutdown RPC). Crash exits (non-zero) still
-	// trigger relaunch. ThrottleInterval keeps a crash-loop from
-	// pegging the CPU while a misconfiguration drives the daemon to
-	// die on boot.
-	plist := `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>            <string>` + daemonctl.LaunchdLabel + `</string>
-    <key>ProgramArguments</key> <array><string>` + bin + `</string></array>
-    <key>RunAtLoad</key>        <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key> <integer>5</integer>
-    <key>StandardOutPath</key>  <string>` + filepath.Join(logDir, "treemand.log") + `</string>
-    <key>StandardErrorPath</key><string>` + filepath.Join(logDir, "treemand.log") + `</string>
-    <key>ProcessType</key>      <string>Background</string>
-</dict>
-</plist>
-`
+	plist := launchdPlistContent(bin, filepath.Join(logDir, "treemand.log"))
 	dst := filepath.Join(home, "Library", "LaunchAgents", daemonctl.LaunchdLabel+".plist")
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err

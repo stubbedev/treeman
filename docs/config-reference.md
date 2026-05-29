@@ -117,6 +117,12 @@ Use slot names that match the role they fill in your app (e.g.
 `octane`, `webpack`, `reverb`) — the name shows up in every
 `{port_<name>}` reference and in `wt show` output.
 
+### `status` *([StatusConfig](#statusconfig))*
+
+Status configures the `treeman status` widget output (icons,
+labels, hover lines, custom bar formats). Lives in the global
+config since the widget aggregates worktrees across every repo.
+
 ## Types
 
 ### Action
@@ -736,6 +742,83 @@ dir exceeds N gigabytes on disk. Default 50.
 
 Cadence (minutes) of the daemon's periodic snapshot-sweep
 goroutine. Default 60.
+
+### StatusBuckets
+
+StatusBuckets carries one string per worktree bucket. Reused for
+both the `icons` and `labels` maps so the four bucket names stay in
+lockstep across the schema.
+
+#### `stable` *(string)*
+
+#### `up` *(string)*
+
+#### `down` *(string)*
+
+#### `failed` *(string)*
+
+### StatusConfig
+
+StatusConfig configures `treeman status` — the bar/waybar widget
+that aggregates worktree health across every registered repo. Each
+active worktree falls into one of four buckets:
+
+	stable  — ready (last finalize succeeded, or never ran)
+	up      — being prepared (finalize in progress)
+	down    — being torn down (teardown in progress)
+	failed  — last finalize errored
+
+All knobs below feed the `{key}` template syntax used elsewhere in
+`.treeman.yaml` (no separate templating engine). The built-in
+`--format` values are `icon`, `hover`, `waybar`, and `json`; entries
+in `formats` add or override named single-line formats.
+
+#### `icons` *([StatusBuckets](#statusbuckets))*
+
+Icons holds the glyph for each bucket. Exposed to format
+templates as `{icon_stable}` / `{icon_up}` / `{icon_down}` /
+`{icon_failed}`, plus `{icon}` for the worst non-empty bucket.
+Defaults to Nerd Font glyphs; set an icon to a single space to
+suppress it (an empty string falls back to the default).
+
+#### `labels` *([StatusBuckets](#statusbuckets))*
+
+Labels holds the text label for each bucket. Exposed as
+`{label_stable}` etc. Defaults to the bucket name.
+
+#### `separator` *(string)*
+
+Separator joins the segments of the built-in `icon` line and is
+exposed to templates as `{sep}`. Default " | ".
+
+#### `header` *(string)*
+
+Header is the `{key}` template for each repo heading in the
+built-in `hover` format. Tokens: `{repo}`, `{total}`,
+`{stable}`, `{up}`, `{down}`, `{failed}` (repo-scoped counts).
+Default "{repo}  ({total})".
+
+#### `row` *(string)*
+
+Row is the `{key}` template for each worktree line in the
+built-in `hover` format. Tokens: `{branch}`, `{slug}`,
+`{state}`, `{bucket}`, `{main}`, `{state_suffix}`, `{path}`,
+`{icon}`. Default "  {main}{branch}{state_suffix}".
+
+#### `main_marker` *(string)*
+
+MainMarker is substituted for `{main}` on a repo's main-worktree
+row (empty string on linked worktrees). Default "★ ".
+
+#### `formats` *(object)*
+
+Formats declares named single-line `{key}` templates selectable
+with `treeman status --format <name>`. A name matching a
+built-in (`icon`/`waybar`) overrides it. Available tokens match
+the `icon` line: `{total}`, `{stable}`, `{up}`, `{down}`,
+`{failed}`, `{icon_*}`, `{icon}`, `{label_*}`, `{class}`,
+`{sep}`. A flat template cannot express the multi-line hover
+body — customize that with `header` / `row` instead.
 
 ### Step
 

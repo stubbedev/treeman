@@ -9,6 +9,35 @@ permissions:
   contents: write
 
 jobs:
+  e2e:
+    name: e2e (${{ matrix.batch }})
+    # Docker-backed engine suites — run only on release tags, since the
+    # full ~60-suite fanout pulls ~3GB of images and is too heavy for
+    # every push/PR. Linux-only: GitHub's macOS runners have no usable
+    # Docker daemon, and every e2e test gates on harness.SkipIfNoDocker.
+    # Advisory: the publish job does NOT depend on this, so a failing
+    # (or flaky) batch surfaces in the run without blocking the release.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One runner per batch — mirrors the groupings in `just
+        # test-e2e` so the fanout parallelises instead of serialising
+        # behind a single docker daemon.
+        batch: [engines, fw1, fw2, matrix, watcher, features, cli]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: extractions/setup-just@v4
+      - name: docker preflight
+        run: docker version && docker compose version
+      - name: run e2e batch
+        run: just test-e2e ${{ matrix.batch }}
+
   build:
     name: build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ${{ matrix.os }}
@@ -30,7 +59,7 @@ jobs:
             os: macos-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true

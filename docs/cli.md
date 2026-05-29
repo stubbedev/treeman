@@ -190,6 +190,30 @@ switch/create branch with auto-routing (use as cd "$(treeman wt go …)")
 | `-r`, `--repo` |  |
 | `--no-fetch` | skip the pre-checkout `git fetch origin <base>` |
 
+### `treeman status`
+
+summarize worktree health across all repos (bar/waybar widget)
+
+```
+Aggregates every active worktree across all registered repos into
+four buckets — stable (ready), up (preparing), down (tearing down),
+failed (last finalize errored) — and renders them.
+
+Formats (--format):
+  icon    one-line counter (default), plain text
+  hover   per-repo grouped detail, plain text (the "cal-style" block)
+  waybar  {"text","tooltip","class"} JSON for a waybar custom module
+  json    the raw aggregated shape (counts + per-repo worktrees)
+  <name>  a custom single-line {key} format from status.formats
+
+Icons, labels, separators, the hover header/row templates, and custom
+formats are all configured under the global config's status: block.
+```
+
+| Flag | Usage |
+|---|---|
+| `-f`, `--format` | icon \| hover \| waybar \| json \| <name from status.formats> |
+
 ### `treeman main`
 
 manage main-worktree enrollment (per-branch DBs at repo root)
