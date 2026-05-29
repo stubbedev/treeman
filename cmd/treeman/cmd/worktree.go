@@ -500,23 +500,58 @@ func lastLabel(headTs, visitedTs int64) string {
 
 func wtFinalize() *cli.Command {
 	return &cli.Command{
-		Name:  "finalize",
-		Usage: "rerun setup + prepare for a worktree (default via daemon; --local runs inline)",
+		Name:      "finalize",
+		Usage:     "rerun setup + prepare for a worktree (default via daemon; --local runs inline)",
+		ArgsUsage: "[path|slug|branch]",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo"},
 			&cli.BoolFlag{Name: "local", Usage: "run setup + prepare in this process instead of dispatching to the daemon"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			path := "."
-			if c.NArg() >= 1 {
-				path = c.Args().First()
+			if c.NArg() > 1 {
+				return fmt.Errorf("finalize takes at most one positional (path|slug|branch); got %d", c.NArg())
 			}
-			wtPath := MustAbs(path)
-			repoRoot, err := resolveRepo(c.String("repo"))
-			if err != nil {
-				repoRoot, err = DiscoverRepoRoot(wtPath)
-				if err != nil {
-					return err
+			arg := ""
+			if c.NArg() == 1 {
+				arg = c.Args().First()
+			}
+			repoRoot, repoErr := resolveRepo(c.String("repo"))
+
+			var wtPath string
+			switch {
+			case arg == "" || arg == ".":
+				wtPath = MustAbs(".")
+				if repoErr != nil {
+					var err error
+					repoRoot, err = DiscoverRepoRoot(wtPath)
+					if err != nil {
+						return err
+					}
+				}
+			default:
+				abs := MustAbs(arg)
+				if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
+					wtPath = abs
+					if repoErr != nil {
+						var derr error
+						repoRoot, derr = DiscoverRepoRoot(wtPath)
+						if derr != nil {
+							return derr
+						}
+					}
+				} else {
+					// Not a directory — try resolving as a registered
+					// slug/branch/basename. Without a repo to scope the
+					// lookup, an unknown token would silently fabricate a
+					// path under cwd; refuse instead.
+					if repoErr != nil {
+						return fmt.Errorf("cannot resolve %q: not a directory and no repo to scope a slug lookup (cd into the repo or pass --repo)", arg)
+					}
+					p, ok := wt.LookupWorktree(ctx, repoRoot, arg, cliSink{})
+					if !ok {
+						return fmt.Errorf("no worktree matches %q (expected a path or registered slug/branch)", arg)
+					}
+					wtPath = p
 				}
 			}
 

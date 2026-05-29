@@ -53,7 +53,7 @@ type State struct {
 	// state (DB + registry row) after the worktree has been deleted.
 	inFlightMu        sync.Mutex
 	inFlightTeardowns map[string]struct{}
-	inFlightFinalizes map[string]context.CancelFunc
+	inFlightFinalizes map[string]inFlightFinalize
 
 	// reapQueuesMu guards reapQueues. Each repo gets a single worker
 	// goroutine draining a buffered channel of trash paths — bursty
@@ -99,6 +99,16 @@ type State struct {
 	syncLastSkip map[string]string
 }
 
+// inFlightFinalize is the per-path tracking record kept in
+// State.inFlightFinalizes. cancel preempts the FinalizeWorktree
+// goroutine via its context; startedAt anchors the watchdog that
+// fails-out hung finalizes whose owning child has wedged (see
+// WatchdogStalePreparing).
+type inFlightFinalize struct {
+	cancel    context.CancelFunc
+	startedAt time.Time
+}
+
 // DBDropJob is one queued `prepare.TeardownDatabases` invocation,
 // scheduled by TeardownWorktree to run in the background after
 // teardown hooks complete. The cfg field is a value copy — the
@@ -136,7 +146,7 @@ func NewState(bg context.Context, s *store.Store) *State {
 		lifecycleWatchers: map[string]*WatcherEntry{},
 		teardownLks:       map[string]*sync.Mutex{},
 		inFlightTeardowns: map[string]struct{}{},
-		inFlightFinalizes: map[string]context.CancelFunc{},
+		inFlightFinalizes: map[string]inFlightFinalize{},
 		reapQueues:        map[string]chan string{},
 		dropQueues:        map[string]chan DBDropJob{},
 		syncBackoff:       map[string]time.Time{},
@@ -268,7 +278,7 @@ func (st *State) MarkFinalizeInFlight(wtPath string, cancel context.CancelFunc) 
 	if cancel == nil {
 		cancel = func() {}
 	}
-	st.inFlightFinalizes[wtPath] = cancel
+	st.inFlightFinalizes[wtPath] = inFlightFinalize{cancel: cancel, startedAt: time.Now()}
 	return true
 }
 
@@ -299,13 +309,28 @@ func (st *State) IsFinalizeInFlight(wtPath string) bool {
 // after the worktree has been removed.
 func (st *State) CancelFinalize(wtPath string) bool {
 	st.inFlightMu.Lock()
-	cancel, ok := st.inFlightFinalizes[wtPath]
+	entry, ok := st.inFlightFinalizes[wtPath]
 	st.inFlightMu.Unlock()
-	if !ok || cancel == nil {
+	if !ok || entry.cancel == nil {
 		return false
 	}
-	cancel()
+	entry.cancel()
 	return true
+}
+
+// SnapshotInFlightFinalizes returns a copy of (wtPath, startedAt) for
+// every FinalizeWorktree currently running. Used by the watchdog to
+// detect finalizes whose owning child has wedged past the prepare
+// timeout. Copying the map (rather than handing back the live one)
+// keeps the inFlightMu critical section short.
+func (st *State) SnapshotInFlightFinalizes() map[string]time.Time {
+	st.inFlightMu.Lock()
+	defer st.inFlightMu.Unlock()
+	out := make(map[string]time.Time, len(st.inFlightFinalizes))
+	for p, e := range st.inFlightFinalizes {
+		out[p] = e.startedAt
+	}
+	return out
 }
 
 // WaitFinalizeCleared blocks until no FinalizeWorktree is in flight

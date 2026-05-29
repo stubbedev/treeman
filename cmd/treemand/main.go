@@ -123,6 +123,15 @@ func run() error {
 		cr.Start(ctx)
 	}
 
+	// Reconcile any finalize that was in flight when the previous
+	// daemon died — the goroutine is gone, so the row would otherwise
+	// stay at derived state=preparing forever. SweepStalePreparing
+	// emits a synthetic wt_finalize error so the user sees the wedge
+	// and can rerun `treeman wt finalize`. Runs BEFORE watchers come
+	// up so the stale event is visible regardless of whether a fresh
+	// finalize is about to fire.
+	daemon.SweepStalePreparing(ctx, st)
+
 	// Auto-resume per-repo watchers on boot. Each known repo gets
 	// its watchers re-spawned via the same path the
 	// watcher_start RPC takes. Failures per-repo are logged + skipped
@@ -204,6 +213,12 @@ func run() error {
 			}
 		}
 	}
+
+	// Watchdog for in-flight FinalizeWorktree goroutines: cancels +
+	// flags any that exceed the prepare timeout. Catches the
+	// daemon-alive-but-child-wedged variant of issue #9 that
+	// SweepStalePreparing (boot-only) can't cover.
+	go daemon.FinalizeWatchdogLoop(st.BgCtx, st)
 
 	// Periodic snapshot GC sweep. Runs at the cadence declared by
 	// `snapshots.retention.gc_interval_minutes` (default 60); each

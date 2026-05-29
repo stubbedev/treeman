@@ -71,6 +71,55 @@ func TestRepairRegistersMissingWorktrees(t *testing.T) {
 	}
 }
 
+func TestRepairPreservesMainWorktreeRow(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	if out, err := exec.Command("git", "init", "-q", "-b", "main", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+
+	st, err := store.Open(ctx, filepath.Join(tmp, "treeman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	repoID, _ := st.EnsureRepo(ctx, repo, "repo")
+	// Simulate `treeman main enable` having enrolled the repo root as
+	// an active is_main=1 worktree row.
+	mainID, err := st.EnsureMainWorktree(ctx, repoID, repo, "main_slug", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// And a genuinely-dead linked-wt row that should still get
+	// unregistered.
+	_, _ = st.EnsureWorktree(ctx, repoID, "/nonexistent-wt", "dead", "feature")
+
+	res, err := Repair(ctx, st, repo, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range res.Unregistered {
+		if p == repo {
+			t.Errorf("Repair unregistered the active main worktree row at %s", repo)
+		}
+	}
+	if len(res.Unregistered) != 1 || res.Unregistered[0] != "/nonexistent-wt" {
+		t.Errorf("Unregistered = %+v, want [/nonexistent-wt]", res.Unregistered)
+	}
+
+	// Verify the main row is still active.
+	row, err := st.LookupMainWorktree(ctx, repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ID != mainID {
+		t.Errorf("main row missing after Repair: got id=%d want %d", row.ID, mainID)
+	}
+}
+
 func TestRepairUnregistersMissingFromGit(t *testing.T) {
 	requireGit(t)
 	ctx := context.Background()

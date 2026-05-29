@@ -71,26 +71,47 @@ func Repair(ctx context.Context, st *store.Store, repoRoot string, detectBranch 
 		}
 	}()
 
-	rows, err := tx.QueryContext(ctx, `SELECT id, path FROM worktrees WHERE repo_id = ? AND deleted_at IS NULL`, repoID)
+	rows, err := tx.QueryContext(ctx, `SELECT id, path, is_main FROM worktrees WHERE repo_id = ? AND deleted_at IS NULL`, repoID)
 	if err != nil {
 		return RepairResult{}, err
 	}
-	dbWTs := map[string]int64{}
+	type dbRow struct {
+		id     int64
+		isMain bool
+	}
+	dbWTs := map[string]dbRow{}
 	for rows.Next() {
 		var id int64
 		var p string
-		if err := rows.Scan(&id, &p); err == nil {
-			dbWTs[p] = id
+		var isMain int
+		if err := rows.Scan(&id, &p, &isMain); err == nil {
+			dbWTs[p] = dbRow{id: id, isMain: isMain == 1}
 		}
 	}
 	_ = rows.Close()
 
 	out := RepairResult{}
 	gitSet := map[string]bool{}
+	// The repo root is the main worktree; `git worktree list` always
+	// reports it. GitWorktreePaths deliberately omits it (it only
+	// scans .git/worktrees/<name>/gitdir entries, which cover linked
+	// worktrees), so add it explicitly when the directory still
+	// exists. Without this, a repaired repo would always have its
+	// main-wt row unregistered alongside genuinely dead rows.
+	if fi, err := os.Stat(repoRoot); err == nil && fi.IsDir() {
+		gitSet[repoRoot] = true
+	}
 	now := nowMillis()
 	for _, p := range gitPaths {
 		gitSet[p] = true
 		if _, ok := dbWTs[p]; ok {
+			continue
+		}
+		if p == repoRoot {
+			// Main worktree rows are owned by `treeman main enable`;
+			// skip the auto-register branch (which would synthesise a
+			// path-hash slug). The row, if any, is already preserved
+			// by the gitSet seed above.
 			continue
 		}
 		branch := detectBranch(p)
@@ -123,11 +144,18 @@ func Repair(ctx context.Context, st *store.Store, repoRoot string, detectBranch 
 		}
 		out.Registered = append(out.Registered, p)
 	}
-	for p, id := range dbWTs {
+	for p, row := range dbWTs {
 		if gitSet[p] {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE worktrees SET deleted_at = ? WHERE id = ?`, now, id); err != nil {
+		if row.isMain {
+			// Defensive: an is_main row whose path is missing from
+			// git's view is almost always our own gitSet gap, not a
+			// dead row. Leave it alone — `treeman main disable` is the
+			// supported way to retire a main-wt enrollment.
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE worktrees SET deleted_at = ? WHERE id = ?`, now, row.id); err != nil {
 			out.Errors = append(out.Errors, fmt.Sprintf("unregister %s: %v", p, err))
 			continue
 		}
