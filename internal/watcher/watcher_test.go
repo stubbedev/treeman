@@ -39,8 +39,7 @@ func TestDispatchesOnMatchingGlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = w.Start(ctx) }()
 
 	// Give the watcher a moment to register its dirs.
@@ -133,8 +132,7 @@ func TestReArmsAfterFlush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = w.Start(ctx) }()
 	time.Sleep(150 * time.Millisecond) // let addAllDirs subscribe
 

@@ -28,13 +28,15 @@ func writeFile(t *testing.T, dir, name, body string) string {
 	return abs
 }
 
-func cachedRow(t *testing.T, s *Store, path string) (size, mtime int64, hash string, cachedAt int64, ok bool) {
+func cachedRow(t *testing.T, s *Store, path string) (cachedAt int64, ok bool) {
 	t.Helper()
+	var size, mtime int64
+	var hash string
 	row := s.DB.QueryRow(`SELECT size, mtime_ns, hash, cached_at FROM file_hashes WHERE path = ?`, path)
 	if err := row.Scan(&size, &mtime, &hash, &cachedAt); err != nil {
-		return 0, 0, "", 0, false
+		return 0, false
 	}
-	return size, mtime, hash, cachedAt, true
+	return cachedAt, true
 }
 
 func TestBatchHashedFiles_FreshAndCacheHit(t *testing.T) {
@@ -51,7 +53,7 @@ func TestBatchHashedFiles_FreshAndCacheHit(t *testing.T) {
 	if first[a] == "" || first[b] == "" || first[a] == first[b] {
 		t.Fatalf("unexpected fresh hashes: %+v", first)
 	}
-	_, _, _, firstCachedAt, ok := cachedRow(t, s, a)
+	firstCachedAt, ok := cachedRow(t, s, a)
 	if !ok {
 		t.Fatal("row not persisted")
 	}
@@ -66,7 +68,7 @@ func TestBatchHashedFiles_FreshAndCacheHit(t *testing.T) {
 	if second[a] != first[a] || second[b] != first[b] {
 		t.Fatalf("hash drift across cache hit: first=%+v second=%+v", first, second)
 	}
-	_, _, _, secondCachedAt, _ := cachedRow(t, s, a)
+	secondCachedAt, _ := cachedRow(t, s, a)
 	if secondCachedAt <= firstCachedAt {
 		t.Errorf("cached_at not refreshed on hit: %d → %d", firstCachedAt, secondCachedAt)
 	}
@@ -135,10 +137,10 @@ func TestBatchHashedFiles_SecondaryIndexReuse(t *testing.T) {
 	}
 	// Both paths must now have their own row so future lookups hit
 	// directly without hitting the secondary index.
-	if _, _, _, _, ok := cachedRow(t, s, pA); !ok {
+	if _, ok := cachedRow(t, s, pA); !ok {
 		t.Error("pA row missing after first lookup")
 	}
-	if _, _, _, _, ok := cachedRow(t, s, pB); !ok {
+	if _, ok := cachedRow(t, s, pB); !ok {
 		t.Error("pB row missing — secondary-index path didn't upsert")
 	}
 }
@@ -199,6 +201,15 @@ func TestBatchHashedFiles_SecondaryBatchMultiMiss(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	assertSecondaryBatchResults(t, s, aRes, bRes, a1, a2, a3, b1, b1dup, b2, bNew)
+}
+
+// assertSecondaryBatchResults checks the secondary-index reuse, dedup,
+// true-miss, and direct-row outcomes of the multi-miss batch. Split out
+// of TestBatchHashedFiles_SecondaryBatchMultiMiss so the test body stays
+// under the cyclomatic-complexity gate.
+func assertSecondaryBatchResults(t *testing.T, s *Store, aRes, bRes map[string]string, a1, a2, a3, b1, b1dup, b2, bNew string) {
+	t.Helper()
 	if bRes[b1] == "" || bRes[b1] != aRes[a1] {
 		t.Errorf("b1 should reuse a1 hash via secondary index: %q vs %q", bRes[b1], aRes[a1])
 	}
@@ -217,7 +228,7 @@ func TestBatchHashedFiles_SecondaryBatchMultiMiss(t *testing.T) {
 	// Every B path must now own a direct row so future lookups hit by
 	// path without touching the secondary index.
 	for _, p := range []string{b1, b1dup, b2, bNew} {
-		if _, _, _, _, ok := cachedRow(t, s, p); !ok {
+		if _, ok := cachedRow(t, s, p); !ok {
 			t.Errorf("row missing for %s after batched lookup", p)
 		}
 	}

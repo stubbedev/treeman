@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -48,10 +49,8 @@ func (d *Driver) DatabaseExists(ctx context.Context, name string) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	for _, n := range names {
-		if n == name {
-			return true, nil
-		}
+	if slices.Contains(names, name) {
+		return true, nil
 	}
 	return false, nil
 }
@@ -124,7 +123,6 @@ func (d *Driver) cloneDatabase(ctx context.Context, source, dest string) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(6)
 	for _, coll := range colls {
-		coll := coll
 		g.Go(func() error {
 			return d.cloneCollection(gctx, source, dest, coll)
 		})

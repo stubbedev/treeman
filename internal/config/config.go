@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 
 	"github.com/invopop/jsonschema"
@@ -500,7 +501,11 @@ func parseMysqlDSN(dsn string, cfg *MysqlConn) error {
 		if err != nil {
 			return fmt.Errorf("mysql DSN port: %w", err)
 		}
+		if n < 0 || n > 65535 {
+			return fmt.Errorf("mysql DSN port out of range: %d", n)
+		}
 		cfg.Port = uint16(n)
+
 	}
 	if u.User != nil {
 		cfg.User = u.User.Username()
@@ -531,7 +536,7 @@ type PostgresConn struct {
 
 	// Maximum open connections in the daemon's pool.
 	PoolMax      uint32 `yaml:"pool_max,omitempty"`
-	ContainerRef `yaml:",inline"`
+	ContainerRef `       yaml:",inline"`
 }
 
 // UnmarshalYAML accepts either a bare DSN string
@@ -561,7 +566,10 @@ func (PostgresConn) JSONSchema() *jsonschema.Schema {
 	}{})
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
-			{Type: "string", Description: "DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below."},
+			{
+				Type:        "string",
+				Description: "DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below.",
+			},
 			obj,
 		},
 		Description: "Postgres connection — bare DSN string OR structured object.",
@@ -583,7 +591,11 @@ func parsePostgresDSN(dsn string, cfg *PostgresConn) error {
 		if err != nil {
 			return fmt.Errorf("postgres DSN port: %w", err)
 		}
+		if n < 0 || n > 65535 {
+			return fmt.Errorf("postgres DSN port out of range: %d", n)
+		}
 		cfg.Port = uint16(n)
+
 	}
 	if u.User != nil {
 		cfg.User = u.User.Username()
@@ -606,7 +618,7 @@ type MongoConn struct {
 	// Defaults to the driver's own default when unset. Same knob as
 	// the SQL engines' pool_max.
 	PoolMax      uint32 `yaml:"pool_max,omitempty"`
-	ContainerRef `yaml:",inline"`
+	ContainerRef `       yaml:",inline"`
 }
 
 func (c *MongoConn) UnmarshalYAML(node *yaml.Node) error {
@@ -630,7 +642,7 @@ type RedisConn struct {
 	// the driver's own default when unset. Same knob as the SQL
 	// engines' pool_max.
 	PoolMax      uint32 `yaml:"pool_max,omitempty"`
-	ContainerRef `yaml:",inline"`
+	ContainerRef `       yaml:",inline"`
 }
 
 func (c *RedisConn) UnmarshalYAML(node *yaml.Node) error {
@@ -656,7 +668,7 @@ type EsConn struct {
 	// (http.Transport.MaxConnsPerHost). Defaults to the Go HTTP
 	// default when unset. Same knob as the SQL engines' pool_max.
 	PoolMax      uint32 `yaml:"pool_max,omitempty"`
-	ContainerRef `yaml:",inline"`
+	ContainerRef `       yaml:",inline"`
 }
 
 func (c *EsConn) UnmarshalYAML(node *yaml.Node) error {
@@ -676,7 +688,14 @@ func (EsConn) JSONSchema() *jsonschema.Schema { return uriOrMap("elasticsearch",
 func uriOrMap(engine, urlField string) *jsonschema.Schema {
 	objProps := orderedmap.New[string, *jsonschema.Schema]()
 	objProps.Set(urlField, &jsonschema.Schema{Type: "string"})
-	objProps.Set("pool_max", &jsonschema.Schema{Type: "integer", Minimum: json.Number("0"), Description: "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency."})
+	objProps.Set(
+		"pool_max",
+		&jsonschema.Schema{
+			Type:        "integer",
+			Minimum:     json.Number("0"),
+			Description: "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency.",
+		},
+	)
 	objProps.Set("container", &jsonschema.Schema{Type: "string"})
 	objProps.Set("compose_service", &jsonschema.Schema{Type: "string"})
 	objProps.Set("compose_project", &jsonschema.Schema{Type: "string"})
@@ -1054,7 +1073,10 @@ func (Action) JSONSchema() *jsonschema.Schema {
 // configs surface a clear error rather than silently mis-parse.
 func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("action (line %d): want a mapping; bare strings + list shorthands have been removed — wrap each action in `{ run: ... }`", node.Line)
+		return fmt.Errorf(
+			"action (line %d): want a mapping; bare strings + list shorthands have been removed — wrap each action in `{ run: ... }`",
+			node.Line,
+		)
 	}
 	for i := 0; i < len(node.Content); i += 2 {
 		switch node.Content[i].Value {
@@ -1274,7 +1296,14 @@ func (Input) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
 	props.Set("glob", &jsonschema.Schema{Type: "string", Description: "Glob pattern (repo-root-relative). Required."})
 	props.Set("label", &jsonschema.Schema{Type: "string", Description: "Optional label for `hooks.on-file-change` matchers."})
-	props.Set("hash", &jsonschema.Schema{Type: "string", Enum: []any{"checksum", "filename"}, Description: "Hash mode: checksum (default) or filename (append-only files)."})
+	props.Set(
+		"hash",
+		&jsonschema.Schema{
+			Type:        "string",
+			Enum:        []any{"checksum", "filename"},
+			Description: "Hash mode: checksum (default) or filename (append-only files).",
+		},
+	)
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
 			{Type: "string", Description: "Bare glob string. Equivalent to `{glob: <this string>}` with default hash mode."},
@@ -1328,7 +1357,11 @@ func (FilteredAction) JSONSchema() *jsonschema.Schema {
 		base.Properties.Set("match", &jsonschema.Schema{
 			OneOf: []*jsonschema.Schema{
 				{Type: "string", Description: "Single watch label to match."},
-				{Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "Set of watch labels; the action fires when any of them matches."},
+				{
+					Type:        "array",
+					Items:       &jsonschema.Schema{Type: "string"},
+					Description: "Set of watch labels; the action fires when any of them matches.",
+				},
 			},
 			Description: "Restrict this action to watch events carrying one of the named labels. Omit to fire for every event.",
 		})
@@ -1380,12 +1413,7 @@ func (f FilteredAction) Matches(label string) bool {
 	if len(f.Match) == 0 {
 		return true
 	}
-	for _, m := range f.Match {
-		if m == label {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(f.Match, label)
 }
 
 // Step is one user-declared shell command executed against a target
@@ -1468,7 +1496,13 @@ func (DumpSpec) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
 	props.Set("path", &jsonschema.Schema{Type: "string", Description: "Dump file path, repo-root-relative. Required."})
 	props.Set("optional", &jsonschema.Schema{Type: "boolean", Description: "When true, missing dump is not an error."})
-	props.Set("source_db", &jsonschema.Schema{Type: "string", Description: "MongoDB only: the database the archive was dumped from; remapped into the per-worktree target DB via mongorestore --nsFrom/--nsTo. Ignored by other engines."})
+	props.Set(
+		"source_db",
+		&jsonschema.Schema{
+			Type:        "string",
+			Description: "MongoDB only: the database the archive was dumped from; remapped into the per-worktree target DB via mongorestore --nsFrom/--nsTo. Ignored by other engines.",
+		},
+	)
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
 			{Type: "string", Description: "Bare path string. Equivalent to `{path: <this string>}`."},
@@ -1559,7 +1593,7 @@ func (c *ClonesSetting) UnmarshalYAML(node *yaml.Node) error {
 		c.Fixed = n
 		return nil
 	}
-	return fmt.Errorf("clones: want scalar")
+	return errors.New("clones: want scalar")
 }
 
 // WatcherPath is the internal projection of an Input that the
@@ -1747,6 +1781,14 @@ func applyDefaults(cfg *Config) {
 		// (handled by callers as <= 0).
 		cfg.Logs.KeepDays = 14
 	}
+	applyStatusDefaults(cfg)
+}
+
+// applyStatusDefaults fills the `status:` block defaults — separator,
+// templates, per-bucket labels, and Nerd Font icon glyphs. Split out
+// of applyDefaults to keep that function's branch count under the
+// cyclomatic-complexity gate.
+func applyStatusDefaults(cfg *Config) {
 	if cfg.Status.Separator == "" {
 		cfg.Status.Separator = " | "
 	}

@@ -51,7 +51,7 @@ type LifecycleWatcher struct {
 // cancels the prior watcher first.
 func StartLifecycleWatcher(ctx context.Context, st *State, repoID int64, repoPath string) (*LifecycleWatcher, error) {
 	if repoPath == "" {
-		return nil, fmt.Errorf("lifecycle: empty repo_path")
+		return nil, errors.New("lifecycle: empty repo_path")
 	}
 	commonDir, err := resolveGitCommonDir(repoPath)
 	if err != nil {
@@ -335,7 +335,7 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 		if _, ok := onDisk[admin]; ok {
 			continue
 		}
-		admin := admin
+
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -511,8 +511,8 @@ func readGitdirFile(adminDir string) (string, bool) {
 	if line == "" {
 		return "", false
 	}
-	if strings.HasSuffix(line, "/.git") {
-		return strings.TrimSuffix(line, "/.git"), true
+	if before, ok := strings.CutSuffix(line, "/.git"); ok {
+		return before, true
 	}
 	return filepath.Dir(line), true
 }

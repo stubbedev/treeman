@@ -88,7 +88,7 @@ func (s Spec) Detect(repoRoot string) bool {
 	}
 	for _, group := range s.Markers {
 		matched := false
-		for _, alt := range strings.Split(group, "|") {
+		for alt := range strings.SplitSeq(group, "|") {
 			alt = strings.TrimSpace(alt)
 			if alt == "" {
 				continue
@@ -330,6 +330,13 @@ func flywayURLEnv() map[string]string {
 }
 
 func builtins() []Spec {
+	specs := builtinsClassic()
+	specs = append(specs, builtinsJSAndOther()...)
+	specs = append(specs, builtinsExtra()...)
+	return specs
+}
+
+func builtinsClassic() []Spec {
 	return []Spec{
 		{
 			Name:    "laravel",
@@ -394,6 +401,11 @@ func builtins() []Spec {
 			// framework's distinctive naming convention).
 			Validate: hasGolangMigrateEvidence,
 		},
+	}
+}
+
+func builtinsJSAndOther() []Spec {
+	return []Spec{
 		{
 			Name:          "sqlx-cli",
 			Markers:       []string{"Cargo.toml", "migrations"},
@@ -497,6 +509,11 @@ func builtins() []Spec {
 			MigrateRun:    "npx drizzle-kit migrate",
 			MigrateEnv:    dbNameEnv(),
 		},
+	}
+}
+
+func builtinsExtra() []Spec {
+	return []Spec{
 		{
 			Name:          "sequelize",
 			Markers:       []string{".sequelizerc|.sequelizerc.js|.sequelizerc.cjs"},
@@ -509,15 +526,22 @@ func builtins() []Spec {
 			MigrateEnv:    dbNameEnv(),
 		},
 		{
-			Name:          "mikro-orm",
-			Markers:       []string{"mikro-orm.config.ts|mikro-orm.config.js|mikro-orm.config.cjs"},
-			MigrationDirs: []string{"migrations", "src/migrations", "apps/*/migrations", "apps/*/src/migrations", "packages/*/migrations", "packages/*/src/migrations"},
-			FileGlobs:     []string{"Migration*.ts", "Migration*.js"},
-			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:      HashFilename,
-			OnModify:      OnRebuild,
-			MigrateRun:    "npx mikro-orm migration:up",
-			MigrateEnv:    dbNameEnv(),
+			Name:    "mikro-orm",
+			Markers: []string{"mikro-orm.config.ts|mikro-orm.config.js|mikro-orm.config.cjs"},
+			MigrationDirs: []string{
+				"migrations",
+				"src/migrations",
+				"apps/*/migrations",
+				"apps/*/src/migrations",
+				"packages/*/migrations",
+				"packages/*/src/migrations",
+			},
+			FileGlobs:  []string{"Migration*.ts", "Migration*.js"},
+			Lockfiles:  []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
+			HashMode:   HashFilename,
+			OnModify:   OnRebuild,
+			MigrateRun: "npx mikro-orm migration:up",
+			MigrateEnv: dbNameEnv(),
 		},
 		{
 			// Symfony bundle (the dominant Doctrine Migrations layout).

@@ -2,10 +2,12 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -66,12 +68,18 @@ Examples:
 			&cli.StringFlag{Name: "repo", Usage: "repo root override"},
 			&cli.BoolFlag{Name: "skip-hooks"},
 			&cli.BoolFlag{Name: "skip-prepare"},
-			&cli.BoolFlag{Name: "no-fetch", Usage: "skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits)"},
-			&cli.BoolFlag{Name: "print-path", Usage: "print only the new worktree path on stdout; status lines redirect to stderr (enables `cd \"$(treeman wt create …)\"`)"},
+			&cli.BoolFlag{
+				Name:  "no-fetch",
+				Usage: "skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits)",
+			},
+			&cli.BoolFlag{
+				Name:  "print-path",
+				Usage: "print only the new worktree path on stdout; status lines redirect to stderr (enables `cd \"$(treeman wt create …)\"`)",
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman wt create <branch>")
+				return errors.New("usage: treeman wt create <branch>")
 			}
 			branch := c.Args().First()
 
@@ -139,7 +147,7 @@ Examples:
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman wt delete <path-or-branch>")
+				return errors.New("usage: treeman wt delete <path-or-branch>")
 			}
 			target := c.Args().First()
 
@@ -261,7 +269,10 @@ func wtList() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "json"},
 			&cli.BoolFlag{Name: "with-state", Usage: "include a STATE column derived from the most recent finalize event"},
-			&cli.BoolFlag{Name: "with-status", Usage: "include a STATUS column (clean/dirty/unpushed; forks git status + rev-list per row)"},
+			&cli.BoolFlag{
+				Name:  "with-status",
+				Usage: "include a STATUS column (clean/dirty/unpushed; forks git status + rev-list per row)",
+			},
 			&cli.StringFlag{Name: "sort", Value: "id", Usage: "id | mtime (HEAD commit ts) | visited (last_visited_at)"},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "scope to one repo (path)"},
 		},
@@ -294,6 +305,7 @@ func wtList() *cli.Command {
 			default:
 				return fmt.Errorf("unknown --sort %q (id|mtime|visited)", c.String("sort"))
 			}
+			//nolint:gosec // where/orderBy are fixed fragments; values are parameterized via args
 			q := `SELECT id, slug, COALESCE(branch,'-'), path, COALESCE(last_visited_at, 0), is_main
 				FROM worktrees WHERE ` + where + ` ` + orderBy
 			rows, err := st.DB.QueryContext(ctx, q, args...)
@@ -301,20 +313,6 @@ func wtList() *cli.Command {
 				return err
 			}
 			defer func() { _ = rows.Close() }()
-			type wtRow struct {
-				ID          int64  `json:"id"`
-				Slug        string `json:"slug"`
-				Branch      string `json:"branch"`
-				Path        string `json:"path"`
-				IsMain      bool   `json:"is_main"`
-				HeadTs      int64  `json:"head_ts,omitempty"`
-				VisitedTs   int64  `json:"visited_ts,omitempty"`
-				Status      string `json:"status,omitempty"`
-				StatusError string `json:"status_error,omitempty"`
-				Dirty       bool   `json:"dirty,omitempty"`
-				Unpushed    bool   `json:"unpushed,omitempty"`
-				FinalState  string `json:"state,omitempty"`
-			}
 			var all []wtRow
 			anyMain := false
 			for rows.Next() {
@@ -335,31 +333,7 @@ func wtList() *cli.Command {
 			withState := c.Bool("with-state")
 			sortMode := c.String("sort")
 			needHeadTs := sortMode == "mtime" || c.Bool("json")
-			for i := range all {
-				r := &all[i]
-				if needHeadTs {
-					r.HeadTs = headCommitTs(r.Path)
-				}
-				if withStatus || c.Bool("json") {
-					dirty, dErr := worktreeDirty(r.Path)
-					unpushed, uErr := gitenv.HasUnpushedCommits(r.Path)
-					r.Dirty = dirty
-					r.Unpushed = unpushed
-					switch {
-					case dErr != nil:
-						r.Status = "?"
-						r.StatusError = dErr.Error()
-					case uErr != nil:
-						r.Status = "?"
-						r.StatusError = uErr.Error()
-					default:
-						r.Status = statusLabel(dirty, unpushed)
-					}
-				}
-				if withState || c.Bool("json") {
-					r.FinalState = finalizeStateShort(ctx, st, r.ID)
-				}
-			}
+			enrichWtRows(ctx, st, all, withStatus, withState, needHeadTs, c.Bool("json"))
 			if sortMode == "mtime" {
 				sort.SliceStable(all, func(i, j int) bool { return all[i].HeadTs > all[j].HeadTs })
 			}
@@ -373,52 +347,104 @@ func wtList() *cli.Command {
 				return nil
 			}
 
-			// MAIN column only shows up when at least one row is the
-			// main wt — keeps the dominant linked-only output narrow.
-			headers := []string{"ID"}
-			if anyMain {
-				headers = append(headers, "MAIN")
-			}
-			headers = append(headers, "SLUG", "BRANCH")
-			if withStatus {
-				headers = append(headers, "STATUS")
-			}
-			if withState {
-				headers = append(headers, "STATE")
-			}
-			headers = append(headers, "LAST", "PATH")
-			tbl := ui.NewTable(headers...)
-			anyStatusErr := false
-			for _, r := range all {
-				cells := []string{ui.Dim(fmt.Sprintf("%d", r.ID))}
-				if anyMain {
-					if r.IsMain {
-						cells = append(cells, ui.Cyan("★"))
-					} else {
-						cells = append(cells, "")
-					}
-				}
-				cells = append(cells, ui.Cyan(r.Slug), r.Branch)
-				if withStatus {
-					if r.StatusError != "" {
-						anyStatusErr = true
-						cells = append(cells, ui.Yellow("?"))
-					} else {
-						cells = append(cells, colorStatus(r.Dirty, r.Unpushed))
-					}
-				}
-				if withState {
-					cells = append(cells, r.FinalState)
-				}
-				cells = append(cells, ui.Dim(lastLabel(r.HeadTs, r.VisitedTs)), r.Path)
-				tbl.Row(cells...)
-			}
-			tbl.Render(nil)
-			if anyStatusErr {
-				ui.Hint("%s", "STATUS '?' = git status failed; use --json for the per-row error")
-			}
+			renderWtTable(all, anyMain, withStatus, withState)
 			return nil
 		},
+	}
+}
+
+// wtRow is one row of `treeman wt list` output.
+type wtRow struct {
+	ID          int64  `json:"id"`
+	Slug        string `json:"slug"`
+	Branch      string `json:"branch"`
+	Path        string `json:"path"`
+	IsMain      bool   `json:"is_main"`
+	HeadTs      int64  `json:"head_ts,omitempty"`
+	VisitedTs   int64  `json:"visited_ts,omitempty"`
+	Status      string `json:"status,omitempty"`
+	StatusError string `json:"status_error,omitempty"`
+	Dirty       bool   `json:"dirty,omitempty"`
+	Unpushed    bool   `json:"unpushed,omitempty"`
+	FinalState  string `json:"state,omitempty"`
+}
+
+// enrichWtRows fills in per-row HEAD timestamp, git status and finalize
+// state for each worktree, honoring which optional columns were
+// requested (or JSON output, which always populates everything).
+func enrichWtRows(ctx context.Context, st *store.Store, all []wtRow, withStatus, withState, needHeadTs, asJSON bool) {
+	for i := range all {
+		r := &all[i]
+		if needHeadTs {
+			r.HeadTs = headCommitTs(r.Path)
+		}
+		if withStatus || asJSON {
+			dirty, dErr := worktreeDirty(r.Path)
+			unpushed, uErr := gitenv.HasUnpushedCommits(r.Path)
+			r.Dirty = dirty
+			r.Unpushed = unpushed
+			switch {
+			case dErr != nil:
+				r.Status = "?"
+				r.StatusError = dErr.Error()
+			case uErr != nil:
+				r.Status = "?"
+				r.StatusError = uErr.Error()
+			default:
+				r.Status = statusLabel(dirty, unpushed)
+			}
+		}
+		if withState || asJSON {
+			r.FinalState = finalizeStateShort(ctx, st, r.ID)
+		}
+	}
+}
+
+// renderWtTable prints the human-readable `treeman wt list` table.
+func renderWtTable(all []wtRow, anyMain, withStatus, withState bool) {
+	// MAIN column only shows up when at least one row is the
+	// main wt — keeps the dominant linked-only output narrow.
+	headers := []string{"ID"}
+	if anyMain {
+		headers = append(headers, "MAIN")
+	}
+	headers = append(headers, "SLUG", "BRANCH")
+	if withStatus {
+		headers = append(headers, "STATUS")
+	}
+	if withState {
+		headers = append(headers, "STATE")
+	}
+	headers = append(headers, "LAST", "PATH")
+	tbl := ui.NewTable(headers...)
+	anyStatusErr := false
+	for _, r := range all {
+		cells := []string{ui.Dim(strconv.FormatInt(r.ID, 10))}
+		if anyMain {
+			if r.IsMain {
+				cells = append(cells, ui.Cyan("★"))
+			} else {
+				cells = append(cells, "")
+			}
+		}
+		cells = append(cells, ui.Cyan(r.Slug), r.Branch)
+		if withStatus {
+			if r.StatusError != "" {
+				anyStatusErr = true
+				cells = append(cells, ui.Yellow("?"))
+			} else {
+				cells = append(cells, colorStatus(r.Dirty, r.Unpushed))
+			}
+		}
+		if withState {
+			cells = append(cells, r.FinalState)
+		}
+		cells = append(cells, ui.Dim(lastLabel(r.HeadTs, r.VisitedTs)), r.Path)
+		tbl.Row(cells...)
+	}
+	tbl.Render(nil)
+	if anyStatusErr {
+		ui.Hint("%s", "STATUS '?' = git status failed; use --json for the per-row error")
 	}
 }
 
@@ -517,69 +543,13 @@ func wtFinalize() *cli.Command {
 			}
 			repoRoot, repoErr := resolveRepo(c.String("repo"))
 
-			var wtPath string
-			switch {
-			case arg == "" || arg == ".":
-				wtPath = MustAbs(".")
-				if repoErr != nil {
-					var err error
-					repoRoot, err = DiscoverRepoRoot(wtPath)
-					if err != nil {
-						return err
-					}
-				}
-			default:
-				abs := MustAbs(arg)
-				if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
-					wtPath = abs
-					if repoErr != nil {
-						var derr error
-						repoRoot, derr = DiscoverRepoRoot(wtPath)
-						if derr != nil {
-							return derr
-						}
-					}
-				} else {
-					// Not a directory — try resolving as a registered
-					// slug/branch/basename. Without a repo to scope the
-					// lookup, an unknown token would silently fabricate a
-					// path under cwd; refuse instead.
-					if repoErr != nil {
-						return fmt.Errorf("cannot resolve %q: not a directory and no repo to scope a slug lookup (cd into the repo or pass --repo)", arg)
-					}
-					p, ok := wt.LookupWorktree(ctx, repoRoot, arg, cliSink{})
-					if !ok {
-						return fmt.Errorf("no worktree matches %q (expected a path or registered slug/branch)", arg)
-					}
-					wtPath = p
-				}
+			wtPath, repoRoot, err := resolveFinalizeTarget(ctx, arg, repoRoot, repoErr)
+			if err != nil {
+				return err
 			}
 
 			if c.Bool("local") {
-				// Used by the wt-create fallback path's detached child.
-				// Loads its own resolved config + opens its own store
-				// handle since the parent has already exited by the
-				// time this runs. Routes through wt.ResolveIdentity so
-				// `wt finalize . --local` at the repo root picks up the
-				// main-wt overlay/slug instead of producing a path-hash
-				// slug that would corrupt the main row.
-				cfg, err := resolve.LoadResolved(repoRoot)
-				if err != nil {
-					return err
-				}
-				dbPath, _ := store.DefaultDBPath()
-				st, err := store.Open(ctx, dbPath)
-				if err != nil {
-					return err
-				}
-				defer func() { _ = st.Close() }()
-				repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-				branch := detectBranchOfWorktree(wtPath)
-				id, err := wt.ResolveIdentity(ctx, st, &cfg, repoRoot, wtPath, branch, repoID)
-				if err != nil {
-					return err
-				}
-				return wt.RunLocalFinalize(ctx, &cfg, repoRoot, wtPath, id.Slug, id.IsMain, st, repoID, id.WtID, CaptureInheritedEnv(), false, cliSink{})
+				return runLocalFinalizeFlow(ctx, repoRoot, wtPath)
 			}
 
 			resp, err := rpc.Call(ctx, rpc.Request{
@@ -600,6 +570,93 @@ func wtFinalize() *cli.Command {
 			return nil
 		},
 	}
+}
+
+// resolveFinalizeTarget maps the positional arg to a concrete worktree
+// path, discovering the repo root when `--repo` wasn't supplied. Returns
+// the resolved (wtPath, repoRoot). `repoErr` is the error from the
+// initial resolveRepo attempt; a non-nil value means no repo was scoped.
+func resolveFinalizeTarget(ctx context.Context, arg, repoRoot string, repoErr error) (string, string, error) {
+	var wtPath string
+	switch arg {
+	case "", ".":
+		wtPath = MustAbs(".")
+		if repoErr != nil {
+			var err error
+			repoRoot, err = DiscoverRepoRoot(wtPath)
+			if err != nil {
+				return "", "", err
+			}
+		}
+	default:
+		abs := MustAbs(arg)
+		if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
+			wtPath = abs
+			if repoErr != nil {
+				var derr error
+				repoRoot, derr = DiscoverRepoRoot(wtPath)
+				if derr != nil {
+					return "", "", derr
+				}
+			}
+		} else {
+			// Not a directory — try resolving as a registered
+			// slug/branch/basename. Without a repo to scope the
+			// lookup, an unknown token would silently fabricate a
+			// path under cwd; refuse instead.
+			if repoErr != nil {
+				return "", "", fmt.Errorf(
+					"cannot resolve %q: not a directory and no repo to scope a slug lookup (cd into the repo or pass --repo)",
+					arg,
+				)
+			}
+			p, ok := wt.LookupWorktree(ctx, repoRoot, arg, cliSink{})
+			if !ok {
+				return "", "", fmt.Errorf("no worktree matches %q (expected a path or registered slug/branch)", arg)
+			}
+			wtPath = p
+		}
+	}
+	return wtPath, repoRoot, nil
+}
+
+// runLocalFinalizeFlow runs setup + prepare inline (used by the
+// wt-create fallback path's detached child). Loads its own resolved
+// config + store handle since the parent has already exited by the time
+// this runs. Routes through wt.ResolveIdentity so `wt finalize . --local`
+// at the repo root picks up the main-wt overlay/slug instead of producing
+// a path-hash slug that would corrupt the main row.
+func runLocalFinalizeFlow(ctx context.Context, repoRoot, wtPath string) error {
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return err
+	}
+	dbPath, _ := store.DefaultDBPath()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = st.Close() }()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	branch := detectBranchOfWorktree(wtPath)
+	id, err := wt.ResolveIdentity(ctx, st, &cfg, repoRoot, wtPath, branch, repoID)
+	if err != nil {
+		return err
+	}
+	return wt.RunLocalFinalize(
+		ctx,
+		&cfg,
+		repoRoot,
+		wtPath,
+		id.Slug,
+		id.IsMain,
+		st,
+		repoID,
+		id.WtID,
+		CaptureInheritedEnv(),
+		false,
+		cliSink{},
+	)
 }
 
 // resolveRepo returns the explicit `--repo` if set, else discovers
@@ -640,7 +697,7 @@ func wtSwitch() *cli.Command {
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman wt switch <name> [--create]")
+				return errors.New("usage: treeman wt switch <name> [--create]")
 			}
 			name := c.Args().First()
 			repoRoot, err := resolveRepo(c.String("repo"))
@@ -801,7 +858,7 @@ func wtResolve() *cli.Command {
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman wt resolve <branch>")
+				return errors.New("usage: treeman wt resolve <branch>")
 			}
 			branch := c.Args().First()
 			repoRoot, err := resolveRepo(c.String("repo"))
@@ -888,7 +945,7 @@ func wtGo() *cli.Command {
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman wt go <branch> [--create]")
+				return errors.New("usage: treeman wt go <branch> [--create]")
 			}
 			branch := c.Args().First()
 			repoRoot, err := resolveRepo(c.String("repo"))
@@ -907,26 +964,7 @@ func wtGo() *cli.Command {
 				}
 			}
 
-			// Mode resolution (create-but-exists → checkout).
-			mode := "checkout"
-			base := c.String("from")
-			if c.Bool("create") {
-				mode = "create"
-				if wt.RefExistsLocal(ctx, repoRoot, branch) {
-					mode = "checkout"
-					base = ""
-				}
-			}
-
-			// Optional pre-fetch so a stale local base doesn't seed
-			// the new branch off yesterday's commit. Same heuristic
-			// as zsh's _resolve_base.
-			if mode == "create" && base != "" && !c.Bool("no-fetch") {
-				_ = gitcmd.RunPiped(ctx, repoRoot, nil, nil, "fetch", "origin", base, "--quiet")
-				if wt.RefExistsRemote(ctx, repoRoot, base) {
-					base = "origin/" + base
-				}
-			}
+			mode, base := resolveGoMode(ctx, repoRoot, branch, c.String("from"), c.Bool("create"), c.Bool("no-fetch"))
 
 			cwd, _ := os.Getwd()
 			cwdTop, _ := gitWorktreeRoot(cwd)
@@ -969,27 +1007,60 @@ func wtGo() *cli.Command {
 			}
 
 			// (3) main dirty → spawn a fresh worktree.
-			argv := []string{"create", branch, "--repo", repoRoot}
-			if c.String("from") != "" {
-				argv = append(argv, "--from", c.String("from"))
-			}
-			if err := wtCreate().Run(ctx, argv); err != nil {
-				return err
-			}
-			// Resolve final path from registry (wt create writes the
-			// row before returning).
-			if path, ok := registryWorktreeForBranch(ctx, repoRoot, branch); ok {
-				touchVisitedByPath(ctx, path)
-				fmt.Println(path)
-				return nil
-			}
-			// Fall back to the default location (matches wt create's path math).
-			cfg, _ := resolve.LoadResolved(repoRoot)
-			path := filepath.Join(wt.WorktreesRoot(cfg, repoRoot), branch)
-			fmt.Println(path)
-			return nil
+			return goSpawnWorktree(ctx, repoRoot, branch, c.String("from"))
 		},
 	}
+}
+
+// resolveGoMode decides whether `wt go` checks out an existing branch or
+// creates a new one, and resolves the base ref. A create that already
+// exists locally degrades to checkout. When creating off a base, an
+// optional pre-fetch keeps the base from seeding off a stale local ref.
+func resolveGoMode(ctx context.Context, repoRoot, branch, from string, create, noFetch bool) (mode, base string) {
+	mode = "checkout"
+	base = from
+	if create {
+		mode = "create"
+		if wt.RefExistsLocal(ctx, repoRoot, branch) {
+			mode = "checkout"
+			base = ""
+		}
+	}
+
+	// Optional pre-fetch so a stale local base doesn't seed the new
+	// branch off yesterday's commit. Same heuristic as zsh's
+	// _resolve_base.
+	if mode == "create" && base != "" && !noFetch {
+		_ = gitcmd.RunPiped(ctx, repoRoot, nil, nil, "fetch", "origin", base, "--quiet")
+		if wt.RefExistsRemote(ctx, repoRoot, base) {
+			base = "origin/" + base
+		}
+	}
+	return mode, base
+}
+
+// goSpawnWorktree creates a fresh worktree for <branch> (the main-dirty
+// path) and prints its resolved path on stdout.
+func goSpawnWorktree(ctx context.Context, repoRoot, branch, from string) error {
+	argv := []string{"create", branch, "--repo", repoRoot}
+	if from != "" {
+		argv = append(argv, "--from", from)
+	}
+	if err := wtCreate().Run(ctx, argv); err != nil {
+		return err
+	}
+	// Resolve final path from registry (wt create writes the
+	// row before returning).
+	if path, ok := registryWorktreeForBranch(ctx, repoRoot, branch); ok {
+		touchVisitedByPath(ctx, path)
+		fmt.Println(path)
+		return nil
+	}
+	// Fall back to the default location (matches wt create's path math).
+	cfg, _ := resolve.LoadResolved(repoRoot)
+	path := filepath.Join(wt.WorktreesRoot(cfg, repoRoot), branch)
+	fmt.Println(path)
+	return nil
 }
 
 // registryWorktreeForBranch finds the live worktree on <branch> for

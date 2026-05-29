@@ -61,7 +61,7 @@ func (d *Driver) DropPrefix(ctx context.Context, prefix string) (int, error) {
 // the eager pre-build drop.
 func (d *Driver) DropPrefixFiltered(ctx context.Context, prefix string, keep func(string) bool) (int, error) {
 	if prefix == "" {
-		return 0, fmt.Errorf("redis: refusing to drop empty prefix (would wipe every key)")
+		return 0, errors.New("redis: refusing to drop empty prefix (would wipe every key)")
 	}
 	c := d.client()
 	iter := c.Scan(ctx, 0, prefix+"*", 1000).Iterator()
@@ -106,7 +106,7 @@ func (d *Driver) DropPrefixFiltered(ctx context.Context, prefix string, keep fun
 // clean ground.
 func (d *Driver) SnapshotCreate(ctx context.Context, sourcePrefix, templatePrefix string) error {
 	if sourcePrefix == templatePrefix {
-		return fmt.Errorf("snapshot create: source and template prefixes must differ")
+		return errors.New("snapshot create: source and template prefixes must differ")
 	}
 	if _, err := d.DropPrefix(ctx, templatePrefix); err != nil {
 		return fmt.Errorf("drop stale template %s*: %w", templatePrefix, err)
@@ -118,7 +118,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, sourcePrefix, templatePrefi
 // so paratest workers each get an isolated copy.
 func (d *Driver) SnapshotRestore(ctx context.Context, templatePrefix, targetPrefix string) error {
 	if templatePrefix == targetPrefix {
-		return fmt.Errorf("snapshot restore: template and target prefixes must differ")
+		return errors.New("snapshot restore: template and target prefixes must differ")
 	}
 	if _, err := d.DropPrefix(ctx, targetPrefix); err != nil {
 		return fmt.Errorf("drop stale target %s*: %w", targetPrefix, err)
@@ -147,7 +147,7 @@ func (d *Driver) DropSnapshot(ctx context.Context, templatePrefix string) error 
 // transient INFO error doesn't surface as "ERR unknown command".
 func (d *Driver) copyByPrefix(ctx context.Context, srcPrefix, dstPrefix string) error {
 	if srcPrefix == "" {
-		return fmt.Errorf("redis: refusing to copy from empty prefix")
+		return errors.New("redis: refusing to copy from empty prefix")
 	}
 	if d.supportsCopy(ctx) {
 		return d.copyByPrefixCOPY(ctx, srcPrefix, dstPrefix)
@@ -187,14 +187,14 @@ func versionAtLeast(v string, wantMajor, wantMinor int) bool {
 			break
 		}
 	}
-	min, err2 := strconv.Atoi(minor)
+	minorNum, err2 := strconv.Atoi(minor)
 	if err1 != nil || err2 != nil {
 		return false
 	}
 	if maj > wantMajor {
 		return true
 	}
-	if maj == wantMajor && min >= wantMinor {
+	if maj == wantMajor && minorNum >= wantMinor {
 		return true
 	}
 	return false

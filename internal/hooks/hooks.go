@@ -15,8 +15,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,7 +82,7 @@ func RunHooksOrphan(
 		return out, nil
 	}
 	if logDir == "" {
-		return out, fmt.Errorf("RunHooksOrphan: empty logDir")
+		return out, errors.New("RunHooksOrphan: empty logDir")
 	}
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return out, fmt.Errorf("create %s: %w", logDir, err)
@@ -316,14 +316,20 @@ func shellSingleQuote(s string) string {
 // already deleted) it is the repo root, while `worktreePath` is the
 // deleted absolute path — surfaced in the env so user scripts can
 // still reference it.
-func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug string, isMain bool, logPath string, inheritedEnv map[string]string, wait bool) (*exec.Cmd, error) {
+func spawnDetached(
+	cmdStr, cwd, worktreePath, repoRoot, slug string,
+	isMain bool,
+	logPath string,
+	inheritedEnv map[string]string,
+	wait bool,
+) (*exec.Cmd, error) {
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open hook log %s: %w", logPath, err)
 	}
 	defer func() { _ = logFile.Close() }()
 
-	c := exec.Command("/bin/sh", "-c", cmdStr)
+	c := exec.Command("/bin/sh", "-c", cmdStr) //nolint:noctx // detached setsid hook; must outlive caller ctx
 	c.Dir = cwd
 	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug, isMain)
 	c.Stdout = logFile
@@ -357,41 +363,6 @@ func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug string, isMain bool
 	return c, nil
 }
 
-// runForeground runs one step synchronously, captures tails, returns
-// a GroupOutcome.
-func runForeground(ctx context.Context, cmdStr, cwd, repoRoot, worktreePath, slug string, isMain bool, inheritedEnv map[string]string) (GroupOutcome, error) {
-	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmdStr)
-	c.Dir = cwd
-	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug, isMain)
-	stdoutPipe, _ := c.StdoutPipe()
-	stderrPipe, _ := c.StderrPipe()
-	if err := c.Start(); err != nil {
-		return GroupOutcome{Command: cmdStr, ExitCode: -1}, fmt.Errorf("spawn `%s`: %w", cmdStr, err)
-	}
-	stdoutTail := captureTail(stdoutPipe, 16*1024)
-	stderrTail := captureTail(stderrPipe, 16*1024)
-	err := c.Wait()
-	g := GroupOutcome{Command: cmdStr, StdoutTail: stdoutTail, StderrTail: stderrTail}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		g.ExitCode = exitErr.ExitCode()
-	} else if err != nil {
-		g.ExitCode = -1
-	}
-	return g, nil
-}
-
-func captureTail(r io.Reader, cap int) string {
-	if r == nil {
-		return ""
-	}
-	all, _ := io.ReadAll(r)
-	if len(all) > cap {
-		all = all[len(all)-cap:]
-	}
-	return string(all)
-}
-
 // buildEnv assembles the env shipped to a hook subprocess. The goal:
 // user commands declared in `.treeman.yaml` should see the same env
 // they would see if the user pasted them into their terminal.
@@ -421,16 +392,14 @@ func captureTail(r io.Reader, cap int) string {
 func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug string, isMain bool) []string {
 	merged := make(map[string]string, len(inheritedEnv)+32)
 	for _, kv := range os.Environ() {
-		for i := 0; i < len(kv); i++ {
+		for i := range len(kv) {
 			if kv[i] == '=' {
 				merged[kv[:i]] = kv[i+1:]
 				break
 			}
 		}
 	}
-	for k, v := range inheritedEnv {
-		merged[k] = v
-	}
+	maps.Copy(merged, inheritedEnv)
 	merged["TREEMAN_MAIN_ROOT"] = repoRoot
 	merged["TREEMAN_WORKTREE"] = worktreePath
 	merged["TREEMAN_SLUG"] = slug

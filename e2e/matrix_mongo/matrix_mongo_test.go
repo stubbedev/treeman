@@ -202,7 +202,12 @@ func TestMongoPoolMaxCaps(t *testing.T) {
 	elapsed := time.Since(start)
 
 	if elapsed < time.Second {
-		t.Errorf("pool_max=2 did not cap concurrency: %d×%dms sleeps finished in %s (want ≥1s — they ran in parallel)", ops, sleepMillis, elapsed)
+		t.Errorf(
+			"pool_max=2 did not cap concurrency: %d×%dms sleeps finished in %s (want ≥1s — they ran in parallel)",
+			ops,
+			sleepMillis,
+			elapsed,
+		)
 	}
 }
 

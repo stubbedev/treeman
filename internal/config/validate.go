@@ -23,19 +23,19 @@ func (c *Config) Validate() error {
 	var errs []error
 
 	if c.Connections.Mysql != nil {
-		errs = appendIfErr(errs, c.Connections.Mysql.ContainerRef.validate("connections.mysql"))
+		errs = appendIfErr(errs, c.Connections.Mysql.validate("connections.mysql"))
 	}
 	if c.Connections.Postgres != nil {
-		errs = appendIfErr(errs, c.Connections.Postgres.ContainerRef.validate("connections.postgres"))
+		errs = appendIfErr(errs, c.Connections.Postgres.validate("connections.postgres"))
 	}
 	if c.Connections.Mongodb != nil {
-		errs = appendIfErr(errs, c.Connections.Mongodb.ContainerRef.validate("connections.mongodb"))
+		errs = appendIfErr(errs, c.Connections.Mongodb.validate("connections.mongodb"))
 	}
 	if c.Connections.Redis != nil {
-		errs = appendIfErr(errs, c.Connections.Redis.ContainerRef.validate("connections.redis"))
+		errs = appendIfErr(errs, c.Connections.Redis.validate("connections.redis"))
 	}
 	if c.Connections.Elasticsearch != nil {
-		errs = appendIfErr(errs, c.Connections.Elasticsearch.ContainerRef.validate("connections.elasticsearch"))
+		errs = appendIfErr(errs, c.Connections.Elasticsearch.validate("connections.elasticsearch"))
 	}
 
 	for i := range c.Databases {
@@ -70,7 +70,11 @@ func (c *Config) Validate() error {
 			if strings.Contains(tmpl, "{slug") {
 				errs = appendIfErr(errs, fmt.Errorf(
 					"databases[%d]: branch_scoped + main_worktree.enabled requires a slug-free main_worktree.databases[%d].%s (got %q) — the main worktree's .env is not patched, so treeman must swap the bare name the app already connects to",
-					i, i, field, tmpl))
+					i,
+					i,
+					field,
+					tmpl,
+				))
 			}
 		}
 	}
@@ -130,7 +134,7 @@ func mainActiveTemplate(c *Config, i int) (tmpl, field string) {
 
 func validatePortSlot(name string, spec PortSpec) error {
 	if name == "" {
-		return fmt.Errorf("ports: slot name must be non-empty")
+		return errors.New("ports: slot name must be non-empty")
 	}
 	if spec.Range.Min == 0 || spec.Range.Max == 0 {
 		return fmt.Errorf("ports[%s]: range [min, max] must be non-zero", name)
@@ -250,7 +254,9 @@ func (d DatabaseConfig) validate(path string) error {
 	if d.BranchScoped {
 		if d.TestClones != nil {
 			errs = appendIfErr(errs, fmt.Errorf(
-				"%s: branch_scoped and test_clones are mutually exclusive — a branch_scoped database is a stateful per-branch snapshot, not a reproducible test-clone source", path))
+				"%s: branch_scoped and test_clones are mutually exclusive — a branch_scoped database is a stateful per-branch snapshot, not a reproducible test-clone source",
+				path,
+			))
 		}
 		if d.Fanout > 0 {
 			errs = appendIfErr(errs, fmt.Errorf(

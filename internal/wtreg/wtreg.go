@@ -7,6 +7,7 @@ package wtreg
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,12 @@ import (
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
+
+// dbRow is a worktree row's identity + main-flag, as read during Repair.
+type dbRow struct {
+	id     int64
+	isMain bool
+}
 
 // timeNow is exposed as a var so tests could swap a fixed clock if
 // they ever need deterministic deleted_at timestamps. Currently
@@ -71,24 +78,10 @@ func Repair(ctx context.Context, st *store.Store, repoRoot string, detectBranch 
 		}
 	}()
 
-	rows, err := tx.QueryContext(ctx, `SELECT id, path, is_main FROM worktrees WHERE repo_id = ? AND deleted_at IS NULL`, repoID)
+	dbWTs, err := loadRepairRows(ctx, tx, repoID)
 	if err != nil {
 		return RepairResult{}, err
 	}
-	type dbRow struct {
-		id     int64
-		isMain bool
-	}
-	dbWTs := map[string]dbRow{}
-	for rows.Next() {
-		var id int64
-		var p string
-		var isMain int
-		if err := rows.Scan(&id, &p, &isMain); err == nil {
-			dbWTs[p] = dbRow{id: id, isMain: isMain == 1}
-		}
-	}
-	_ = rows.Close()
 
 	out := RepairResult{}
 	gitSet := map[string]bool{}
@@ -102,6 +95,64 @@ func Repair(ctx context.Context, st *store.Store, repoRoot string, detectBranch 
 		gitSet[repoRoot] = true
 	}
 	now := nowMillis()
+	repairRegister(ctx, tx, &out, gitSet, gitPaths, dbWTs, repoRoot, repoID, now, detectBranch)
+	repairUnregister(ctx, tx, &out, gitSet, dbWTs, now)
+
+	if len(out.Errors) > 0 {
+		// Any per-row failure poisons the whole reconcile — better
+		// to surface the drift to the operator than to commit a
+		// partial fix that's harder to reason about.
+		rolledBack = true
+		_ = tx.Rollback()
+		return out, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return out, fmt.Errorf("commit tx: %w", err)
+	}
+	rolledBack = true
+	return out, nil
+}
+
+// loadRepairRows reads the live (non-deleted) worktree rows for a repo
+// into a path-keyed map. Extracted from Repair so the rows handle is
+// scoped to a single defer-closed function.
+func loadRepairRows(ctx context.Context, tx *sql.Tx, repoID int64) (map[string]dbRow, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, path, is_main FROM worktrees WHERE repo_id = ? AND deleted_at IS NULL`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	dbWTs := map[string]dbRow{}
+	for rows.Next() {
+		var id int64
+		var p string
+		var isMain int
+		if err := rows.Scan(&id, &p, &isMain); err == nil {
+			dbWTs[p] = dbRow{id: id, isMain: isMain == 1}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return dbWTs, nil
+}
+
+// repairRegister registers every git-known path missing from SQLite.
+// Mutates out (Registered / Errors) and seeds gitSet so the caller's
+// subsequent unregister pass can tell live paths from dead ones.
+// Extracted from Repair as a pure mechanical lift of the registration
+// loop.
+func repairRegister(
+	ctx context.Context,
+	tx *sql.Tx,
+	out *RepairResult,
+	gitSet map[string]bool,
+	gitPaths []string,
+	dbWTs map[string]dbRow,
+	repoRoot string,
+	repoID, now int64,
+	detectBranch func(path string) string,
+) {
 	for _, p := range gitPaths {
 		gitSet[p] = true
 		if _, ok := dbWTs[p]; ok {
@@ -131,7 +182,7 @@ func Repair(ctx context.Context, st *store.Store, repoRoot string, detectBranch 
 				continue
 			}
 		} else {
-			var br interface{}
+			var br any
 			if branch != "" {
 				br = branch
 			}
@@ -144,6 +195,19 @@ func Repair(ctx context.Context, st *store.Store, repoRoot string, detectBranch 
 		}
 		out.Registered = append(out.Registered, p)
 	}
+}
+
+// repairUnregister marks every SQLite-known path that git no longer
+// reports as deleted. Mutates out (Unregistered / Errors). Extracted
+// from Repair as a pure mechanical lift of the unregistration loop.
+func repairUnregister(
+	ctx context.Context,
+	tx *sql.Tx,
+	out *RepairResult,
+	gitSet map[string]bool,
+	dbWTs map[string]dbRow,
+	now int64,
+) {
 	for p, row := range dbWTs {
 		if gitSet[p] {
 			continue
@@ -161,20 +225,6 @@ func Repair(ctx context.Context, st *store.Store, repoRoot string, detectBranch 
 		}
 		out.Unregistered = append(out.Unregistered, p)
 	}
-
-	if len(out.Errors) > 0 {
-		// Any per-row failure poisons the whole reconcile — better
-		// to surface the drift to the operator than to commit a
-		// partial fix that's harder to reason about.
-		rolledBack = true
-		_ = tx.Rollback()
-		return out, nil
-	}
-	if err := tx.Commit(); err != nil {
-		return out, fmt.Errorf("commit tx: %w", err)
-	}
-	rolledBack = true
-	return out, nil
 }
 
 // nowMillis mirrors store.nowMillis (unexported there). Kept here as

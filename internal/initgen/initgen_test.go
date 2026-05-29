@@ -54,9 +54,9 @@ func TestWriteYAMLRefusesOverwriteWithoutForce(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, ".treeman.yaml")
 	_ = os.WriteFile(target, []byte("existing\n"), 0o644)
-	_, _, _, err := WriteYAML(dir, false)
+	_, created, _, err := WriteYAML(dir, false)
 	if err == nil {
-		t.Error("WriteYAML(force=false) should error when file exists")
+		t.Errorf("WriteYAML(force=false) should error when file exists (created=%v)", created)
 	}
 }
 

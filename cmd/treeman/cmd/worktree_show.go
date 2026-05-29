@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,14 +44,7 @@ func wtShow() *cli.Command {
 			}
 			defer closer()
 
-			repoID := int64(0)
-			if r := c.String("repo"); r != "" {
-				repoID, _ = lookupRepoID(ctx, st, MustAbs(r))
-			} else if cwd, err := os.Getwd(); err == nil {
-				if root, err := DiscoverRepoRoot(cwd); err == nil {
-					repoID, _ = lookupRepoID(ctx, st, root)
-				}
-			}
+			repoID := resolveShowRepoID(ctx, st, c.String("repo"))
 
 			var wt worktreeRow
 			if c.NArg() >= 1 {
@@ -62,24 +57,12 @@ func wtShow() *cli.Command {
 				return err
 			}
 
-			_, _ = fmt.Fprintln(ui.Out, ui.Bold(wt.Slug)+ui.Dim("  #"+fmt.Sprintf("%d", wt.ID)))
-			_, _ = fmt.Fprintf(ui.Out, "  branch: %s\n", wt.Branch)
-			_, _ = fmt.Fprintf(ui.Out, "  path:   %s\n", wt.Path)
-			_, _ = fmt.Fprintf(ui.Out, "  state:  %s\n", finalizeStatusLine(ctx, st, wt.ID))
-			if portMap, _ := st.LoadWorktreePorts(ctx, wt.ID); len(portMap) > 0 {
-				_, _ = fmt.Fprintf(ui.Out, "  ports:  %s\n", formatPortMap(portMap))
-			}
-			if bs, _ := st.ListActiveBranches(ctx, wt.ID); len(bs) > 0 {
-				for _, r := range bs {
-					_, _ = fmt.Fprintf(ui.Out, "  branch_scoped: %s (%s) → active branch %s\n", r.DBKey, r.Engine, r.Branch)
-				}
-			}
-			_, _ = fmt.Fprintln(ui.Out)
+			printWtHeader(ctx, st, wt)
 
 			// Recent events.
 			evs, _ := st.QueryEvents(ctx, store.EventFilter{
 				WorktreeID: wt.ID,
-				Limit:      int(c.Int("events")),
+				Limit:      c.Int("events"),
 				HydrateWT:  false,
 			})
 			reverseEvents(evs)
@@ -92,34 +75,74 @@ func wtShow() *cli.Command {
 			}
 
 			// Recent hook runs.
-			runs, _ := st.QueryHookRuns(ctx, wt.ID, int(c.Int("hooks")))
-			if len(runs) > 0 {
-				_, _ = fmt.Fprintln(ui.Out, ui.Bold("recent hook runs"))
-				tbl := ui.NewTable("STARTED", "PHASE", "EXIT", "DURATION")
-				for _, h := range runs {
-					exit := ui.Yellow("running")
-					if h.ExitCode.Valid {
-						s := fmt.Sprintf("%d", h.ExitCode.Int64)
-						if h.ExitCode.Int64 == 0 {
-							exit = ui.Green(s)
-						} else {
-							exit = ui.Red(s)
-						}
-					}
-					dur := "—"
-					if h.FinishedAt.Valid {
-						dur = ui.Dim((time.Duration(h.FinishedAt.Int64-h.StartedAt) * time.Millisecond).String())
-					}
-					tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), exit, dur)
-				}
-				tbl.Render(nil)
-				_, _ = fmt.Fprintln(ui.Out)
-			}
+			runs, _ := st.QueryHookRuns(ctx, wt.ID, c.Int("hooks"))
+			printWtHookRuns(runs)
 
 			ui.Hint("follow live events: treeman wt logs %s --follow", wt.Slug)
 			return nil
 		},
 	}
+}
+
+// resolveShowRepoID resolves the repo id to scope `wt show` lookups to:
+// the explicit --repo override, else the repo containing cwd. Returns 0
+// when neither resolves (an unscoped lookup).
+func resolveShowRepoID(ctx context.Context, st *store.Store, repoOverride string) int64 {
+	repoID := int64(0)
+	if repoOverride != "" {
+		repoID, _ = lookupRepoID(ctx, st, MustAbs(repoOverride))
+	} else if cwd, err := os.Getwd(); err == nil {
+		if root, err := DiscoverRepoRoot(cwd); err == nil {
+			repoID, _ = lookupRepoID(ctx, st, root)
+		}
+	}
+	return repoID
+}
+
+// printWtHeader prints the metadata block (slug, branch, path, state,
+// ports, branch-scoped DBs) for a worktree.
+func printWtHeader(ctx context.Context, st *store.Store, wt worktreeRow) {
+	_, _ = fmt.Fprintln(ui.Out, ui.Bold(wt.Slug)+ui.Dim("  #"+strconv.FormatInt(wt.ID, 10)))
+	_, _ = fmt.Fprintf(ui.Out, "  branch: %s\n", wt.Branch)
+	_, _ = fmt.Fprintf(ui.Out, "  path:   %s\n", wt.Path)
+	_, _ = fmt.Fprintf(ui.Out, "  state:  %s\n", finalizeStatusLine(ctx, st, wt.ID))
+	if portMap, _ := st.LoadWorktreePorts(ctx, wt.ID); len(portMap) > 0 {
+		_, _ = fmt.Fprintf(ui.Out, "  ports:  %s\n", formatPortMap(portMap))
+	}
+	if bs, _ := st.ListActiveBranches(ctx, wt.ID); len(bs) > 0 {
+		for _, r := range bs {
+			_, _ = fmt.Fprintf(ui.Out, "  branch_scoped: %s (%s) → active branch %s\n", r.DBKey, r.Engine, r.Branch)
+		}
+	}
+	_, _ = fmt.Fprintln(ui.Out)
+}
+
+// printWtHookRuns prints the recent hook runs table (nothing when the
+// slice is empty).
+func printWtHookRuns(runs []store.HookRun) {
+	if len(runs) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintln(ui.Out, ui.Bold("recent hook runs"))
+	tbl := ui.NewTable("STARTED", "PHASE", "EXIT", "DURATION")
+	for _, h := range runs {
+		exit := ui.Yellow("running")
+		if h.ExitCode.Valid {
+			s := strconv.FormatInt(h.ExitCode.Int64, 10)
+			if h.ExitCode.Int64 == 0 {
+				exit = ui.Green(s)
+			} else {
+				exit = ui.Red(s)
+			}
+		}
+		dur := "—"
+		if h.FinishedAt.Valid {
+			dur = ui.Dim((time.Duration(h.FinishedAt.Int64-h.StartedAt) * time.Millisecond).String())
+		}
+		tbl.Row(ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), exit, dur)
+	}
+	tbl.Render(nil)
+	_, _ = fmt.Fprintln(ui.Out)
 }
 
 // wtLogs — `treeman wt logs <name>` is a convenience wrapper around
@@ -136,7 +159,7 @@ func wtLogs() *cli.Command {
 		),
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman wt logs <worktree>")
+				return errors.New("usage: treeman wt logs <worktree>")
 			}
 			name := c.Args().First()
 			// Delegate to the logs command's argv shape so the
@@ -162,7 +185,7 @@ func wtLogs() *cli.Command {
 				argv = append(argv, "--no-pager")
 			}
 			if n := c.Int("n"); n > 0 {
-				argv = append(argv, "--n", fmt.Sprintf("%d", n))
+				argv = append(argv, "--n", strconv.Itoa(n))
 			}
 			if r := c.String("repo"); r != "" {
 				argv = append(argv, "--repo", r)
@@ -202,7 +225,7 @@ func wtWait() *cli.Command {
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman wt wait <worktree>")
+				return errors.New("usage: treeman wt wait <worktree>")
 			}
 			name := c.Args().First()
 			st, closer, err := openLogStore(ctx)
@@ -210,14 +233,7 @@ func wtWait() *cli.Command {
 				return err
 			}
 			defer closer()
-			repoID := int64(0)
-			if r := c.String("repo"); r != "" {
-				repoID, _ = lookupRepoID(ctx, st, MustAbs(r))
-			} else if cwd, err := os.Getwd(); err == nil {
-				if root, err := DiscoverRepoRoot(cwd); err == nil {
-					repoID, _ = lookupRepoID(ctx, st, root)
-				}
-			}
+			repoID := resolveShowRepoID(ctx, st, c.String("repo"))
 			wt, err := loadWorktreeRow(ctx, st, repoID, name)
 			if err != nil {
 				return err
@@ -236,40 +252,55 @@ func wtWait() *cli.Command {
 				ui.Info("waiting for finalize on %s (timeout %s)…", ui.Cyan(wt.Slug), c.Duration("timeout"))
 			}
 
-			tick := time.NewTicker(500 * time.Millisecond)
-			defer tick.Stop()
-			for {
-				if time.Now().After(deadline) {
-					return fmt.Errorf("timed out after %s", c.Duration("timeout"))
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-tick.C:
-				}
-				rows, err := st.QueryEvents(ctx, store.EventFilter{
-					WorktreeID:  wt.ID,
-					EventTypes:  []string{"wt_finalize_done", "wt_finalize"},
-					SinceMs:     anchor,
-					OldestFirst: true,
-					Limit:       50,
-				})
-				if err != nil {
-					return err
-				}
-				for _, e := range rows {
-					if e.EventType == "wt_finalize_done" {
-						if !c.Bool("quiet") {
-							ui.Success("finalize complete for %s", wt.Slug)
-						}
-						return nil
-					}
-					if e.EventType == "wt_finalize" && e.Level == "error" {
-						return fmt.Errorf("finalize failed: %s", e.Message)
-					}
-				}
-			}
+			return pollFinalize(ctx, st, wt, anchor, deadline, c.Duration("timeout"), c.Bool("quiet"))
 		},
+	}
+}
+
+// pollFinalize polls the event log every 500ms until the worktree's
+// finalize completes (success → nil), fails (error event → error) or the
+// deadline passes (timeout → error).
+func pollFinalize(
+	ctx context.Context,
+	st *store.Store,
+	wt worktreeRow,
+	anchor int64,
+	deadline time.Time,
+	timeout time.Duration,
+	quiet bool,
+) error {
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s", timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+		rows, err := st.QueryEvents(ctx, store.EventFilter{
+			WorktreeID:  wt.ID,
+			EventTypes:  []string{"wt_finalize_done", "wt_finalize"},
+			SinceMs:     anchor,
+			OldestFirst: true,
+			Limit:       50,
+		})
+		if err != nil {
+			return err
+		}
+		for _, e := range rows {
+			if e.EventType == "wt_finalize_done" {
+				if !quiet {
+					ui.Success("finalize complete for %s", wt.Slug)
+				}
+				return nil
+			}
+			if e.EventType == "wt_finalize" && e.Level == "error" {
+				return fmt.Errorf("finalize failed: %s", e.Message)
+			}
+		}
 	}
 }
 
@@ -312,7 +343,7 @@ func worktreeFromCwd(ctx context.Context, st *store.Store) (worktreeRow, error) 
 		}
 		dir = parent
 	}
-	return worktreeRow{}, fmt.Errorf("not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)")
+	return worktreeRow{}, errors.New("not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)")
 }
 
 // formatPortMap renders a slot→port map as "name=port name=port" in

@@ -95,126 +95,153 @@ func LoadPostgres(ctx context.Context, db *sql.DB, targetDB, dumpPath string) (u
 // that reference implementation byte-for-byte.
 func streamStatements(ctx context.Context, r io.Reader, onStmt func(stmt string) error) (uint64, error) {
 	chunk := make([]byte, 1<<20)
-	var buf bytes.Buffer
-	var (
-		inSingle, inDouble, inBacktick bool
-		inLineComment, inBlockComment  bool
-		starSeen, dashSeen, slashSeen  bool
-		applied                        uint64
-	)
-	flush := func() error {
-		stmt := buf.String()
-		buf.Reset()
-		if isBlank(stmt) {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := onStmt(stmt); err != nil {
-			return fmt.Errorf("apply dump stmt #%d: %w", applied, err)
-		}
-		applied++
-		return nil
-	}
+	s := &stmtScanner{ctx: ctx, onStmt: onStmt}
 	for {
 		n, rerr := r.Read(chunk)
-		for i := 0; i < n; i++ {
-			b := chunk[i]
-			switch {
-			case inLineComment:
-				if b == '\n' {
-					inLineComment = false
-				}
-				continue
-			case inBlockComment:
-				if starSeen && b == '/' {
-					inBlockComment = false
-					starSeen = false
-					continue
-				}
-				starSeen = b == '*'
-				continue
-			case inSingle:
-				buf.WriteByte(b)
-				if b == '\'' {
-					inSingle = false
-				}
-				continue
-			case inDouble:
-				buf.WriteByte(b)
-				if b == '"' {
-					inDouble = false
-				}
-				continue
-			case inBacktick:
-				buf.WriteByte(b)
-				if b == '`' {
-					inBacktick = false
-				}
-				continue
-			}
-			// Top-level (not in a quote or comment). Resolve a pending
-			// `-` / `/` from the previous byte first: it either forms a
-			// comment opener or gets written verbatim before we handle b.
-			if dashSeen {
-				dashSeen = false
-				if b == '-' {
-					inLineComment = true
-					continue
-				}
-				buf.WriteByte('-')
-			} else if slashSeen {
-				slashSeen = false
-				if b == '*' {
-					inBlockComment = true
-					continue
-				}
-				buf.WriteByte('/')
-			}
-			switch b {
-			case '-':
-				dashSeen = true
-			case '/':
-				slashSeen = true
-			case '\'':
-				inSingle = true
-				buf.WriteByte(b)
-			case '"':
-				inDouble = true
-				buf.WriteByte(b)
-			case '`':
-				inBacktick = true
-				buf.WriteByte(b)
-			case ';':
-				if err := flush(); err != nil {
-					return applied, err
-				}
-			default:
-				buf.WriteByte(b)
+		for i := range n {
+			if err := s.feed(chunk[i]); err != nil {
+				return s.applied, err
 			}
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
 				break
 			}
-			return applied, rerr
+			return s.applied, rerr
 		}
 	}
 	// A `-` or `/` pending at EOF was a literal trailing byte, not a
 	// comment opener — write it before the final flush (mirrors the
 	// byte-by-byte path, which wrote it once Peek returned empty).
-	if dashSeen {
-		buf.WriteByte('-')
+	if s.dashSeen {
+		s.buf.WriteByte('-')
 	}
-	if slashSeen {
-		buf.WriteByte('/')
+	if s.slashSeen {
+		s.buf.WriteByte('/')
 	}
 	// Trailing statement without a closing `;` (rare but tolerated).
-	if err := flush(); err != nil {
-		return applied, err
+	if err := s.flush(); err != nil {
+		return s.applied, err
 	}
-	return applied, nil
+	return s.applied, nil
+}
+
+// stmtScanner carries the SQL-splitting state machine across the 1MB
+// read chunks so the two-character `--` / `/*` / `*/` lookaheads and
+// quote/comment context survive chunk boundaries.
+type stmtScanner struct {
+	ctx    context.Context
+	onStmt func(stmt string) error
+	buf    bytes.Buffer
+
+	inSingle, inDouble, inBacktick bool
+	inLineComment, inBlockComment  bool
+	starSeen, dashSeen, slashSeen  bool
+	applied                        uint64
+}
+
+func (s *stmtScanner) flush() error {
+	stmt := s.buf.String()
+	s.buf.Reset()
+	if isBlank(stmt) {
+		return nil
+	}
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.onStmt(stmt); err != nil {
+		return fmt.Errorf("apply dump stmt #%d: %w", s.applied, err)
+	}
+	s.applied++
+	return nil
+}
+
+// feed advances the scanner by one byte. Returns the error from flush
+// only when a `;` terminator (or trailing-statement) callback fails.
+func (s *stmtScanner) feed(b byte) error {
+	if s.feedInContext(b) {
+		return nil
+	}
+	// Top-level (not in a quote or comment). Resolve a pending
+	// `-` / `/` from the previous byte first: it either forms a
+	// comment opener or gets written verbatim before we handle b.
+	if s.dashSeen {
+		s.dashSeen = false
+		if b == '-' {
+			s.inLineComment = true
+			return nil
+		}
+		s.buf.WriteByte('-')
+	} else if s.slashSeen {
+		s.slashSeen = false
+		if b == '*' {
+			s.inBlockComment = true
+			return nil
+		}
+		s.buf.WriteByte('/')
+	}
+	switch b {
+	case '-':
+		s.dashSeen = true
+	case '/':
+		s.slashSeen = true
+	case '\'':
+		s.inSingle = true
+		s.buf.WriteByte(b)
+	case '"':
+		s.inDouble = true
+		s.buf.WriteByte(b)
+	case '`':
+		s.inBacktick = true
+		s.buf.WriteByte(b)
+	case ';':
+		if err := s.flush(); err != nil {
+			return err
+		}
+	default:
+		s.buf.WriteByte(b)
+	}
+	return nil
+}
+
+// feedInContext handles a byte while inside a comment or quoted string,
+// reporting true when b was consumed in such a context (so the caller
+// skips top-level handling) and false when at top level.
+func (s *stmtScanner) feedInContext(b byte) bool {
+	switch {
+	case s.inLineComment:
+		if b == '\n' {
+			s.inLineComment = false
+		}
+		return true
+	case s.inBlockComment:
+		if s.starSeen && b == '/' {
+			s.inBlockComment = false
+			s.starSeen = false
+			return true
+		}
+		s.starSeen = b == '*'
+		return true
+	case s.inSingle:
+		s.buf.WriteByte(b)
+		if b == '\'' {
+			s.inSingle = false
+		}
+		return true
+	case s.inDouble:
+		s.buf.WriteByte(b)
+		if b == '"' {
+			s.inDouble = false
+		}
+		return true
+	case s.inBacktick:
+		s.buf.WriteByte(b)
+		if b == '`' {
+			s.inBacktick = false
+		}
+		return true
+	}
+	return false
 }
 
 func isBlank(s string) bool {

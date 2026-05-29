@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -75,10 +76,7 @@ func repoJitter(repoPath string) time.Duration {
 // misconfigured `interval_minutes: 0` can't spin a tight ticker that
 // hammers every remote on every tick.
 func autoFetchInterval(cfg config.AutoFetchConfig) time.Duration {
-	d := time.Duration(cfg.IntervalMinutes) * time.Minute
-	if d < time.Minute {
-		d = time.Minute
-	}
+	d := max(time.Duration(cfg.IntervalMinutes)*time.Minute, time.Minute)
 	return d
 }
 
@@ -198,7 +196,7 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 			"consecutive_failures", failures)
 		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "auto_fetch_fetch_failed",
 			err.Error(), r.ID, 0, "", 0, map[string]string{
-				"consecutive_failures": fmt.Sprintf("%d", failures),
+				"consecutive_failures": strconv.Itoa(failures),
 				"next_retry_at":        st.SyncBackoffUntil(r.Path).UTC().Format(time.RFC3339),
 			})
 		return err
@@ -218,7 +216,7 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 	mode := cfg.AutoFetch.ResolvedMode()
 	for _, wtPath := range paths {
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // ctx cancelled mid-loop: stop syncing cleanly, not a failure
 		}
 		_ = SyncWorktree(ctx, st, r.ID, wtPath, mode)
 	}
@@ -253,7 +251,7 @@ func SyncWorktree(ctx context.Context, st *State, repoID int64, wtPath, mode str
 	head, err := gitcmd.String(ctx, wtPath, "symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
 		emitSkip(ctx, st, repoID, wtPath, "", SyncSkipDetached, "detached HEAD or no branch")
-		return nil
+		return nil //nolint:nilerr // refusable precondition: not a sync candidate, not a failure
 	}
 	// Strip `refs/heads/` for the event payload below.
 	branch := strings.TrimSpace(strings.TrimPrefix(head, "refs/heads/"))

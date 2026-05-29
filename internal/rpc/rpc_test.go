@@ -64,7 +64,10 @@ func TestRequestRoundtripWorktreeTeardown(t *testing.T) {
 			InheritedEnv: map[string]string{},
 		},
 	}
-	b, _ := json.Marshal(&req)
+	b, err := json.Marshal(&req)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var got Request
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatal(err)

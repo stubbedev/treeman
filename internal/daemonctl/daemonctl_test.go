@@ -51,7 +51,7 @@ func fakeBins(t *testing.T, names ...string) (logLines func() []string) {
 			return nil
 		}
 		var out []string
-		for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		for l := range strings.SplitSeq(strings.TrimSpace(string(b)), "\n") {
 			if l != "" {
 				out = append(out, l)
 			}

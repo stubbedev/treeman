@@ -31,7 +31,7 @@ func CaptureInheritedEnv() map[string]string {
 	env := os.Environ()
 	out := make(map[string]string, len(env))
 	for _, kv := range env {
-		for i := 0; i < len(kv); i++ {
+		for i := range len(kv) {
 			if kv[i] == '=' {
 				out[kv[:i]] = kv[i+1:]
 				break
@@ -68,7 +68,7 @@ func PrintHint(format string, args ...any) { ui.Hint(format, args...) }
 //
 // Aliases are considered alongside primary names so `treeman
 // worktreee` still suggests `wt` if that's closer.
-func SuggestNearestCommands(typed string, commands []string, max int) []string {
+func SuggestNearestCommands(typed string, commands []string, maxN int) []string {
 	type scored struct {
 		name string
 		d    int
@@ -90,8 +90,8 @@ func SuggestNearestCommands(typed string, commands []string, max int) []string {
 			out[j], out[j-1] = out[j-1], out[j]
 		}
 	}
-	if max > 0 && len(out) > max {
-		out = out[:max]
+	if maxN > 0 && len(out) > maxN {
+		out = out[:maxN]
 	}
 	names := make([]string, len(out))
 	for i, s := range out {
@@ -125,13 +125,7 @@ func levenshtein(a, b string) int {
 			del := prev[j] + 1
 			ins := curr[j-1] + 1
 			sub := prev[j-1] + cost
-			m := del
-			if ins < m {
-				m = ins
-			}
-			if sub < m {
-				m = sub
-			}
+			m := min(sub, min(ins, del))
 			curr[j] = m
 		}
 		prev, curr = curr, prev

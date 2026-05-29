@@ -3,6 +3,7 @@
 package containerip
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strings"
@@ -62,7 +63,8 @@ func detectInsideContainer() bool {
 // connection attempt.
 func engineSocketReachable(engine string) bool {
 	if v, ok := engineOnce.Load(engine); ok {
-		return v.(bool)
+		cached, _ := v.(bool)
+		return cached
 	}
 	ok := func() bool {
 		if _, err := exec.LookPath(engine); err != nil {
@@ -70,11 +72,8 @@ func engineSocketReachable(engine string) bool {
 		}
 		// `info` is cheap and proves the daemon socket answers.
 		// Output discarded — exit code is the signal.
-		return exec.Command(engine, "info", "--format", "ok").Run() == nil
+		return exec.CommandContext(context.Background(), engine, "info", "--format", "ok").Run() == nil
 	}()
 	engineOnce.Store(engine, ok)
 	return ok
 }
-
-// resetEngineReachableCache is for tests.
-func resetEngineReachableCache() { engineOnce = sync.Map{} }

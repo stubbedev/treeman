@@ -16,6 +16,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -152,10 +153,5 @@ func constraints(s *jsonschema.Schema) string {
 
 // required reports whether `key` is in the schema's Required list.
 func required(s *jsonschema.Schema, key string) bool {
-	for _, r := range s.Required {
-		if r == key {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s.Required, key)
 }

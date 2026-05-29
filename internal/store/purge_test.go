@@ -83,10 +83,10 @@ func TestPurgeEventsRequiresFilter(t *testing.T) {
 	defer func() { _ = st.Close() }()
 
 	// Insert a couple of events so we can verify selective purge.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_ = st.WriteEvent(ctx, LevelInfo, "test", "msg", 0, 0, "", 0, nil)
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		_ = st.WriteEvent(ctx, LevelError, "test", "boom", 0, 0, "", 0, nil)
 	}
 

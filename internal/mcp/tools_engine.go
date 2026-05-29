@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -223,7 +225,7 @@ func probeES(ctx context.Context, cfg *config.Config) engineProbeResult {
 
 type dbSchemaIn struct {
 	Repo   string `json:"repo,omitempty"`
-	Engine string `json:"engine" jsonschema:"mysql|mariadb|tidb|postgres|postgresql|mongodb|redis|elasticsearch"`
+	Engine string `json:"engine"         jsonschema:"mysql|mariadb|tidb|postgres|postgresql|mongodb|redis|elasticsearch"`
 	DB     string `json:"db"`
 }
 type dbSchemaOut struct {
@@ -238,75 +240,85 @@ func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchem
 		return nil, dbSchemaOut{}, err
 	}
 	out := dbSchemaOut{Engine: in.Engine, DB: in.DB, Schema: map[string]any{}}
+	var schema map[string]any
 	switch in.Engine {
 	case "mysql", "mariadb", "tidb":
-		if cfg.Connections.Mysql == nil {
-			return nil, out, fmt.Errorf("connections.mysql not configured")
-		}
-		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = drv.Close() }()
-		out.Schema, err = mysqlSchema(ctx, drv, in.DB)
-		if err != nil {
-			return nil, out, err
-		}
+		schema, err = dbSchemaMySQL(ctx, cfg, in.DB)
 	case "postgres", "postgresql":
-		if cfg.Connections.Postgres == nil {
-			return nil, out, fmt.Errorf("connections.postgres not configured")
-		}
-		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = drv.Close() }()
-		out.Schema, err = postgresSchema(ctx, drv, in.DB)
-		if err != nil {
-			return nil, out, err
-		}
+		schema, err = dbSchemaPostgres(ctx, cfg, in.DB)
 	case "mongodb":
-		if cfg.Connections.Mongodb == nil {
-			return nil, out, fmt.Errorf("connections.mongodb not configured")
-		}
-		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = drv.Close(ctx) }()
-		out.Schema, err = mongoSchema(ctx, drv, in.DB)
-		if err != nil {
-			return nil, out, err
-		}
+		schema, err = dbSchemaMongo(ctx, cfg, in.DB)
 	case "elasticsearch", "opensearch":
-		if cfg.Connections.Elasticsearch == nil {
-			return nil, out, fmt.Errorf("connections.elasticsearch not configured")
-		}
-		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-		if err != nil {
-			return nil, out, err
-		}
-		out.Schema, err = esSchema(ctx, drv, in.DB)
-		if err != nil {
-			return nil, out, err
-		}
+		schema, err = dbSchemaES(ctx, cfg, in.DB)
 	case "redis":
-		if cfg.Connections.Redis == nil {
-			return nil, out, fmt.Errorf("connections.redis not configured")
-		}
-		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = drv.Close() }()
-		out.Schema, err = redisSchema(ctx, drv, in.DB)
-		if err != nil {
-			return nil, out, err
-		}
+		schema, err = dbSchemaRedis(ctx, cfg, in.DB)
 	default:
 		return nil, out, fmt.Errorf("unsupported engine: %s", in.Engine)
 	}
+	if err != nil {
+		return nil, out, err
+	}
+	out.Schema = schema
 	return nil, out, nil
+}
+
+func dbSchemaMySQL(ctx context.Context, cfg *config.Config, db string) (map[string]any, error) {
+	if cfg.Connections.Mysql == nil {
+		return nil, errors.New("connections.mysql not configured")
+	}
+	drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = drv.Close() }()
+	return mysqlSchema(ctx, drv, db)
+}
+
+func dbSchemaPostgres(ctx context.Context, cfg *config.Config, db string) (map[string]any, error) {
+	if cfg.Connections.Postgres == nil {
+		return nil, errors.New("connections.postgres not configured")
+	}
+	drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = drv.Close() }()
+	return postgresSchema(ctx, drv, db)
+}
+
+func dbSchemaMongo(ctx context.Context, cfg *config.Config, db string) (map[string]any, error) {
+	if cfg.Connections.Mongodb == nil {
+		return nil, errors.New("connections.mongodb not configured")
+	}
+	drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = drv.Close(ctx) }()
+	return mongoSchema(ctx, drv, db)
+}
+
+func dbSchemaES(ctx context.Context, cfg *config.Config, db string) (map[string]any, error) {
+	if cfg.Connections.Elasticsearch == nil {
+		return nil, errors.New("connections.elasticsearch not configured")
+	}
+	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+	if err != nil {
+		return nil, err
+	}
+	return esSchema(ctx, drv, db)
+}
+
+func dbSchemaRedis(ctx context.Context, cfg *config.Config, db string) (map[string]any, error) {
+	if cfg.Connections.Redis == nil {
+		return nil, errors.New("connections.redis not configured")
+	}
+	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = drv.Close() }()
+	return redisSchema(ctx, drv, db)
 }
 
 // ─── db_query ───────────────────────────────────────────────────────
@@ -315,12 +327,12 @@ type dbQueryIn struct {
 	Repo       string `json:"repo,omitempty"`
 	Engine     string `json:"engine"`
 	DB         string `json:"db"`
-	Query      string `json:"query,omitempty" jsonschema:"SQL for mysql/postgres; raw command for redis"`
-	Collection string `json:"collection,omitempty" jsonschema:"required for mongodb"`
+	Query      string `json:"query,omitempty"       jsonschema:"SQL for mysql/postgres; raw command for redis"`
+	Collection string `json:"collection,omitempty"  jsonschema:"required for mongodb"`
 	FilterJSON string `json:"filter_json,omitempty" jsonschema:"mongodb filter document"`
-	Index      string `json:"index,omitempty" jsonschema:"elasticsearch index name (overrides db field)"`
-	BodyJSON   string `json:"body_json,omitempty" jsonschema:"elasticsearch _search body"`
-	Limit      int    `json:"limit,omitempty" jsonschema:"max rows/docs returned (default 100)"`
+	Index      string `json:"index,omitempty"       jsonschema:"elasticsearch index name (overrides db field)"`
+	BodyJSON   string `json:"body_json,omitempty"   jsonschema:"elasticsearch _search body"`
+	Limit      int    `json:"limit,omitempty"       jsonschema:"max rows/docs returned (default 100)"`
 }
 type dbQueryOut struct {
 	Engine  string   `json:"engine"`
@@ -337,145 +349,167 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 		return nil, dbQueryOut{}, err
 	}
 	out := dbQueryOut{Engine: in.Engine}
+	var rows []any
+	var cols []string
 	switch in.Engine {
 	case "mysql", "mariadb", "tidb":
-		if err := assertReadOnlySQL(in.Query); err != nil {
-			return nil, out, err
-		}
-		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = drv.Close() }()
-		qdb, err := ident.QuoteMySQL(in.DB)
-		if err != nil {
-			return nil, out, fmt.Errorf("db %q: %w", in.DB, err)
-		}
-		if _, err := drv.DB.ExecContext(ctx, "USE "+qdb); err != nil {
-			return nil, out, fmt.Errorf("use %s: %w", in.DB, err)
-		}
-		rows, cols, err := runSQLQuery(ctx, drv.DB, in.Query, in.Limit)
-		if err != nil {
-			return nil, out, err
-		}
-		out.Rows, out.Columns = rows, cols
+		rows, cols, err = dbQueryMySQL(ctx, cfg, in)
 	case "postgres", "postgresql":
-		if err := assertReadOnlySQL(in.Query); err != nil {
-			return nil, out, err
-		}
-		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = drv.Close() }()
-		scoped, err := drv.OpenScoped(ctx, in.DB)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = scoped.Close() }()
-		rows, cols, err := runSQLQuery(ctx, scoped, in.Query, in.Limit)
-		if err != nil {
-			return nil, out, err
-		}
-		out.Rows, out.Columns = rows, cols
+		rows, cols, err = dbQueryPostgres(ctx, cfg, in)
 	case "mongodb":
-		if in.Collection == "" {
-			return nil, out, fmt.Errorf("mongodb query: collection required")
-		}
-		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = drv.Close(ctx) }()
-		filter := bson.D{}
-		if strings.TrimSpace(in.FilterJSON) != "" {
-			if err := bson.UnmarshalExtJSON([]byte(in.FilterJSON), false, &filter); err != nil {
-				return nil, out, fmt.Errorf("parse filter_json: %w", err)
-			}
-		}
-		col := drv.Client.Database(in.DB).Collection(in.Collection)
-		// Use limit via Find options.
-		cur, err := col.Find(ctx, filter)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = cur.Close(ctx) }()
-		for cur.Next(ctx) {
-			if len(out.Rows) >= in.Limit {
-				break
-			}
-			var doc bson.M
-			if err := cur.Decode(&doc); err != nil {
-				return nil, out, err
-			}
-			out.Rows = append(out.Rows, doc)
-		}
+		rows, err = dbQueryMongo(ctx, cfg, in)
 	case "elasticsearch", "opensearch":
-		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-		if err != nil {
-			return nil, out, err
-		}
-		idx := in.Index
-		if idx == "" {
-			idx = in.DB
-		}
-		body := strings.TrimSpace(in.BodyJSON)
-		if body == "" {
-			body = `{"query":{"match_all":{}},"size":` + fmt.Sprintf("%d", in.Limit) + `}`
-		}
-		req, err := http.NewRequestWithContext(ctx, "POST",
-			drv.Base+"/"+idx+"/_search", strings.NewReader(body))
-		if err != nil {
-			return nil, out, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := drv.HTTP.Do(req)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = resp.Body.Close() }()
-		buf, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 400 {
-			return nil, out, fmt.Errorf("es _search: %s: %s", resp.Status, string(buf))
-		}
-		var parsed map[string]any
-		if err := json.Unmarshal(buf, &parsed); err != nil {
-			return nil, out, fmt.Errorf("parse es response: %w", err)
-		}
-		if hits, ok := parsed["hits"].(map[string]any); ok {
-			if arr, ok := hits["hits"].([]any); ok {
-				for i, h := range arr {
-					if i >= in.Limit {
-						break
-					}
-					out.Rows = append(out.Rows, h)
-				}
-			}
-		}
+		rows, err = dbQueryES(ctx, cfg, in)
 	case "redis":
-		if err := assertReadOnlyRedis(in.Query); err != nil {
-			return nil, out, err
-		}
-		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-		if err != nil {
-			return nil, out, err
-		}
-		defer func() { _ = drv.Close() }()
-		args := strings.Fields(in.Query)
-		anyArgs := make([]any, len(args))
-		for i, a := range args {
-			anyArgs[i] = a
-		}
-		c := drv.Client()
-		res, err := c.Do(ctx, anyArgs...).Result()
-		if err != nil {
-			return nil, out, err
-		}
-		out.Rows = []any{res}
+		rows, err = dbQueryRedis(ctx, cfg, in)
 	default:
 		return nil, out, fmt.Errorf("unsupported engine: %s", in.Engine)
 	}
+	if err != nil {
+		return nil, out, err
+	}
+	out.Rows, out.Columns = rows, cols
 	return nil, out, nil
+}
+
+func dbQueryMySQL(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, []string, error) {
+	if err := assertReadOnlySQL(in.Query); err != nil {
+		return nil, nil, err
+	}
+	drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = drv.Close() }()
+	qdb, err := ident.QuoteMySQL(in.DB)
+	if err != nil {
+		return nil, nil, fmt.Errorf("db %q: %w", in.DB, err)
+	}
+	if _, err := drv.DB.ExecContext(ctx, "USE "+qdb); err != nil {
+		return nil, nil, fmt.Errorf("use %s: %w", in.DB, err)
+	}
+	return runSQLQuery(ctx, drv.DB, in.Query, in.Limit)
+}
+
+func dbQueryPostgres(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, []string, error) {
+	if err := assertReadOnlySQL(in.Query); err != nil {
+		return nil, nil, err
+	}
+	drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = drv.Close() }()
+	scoped, err := drv.OpenScoped(ctx, in.DB)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = scoped.Close() }()
+	return runSQLQuery(ctx, scoped, in.Query, in.Limit)
+}
+
+func dbQueryMongo(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, error) {
+	if in.Collection == "" {
+		return nil, errors.New("mongodb query: collection required")
+	}
+	drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = drv.Close(ctx) }()
+	filter := bson.D{}
+	if strings.TrimSpace(in.FilterJSON) != "" {
+		if err := bson.UnmarshalExtJSON([]byte(in.FilterJSON), false, &filter); err != nil {
+			return nil, fmt.Errorf("parse filter_json: %w", err)
+		}
+	}
+	col := drv.Client.Database(in.DB).Collection(in.Collection)
+	// Use limit via Find options.
+	cur, err := col.Find(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cur.Close(ctx) }()
+	var rows []any
+	for cur.Next(ctx) {
+		if len(rows) >= in.Limit {
+			break
+		}
+		var doc bson.M
+		if err := cur.Decode(&doc); err != nil {
+			return nil, err
+		}
+		rows = append(rows, doc)
+	}
+	return rows, nil
+}
+
+func dbQueryES(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, error) {
+	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+	if err != nil {
+		return nil, err
+	}
+	idx := in.Index
+	if idx == "" {
+		idx = in.DB
+	}
+	body := strings.TrimSpace(in.BodyJSON)
+	if body == "" {
+		body = `{"query":{"match_all":{}},"size":` + strconv.Itoa(in.Limit) + `}`
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		drv.Base+"/"+idx+"/_search", strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := drv.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	buf, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("es _search: %s: %s", resp.Status, string(buf))
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(buf, &parsed); err != nil {
+		return nil, fmt.Errorf("parse es response: %w", err)
+	}
+	var rows []any
+	if hits, ok := parsed["hits"].(map[string]any); ok {
+		if arr, ok := hits["hits"].([]any); ok {
+			for i, h := range arr {
+				if i >= in.Limit {
+					break
+				}
+				rows = append(rows, h)
+			}
+		}
+	}
+	return rows, nil
+}
+
+func dbQueryRedis(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, error) {
+	if err := assertReadOnlyRedis(in.Query); err != nil {
+		return nil, err
+	}
+	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = drv.Close() }()
+	args := strings.Fields(in.Query)
+	anyArgs := make([]any, len(args))
+	for i, a := range args {
+		anyArgs[i] = a
+	}
+	c := drv.Client()
+	res, err := c.Do(ctx, anyArgs...).Result()
+	if err != nil {
+		return nil, err
+	}
+	return []any{res}, nil
 }
 
 // ─── snapshot_inspect ───────────────────────────────────────────────
@@ -493,13 +527,17 @@ type snapshotInspectOut struct {
 	EngineVersionNow string         `json:"engine_version_now,omitempty"`
 }
 
-func snapshotInspectTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapshotInspectIn) (*mcpsdk.CallToolResult, snapshotInspectOut, error) {
+func snapshotInspectTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in snapshotInspectIn,
+) (*mcpsdk.CallToolResult, snapshotInspectOut, error) {
 	st, err := openStore(ctx)
 	if err != nil {
 		return nil, snapshotInspectOut{}, err
 	}
 	defer func() { _ = st.Close() }()
-	var rec *store_SnapshotRecord
+	var rec *storeSnapshotRecord
 	if in.Fingerprint != "" {
 		rec, err = snapshotLookupByFingerprint(ctx, st, in.Fingerprint)
 		if err != nil {
@@ -512,14 +550,13 @@ func snapshotInspectTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snap
 		}
 	}
 	if rec == nil {
-		return nil, snapshotInspectOut{}, fmt.Errorf("no snapshot row matches the supplied criteria")
+		return nil, snapshotInspectOut{}, errors.New("no snapshot row matches the supplied criteria")
 	}
 	out := snapshotInspectOut{Record: snapshotRecordToMap(rec)}
 
 	cfg, err := loadCfgForRepo(in.Repo)
 	if err == nil {
-		out.TemplateExists, out.TemplateSizeKB, out.EngineVersionNow =
-			probeTemplate(ctx, cfg, rec.Engine, rec.TemplateName)
+		out.TemplateExists, out.TemplateSizeKB, out.EngineVersionNow = probeTemplate(ctx, cfg, rec.Engine, rec.TemplateName)
 	}
 	return nil, out, nil
 }
@@ -540,7 +577,7 @@ type snapshotDropOut struct {
 
 func snapshotDropTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapshotDropIn) (*mcpsdk.CallToolResult, snapshotDropOut, error) {
 	if in.Fingerprint == "" {
-		return nil, snapshotDropOut{}, fmt.Errorf("fingerprint required")
+		return nil, snapshotDropOut{}, errors.New("fingerprint required")
 	}
 	st, err := openStore(ctx)
 	if err != nil {
@@ -591,7 +628,7 @@ type hookLogReadOut struct {
 
 func hookLogReadTool(_ context.Context, _ *mcpsdk.CallToolRequest, in hookLogReadIn) (*mcpsdk.CallToolResult, hookLogReadOut, error) {
 	if in.WorktreePath == "" || in.Phase == "" {
-		return nil, hookLogReadOut{}, fmt.Errorf("worktree_path and phase required")
+		return nil, hookLogReadOut{}, errors.New("worktree_path and phase required")
 	}
 	p := filepath.Join(in.WorktreePath, ".treeman-hooks",
 		fmt.Sprintf("%s-%d.log", in.Phase, in.GroupIdx))
@@ -677,7 +714,9 @@ func dbDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbDumpIn) (*m
 		}
 		return runESDump(ctx, cfg.Connections.Elasticsearch, in.DB, p, in.Gzip)
 	case engine.FamilyRedis:
-		return nil, dbDumpOut{}, fmt.Errorf("db_dump: redis dump is not implemented — redis cold-build uses a `seed:` step rather than a dump file, so there is no restore counterpart. If you need a redis snapshot, use redis-cli BGSAVE / SAVE manually and reference the resulting RDB out-of-band")
+		return nil, dbDumpOut{}, errors.New(
+			"db_dump: redis dump is not implemented — redis cold-build uses a `seed:` step rather than a dump file, so there is no restore counterpart. If you need a redis snapshot, use redis-cli BGSAVE / SAVE manually and reference the resulting RDB out-of-band",
+		)
 	default:
 		return nil, dbDumpOut{}, fmt.Errorf("db_dump: engine family %q has no dump runner", fam)
 	}
@@ -767,6 +806,9 @@ func listMysqlDatabases(ctx context.Context, drv *dbmysql.Driver) ([]string, err
 		_ = rows.Scan(&s)
 		out = append(out, s)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -785,6 +827,9 @@ func listPostgresDatabases(ctx context.Context, drv *dbpostgres.Driver) ([]strin
 		var s string
 		_ = rows.Scan(&s)
 		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -809,6 +854,9 @@ func mysqlSchema(ctx context.Context, drv *dbmysql.Driver, db string) (map[strin
 		var n string
 		_ = rows.Scan(&n)
 		names = append(names, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	for _, n := range names {
 		qn, err := ident.QuoteMySQL(n)
@@ -851,32 +899,50 @@ func postgresSchema(ctx context.Context, drv *dbpostgres.Driver, db string) (map
 		_ = rows.Scan(&p.schema, &p.name)
 		tables = append(tables, p)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	schema := map[string]any{}
 	for _, t := range tables {
-		colRows, err := scoped.QueryContext(ctx, `
-			SELECT column_name, data_type, is_nullable, column_default
-			FROM information_schema.columns
-			WHERE table_schema = $1 AND table_name = $2
-			ORDER BY ordinal_position
-		`, t.schema, t.name)
-		if err != nil {
+		cols, ok := postgresTableColumns(ctx, scoped, t.schema, t.name)
+		if !ok {
 			continue
 		}
-		var cols []map[string]any
-		for colRows.Next() {
-			var name, dtype, nullable string
-			var def sql.NullString
-			_ = colRows.Scan(&name, &dtype, &nullable, &def)
-			cols = append(cols, map[string]any{
-				"name": name, "type": dtype,
-				"nullable": nullable == "YES",
-				"default":  def.String,
-			})
-		}
-		_ = colRows.Close()
 		schema[t.schema+"."+t.name] = cols
 	}
 	return map[string]any{"tables": schema}, nil
+}
+
+// postgresTableColumns reads one table's column metadata. ok is false
+// when the column query fails, so the caller can omit the table from
+// the schema map (a partial schema is better than aborting the whole
+// dump for one unreadable table).
+func postgresTableColumns(ctx context.Context, scoped *sql.DB, schema, name string) ([]map[string]any, bool) {
+	colRows, err := scoped.QueryContext(ctx, `
+		SELECT column_name, data_type, is_nullable, column_default
+		FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = $2
+		ORDER BY ordinal_position
+	`, schema, name)
+	if err != nil {
+		return nil, false
+	}
+	defer func() { _ = colRows.Close() }()
+	var cols []map[string]any
+	for colRows.Next() {
+		var colName, dtype, nullable string
+		var def sql.NullString
+		_ = colRows.Scan(&colName, &dtype, &nullable, &def)
+		cols = append(cols, map[string]any{
+			"name": colName, "type": dtype,
+			"nullable": nullable == "YES",
+			"default":  def.String,
+		})
+	}
+	if err := colRows.Err(); err != nil {
+		return nil, false
+	}
+	return cols, true
 }
 
 func mongoSchema(ctx context.Context, drv *dbmongo.Driver, db string) (map[string]any, error) {
@@ -899,7 +965,7 @@ func esSchema(ctx context.Context, drv *dbes.Driver, indexPattern string) (map[s
 	if target == "" {
 		target = "_all"
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", drv.Base+"/"+target+"*/_mapping", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, drv.Base+"/"+target+"*/_mapping", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -916,7 +982,7 @@ func esSchema(ctx context.Context, drv *dbes.Driver, indexPattern string) (map[s
 
 func redisSchema(ctx context.Context, drv *dbredis.Driver, prefix string) (map[string]any, error) {
 	if prefix == "" {
-		return nil, fmt.Errorf("redis schema_dump: prefix required (e.g. wt_feature-x:)")
+		return nil, errors.New("redis schema_dump: prefix required (e.g. wt_feature-x:)")
 	}
 	c := drv.Client()
 	var cursor uint64
@@ -949,7 +1015,10 @@ func assertReadOnlySQL(q string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("db_query (SQL) refuses non-read statements; got %q (must start with SELECT/SHOW/EXPLAIN/DESCRIBE/WITH)", firstWord(q))
+	return fmt.Errorf(
+		"db_query (SQL) refuses non-read statements; got %q (must start with SELECT/SHOW/EXPLAIN/DESCRIBE/WITH)",
+		firstWord(q),
+	)
 }
 
 func assertReadOnlyRedis(q string) error {

@@ -21,8 +21,10 @@ const ProtocolVersion uint32 = 1
 
 // Default socket-path lookup order: $TREEMAN_SOCKET → $XDG_RUNTIME_DIR
 // /treeman.sock → $XDG_DATA_HOME/treeman/treeman.sock.
-const SocketEnv = "TREEMAN_SOCKET"
-const SocketBasename = "treeman.sock"
+const (
+	SocketEnv      = "TREEMAN_SOCKET"
+	SocketBasename = "treeman.sock"
+)
 
 // SocketPath returns the effective socket path.
 func SocketPath() (string, error) {
@@ -88,6 +90,17 @@ type Request struct {
 // keyed by `method`.
 func (r Request) MarshalJSON() ([]byte, error) {
 	wrapper := map[string]any{"method": r.Method}
+	if !populateWrapperA(r, wrapper) {
+		populateWrapperB(r, wrapper)
+	}
+	return json.Marshal(wrapper)
+}
+
+// populateWrapperA flattens the args struct for the first half of the
+// method discriminator. Returns true when r.Method was handled here so
+// the caller can skip the second half. Split out of MarshalJSON to keep
+// each discriminator switch under the complexity budget.
+func populateWrapperA(r Request, wrapper map[string]any) bool {
 	switch r.Method {
 	case MethodRepoRegister:
 		if r.RepoRegister != nil {
@@ -112,6 +125,16 @@ func (r Request) MarshalJSON() ([]byte, error) {
 			wrapper["worktree_path"] = r.WorktreeFinalize.WorktreePath
 			wrapper["inherited_env"] = r.WorktreeFinalize.InheritedEnv
 		}
+	default:
+		return false
+	}
+	return true
+}
+
+// populateWrapperB handles the remaining methods not matched by
+// populateWrapperA.
+func populateWrapperB(r Request, wrapper map[string]any) {
+	switch r.Method {
 	case MethodWorktreeTeardown:
 		if r.WorktreeTeardown != nil {
 			wrapper["repo_path"] = r.WorktreeTeardown.RepoPath
@@ -137,7 +160,6 @@ func (r Request) MarshalJSON() ([]byte, error) {
 			wrapper["repo_path"] = r.SyncStatus.RepoPath
 		}
 	}
-	return json.Marshal(wrapper)
 }
 
 // UnmarshalJSON parses the flat tagged shape back into Request +
@@ -225,8 +247,10 @@ type RepoRegisterArgs struct {
 }
 
 // WatcherStartArgs / WatcherStopArgs — control the per-repo watcher.
-type WatcherStartArgs struct{ RepoPath string }
-type WatcherStopArgs struct{ RepoPath string }
+type (
+	WatcherStartArgs struct{ RepoPath string }
+	WatcherStopArgs  struct{ RepoPath string }
+)
 
 // WorktreeListArgs — list the watched linked-worktrees for a repo.
 type WorktreeListArgs struct{ RepoPath string }

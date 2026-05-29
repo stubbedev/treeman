@@ -6,6 +6,7 @@ package yamlpatch
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,10 +30,10 @@ type Segment struct {
 // may chain (e.g. "x[0][1]") to walk nested sequences.
 func ParsePath(p string) ([]Segment, error) {
 	if p == "" {
-		return nil, fmt.Errorf("path is empty")
+		return nil, errors.New("path is empty")
 	}
 	var segs []Segment
-	for _, part := range strings.Split(p, ".") {
+	for part := range strings.SplitSeq(p, ".") {
 		if part == "" {
 			return nil, fmt.Errorf("empty segment in path %q", p)
 		}

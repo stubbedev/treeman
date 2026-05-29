@@ -2,6 +2,7 @@ package wt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -69,10 +70,10 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 		sink = NoopSink{}
 	}
 	if req.Target == "" {
-		return DeleteResult{}, fmt.Errorf("target is required")
+		return DeleteResult{}, errors.New("target is required")
 	}
 	if req.RepoRoot == "" {
-		return DeleteResult{}, fmt.Errorf("repo_root is required")
+		return DeleteResult{}, errors.New("repo_root is required")
 	}
 
 	// Registry lookup wins over path interpretation. With Force we
@@ -87,7 +88,11 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 		}
 		wtPath = abs
 		if _, statErr := os.Stat(wtPath); statErr != nil && !req.Force {
-			return DeleteResult{}, fmt.Errorf("no worktree matches %q in %s (use --force to remove a stale registry entry)", req.Target, req.RepoRoot)
+			return DeleteResult{}, fmt.Errorf(
+				"no worktree matches %q in %s (use --force to remove a stale registry entry)",
+				req.Target,
+				req.RepoRoot,
+			)
 		}
 	}
 
@@ -99,7 +104,10 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 	// worktrees dir, never at the repo root, so this only trips on a
 	// main-worktree target.
 	if pathsEqual(wtPath, req.RepoRoot) {
-		return DeleteResult{}, fmt.Errorf("refusing to delete %q: it is the repo's main worktree (primary checkout), not a linked worktree", wtPath)
+		return DeleteResult{}, fmt.Errorf(
+			"refusing to delete %q: it is the repo's main worktree (primary checkout), not a linked worktree",
+			wtPath,
+		)
 	}
 
 	if req.Detached {

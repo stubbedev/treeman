@@ -188,11 +188,14 @@ func worktreeHooksResource(ctx context.Context, req *mcpsdk.ReadResourceRequest)
 	if err != nil {
 		return nil, err
 	}
-	body, _ := json.MarshalIndent(map[string]any{
+	body, err := json.MarshalIndent(map[string]any{
 		"worktree_id": wid,
 		"slug":        slug,
 		"hook_runs":   rows,
 	}, "", "  ")
+	if err != nil {
+		return nil, err
+	}
 	return &mcpsdk.ReadResourceResult{
 		Contents: []*mcpsdk.ResourceContents{{URI: req.Params.URI, MIMEType: "application/json", Text: string(body)}},
 	}, nil

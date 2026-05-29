@@ -132,7 +132,7 @@ func TestRepoJitterStable(t *testing.T) {
 // stripField returns the first whitespace-delimited token, used to
 // pull the sha out of `git ls-remote` output.
 func stripField(s string) string {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if s[i] == ' ' || s[i] == '\t' {
 			return s[:i]
 		}

@@ -2,7 +2,9 @@ package prepare
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -27,9 +29,7 @@ func newFakeNS() *fakeNS { return &fakeNS{data: map[string]map[string]string{}} 
 
 func clone(src map[string]string) map[string]string {
 	out := make(map[string]string, len(src))
-	for k, v := range src {
-		out[k] = v
-	}
+	maps.Copy(out, src)
 	return out
 }
 
@@ -37,6 +37,7 @@ func (f *fakeNS) Exists(_ context.Context, ns string) (bool, error) {
 	_, ok := f.data[ns]
 	return ok, nil
 }
+
 func (f *fakeNS) Capture(_ context.Context, active, durable string) error {
 	src, ok := f.data[active]
 	if !ok {
@@ -45,6 +46,7 @@ func (f *fakeNS) Capture(_ context.Context, active, durable string) error {
 	f.data[durable] = clone(src)
 	return nil
 }
+
 func (f *fakeNS) Restore(_ context.Context, durable, active string) error {
 	if f.restoreErr != nil {
 		return f.restoreErr
@@ -56,14 +58,17 @@ func (f *fakeNS) Restore(_ context.Context, durable, active string) error {
 	f.data[active] = clone(src) // drops active first, then copies
 	return nil
 }
+
 func (f *fakeNS) Empty(_ context.Context, active string) error {
 	f.data[active] = map[string]string{}
 	return nil
 }
+
 func (f *fakeNS) Drop(_ context.Context, ns string) error {
 	delete(f.data, ns)
 	return nil
 }
+
 func (f *fakeNS) DropDurable(_ context.Context, durable string) error {
 	delete(f.data, durable)
 	return nil
@@ -370,7 +375,7 @@ func TestBranchScopedSwapAdvancesMarkerBeforeFill(t *testing.T) {
 	// Switch to feature, but fill fails partway (simulated crash).
 	f.set("parentdb", map[string]string{"base": "1"})
 	f.parent = func(string) (string, bool, error) { return "parentdb", true, nil }
-	f.fake.restoreErr = fmt.Errorf("simulated crash mid-fill")
+	f.fake.restoreErr = errors.New("simulated crash mid-fill")
 	if _, err := f.st.EnsureWorktree(ctx, f.repoID, f.worktreePath, "wtslug", "feature"); err != nil {
 		t.Fatal(err)
 	}

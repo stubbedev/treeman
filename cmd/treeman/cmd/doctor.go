@@ -36,7 +36,10 @@ func DoctorCmd() *cli.Command {
 		Usage: "health-check the local treeman setup",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "json", Usage: "emit one JSON line per check"},
-			&cli.BoolFlag{Name: "fix", Usage: "auto-apply remediations for `schema` (install) and `registry` (repair) checks; re-runs the probe so the printed result reflects the post-fix state"},
+			&cli.BoolFlag{
+				Name:  "fix",
+				Usage: "auto-apply remediations for `schema` (install) and `registry` (repair) checks; re-runs the probe so the printed result reflects the post-fix state",
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			results := RunDoctorChecks(ctx)
@@ -251,15 +254,15 @@ func checkSchema(repoRoot string) doctorResult {
 	ref := schema.ReadModeline(repoRoot)
 	modelineDetail := ""
 	if ref != "" {
-		if ok, detail := schema.ProbeRef(repoRoot, ref); ok {
+		ok, detail := schema.ProbeRef(repoRoot, ref)
+		if ok {
 			return doctorResult{
 				Name:   "schema",
 				Status: "ok",
 				Detail: "modeline → " + detail,
 			}
-		} else {
-			modelineDetail = detail
 		}
+		modelineDetail = detail
 	}
 
 	if gp, err := schema.GlobalPath(); err == nil {

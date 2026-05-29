@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -109,11 +110,11 @@ func allocateOne(
 	// Iterate with an int so candidate == 65535 + 1 doesn't wrap a
 	// uint16 back to 0 and loop forever.
 	for p := int(spec.Range.Min); p <= int(spec.Range.Max); p++ {
-		candidate := uint16(p)
+		candidate := uint16(p) //nolint:gosec // p bounded by uint16 Range.Max; cannot overflow
 		if _, taken := used[candidate]; taken {
 			continue
 		}
-		if !portFree(candidate) {
+		if !portFree(ctx, candidate) {
 			continue
 		}
 		switch err := st.AllocateWorktreePort(ctx, repoID, worktreeID, name, candidate); {
@@ -136,11 +137,12 @@ var ErrExhausted = errors.New("port range exhausted")
 // portFree reports whether 127.0.0.1:port is currently bindable.
 // Uses a single tcp4 listen attempt + immediate close so the probe
 // is brief (<= ProbeTimeout under a sane kernel).
-func portFree(port uint16) bool {
+func portFree(ctx context.Context, port uint16) bool {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
 	deadline := time.Now().Add(ProbeTimeout)
+	var lc net.ListenConfig
 	for {
-		l, err := net.Listen("tcp4", addr)
+		l, err := lc.Listen(ctx, "tcp4", addr)
 		if err == nil {
 			_ = l.Close()
 			return true
@@ -161,8 +163,10 @@ func FormatSummary(allocs []Allocation) string {
 		return ""
 	}
 	out := "ports:"
+	var outSb164 strings.Builder
 	for _, a := range allocs {
-		out += " " + a.Name + "=" + strconv.Itoa(int(a.Port))
+		outSb164.WriteString(" " + a.Name + "=" + strconv.Itoa(int(a.Port)))
 	}
+	out += outSb164.String()
 	return out
 }

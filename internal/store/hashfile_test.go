@@ -19,7 +19,7 @@ func TestHashFileBLAKE3_AcrossBufferBoundary(t *testing.T) {
 	// 3 MiB + a non-aligned tail so the final Read is a partial buffer.
 	data := make([]byte, 3*(1<<20)+1237)
 	for i := range data {
-		data[i] = byte(i*131 + 7)
+		data[i] = byte(i*131 + 7) //nolint:gosec // intentional truncation to fill a test buffer
 	}
 	p := filepath.Join(dir, "big.bin")
 	if err := os.WriteFile(p, data, 0o644); err != nil {

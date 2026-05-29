@@ -34,8 +34,8 @@ func TestDeltaWatcherRePrepsAfterInputEdit(t *testing.T) {
 	composeDir := harness.MustAbs(".")
 	t.Cleanup(harness.ComposeUp(t, composeDir))
 
-	harness.WaitForReady(t, "mysql:13326", 60*time.Second, func() error {
-		c, err := net.DialTimeout("tcp", "127.0.0.1:13326", 1*time.Second)
+	harness.WaitForReady(t, "mysql:13327", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:13327", 1*time.Second)
 		if err != nil {
 			return err
 		}
@@ -62,7 +62,7 @@ env_sources: [.env]
 connections:
   mysql:
     host: 127.0.0.1
-    port: 13326
+    port: 13327
     user: root
     password: $MYSQL_PW
 databases:

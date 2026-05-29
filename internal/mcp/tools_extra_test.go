@@ -77,9 +77,12 @@ func TestSummarizeChanges_EmptyIsNoChanges(t *testing.T) {
 
 func TestSummarizeChanges_CountsByOp(t *testing.T) {
 	c := []configDiffChange{
-		{Op: "add"}, {Op: "add"},
+		{Op: "add"},
+		{Op: "add"},
 		{Op: "change"},
-		{Op: "remove"}, {Op: "remove"}, {Op: "remove"},
+		{Op: "remove"},
+		{Op: "remove"},
+		{Op: "remove"},
 	}
 	got := summarizeChanges(c)
 	// Order: add, change, remove
@@ -102,7 +105,7 @@ func TestNewestMatchingID_PicksLatestEvent(t *testing.T) {
 	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/foo", "foo")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/r/foo/.wt/x", "x", "main")
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_ = s.WriteEvent(ctx, store.LevelInfo, "demo", "msg", repoID, wtID, "", 0, nil)
 	}
 	all, _ := s.QueryEvents(ctx, store.EventFilter{WorktreeID: wtID, Limit: 100})

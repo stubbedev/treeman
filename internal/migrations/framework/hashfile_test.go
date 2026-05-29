@@ -17,7 +17,7 @@ func TestHashFileBLAKE3_AcrossBufferBoundary(t *testing.T) {
 	dir := t.TempDir()
 	data := make([]byte, 2*(1<<20)+999) // > 1 MiB, non-aligned tail
 	for i := range data {
-		data[i] = byte(i*97 + 13)
+		data[i] = byte((i*97 + 13) & 0xff)
 	}
 	p := filepath.Join(dir, "migration.sql")
 	if err := os.WriteFile(p, data, 0o644); err != nil {

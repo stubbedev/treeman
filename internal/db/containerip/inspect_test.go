@@ -45,7 +45,7 @@ func TestPickIPPrefersNamedNetwork(t *testing.T) {
 func TestPickIPDeterministicOrderSkipsBridge(t *testing.T) {
 	info := mustInspect(t)
 	// Run many times to catch nondeterministic map iteration regressions.
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		ip, err := info.pickIP("")
 		if err != nil {
 			t.Fatal(err)

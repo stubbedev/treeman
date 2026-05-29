@@ -91,7 +91,9 @@ var (
 )
 
 func cacheKey(opts Opts) string {
-	return opts.normEngine() + "/" + opts.Container + "/" + opts.ComposeProject + "/" + opts.ComposeService + "/" + opts.Network + "/" + strconv.Itoa(int(opts.InternalPort))
+	return opts.normEngine() + "/" + opts.Container + "/" + opts.ComposeProject + "/" + opts.ComposeService + "/" + opts.Network + "/" + strconv.Itoa(
+		int(opts.InternalPort),
+	)
 }
 
 func (o Opts) normEngine() string {
@@ -252,16 +254,18 @@ func resolveContainerID(opts Opts) (string, error) {
 		project = os.Getenv("COMPOSE_PROJECT_NAME")
 	}
 	engine := opts.normEngine()
-	args := []string{"ps", "-q", "--filter", "status=running",
-		"--filter", "label=com.docker.compose.service=" + opts.ComposeService}
+	args := []string{
+		"ps", "-q", "--filter", "status=running",
+		"--filter", "label=com.docker.compose.service=" + opts.ComposeService,
+	}
 	if project != "" {
 		args = append(args, "--filter", "label=com.docker.compose.project="+project)
 	}
-	out, err := exec.Command(engine, args...).Output()
+	out, err := exec.CommandContext(context.Background(), engine, args...).Output()
 	if err != nil {
 		return "", fmt.Errorf("%s ps -q (service=%s, project=%s): %w", engine, opts.ComposeService, project, err)
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			return line, nil
@@ -288,7 +292,7 @@ type inspectInfo struct {
 }
 
 func inspectContainer(engine, id string) (*inspectInfo, error) {
-	out, err := exec.Command(engine, "inspect", id).Output()
+	out, err := exec.CommandContext(context.Background(), engine, "inspect", id).Output()
 	if err != nil {
 		return nil, fmt.Errorf("%s inspect %s: %w", engine, id, err)
 	}
@@ -384,8 +388,8 @@ func EnvLookup(opts Opts) (map[string]string, error) {
 	}
 	out := make(map[string]string, len(info.Config.Env))
 	for _, kv := range info.Config.Env {
-		if i := strings.IndexByte(kv, '='); i >= 0 {
-			out[kv[:i]] = kv[i+1:]
+		if before, after, ok := strings.Cut(kv, "="); ok {
+			out[before] = after
 		}
 	}
 	return out, nil
@@ -424,7 +428,7 @@ func RewriteHostPortInURIWithPort(uri, newHost string, newPort uint16) string {
 	if hostPart == "" {
 		return uri
 	}
-	_, port := splitHostPort(hostPart)
+	port := splitHostPort(hostPart)
 	newHostPort := newHost
 	switch {
 	case newPort != 0:
@@ -441,11 +445,11 @@ func RewriteHostPortInURIWithPort(uri, newHost string, newPort uint16) string {
 }
 
 func splitScheme(uri string) (scheme, rest string) {
-	i := strings.Index(uri, "://")
-	if i < 0 {
+	before, after, ok := strings.Cut(uri, "://")
+	if !ok {
 		return "", uri
 	}
-	return uri[:i], uri[i+3:]
+	return before, after
 }
 
 func splitUserinfo(s string) (userinfo, rest string) {
@@ -475,7 +479,7 @@ func URIPort(uri string, fallback uint16) uint16 {
 	}
 	_, hostPath := splitUserinfo(rest)
 	hostPart, _ := splitHostFromTail(hostPath)
-	_, p := splitHostPort(hostPart)
+	p := splitHostPort(hostPart)
 	if p == "" {
 		return fallback
 	}
@@ -486,11 +490,11 @@ func URIPort(uri string, fallback uint16) uint16 {
 	return uint16(n)
 }
 
-func splitHostPort(s string) (host, port string) {
+func splitHostPort(s string) (port string) {
 	if i := strings.LastIndex(s, ":"); i >= 0 && !strings.Contains(s[i+1:], "]") {
-		return s[:i], s[i+1:]
+		return s[i+1:]
 	}
-	return s, ""
+	return ""
 }
 
 // ErrNoContainer is returned when Resolve is called with no

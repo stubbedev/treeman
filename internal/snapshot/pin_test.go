@@ -58,7 +58,7 @@ func TestPinConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(n)
 	releases := make(chan func(), n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			releases <- Pin(fp)

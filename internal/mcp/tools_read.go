@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -134,10 +135,13 @@ func registerReadTools(srv *mcpsdk.Server) {
 
 // ─── doctor ───────────────────────────────────────────────────────
 
-type doctorIn struct{}
-type doctorOut struct {
-	Results []doctorResult `json:"results"`
-}
+type (
+	doctorIn  struct{}
+	doctorOut struct {
+		Results []doctorResult `json:"results"`
+	}
+)
+
 type doctorResult struct {
 	Name   string `json:"name"`
 	Status string `json:"status"` // ok|warn|fail|skip
@@ -172,7 +176,11 @@ func checkDaemon(ctx context.Context) doctorResult {
 	if resp.Kind == rpc.KindError {
 		return doctorResult{Name: "daemon", Status: "fail", Detail: resp.Message}
 	}
-	return doctorResult{Name: "daemon", Status: "ok", Detail: fmt.Sprintf("treemand %s pid=%d watchers=%d", resp.DaemonVersion, resp.Pid, resp.WatcherCount)}
+	return doctorResult{
+		Name:   "daemon",
+		Status: "ok",
+		Detail: fmt.Sprintf("treemand %s pid=%d watchers=%d", resp.DaemonVersion, resp.Pid, resp.WatcherCount),
+	}
 }
 
 func checkConfig(repoRoot string) doctorResult {
@@ -191,11 +199,11 @@ func checkSchema(repoRoot string) doctorResult {
 	ref := schema.ReadModeline(repoRoot)
 	modelineDetail := ""
 	if ref != "" {
-		if ok, detail := schema.ProbeRef(repoRoot, ref); ok {
+		ok, detail := schema.ProbeRef(repoRoot, ref)
+		if ok {
 			return doctorResult{Name: "schema", Status: "ok", Detail: "modeline → " + detail}
-		} else {
-			modelineDetail = detail
 		}
+		modelineDetail = detail
 	}
 
 	if gp, err := schema.GlobalPath(); err == nil {
@@ -249,6 +257,9 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 			dbPaths[p] = true
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return doctorResult{Name: "registry", Status: "fail", Detail: err.Error()}
+	}
 	gitSet := map[string]bool{}
 	var onlyInGit, onlyInDB []string
 	for _, p := range gitPaths {
@@ -282,7 +293,7 @@ func gitWorktreePaths(ctx context.Context, repoRoot string) ([]string, error) {
 // ─── config_get / validate / schema ───────────────────────────────
 
 type configGetIn struct {
-	Repo     string `json:"repo,omitempty" jsonschema:"repo root override (defaults to cwd)"`
+	Repo     string `json:"repo,omitempty"     jsonschema:"repo root override (defaults to cwd)"`
 	Resolved bool   `json:"resolved,omitempty" jsonschema:"include resolved connection strings"`
 }
 
@@ -338,14 +349,20 @@ type configValidateOut struct {
 	Error     string `json:"error,omitempty"`
 }
 
-func configValidateTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configValidateIn) (*mcpsdk.CallToolResult, configValidateOut, error) {
+func configValidateTool(
+	_ context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in configValidateIn,
+) (*mcpsdk.CallToolResult, configValidateOut, error) {
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
-		return nil, configValidateOut{OK: false, Error: err.Error()}, nil
+		out := configValidateOut{OK: false, Error: err.Error()}
+		return nil, out, nil //nolint:nilerr // validation failure is tool output, not a transport error
 	}
 	cfg, err := resolve.LoadResolved(repoRoot)
 	if err != nil {
-		return nil, configValidateOut{OK: false, Repo: repoRoot, Error: err.Error()}, nil
+		out := configValidateOut{OK: false, Repo: repoRoot, Error: err.Error()}
+		return nil, out, nil //nolint:nilerr // validation failure is tool output, not a transport error
 	}
 	return nil, configValidateOut{OK: true, Repo: repoRoot, Databases: len(cfg.Databases)}, nil
 }
@@ -489,7 +506,11 @@ type branchScopedStatusOut struct {
 	Databases []prepare.BranchScopedDB `json:"databases"`
 }
 
-func branchScopedStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in branchScopedStatusIn) (*mcpsdk.CallToolResult, branchScopedStatusOut, error) {
+func branchScopedStatusTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in branchScopedStatusIn,
+) (*mcpsdk.CallToolResult, branchScopedStatusOut, error) {
 	dbs, err := runBranchScopedStatus(ctx, in.Worktree, in.Repo)
 	if err != nil {
 		return nil, branchScopedStatusOut{}, err
@@ -524,7 +545,9 @@ func worktreeRowFromCwd(ctx context.Context, st *store.Store) (worktreeRow, erro
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return worktreeRow{}, fmt.Errorf("not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)")
+			return worktreeRow{}, errors.New(
+				"not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)",
+			)
 		}
 		dir = parent
 	}
@@ -534,14 +557,14 @@ func worktreeRowFromCwd(ctx context.Context, st *store.Store) (worktreeRow, erro
 
 type logsQueryIn struct {
 	Repo        string   `json:"repo,omitempty"`
-	Worktree    string   `json:"worktree,omitempty" jsonschema:"slug, branch, or basename"`
-	Levels      []string `json:"levels,omitempty" jsonschema:"any of debug|info|warn|error"`
+	Worktree    string   `json:"worktree,omitempty"     jsonschema:"slug, branch, or basename"`
+	Levels      []string `json:"levels,omitempty"       jsonschema:"any of debug|info|warn|error"`
 	EventTypes  []string `json:"event_types,omitempty"`
 	Phases      []string `json:"phases,omitempty"`
-	Since       string   `json:"since,omitempty" jsonschema:"duration (10m, 2h) or RFC3339"`
+	Since       string   `json:"since,omitempty"        jsonschema:"duration (10m, 2h) or RFC3339"`
 	PayloadLike string   `json:"payload_like,omitempty"`
-	RunID       string   `json:"run_id,omitempty" jsonschema:"exact correlation id (8-char hex stamped on every event from one prepare/finalize/teardown/watcher flow)"`
-	Limit       int      `json:"limit,omitempty" jsonschema:"default 50, max 1000"`
+	RunID       string   `json:"run_id,omitempty"       jsonschema:"exact correlation id (8-char hex stamped on every event from one prepare/finalize/teardown/watcher flow)"`
+	Limit       int      `json:"limit,omitempty"        jsonschema:"default 50, max 1000"`
 }
 type logsQueryOut struct {
 	Events []store.Event `json:"events"`
@@ -638,9 +661,36 @@ func lookupRepoID(ctx context.Context, st *store.Store, root string) (int64, err
 	return id, nil
 }
 
+// applyRepoWorktreeFilter resolves the optional repo/worktree scope onto
+// an EventFilter. A resolvable repo sets RepoID (lookup failures are
+// ignored — an unmatched repo simply leaves the filter unscoped); a
+// non-empty worktree must resolve or the call errors so a typo never
+// silently widens the query.
+func applyRepoWorktreeFilter(ctx context.Context, st *store.Store, f *store.EventFilter, repo, worktree string) error {
+	if repo == "" && worktree == "" {
+		return nil
+	}
+	if repoRoot, err := resolveRepo(repo); err == nil && repoRoot != "" {
+		if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil && rid > 0 {
+			f.RepoID = rid
+		}
+	}
+	if worktree != "" {
+		wid, err := st.LookupWorktreeID(ctx, f.RepoID, worktree)
+		if err != nil {
+			return err
+		}
+		if wid == 0 {
+			return fmt.Errorf("no worktree matches %q", worktree)
+		}
+		f.WorktreeID = wid
+	}
+	return nil
+}
+
 type logsHooksIn struct {
 	Repo     string `json:"repo,omitempty"`
-	Worktree string `json:"worktree" jsonschema:"slug, branch, or basename"`
+	Worktree string `json:"worktree"        jsonschema:"slug, branch, or basename"`
 	Limit    int    `json:"limit,omitempty" jsonschema:"default 50"`
 }
 type logsHooksOut struct {
@@ -649,7 +699,7 @@ type logsHooksOut struct {
 
 func logsHooksTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsHooksIn) (*mcpsdk.CallToolResult, logsHooksOut, error) {
 	if in.Worktree == "" {
-		return nil, logsHooksOut{}, fmt.Errorf("worktree is required")
+		return nil, logsHooksOut{}, errors.New("worktree is required")
 	}
 	limit := in.Limit
 	if limit <= 0 {
@@ -732,14 +782,16 @@ func slugComputeTool(_ context.Context, _ *mcpsdk.CallToolRequest, in slugComput
 	}, nil
 }
 
-type daemonStatusIn struct{}
-type daemonStatusOut struct {
-	Status   string `json:"status"`
-	Version  string `json:"version,omitempty"`
-	PID      int    `json:"pid,omitempty"`
-	Watchers int    `json:"watchers,omitempty"`
-	Error    string `json:"error,omitempty"`
-}
+type (
+	daemonStatusIn  struct{}
+	daemonStatusOut struct {
+		Status   string `json:"status"`
+		Version  string `json:"version,omitempty"`
+		PID      int    `json:"pid,omitempty"`
+		Watchers int    `json:"watchers,omitempty"`
+		Error    string `json:"error,omitempty"`
+	}
+)
 
 // ─── snapshots_list ───────────────────────────────────────────────
 
@@ -757,7 +809,11 @@ type snapshotsListOut struct {
 	Snapshots []snapshotsListRow `json:"snapshots"`
 }
 
-func snapshotsListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapshotsListIn) (*mcpsdk.CallToolResult, snapshotsListOut, error) {
+func snapshotsListTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in snapshotsListIn,
+) (*mcpsdk.CallToolResult, snapshotsListOut, error) {
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		return nil, snapshotsListOut{}, err
@@ -790,7 +846,8 @@ func snapshotsListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapsh
 func daemonStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, _ daemonStatusIn) (*mcpsdk.CallToolResult, daemonStatusOut, error) {
 	resp, err := rpc.Call(ctx, rpc.Request{Method: rpc.MethodStatus})
 	if err != nil {
-		return nil, daemonStatusOut{Status: "not-running", Error: err.Error()}, nil
+		out := daemonStatusOut{Status: "not-running", Error: err.Error()}
+		return nil, out, nil //nolint:nilerr // daemon-down is tool output, not a transport error
 	}
 	if resp.Kind == rpc.KindError {
 		return nil, daemonStatusOut{Status: "error", Error: resp.Message}, nil

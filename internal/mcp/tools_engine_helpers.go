@@ -3,10 +3,13 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/klauspost/compress/gzip"
@@ -25,7 +28,7 @@ import (
 // Alias so tools_engine.go can refer to the snapshot type without
 // pulling the store import into its own header — keeps the engine
 // tools file focused on MCP wiring.
-type store_SnapshotRecord = store.SnapshotRecord
+type storeSnapshotRecord = store.SnapshotRecord
 
 func snapshotLookupByFingerprint(ctx context.Context, st *store.Store, fp string) (*store.SnapshotRecord, error) {
 	return st.LookupSnapshot(ctx, fp)
@@ -42,8 +45,11 @@ func snapshotLookupByEngineSource(ctx context.Context, st *store.Store, engine, 
 		WHERE engine = ? AND source_db = ?
 		ORDER BY last_used_at DESC LIMIT 1
 	`, engine, sourceDB).Scan(&fp)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	return st.LookupSnapshot(ctx, fp)
 }
@@ -178,7 +184,11 @@ func isReservedTemplateName(name string) bool {
 // prefix.
 func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string) error {
 	if !isReservedTemplateName(template) {
-		return fmt.Errorf("refusing to drop %q: not a treeman-reserved template name (expected one of %v)", template, reservedTemplatePrefixes)
+		return fmt.Errorf(
+			"refusing to drop %q: not a treeman-reserved template name (expected one of %v)",
+			template,
+			reservedTemplatePrefixes,
+		)
 	}
 	fam, ok := engine.Canonical(eng)
 	if !ok {
@@ -187,7 +197,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 	switch fam {
 	case engine.FamilyMySQL:
 		if cfg.Connections.Mysql == nil {
-			return fmt.Errorf("connections.mysql not configured")
+			return errors.New("connections.mysql not configured")
 		}
 		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
 		if err != nil {
@@ -198,7 +208,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 		return err
 	case engine.FamilyPostgres:
 		if cfg.Connections.Postgres == nil {
-			return fmt.Errorf("connections.postgres not configured")
+			return errors.New("connections.postgres not configured")
 		}
 		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
 		if err != nil {
@@ -209,7 +219,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 		return err
 	case engine.FamilyMongo:
 		if cfg.Connections.Mongodb == nil {
-			return fmt.Errorf("connections.mongodb not configured")
+			return errors.New("connections.mongodb not configured")
 		}
 		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
 		if err != nil {
@@ -220,7 +230,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 		return err
 	case engine.FamilyRedis:
 		if cfg.Connections.Redis == nil {
-			return fmt.Errorf("connections.redis not configured")
+			return errors.New("connections.redis not configured")
 		}
 		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 		if err != nil {
@@ -231,7 +241,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 		return err
 	case engine.FamilyES:
 		if cfg.Connections.Elasticsearch == nil {
-			return fmt.Errorf("connections.elasticsearch not configured")
+			return errors.New("connections.elasticsearch not configured")
 		}
 		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 		if err != nil {
@@ -246,13 +256,18 @@ func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string)
 
 // ─── dump generators ────────────────────────────────────────────────
 
-func runMysqldump(ctx context.Context, conn *config.MysqlConn, db, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
+func runMysqldump(
+	ctx context.Context,
+	conn *config.MysqlConn,
+	db, outPath string,
+	gzipOut bool,
+) (*mcpsdk.CallToolResult, dbDumpOut, error) {
 	if _, err := exec.LookPath("mysqldump"); err != nil {
 		return nil, dbDumpOut{}, fmt.Errorf("mysqldump not on PATH: %w", err)
 	}
 	args := []string{
 		"--host=" + conn.Host,
-		"--port=" + fmt.Sprintf("%d", coalescePort(conn.Port, 3306)),
+		"--port=" + strconv.Itoa(coalescePort(conn.Port, 3306)),
 		"--user=" + conn.User,
 		"--single-transaction", "--routines", "--triggers",
 		db,
@@ -262,13 +277,18 @@ func runMysqldump(ctx context.Context, conn *config.MysqlConn, db, outPath strin
 	return runDumpCmd(cmd, outPath, gzipOut)
 }
 
-func runPgDump(ctx context.Context, conn *config.PostgresConn, db, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
+func runPgDump(
+	ctx context.Context,
+	conn *config.PostgresConn,
+	db, outPath string,
+	gzipOut bool,
+) (*mcpsdk.CallToolResult, dbDumpOut, error) {
 	if _, err := exec.LookPath("pg_dump"); err != nil {
 		return nil, dbDumpOut{}, fmt.Errorf("pg_dump not on PATH: %w", err)
 	}
 	args := []string{
 		"--host=" + conn.Host,
-		"--port=" + fmt.Sprintf("%d", coalescePort(conn.Port, 5432)),
+		"--port=" + strconv.Itoa(coalescePort(conn.Port, 5432)),
 		"--username=" + conn.User,
 		"--no-password", "--format=plain", "--clean", "--if-exists", db,
 	}
@@ -283,7 +303,7 @@ func runPgDump(ctx context.Context, conn *config.PostgresConn, db, outPath strin
 // prefix at load time).
 func runESDump(ctx context.Context, conn *config.EsConn, prefix, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
 	if conn == nil {
-		return nil, dbDumpOut{}, fmt.Errorf("connections.elasticsearch not configured")
+		return nil, dbDumpOut{}, errors.New("connections.elasticsearch not configured")
 	}
 	drv, err := dbes.Connect(ctx, *conn)
 	if err != nil {
@@ -322,7 +342,12 @@ func runESDump(ctx context.Context, conn *config.EsConn, prefix, outPath string,
 	return nil, dbDumpOut{Path: outPath, SizeBytes: info.Size()}, nil
 }
 
-func runMongoDump(ctx context.Context, conn *config.MongoConn, db, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
+func runMongoDump(
+	ctx context.Context,
+	conn *config.MongoConn,
+	db, outPath string,
+	gzipOut bool,
+) (*mcpsdk.CallToolResult, dbDumpOut, error) {
 	if _, err := exec.LookPath("mongodump"); err != nil {
 		return nil, dbDumpOut{}, fmt.Errorf("mongodump not on PATH: %w", err)
 	}

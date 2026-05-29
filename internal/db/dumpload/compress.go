@@ -36,6 +36,8 @@ func (f Format) String() string {
 		return "bzip2"
 	case FormatXz:
 		return "xz"
+	case FormatNone:
+		return "none"
 	}
 	return "none"
 }
@@ -49,17 +51,23 @@ func SniffFormat(r io.Reader) (Format, io.Reader, error) {
 	if err != nil && err != io.EOF {
 		return FormatNone, br, err
 	}
+	return detectMagic(head), br, nil
+}
+
+// detectMagic maps the leading magic bytes of a dump to its compression
+// format, returning FormatNone when no known signature matches.
+func detectMagic(head []byte) Format {
 	switch {
 	case len(head) >= 2 && head[0] == 0x1f && head[1] == 0x8b:
-		return FormatGzip, br, nil
+		return FormatGzip
 	case len(head) >= 4 && head[0] == 0x28 && head[1] == 0xb5 && head[2] == 0x2f && head[3] == 0xfd:
-		return FormatZstd, br, nil
+		return FormatZstd
 	case len(head) >= 3 && head[0] == 'B' && head[1] == 'Z' && head[2] == 'h':
-		return FormatBzip2, br, nil
+		return FormatBzip2
 	case len(head) >= 6 && head[0] == 0xfd && head[1] == '7' && head[2] == 'z' && head[3] == 'X' && head[4] == 'Z' && head[5] == 0x00:
-		return FormatXz, br, nil
+		return FormatXz
 	}
-	return FormatNone, br, nil
+	return FormatNone
 }
 
 // Decompress wraps r in a decoder appropriate for f. The returned

@@ -13,6 +13,83 @@ import (
 	"testing/iotest"
 )
 
+// refSkipUntil consumes bytes from br up to and including sep.
+func refSkipUntil(br *bufio.Reader, sep byte) error {
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return err
+		}
+		if b == sep {
+			return nil
+		}
+	}
+}
+
+// refSkipBlockComment consumes bytes from br up to and including the
+// `*/` block-comment terminator.
+func refSkipBlockComment(br *bufio.Reader) error {
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return err
+		}
+		if b == '*' {
+			peek, _ := br.Peek(1)
+			if len(peek) == 1 && peek[0] == '/' {
+				_, _ = br.Discard(1)
+				return nil
+			}
+		}
+	}
+}
+
+// refConsumeComment detects and skips a `--` line comment or `/* */`
+// block comment starting at the top-level byte b. consumed reports
+// whether b began a comment (so the caller should continue); a mid-skip
+// EOF is tolerated exactly as the original inline code did.
+func refConsumeComment(br *bufio.Reader, b byte) (bool, error) {
+	if b == '-' {
+		if peek, _ := br.Peek(1); len(peek) == 1 && peek[0] == '-' {
+			_, _ = br.Discard(1)
+			if err := refSkipUntil(br, '\n'); err != nil && !errors.Is(err, io.EOF) {
+				return true, err
+			}
+			return true, nil
+		}
+	}
+	if b == '/' {
+		if peek, _ := br.Peek(1); len(peek) == 1 && peek[0] == '*' {
+			_, _ = br.Discard(1)
+			if err := refSkipBlockComment(br); err != nil && !errors.Is(err, io.EOF) {
+				return true, err
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// refToggleQuote flips the quote-context flags for a quote byte at top
+// level, matching the original switch: a quote only toggles when not
+// already inside a different quote kind. Non-quote bytes are no-ops.
+func refToggleQuote(b byte, inSingle, inDouble, inBacktick *bool) {
+	switch b {
+	case '\'':
+		if !*inDouble && !*inBacktick {
+			*inSingle = !*inSingle
+		}
+	case '"':
+		if !*inSingle && !*inBacktick {
+			*inDouble = !*inDouble
+		}
+	case '`':
+		if !*inSingle && !*inDouble {
+			*inBacktick = !*inBacktick
+		}
+	}
+}
+
 // streamStatementsRef is a verbatim copy of the original byte-by-byte
 // streamStatements implementation (bufio.ReadByte + Peek/Discard). It
 // is the oracle FuzzStreamStatementsParity pins the chunked rewrite
@@ -39,32 +116,6 @@ func streamStatementsRef(ctx context.Context, r io.Reader, onStmt func(stmt stri
 		applied++
 		return nil
 	}
-	skipUntil := func(sep byte) error {
-		for {
-			b, err := br.ReadByte()
-			if err != nil {
-				return err
-			}
-			if b == sep {
-				return nil
-			}
-		}
-	}
-	skipBlockComment := func() error {
-		for {
-			b, err := br.ReadByte()
-			if err != nil {
-				return err
-			}
-			if b == '*' {
-				peek, _ := br.Peek(1)
-				if len(peek) == 1 && peek[0] == '/' {
-					_, _ = br.Discard(1)
-					return nil
-				}
-			}
-		}
-	}
 	for {
 		b, err := br.ReadByte()
 		if err == io.EOF {
@@ -73,47 +124,22 @@ func streamStatementsRef(ctx context.Context, r io.Reader, onStmt func(stmt stri
 		if err != nil {
 			return applied, err
 		}
-		if !(inSingle || inDouble || inBacktick) {
-			if b == '-' {
-				if peek, _ := br.Peek(1); len(peek) == 1 && peek[0] == '-' {
-					_, _ = br.Discard(1)
-					if err := skipUntil('\n'); err != nil && !errors.Is(err, io.EOF) {
-						return applied, err
-					}
-					continue
-				}
+		if !inSingle && !inDouble && !inBacktick {
+			consumed, cerr := refConsumeComment(br, b)
+			if cerr != nil {
+				return applied, cerr
 			}
-			if b == '/' {
-				if peek, _ := br.Peek(1); len(peek) == 1 && peek[0] == '*' {
-					_, _ = br.Discard(1)
-					if err := skipBlockComment(); err != nil && !errors.Is(err, io.EOF) {
-						return applied, err
-					}
-					continue
-				}
-			}
-		}
-		switch b {
-		case '\'':
-			if !inDouble && !inBacktick {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle && !inBacktick {
-				inDouble = !inDouble
-			}
-		case '`':
-			if !inSingle && !inDouble {
-				inBacktick = !inBacktick
-			}
-		case ';':
-			if !inSingle && !inDouble && !inBacktick {
-				if err := flush(); err != nil {
-					return applied, err
-				}
+			if consumed {
 				continue
 			}
 		}
+		if b == ';' && !inSingle && !inDouble && !inBacktick {
+			if err := flush(); err != nil {
+				return applied, err
+			}
+			continue
+		}
+		refToggleQuote(b, &inSingle, &inDouble, &inBacktick)
 		buf.WriteByte(b)
 	}
 	if err := flush(); err != nil {
@@ -137,11 +163,12 @@ func syntheticDump(targetBytes int) string {
 }
 
 func benchStream(b *testing.B, fn func(context.Context, io.Reader, func(string) error) (uint64, error)) {
+	b.Helper()
 	dump := syntheticDump(8 << 20) // ~8 MiB
 	b.SetBytes(int64(len(dump)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if _, err := fn(context.Background(), strings.NewReader(dump), func(string) error { return nil }); err != nil {
 			b.Fatal(err)
 		}
@@ -151,7 +178,11 @@ func benchStream(b *testing.B, fn func(context.Context, io.Reader, func(string) 
 func BenchmarkStreamStatements(b *testing.B)    { benchStream(b, streamStatements) }
 func BenchmarkStreamStatementsRef(b *testing.B) { benchStream(b, streamStatementsRef) }
 
-func collectStatements(t *testing.T, fn func(context.Context, io.Reader, func(string) error) (uint64, error), r io.Reader) ([]string, uint64) {
+func collectStatements(
+	t *testing.T,
+	fn func(context.Context, io.Reader, func(string) error) (uint64, error),
+	r io.Reader,
+) ([]string, uint64) {
 	t.Helper()
 	var out []string
 	applied, err := fn(context.Background(), r, func(stmt string) error {

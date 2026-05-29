@@ -3,11 +3,13 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -113,7 +115,10 @@ func DbCmd() *cli.Command {
 				ArgsUsage: "[worktree]",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
-					&cli.StringFlag{Name: "engine", Usage: "restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted)"},
+					&cli.StringFlag{
+						Name:  "engine",
+						Usage: "restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted)",
+					},
 					&cli.BoolFlag{Name: "json"},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
@@ -297,7 +302,7 @@ func HookCmd() *cli.Command {
 			},
 			Action: func(ctx context.Context, c *cli.Command) error {
 				if c.NArg() < 1 {
-					return fmt.Errorf("usage: treeman hook run <setup|teardown>")
+					return errors.New("usage: treeman hook run <setup|teardown>")
 				}
 				phase := c.Args().First()
 				out, err := RunHookPhase(ctx, phase, c.String("worktree"))
@@ -383,7 +388,10 @@ func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	case "on-checkout":
 		hookEntries = cfg.Hooks.OnCheckout
 	default:
-		return hooks.RunOutcome{}, fmt.Errorf("unknown phase: %s (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)", phase)
+		return hooks.RunOutcome{}, fmt.Errorf(
+			"unknown phase: %s (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)",
+			phase,
+		)
 	}
 	entries = len(hookEntries)
 
@@ -516,7 +524,11 @@ func printResolved(name string, c any) {
 		_, _ = fmt.Fprintf(ui.Out, "# %s <- (none)\n", name)
 		return
 	}
-	b, _ := json.Marshal(c)
+	b, err := json.Marshal(c)
+	if err != nil {
+		_, _ = fmt.Fprintf(ui.Out, "# %s <- (unprintable: %v)\n", name, err)
+		return
+	}
 	_, _ = fmt.Fprintf(ui.Out, "# %s <- %s\n", name, string(b))
 }
 
@@ -524,8 +536,7 @@ func isNil(v any) bool {
 	if v == nil {
 		return true
 	}
-	switch x := v.(type) {
-	case interface{ IsNil() bool }:
+	if x, ok := v.(interface{ IsNil() bool }); ok {
 		return x.IsNil()
 	}
 	// Reflection-free heuristic: stringify and look for the typed-
@@ -583,7 +594,7 @@ func SchemaCmd() *cli.Command {
 
 func schemaInstall(ctx context.Context, c *cli.Command) error {
 	if c.Bool("global") && c.Bool("url") {
-		return fmt.Errorf("--global and --url are mutually exclusive")
+		return errors.New("--global and --url are mutually exclusive")
 	}
 	cwd, _ := os.Getwd()
 	repoRoot, err := DiscoverRepoRoot(cwd)
@@ -719,7 +730,7 @@ func daemonStatus(ctx context.Context, c *cli.Command) error {
 		ui.Warn("daemon not running")
 		ui.Hint("start it with: treeman daemon start")
 		ui.Hint("or auto-launch on login: treeman daemon install")
-		return nil
+		return nil //nolint:nilerr // "not running" is a normal status result, not a CLI error
 	}
 	if resp.Kind == rpc.KindError {
 		return fmt.Errorf("daemon: %s", resp.Message)
@@ -743,7 +754,7 @@ func daemonInstall(ctx context.Context, c *cli.Command) error {
 func daemonUninstall(ctx context.Context, c *cli.Command) error {
 	if !c.Bool("yes") {
 		if !ui.Confirm("remove the treemand systemd/launchd auto-start unit?") {
-			return fmt.Errorf("aborted")
+			return errors.New("aborted")
 		}
 	}
 	switch runtime.GOOS {
@@ -949,7 +960,10 @@ func FwCmd() *cli.Command {
 				} else {
 					tests.Render(nil)
 				}
-				fmt.Printf("\nauto-clones (replication target): %s\n", ui.Bold(fmt.Sprintf("%d", testfw.DetectedCloneCount(repoRoot))))
+				fmt.Printf(
+					"\nauto-clones (replication target): %s\n",
+					ui.Bold(strconv.FormatUint(uint64(testfw.DetectedCloneCount(repoRoot)), 10)),
+				)
 				return nil
 			},
 		}},
@@ -1076,8 +1090,8 @@ func detectBranchOfWorktree(worktree string) string {
 	}
 	s := strings.TrimSpace(string(b))
 	const pfx = "ref: refs/heads/"
-	if strings.HasPrefix(s, pfx) {
-		return strings.TrimPrefix(s, pfx)
+	if after, ok := strings.CutPrefix(s, pfx); ok {
+		return after
 	}
 	return ""
 }

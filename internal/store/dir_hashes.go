@@ -41,39 +41,52 @@ func (s *Store) BatchDirHashes(ctx context.Context, dirs []string, specName, has
 	}
 	const chunk = 500
 	for i := 0; i < len(dirs); i += chunk {
-		j := i + chunk
-		if j > len(dirs) {
-			j = len(dirs)
-		}
-		batch := dirs[i:j]
-		ph := make([]string, len(batch))
-		args := make([]any, 0, len(batch)+2)
-		for k, d := range batch {
-			ph[k] = "?"
-			args = append(args, d)
-		}
-		args = append(args, specName, hashMode)
-		q := "SELECT dir, mtime_ns, member_count, member_hash FROM dir_hashes " +
-			"WHERE dir IN (" + strings.Join(ph, ",") + ") AND spec_name = ? AND hash_mode = ?"
-		rows, err := s.DB.QueryContext(ctx, q, args...)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			slog.Warn("dir_hashes batch lookup failed", "err", err)
+		j := min(i+chunk, len(dirs))
+		// A failed chunk is advisory: stop and return the partial cache
+		// so the caller recomputes the rest.
+		if !s.loadDirHashChunk(ctx, dirs[i:j], specName, hashMode, out) {
 			return out, nil
 		}
-		for rows.Next() {
-			var dir, h string
-			var mt, mc int64
-			if err := rows.Scan(&dir, &mt, &mc, &h); err != nil {
-				continue
-			}
-			out[dir] = DirHashRecord{MtimeNs: mt, MemberCount: mc, MemberHash: h}
-		}
-		_ = rows.Close()
 	}
 	return out, nil
+}
+
+// loadDirHashChunk fills out with the cached rows for one chunk of
+// dirs. Returns false on a query or iteration error (caller stops and
+// recomputes the remaining dirs); an empty result set is a success.
+func (s *Store) loadDirHashChunk(ctx context.Context, batch []string, specName, hashMode string, out map[string]DirHashRecord) bool {
+	ph := make([]string, len(batch))
+	args := make([]any, 0, len(batch)+2)
+	for k, d := range batch {
+		ph[k] = "?"
+		args = append(args, d)
+	}
+	args = append(args, specName, hashMode)
+	//nolint:gosec // only `?` placeholders are concatenated; values are parameterized
+	q := "SELECT dir, mtime_ns, member_count, member_hash FROM dir_hashes " +
+		"WHERE dir IN (" + strings.Join(ph, ",") + ") AND spec_name = ? AND hash_mode = ?"
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return true
+		}
+		slog.Warn("dir_hashes batch lookup failed", "err", err)
+		return false
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var dir, h string
+		var mt, mc int64
+		if err := rows.Scan(&dir, &mt, &mc, &h); err != nil {
+			continue
+		}
+		out[dir] = DirHashRecord{MtimeNs: mt, MemberCount: mc, MemberHash: h}
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("dir_hashes batch iteration failed", "err", err)
+		return false
+	}
+	return true
 }
 
 // UpsertDirHashes writes (or refreshes) one row per entry.

@@ -31,7 +31,9 @@ var secretPatterns = []*regexp.Regexp{
 	// URI userinfo: scheme://user:password@host
 	regexp.MustCompile(`([a-z][a-z0-9+.-]*://)([^:/@\s]+):([^@\s]+)@`),
 	// KEY=VALUE for common secret-bearing variable names
-	regexp.MustCompile(`(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth)[\s]*[:=][\s]*['"]?([^\s'"\n]+)`),
+	regexp.MustCompile(
+		`(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth)[\s]*[:=][\s]*['"]?([^\s'"\n]+)`,
+	),
 	// AWS access key id
 	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
 	// GitHub PATs
@@ -102,8 +104,8 @@ func detectBranch(worktree string) string {
 	}
 	s := strings.TrimSpace(string(b))
 	const pfx = "ref: refs/heads/"
-	if strings.HasPrefix(s, pfx) {
-		return strings.TrimPrefix(s, pfx)
+	if after, ok := strings.CutPrefix(s, pfx); ok {
+		return after
 	}
 	return ""
 }
@@ -114,7 +116,7 @@ func captureEnv() map[string]string {
 	env := os.Environ()
 	out := make(map[string]string, len(env))
 	for _, kv := range env {
-		for i := 0; i < len(kv); i++ {
+		for i := range len(kv) {
 			if kv[i] == '=' {
 				out[kv[:i]] = kv[i+1:]
 				break
@@ -331,7 +333,10 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 	case "on-checkout":
 		entries = cfg.Hooks.OnCheckout
 	default:
-		return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)", phase)
+		return hooks.RunOutcome{}, fmt.Errorf(
+			"unknown phase %q (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)",
+			phase,
+		)
 	}
 
 	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, len(entries))

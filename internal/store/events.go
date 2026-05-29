@@ -46,20 +46,12 @@ type EventFilter struct {
 	HydrateWT   bool     // LEFT JOIN worktrees to fill WorktreeSlug etc.
 }
 
-// QueryEvents returns events matching f. The default ordering is
-// newest-first; pass OldestFirst=true to stream chronologically (used
-// by --follow and oldest-first tail output).
-func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error) {
-	cols := `e.id, e.ts, e.level, e.repo_id, e.worktree_id, e.event_type,
-		COALESCE(e.phase,''), COALESCE(e.message,''), e.payload_json, e.duration_ms`
-	from := `FROM events e`
-	if f.HydrateWT {
-		cols += `, COALESCE(w.slug,''), COALESCE(w.branch,''), COALESCE(w.path,'')`
-		from += ` LEFT JOIN worktrees w ON w.id = e.worktree_id`
-	}
-	q := "SELECT " + cols + " " + from
-	where := []string{}
-	args := []any{}
+// queryEventsWhere builds the WHERE-clause fragments and their bound
+// args for QueryEvents. Split out so QueryEvents stays under the
+// cyclomatic-complexity gate; the predicate ordering is preserved.
+func queryEventsWhere(f EventFilter) (where []string, args []any) {
+	where = []string{}
+	args = []any{}
 	if f.WorktreeID > 0 {
 		where = append(where, "e.worktree_id = ?")
 		args = append(args, f.WorktreeID)
@@ -114,8 +106,24 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 		where = append(where, "e.id > ?")
 		args = append(args, f.AfterID)
 	}
+	return where, args
+}
+
+// QueryEvents returns events matching f. The default ordering is
+// newest-first; pass OldestFirst=true to stream chronologically (used
+// by --follow and oldest-first tail output).
+func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error) {
+	cols := `e.id, e.ts, e.level, e.repo_id, e.worktree_id, e.event_type,
+		COALESCE(e.phase,''), COALESCE(e.message,''), e.payload_json, e.duration_ms`
+	from := `FROM events e`
+	if f.HydrateWT {
+		cols += `, COALESCE(w.slug,''), COALESCE(w.branch,''), COALESCE(w.path,'')`
+		from += ` LEFT JOIN worktrees w ON w.id = e.worktree_id`
+	}
+	q := "SELECT " + cols + " " + from
+	where, args := queryEventsWhere(f)
 	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
+		q += " WHERE " + strings.Join(where, " AND ") //nolint:gosec // only placeholder fragments joined; values are parameterized
 	}
 	if f.OldestFirst {
 		q += " ORDER BY e.ts ASC, e.id ASC"
@@ -245,12 +253,12 @@ func pickByRank(matches []WorktreeMatch) []WorktreeMatch {
 func ambiguousMatchError(name string, matches []WorktreeMatch) error {
 	var b strings.Builder
 	b.WriteString("ambiguous worktree ")
-	b.WriteString(fmt.Sprintf("%q", name))
+	fmt.Fprintf(&b, "%q", name)
 	b.WriteString(" — ")
-	b.WriteString(fmt.Sprintf("%d candidates:", len(matches)))
+	fmt.Fprintf(&b, "%d candidates:", len(matches))
 	for _, m := range matches {
 		b.WriteString("\n  ")
-		b.WriteString(fmt.Sprintf("id=%d slug=%s branch=%s path=%s", m.ID, m.Slug, m.Branch, m.Path))
+		fmt.Fprintf(&b, "id=%d slug=%s branch=%s path=%s", m.ID, m.Slug, m.Branch, m.Path)
 	}
 	b.WriteString("\n(pass a more specific branch name or path to disambiguate)")
 	return fmt.Errorf("%s", b.String())
@@ -297,7 +305,19 @@ func (s *Store) QueryHookRuns(ctx context.Context, worktreeID int64, limit int) 
 	var out []HookRun
 	for rows.Next() {
 		var h HookRun
-		if err := rows.Scan(&h.ID, &h.WorktreeID, &h.WorktreeSlug, &h.Phase, &h.GroupIdx, &h.Command, &h.StartedAt, &h.FinishedAt, &h.ExitCode, &h.StdoutTail, &h.StderrTail); err != nil {
+		if err := rows.Scan(
+			&h.ID,
+			&h.WorktreeID,
+			&h.WorktreeSlug,
+			&h.Phase,
+			&h.GroupIdx,
+			&h.Command,
+			&h.StartedAt,
+			&h.FinishedAt,
+			&h.ExitCode,
+			&h.StdoutTail,
+			&h.StderrTail,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
@@ -463,7 +483,7 @@ func (s *Store) PurgeEvents(ctx context.Context, f EventFilter) (int64, error) {
 		}
 	}
 	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
+		q += " WHERE " + strings.Join(where, " AND ") //nolint:gosec // only placeholder fragments joined; values are parameterized
 	}
 	res, err := s.DB.ExecContext(ctx, q, args...)
 	if err != nil {

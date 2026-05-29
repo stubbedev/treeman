@@ -48,7 +48,7 @@ func Start(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("treemand not on PATH: %w", err)
 	}
-	cmd := exec.Command(binPath)
+	cmd := exec.Command(binPath) //nolint:noctx // detached daemon fork; must outlive caller ctx
 	cmd.Stdin = nil
 	cmd.Stdout, _ = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	cmd.Stderr = cmd.Stdout

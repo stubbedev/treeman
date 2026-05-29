@@ -34,10 +34,11 @@ func PersistOutcome(
 	failed := 0
 	maxExit := 0
 	for i, g := range out.Groups {
-		// stdout/stderr tails are only captured by runForeground
-		// (precreate). The async groups dump everything to a log file
-		// — we record the path in the command column so the caller
-		// can still reach the bytes if needed.
+		// Every group's merged stdout+stderr is written to a log
+		// file; StderrTail holds the last few KB of that log and is
+		// populated only when the group exited non-zero. We record
+		// the log path in the command column so the caller can still
+		// reach the full bytes if needed.
 		cmd := g.Command
 		if g.LogPath != "" {
 			cmd = fmt.Sprintf("%s  # log=%s", cmd, g.LogPath)

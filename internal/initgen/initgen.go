@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 
 	"gopkg.in/yaml.v3"
@@ -244,13 +245,6 @@ func scalar(v string) *yaml.Node {
 	return &yaml.Node{Kind: yaml.ScalarNode, Value: v}
 }
 
-func scalarBool(b bool) *yaml.Node {
-	if b {
-		return &yaml.Node{Kind: yaml.ScalarNode, Value: "true", Tag: "!!bool"}
-	}
-	return &yaml.Node{Kind: yaml.ScalarNode, Value: "false", Tag: "!!bool"}
-}
-
 // mapNode constructs a mapping. Arguments alternate key (string) +
 // value (*yaml.Node).
 func mapNode(kv ...any) *yaml.Node {
@@ -270,14 +264,6 @@ func mapSet(m *yaml.Node, key string, value *yaml.Node) {
 func seqNode(items ...*yaml.Node) *yaml.Node {
 	n := &yaml.Node{Kind: yaml.SequenceNode}
 	n.Content = append(n.Content, items...)
-	return n
-}
-
-func stringSeq(items []string) *yaml.Node {
-	n := seqNode()
-	for _, s := range items {
-		n.Content = append(n.Content, scalar(s))
-	}
 	return n
 }
 
@@ -320,10 +306,8 @@ func defaultEnvSourcesFor(detected []framework.Spec, has func(string) bool) []st
 
 func hasFrameworkNamed(specs []framework.Spec, names ...string) bool {
 	for _, s := range specs {
-		for _, n := range names {
-			if s.Name == n {
-				return true
-			}
+		if slices.Contains(names, s.Name) {
+			return true
 		}
 	}
 	return false

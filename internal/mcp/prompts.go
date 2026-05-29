@@ -24,7 +24,11 @@ func registerPrompts(srv *mcpsdk.Server) {
 		Description: "Walks through the chain of tool calls needed to localize a failing prepare: pull recent error events, identify the engine that failed, check engine reachability, inspect the cached snapshot, and surface the actual root-cause line. Pass worktree to scope to one worktree, or run_id to scope to one prepare invocation.",
 		Arguments: []*mcpsdk.PromptArgument{
 			{Name: "worktree", Description: "slug, branch, or basename to scope the investigation", Required: false},
-			{Name: "run_id", Description: "8-char correlation id; preferred when known (much narrower scope than worktree)", Required: false},
+			{
+				Name:        "run_id",
+				Description: "8-char correlation id; preferred when known (much narrower scope than worktree)",
+				Required:    false,
+			},
 		},
 	}, diagnosePreparePrompt)
 
@@ -51,7 +55,11 @@ func registerPrompts(srv *mcpsdk.Server) {
 		Title:       "Create a worktree end-to-end",
 		Description: "Walks through picking an unoccupied branch, computing the slug, creating the worktree (which triggers prepare + setup hooks), waiting for finalize, and reporting the result. Best when the user says \"set me up a worktree for branch X\" but hasn't decided how to verify success.",
 		Arguments: []*mcpsdk.PromptArgument{
-			{Name: "branch", Description: "branch name to base the worktree on; omit to let the agent recommend one from branches_list", Required: false},
+			{
+				Name:        "branch",
+				Description: "branch name to base the worktree on; omit to let the agent recommend one from branches_list",
+				Required:    false,
+			},
 			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
 		},
 	}, worktreeSetupPrompt)
@@ -62,7 +70,11 @@ func registerPrompts(srv *mcpsdk.Server) {
 		Description: "Creates a throw-away worktree, runs the user's migrate step against it, reports the outcome (plus any schema deltas via db_schema_dump), and tears the worktree down. Use this to validate a migration change BEFORE merging — without polluting any existing worktree's database state.",
 		Arguments: []*mcpsdk.PromptArgument{
 			{Name: "branch", Description: "branch carrying the migration to trial", Required: true},
-			{Name: "db_index", Description: "index into databases[] to focus the schema diff on; omit to skip the diff step", Required: false},
+			{
+				Name:        "db_index",
+				Description: "index into databases[] to focus the schema diff on; omit to skip the diff step",
+				Required:    false,
+			},
 			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
 		},
 	}, migrationTrialPrompt)
@@ -87,9 +99,9 @@ func diagnosePreparePrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mc
 	scope := "scope: most-recent prepare across every worktree"
 	switch {
 	case runID != "":
-		scope = fmt.Sprintf("scope: run_id=%s", runID)
+		scope = "scope: run_id=" + runID
 	case wt != "":
-		scope = fmt.Sprintf("scope: worktree=%s", wt)
+		scope = "scope: worktree=" + wt
 	}
 
 	text := fmt.Sprintf(`Diagnose the most recent failed prepare. %s
@@ -137,7 +149,8 @@ func scaffoldFromFrameworkPrompt(_ context.Context, req *mcpsdk.GetPromptRequest
 		repoArg = "repo=\"" + repo + "\", "
 	}
 
-	text := fmt.Sprintf(`Scaffold a .treeman.yaml for this repo from the detected framework template. Do NOT run prepare — the user should approve the file first.
+	text := fmt.Sprintf(
+		`Scaffold a .treeman.yaml for this repo from the detected framework template. Do NOT run prepare — the user should approve the file first.
 
 Execute these tool calls in order:
 
@@ -149,7 +162,10 @@ Execute these tool calls in order:
 
 4. config_get (resolved=true) — show the user what treeman will actually execute against (after env-var substitution and defaults).
 
-Report: the detected framework(s), the path written, the resolved databases[] block, and one short paragraph telling the user what to verify before running 'treeman prepare'.`, repoArg, repoArg)
+Report: the detected framework(s), the path written, the resolved databases[] block, and one short paragraph telling the user what to verify before running 'treeman prepare'.`,
+		repoArg,
+		repoArg,
+	)
 
 	return userMsg(text), nil
 }
@@ -162,14 +178,19 @@ func worktreeSetupPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcps
 		repoArg = "repo=\"" + repo + "\""
 	}
 
-	branchStep := ""
+	var branchStep string
 	if branch == "" {
 		branchStep = `1. branches_list (` + repoArg + `) — list local + origin-only branches. RECOMMEND one branch to the user (prefer: has_local=true AND worktree_dir empty; otherwise has_remote=true AND worktree_dir empty). ASK the user to confirm or pick a different branch before continuing.`
 	} else {
-		branchStep = fmt.Sprintf(`1. branches_list (%s) — verify branch=%q is not already occupying a worktree (worktree_dir empty). If it is, STOP and tell the user which worktree currently has it.`, repoArg, branch)
+		branchStep = fmt.Sprintf(
+			`1. branches_list (%s) — verify branch=%q is not already occupying a worktree (worktree_dir empty). If it is, STOP and tell the user which worktree currently has it.`,
+			repoArg,
+			branch,
+		)
 	}
 
-	text := fmt.Sprintf(`Set up a fresh worktree end-to-end. Do NOT skip the wait step — without it, the user can't tell whether prepare actually succeeded.
+	text := fmt.Sprintf(
+		`Set up a fresh worktree end-to-end. Do NOT skip the wait step — without it, the user can't tell whether prepare actually succeeded.
 
 %s
 
@@ -184,7 +205,10 @@ func worktreeSetupPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcps
 6. worktree_show — confirm the new worktree is registered, with the expected slug and branch.
 
 Report: the slug, the absolute worktree path, total wall-clock time, and one short verification command the user can run inside the worktree to sanity-check the app sees the new database.`,
-		branchStep, ifEmpty(branch, "<chosen-branch>"), repoArg)
+		branchStep,
+		ifEmpty(branch, "<chosen-branch>"),
+		repoArg,
+	)
 
 	return userMsg(text), nil
 }
@@ -203,7 +227,8 @@ func migrationTrialPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcp
 6. db_schema_dump (engine=<from cfg.databases[%s].engine>, db=<from worktree_show>) — capture the post-migration schema. Compare against the pre-migration schema (run the same call against an unmodified worktree's db if one exists, or against the source DB before migration ran).`, dbIdx)
 	}
 
-	text := fmt.Sprintf(`Trial the migration on branch %q in a throw-away worktree. The worktree MUST be torn down at the end regardless of outcome — otherwise we leak DB state.
+	text := fmt.Sprintf(
+		`Trial the migration on branch %q in a throw-away worktree. The worktree MUST be torn down at the end regardless of outcome — otherwise we leak DB state.
 
 Execute these tool calls in order:
 
@@ -220,7 +245,14 @@ Execute these tool calls in order:
 7. worktree_delete (branch=%q) — ALWAYS run this, even on failure. The trial is throw-away by design.
 
 Report: did the migration succeed? If yes, the schema delta (table-level summary). If no, the failing step and the exact error line.`,
-		branch, repoArg, branch, repoArg, branch, schemaDiffStep, branch)
+		branch,
+		repoArg,
+		branch,
+		repoArg,
+		branch,
+		schemaDiffStep,
+		branch,
+	)
 
 	return userMsg(text), nil
 }
@@ -241,7 +273,8 @@ func cacheCleanupPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcpsd
 		repoArg = "repo=\"" + repo + "\""
 	}
 
-	text := fmt.Sprintf(`Find and drop orphan snapshots for this repo. An orphan is a SQLite snapshot row whose engine-side template was deleted out-of-band (e.g. someone ran 'DROP DATABASE' directly). They're invisible to snapshots_purge because purge drops every snapshot, not just stale ones.
+	text := fmt.Sprintf(
+		`Find and drop orphan snapshots for this repo. An orphan is a SQLite snapshot row whose engine-side template was deleted out-of-band (e.g. someone ran 'DROP DATABASE' directly). They're invisible to snapshots_purge because purge drops every snapshot, not just stale ones.
 
 Execute these tool calls in order:
 
@@ -255,7 +288,9 @@ Execute these tool calls in order:
 
 5. After confirmation, for each orphan call snapshot_drop with that fingerprint. Report per-engine success/failure counts.
 
-NEVER call snapshots_purge from this flow — that nukes valid templates too.`, repoArg)
+NEVER call snapshots_purge from this flow — that nukes valid templates too.`,
+		repoArg,
+	)
 
 	return userMsg(text), nil
 }

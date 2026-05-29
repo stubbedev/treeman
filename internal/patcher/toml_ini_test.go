@@ -29,7 +29,14 @@ func TestPatchTOMLFile_SetsNestedKey(t *testing.T) {
 	if err := toml.Unmarshal(got, &doc); err != nil {
 		t.Fatalf("toml: %v", err)
 	}
-	pkg := doc["tool"].(map[string]any)["poetry"].(map[string]any)
+	tool, ok := doc["tool"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool = %T, want map[string]any", doc["tool"])
+	}
+	pkg, ok := tool["poetry"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool.poetry = %T, want map[string]any", tool["poetry"])
+	}
 	if pkg["name"] != "app_feature-x" {
 		t.Errorf("name = %v, want app_feature-x", pkg["name"])
 	}
@@ -51,7 +58,11 @@ func TestPatchTOMLFile_NumericValueBecomesInt(t *testing.T) {
 	got, _ := os.ReadFile(path)
 	var doc map[string]any
 	_ = toml.Unmarshal(got, &doc)
-	if doc["port"].(int64) != 6432 {
+	port, ok := doc["port"].(int64)
+	if !ok {
+		t.Fatalf("port = %T, want int64", doc["port"])
+	}
+	if port != 6432 {
 		t.Errorf("port = %v, want 6432 (int)", doc["port"])
 	}
 }

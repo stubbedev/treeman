@@ -92,106 +92,175 @@ func recoverTestClone(
 ) error {
 	switch d.Engine {
 	case "mysql", "mariadb", "tidb":
-		if cfg.Connections.Mysql == nil {
-			return nil
-		}
-		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close() }()
-		name, err := template.Render(d.NameTemplate, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropMatching(ctx, name)
-		if err != nil {
-			return err
-		}
-		emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, name, len(dropped))
-		return nil
+		return recoverTestCloneMySQL(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
 	case "postgres", "postgresql":
-		if cfg.Connections.Postgres == nil {
-			return nil
-		}
-		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close() }()
-		name, err := template.Render(d.NameTemplate, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropMatching(ctx, name)
-		if err != nil {
-			return err
-		}
-		emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, name, len(dropped))
-		return nil
+		return recoverTestClonePostgres(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
 	case "mongodb":
-		if cfg.Connections.Mongodb == nil {
-			return nil
-		}
-		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close(ctx) }()
-		name, err := template.Render(d.NameTemplate, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropMatching(ctx, name)
-		if err != nil {
-			return err
-		}
-		emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, name, len(dropped))
-		return nil
+		return recoverTestCloneMongo(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
 	case "redis":
-		if cfg.Connections.Redis == nil {
-			return nil
-		}
-		if d.KeyPrefix == "" {
-			return nil
-		}
-		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close() }()
-		prefix, err := template.Render(d.KeyPrefix, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropPrefix(ctx, prefix)
-		if err != nil {
-			return err
-		}
-		emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, prefix, dropped)
-		return nil
+		return recoverTestCloneRedis(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
 	case "elasticsearch", "opensearch":
-		if cfg.Connections.Elasticsearch == nil {
-			return nil
-		}
-		if d.KeyPrefix == "" {
-			return nil
-		}
-		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-		if err != nil {
-			return err
-		}
-		prefix, err := template.Render(d.KeyPrefix, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropMatching(ctx, prefix)
-		if err != nil {
-			return err
-		}
-		emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, prefix, len(dropped))
+		return recoverTestCloneES(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
+	}
+	return nil
+}
+
+// recoverTestCloneMySQL drops the MySQL source DB family for stale-
+// worktree recovery. Extracted verbatim from recoverTestClone's
+// `mysql` switch arm.
+func recoverTestCloneMySQL(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Mysql == nil {
 		return nil
 	}
+	drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = drv.Close() }()
+	name, err := template.Render(d.NameTemplate, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropMatching(ctx, name)
+	if err != nil {
+		return err
+	}
+	emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, name, len(dropped))
+	return nil
+}
+
+// recoverTestClonePostgres drops the Postgres source DB family for
+// stale-worktree recovery. Extracted verbatim from recoverTestClone's
+// `postgres` switch arm.
+func recoverTestClonePostgres(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Postgres == nil {
+		return nil
+	}
+	drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = drv.Close() }()
+	name, err := template.Render(d.NameTemplate, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropMatching(ctx, name)
+	if err != nil {
+		return err
+	}
+	emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, name, len(dropped))
+	return nil
+}
+
+// recoverTestCloneMongo drops the MongoDB source DB family for stale-
+// worktree recovery. Extracted verbatim from recoverTestClone's
+// `mongodb` switch arm.
+func recoverTestCloneMongo(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Mongodb == nil {
+		return nil
+	}
+	drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = drv.Close(ctx) }()
+	name, err := template.Render(d.NameTemplate, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropMatching(ctx, name)
+	if err != nil {
+		return err
+	}
+	emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, name, len(dropped))
+	return nil
+}
+
+// recoverTestCloneRedis drops the Redis key prefix for stale-worktree
+// recovery. Extracted verbatim from recoverTestClone's `redis` arm.
+func recoverTestCloneRedis(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Redis == nil {
+		return nil
+	}
+	if d.KeyPrefix == "" {
+		return nil
+	}
+	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = drv.Close() }()
+	prefix, err := template.Render(d.KeyPrefix, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropPrefix(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, prefix, dropped)
+	return nil
+}
+
+// recoverTestCloneES drops the Elasticsearch / OpenSearch index prefix
+// for stale-worktree recovery. Extracted verbatim from
+// recoverTestClone's `elasticsearch` switch arm.
+func recoverTestCloneES(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Elasticsearch == nil {
+		return nil
+	}
+	if d.KeyPrefix == "" {
+		return nil
+	}
+	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+	if err != nil {
+		return err
+	}
+	prefix, err := template.Render(d.KeyPrefix, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropMatching(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	emitRecoveryDrop(ctx, st, repoID, worktreeID, d.Engine, prefix, len(dropped))
 	return nil
 }
 

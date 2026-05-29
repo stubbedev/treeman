@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	// modernc.org/sqlite registers the pure-Go "sqlite" database/sql driver.
 	_ "modernc.org/sqlite"
 
 	"github.com/stubbedev/treeman/internal/runid"
@@ -73,13 +74,13 @@ type Store struct {
 type pendingEvent struct {
 	tsMillis   int64
 	level      string
-	repoID     interface{}
-	worktreeID interface{}
+	repoID     any
+	worktreeID any
 	eventType  string
-	phase      interface{}
-	message    interface{}
+	phase      any
+	message    any
 	payload    string
-	durationMs interface{}
+	durationMs any
 }
 
 // batchFlushInterval bounds the worst-case latency between a
@@ -102,7 +103,10 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 	// modernc.org/sqlite's DSN supports query params for pragmas
 	// applied at connection open (compatible across the pool).
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", path)
+	dsn := fmt.Sprintf(
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)",
+		path,
+	)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite at %s: %w", path, err)
@@ -141,7 +145,7 @@ func (s *Store) StartEventBatcher(ctx context.Context) {
 	s.batchDone = make(chan struct{})
 	s.batchActive = true
 	s.batchMu.Unlock()
-	go s.eventBatchLoop()
+	go s.eventBatchLoop() //nolint:gosec // long-lived background loop; intentionally detached from any request ctx
 }
 
 // StopEventBatcher cancels the flusher and synchronously drains any
@@ -384,11 +388,11 @@ func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path,
 		// `row.Deleted` check so predelete + db drop + git remove
 		// never run and the working tree lingers on disk forever.
 		// Also keep admin_dir current.
-		var br interface{}
+		var br any
 		if branch != "" {
 			br = branch
 		}
-		var ad interface{}
+		var ad any
 		if adminDir != "" {
 			ad = adminDir
 		}
@@ -405,11 +409,11 @@ func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path,
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
-	var br interface{}
+	var br any
 	if branch != "" {
 		br = branch
 	}
-	var ad interface{}
+	var ad any
 	if adminDir != "" {
 		ad = adminDir
 	}
@@ -436,7 +440,7 @@ func (s *Store) EnsureMainWorktree(ctx context.Context, repoID int64, path, slug
 	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
 	var id int64
 	if err := row.Scan(&id); err == nil {
-		var br interface{}
+		var br any
 		if branch != "" {
 			br = branch
 		}
@@ -453,7 +457,7 @@ func (s *Store) EnsureMainWorktree(ctx context.Context, repoID int64, path, slug
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
-	var br interface{}
+	var br any
 	if branch != "" {
 		br = branch
 	}
@@ -742,7 +746,7 @@ func (s *Store) TouchWorktreeVisitedByPath(ctx context.Context, path string) err
 	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE AND deleted_at IS NULL", path)
 	var id int64
 	if err := row.Scan(&id); err != nil {
-		return nil
+		return nil //nolint:nilerr // documented no-op when no worktree row matches the path
 	}
 	return s.TouchWorktreeVisited(ctx, id)
 }

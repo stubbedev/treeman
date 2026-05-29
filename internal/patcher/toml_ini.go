@@ -1,6 +1,7 @@
 package patcher
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -91,7 +92,7 @@ func PatchINIFile(path string, pairs map[string]string) (Outcome, error) {
 // `key` lands in the unnamed default section ("DEFAULT" in ini.v1).
 func splitINIPath(p string) (section, key string, err error) {
 	if p == "" {
-		return "", "", fmt.Errorf("empty ini path")
+		return "", "", errors.New("empty ini path")
 	}
 	parts := strings.Split(p, ".")
 	if len(parts) == 1 {

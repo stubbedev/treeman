@@ -9,6 +9,7 @@
 package schema
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -122,7 +123,7 @@ func Install(repoRoot string, t Target) (resolved string, modelineChanged bool, 
 func ProbeRef(repoRoot, ref string) (bool, string) {
 	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
 		client := &http.Client{Timeout: 3 * time.Second}
-		req, err := http.NewRequest(http.MethodHead, ref, nil)
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, ref, nil)
 		if err != nil {
 			return false, fmt.Sprintf("invalid URL: %v", err)
 		}
@@ -161,7 +162,7 @@ func ReadModeline(repoRoot string) string {
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	for line := range strings.SplitSeq(string(b), "\n") {
 		trim := strings.TrimSpace(line)
 		if !strings.HasPrefix(trim, "#") {
 			continue
@@ -170,7 +171,7 @@ func ReadModeline(repoRoot string) string {
 		if !strings.HasPrefix(body, "yaml-language-server:") {
 			continue
 		}
-		for _, tok := range strings.Fields(strings.TrimPrefix(body, "yaml-language-server:")) {
+		for tok := range strings.FieldsSeq(strings.TrimPrefix(body, "yaml-language-server:")) {
 			if v, ok := strings.CutPrefix(tok, "$schema="); ok {
 				return v
 			}

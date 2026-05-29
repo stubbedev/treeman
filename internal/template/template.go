@@ -26,6 +26,7 @@ package template
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 
@@ -87,9 +88,7 @@ func (c Context) WithPorts(ports map[string]uint16) Context {
 		return c
 	}
 	dup := make(map[string]uint16, len(ports))
-	for k, v := range ports {
-		dup[k] = v
-	}
+	maps.Copy(dup, ports)
 	c.Ports = dup
 	return c
 }
@@ -102,7 +101,7 @@ type RenderError struct {
 
 func (e *RenderError) Error() string {
 	if e.UnknownKey != "" {
-		return fmt.Sprintf("unknown template key: %s", e.UnknownKey)
+		return "unknown template key: " + e.UnknownKey
 	}
 	return fmt.Sprintf("unmatched '{' at offset %d", e.UnmatchedAt)
 }

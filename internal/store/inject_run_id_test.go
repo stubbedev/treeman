@@ -60,7 +60,10 @@ func TestInjectRunID_ExistingRunIDPreserved(t *testing.T) {
 	// override what the ctx says when needed.
 	ctx := runid.With(context.Background(), "fromctx0")
 	in := map[string]string{"run_id": "explicit"}
-	got := injectRunID(ctx, in).(map[string]string)
+	got, ok := injectRunID(ctx, in).(map[string]string)
+	if !ok {
+		t.Fatalf("injectRunID returned %T, want map[string]string", got)
+	}
 	if got["run_id"] != "explicit" {
 		t.Fatalf("existing run_id overwritten: %#v", got)
 	}

@@ -94,7 +94,7 @@ func run() error {
 			return fmt.Errorf("mkdir %s: %w", dir, err)
 		}
 	}
-	ln, err := net.Listen("unix", sockPath)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "unix", sockPath)
 	if err != nil {
 		return fmt.Errorf("bind %s: %w", sockPath, err)
 	}
@@ -143,17 +143,7 @@ func run() error {
 	// repos. 8 concurrent resumes keeps the host responsive while
 	// cutting boot wall-time roughly proportionally.
 	repoPaths, _ := s.ListRepoPaths(ctx)
-	parallelFor(repoPaths, 8, func(p string) {
-		if _, err := os.Stat(p); err != nil {
-			slog.Warn("resume watcher skipped (path missing)", "repo", p, "err", err)
-			return
-		}
-		if err := daemon.ResumeRepoWatcher(ctx, st, p); err != nil {
-			slog.Warn("resume watcher failed", "repo", p, "err", err)
-			return
-		}
-		slog.Info("resumed watcher", "repo", p)
-	})
+	resumeRepoWatchers(ctx, st, repoPaths)
 
 	// Reap any `.treeman-trash/` leftovers from a previously crashed
 	// daemon. The background reaper runs on st.BgCtx so it survives
@@ -166,53 +156,19 @@ func run() error {
 	// the boot resume below spawns watchers against the repo root for
 	// every repo where `main_worktree.enabled: true`. Idempotent —
 	// flips a row's is_main + slug to match the current branch.
-	for _, p := range repoPaths {
-		if _, err := os.Stat(p); err != nil {
-			continue
-		}
-		if _, err := daemon.EnrollMainWorktree(ctx, st, p); err != nil {
-			slog.Warn("main worktree enroll skipped", "repo", p, "err", err)
-		}
-	}
+	enrollMainWorktrees(ctx, st, repoPaths)
 
 	// Auto-resume per-worktree fsnotify watchers. Migrations and
 	// dumps live in the worktree (each linked worktree has its own
 	// branch checkout), so the file watcher is rooted there.
-	if wts, err := s.ListActiveWorktrees(ctx); err == nil {
-		parallelFor(wts, 8, func(w store.ActiveWorktree) {
-			if _, err := os.Stat(w.WorktreePath); err != nil {
-				slog.Warn("resume wt watcher skipped (path missing)",
-					"wt", w.WorktreePath, "err", err)
-				return
-			}
-			if err := daemon.ResumeWorktreeWatcher(ctx, st, w.RepoPath, w.WorktreePath); err != nil {
-				slog.Warn("resume wt watcher failed",
-					"wt", w.WorktreePath, "err", err)
-				return
-			}
-			slog.Info("resumed wt watcher", "wt", w.WorktreePath)
-		})
-	}
+	resumeWorktreeWatchers(ctx, s, st)
 
 	// Auto-resume lifecycle watchers for every registered repo. The
 	// lifecycle watcher tails `<common-dir>/worktrees/` so
 	// `git worktree add`/`remove` runs outside the treeman CLI still
 	// fire setup / teardown. Unconditional — worktree
 	// lifecycle is infrastructure, not user policy.
-	if repos, err := s.ListRepoRefs(ctx); err == nil {
-		for _, r := range repos {
-			if _, err := os.Stat(r.Path); err != nil {
-				slog.Warn("resume lifecycle watcher skipped (path missing)",
-					"repo", r.Path, "err", err)
-				continue
-			}
-			if _, err := daemon.StartLifecycleWatcher(ctx, st, r.ID, r.Path); err != nil {
-				slog.Warn("resume lifecycle watcher failed",
-					"repo", r.Path, "err", err)
-				continue
-			}
-		}
-	}
+	resumeLifecycleWatchers(ctx, s, st)
 
 	// Watchdog for in-flight FinalizeWorktree goroutines: cancels +
 	// flags any that exceed the prepare timeout. Catches the
@@ -240,17 +196,7 @@ func run() error {
 	// `kill -HUP $(pgrep treemand)` is a deterministic operator knob
 	// and matches Unix daemon convention.
 	if cr != nil {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-hupCh:
-					slog.Info("SIGHUP received — reloading config")
-					cr.ReloadAll(st.BgCtx)
-				}
-			}
-		}()
+		go hupReloadLoop(ctx, st, cr, hupCh)
 	}
 
 	shutdown := make(chan struct{}, 1)
@@ -267,6 +213,96 @@ func run() error {
 	_ = ln.Close()
 	_ = os.Remove(sockPath)
 	return nil
+}
+
+// resumeRepoWatchers re-spawns per-repo watchers on boot via the same
+// path the watcher_start RPC takes. Failures per-repo are logged +
+// skipped — a missing or moved repo dir shouldn't abort startup.
+func resumeRepoWatchers(ctx context.Context, st *daemon.State, repoPaths []string) {
+	parallelFor(repoPaths, 8, func(p string) {
+		if _, err := os.Stat(p); err != nil {
+			slog.Warn("resume watcher skipped (path missing)", "repo", p, "err", err)
+			return
+		}
+		if err := daemon.ResumeRepoWatcher(ctx, st, p); err != nil {
+			slog.Warn("resume watcher failed", "repo", p, "err", err)
+			return
+		}
+		slog.Info("resumed watcher", "repo", p)
+	})
+}
+
+// enrollMainWorktrees flips each repo's main worktree row to match the
+// current branch where `main_worktree.enabled: true`. Idempotent.
+func enrollMainWorktrees(ctx context.Context, st *daemon.State, repoPaths []string) {
+	for _, p := range repoPaths {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		if _, err := daemon.EnrollMainWorktree(ctx, st, p); err != nil {
+			slog.Warn("main worktree enroll skipped", "repo", p, "err", err)
+		}
+	}
+}
+
+// resumeWorktreeWatchers re-spawns per-worktree fsnotify watchers on
+// boot. Migrations and dumps live in the worktree, so the file watcher
+// is rooted there.
+func resumeWorktreeWatchers(ctx context.Context, s *store.Store, st *daemon.State) {
+	wts, err := s.ListActiveWorktrees(ctx)
+	if err != nil {
+		return
+	}
+	parallelFor(wts, 8, func(w store.ActiveWorktree) {
+		if _, err := os.Stat(w.WorktreePath); err != nil {
+			slog.Warn("resume wt watcher skipped (path missing)",
+				"wt", w.WorktreePath, "err", err)
+			return
+		}
+		if err := daemon.ResumeWorktreeWatcher(ctx, st, w.RepoPath, w.WorktreePath); err != nil {
+			slog.Warn("resume wt watcher failed",
+				"wt", w.WorktreePath, "err", err)
+			return
+		}
+		slog.Info("resumed wt watcher", "wt", w.WorktreePath)
+	})
+}
+
+// resumeLifecycleWatchers re-spawns lifecycle watchers for every
+// registered repo so `git worktree add`/`remove` outside the treeman
+// CLI still fire setup / teardown.
+func resumeLifecycleWatchers(ctx context.Context, s *store.Store, st *daemon.State) {
+	repos, err := s.ListRepoRefs(ctx)
+	if err != nil {
+		return
+	}
+	for _, r := range repos {
+		if _, err := os.Stat(r.Path); err != nil {
+			slog.Warn("resume lifecycle watcher skipped (path missing)",
+				"repo", r.Path, "err", err)
+			continue
+		}
+		if _, err := daemon.StartLifecycleWatcher(ctx, st, r.ID, r.Path); err != nil {
+			slog.Warn("resume lifecycle watcher failed",
+				"repo", r.Path, "err", err)
+			continue
+		}
+	}
+}
+
+// hupReloadLoop routes SIGHUP to a full config reload until ctx is
+// cancelled. Independent of the shutdown signal set so
+// `kill -HUP $(pgrep treemand)` is a deterministic operator knob.
+func hupReloadLoop(ctx context.Context, st *daemon.State, cr *daemon.ConfigReloader, hupCh <-chan os.Signal) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hupCh:
+			slog.Info("SIGHUP received — reloading config")
+			cr.ReloadAll(st.BgCtx)
+		}
+	}
 }
 
 func acceptLoop(ctx context.Context, ln net.Listener, st *daemon.State, shutdown chan struct{}) {

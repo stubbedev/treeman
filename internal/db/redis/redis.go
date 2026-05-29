@@ -104,7 +104,7 @@ func (d *Driver) EngineVersion(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(info, "\n") {
+	for line := range strings.SplitSeq(info, "\n") {
 		line = strings.TrimRight(line, "\r")
 		if v, ok := strings.CutPrefix(line, "redis_version:"); ok {
 			return v, nil

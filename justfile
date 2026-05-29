@@ -25,9 +25,9 @@ install:
     @echo "Installed treeman + treemand to $(go env GOBIN || echo $(go env GOPATH)/bin)"
 
 fmt:
-    gofmt -w ./cmd ./internal
+    golangci-lint fmt ./...
 
-# Point git at .githooks/ so the pre-commit gofmt gate fires. One-shot
+# Point git at .githooks/ so the pre-commit format gate fires. One-shot
 # per clone; idempotent. CI still runs the same check as the
 # authoritative gate — the hook just catches drift earlier.
 install-hooks:
@@ -35,31 +35,31 @@ install-hooks:
     set -euo pipefail
     git config core.hooksPath .githooks
     echo "git config core.hooksPath = .githooks"
-    echo "pre-commit gofmt gate is now active (bypass with --no-verify)."
+    echo "pre-commit golangci-lint fmt gate is now active (bypass with --no-verify)."
 
-# Auto-fix formatting drift, then vet. Same dev contract as the
-# sync-schema / sync-docs / sync-flake recipes: anything that *can*
-# be regenerated *is* regenerated, and the release flow commits the
-# diff. CI uses a separate read-only gofmt check (in ci.yml) as the
-# strict gate so a broken `just lint` never silently re-fixes the
+# Auto-fix formatting drift (golangci-lint fmt = gofumpt + goimports +
+# golines), then vet + the full golangci-lint gate. Same dev contract as
+# the sync-schema / sync-docs / sync-flake recipes: anything that *can* be
+# regenerated *is* regenerated. CI uses the read-only `lint-check` variant
+# as the strict gate so a broken `just lint` never silently re-fixes the
 # CI workspace.
 lint: fmt
     go vet ./...
+    golangci-lint run ./...
 
-# Strict read-only gofmt check — same logic CI runs, exposed for
-# local pre-push verification.
+# Strict read-only check — same logic CI runs, exposed for local pre-push
+# verification. Fails if formatting would change or any linter fires.
 lint-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    out=$(gofmt -l ./cmd ./internal)
+    out=$(golangci-lint fmt --diff ./...)
     if [ -n "$out" ]; then
-        echo "gofmt would rewrite:"
+        echo "code is not formatted; run 'just fmt':"
         printf '%s\n' "$out"
-        echo
-        gofmt -d ./cmd ./internal
         exit 1
     fi
     go vet ./...
+    golangci-lint run ./...
 
 test:
     go test ./...

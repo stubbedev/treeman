@@ -28,19 +28,19 @@ func TestEnsureFilter_LinkedWorktreeAttributesVisible(t *testing.T) {
 	tmp := t.TempDir()
 
 	main := filepath.Join(tmp, "main")
-	mustRun(t, tmp, "git", "init", "-q", "-b", "master", main)
-	mustRun(t, main, "git", "config", "user.email", "t@t")
-	mustRun(t, main, "git", "config", "user.name", "t")
+	mustRun(t, tmp, "init", "-q", "-b", "master", main)
+	mustRun(t, main, "config", "user.email", "t@t")
+	mustRun(t, main, "config", "user.name", "t")
 	envPath := filepath.Join(main, ".env.testing")
 	if err := os.WriteFile(envPath, []byte("DB=app_testing\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mustRun(t, main, "git", "add", ".env.testing")
-	mustRun(t, main, "git", "commit", "-q", "-m", "v1")
-	mustRun(t, main, "git", "branch", "feature")
+	mustRun(t, main, "add", ".env.testing")
+	mustRun(t, main, "commit", "-q", "-m", "v1")
+	mustRun(t, main, "branch", "feature")
 
 	linked := filepath.Join(tmp, "linked")
-	mustRun(t, main, "git", "worktree", "add", "-q", linked, "feature")
+	mustRun(t, main, "worktree", "add", "-q", linked, "feature")
 
 	ctx := context.Background()
 	if err := EnsureFilter(ctx, linked, []string{".env.testing"}); err != nil {
@@ -90,17 +90,17 @@ func TestEnsureFilter_StripsLegacyPerWorktreeAttributes(t *testing.T) {
 	}
 	tmp := t.TempDir()
 	main := filepath.Join(tmp, "main")
-	mustRun(t, tmp, "git", "init", "-q", "-b", "master", main)
-	mustRun(t, main, "git", "config", "user.email", "t@t")
-	mustRun(t, main, "git", "config", "user.name", "t")
+	mustRun(t, tmp, "init", "-q", "-b", "master", main)
+	mustRun(t, main, "config", "user.email", "t@t")
+	mustRun(t, main, "config", "user.name", "t")
 	if err := os.WriteFile(filepath.Join(main, ".env.testing"), []byte("DB=v1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mustRun(t, main, "git", "add", ".env.testing")
-	mustRun(t, main, "git", "commit", "-q", "-m", "v1")
-	mustRun(t, main, "git", "branch", "feature")
+	mustRun(t, main, "add", ".env.testing")
+	mustRun(t, main, "commit", "-q", "-m", "v1")
+	mustRun(t, main, "branch", "feature")
 	linked := filepath.Join(tmp, "linked")
-	mustRun(t, main, "git", "worktree", "add", "-q", linked, "feature")
+	mustRun(t, main, "worktree", "add", "-q", linked, "feature")
 
 	// Seed a legacy per-worktree attributes file as treeman 2.4.1
 	// would have produced it. Drop a real user line in there too so
@@ -147,17 +147,17 @@ func TestEnsureFilter_DeletesEmptyLegacyPerWorktreeAttributes(t *testing.T) {
 	}
 	tmp := t.TempDir()
 	main := filepath.Join(tmp, "main")
-	mustRun(t, tmp, "git", "init", "-q", "-b", "master", main)
-	mustRun(t, main, "git", "config", "user.email", "t@t")
-	mustRun(t, main, "git", "config", "user.name", "t")
+	mustRun(t, tmp, "init", "-q", "-b", "master", main)
+	mustRun(t, main, "config", "user.email", "t@t")
+	mustRun(t, main, "config", "user.name", "t")
 	if err := os.WriteFile(filepath.Join(main, ".env.testing"), []byte("DB=v1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	mustRun(t, main, "git", "add", ".env.testing")
-	mustRun(t, main, "git", "commit", "-q", "-m", "v1")
-	mustRun(t, main, "git", "branch", "feature")
+	mustRun(t, main, "add", ".env.testing")
+	mustRun(t, main, "commit", "-q", "-m", "v1")
+	mustRun(t, main, "branch", "feature")
 	linked := filepath.Join(tmp, "linked")
-	mustRun(t, main, "git", "worktree", "add", "-q", linked, "feature")
+	mustRun(t, main, "worktree", "add", "-q", linked, "feature")
 	perWtAttrs := filepath.Join(main, ".git", "worktrees", "linked", "info", "attributes")
 	if err := os.MkdirAll(filepath.Dir(perWtAttrs), 0o755); err != nil {
 		t.Fatal(err)
@@ -183,16 +183,16 @@ func TestEnsureFilter_ReplacesTreemanBlock(t *testing.T) {
 	}
 	tmp := t.TempDir()
 	repo := filepath.Join(tmp, "repo")
-	mustRun(t, tmp, "git", "init", "-q", "-b", "master", repo)
-	mustRun(t, repo, "git", "config", "user.email", "t@t")
-	mustRun(t, repo, "git", "config", "user.name", "t")
+	mustRun(t, tmp, "init", "-q", "-b", "master", repo)
+	mustRun(t, repo, "config", "user.email", "t@t")
+	mustRun(t, repo, "config", "user.name", "t")
 	for _, f := range []string{"a", "b", "c"} {
 		if err := os.WriteFile(filepath.Join(repo, f), []byte("x\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	mustRun(t, repo, "git", "add", ".")
-	mustRun(t, repo, "git", "commit", "-q", "-m", "v1")
+	mustRun(t, repo, "add", ".")
+	mustRun(t, repo, "commit", "-q", "-m", "v1")
 
 	// Pre-seed an unrelated user attribute that EnsureFilter must
 	// preserve.
@@ -228,12 +228,12 @@ func TestEnsureFilter_ReplacesTreemanBlock(t *testing.T) {
 	}
 }
 
-func mustRun(t *testing.T, dir, name string, args ...string) {
+func mustRun(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command(name, args...)
+	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 }
 

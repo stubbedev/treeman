@@ -112,6 +112,11 @@ func worktreeSlugCompletions(ctx context.Context) []string {
 			out = append(out, s)
 		}
 	}
+	// Best-effort: a mid-iteration DB error just truncates the
+	// completion list rather than failing the whole call.
+	if err := rows.Err(); err != nil {
+		return out
+	}
 	return out
 }
 
@@ -140,6 +145,9 @@ func branchCompletions(ctx context.Context) []string {
 		if b != "" {
 			out = append(out, b)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return out
 	}
 	return out
 }
@@ -180,6 +188,9 @@ func recentRunIDCompletions(ctx context.Context) []string {
 			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return out
+	}
 	return out
 }
 
@@ -219,6 +230,9 @@ func snapshotFingerprintCompletions(ctx context.Context) []string {
 		if f != "" {
 			out = append(out, f)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return out
 	}
 	return out
 }

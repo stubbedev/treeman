@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -33,8 +34,8 @@ import (
 // running — the SQLite UPSERT on `RecordSnapshot` is idempotent and
 // `DROP DATABASE IF EXISTS` is engine-side idempotent.
 func EvictExcess(ctx context.Context, cfg *config.Config, st *store.Store, repoID int64) {
-	cap := cfg.Snapshots.CapPerRepo
-	candidates, err := st.ListLRUEvictable(ctx, repoID, cap)
+	capPerRepo := cfg.Snapshots.CapPerRepo
+	candidates, err := st.ListLRUEvictable(ctx, repoID, capPerRepo)
 	if err != nil {
 		slog.Warn("snapshot eviction lookup", "repo_id", repoID, "err", err)
 		return
@@ -154,7 +155,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 	switch fam {
 	case engine.FamilyMySQL:
 		if cfg.Connections.Mysql == nil {
-			return fmt.Errorf("connections.mysql not configured")
+			return errors.New("connections.mysql not configured")
 		}
 		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
 		if err != nil {
@@ -164,7 +165,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		return drv.DropSnapshot(ctx, c.TemplateName)
 	case engine.FamilyPostgres:
 		if cfg.Connections.Postgres == nil {
-			return fmt.Errorf("connections.postgres not configured")
+			return errors.New("connections.postgres not configured")
 		}
 		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
 		if err != nil {
@@ -174,7 +175,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		return drv.DropSnapshot(ctx, c.TemplateName)
 	case engine.FamilyMongo:
 		if cfg.Connections.Mongodb == nil {
-			return fmt.Errorf("connections.mongodb not configured")
+			return errors.New("connections.mongodb not configured")
 		}
 		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
 		if err != nil {
@@ -184,7 +185,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		return drv.DropSnapshot(ctx, c.TemplateName)
 	case engine.FamilyES:
 		if cfg.Connections.Elasticsearch == nil {
-			return fmt.Errorf("connections.elasticsearch not configured")
+			return errors.New("connections.elasticsearch not configured")
 		}
 		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 		if err != nil {
@@ -193,7 +194,7 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		return drv.DropSnapshot(ctx, c.TemplateName)
 	case engine.FamilyRedis:
 		if cfg.Connections.Redis == nil {
-			return fmt.Errorf("connections.redis not configured")
+			return errors.New("connections.redis not configured")
 		}
 		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 		if err != nil {
@@ -254,13 +255,13 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 	if gb == 0 {
 		return
 	}
-	cap := int64(gb) * 1024 * 1024 * 1024
+	capBytes := int64(gb) * 1024 * 1024 * 1024
 	total, err := st.SumSnapshotBytes(ctx)
 	if err != nil {
 		slog.Warn("snapshot size sweep sum", "err", err)
 		return
 	}
-	if total <= cap {
+	if total <= capBytes {
 		return
 	}
 	cands, sizes, err := st.ListSnapshotsLargestLRU(ctx)
@@ -269,7 +270,7 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 		return
 	}
 	for i, c := range cands {
-		if total <= cap {
+		if total <= capBytes {
 			break
 		}
 		if IsPinned(c.Fingerprint) {

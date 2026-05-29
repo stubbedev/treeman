@@ -23,7 +23,7 @@ func TestListLRUEvictable(t *testing.T) {
 	}
 
 	// Seed 10 snapshots with monotonically increasing LastUsedAt.
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		err := st.RecordSnapshot(ctx, SnapshotRecord{
 			Fingerprint:   fingerprintN(i),
 			Engine:        "mysql",

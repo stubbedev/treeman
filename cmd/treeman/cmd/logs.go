@@ -3,9 +3,11 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,7 +76,7 @@ TREEMAN_NO_PAGER=1 to disable.`,
 				return err
 			}
 			f := scope.Filter
-			f.Limit = int(c.Int("n"))
+			f.Limit = c.Int("n")
 			st, closer, err := openLogStore(ctx)
 			if err != nil {
 				return err
@@ -126,7 +128,7 @@ func logsGrep() *cli.Command {
 		),
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return fmt.Errorf("usage: treeman logs grep <pattern>")
+				return errors.New("usage: treeman logs grep <pattern>")
 			}
 			pattern := c.Args().First()
 			scope, err := buildFilterWithScope(ctx, c)
@@ -135,7 +137,7 @@ func logsGrep() *cli.Command {
 			}
 			f := scope.Filter
 			if c.Int("n") > 0 {
-				f.Limit = int(c.Int("n"))
+				f.Limit = c.Int("n")
 			} else {
 				f.Limit = 500
 			}
@@ -249,46 +251,12 @@ included, so the original terminal colors round-trip.`,
 				return renderHookLog(ctx, st, id, c.Bool("json"))
 			}
 			all := c.Bool("all")
-			repoID := int64(0)
-			if r := c.String("repo"); r != "" {
-				repoID, _ = lookupRepoID(ctx, st, MustAbs(r))
-			} else if !all {
-				if cwd, err := os.Getwd(); err == nil {
-					if root, err := DiscoverRepoRoot(cwd); err == nil {
-						repoID, _ = lookupRepoID(ctx, st, root)
-					}
-				}
+			wtID, name, err := resolveHooksScope(ctx, st, c, all)
+			if err != nil {
+				return err
 			}
 
-			var wtID int64
-			var name string
-			if c.NArg() >= 1 {
-				name = c.Args().First()
-				var lookupErr error
-				wtID, lookupErr = st.LookupWorktreeID(ctx, repoID, name)
-				if lookupErr != nil {
-					return lookupErr
-				}
-				if wtID == 0 {
-					return fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
-				}
-			} else if !all {
-				cwd, _ := os.Getwd()
-				row := lookupWorktreeContainingCwd(ctx, st, MustAbs(cwd))
-				if row.ID == 0 {
-					return fmt.Errorf("usage: treeman logs hooks [worktree] (cwd is not inside a registered worktree; pass --all to span every worktree)")
-				}
-				wtID = row.ID
-				name = row.Slug
-				if name == "" {
-					name = row.Branch
-				}
-				if !c.Bool("json") {
-					fmt.Fprintf(os.Stderr, "# scope: worktree=%s (--all to widen)\n", name)
-				}
-			}
-
-			runs, err := st.QueryHookRuns(ctx, wtID, int(c.Int("n")))
+			runs, err := st.QueryHookRuns(ctx, wtID, c.Int("n"))
 			if err != nil {
 				return err
 			}
@@ -303,55 +271,108 @@ included, so the original terminal colors round-trip.`,
 				}
 				return nil
 			}
-			cols := []string{"ID", "STARTED", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
-			if all {
-				cols = []string{"ID", "STARTED", "WORKTREE", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
-			}
-			tbl := ui.NewTable(cols...)
-			for _, h := range runs {
-				var exit string
-				if h.ExitCode.Valid {
-					code := fmt.Sprintf("%d", h.ExitCode.Int64)
-					if h.ExitCode.Int64 == 0 {
-						exit = ui.Green(code)
-					} else {
-						exit = ui.Red(code)
-					}
-				} else {
-					exit = ui.Yellow("running")
-				}
-				dur := "—"
-				if h.FinishedAt.Valid {
-					d := time.Duration(h.FinishedAt.Int64-h.StartedAt) * time.Millisecond
-					dur = ui.Dim(d.String())
-				}
-				cmd := h.Command
-				if cmd == "" {
-					// Older rows (pre-0008) won't have command; fall
-					// back to the captured tails so the column isn't
-					// empty.
-					cmd = h.StderrTail
-					if cmd == "" {
-						cmd = h.StdoutTail
-					}
-				}
-				cmd = singleLine(cmd, 80)
-				group := fmt.Sprintf("%d", h.GroupIdx)
-				id := ui.Dim(fmt.Sprintf("%d", h.ID))
-				if all {
-					slug := h.WorktreeSlug
-					if slug == "" {
-						slug = fmt.Sprintf("#%d", h.WorktreeID)
-					}
-					tbl.Row(id, ui.Dim(formatTs(h.StartedAt)), ui.Magenta(slug), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
-				} else {
-					tbl.Row(id, ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
-				}
-			}
-			tbl.Render(nil)
+			renderHookRunsTable(runs, all)
 			return nil
 		},
 	}
+}
+
+// resolveHooksScope resolves the worktree id + display name to scope
+// `logs hooks` to, honoring --repo/--all and cwd auto-detection. Returns
+// (0, "", nil) for the --all span (no single worktree).
+func resolveHooksScope(ctx context.Context, st *store.Store, c *cli.Command, all bool) (int64, string, error) {
+	repoID := int64(0)
+	if r := c.String("repo"); r != "" {
+		repoID, _ = lookupRepoID(ctx, st, MustAbs(r))
+	} else if !all {
+		if cwd, err := os.Getwd(); err == nil {
+			if root, err := DiscoverRepoRoot(cwd); err == nil {
+				repoID, _ = lookupRepoID(ctx, st, root)
+			}
+		}
+	}
+
+	if c.NArg() >= 1 {
+		name := c.Args().First()
+		wtID, lookupErr := st.LookupWorktreeID(ctx, repoID, name)
+		if lookupErr != nil {
+			return 0, "", lookupErr
+		}
+		if wtID == 0 {
+			return 0, "", fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
+		}
+		return wtID, name, nil
+	}
+	if all {
+		return 0, "", nil
+	}
+
+	cwd, _ := os.Getwd()
+	row := lookupWorktreeContainingCwd(ctx, st, MustAbs(cwd))
+	if row.ID == 0 {
+		return 0, "", errors.New(
+			"usage: treeman logs hooks [worktree] (cwd is not inside a registered worktree; pass --all to span every worktree)",
+		)
+	}
+	name := row.Slug
+	if name == "" {
+		name = row.Branch
+	}
+	if !c.Bool("json") {
+		fmt.Fprintf(os.Stderr, "# scope: worktree=%s (--all to widen)\n", name)
+	}
+	return row.ID, name, nil
+}
+
+// renderHookRunsTable prints the human-readable hook_runs table. The
+// WORKTREE column only appears in --all mode.
+func renderHookRunsTable(runs []store.HookRun, all bool) {
+	cols := []string{"ID", "STARTED", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
+	if all {
+		cols = []string{"ID", "STARTED", "WORKTREE", "PHASE", "GROUP", "EXIT", "DURATION", "COMMAND"}
+	}
+	tbl := ui.NewTable(cols...)
+	for _, h := range runs {
+		var exit string
+		if h.ExitCode.Valid {
+			code := strconv.FormatInt(h.ExitCode.Int64, 10)
+			if h.ExitCode.Int64 == 0 {
+				exit = ui.Green(code)
+			} else {
+				exit = ui.Red(code)
+			}
+		} else {
+			exit = ui.Yellow("running")
+		}
+		dur := "—"
+		if h.FinishedAt.Valid {
+			d := time.Duration(h.FinishedAt.Int64-h.StartedAt) * time.Millisecond
+			dur = ui.Dim(d.String())
+		}
+		cmd := h.Command
+		if cmd == "" {
+			// Older rows (pre-0008) won't have command; fall
+			// back to the captured tails so the column isn't
+			// empty.
+			cmd = h.StderrTail
+			if cmd == "" {
+				cmd = h.StdoutTail
+			}
+		}
+		cmd = singleLine(cmd, 80)
+		group := strconv.FormatInt(h.GroupIdx, 10)
+		id := ui.Dim(strconv.FormatInt(h.ID, 10))
+		if all {
+			slug := h.WorktreeSlug
+			if slug == "" {
+				slug = fmt.Sprintf("#%d", h.WorktreeID)
+			}
+			tbl.Row(id, ui.Dim(formatTs(h.StartedAt)), ui.Magenta(slug), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
+		} else {
+			tbl.Row(id, ui.Dim(formatTs(h.StartedAt)), ui.Cyan(h.Phase), ui.Dim(group), exit, dur, cmd)
+		}
+	}
+	tbl.Render(nil)
 }
 
 // renderHookLog writes the captured stdout+stderr for a hook_run id

@@ -49,8 +49,8 @@ func MainRoot(start string) (string, error) {
 		// Canonicalise (the gitdir for a linked worktree is
 		// <main>/.git on disk; we want <main>).
 		common, _ = filepath.EvalSymlinks(common)
-		if strings.HasSuffix(common, string(filepath.Separator)+".git") {
-			return strings.TrimSuffix(common, string(filepath.Separator)+".git"), nil
+		if before, ok := strings.CutSuffix(common, string(filepath.Separator)+".git"); ok {
+			return before, nil
 		}
 		return common, nil
 	}
@@ -107,7 +107,7 @@ func HasUnpushedCommits(path string) (bool, error) {
 	count, err := gitcmd.String(context.Background(), path, "rev-list", "@{upstream}..HEAD", "--count")
 	if err != nil {
 		// No upstream — treat as no unpushed work.
-		return false, nil
+		return false, nil //nolint:nilerr // no tracking branch means nothing can be unpushed
 	}
 	return count != "0" && count != "", nil
 }
@@ -132,8 +132,8 @@ func DetectBranch(worktree string) string {
 	}
 	line := strings.TrimSpace(string(b))
 	const prefix = "ref: refs/heads/"
-	if strings.HasPrefix(line, prefix) {
-		return strings.TrimPrefix(line, prefix)
+	if after, ok := strings.CutPrefix(line, prefix); ok {
+		return after
 	}
 	return ""
 }

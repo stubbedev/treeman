@@ -14,11 +14,13 @@ package prepare
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,7 +56,11 @@ import (
 // conversion bridges the boundary at zero allocation cost.
 type frameworkHashCache struct{ *store.Store }
 
-func (f frameworkHashCache) BatchDirHashes(ctx context.Context, dirs []string, specName, hashMode string) (map[string]framework.DirHashCacheRecord, error) {
+func (f frameworkHashCache) BatchDirHashes(
+	ctx context.Context,
+	dirs []string,
+	specName, hashMode string,
+) (map[string]framework.DirHashCacheRecord, error) {
 	raw, err := f.Store.BatchDirHashes(ctx, dirs, specName, hashMode)
 	if err != nil {
 		return nil, err
@@ -95,7 +101,8 @@ func runnerLogPath(worktreePath, engine, label, target string) string {
 // the stderr-only event payload was empty and the failure reason was
 // lost. Mirrors emitPhaseDone's shape: the run_id is auto-injected.
 func emitRunnerError(ctx context.Context, st *store.Store, repoID, worktreeID int64,
-	engine, sourceDB, label string, out runner.Outcome) {
+	engine, sourceDB, label string, out runner.Outcome,
+) {
 	if st == nil {
 		return
 	}
@@ -104,7 +111,7 @@ func emitRunnerError(ctx context.Context, st *store.Store, repoID, worktreeID in
 		repoID, worktreeID, label, 0, map[string]string{
 			"engine":      engine,
 			"source_db":   sourceDB,
-			"exit_code":   fmt.Sprintf("%d", out.ExitCode),
+			"exit_code":   strconv.Itoa(out.ExitCode),
 			"stderr_tail": out.StderrTail,
 			"stdout_tail": out.StdoutTail,
 			"log_path":    out.LogPath,
@@ -118,7 +125,8 @@ func emitRunnerError(ctx context.Context, st *store.Store, repoID, worktreeID in
 // is spent during a cold build. The run_id (set on ctx in the
 // dispatch layer) is auto-injected into the payload by store.
 func emitPhaseDone(ctx context.Context, st *store.Store, repoID, worktreeID int64,
-	engine, sourceDB, phase string, stepStart time.Time) {
+	engine, sourceDB, phase string, stepStart time.Time,
+) {
 	if st == nil {
 		return
 	}
@@ -128,7 +136,7 @@ func emitPhaseDone(ctx context.Context, st *store.Store, repoID, worktreeID int6
 		repoID, worktreeID, phase, durMs, map[string]string{
 			"engine":      engine,
 			"source_db":   sourceDB,
-			"duration_ms": fmt.Sprintf("%d", durMs),
+			"duration_ms": strconv.FormatInt(durMs, 10),
 		})
 }
 
@@ -249,10 +257,7 @@ const mysqlInnerPerRestore = 6
 // restorer goroutines. Per-call `len(clones)` clamping happens at
 // the use site.
 func autoTuneOuter(engine string, maxConns int) int {
-	inner := innerConnsPerRestore[engine]
-	if inner < 1 {
-		inner = 1
-	}
+	inner := max(innerConnsPerRestore[engine], 1)
 	defaultCap := fanOutLimits[engine]
 	if defaultCap < 2 {
 		defaultCap = 4
@@ -260,18 +265,12 @@ func autoTuneOuter(engine string, maxConns int) int {
 	if maxConns <= 0 {
 		return defaultCap
 	}
-	reserved := maxConns / 10
-	if reserved < 5 {
-		reserved = 5
-	}
+	reserved := max(maxConns/10, 5)
 	available := maxConns - reserved
 	if available < inner {
 		return 2
 	}
-	outer := available / inner
-	if outer < 2 {
-		outer = 2
-	}
+	outer := max(available/inner, 2)
 	// Ceiling is 2× the conservative default — beyond that we hit
 	// engine-side serialization (Postgres template I/O, MySQL ROW
 	// lock contention) and gain nothing.
@@ -317,26 +316,7 @@ func fanOutClones(
 	if len(clones) == 0 {
 		return nil
 	}
-	autoTuned := false
-	limit := 0
-	if override > 0 {
-		limit = int(override)
-	} else if maxConns > 0 {
-		limit = autoTuneOuter(engine, maxConns)
-		autoTuned = true
-	} else {
-		limit = fanOutLimits[engine]
-		if limit == 0 {
-			limit = runtime.GOMAXPROCS(0)
-		}
-	}
-	if limit < 2 {
-		limit = 2
-	}
-	if limit > len(clones) {
-		limit = len(clones)
-	}
-	_ = autoTuned // surfaced via the fanout_start payload below
+	limit, autoTuned := fanOutLimit(override, maxConns, len(clones), engine)
 
 	startedMs := time.Now().UnixMilli()
 	if st != nil {
@@ -363,7 +343,6 @@ func fanOutClones(
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(limit)
 	for _, c := range clones {
-		c := c
 		g.Go(func() error {
 			cloneStart := time.Now()
 			err := restore(gctx, template, c)
@@ -429,6 +408,34 @@ func fanOutClones(
 	return gErr
 }
 
+// fanOutLimit picks the concurrency cap for a fan-out restore. Explicit
+// override wins; otherwise auto-tune from the pool's max connections;
+// otherwise a per-engine default (falling back to GOMAXPROCS). The
+// result is clamped to [2, numClones]. autoTuned reports whether the
+// max-connections heuristic was used (surfaced in the fanout_start
+// event payload).
+func fanOutLimit(override uint32, maxConns, numClones int, engine string) (limit int, autoTuned bool) {
+	switch {
+	case override > 0:
+		limit = int(override)
+	case maxConns > 0:
+		limit = autoTuneOuter(engine, maxConns)
+		autoTuned = true
+	default:
+		limit = fanOutLimits[engine]
+		if limit == 0 {
+			limit = runtime.GOMAXPROCS(0)
+		}
+	}
+	if limit < 2 {
+		limit = 2
+	}
+	if limit > numClones {
+		limit = numClones
+	}
+	return limit, autoTuned
+}
+
 // Run drives prepare for every database declared by cfg.Databases.
 //
 // `worktreePath` is the linked-worktree checkout root — migration
@@ -490,7 +497,6 @@ func RunFiltered(
 	hasResult := make([]bool, len(cfg.Databases))
 	g, gctx := errgroup.WithContext(ctx)
 	for i, d := range cfg.Databases {
-		i, d := i, d
 		if opts.FilterDBs && opts.OnlyDBIndex != i {
 			continue
 		}
@@ -610,85 +616,11 @@ func prepareMySQL(
 	// the cold build and just clone the template into paratest DBs.
 	// Inputs feed the fingerprint, so any user-meaningful change
 	// invalidates the cache naturally — no force-rebuild knob.
-	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-		// Touch the row BEFORE DatabaseExists so a concurrent
-		// EvictExcess sees this template as most-recently-used and
-		// won't pick it as LRU while we're about to use it.
-		_ = st.TouchSnapshot(ctx, key.Fingerprint())
-		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
-			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-				fmt.Sprintf("template=%s", rec.TemplateName),
-				repoID, worktreeID, "", 0, map[string]string{
-					"engine":      d.Engine,
-					"source_db":   sourceDB,
-					"template":    rec.TemplateName,
-					"fingerprint": key.Fingerprint(),
-				})
-			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-			if err != nil {
-				return Outcome{}, err
-			}
-			// Cache-hit skips the cold-build path that populates the
-			// source DB via dump+migrate. Restore source from the
-			// template so non-parallel runs (single `php artisan test`,
-			// dev shells, tinker — anything that reads DB_DATABASE
-			// without the `_test_N` suffix paratest appends) have a
-			// populated DB at the user-facing name_template.
-			//
-			// If the template disappears mid-flight (race with
-			// EvictExcess between DatabaseExists and SnapshotRestore /
-			// fanOutClones), fall through to cold build instead of
-			// failing wt_finalize.
-			if restoreErr := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); restoreErr != nil {
-				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
-					fmt.Sprintf("restore failed, falling back to cold build: %v", restoreErr),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      d.Engine,
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-						"error":       restoreErr.Error(),
-					})
-				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-				goto mysqlColdBuild
-			}
-			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); foErr != nil {
-				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
-					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      d.Engine,
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-						"error":       foErr.Error(),
-					})
-				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-				goto mysqlColdBuild
-			}
-			ms := time.Since(started).Milliseconds()
-			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-				repoID, worktreeID, "", 0, map[string]string{
-					"source_db":   sourceDB,
-					"template":    rec.TemplateName,
-					"clones":      fmt.Sprintf("%d", len(clones)),
-					"fingerprint": key.Fingerprint(),
-					"cache_hit":   "true",
-					"duration_ms": fmt.Sprintf("%d", ms),
-				})
-			return Outcome{
-				Engine:       d.Engine,
-				SourceDB:     sourceDB,
-				TemplateName: rec.TemplateName,
-				Fingerprint:  key.Fingerprint(),
-				CacheHit:     true,
-				Clones:       clones,
-			}, nil
-		}
-		// Row stale (template was dropped externally). Wipe so the
-		// cold-build path below overwrites it cleanly.
-		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	out, done, err := mysqlCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, key, maxConns, started)
+	if done || err != nil {
+		return out, err
 	}
 
-mysqlColdBuild:
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
 		fmt.Sprintf("engine=mysql source=%s template=%s", sourceDB, templateName),
 		repoID, worktreeID, "", 0, map[string]string{
@@ -707,19 +639,197 @@ mysqlColdBuild:
 	// prefix drop would wipe sibling worktrees. Stale per-test
 	// clones from a prior cold-build get overwritten by exact name
 	// in SnapshotRestore during fanout below.
-	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
+	if err := mysqlColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
 		return Outcome{}, err
+	}
+
+	// Build the template snapshot, then clone it into paratest DBs.
+	if err := mysqlSnapshotAndRecord(ctx, drv, cfg, d, st, repoID, worktreeID, sourceDB, templateName, version, key); err != nil {
+		return Outcome{}, err
+	}
+
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if err := fanOutClones(
+		ctx,
+		st,
+		repoID,
+		worktreeID,
+		drv.SnapshotRestore,
+		templateName,
+		clones,
+		d.Engine,
+		d.Fanout,
+		maxConns,
+	); err != nil {
+		return Outcome{}, err
+	}
+
+	ms := time.Since(started).Milliseconds()
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
+		repoID, worktreeID, "", 0, map[string]string{
+			"source_db":   sourceDB,
+			"template":    templateName,
+			"clones":      strconv.Itoa(len(clones)),
+			"cache_hit":   "false",
+			"duration_ms": strconv.FormatInt(ms, 10),
+		})
+
+	return Outcome{
+		Engine:       d.Engine,
+		SourceDB:     sourceDB,
+		TemplateName: templateName,
+		Fingerprint:  key.Fingerprint(),
+		CacheHit:     false,
+		Clones:       clones,
+	}, nil
+}
+
+// mysqlCacheHit handles the MySQL fingerprint-cache fast path. It
+// returns (out, true, nil) when the cached template was reused and the
+// caller should return `out`; (Outcome{}, false, nil) when the cache
+// missed or fell back (caller must cold-build); (Outcome{}, false, err)
+// on a hard error. Extracted verbatim from prepareMySQL — the prior
+// `goto mysqlColdBuild` jumps become `return Outcome{}, false, nil`.
+func mysqlCacheHit(
+	ctx context.Context,
+	drv *dbmysql.Driver,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourceDB string,
+	key snapshot.Key,
+	maxConns int,
+	started time.Time,
+) (Outcome, bool, error) {
+	// A LookupSnapshot error is treated as a cache miss (fall through to
+	// cold build), matching the original `err == nil && rec != nil` guard.
+	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
+	if rec == nil {
+		return Outcome{}, false, nil
+	}
+	// Touch the row BEFORE DatabaseExists so a concurrent
+	// EvictExcess sees this template as most-recently-used and
+	// won't pick it as LRU while we're about to use it.
+	_ = st.TouchSnapshot(ctx, key.Fingerprint())
+	if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
+		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+			"template="+rec.TemplateName,
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":      d.Engine,
+				"source_db":   sourceDB,
+				"template":    rec.TemplateName,
+				"fingerprint": key.Fingerprint(),
+			})
+		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+		if err != nil {
+			return Outcome{}, false, err
+		}
+		// Cache-hit skips the cold-build path that populates the
+		// source DB via dump+migrate. Restore source from the
+		// template so non-parallel runs (single `php artisan test`,
+		// dev shells, tinker — anything that reads DB_DATABASE
+		// without the `_test_N` suffix paratest appends) have a
+		// populated DB at the user-facing name_template.
+		//
+		// If the template disappears mid-flight (race with
+		// EvictExcess between DatabaseExists and SnapshotRestore /
+		// fanOutClones), fall through to cold build instead of
+		// failing wt_finalize.
+		if restoreErr := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); restoreErr != nil {
+			_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+				fmt.Sprintf("restore failed, falling back to cold build: %v", restoreErr),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      d.Engine,
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+					"error":       restoreErr.Error(),
+				})
+			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			return Outcome{}, false, nil
+		}
+		if foErr := fanOutClones(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			drv.SnapshotRestore,
+			rec.TemplateName,
+			clones,
+			d.Engine,
+			d.Fanout,
+			maxConns,
+		); foErr != nil {
+			_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+				fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      d.Engine,
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+					"error":       foErr.Error(),
+				})
+			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			return Outcome{}, false, nil
+		}
+		ms := time.Since(started).Milliseconds()
+		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+			repoID, worktreeID, "", 0, map[string]string{
+				"source_db":   sourceDB,
+				"template":    rec.TemplateName,
+				"clones":      strconv.Itoa(len(clones)),
+				"fingerprint": key.Fingerprint(),
+				"cache_hit":   "true",
+				"duration_ms": strconv.FormatInt(ms, 10),
+			})
+		return Outcome{
+			Engine:       d.Engine,
+			SourceDB:     sourceDB,
+			TemplateName: rec.TemplateName,
+			Fingerprint:  key.Fingerprint(),
+			CacheHit:     true,
+			Clones:       clones,
+		}, true, nil
+	}
+	// Row stale (template was dropped externally). Wipe so the
+	// cold-build path below overwrites it cleanly.
+	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	return Outcome{}, false, nil
+}
+
+// mysqlColdBuildSteps runs the MySQL cold-build populate phase: drop +
+// recreate the source DB, optionally load a dump, then run migrate and
+// seed. Extracted verbatim from prepareMySQL's cold-build block.
+func mysqlColdBuildSteps(
+	ctx context.Context,
+	drv *dbmysql.Driver,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourceDB string,
+	inheritedEnv map[string]string,
+) error {
+	// mysqlColdBuild: cold-build pre-drop site (see coldbuild_invariant_test).
+	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
+		return err
 	}
 	emitColdBuildDrop(ctx, st, repoID, worktreeID, "mysql", sourceDB)
 	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
-		return Outcome{}, err
+		return err
 	}
 	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
-		return Outcome{}, err
+		return err
 	} else if ok {
 		stepStart := time.Now()
 		if _, err := dumpload.LoadMySQL(ctx, drv.DB, sourceDB, dp); err != nil {
-			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
+			return fmt.Errorf("load dump %s: %w", dp, err)
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
 	}
@@ -728,11 +838,11 @@ mysqlColdBuild:
 		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "mysql", "migrate", sourceDB))
 		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
-			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
+			return fmt.Errorf("migrate source %s: %w", sourceDB, err)
 		}
 		if out.ExitCode != 0 {
 			emitRunnerError(ctx, st, repoID, worktreeID, "mysql", sourceDB, "migrate", out)
-			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
+			return fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
 	}
@@ -741,19 +851,34 @@ mysqlColdBuild:
 		spec := runner.FromSeed(*d.Seed).WithLogPath(runnerLogPath(worktreePath, "mysql", "seed", sourceDB))
 		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
 		if err != nil {
-			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
+			return fmt.Errorf("seed source %s: %w", sourceDB, err)
 		}
 		if out.ExitCode != 0 {
 			emitRunnerError(ctx, st, repoID, worktreeID, "mysql", sourceDB, "seed", out)
-			return Outcome{}, fmt.Errorf("%s", runner.FormatError("seed source", sourceDB, out))
+			return fmt.Errorf("%s", runner.FormatError("seed source", sourceDB, out))
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
+	return nil
+}
 
-	// Build the template snapshot, then clone it into paratest DBs.
+// mysqlSnapshotAndRecord builds the template snapshot from the populated
+// source, records the SQLite snapshot row, and fires the detached LRU
+// eviction sweep. Extracted verbatim from prepareMySQL's snapshot/record
+// block.
+func mysqlSnapshotAndRecord(
+	ctx context.Context,
+	drv *dbmysql.Driver,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourceDB, templateName, version string,
+	key snapshot.Key,
+) error {
 	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
-		return Outcome{}, fmt.Errorf("snapshot create %s → %s: %w", sourceDB, templateName, err)
+		return fmt.Errorf("snapshot create %s → %s: %w", sourceDB, templateName, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
 	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
@@ -771,39 +896,12 @@ mysqlColdBuild:
 	// background context with a hard deadline so a stalled DROP
 	// (e.g. lock contention) can't leak this goroutine forever.
 	// Errors are logged inside EvictExcess.
-	go func() {
+	go func() { //nolint:gosec // detached cache eviction with its own deadline; must outlive the prepare request ctx
 		evictCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		snapshot.EvictExcess(evictCtx, cfg, st, repoID)
 	}()
-
-	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-	if err != nil {
-		return Outcome{}, err
-	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
-		return Outcome{}, err
-	}
-
-	ms := time.Since(started).Milliseconds()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
-		repoID, worktreeID, "", 0, map[string]string{
-			"source_db":   sourceDB,
-			"template":    templateName,
-			"clones":      fmt.Sprintf("%d", len(clones)),
-			"cache_hit":   "false",
-			"duration_ms": fmt.Sprintf("%d", ms),
-		})
-
-	return Outcome{
-		Engine:       d.Engine,
-		SourceDB:     sourceDB,
-		TemplateName: templateName,
-		Fingerprint:  key.Fingerprint(),
-		CacheHit:     false,
-		Clones:       clones,
-	}, nil
+	return nil
 }
 
 // preparePostgres mirrors prepareMySQL for the PostgreSQL engine.
@@ -875,129 +973,13 @@ func preparePostgres(
 		})
 
 	// Cache hit? Fingerprint covers every declared input.
-	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-		// Touch row early so concurrent EvictExcess sees this template
-		// as most-recently-used and skips it as LRU candidate.
-		_ = st.TouchSnapshot(ctx, key.Fingerprint())
-		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
-			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-				fmt.Sprintf("template=%s", rec.TemplateName),
-				repoID, worktreeID, "", 0, map[string]string{
-					"engine":      "postgres",
-					"source_db":   sourceDB,
-					"template":    rec.TemplateName,
-					"fingerprint": key.Fingerprint(),
-				})
-			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-			if err != nil {
-				return Outcome{}, err
-			}
-			// Cache-hit skips the cold-build path that populates the
-			// source DB via dump+migrate. Restore source from the
-			// template so non-parallel runs (single test command,
-			// dev shells — anything that reads the user-facing
-			// name_template without the per-worker suffix) have a
-			// populated DB.
-			//
-			// If the template disappears mid-flight (race with
-			// EvictExcess between DatabaseExists and the restore/
-			// fanout calls), fall through to cold build.
-			if restoreErr := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); restoreErr != nil {
-				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
-					fmt.Sprintf("restore failed, falling back to cold build: %v", restoreErr),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      "postgres",
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-						"error":       restoreErr.Error(),
-					})
-				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-				goto pgColdBuild
-			}
-			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, maxConns); foErr != nil {
-				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
-					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      "postgres",
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-						"error":       foErr.Error(),
-					})
-				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-				goto pgColdBuild
-			}
-			ms := time.Since(started).Milliseconds()
-			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-				repoID, worktreeID, "", 0, map[string]string{
-					"source_db":   sourceDB,
-					"template":    rec.TemplateName,
-					"clones":      fmt.Sprintf("%d", len(clones)),
-					"fingerprint": key.Fingerprint(),
-					"cache_hit":   "true",
-					"duration_ms": fmt.Sprintf("%d", ms),
-				})
-			return Outcome{
-				Engine: d.Engine, SourceDB: sourceDB,
-				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-				CacheHit: true, Clones: clones,
-			}, nil
-		}
-		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	out, done, err := postgresCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, key, maxConns, started)
+	if done || err != nil {
+		return out, err
 	}
 
-pgColdBuild:
-	// Cold build. DropDatabase, NOT DropMatching — see the comment
-	// on the matching mysql cold-build site.
-	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
+	if err := postgresColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
 		return Outcome{}, err
-	}
-	emitColdBuildDrop(ctx, st, repoID, worktreeID, "postgres", sourceDB)
-	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
-		return Outcome{}, err
-	}
-	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
-		return Outcome{}, err
-	} else if ok {
-		stepStart := time.Now()
-		// Postgres has no USE, so dumpload needs a connection scoped
-		// to the target DB rather than the server-level pool.
-		scoped, err := drv.OpenScoped(ctx, sourceDB)
-		if err != nil {
-			return Outcome{}, err
-		}
-		if _, err := dumpload.LoadPostgres(ctx, scoped, sourceDB, dp); err != nil {
-			_ = scoped.Close()
-			return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
-		}
-		_ = scoped.Close()
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
-	}
-	if d.Migrate != nil {
-		stepStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "postgres", "migrate", sourceDB))
-		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
-		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "postgres", sourceDB, "migrate", out)
-			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
-	}
-	if d.Seed != nil {
-		stepStart := time.Now()
-		spec := runner.FromSeed(*d.Seed).WithLogPath(runnerLogPath(worktreePath, "postgres", "seed", sourceDB))
-		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
-		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "postgres", sourceDB, "seed", out)
-			return Outcome{}, fmt.Errorf("%s", runner.FormatError("seed source", sourceDB, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
 	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
@@ -1010,13 +992,26 @@ pgColdBuild:
 		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
 		RepoID: repoID,
 	})
-	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
+		snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+	}()
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
+	if err := fanOutClones(
+		ctx,
+		st,
+		repoID,
+		worktreeID,
+		drv.SnapshotRestore,
+		templateName,
+		clones,
+		d.Engine,
+		d.Fanout,
+		maxConns,
+	); err != nil {
 		return Outcome{}, err
 	}
 	ms := time.Since(started).Milliseconds()
@@ -1026,14 +1021,191 @@ pgColdBuild:
 			"engine":      "postgres",
 			"source_db":   sourceDB,
 			"template":    templateName,
-			"clones":      fmt.Sprintf("%d", len(clones)),
+			"clones":      strconv.Itoa(len(clones)),
 			"cache_hit":   "false",
-			"duration_ms": fmt.Sprintf("%d", ms),
+			"duration_ms": strconv.FormatInt(ms, 10),
 		})
 	return Outcome{
 		Engine: d.Engine, SourceDB: sourceDB, TemplateName: templateName,
 		Fingerprint: key.Fingerprint(), CacheHit: false, Clones: clones,
 	}, nil
+}
+
+// postgresCacheHit handles the Postgres fingerprint-cache fast path.
+// Contract mirrors mysqlCacheHit: (out, true, nil) → return out;
+// (Outcome{}, false, nil) → fall through to cold build; (_, false, err)
+// → hard error. Extracted verbatim from preparePostgres — the prior
+// `goto pgColdBuild` jumps become `return Outcome{}, false, nil`.
+func postgresCacheHit(
+	ctx context.Context,
+	drv *dbpostgres.Driver,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourceDB string,
+	key snapshot.Key,
+	maxConns int,
+	started time.Time,
+) (Outcome, bool, error) {
+	// A LookupSnapshot error is treated as a cache miss (fall through to
+	// cold build), matching the original `err == nil && rec != nil` guard.
+	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
+	if rec == nil {
+		return Outcome{}, false, nil
+	}
+	// Touch row early so concurrent EvictExcess sees this template
+	// as most-recently-used and skips it as LRU candidate.
+	_ = st.TouchSnapshot(ctx, key.Fingerprint())
+	if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
+		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+			"template="+rec.TemplateName,
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":      "postgres",
+				"source_db":   sourceDB,
+				"template":    rec.TemplateName,
+				"fingerprint": key.Fingerprint(),
+			})
+		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+		if err != nil {
+			return Outcome{}, false, err
+		}
+		// Cache-hit skips the cold-build path that populates the
+		// source DB via dump+migrate. Restore source from the
+		// template so non-parallel runs (single test command,
+		// dev shells — anything that reads the user-facing
+		// name_template without the per-worker suffix) have a
+		// populated DB.
+		//
+		// If the template disappears mid-flight (race with
+		// EvictExcess between DatabaseExists and the restore/
+		// fanout calls), fall through to cold build.
+		if restoreErr := drv.SnapshotRestore(ctx, rec.TemplateName, sourceDB); restoreErr != nil {
+			_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+				fmt.Sprintf("restore failed, falling back to cold build: %v", restoreErr),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "postgres",
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+					"error":       restoreErr.Error(),
+				})
+			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			return Outcome{}, false, nil
+		}
+		if foErr := fanOutClones(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			drv.SnapshotRestore,
+			rec.TemplateName,
+			clones,
+			d.Engine,
+			d.Fanout,
+			maxConns,
+		); foErr != nil {
+			_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+				fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "postgres",
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+					"error":       foErr.Error(),
+				})
+			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			return Outcome{}, false, nil
+		}
+		ms := time.Since(started).Milliseconds()
+		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+			repoID, worktreeID, "", 0, map[string]string{
+				"source_db":   sourceDB,
+				"template":    rec.TemplateName,
+				"clones":      strconv.Itoa(len(clones)),
+				"fingerprint": key.Fingerprint(),
+				"cache_hit":   "true",
+				"duration_ms": strconv.FormatInt(ms, 10),
+			})
+		return Outcome{
+			Engine: d.Engine, SourceDB: sourceDB,
+			TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
+			CacheHit: true, Clones: clones,
+		}, true, nil
+	}
+	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	return Outcome{}, false, nil
+}
+
+// postgresColdBuildSteps runs the Postgres cold-build populate phase:
+// drop + recreate the source DB, optionally load a dump (via a scoped
+// connection), then run migrate and seed. Extracted verbatim from
+// preparePostgres's cold-build block.
+func postgresColdBuildSteps(
+	ctx context.Context,
+	drv *dbpostgres.Driver,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourceDB string,
+	inheritedEnv map[string]string,
+) error {
+	// pgColdBuild: cold-build pre-drop site (see coldbuild_invariant_test).
+	// DropDatabase, NOT DropMatching — see the comment on the matching
+	// mysql cold-build site.
+	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
+		return err
+	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "postgres", sourceDB)
+	if err := drv.EnsureDB(ctx, sourceDB); err != nil {
+		return err
+	}
+	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
+		return err
+	} else if ok {
+		stepStart := time.Now()
+		// Postgres has no USE, so dumpload needs a connection scoped
+		// to the target DB rather than the server-level pool.
+		scoped, err := drv.OpenScoped(ctx, sourceDB)
+		if err != nil {
+			return err
+		}
+		if _, err := dumpload.LoadPostgres(ctx, scoped, sourceDB, dp); err != nil {
+			_ = scoped.Close()
+			return fmt.Errorf("load dump %s: %w", dp, err)
+		}
+		_ = scoped.Close()
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
+	}
+	if d.Migrate != nil {
+		stepStart := time.Now()
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "postgres", "migrate", sourceDB))
+		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
+		if err != nil {
+			return fmt.Errorf("migrate source %s: %w", sourceDB, err)
+		}
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, "postgres", sourceDB, "migrate", out)
+			return fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
+	}
+	if d.Seed != nil {
+		stepStart := time.Now()
+		spec := runner.FromSeed(*d.Seed).WithLogPath(runnerLogPath(worktreePath, "postgres", "seed", sourceDB))
+		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
+		if err != nil {
+			return fmt.Errorf("seed source %s: %w", sourceDB, err)
+		}
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, "postgres", sourceDB, "seed", out)
+			return fmt.Errorf("%s", runner.FormatError("seed source", sourceDB, out))
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
+	}
+	return nil
 }
 
 // prepareMongo readies the per-worktree MongoDB database. Cold-build
@@ -1101,102 +1273,13 @@ func prepareMongo(
 		})
 
 	// Cache hit?
-	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-		// Touch row early so concurrent EvictExcess sees this template
-		// as most-recently-used and skips it as LRU candidate.
-		_ = st.TouchSnapshot(ctx, key.Fingerprint())
-		if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
-			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-				fmt.Sprintf("template=%s", rec.TemplateName),
-				repoID, worktreeID, "", 0, map[string]string{
-					"engine":      "mongodb",
-					"source_db":   sourceDB,
-					"template":    rec.TemplateName,
-					"fingerprint": key.Fingerprint(),
-				})
-			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-			if err != nil {
-				return Outcome{}, err
-			}
-			// If the template disappears mid-flight (race with
-			// EvictExcess), fall through to cold build instead of
-			// failing wt_finalize.
-			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); foErr != nil {
-				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
-					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      "mongodb",
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-						"error":       foErr.Error(),
-					})
-				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-				goto mongoColdBuild
-			}
-			ms := time.Since(started).Milliseconds()
-			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-				repoID, worktreeID, "", 0, map[string]string{
-					"engine":      "mongodb",
-					"source_db":   sourceDB,
-					"template":    rec.TemplateName,
-					"clones":      fmt.Sprintf("%d", len(clones)),
-					"fingerprint": key.Fingerprint(),
-					"cache_hit":   "true",
-					"duration_ms": fmt.Sprintf("%d", ms),
-				})
-			return Outcome{
-				Engine: d.Engine, SourceDB: sourceDB,
-				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-				CacheHit: true, Clones: clones,
-			}, nil
-		}
-		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	out, done, err := mongoCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, key, started)
+	if done || err != nil {
+		return out, err
 	}
 
-mongoColdBuild:
-	// Cold build: drop source, optionally mongorestore a dump
-	// archive, run the seed step, snapshot template, fan out
-	// clones.
-	//
-	// DropDatabase, NOT DropMatching — see the comment on the
-	// matching mysql cold-build site.
-	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
-		return Outcome{}, fmt.Errorf("mongo drop %s: %w", sourceDB, err)
-	}
-	emitColdBuildDrop(ctx, st, repoID, worktreeID, "mongodb", sourceDB)
-	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
+	if err := mongoColdBuildSteps(ctx, drv, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
 		return Outcome{}, err
-	} else if ok {
-		stepStart := time.Now()
-		if err := dbmongo.Restore(ctx, cfg.Connections.Mongodb.URI, sourceDB, d.Dump.SourceDB, dp); err != nil {
-			return Outcome{}, fmt.Errorf("mongo restore %s: %w", dp, err)
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
-	}
-	if d.Migrate != nil {
-		stepStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "mongodb", "migrate", sourceDB))
-		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("migrate source %s: %w", sourceDB, err)
-		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "mongodb", sourceDB, "migrate", out)
-			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
-	}
-	if d.Seed != nil {
-		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("seed source %s: %w", sourceDB, err)
-		}
-		if out.ExitCode != 0 {
-			return Outcome{}, fmt.Errorf("seed source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
 	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
@@ -1209,7 +1292,9 @@ mongoColdBuild:
 		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
 		RepoID: repoID,
 	})
-	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
+		snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+	}()
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
@@ -1226,9 +1311,9 @@ mongoColdBuild:
 			"engine":      "mongodb",
 			"source_db":   sourceDB,
 			"template":    templateName,
-			"clones":      fmt.Sprintf("%d", len(clones)),
+			"clones":      strconv.Itoa(len(clones)),
 			"cache_hit":   "false",
-			"duration_ms": fmt.Sprintf("%d", ms),
+			"duration_ms": strconv.FormatInt(ms, 10),
 		})
 	return Outcome{
 		Engine:       d.Engine,
@@ -1238,6 +1323,155 @@ mongoColdBuild:
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
+}
+
+// mongoCacheHit handles the MongoDB fingerprint-cache fast path.
+// Contract mirrors mysqlCacheHit: (out, true, nil) → return out;
+// (Outcome{}, false, nil) → fall through to cold build; (_, false, err)
+// → hard error. Extracted verbatim from prepareMongo — the prior
+// `goto mongoColdBuild` jump becomes `return Outcome{}, false, nil`.
+func mongoCacheHit(
+	ctx context.Context,
+	drv *dbmongo.Driver,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourceDB string,
+	key snapshot.Key,
+	started time.Time,
+) (Outcome, bool, error) {
+	// A LookupSnapshot error is treated as a cache miss (fall through to
+	// cold build), matching the original `err == nil && rec != nil` guard.
+	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
+	if rec == nil {
+		return Outcome{}, false, nil
+	}
+	// Touch row early so concurrent EvictExcess sees this template
+	// as most-recently-used and skips it as LRU candidate.
+	_ = st.TouchSnapshot(ctx, key.Fingerprint())
+	if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
+		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+			"template="+rec.TemplateName,
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":      "mongodb",
+				"source_db":   sourceDB,
+				"template":    rec.TemplateName,
+				"fingerprint": key.Fingerprint(),
+			})
+		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+		if err != nil {
+			return Outcome{}, false, err
+		}
+		// If the template disappears mid-flight (race with
+		// EvictExcess), fall through to cold build instead of
+		// failing wt_finalize.
+		if foErr := fanOutClones(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			drv.SnapshotRestore,
+			rec.TemplateName,
+			clones,
+			d.Engine,
+			d.Fanout,
+			0,
+		); foErr != nil {
+			_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+				fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "mongodb",
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+					"error":       foErr.Error(),
+				})
+			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			return Outcome{}, false, nil
+		}
+		ms := time.Since(started).Milliseconds()
+		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":      "mongodb",
+				"source_db":   sourceDB,
+				"template":    rec.TemplateName,
+				"clones":      strconv.Itoa(len(clones)),
+				"fingerprint": key.Fingerprint(),
+				"cache_hit":   "true",
+				"duration_ms": strconv.FormatInt(ms, 10),
+			})
+		return Outcome{
+			Engine: d.Engine, SourceDB: sourceDB,
+			TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
+			CacheHit: true, Clones: clones,
+		}, true, nil
+	}
+	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	return Outcome{}, false, nil
+}
+
+// mongoColdBuildSteps runs the MongoDB cold-build populate phase: drop
+// the source DB, optionally mongorestore a dump archive, then run
+// migrate and seed. Extracted verbatim from prepareMongo's cold-build
+// block.
+func mongoColdBuildSteps(
+	ctx context.Context,
+	drv *dbmongo.Driver,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourceDB string,
+	inheritedEnv map[string]string,
+) error {
+	// mongoColdBuild: cold-build pre-drop site (see coldbuild_invariant_test).
+	// Drop source, optionally mongorestore a dump archive, run the seed
+	// step, snapshot template, fan out clones.
+	//
+	// DropDatabase, NOT DropMatching — see the comment on the
+	// matching mysql cold-build site.
+	if err := drv.DropDatabase(ctx, sourceDB); err != nil {
+		return fmt.Errorf("mongo drop %s: %w", sourceDB, err)
+	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "mongodb", sourceDB)
+	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
+		return err
+	} else if ok {
+		stepStart := time.Now()
+		if err := dbmongo.Restore(ctx, cfg.Connections.Mongodb.URI, sourceDB, d.Dump.SourceDB, dp); err != nil {
+			return fmt.Errorf("mongo restore %s: %w", dp, err)
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dump-load", stepStart)
+	}
+	if d.Migrate != nil {
+		stepStart := time.Now()
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "mongodb", "migrate", sourceDB))
+		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
+		if err != nil {
+			return fmt.Errorf("migrate source %s: %w", sourceDB, err)
+		}
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, "mongodb", sourceDB, "migrate", out)
+			return fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
+	}
+	if d.Seed != nil {
+		stepStart := time.Now()
+		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, tplCtx, inheritedEnv)
+		if err != nil {
+			return fmt.Errorf("seed source %s: %w", sourceDB, err)
+		}
+		if out.ExitCode != 0 {
+			return fmt.Errorf("seed source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
+	}
+	return nil
 }
 
 // prepareRedis brings up a worktree's Redis namespace using the
@@ -1276,7 +1510,7 @@ func prepareRedis(
 			"connections.redis not configured"), nil
 	}
 	if d.KeyPrefix == "" {
-		return Outcome{}, fmt.Errorf("redis: key_prefix required")
+		return Outcome{}, errors.New("redis: key_prefix required")
 	}
 	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 	if err != nil {
@@ -1331,111 +1565,14 @@ func prepareRedisPrefix(
 		})
 
 	// Cache hit?
-	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-		// Touch row early so concurrent EvictExcess sees this template
-		// as most-recently-used and skips it as LRU candidate.
-		_ = st.TouchSnapshot(ctx, key.Fingerprint())
-		alive, _ := drv.PrefixExists(ctx, rec.TemplateName)
-		if alive {
-			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-				fmt.Sprintf("template=%s", rec.TemplateName),
-				repoID, worktreeID, "", 0, map[string]string{
-					"engine":      "redis",
-					"source_db":   sourcePrefix,
-					"template":    rec.TemplateName,
-					"fingerprint": key.Fingerprint(),
-				})
-			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-			if err != nil {
-				return Outcome{}, err
-			}
-			// Restore template → source so the worktree app sees fresh
-			// data. If the template disappears mid-flight (race with
-			// EvictExcess), fall through to cold build.
-			if restoreErr := drv.SnapshotRestore(ctx, rec.TemplateName, sourcePrefix); restoreErr != nil {
-				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
-					fmt.Sprintf("restore failed, falling back to cold build: %v", restoreErr),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      "redis",
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-						"error":       restoreErr.Error(),
-					})
-				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-				goto redisColdBuild
-			}
-			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); foErr != nil {
-				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
-					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      "redis",
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-						"error":       foErr.Error(),
-					})
-				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-				goto redisColdBuild
-			}
-			ms := time.Since(started).Milliseconds()
-			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-				repoID, worktreeID, "", 0, map[string]string{
-					"engine":      "redis",
-					"source_db":   sourcePrefix,
-					"template":    rec.TemplateName,
-					"clones":      fmt.Sprintf("%d", len(clones)),
-					"fingerprint": key.Fingerprint(),
-					"cache_hit":   "true",
-					"duration_ms": fmt.Sprintf("%d", ms),
-				})
-			return Outcome{
-				Engine: d.Engine, SourceDB: sourcePrefix,
-				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-				CacheHit: true, Clones: clones,
-			}, nil
-		}
-		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	out, done, err := redisCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, key, started)
+	if done || err != nil {
+		return out, err
 	}
 
-redisColdBuild:
 	// Cold build: drop source, run seed, snapshot template, fanout.
-	//
-	// DropPrefixFiltered, NOT DropPrefix: under the main-wt overlay
-	// sourcePrefix can prefix every other worktree's
-	// `<sourcePrefix><slug>_*` keys. Skip keys containing
-	// `_<otherslug>` as a whole token so sibling worktrees'
-	// branch-scoped keys survive.
-	redisOthers := siblingSlugs(ctx, st, repoID, worktreeID)
-	keepRedisKey := func(k string) bool { return !nameOwnedByOtherSlug(k, redisOthers) }
-	droppedCount, err := drv.DropPrefixFiltered(ctx, sourcePrefix, keepRedisKey)
-	if err != nil {
-		return Outcome{}, fmt.Errorf("redis drop %s*: %w", sourcePrefix, err)
-	}
-	emitColdBuildDrop(ctx, st, repoID, worktreeID, "redis",
-		fmt.Sprintf("%s* (%d)", sourcePrefix, droppedCount))
-	if d.Migrate != nil {
-		stepStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "redis", "migrate", sourcePrefix))
-		out, err := runner.Run(ctx, spec, worktreePath, sourcePrefix, tplCtx, inheritedEnv)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("migrate redis %s: %w", sourcePrefix, err)
-		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "redis", sourcePrefix, "migrate", out)
-			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate redis", sourcePrefix, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "migrate", stepStart)
-	}
-	if d.Seed != nil {
-		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("seed redis %s: %w", sourcePrefix, err)
-		}
-		if out.ExitCode != 0 {
-			return Outcome{}, fmt.Errorf("seed redis %s exit %d: %s", sourcePrefix, out.ExitCode, out.StderrTail)
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "seed", stepStart)
+	if err := redisColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
+		return Outcome{}, err
 	}
 	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourcePrefix, templatePrefix); err != nil {
@@ -1448,7 +1585,9 @@ redisColdBuild:
 		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
 		RepoID: repoID,
 	})
-	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
+		snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+	}()
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
@@ -1465,9 +1604,9 @@ redisColdBuild:
 			"engine":      "redis",
 			"source_db":   sourcePrefix,
 			"template":    templatePrefix,
-			"clones":      fmt.Sprintf("%d", len(clones)),
+			"clones":      strconv.Itoa(len(clones)),
 			"cache_hit":   "false",
-			"duration_ms": fmt.Sprintf("%d", ms),
+			"duration_ms": strconv.FormatInt(ms, 10),
 		})
 	return Outcome{
 		Engine:       d.Engine,
@@ -1477,6 +1616,161 @@ redisColdBuild:
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
+}
+
+// redisCacheHit handles the Redis-prefix fingerprint-cache fast path.
+// Contract mirrors mysqlCacheHit: (out, true, nil) → return out;
+// (Outcome{}, false, nil) → fall through to cold build; (_, false, err)
+// → hard error. Extracted verbatim from prepareRedisPrefix — the prior
+// `goto redisColdBuild` jumps become `return Outcome{}, false, nil`.
+func redisCacheHit(
+	ctx context.Context,
+	drv *dbredis.Driver,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourcePrefix string,
+	key snapshot.Key,
+	started time.Time,
+) (Outcome, bool, error) {
+	// A LookupSnapshot error is treated as a cache miss (fall through to
+	// cold build), matching the original `err == nil && rec != nil` guard.
+	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
+	if rec == nil {
+		return Outcome{}, false, nil
+	}
+	// Touch row early so concurrent EvictExcess sees this template
+	// as most-recently-used and skips it as LRU candidate.
+	_ = st.TouchSnapshot(ctx, key.Fingerprint())
+	alive, _ := drv.PrefixExists(ctx, rec.TemplateName)
+	if alive {
+		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+			"template="+rec.TemplateName,
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":      "redis",
+				"source_db":   sourcePrefix,
+				"template":    rec.TemplateName,
+				"fingerprint": key.Fingerprint(),
+			})
+		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+		if err != nil {
+			return Outcome{}, false, err
+		}
+		// Restore template → source so the worktree app sees fresh
+		// data. If the template disappears mid-flight (race with
+		// EvictExcess), fall through to cold build.
+		if restoreErr := drv.SnapshotRestore(ctx, rec.TemplateName, sourcePrefix); restoreErr != nil {
+			_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+				fmt.Sprintf("restore failed, falling back to cold build: %v", restoreErr),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "redis",
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+					"error":       restoreErr.Error(),
+				})
+			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			return Outcome{}, false, nil
+		}
+		if foErr := fanOutClones(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			drv.SnapshotRestore,
+			rec.TemplateName,
+			clones,
+			d.Engine,
+			d.Fanout,
+			0,
+		); foErr != nil {
+			_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+				fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "redis",
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+					"error":       foErr.Error(),
+				})
+			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			return Outcome{}, false, nil
+		}
+		ms := time.Since(started).Milliseconds()
+		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":      "redis",
+				"source_db":   sourcePrefix,
+				"template":    rec.TemplateName,
+				"clones":      strconv.Itoa(len(clones)),
+				"fingerprint": key.Fingerprint(),
+				"cache_hit":   "true",
+				"duration_ms": strconv.FormatInt(ms, 10),
+			})
+		return Outcome{
+			Engine: d.Engine, SourceDB: sourcePrefix,
+			TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
+			CacheHit: true, Clones: clones,
+		}, true, nil
+	}
+	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	return Outcome{}, false, nil
+}
+
+// redisColdBuildSteps runs the Redis-prefix cold-build populate phase:
+// filtered drop of the source prefix, then migrate + seed. Extracted
+// verbatim from prepareRedisPrefix's cold-build block.
+func redisColdBuildSteps(
+	ctx context.Context,
+	drv *dbredis.Driver,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourcePrefix string,
+	inheritedEnv map[string]string,
+) error {
+	// redisColdBuild: cold-build pre-drop site (see coldbuild_invariant_test).
+	// DropPrefixFiltered, NOT DropPrefix: under the main-wt overlay
+	// sourcePrefix can prefix every other worktree's
+	// `<sourcePrefix><slug>_*` keys. Skip keys containing
+	// `_<otherslug>` as a whole token so sibling worktrees'
+	// branch-scoped keys survive.
+	redisOthers := siblingSlugs(ctx, st, repoID, worktreeID)
+	keepRedisKey := func(k string) bool { return !nameOwnedByOtherSlug(k, redisOthers) }
+	droppedCount, err := drv.DropPrefixFiltered(ctx, sourcePrefix, keepRedisKey)
+	if err != nil {
+		return fmt.Errorf("redis drop %s*: %w", sourcePrefix, err)
+	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "redis",
+		fmt.Sprintf("%s* (%d)", sourcePrefix, droppedCount))
+	if d.Migrate != nil {
+		stepStart := time.Now()
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "redis", "migrate", sourcePrefix))
+		out, err := runner.Run(ctx, spec, worktreePath, sourcePrefix, tplCtx, inheritedEnv)
+		if err != nil {
+			return fmt.Errorf("migrate redis %s: %w", sourcePrefix, err)
+		}
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, "redis", sourcePrefix, "migrate", out)
+			return fmt.Errorf("%s", runner.FormatError("migrate redis", sourcePrefix, out))
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "migrate", stepStart)
+	}
+	if d.Seed != nil {
+		stepStart := time.Now()
+		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
+		if err != nil {
+			return fmt.Errorf("seed redis %s: %w", sourcePrefix, err)
+		}
+		if out.ExitCode != 0 {
+			return fmt.Errorf("seed redis %s exit %d: %s", sourcePrefix, out.ExitCode, out.StderrTail)
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "seed", stepStart)
+	}
+	return nil
 }
 
 // prepareES brings up a worktree's Elasticsearch / OpenSearch
@@ -1507,7 +1801,7 @@ func prepareES(
 ) (Outcome, error) {
 	started := time.Now()
 	if d.KeyPrefix == "" {
-		return Outcome{}, fmt.Errorf("elasticsearch: missing key_prefix")
+		return Outcome{}, errors.New("elasticsearch: missing key_prefix")
 	}
 	sourcePrefix, err := template.Render(d.KeyPrefix, tplCtx)
 	if err != nil {
@@ -1553,108 +1847,13 @@ func prepareES(
 		})
 
 	// Cache hit? Verify by listing indices under the template prefix.
-	if rec, err := st.LookupSnapshot(ctx, key.Fingerprint()); err == nil && rec != nil {
-		// Touch row early so concurrent EvictExcess sees this template
-		// as most-recently-used and skips it as LRU candidate.
-		_ = st.TouchSnapshot(ctx, key.Fingerprint())
-		alive, _ := drv.ListMatching(ctx, rec.TemplateName)
-		if len(alive) > 0 {
-			_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-				fmt.Sprintf("template=%s indices=%d", rec.TemplateName, len(alive)),
-				repoID, worktreeID, "", 0, map[string]string{
-					"engine":      "elasticsearch",
-					"source_db":   sourcePrefix,
-					"template":    rec.TemplateName,
-					"fingerprint": key.Fingerprint(),
-				})
-			clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-			if err != nil {
-				return Outcome{}, err
-			}
-			// If template disappears mid-flight (race with EvictExcess),
-			// fall through to cold build.
-			if foErr := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, rec.TemplateName, clones, d.Engine, d.Fanout, 0); foErr != nil {
-				_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
-					fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
-					repoID, worktreeID, "", 0, map[string]string{
-						"engine":      "elasticsearch",
-						"template":    rec.TemplateName,
-						"fingerprint": key.Fingerprint(),
-						"error":       foErr.Error(),
-					})
-				_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-				goto esColdBuild
-			}
-			ms := time.Since(started).Milliseconds()
-			_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-				fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-				repoID, worktreeID, "", 0, map[string]string{
-					"engine":      "elasticsearch",
-					"source_db":   sourcePrefix,
-					"template":    rec.TemplateName,
-					"clones":      fmt.Sprintf("%d", len(clones)),
-					"fingerprint": key.Fingerprint(),
-					"cache_hit":   "true",
-					"duration_ms": fmt.Sprintf("%d", ms),
-				})
-			return Outcome{
-				Engine: d.Engine, SourceDB: sourcePrefix,
-				TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-				CacheHit: true, Clones: clones,
-			}, nil
-		}
-		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	out, done, err := esCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, key, started)
+	if done || err != nil {
+		return out, err
 	}
 
-esColdBuild:
-	// Cold build: drop, optionally bulk-load a dump NDJSON, run
-	// seed, snapshot, fanout.
-	//
-	// DropMatchingFiltered, NOT DropMatching: under the main-wt
-	// overlay sourcePrefix can prefix every other worktree's
-	// `<sourcePrefix>_<slug>_*` indices. Skip names containing
-	// `_<otherslug>` as a whole token so sibling worktrees'
-	// branch-scoped indices survive.
-	others := siblingSlugs(ctx, st, repoID, worktreeID)
-	keep := func(n string) bool { return !nameOwnedByOtherSlug(n, others) }
-	dropped, err := drv.DropMatchingFiltered(ctx, sourcePrefix, keep)
-	if err != nil {
-		return Outcome{}, fmt.Errorf("es drop %s*: %w", sourcePrefix, err)
-	}
-	emitColdBuildDrop(ctx, st, repoID, worktreeID, "elasticsearch",
-		fmt.Sprintf("%s* (%d)", sourcePrefix, len(dropped)))
-	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
+	if err := esColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
 		return Outcome{}, err
-	} else if ok {
-		stepStart := time.Now()
-		if err := drv.Restore(ctx, sourcePrefix, dp); err != nil {
-			return Outcome{}, fmt.Errorf("es restore %s: %w", dp, err)
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "dump-load", stepStart)
-	}
-	if d.Migrate != nil {
-		stepStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "elasticsearch", "migrate", sourcePrefix))
-		out, err := runner.Run(ctx, spec, worktreePath, sourcePrefix, tplCtx, inheritedEnv)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("migrate es %s: %w", sourcePrefix, err)
-		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "elasticsearch", sourcePrefix, "migrate", out)
-			return Outcome{}, fmt.Errorf("%s", runner.FormatError("migrate es", sourcePrefix, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "migrate", stepStart)
-	}
-	if d.Seed != nil {
-		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("seed es %s: %w", sourcePrefix, err)
-		}
-		if out.ExitCode != 0 {
-			return Outcome{}, fmt.Errorf("seed es %s exit %d: %s", sourcePrefix, out.ExitCode, out.StderrTail)
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "seed", stepStart)
 	}
 	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourcePrefix, templatePrefix); err != nil {
@@ -1667,7 +1866,9 @@ esColdBuild:
 		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
 		RepoID: repoID,
 	})
-	go snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
+		snapshot.EvictExcess(context.Background(), cfg, st, repoID)
+	}()
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
@@ -1684,9 +1885,9 @@ esColdBuild:
 			"engine":      "elasticsearch",
 			"source_db":   sourcePrefix,
 			"template":    templatePrefix,
-			"clones":      fmt.Sprintf("%d", len(clones)),
+			"clones":      strconv.Itoa(len(clones)),
 			"cache_hit":   "false",
-			"duration_ms": fmt.Sprintf("%d", ms),
+			"duration_ms": strconv.FormatInt(ms, 10),
 		})
 	return Outcome{
 		Engine:       d.Engine,
@@ -1696,6 +1897,160 @@ esColdBuild:
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
+}
+
+// esCacheHit handles the Elasticsearch fingerprint-cache fast path.
+// Contract mirrors mysqlCacheHit: (out, true, nil) → return out;
+// (Outcome{}, false, nil) → fall through to cold build; (_, false, err)
+// → hard error. Extracted verbatim from prepareES — the prior
+// `goto esColdBuild` jump becomes `return Outcome{}, false, nil`.
+func esCacheHit(
+	ctx context.Context,
+	drv *dbes.Driver,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourcePrefix string,
+	key snapshot.Key,
+	started time.Time,
+) (Outcome, bool, error) {
+	// A LookupSnapshot error is treated as a cache miss (fall through to
+	// cold build), matching the original `err == nil && rec != nil` guard.
+	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
+	if rec == nil {
+		return Outcome{}, false, nil
+	}
+	// Touch row early so concurrent EvictExcess sees this template
+	// as most-recently-used and skips it as LRU candidate.
+	_ = st.TouchSnapshot(ctx, key.Fingerprint())
+	alive, _ := drv.ListMatching(ctx, rec.TemplateName)
+	if len(alive) > 0 {
+		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+			fmt.Sprintf("template=%s indices=%d", rec.TemplateName, len(alive)),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":      "elasticsearch",
+				"source_db":   sourcePrefix,
+				"template":    rec.TemplateName,
+				"fingerprint": key.Fingerprint(),
+			})
+		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+		if err != nil {
+			return Outcome{}, false, err
+		}
+		// If template disappears mid-flight (race with EvictExcess),
+		// fall through to cold build.
+		if foErr := fanOutClones(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			drv.SnapshotRestore,
+			rec.TemplateName,
+			clones,
+			d.Engine,
+			d.Fanout,
+			0,
+		); foErr != nil {
+			_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+				fmt.Sprintf("fanout failed, falling back to cold build: %v", foErr),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine":      "elasticsearch",
+					"template":    rec.TemplateName,
+					"fingerprint": key.Fingerprint(),
+					"error":       foErr.Error(),
+				})
+			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+			return Outcome{}, false, nil
+		}
+		ms := time.Since(started).Milliseconds()
+		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":      "elasticsearch",
+				"source_db":   sourcePrefix,
+				"template":    rec.TemplateName,
+				"clones":      strconv.Itoa(len(clones)),
+				"fingerprint": key.Fingerprint(),
+				"cache_hit":   "true",
+				"duration_ms": strconv.FormatInt(ms, 10),
+			})
+		return Outcome{
+			Engine: d.Engine, SourceDB: sourcePrefix,
+			TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
+			CacheHit: true, Clones: clones,
+		}, true, nil
+	}
+	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+	return Outcome{}, false, nil
+}
+
+// esColdBuildSteps runs the Elasticsearch cold-build populate phase:
+// filtered drop of the source-prefix indices, optionally bulk-load a
+// dump NDJSON, then run migrate and seed. Extracted verbatim from
+// prepareES's cold-build block.
+func esColdBuildSteps(
+	ctx context.Context,
+	drv *dbes.Driver,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourcePrefix string,
+	inheritedEnv map[string]string,
+) error {
+	// esColdBuild: cold-build pre-drop site (see coldbuild_invariant_test).
+	// Drop, optionally bulk-load a dump NDJSON, run seed, snapshot, fanout.
+	//
+	// DropMatchingFiltered, NOT DropMatching: under the main-wt
+	// overlay sourcePrefix can prefix every other worktree's
+	// `<sourcePrefix>_<slug>_*` indices. Skip names containing
+	// `_<otherslug>` as a whole token so sibling worktrees'
+	// branch-scoped indices survive.
+	others := siblingSlugs(ctx, st, repoID, worktreeID)
+	keep := func(n string) bool { return !nameOwnedByOtherSlug(n, others) }
+	dropped, err := drv.DropMatchingFiltered(ctx, sourcePrefix, keep)
+	if err != nil {
+		return fmt.Errorf("es drop %s*: %w", sourcePrefix, err)
+	}
+	emitColdBuildDrop(ctx, st, repoID, worktreeID, "elasticsearch",
+		fmt.Sprintf("%s* (%d)", sourcePrefix, len(dropped)))
+	if dp, ok, err := dumpReady(d.Dump, worktreePath); err != nil {
+		return err
+	} else if ok {
+		stepStart := time.Now()
+		if err := drv.Restore(ctx, sourcePrefix, dp); err != nil {
+			return fmt.Errorf("es restore %s: %w", dp, err)
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "dump-load", stepStart)
+	}
+	if d.Migrate != nil {
+		stepStart := time.Now()
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "elasticsearch", "migrate", sourcePrefix))
+		out, err := runner.Run(ctx, spec, worktreePath, sourcePrefix, tplCtx, inheritedEnv)
+		if err != nil {
+			return fmt.Errorf("migrate es %s: %w", sourcePrefix, err)
+		}
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, "elasticsearch", sourcePrefix, "migrate", out)
+			return fmt.Errorf("%s", runner.FormatError("migrate es", sourcePrefix, out))
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "migrate", stepStart)
+	}
+	if d.Seed != nil {
+		stepStart := time.Now()
+		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
+		if err != nil {
+			return fmt.Errorf("seed es %s: %w", sourcePrefix, err)
+		}
+		if out.ExitCode != 0 {
+			return fmt.Errorf("seed es %s exit %d: %s", sourcePrefix, out.ExitCode, out.StderrTail)
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "seed", stepStart)
+	}
+	return nil
 }
 
 // computeSnapshotKey hashes every input the snapshot fingerprint
@@ -1722,7 +2077,7 @@ func computeSnapshotKey(
 		switch mode {
 		case "filename":
 			spec := framework.Spec{
-				Name:          fmt.Sprintf("input:%s", in.Glob),
+				Name:          "input:" + in.Glob,
 				MigrationDirs: []string{staticGlobPrefix(in.Glob)},
 				FileGlobs:     []string{filepath.Base(in.Glob)},
 				HashMode:      framework.HashFilename,
@@ -1746,9 +2101,11 @@ func computeSnapshotKey(
 				// by the glob so the user can tell from the SQLite
 				// row what changed.
 				agg := ""
+				var aggSb1749 strings.Builder
 				for _, k := range sortedKeys(hs) {
-					agg += k + ":" + hs[k] + "\n"
+					aggSb1749.WriteString(k + ":" + hs[k] + "\n")
 				}
+				agg += aggSb1749.String()
 				inputHashes[in.Glob] = agg
 			}
 		}
@@ -1979,7 +2336,6 @@ func TeardownDatabases(
 
 	g, gctx := errgroup.WithContext(ctx)
 	for _, d := range cfg.Databases {
-		d := d
 		g.Go(func() error {
 			if err := teardownOne(gctx, cfg, d, tplCtx, sl, repoID, worktreeID, st); err != nil {
 				_ = st.WriteEvent(gctx, store.LevelWarn, "db_teardown_error",
@@ -2008,128 +2364,15 @@ func teardownOne(
 	}
 	switch d.Engine {
 	case "mysql", "mariadb", "tidb":
-		if cfg.Connections.Mysql == nil {
-			// Nothing to drop — engine isn't wired up. Silent skip
-			// (matches the prepare side; the database was never
-			// created in the first place).
-			return nil
-		}
-		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close() }()
-		name, err := template.Render(d.NameTemplate, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropMatching(ctx, name)
-		if err != nil {
-			return err
-		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-			fmt.Sprintf("mysql: %s (%d)", name, len(dropped)),
-			repoID, worktreeID, "", 0, map[string]any{
-				"engine": "mysql", "slug": sl, "target": name, "count": len(dropped),
-			})
-		return nil
+		return teardownMySQL(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
 	case "postgres", "postgresql":
-		if cfg.Connections.Postgres == nil {
-			return nil
-		}
-		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close() }()
-		name, err := template.Render(d.NameTemplate, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropMatching(ctx, name)
-		if err != nil {
-			return err
-		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-			fmt.Sprintf("postgres: %s (%d)", name, len(dropped)),
-			repoID, worktreeID, "", 0, map[string]any{
-				"engine": "postgres", "slug": sl, "target": name, "count": len(dropped),
-			})
-		return nil
+		return teardownPostgres(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
 	case "mongodb":
-		if cfg.Connections.Mongodb == nil {
-			return nil
-		}
-		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close(ctx) }()
-		name, err := template.Render(d.NameTemplate, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropMatching(ctx, name)
-		if err != nil {
-			return err
-		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-			fmt.Sprintf("mongodb: %s (%d)", name, len(dropped)),
-			repoID, worktreeID, "", 0, map[string]any{
-				"engine": "mongodb", "slug": sl, "target": name, "count": len(dropped),
-			})
-		return nil
+		return teardownMongo(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
 	case "redis":
-		if cfg.Connections.Redis == nil {
-			return nil
-		}
-		if d.KeyPrefix == "" {
-			return fmt.Errorf("redis: missing key_prefix")
-		}
-		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close() }()
-		prefix, err := template.Render(d.KeyPrefix, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropPrefix(ctx, prefix)
-		if err != nil {
-			return err
-		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-			fmt.Sprintf("redis: %s (%d)", prefix, dropped),
-			repoID, worktreeID, "", 0, map[string]any{
-				"engine": "redis", "slug": sl, "target": prefix, "count": dropped,
-			})
-		return nil
+		return teardownRedis(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
 	case "elasticsearch", "opensearch":
-		if cfg.Connections.Elasticsearch == nil {
-			return nil
-		}
-		if d.KeyPrefix == "" {
-			return fmt.Errorf("es: missing key_prefix")
-		}
-		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-		if err != nil {
-			return err
-		}
-		prefix, err := template.Render(d.KeyPrefix, tplCtx)
-		if err != nil {
-			return err
-		}
-		dropped, err := drv.DropMatching(ctx, prefix)
-		if err != nil {
-			return err
-		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-			fmt.Sprintf("elasticsearch: %s (%d)", prefix, len(dropped)),
-			repoID, worktreeID, "", 0, map[string]any{
-				"engine": "elasticsearch", "slug": sl, "target": prefix, "count": len(dropped),
-			})
-		return nil
+		return teardownES(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
 	}
 	// Unknown engine — log + event so a typo'd `engine: postgress`
 	// doesn't turn worktree teardown into a silent no-op (same
@@ -2139,6 +2382,189 @@ func teardownOne(
 		fmt.Sprintf("teardown skipped: unknown engine %q (allowed: %s)", d.Engine, engine.KnownList()),
 		repoID, worktreeID, "", 0, map[string]any{
 			"engine": d.Engine, "slug": sl,
+		})
+	return nil
+}
+
+// teardownMySQL drops the per-worktree MySQL database family. Extracted
+// verbatim from teardownOne's `mysql` switch arm.
+func teardownMySQL(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	sl string,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Mysql == nil {
+		// Nothing to drop — engine isn't wired up. Silent skip
+		// (matches the prepare side; the database was never
+		// created in the first place).
+		return nil
+	}
+	drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = drv.Close() }()
+	name, err := template.Render(d.NameTemplate, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropMatching(ctx, name)
+	if err != nil {
+		return err
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+		fmt.Sprintf("mysql: %s (%d)", name, len(dropped)),
+		repoID, worktreeID, "", 0, map[string]any{
+			"engine": "mysql", "slug": sl, "target": name, "count": len(dropped),
+		})
+	return nil
+}
+
+// teardownPostgres drops the per-worktree Postgres database family.
+// Extracted verbatim from teardownOne's `postgres` switch arm.
+func teardownPostgres(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	sl string,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Postgres == nil {
+		return nil
+	}
+	drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = drv.Close() }()
+	name, err := template.Render(d.NameTemplate, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropMatching(ctx, name)
+	if err != nil {
+		return err
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+		fmt.Sprintf("postgres: %s (%d)", name, len(dropped)),
+		repoID, worktreeID, "", 0, map[string]any{
+			"engine": "postgres", "slug": sl, "target": name, "count": len(dropped),
+		})
+	return nil
+}
+
+// teardownMongo drops the per-worktree MongoDB database family.
+// Extracted verbatim from teardownOne's `mongodb` switch arm.
+func teardownMongo(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	sl string,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Mongodb == nil {
+		return nil
+	}
+	drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = drv.Close(ctx) }()
+	name, err := template.Render(d.NameTemplate, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropMatching(ctx, name)
+	if err != nil {
+		return err
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+		fmt.Sprintf("mongodb: %s (%d)", name, len(dropped)),
+		repoID, worktreeID, "", 0, map[string]any{
+			"engine": "mongodb", "slug": sl, "target": name, "count": len(dropped),
+		})
+	return nil
+}
+
+// teardownRedis drops the per-worktree Redis key prefix. Extracted
+// verbatim from teardownOne's `redis` switch arm.
+func teardownRedis(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	sl string,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Redis == nil {
+		return nil
+	}
+	if d.KeyPrefix == "" {
+		return errors.New("redis: missing key_prefix")
+	}
+	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = drv.Close() }()
+	prefix, err := template.Render(d.KeyPrefix, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropPrefix(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+		fmt.Sprintf("redis: %s (%d)", prefix, dropped),
+		repoID, worktreeID, "", 0, map[string]any{
+			"engine": "redis", "slug": sl, "target": prefix, "count": dropped,
+		})
+	return nil
+}
+
+// teardownES drops the per-worktree Elasticsearch / OpenSearch index
+// prefix. Extracted verbatim from teardownOne's `elasticsearch` arm.
+func teardownES(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	sl string,
+	repoID, worktreeID int64,
+	st *store.Store,
+) error {
+	if cfg.Connections.Elasticsearch == nil {
+		return nil
+	}
+	if d.KeyPrefix == "" {
+		return errors.New("es: missing key_prefix")
+	}
+	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+	if err != nil {
+		return err
+	}
+	prefix, err := template.Render(d.KeyPrefix, tplCtx)
+	if err != nil {
+		return err
+	}
+	dropped, err := drv.DropMatching(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+		fmt.Sprintf("elasticsearch: %s (%d)", prefix, len(dropped)),
+		repoID, worktreeID, "", 0, map[string]any{
+			"engine": "elasticsearch", "slug": sl, "target": prefix, "count": len(dropped),
 		})
 	return nil
 }

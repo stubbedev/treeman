@@ -102,7 +102,7 @@ func TestSumSnapshotBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		_ = st.RecordSnapshot(ctx, SnapshotRecord{
 			Fingerprint: "fp" + itoaTest(i), Engine: "mysql", EngineVersion: "8.0",
 			SourceDB: "src", TemplateName: "t" + itoaTest(i), LastUsedAt: 1, SizeBytes: 50,

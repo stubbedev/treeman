@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -45,147 +48,197 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 		return rpc.Response{Kind: rpc.KindOk}
 
 	case rpc.MethodRepoRegister:
-		if req.RepoRegister == nil {
-			return errResp("repo_register: missing args")
-		}
-		id, err := st.Store.EnsureRepo(ctx, req.RepoRegister.Path, req.RepoRegister.Name)
-		if err != nil {
-			return errResp(err.Error())
-		}
-		return rpc.Response{Kind: rpc.KindRepoRegistered, RepoID: id}
+		return handleRepoRegister(ctx, st, req)
 
 	case rpc.MethodWatcherList:
-		s := st.ListWatchers()
-		out := make([]rpc.WatcherSummary, len(s))
-		for i, e := range s {
-			out[i] = rpc.WatcherSummary{Repo: e.Repo, WorktreeCount: e.WorktreeCount}
-		}
-		return rpc.Response{Kind: rpc.KindWatcherList, Repos: out}
+		return handleWatcherList(st)
 
 	case rpc.MethodWorktreeFinalize:
-		if req.WorktreeFinalize == nil {
-			return errResp("worktree_finalize: missing args")
-		}
-		args := *req.WorktreeFinalize
-		safeGo("wt_finalize", func() {
-			bg := runid.With(st.BgCtx, runid.New())
-			err := FinalizeWorktree(bg, st, args.RepoPath, args.WorktreePath, args.InheritedEnv)
-			if err != nil {
-				_ = st.Store.WriteEvent(bg, "error", "wt_finalize", err.Error(),
-					0, 0, "", 0, map[string]string{
-						"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
-					})
-			}
-		})
-		return rpc.Response{Kind: rpc.KindWorktreeFinalizeQueued, WorktreePath: args.WorktreePath}
+		return handleWorktreeFinalize(st, req)
 
 	case rpc.MethodWorktreeTeardown:
-		if req.WorktreeTeardown == nil {
-			return errResp("worktree_teardown: missing args")
-		}
-		args := *req.WorktreeTeardown
-		safeGo("wt_teardown", func() {
-			bg := runid.With(st.BgCtx, runid.New())
-			err := TeardownWorktree(bg, st, args.RepoPath, args.WorktreePath, args.Force, args.InheritedEnv)
-			if err != nil {
-				_ = st.Store.WriteEvent(bg, "error", "wt_teardown", err.Error(),
-					0, 0, "", 0, map[string]string{
-						"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
-					})
-			}
-		})
-		return rpc.Response{Kind: rpc.KindWorktreeTeardownQueued, WorktreePath: args.WorktreePath}
+		return handleWorktreeTeardown(st, req)
 
 	case rpc.MethodWatcherStart:
-		if req.WatcherStart == nil {
-			return errResp("watcher_start: missing args")
-		}
-		if err := startRepoWatcher(ctx, st, req.WatcherStart.RepoPath); err != nil {
-			return errResp(err.Error())
-		}
-		return rpc.Response{Kind: rpc.KindOk}
+		return handleWatcherStart(ctx, st, req)
 
 	case rpc.MethodWatcherStop:
-		if req.WatcherStop == nil {
-			return errResp("watcher_stop: missing args")
-		}
-		st.UnregisterWatcher(req.WatcherStop.RepoPath)
-		return rpc.Response{Kind: rpc.KindOk}
+		return handleWatcherStop(st, req)
 
 	case rpc.MethodConfigReload:
-		repoPath := ""
-		if req.ConfigReload != nil {
-			repoPath = req.ConfigReload.RepoPath
-		}
-		if st.ConfigReloader == nil {
-			return errResp("config_reload: reloader not initialised")
-		}
-		if repoPath == "" {
-			st.ConfigReloader.ReloadAll(st.BgCtx)
-		} else {
-			st.ConfigReloader.ReloadRepo(st.BgCtx, repoPath)
-		}
-		return rpc.Response{Kind: rpc.KindOk}
+		return handleConfigReload(st, req)
 
 	case rpc.MethodRepoRemove:
-		if req.RepoRemove == nil || req.RepoRemove.RepoPath == "" {
-			return errResp("repo_remove: missing repo_path")
-		}
-		if err := removeRepoFromRegistry(ctx, st, req.RepoRemove.RepoPath, req.RepoRemove.Force); err != nil {
-			return errResp(err.Error())
-		}
-		return rpc.Response{Kind: rpc.KindOk}
+		return handleRepoRemove(ctx, st, req)
 
 	case rpc.MethodWorktreeList:
-		if req.WorktreeList == nil {
-			return errResp("worktree_list: missing args")
-		}
-		paths, err := listWorktreePaths(ctx, st, req.WorktreeList.RepoPath)
-		if err != nil {
-			return errResp(err.Error())
-		}
-		return rpc.Response{
-			Kind:      rpc.KindWorktreeList,
-			RepoPath:  req.WorktreeList.RepoPath,
-			Worktrees: paths,
-		}
+		return handleWorktreeList(ctx, st, req)
 
 	case rpc.MethodSyncNow:
-		target := ""
-		if req.SyncNow != nil {
-			target = req.SyncNow.Path
-		}
-		statuses, errs := SyncNow(ctx, st, target)
-		return rpc.Response{
-			Kind:        rpc.KindSyncResult,
-			SyncedRepos: statuses,
-			SyncErrors:  errs,
-		}
+		return handleSyncNow(ctx, st, req)
 
 	case rpc.MethodSyncStatus:
-		filter := ""
-		if req.SyncStatus != nil {
-			filter = req.SyncStatus.RepoPath
-		}
-		statuses := SyncStatusSnapshot(ctx, st, filter)
-		return rpc.Response{
-			Kind:        rpc.KindSyncStatus,
-			SyncedRepos: statuses,
-		}
+		return handleSyncStatus(ctx, st, req)
 
 	default:
 		return errResp("unknown method: " + req.Method)
 	}
 }
 
-func phaseFor(method string) string {
-	switch method {
-	case rpc.MethodWatcherStart, rpc.MethodWatcherStop, rpc.MethodWorktreeList:
-		return "10 (watcher)"
-	case rpc.MethodWorktreeFinalize, rpc.MethodWorktreeTeardown:
-		return "8/10 (prepare + daemon supervisor)"
+// handleRepoRegister ensures the repo row exists and returns its ID.
+func handleRepoRegister(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	if req.RepoRegister == nil {
+		return errResp("repo_register: missing args")
 	}
-	return "TBD"
+	id, err := st.Store.EnsureRepo(ctx, req.RepoRegister.Path, req.RepoRegister.Name)
+	if err != nil {
+		return errResp(err.Error())
+	}
+	return rpc.Response{Kind: rpc.KindRepoRegistered, RepoID: id}
+}
+
+// handleWatcherList snapshots the running watcher set into the RPC
+// summary shape.
+func handleWatcherList(st *State) rpc.Response {
+	s := st.ListWatchers()
+	out := make([]rpc.WatcherSummary, len(s))
+	for i, e := range s {
+		out[i] = rpc.WatcherSummary{Repo: e.Repo, WorktreeCount: e.WorktreeCount}
+	}
+	return rpc.Response{Kind: rpc.KindWatcherList, Repos: out}
+}
+
+// handleWatcherStart validates args and spins up the per-repo watcher.
+func handleWatcherStart(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	if req.WatcherStart == nil {
+		return errResp("watcher_start: missing args")
+	}
+	if err := startRepoWatcher(ctx, st, req.WatcherStart.RepoPath); err != nil {
+		return errResp(err.Error())
+	}
+	return rpc.Response{Kind: rpc.KindOk}
+}
+
+// handleWatcherStop validates args and unregisters the per-repo watcher.
+func handleWatcherStop(st *State, req rpc.Request) rpc.Response {
+	if req.WatcherStop == nil {
+		return errResp("watcher_stop: missing args")
+	}
+	st.UnregisterWatcher(req.WatcherStop.RepoPath)
+	return rpc.Response{Kind: rpc.KindOk}
+}
+
+// handleConfigReload triggers a global or per-repo config reload.
+func handleConfigReload(st *State, req rpc.Request) rpc.Response {
+	repoPath := ""
+	if req.ConfigReload != nil {
+		repoPath = req.ConfigReload.RepoPath
+	}
+	if st.ConfigReloader == nil {
+		return errResp("config_reload: reloader not initialised")
+	}
+	if repoPath == "" {
+		st.ConfigReloader.ReloadAll(st.BgCtx)
+	} else {
+		st.ConfigReloader.ReloadRepo(st.BgCtx, repoPath)
+	}
+	return rpc.Response{Kind: rpc.KindOk}
+}
+
+// handleRepoRemove validates args and removes a repo from the registry.
+func handleRepoRemove(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	if req.RepoRemove == nil || req.RepoRemove.RepoPath == "" {
+		return errResp("repo_remove: missing repo_path")
+	}
+	if err := removeRepoFromRegistry(ctx, st, req.RepoRemove.RepoPath, req.RepoRemove.Force); err != nil {
+		return errResp(err.Error())
+	}
+	return rpc.Response{Kind: rpc.KindOk}
+}
+
+// handleWorktreeList validates args and lists the repo's active worktrees.
+func handleWorktreeList(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	if req.WorktreeList == nil {
+		return errResp("worktree_list: missing args")
+	}
+	paths, err := listWorktreePaths(ctx, st, req.WorktreeList.RepoPath)
+	if err != nil {
+		return errResp(err.Error())
+	}
+	return rpc.Response{
+		Kind:      rpc.KindWorktreeList,
+		RepoPath:  req.WorktreeList.RepoPath,
+		Worktrees: paths,
+	}
+}
+
+// handleSyncNow runs an on-demand fetch/merge sweep for the target.
+func handleSyncNow(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	target := ""
+	if req.SyncNow != nil {
+		target = req.SyncNow.Path
+	}
+	statuses, errs := SyncNow(ctx, st, target)
+	return rpc.Response{
+		Kind:        rpc.KindSyncResult,
+		SyncedRepos: statuses,
+		SyncErrors:  errs,
+	}
+}
+
+// handleSyncStatus returns a snapshot of per-repo sync state.
+func handleSyncStatus(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	filter := ""
+	if req.SyncStatus != nil {
+		filter = req.SyncStatus.RepoPath
+	}
+	statuses := SyncStatusSnapshot(ctx, st, filter)
+	return rpc.Response{
+		Kind:        rpc.KindSyncStatus,
+		SyncedRepos: statuses,
+	}
+}
+
+// handleWorktreeFinalize validates the finalize args and dispatches a
+// detached FinalizeWorktree goroutine. Extracted from Dispatch to keep
+// that switch's cognitive complexity under the gate.
+func handleWorktreeFinalize(st *State, req rpc.Request) rpc.Response {
+	if req.WorktreeFinalize == nil {
+		return errResp("worktree_finalize: missing args")
+	}
+	args := *req.WorktreeFinalize
+	safeGo("wt_finalize", func() {
+		bg := runid.With(st.BgCtx, runid.New())
+		err := FinalizeWorktree(bg, st, args.RepoPath, args.WorktreePath, args.InheritedEnv)
+		if err != nil {
+			_ = st.Store.WriteEvent(bg, "error", "wt_finalize", err.Error(),
+				0, 0, "", 0, map[string]string{
+					"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
+				})
+		}
+	})
+	return rpc.Response{Kind: rpc.KindWorktreeFinalizeQueued, WorktreePath: args.WorktreePath}
+}
+
+// handleWorktreeTeardown validates the teardown args and dispatches a
+// detached TeardownWorktree goroutine. Extracted from Dispatch to keep
+// that switch's cognitive complexity under the gate.
+func handleWorktreeTeardown(st *State, req rpc.Request) rpc.Response {
+	if req.WorktreeTeardown == nil {
+		return errResp("worktree_teardown: missing args")
+	}
+	args := *req.WorktreeTeardown
+	safeGo("wt_teardown", func() {
+		bg := runid.With(st.BgCtx, runid.New())
+		err := TeardownWorktree(bg, st, args.RepoPath, args.WorktreePath, args.Force, args.InheritedEnv)
+		if err != nil {
+			_ = st.Store.WriteEvent(bg, "error", "wt_teardown", err.Error(),
+				0, 0, "", 0, map[string]string{
+					"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
+				})
+		}
+	})
+	return rpc.Response{Kind: rpc.KindWorktreeTeardownQueued, WorktreePath: args.WorktreePath}
 }
 
 func errResp(msg string) rpc.Response {
@@ -201,7 +254,7 @@ func listWorktreePaths(ctx context.Context, st *State, repoPath string) ([]strin
 		rows interface {
 			Close() error
 			Next() bool
-			Scan(...any) error
+			Scan(dest ...any) error
 			Err() error
 		}
 		err error
@@ -256,7 +309,7 @@ func ResumeWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath stri
 // the running set.
 func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 	if repoPath == "" {
-		return fmt.Errorf("watcher_start: empty repo_path")
+		return errors.New("watcher_start: empty repo_path")
 	}
 	if _, err := resolve.LoadResolved(repoPath); err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -302,7 +355,7 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 // Idempotent — a second call for the same wtPath is a no-op.
 func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath string) error {
 	if wtPath == "" {
-		return fmt.Errorf("watcher_start: empty worktree_path")
+		return errors.New("watcher_start: empty worktree_path")
 	}
 	if st.HasWtWatcher(wtPath) {
 		return nil
@@ -335,7 +388,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		rid := runid.New()
 		evCtx := runid.With(st.BgCtx, rid)
 		_ = st.Store.WriteEvent(evCtx, "info", "head_changed",
-			fmt.Sprintf("HEAD → %s", newRef),
+			"HEAD → "+newRef,
 			repoID, 0, "", 0, map[string]string{
 				"wt":  wtPath,
 				"ref": newRef,
@@ -461,7 +514,7 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 			fmt.Sprintf("%s (db_idx=%d label=%s)", ev.Path, ev.DBIndex, ev.Label),
 			repoID, 0, "", 0, map[string]string{
 				"path":   ev.Path,
-				"db_idx": fmt.Sprintf("%d", ev.DBIndex),
+				"db_idx": strconv.Itoa(ev.DBIndex),
 				"label":  ev.Label,
 				"wt":     wtPath,
 			})
@@ -557,9 +610,7 @@ func fireOnFileChange(
 	}
 	// Layer the watch-context env on top of the user's cached env.
 	env := make(map[string]string, len(inheritedEnv)+4)
-	for k, v := range inheritedEnv {
-		env[k] = v
-	}
+	maps.Copy(env, inheritedEnv)
 	env["TREEMAN_WATCH_PATH"] = eventPath
 	env["TREEMAN_WATCH_LABEL"] = label
 	env["TREEMAN_WATCH_ENGINE"] = engine
@@ -606,7 +657,19 @@ func fireTriggerActions(
 			"trigger", trigger, "wt", wtPath, "err", err)
 		return
 	}
-	if err := runTriggerActions(ctx, st, trigger, actions, repoPath, wtPath, id.Slug.Value, id.IsMain, repoID, id.WtID, inheritedEnv); err != nil {
+	if err := runTriggerActions(
+		ctx,
+		st,
+		trigger,
+		actions,
+		repoPath,
+		wtPath,
+		id.Slug.Value,
+		id.IsMain,
+		repoID,
+		id.WtID,
+		inheritedEnv,
+	); err != nil {
 		slog.Warn("trigger actions: run",
 			"trigger", trigger, "wt", wtPath, "err", err)
 	}

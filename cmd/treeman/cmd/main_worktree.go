@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/urfave/cli/v3"
@@ -43,7 +45,10 @@ func MainCmd() *cli.Command {
 				Usage: "remove the repo root from the watcher lifecycle",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
-					&cli.BoolFlag{Name: "purge", Usage: "after disabling, drop every per-branch DB the main_<branch> slug owns (current branch + every local branch). Engine resources only — the worktrees row stays soft-deleted for resurrection."},
+					&cli.BoolFlag{
+						Name:  "purge",
+						Usage: "after disabling, drop every per-branch DB the main_<branch> slug owns (current branch + every local branch). Engine resources only — the worktrees row stays soft-deleted for resurrection.",
+					},
 				},
 				Action: mainDisableAction,
 			},
@@ -136,7 +141,7 @@ func mainDisableAction(ctx context.Context, c *cli.Command) error {
 func purgeMainDatabases(ctx context.Context, repoRoot string, cfg *config.Config) error {
 	dbPath, _ := store.DefaultDBPath()
 	if dbPath == "" {
-		return fmt.Errorf("no default db path")
+		return errors.New("no default db path")
 	}
 	st, err := store.Open(ctx, dbPath)
 	if err != nil {
@@ -155,13 +160,7 @@ func purgeMainDatabases(ctx context.Context, repoRoot string, cfg *config.Config
 	if current != "" {
 		// Make sure HEAD is covered even if for-each-ref didn't
 		// surface it (detached HEAD edge cases).
-		seen := false
-		for _, b := range branches {
-			if b == current {
-				seen = true
-				break
-			}
-		}
+		seen := slices.Contains(branches, current)
 		if !seen {
 			branches = append(branches, current)
 		}
@@ -193,7 +192,7 @@ func localBranches(ctx context.Context, repoRoot string) []string {
 		return nil
 	}
 	var branches []string
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			branches = append(branches, line)

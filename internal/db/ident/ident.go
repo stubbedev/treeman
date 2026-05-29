@@ -6,7 +6,10 @@
 // validation call cannot create an injection point.
 package ident
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // validate rejects anything outside [A-Za-z0-9_]. Both MySQL and
 // Postgres support a wider set inside quoted identifiers, but treeman
@@ -14,7 +17,7 @@ import "fmt"
 // charset is enough and keeps the trust surface small.
 func validate(s string) error {
 	if s == "" {
-		return fmt.Errorf("empty identifier")
+		return errors.New("empty identifier")
 	}
 	for _, c := range s {
 		ok := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'

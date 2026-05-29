@@ -93,7 +93,7 @@ func detachChild(logPath string, args ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, args...) //nolint:noctx // detached setsid child; must outlive caller ctx
 	cmd.Stdin = nil
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

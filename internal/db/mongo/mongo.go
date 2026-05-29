@@ -85,7 +85,6 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	}
 	g.SetLimit(limit)
 	for _, n := range names {
-		n := n
 		g.Go(func() error {
 			if err := d.Client.Database(n).Drop(gctx); err != nil {
 				return fmt.Errorf("drop mongo db %q: %w", n, err)

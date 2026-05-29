@@ -110,6 +110,9 @@ func dump(t *testing.T, db *sql.DB) schemaSnapshot {
 			s.indexes = append(s.indexes, name)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	sort.Strings(s.tables)
 	sort.Strings(s.indexes)
 	return s

@@ -38,7 +38,7 @@ func removeWorktreeViaTrash(
 	if _, statErr := os.Stat(wtRoot); statErr != nil {
 		// Working tree already gone — just prune git's view of it.
 		_ = runGitPrune(ctx, repoRoot)
-		return "", nil
+		return "", nil //nolint:nilerr // idempotent: a missing worktree is success for a removal
 	}
 
 	trashRoot := filepath.Join(worktreesRoot, trashDirName)

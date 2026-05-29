@@ -139,6 +139,7 @@ func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	//nolint:gosec // qname is validated/quoted via ident.QuoteMySQL; no user values concatenated
 	stmt := "CREATE DATABASE IF NOT EXISTS " + qname +
 		" DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
 	if _, err := d.DB.ExecContext(ctx, stmt); err != nil {
@@ -170,7 +171,6 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	}
 	g.SetLimit(limit)
 	for _, n := range matched {
-		n := n
 		g.Go(func() error {
 			qn, err := ident.QuoteMySQL(n)
 			if err != nil {
@@ -272,96 +272,16 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 		return err
 	}
 
-	rows, err := d.DB.QueryContext(ctx, `
-		SELECT
-			CONVERT(TABLE_NAME USING utf8mb4) AS TABLE_NAME,
-			CONVERT(TABLE_TYPE USING utf8mb4) AS TABLE_TYPE
-		FROM information_schema.TABLES
-		WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME
-	`, source)
+	tables, views, err := d.listTablesAndViews(ctx, source)
 	if err != nil {
-		return err
-	}
-	defer func() { _ = rows.Close() }()
-	type t struct{ name, kind string }
-	var tables, views []t
-	for rows.Next() {
-		var n, k string
-		if err := rows.Scan(&n, &k); err != nil {
-			return err
-		}
-		row := t{name: n, kind: k}
-		if k == "VIEW" {
-			views = append(views, row)
-		} else {
-			tables = append(tables, row)
-		}
-	}
-	if err := rows.Err(); err != nil {
 		return err
 	}
 
 	// Phase 1 — serial DDL pass on a single connection. Captures
 	// each table's non-generated column list so Phase 2 can skip
 	// the per-worker column lookup.
-	type tableJob struct {
-		name string
-		cols []string // empty → all-generated, no data copy needed
-	}
-	jobs := make([]tableJob, 0, len(tables))
-	if err := func() error {
-		conn, err := d.DB.Conn(ctx)
-		if err != nil {
-			return fmt.Errorf("acquire DDL connection: %w", err)
-		}
-		defer func() { _ = conn.Close() }()
-		if err := applyCloneSession(ctx, conn); err != nil {
-			return err
-		}
-		if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
-			return fmt.Errorf("USE %s: %w", qtemplate, err)
-		}
-		// One schema-wide column lookup instead of a per-table query in
-		// the loop: collapses N information_schema.COLUMNS round trips
-		// into one on the cold-build critical path. Same gating (EXTRA
-		// NOT LIKE '%GENERATED%') and ordinal ordering as the per-table
-		// form, so each table's column list is byte-identical.
-		colsByTable, err := nonGeneratedColumnsBySchema(ctx, conn, source)
-		if err != nil {
-			return fmt.Errorf("list columns for %s: %w", qsource, err)
-		}
-		for _, tbl := range tables {
-			qtbl, err := ident.QuoteMySQL(tbl.name)
-			if err != nil {
-				return err
-			}
-			row := conn.QueryRowContext(ctx, "SHOW CREATE TABLE "+qsource+"."+qtbl)
-			var gotName, createStmt string
-			if err := row.Scan(&gotName, &createStmt); err != nil {
-				return fmt.Errorf("SHOW CREATE TABLE %s.%s: %w", qsource, qtbl, err)
-			}
-			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-				// MySQL 1050 = "Table already exists". Most often
-				// caused by a prior aborted restore that left the
-				// schema half-populated (or an orphan InnoDB .ibd
-				// file post-crash). Force-drop the leftover and
-				// retry so the fanout completes instead of bailing
-				// the whole prepare. Conservative: only retry on
-				// 1050; any other CREATE TABLE failure still aborts.
-				if !isTableExistsErr(err) {
-					return fmt.Errorf("recreate %s: %w", qtbl, err)
-				}
-				if _, dropErr := conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+qtbl); dropErr != nil {
-					return fmt.Errorf("recreate %s: drop stale table: %w (after %v)", qtbl, dropErr, err)
-				}
-				if _, retryErr := conn.ExecContext(ctx, createStmt); retryErr != nil {
-					return fmt.Errorf("recreate %s after dropping stale table: %w", qtbl, retryErr)
-				}
-			}
-			jobs = append(jobs, tableJob{name: tbl.name, cols: colsByTable[tbl.name]})
-		}
-		return nil
-	}(); err != nil {
+	jobs, err := d.cloneTablesDDL(ctx, source, qsource, qtemplate, tables)
+	if err != nil {
 		return err
 	}
 
@@ -382,7 +302,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 			// the schema and there's nothing to copy.
 			continue
 		}
-		j := j
+
 		g.Go(func() error {
 			return copyOneTableData(gctx, d.DB, source, template, j.name, j.cols)
 		})
@@ -394,33 +314,158 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 	// Views need their dependencies in place — defer to a single
 	// serial pass after the parallel table copy finishes.
 	if len(views) > 0 {
-		conn, err := d.DB.Conn(ctx)
+		if err := d.cloneViews(ctx, qsource, qtemplate, views); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// schemaObject is one base table or view enumerated from
+// information_schema for the clone. kind is the raw TABLE_TYPE.
+type schemaObject struct{ name, kind string }
+
+// tableJob carries a base table's name plus its non-generated column
+// list (empty → all-generated, nothing to copy) from the serial DDL
+// pass to the parallel data copy.
+type tableJob struct {
+	name string
+	cols []string
+}
+
+// listTablesAndViews enumerates the base tables and views in `source`,
+// splitting them into separate slices so SnapshotCreate can run the
+// table DDL/data passes before replaying views (which may depend on
+// tables or other views).
+func (d *Driver) listTablesAndViews(ctx context.Context, source string) (tables, views []schemaObject, err error) {
+	rows, err := d.DB.QueryContext(ctx, `
+		SELECT
+			CONVERT(TABLE_NAME USING utf8mb4) AS TABLE_NAME,
+			CONVERT(TABLE_TYPE USING utf8mb4) AS TABLE_TYPE
+		FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME
+	`, source)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var n, k string
+		if err := rows.Scan(&n, &k); err != nil {
+			return nil, nil, err
+		}
+		row := schemaObject{name: n, kind: k}
+		if k == "VIEW" {
+			views = append(views, row)
+		} else {
+			tables = append(tables, row)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return tables, views, nil
+}
+
+// cloneTablesDDL runs SnapshotCreate's serial DDL pass on a single
+// connection: it recreates every base table in the template and
+// captures each table's non-generated column list for the parallel
+// data copy. Returns the per-table jobs in source order.
+func (d *Driver) cloneTablesDDL(ctx context.Context, source, qsource, qtemplate string, tables []schemaObject) ([]tableJob, error) {
+	jobs := make([]tableJob, 0, len(tables))
+	conn, err := d.DB.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire DDL connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := applyCloneSession(ctx, conn); err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
+		return nil, fmt.Errorf("USE %s: %w", qtemplate, err)
+	}
+	// One schema-wide column lookup instead of a per-table query in
+	// the loop: collapses N information_schema.COLUMNS round trips
+	// into one on the cold-build critical path. Same gating (EXTRA
+	// NOT LIKE '%GENERATED%') and ordinal ordering as the per-table
+	// form, so each table's column list is byte-identical.
+	colsByTable, err := nonGeneratedColumnsBySchema(ctx, conn, source)
+	if err != nil {
+		return nil, fmt.Errorf("list columns for %s: %w", qsource, err)
+	}
+	for _, tbl := range tables {
+		if err := recreateTableDDL(ctx, conn, qsource, tbl.name); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, tableJob{name: tbl.name, cols: colsByTable[tbl.name]})
+	}
+	return jobs, nil
+}
+
+// recreateTableDDL copies one table's schema from source into the
+// connection's current (template) database via SHOW CREATE TABLE +
+// CREATE TABLE, force-dropping and retrying on MySQL 1050.
+func recreateTableDDL(ctx context.Context, conn *sql.Conn, qsource, name string) error {
+	qtbl, err := ident.QuoteMySQL(name)
+	if err != nil {
+		return err
+	}
+	row := conn.QueryRowContext(ctx, "SHOW CREATE TABLE "+qsource+"."+qtbl)
+	var gotName, createStmt string
+	if err := row.Scan(&gotName, &createStmt); err != nil {
+		return fmt.Errorf("SHOW CREATE TABLE %s.%s: %w", qsource, qtbl, err)
+	}
+	if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+		// MySQL 1050 = "Table already exists". Most often
+		// caused by a prior aborted restore that left the
+		// schema half-populated (or an orphan InnoDB .ibd
+		// file post-crash). Force-drop the leftover and
+		// retry so the fanout completes instead of bailing
+		// the whole prepare. Conservative: only retry on
+		// 1050; any other CREATE TABLE failure still aborts.
+		if !isTableExistsErr(err) {
+			return fmt.Errorf("recreate %s: %w", qtbl, err)
+		}
+		if _, dropErr := conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+qtbl); dropErr != nil {
+			return fmt.Errorf("recreate %s: drop stale table: %w (after %w)", qtbl, dropErr, err)
+		}
+		if _, retryErr := conn.ExecContext(ctx, createStmt); retryErr != nil {
+			return fmt.Errorf("recreate %s after dropping stale table: %w", qtbl, retryErr)
+		}
+	}
+	return nil
+}
+
+// cloneViews replays every view from source into the template on a
+// single connection after the table copy finishes, so each CREATE VIEW
+// sees its table / view dependencies already in place.
+func (d *Driver) cloneViews(ctx context.Context, qsource, qtemplate string, views []schemaObject) error {
+	conn, err := d.DB.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	if err := applyCloneSession(ctx, conn); err != nil {
+		return err
+	}
+	for _, v := range views {
+		qv, err := ident.QuoteMySQL(v.name)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = conn.Close() }()
-		if err := applyCloneSession(ctx, conn); err != nil {
-			return err
+		row := conn.QueryRowContext(ctx, "SHOW CREATE VIEW "+qsource+"."+qv)
+		var name, createStmt string
+		// SHOW CREATE VIEW returns four columns; scan into
+		// dummies for the extras.
+		var charset, collation string
+		if err := row.Scan(&name, &createStmt, &charset, &collation); err != nil {
+			return fmt.Errorf("SHOW CREATE VIEW %s.%s: %w", qsource, qv, err)
 		}
-		for _, v := range views {
-			qv, err := ident.QuoteMySQL(v.name)
-			if err != nil {
-				return err
-			}
-			row := conn.QueryRowContext(ctx, "SHOW CREATE VIEW "+qsource+"."+qv)
-			var name, createStmt string
-			// SHOW CREATE VIEW returns four columns; scan into
-			// dummies for the extras.
-			var charset, collation string
-			if err := row.Scan(&name, &createStmt, &charset, &collation); err != nil {
-				return fmt.Errorf("SHOW CREATE VIEW %s.%s: %w", qsource, qv, err)
-			}
-			if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
-				return fmt.Errorf("USE %s: %w", qtemplate, err)
-			}
-			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-				return fmt.Errorf("recreate view %s: %w", qv, err)
-			}
+		if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
+			return fmt.Errorf("USE %s: %w", qtemplate, err)
+		}
+		if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+			return fmt.Errorf("recreate view %s: %w", qv, err)
 		}
 	}
 	return nil
@@ -454,7 +499,10 @@ func applyCloneSession(ctx context.Context, conn *sql.Conn) error {
 		return fmt.Errorf("read back @@SESSION.sql_log_bin: %w", err)
 	}
 	if v != 0 {
-		return fmt.Errorf("SET SESSION sql_log_bin=0 was accepted but the session still reports %d; check user grants (need SESSION_VARIABLES_ADMIN or SUPER)", v)
+		return fmt.Errorf(
+			"SET SESSION sql_log_bin=0 was accepted but the session still reports %d; check user grants (need SESSION_VARIABLES_ADMIN or SUPER)",
+			v,
+		)
 	}
 	return nil
 }
@@ -488,6 +536,7 @@ func copyOneTableData(ctx context.Context, db *sql.DB, source, template, name st
 	if err := applyCloneSession(ctx, conn); err != nil {
 		return err
 	}
+	//nolint:gosec // identifiers validated/quoted via ident.QuoteMySQL; no user values concatenated
 	copyStmt := "INSERT INTO " + qtemplate + "." + qname + " (" + colList +
 		") SELECT " + colList + " FROM " + qsource + "." + qname
 	if _, err := conn.ExecContext(ctx, copyStmt); err != nil {

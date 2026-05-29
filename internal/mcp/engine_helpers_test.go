@@ -77,7 +77,7 @@ func TestHookLogReadTool_TruncatesWhenMaxBytesSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(hooksDir, "setup-0.log")
-	body := []byte(fmt.Sprintf("HEAD-PADDING-%s\nTAIL", string(make([]byte, 1000))))
+	body := fmt.Appendf(nil, "HEAD-PADDING-%s\nTAIL", string(make([]byte, 1000)))
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatal(err)
 	}

@@ -101,7 +101,7 @@ func TestFanOutClonesHonoursMaxConnsProbe(t *testing.T) {
 	// the limiter will admit as those drain.
 	deadline := time.Now().Add(5 * time.Second)
 	go func() {
-		for peak.Load() < int32(want) {
+		for peak.Load() < int32(want) { //nolint:gosec // test cap is small and non-negative
 			if time.Now().After(deadline) {
 				close(release)
 				return
@@ -115,10 +115,10 @@ func TestFanOutClonesHonoursMaxConnsProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := peak.Load()
-	if got > int32(want) {
+	if got > int32(want) { //nolint:gosec // test cap is small and non-negative
 		t.Errorf("peak %d exceeded auto-tuned cap %d", got, want)
 	}
-	if got < int32(want) {
+	if got < int32(want) { //nolint:gosec // test cap is small and non-negative
 		t.Errorf("limiter never reached its cap: peak=%d want=%d", got, want)
 	}
 }

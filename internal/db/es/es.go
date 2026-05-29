@@ -53,7 +53,11 @@ func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 	if cfg.PoolMax > 0 {
 		// Cap simultaneous + idle HTTP connections to the cluster, the
 		// HTTP analogue of the SQL engines' pool_max.
-		tr := http.DefaultTransport.(*http.Transport).Clone()
+		base, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return nil, fmt.Errorf("es connect: http.DefaultTransport is %T, not *http.Transport", http.DefaultTransport)
+		}
+		tr := base.Clone()
 		tr.MaxConnsPerHost = int(cfg.PoolMax)
 		tr.MaxIdleConnsPerHost = int(cfg.PoolMax)
 		httpClient.Transport = tr
@@ -124,16 +128,9 @@ func (d *Driver) DropMatchingFiltered(ctx context.Context, prefix string, keep f
 		return nil, nil
 	}
 	g, gctx := errgroup.WithContext(ctx)
-	limit := 8
-	if limit > len(names) {
-		limit = len(names)
-	}
-	if limit < 1 {
-		limit = 1
-	}
+	limit := max(min(8, len(names)), 1)
 	g.SetLimit(limit)
 	for _, n := range names {
-		n := n
 		g.Go(func() error {
 			if _, err := d.delete(gctx, "/"+n); err != nil {
 				return fmt.Errorf("DELETE %s: %w", n, err)
@@ -159,7 +156,7 @@ func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, err
 	if err := json.Unmarshal(body, &rows); err != nil {
 		// Fallback: text format (older ES versions return blank).
 		var out []string
-		for _, line := range strings.Split(string(body), "\n") {
+		for line := range strings.SplitSeq(string(body), "\n") {
 			line = strings.TrimSpace(line)
 			if line != "" {
 				out = append(out, line)

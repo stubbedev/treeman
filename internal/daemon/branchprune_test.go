@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/gitcmd"
@@ -68,12 +69,7 @@ func featureExists(work string) bool {
 }
 
 func listed(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(xs, want)
 }
 
 func requireDeleted(t *testing.T, work string, got []string) {

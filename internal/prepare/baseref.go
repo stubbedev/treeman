@@ -103,18 +103,18 @@ func lookupMainBranch(ctx context.Context, st *store.Store, repoRoot string, rep
 // first path component names a configured git remote. `origin/develop`
 // → `develop`; a local ref like `develop` is returned unchanged.
 func stripRemotePrefix(ctx context.Context, repoRoot, ref string) string {
-	slash := strings.IndexByte(ref, '/')
-	if slash < 0 {
+	before, after, ok := strings.Cut(ref, "/")
+	if !ok {
 		return ref
 	}
-	candidate := ref[:slash]
+	candidate := before
 	remotes, err := gitcmd.Output(ctx, repoRoot, "remote")
 	if err != nil {
 		return ref
 	}
-	for _, r := range strings.Split(strings.TrimSpace(string(remotes)), "\n") {
+	for r := range strings.SplitSeq(strings.TrimSpace(string(remotes)), "\n") {
 		if strings.TrimSpace(r) == candidate {
-			return ref[slash+1:]
+			return after
 		}
 	}
 	return ref

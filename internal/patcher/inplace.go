@@ -73,7 +73,9 @@ func jsonLiteralFor(v string) string {
 	if err != nil {
 		// jsonScalar only ever yields string/int, both of which marshal;
 		// fall back to a quoted string on the impossible error path.
-		b, _ = json.Marshal(v)
+		if b, err = json.Marshal(v); err != nil {
+			return `""`
+		}
 	}
 	return string(b)
 }

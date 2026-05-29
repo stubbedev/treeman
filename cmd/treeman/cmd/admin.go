@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -111,7 +112,7 @@ Examples:
 			force := c.Bool("force")
 			if !c.Bool("yes") && !c.Bool("json") {
 				if !ui.Confirm(fmt.Sprintf("remove %s from the treeman registry?", repoRoot)) {
-					return fmt.Errorf("aborted")
+					return errors.New("aborted")
 				}
 			}
 
@@ -298,7 +299,7 @@ never wipe the whole table.
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.String("repo") == "" && c.String("worktree") == "" && c.String("older-than") == "" &&
 				len(c.StringSlice("level")) == 0 && len(c.StringSlice("event-type")) == 0 {
-				return fmt.Errorf("at least one filter (--repo, --worktree, --older-than, --level, --event-type) is required")
+				return errors.New("at least one filter (--repo, --worktree, --older-than, --level, --event-type) is required")
 			}
 			f := store.EventFilter{
 				Levels:     validateLevels(c.StringSlice("level")),
@@ -317,21 +318,8 @@ never wipe the whole table.
 			}
 			defer func() { _ = st.Close() }()
 			if c.String("repo") != "" || c.String("worktree") != "" {
-				repoRoot, err := resolveRepo(c.String("repo"))
-				if err == nil && repoRoot != "" {
-					if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
-						f.RepoID = rid
-					}
-				}
-				if wname := c.String("worktree"); wname != "" {
-					wid, err := st.LookupWorktreeID(ctx, f.RepoID, wname)
-					if err != nil {
-						return err
-					}
-					if wid == 0 {
-						return fmt.Errorf("no worktree matches %q", wname)
-					}
-					f.WorktreeID = wid
+				if err := applyPurgeScope(ctx, st, c.String("repo"), c.String("worktree"), &f); err != nil {
+					return err
 				}
 			}
 			n, err := st.PurgeEvents(ctx, f)
@@ -345,6 +333,29 @@ never wipe the whole table.
 			return nil
 		},
 	}
+}
+
+// applyPurgeScope resolves the optional --repo / --worktree filters into
+// the EventFilter. A repo that can't be resolved is silently left unset
+// (best-effort scope); a named worktree that doesn't exist is an error.
+func applyPurgeScope(ctx context.Context, st *store.Store, repoArg, wtArg string, f *store.EventFilter) error {
+	repoRoot, err := resolveRepo(repoArg)
+	if err == nil && repoRoot != "" {
+		if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
+			f.RepoID = rid
+		}
+	}
+	if wtArg != "" {
+		wid, err := st.LookupWorktreeID(ctx, f.RepoID, wtArg)
+		if err != nil {
+			return err
+		}
+		if wid == 0 {
+			return fmt.Errorf("no worktree matches %q", wtArg)
+		}
+		f.WorktreeID = wid
+	}
+	return nil
 }
 
 // configSet returns the `treeman config set` subcommand. Wired into
@@ -367,7 +378,7 @@ Examples:
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 2 {
-				return fmt.Errorf("usage: treeman config set <path> <value>")
+				return errors.New("usage: treeman config set <path> <value>")
 			}
 			path := c.Args().Get(0)
 			rawValue := c.Args().Get(1)

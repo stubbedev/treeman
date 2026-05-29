@@ -58,7 +58,8 @@ func TestMikroORMEndToEnd(t *testing.T) {
 				Migrate: &config.Step{
 					Run: fmt.Sprintf(
 						`docker exec -w %s -e DATABASE_URL=postgres://postgres:pgpw@postgres:5432/${DB_NAME} %s npx --no-install mikro-orm migration:up`,
-						wt, nodeContainer,
+						wt,
+						nodeContainer,
 					),
 					Env: map[string]string{"DB_NAME": "{target_db}"},
 				},

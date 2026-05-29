@@ -42,7 +42,7 @@ func pruneGoneLocals(ctx context.Context, repoRoot string) []string {
 	checkedOut := checkedOutBranches(ctx, repoRoot)
 
 	var deleted []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
 		}
@@ -94,7 +94,7 @@ func checkedOutBranches(ctx context.Context, repoRoot string) map[string]struct{
 	if err != nil {
 		return set
 	}
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if rest, ok := strings.CutPrefix(line, "branch refs/heads/"); ok {
 			if b := strings.TrimSpace(rest); b != "" {
 				set[b] = struct{}{}

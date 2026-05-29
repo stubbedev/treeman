@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 )
 
@@ -70,7 +71,7 @@ func NumCPUs() uint32 {
 	if n < 1 {
 		return 4
 	}
-	return uint32(n)
+	return uint32(n) //nolint:gosec // runtime.NumCPU() is a small positive count; cannot overflow uint32
 }
 
 func builtins() []Spec {
@@ -79,97 +80,114 @@ func builtins() []Spec {
 			func(r string) bool { return composerHas(r, "brianium/paratest") }),
 		spec("pest", "php", "TEST_TOKEN", WorkerOneBased, ClonePerWorker,
 			func(r string) bool { return composerHas(r, "pestphp/pest") }),
-		spec("codeception", "php", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return composerHas(r, "codeception/codeception") && !composerHas(r, "brianium/paratest")
-			}),
-		spec("phpunit", "php", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return composerHas(r, "phpunit/phpunit") &&
-					!composerHas(r, "brianium/paratest") &&
-					!composerHas(r, "pestphp/pest")
-			}),
+		spec("codeception", "php", "", WorkerOneBased, CloneShared, detectCodeception),
+		spec("phpunit", "php", "", WorkerOneBased, CloneShared, detectPHPUnit),
 		spec("pytest-xdist", "python", "PYTEST_XDIST_WORKER", WorkerPytestXdist, ClonePerWorker,
 			func(r string) bool { return pythonDepHas(r, "pytest-xdist") }),
 		spec("pytest-parallel", "python", "", WorkerOneBased, CloneShared,
 			func(r string) bool { return pythonDepHas(r, "pytest-parallel") }),
-		spec("pytest", "python", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return pythonDepHas(r, "pytest") &&
-					!pythonDepHas(r, "pytest-xdist") &&
-					!pythonDepHas(r, "pytest-parallel")
-			}),
+		spec("pytest", "python", "", WorkerOneBased, CloneShared, detectPytest),
 		spec("parallel_tests", "ruby", "TEST_ENV_NUMBER", WorkerOneBased, ClonePerWorker,
 			func(r string) bool { return gemfileHas(r, "parallel_tests") }),
-		spec("rspec", "ruby", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return gemfileHas(r, "rspec") && !gemfileHas(r, "parallel_tests")
-			}),
-		spec("minitest", "ruby", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return gemfileHas(r, "minitest") && !gemfileHas(r, "parallel_tests")
-			}),
+		spec("rspec", "ruby", "", WorkerOneBased, CloneShared, detectRSpec),
+		spec("minitest", "ruby", "", WorkerOneBased, CloneShared, detectMinitest),
 		spec("jest", "javascript", "JEST_WORKER_ID", WorkerOneBased, ClonePerWorker,
 			func(r string) bool { return packageJSONHas(r, "jest") }),
 		spec("vitest", "javascript", "VITEST_POOL_ID", WorkerOneBased, ClonePerWorker,
 			func(r string) bool { return packageJSONHas(r, "vitest") }),
 		spec("playwright", "javascript", "TEST_PARALLEL_INDEX", WorkerZeroBased, ClonePerWorker,
 			func(r string) bool { return packageJSONHas(r, "@playwright/test") }),
-		spec("cypress-parallel", "javascript", "CYPRESS_THREAD", WorkerOneBased, ClonePerWorker,
-			func(r string) bool {
-				return packageJSONHas(r, "cypress-parallel") || packageJSONHas(r, "@badeball/cypress-parallel")
-			}),
+		spec("cypress-parallel", "javascript", "CYPRESS_THREAD", WorkerOneBased, ClonePerWorker, detectCypressParallel),
 		spec("mocha-parallel-tests", "javascript", "MOCHA_PARALLEL_INDEX", WorkerOneBased, ClonePerWorker,
 			func(r string) bool { return packageJSONHas(r, "mocha-parallel-tests") }),
-		spec("mocha", "javascript", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return packageJSONHas(r, "mocha") && !packageJSONHas(r, "mocha-parallel-tests")
-			}),
-		spec("bun-test", "javascript", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return (hasPath(r, "bun.lockb") || hasPath(r, "bun.lock")) &&
-					!packageJSONHas(r, "vitest") &&
-					!packageJSONHas(r, "jest")
-			}),
-		spec("deno-test", "javascript", "", WorkerOneBased, CloneShared,
-			func(r string) bool { return hasPath(r, "deno.json") || hasPath(r, "deno.jsonc") }),
-		spec("cargo-nextest", "rust", "NEXTEST_TEST_GLOBAL_SLOT", WorkerZeroBased, ClonePerWorker,
-			func(r string) bool {
-				return hasPath(r, ".config/nextest.toml") || hasPath(r, "nextest.toml") ||
-					cargoTomlHas(r, "nextest")
-			}),
-		spec("cargo-test", "rust", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return hasPath(r, "Cargo.toml") &&
-					!hasPath(r, ".config/nextest.toml") && !hasPath(r, "nextest.toml")
-			}),
-		spec("ginkgo", "go", "", WorkerOneBased, ClonePerWorker,
-			func(r string) bool {
-				return hasPath(r, "go.mod") && (goSumHas(r, "github.com/onsi/ginkgo/v2") || goSumHas(r, "github.com/onsi/ginkgo"))
-			}),
-		spec("go-test", "go", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return hasPath(r, "go.mod") && !goSumHas(r, "github.com/onsi/ginkgo")
-			}),
+		spec("mocha", "javascript", "", WorkerOneBased, CloneShared, detectMocha),
+		spec("bun-test", "javascript", "", WorkerOneBased, CloneShared, detectBunTest),
+		spec("deno-test", "javascript", "", WorkerOneBased, CloneShared, detectDenoTest),
+		spec("cargo-nextest", "rust", "NEXTEST_TEST_GLOBAL_SLOT", WorkerZeroBased, ClonePerWorker, detectCargoNextest),
+		spec("cargo-test", "rust", "", WorkerOneBased, CloneShared, detectCargoTest),
+		spec("ginkgo", "go", "", WorkerOneBased, ClonePerWorker, detectGinkgo),
+		spec("go-test", "go", "", WorkerOneBased, CloneShared, detectGoTest),
 		spec("maven-surefire", "java", "SUREFIRE_FORK_NUMBER", WorkerOneBased, ClonePerWorker,
 			func(r string) bool { return hasPath(r, "pom.xml") }),
-		spec("gradle-test", "java", "GRADLE_TEST_WORKER", WorkerOneBased, ClonePerWorker,
-			func(r string) bool {
-				return hasPath(r, "build.gradle") || hasPath(r, "build.gradle.kts")
-			}),
-		spec("dotnet-test", "dotnet", "", WorkerOneBased, CloneShared,
-			func(r string) bool {
-				return hasAnyWithExt(r, []string{".csproj", ".fsproj", ".sln"})
-			}),
+		spec("gradle-test", "java", "GRADLE_TEST_WORKER", WorkerOneBased, ClonePerWorker, detectGradleTest),
+		spec("dotnet-test", "dotnet", "", WorkerOneBased, CloneShared, detectDotnetTest),
 		spec("mix-test", "elixir", "MIX_TEST_PARTITION", WorkerOneBased, ClonePerWorker,
 			func(r string) bool { return hasPath(r, "mix.exs") }),
 	}
 }
 
-func spec(name, lang, env string, idx WorkerIndex, strat CloneStrategy, detect func(string) bool) Spec {
+func detectCodeception(r string) bool {
+	return composerHas(r, "codeception/codeception") && !composerHas(r, "brianium/paratest")
+}
+
+func detectPHPUnit(r string) bool {
+	return composerHas(r, "phpunit/phpunit") &&
+		!composerHas(r, "brianium/paratest") &&
+		!composerHas(r, "pestphp/pest")
+}
+
+func detectPytest(r string) bool {
+	return pythonDepHas(r, "pytest") &&
+		!pythonDepHas(r, "pytest-xdist") &&
+		!pythonDepHas(r, "pytest-parallel")
+}
+
+func detectRSpec(r string) bool {
+	return gemfileHas(r, "rspec") && !gemfileHas(r, "parallel_tests")
+}
+
+func detectMinitest(r string) bool {
+	return gemfileHas(r, "minitest") && !gemfileHas(r, "parallel_tests")
+}
+
+func detectCypressParallel(r string) bool {
+	return packageJSONHas(r, "cypress-parallel") || packageJSONHas(r, "@badeball/cypress-parallel")
+}
+
+func detectMocha(r string) bool {
+	return packageJSONHas(r, "mocha") && !packageJSONHas(r, "mocha-parallel-tests")
+}
+
+func detectBunTest(r string) bool {
+	return (hasPath(r, "bun.lockb") || hasPath(r, "bun.lock")) &&
+		!packageJSONHas(r, "vitest") &&
+		!packageJSONHas(r, "jest")
+}
+
+func detectDenoTest(r string) bool {
+	return hasPath(r, "deno.json") || hasPath(r, "deno.jsonc")
+}
+
+func detectCargoNextest(r string) bool {
+	return hasPath(r, ".config/nextest.toml") || hasPath(r, "nextest.toml") ||
+		cargoTomlHas(r, "nextest")
+}
+
+func detectCargoTest(r string) bool {
+	return hasPath(r, "Cargo.toml") &&
+		!hasPath(r, ".config/nextest.toml") && !hasPath(r, "nextest.toml")
+}
+
+func detectGinkgo(r string) bool {
+	return hasPath(r, "go.mod") && (goSumHas(r, "github.com/onsi/ginkgo/v2") || goSumHas(r, "github.com/onsi/ginkgo"))
+}
+
+func detectGoTest(r string) bool {
+	return hasPath(r, "go.mod") && !goSumHas(r, "github.com/onsi/ginkgo")
+}
+
+func detectGradleTest(r string) bool {
+	return hasPath(r, "build.gradle") || hasPath(r, "build.gradle.kts")
+}
+
+func detectDotnetTest(r string) bool {
+	return hasAnyWithExt(r, []string{".csproj", ".fsproj", ".sln"})
+}
+
+func spec(name, lang, env string, idx WorkerIndex, start CloneStrategy, detect func(string) bool) Spec {
 	return Spec{
 		Name: name, Language: lang, WorkerEnv: env,
-		WorkerIndex: idx, Strategy: strat, Detect: detect,
+		WorkerIndex: idx, Strategy: start, Detect: detect,
 	}
 }
 
@@ -261,10 +279,8 @@ func hasAnyWithExt(root string, exts []string) bool {
 	}
 	for _, e := range entries {
 		ext := filepath.Ext(e.Name())
-		for _, want := range exts {
-			if ext == want {
-				return true
-			}
+		if slices.Contains(exts, ext) {
+			return true
 		}
 	}
 	return false

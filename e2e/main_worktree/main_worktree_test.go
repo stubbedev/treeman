@@ -281,7 +281,10 @@ hooks:
 	// Main slug is main_main → overlay "mainpfx_{slug}_" renders
 	// "mainpfx_main_main_". The base "basepfx_" must NOT appear.
 	if !strings.HasPrefix(gotDB, "mainpfx_main") {
-		t.Errorf("TREEMAN_WATCH_DB_NAME = %q, want overlay key_prefix (mainpfx_main…); base key_prefix leaked or prefix-engine name was empty", gotDB)
+		t.Errorf(
+			"TREEMAN_WATCH_DB_NAME = %q, want overlay key_prefix (mainpfx_main…); base key_prefix leaked or prefix-engine name was empty",
+			gotDB,
+		)
 	}
 	if strings.Contains(gotDB, "basepfx") {
 		t.Errorf("TREEMAN_WATCH_DB_NAME = %q used the BASE key_prefix, overlay did not apply", gotDB)
@@ -335,7 +338,13 @@ hooks:
 	}
 	// This is what mainEnableAction's requestWorktreeFinalize triggers
 	// — the daemon-side handler call. Same code path, no RPC layer.
-	if err := daemon.FinalizeWorktree(context.Background(), state, repoRoot, repoRoot, map[string]string{"PATH": os.Getenv("PATH")}); err != nil {
+	if err := daemon.FinalizeWorktree(
+		context.Background(),
+		state,
+		repoRoot,
+		repoRoot,
+		map[string]string{"PATH": os.Getenv("PATH")},
+	); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 

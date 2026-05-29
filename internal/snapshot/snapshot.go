@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -98,6 +97,7 @@ func (k Key) Fingerprint() string {
 	}
 	sort.Strings(keys)
 	var cbuf [4]byte
+	//nolint:gosec // len of in-memory key slice; provably non-negative and within uint32
 	binary.LittleEndian.PutUint32(cbuf[:], uint32(len(keys)))
 	_, _ = h.Write(cbuf[:])
 	_, _ = h.Write([]byte{0})
@@ -124,7 +124,7 @@ func (k Key) Fingerprint() string {
 // through `template_name`, and only newly built templates get the
 // shorter form.
 func (k Key) TemplateName() string {
-	return fmt.Sprintf("_tm_%s", k.Fingerprint()[:16])
+	return "_tm_" + k.Fingerprint()[:16]
 }
 
 // IndexPrefix is the ES/OpenSearch variant of TemplateName: ES
@@ -132,7 +132,7 @@ func (k Key) TemplateName() string {
 // namespace marker. Returns a stable, lowercase, hyphen-free prefix
 // without trailing punctuation; callers add their own separator.
 func (k Key) IndexPrefix() string {
-	return fmt.Sprintf("tm_%s", k.Fingerprint()[:16])
+	return "tm_" + k.Fingerprint()[:16]
 }
 
 // HashCache is the subset of *store.Store that LockfileHashesFor +

@@ -58,11 +58,11 @@ func WaitForReady(t *testing.T, label string, timeout time.Duration, check func(
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		if err := check(); err == nil {
+		err := check()
+		if err == nil {
 			return
-		} else {
-			lastErr = err
 		}
+		lastErr = err
 		time.Sleep(500 * time.Millisecond)
 	}
 	t.Fatalf("%s not ready after %s: %v", label, timeout, lastErr)

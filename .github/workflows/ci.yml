@@ -26,18 +26,33 @@ jobs:
           cache: true
       - run: go build ./...
       - run: go vet ./...
-      - name: gofmt
-        run: |
-          out=$(gofmt -l ./cmd ./internal)
-          if [ -n "$out" ]; then
-            echo "::error::gofmt would rewrite the following files:"
-            printf '%s\n' "$out"
-            echo
-            echo "--- proposed diff ---"
-            gofmt -d ./cmd ./internal
-            exit 1
-          fi
       - run: go test ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Install pinned golangci-lint + just as prebuilt binaries (no build,
+      # so neither depends on the CI Go version matching their releases').
+      - name: install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: install just
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+            | bash -s -- --to "$(go env GOPATH)/bin"
+      # Run the exact same gate developers run locally: `just lint-check`
+      # (golangci-lint fmt --diff + go vet + golangci-lint run). Single
+      # source of truth so CI and local can't drift.
+      - name: just lint-check
+        run: just lint-check
 
   nix:
     name: nix flake check

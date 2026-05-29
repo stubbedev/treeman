@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	mongoURI       = "mongodb://127.0.0.1:27127"
+	mongoURI       = "mongodb://127.0.0.1:27128"
 	mongoContainer = "treeman-e2e-mongodump"
 	seedDB         = "seed_source"
 )
@@ -43,8 +43,8 @@ func TestMongoArchiveRestore(t *testing.T) {
 		t.Skip("mongorestore not on PATH")
 	}
 	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
-	harness.WaitForReady(t, "mongo:27127", 60*time.Second, func() error {
-		c, err := net.DialTimeout("tcp", "127.0.0.1:27127", 1*time.Second)
+	harness.WaitForReady(t, "mongo:27128", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:27128", 1*time.Second)
 		if err != nil {
 			return err
 		}

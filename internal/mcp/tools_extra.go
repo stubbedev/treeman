@@ -4,9 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -33,13 +32,13 @@ import (
 
 type logsWaitIn struct {
 	Repo           string   `json:"repo,omitempty"`
-	Worktree       string   `json:"worktree,omitempty" jsonschema:"slug, branch, or basename"`
+	Worktree       string   `json:"worktree,omitempty"        jsonschema:"slug, branch, or basename"`
 	Levels         []string `json:"levels,omitempty"`
 	EventTypes     []string `json:"event_types,omitempty"`
 	Phases         []string `json:"phases,omitempty"`
 	PayloadLike    string   `json:"payload_like,omitempty"`
-	RunID          string   `json:"run_id,omitempty" jsonschema:"correlation id; the common case — wait for events from one prepare/finalize run"`
-	MinCount       int      `json:"min_count,omitempty" jsonschema:"return after this many new events arrive (default 1)"`
+	RunID          string   `json:"run_id,omitempty"          jsonschema:"correlation id; the common case — wait for events from one prepare/finalize run"`
+	MinCount       int      `json:"min_count,omitempty"       jsonschema:"return after this many new events arrive (default 1)"`
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"give up after this many seconds (default 30, max 300)"`
 }
 
@@ -84,23 +83,8 @@ func logsWaitTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsWaitIn)
 		Limit:       200,
 		OldestFirst: true,
 	}
-	if in.Repo != "" || in.Worktree != "" {
-		repoRoot, _ := resolveRepo(in.Repo)
-		if repoRoot != "" {
-			if rid, _ := lookupRepoID(ctx, st, repoRoot); rid > 0 {
-				f.RepoID = rid
-			}
-		}
-		if in.Worktree != "" {
-			wid, err := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
-			if err != nil {
-				return nil, logsWaitOut{}, err
-			}
-			if wid == 0 {
-				return nil, logsWaitOut{}, fmt.Errorf("no worktree matches %q", in.Worktree)
-			}
-			f.WorktreeID = wid
-		}
+	if err := applyRepoWorktreeFilter(ctx, st, &f, in.Repo, in.Worktree); err != nil {
+		return nil, logsWaitOut{}, err
 	}
 
 	anchor := newestMatchingID(ctx, st, f)
@@ -196,14 +180,14 @@ func branchesListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in branche
 	branchToWtDir, _ := branchOccupancyFromStore(ctx, repoRoot)
 
 	entries := map[string]*branchesListEntry{}
-	for _, b := range strings.Split(local, "\n") {
+	for b := range strings.SplitSeq(local, "\n") {
 		b = strings.TrimSpace(b)
 		if b == "" {
 			continue
 		}
 		entries[b] = &branchesListEntry{Name: b, HasLocal: true}
 	}
-	for _, b := range strings.Split(remote, "\n") {
+	for b := range strings.SplitSeq(remote, "\n") {
 		b = strings.TrimSpace(b)
 		if b == "" || b == "origin/HEAD" {
 			continue
@@ -244,12 +228,12 @@ func branchesListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in branche
 
 type configDiffIn struct {
 	Repo string `json:"repo,omitempty"`
-	Body string `json:"body" jsonschema:"proposed .treeman.yaml body"`
+	Body string `json:"body"           jsonschema:"proposed .treeman.yaml body"`
 }
 
 type configDiffChange struct {
 	Path     string `json:"path"`
-	Op       string `json:"op" jsonschema:"add|remove|change"`
+	Op       string `json:"op"            jsonschema:"add|remove|change"`
 	OldValue any    `json:"old,omitempty"`
 	NewValue any    `json:"new,omitempty"`
 }
@@ -267,7 +251,7 @@ type configDiffOut struct {
 // broken YAML produces a parse error rather than confusing diff output.
 func configDiffTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configDiffIn) (*mcpsdk.CallToolResult, configDiffOut, error) {
 	if strings.TrimSpace(in.Body) == "" {
-		return nil, configDiffOut{}, fmt.Errorf("body is required")
+		return nil, configDiffOut{}, errors.New("body is required")
 	}
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
@@ -287,8 +271,14 @@ func configDiffTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configDif
 		current = config.Config{}
 	}
 
-	curJSON, _ := json.Marshal(current)
-	newJSON, _ := json.Marshal(proposed)
+	curJSON, err := json.Marshal(current)
+	if err != nil {
+		return nil, configDiffOut{Repo: repoRoot}, fmt.Errorf("marshal current config: %w", err)
+	}
+	newJSON, err := json.Marshal(proposed)
+	if err != nil {
+		return nil, configDiffOut{Repo: repoRoot}, fmt.Errorf("marshal proposed config: %w", err)
+	}
 	var curMap, newMap map[string]any
 	_ = json.Unmarshal(curJSON, &curMap)
 	_ = json.Unmarshal(newJSON, &newMap)
@@ -367,33 +357,13 @@ func summarizeChanges(c []configDiffChange) string {
 	return b.String()
 }
 
-// resolvePathSafe is a small helper for resource handlers that build
-// file paths from URI templates — guards against path traversal so a
-// malicious {slug} can't escape the worktree root.
-func resolvePathSafe(base, untrusted string) (string, error) {
-	full := filepath.Join(base, untrusted)
-	abs, err := filepath.Abs(full)
-	if err != nil {
-		return "", err
-	}
-	baseAbs, _ := filepath.Abs(base)
-	if !strings.HasPrefix(abs, baseAbs) {
-		return "", os.ErrPermission
-	}
-	return abs, nil
-}
-
-// nowMs is a tiny shim so tests can fake the wall clock without
-// dragging in a time-mock package.
-var nowMs = func() int64 { return time.Now().UnixMilli() }
-
 // ─── inputs_fingerprint ─────────────────────────────────────────────
 
 type inputsFingerprintIn struct {
 	Repo         string `json:"repo,omitempty"`
 	WorktreePath string `json:"worktree_path,omitempty" jsonschema:"absolute worktree path; defaults to the cwd-discovered repo root"`
-	DBIndex      *int   `json:"db_index,omitempty" jsonschema:"index into databases[]; omit to return one report per configured database"`
-	ProbeEngine  bool   `json:"probe_engine,omitempty" jsonschema:"connect to the engine to fetch the real engine_version (slower but produces a fingerprint that can match the cached one); default false"`
+	DBIndex      *int   `json:"db_index,omitempty"      jsonschema:"index into databases[]; omit to return one report per configured database"`
+	ProbeEngine  bool   `json:"probe_engine,omitempty"  jsonschema:"connect to the engine to fetch the real engine_version (slower but produces a fingerprint that can match the cached one); default false"`
 }
 
 type inputsFingerprintEntry struct {
@@ -408,7 +378,11 @@ type inputsFingerprintOut struct {
 	Entries      []inputsFingerprintEntry `json:"entries"`
 }
 
-func inputsFingerprintTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in inputsFingerprintIn) (*mcpsdk.CallToolResult, inputsFingerprintOut, error) {
+func inputsFingerprintTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in inputsFingerprintIn,
+) (*mcpsdk.CallToolResult, inputsFingerprintOut, error) {
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		return nil, inputsFingerprintOut{}, err
@@ -554,6 +528,9 @@ func branchOccupancyFromStore(ctx context.Context, repoRoot string) (map[string]
 			continue
 		}
 		out[branch] = path
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

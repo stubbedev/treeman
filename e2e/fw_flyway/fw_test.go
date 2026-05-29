@@ -52,7 +52,9 @@ func TestFlywayEndToEnd(t *testing.T) {
 				Migrate: &config.Step{
 					Run: fmt.Sprintf(
 						`docker exec -w %s %s flyway -url=jdbc:postgresql://postgres:5432/${DB_NAME} -user=postgres -password=pgpw -locations=filesystem:%s/sql migrate`,
-						wt, flywayContainer, wt,
+						wt,
+						flywayContainer,
+						wt,
 					),
 					Env: map[string]string{"DB_NAME": "{target_db}"},
 				},

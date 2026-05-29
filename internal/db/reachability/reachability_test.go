@@ -65,8 +65,15 @@ func TestProbeCtxSucceedsWhenReachable(t *testing.T) {
 			_ = c.Close()
 		}
 	}()
-	addr := ln.Addr().(*net.TCPAddr)
-	if err := ProbeCtx(context.Background(), "test", "127.0.0.1", uint16(addr.Port)); err != nil {
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr is %T, not *net.TCPAddr", ln.Addr())
+	}
+	if addr.Port < 0 || addr.Port > 65535 {
+		t.Fatalf("listener port %d out of uint16 range", addr.Port)
+	}
+	port := uint16(addr.Port) //nolint:gosec // addr.Port bounds-checked to 0..65535 above
+	if err := ProbeCtx(context.Background(), "test", "127.0.0.1", port); err != nil {
 		t.Errorf("probe against in-process listener failed: %v", err)
 	}
 }

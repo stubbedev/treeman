@@ -72,10 +72,9 @@ func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot stri
 	}
 
 	type dirEntry struct {
-		absDir  string
-		relDir  string
-		mtime   int64
-		entries []os.DirEntry // populated lazily on cache miss
+		absDir string
+		relDir string
+		mtime  int64
 	}
 	dirRecords := make([]dirEntry, 0, len(dirs))
 	statDirs := make([]string, 0, len(dirs))
@@ -315,7 +314,7 @@ func compiledMatcherFor(spec Spec) func(string) bool {
 	patterns := make([]string, 0, len(spec.FileGlobs)*2)
 	for _, g := range spec.FileGlobs {
 		patterns = append(patterns, g)
-		for _, alt := range strings.Split(g, "|") {
+		for alt := range strings.SplitSeq(g, "|") {
 			alt = strings.TrimSpace(alt)
 			if alt != "" && alt != g {
 				patterns = append(patterns, alt)

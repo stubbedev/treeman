@@ -2,7 +2,7 @@ services:
   mongo:
     image: mongo:7
     container_name: treeman-e2e-mongodump
-    ports: ["27127:27017"]
+    ports: ["27128:27017"]
     volumes:
       - /tmp:/tmp
     healthcheck:

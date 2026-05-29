@@ -64,10 +64,7 @@ func ResolveAndProbe(ctx context.Context, engine string, opts containerip.Opts, 
 func ConfigurePool(db *sql.DB, poolMax int) {
 	if poolMax > 0 {
 		db.SetMaxOpenConns(poolMax)
-		idle := poolMax / 2
-		if idle < 1 {
-			idle = 1
-		}
+		idle := max(poolMax/2, 1)
 		db.SetMaxIdleConns(idle)
 	}
 	db.SetConnMaxLifetime(30 * time.Minute)

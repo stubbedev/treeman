@@ -31,8 +31,9 @@ func TestPlainJsProjectDoesNotMatchOrms(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(d, "package.json"), []byte(`{"name":"plain"}`), 0o644)
 	_ = os.WriteFile(filepath.Join(d, "yarn.lock"), nil, 0o644)
 	r := DefaultRegistry()
-	names := make([]string, 0)
-	for _, s := range r.DetectAll(d) {
+	detected := r.DetectAll(d)
+	names := make([]string, 0, len(detected))
+	for _, s := range detected {
 		names = append(names, s.Name)
 	}
 	for _, orm := range []string{"typeorm", "drizzle", "sequelize", "mikro-orm", "knex", "prisma"} {

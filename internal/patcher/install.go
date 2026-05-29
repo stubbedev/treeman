@@ -156,6 +156,7 @@ func writeAttributes(gitDir string, files []string) error {
 		tail += "\n\n"
 	}
 	tail += attrsHeader + "\n"
+	var tailSb159 strings.Builder
 	for _, f := range files {
 		// Quote paths with whitespace; otherwise git treats only the
 		// first token as the pattern. Plain quoting (no escape) is
@@ -165,8 +166,9 @@ func writeAttributes(gitDir string, files []string) error {
 		if strings.ContainsAny(pattern, " \t") {
 			pattern = `"` + pattern + `"`
 		}
-		tail += pattern + " filter=" + FilterName + "\n"
+		tailSb159.WriteString(pattern + " filter=" + FilterName + "\n")
 	}
+	tail += tailSb159.String()
 	tail += "\n"
 	return os.WriteFile(attrPath, []byte(tail), 0o644)
 }
@@ -177,7 +179,7 @@ func writeAttributes(gitDir string, files []string) error {
 func dropTreemanBlock(body string) string {
 	var out strings.Builder
 	skipping := false
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		if line == attrsHeader {
 			skipping = true
 			continue

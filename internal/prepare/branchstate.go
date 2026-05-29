@@ -2,8 +2,11 @@ package prepare
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,7 +44,10 @@ type nsDriver interface {
 	Capture(ctx context.Context, active, durable string) error // active → durable
 	Restore(ctx context.Context, durable, active string) error // durable → active (drops active first)
 	Empty(ctx context.Context, active string) error            // reset active to an empty, present namespace
-	Drop(ctx context.Context, ns string) error                 // remove the namespace entirely (EXACT for name-scoped; prefix for prefix-scoped)
+	Drop(
+		ctx context.Context,
+		ns string,
+	) error // remove the namespace entirely (EXACT for name-scoped; prefix for prefix-scoped)
 	DropDurable(ctx context.Context, durable string) error
 }
 
@@ -116,12 +122,15 @@ type mysqlNS struct{ d *dbmysql.Driver }
 func (a mysqlNS) Exists(ctx context.Context, ns string) (bool, error) {
 	return a.d.DatabaseExists(ctx, ns)
 }
+
 func (a mysqlNS) Capture(ctx context.Context, active, durable string) error {
 	return a.d.SnapshotCreate(ctx, active, durable)
 }
+
 func (a mysqlNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
+
 func (a mysqlNS) Empty(ctx context.Context, active string) error {
 	// EXACT drop, not DropMatching: a branch_scoped DB never fans out
 	// into a clone family, and the active name (bare on the main
@@ -131,9 +140,11 @@ func (a mysqlNS) Empty(ctx context.Context, active string) error {
 	}
 	return a.d.EnsureDB(ctx, active)
 }
+
 func (a mysqlNS) Drop(ctx context.Context, ns string) error {
 	return a.d.DropDatabase(ctx, ns)
 }
+
 func (a mysqlNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
@@ -143,12 +154,15 @@ type postgresNS struct{ d *dbpostgres.Driver }
 func (a postgresNS) Exists(ctx context.Context, ns string) (bool, error) {
 	return a.d.DatabaseExists(ctx, ns)
 }
+
 func (a postgresNS) Capture(ctx context.Context, active, durable string) error {
 	return a.d.SnapshotCreate(ctx, active, durable)
 }
+
 func (a postgresNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
+
 func (a postgresNS) Empty(ctx context.Context, active string) error {
 	// EXACT drop, not DropMatching — see mysqlNS.Empty.
 	if err := a.d.DropDatabase(ctx, active); err != nil {
@@ -156,9 +170,11 @@ func (a postgresNS) Empty(ctx context.Context, active string) error {
 	}
 	return a.d.EnsureDB(ctx, active)
 }
+
 func (a postgresNS) Drop(ctx context.Context, ns string) error {
 	return a.d.DropDatabase(ctx, ns)
 }
+
 func (a postgresNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
@@ -168,20 +184,25 @@ type mongoNS struct{ d *dbmongo.Driver }
 func (a mongoNS) Exists(ctx context.Context, ns string) (bool, error) {
 	return a.d.DatabaseExists(ctx, ns)
 }
+
 func (a mongoNS) Capture(ctx context.Context, active, durable string) error {
 	return a.d.SnapshotCreate(ctx, active, durable)
 }
+
 func (a mongoNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
+
 func (a mongoNS) Empty(ctx context.Context, active string) error {
 	// EXACT drop, not DropMatching — see mysqlNS.Empty. Mongo creates
 	// databases lazily on first write, so a dropped name is "empty".
 	return a.d.DropDatabase(ctx, active)
 }
+
 func (a mongoNS) Drop(ctx context.Context, ns string) error {
 	return a.d.DropDatabase(ctx, ns)
 }
+
 func (a mongoNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
@@ -191,20 +212,25 @@ type redisNS struct{ d *dbredis.Driver }
 func (a redisNS) Exists(ctx context.Context, ns string) (bool, error) {
 	return a.d.PrefixExists(ctx, ns)
 }
+
 func (a redisNS) Capture(ctx context.Context, active, durable string) error {
 	return a.d.SnapshotCreate(ctx, active, durable)
 }
+
 func (a redisNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
+
 func (a redisNS) Empty(ctx context.Context, active string) error {
 	_, err := a.d.DropPrefix(ctx, active)
 	return err
 }
+
 func (a redisNS) Drop(ctx context.Context, ns string) error {
 	_, err := a.d.DropPrefix(ctx, ns)
 	return err
 }
+
 func (a redisNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
@@ -215,20 +241,25 @@ func (a esNS) Exists(ctx context.Context, ns string) (bool, error) {
 	m, err := a.d.ListMatching(ctx, ns)
 	return len(m) > 0, err
 }
+
 func (a esNS) Capture(ctx context.Context, active, durable string) error {
 	return a.d.SnapshotCreate(ctx, active, durable)
 }
+
 func (a esNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
+
 func (a esNS) Empty(ctx context.Context, active string) error {
 	_, err := a.d.DropMatching(ctx, active)
 	return err
 }
+
 func (a esNS) Drop(ctx context.Context, ns string) error {
 	_, err := a.d.DropMatching(ctx, ns)
 	return err
 }
+
 func (a esNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
@@ -266,7 +297,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 	switch label {
 	case "mysql":
 		if cfg.Connections.Mysql == nil {
-			return nil, func() {}, fmt.Errorf("connections.mysql not configured")
+			return nil, func() {}, errors.New("connections.mysql not configured")
 		}
 		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
 		if err != nil {
@@ -275,7 +306,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		return &branchEngine{drv: mysqlNS{drv}, scope: scope, engine: label}, func() { _ = drv.Close() }, nil
 	case "postgres":
 		if cfg.Connections.Postgres == nil {
-			return nil, func() {}, fmt.Errorf("connections.postgres not configured")
+			return nil, func() {}, errors.New("connections.postgres not configured")
 		}
 		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
 		if err != nil {
@@ -284,7 +315,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		return &branchEngine{drv: postgresNS{drv}, scope: scope, engine: label}, func() { _ = drv.Close() }, nil
 	case "mongodb":
 		if cfg.Connections.Mongodb == nil {
-			return nil, func() {}, fmt.Errorf("connections.mongodb not configured")
+			return nil, func() {}, errors.New("connections.mongodb not configured")
 		}
 		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
 		if err != nil {
@@ -293,7 +324,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		return &branchEngine{drv: mongoNS{drv}, scope: scope, engine: label}, func() { _ = drv.Close(ctx) }, nil
 	case "redis":
 		if cfg.Connections.Redis == nil {
-			return nil, func() {}, fmt.Errorf("connections.redis not configured")
+			return nil, func() {}, errors.New("connections.redis not configured")
 		}
 		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 		if err != nil {
@@ -302,7 +333,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		return &branchEngine{drv: redisNS{drv}, scope: scope, engine: label}, func() { _ = drv.Close() }, nil
 	case "elasticsearch":
 		if cfg.Connections.Elasticsearch == nil {
-			return nil, func() {}, fmt.Errorf("connections.elasticsearch not configured")
+			return nil, func() {}, errors.New("connections.elasticsearch not configured")
 		}
 		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 		if err != nil {
@@ -400,27 +431,10 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 	switch {
 	case !exists:
 		// Fresh: nothing in the active slot. Seed this branch's data.
-		filled, how, ferr := a.fill(ctx, active, branch)
-		if ferr != nil {
-			return Outcome{}, ferr
+		builtEmpty, decision, err = a.seedFresh(ctx, active, branch)
+		if err != nil {
+			return Outcome{}, err
 		}
-		if !filled {
-			if err := a.eng.drv.Empty(ctx, active); err != nil {
-				return Outcome{}, fmt.Errorf("empty active %s: %w", active, err)
-			}
-			builtEmpty = true
-			if dp, ok, derr := dumpReady(a.d.Dump, a.worktreePath); derr != nil {
-				return Outcome{}, derr
-			} else if ok && a.loadDump != nil {
-				if err := a.loadDump(ctx, active, dp); err != nil {
-					return Outcome{}, fmt.Errorf("load dump %s: %w", dp, err)
-				}
-				how = "dump"
-			} else {
-				how = "empty"
-			}
-		}
-		decision = "seed:" + how
 
 	case !hasOld:
 		// Active exists but treeman never recorded who owns it — adopt
@@ -434,30 +448,10 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 	case old != branch:
 		// Branch switch. Preserve the OLD branch's data, then fill the
 		// active slot with THIS branch's data.
-		if err := a.eng.drv.Capture(ctx, active, a.eng.durable(active, old)); err != nil {
-			return Outcome{}, fmt.Errorf("capture old branch %q: %w", old, err)
+		decision, err = a.swapBranch(ctx, active, old, branch)
+		if err != nil {
+			return Outcome{}, err
 		}
-		// Advance the marker to the NEW branch the instant old's data is
-		// safe in its durable copy — BEFORE fill mutates the active slot.
-		// If the daemon dies mid-fill, the next prepare sees old==branch
-		// and takes the noop path instead of re-capturing the (now
-		// new-branch) active back into durable(old) and clobbering it.
-		// The trade-off is a possibly-stale active on crash, recoverable
-		// with `treeman db reset`; no durable copy is ever destroyed.
-		if err := a.st.SetActiveBranch(ctx, a.repoID, a.worktreeID, active, branch, a.eng.engine); err != nil {
-			return Outcome{}, fmt.Errorf("record active-branch marker (pre-fill): %w", err)
-		}
-		filled, how, ferr := a.fill(ctx, active, branch)
-		if ferr != nil {
-			return Outcome{}, ferr
-		}
-		if !filled {
-			// No durable copy and no resolvable parent: the data we just
-			// captured (old branch's state) IS the branch point for a
-			// new branch forked off old. Leave it in place.
-			how = "branch-point"
-		}
-		decision = "swap:" + how
 
 	default:
 		// old == branch: same branch already loaded. Nothing to swap.
@@ -482,9 +476,70 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 	ms := time.Since(started).Milliseconds()
 	a.event(ctx, "prepare_done",
 		fmt.Sprintf("branch_scoped decision=%s active=%s branch=%s duration=%dms", decision, active, branch, ms),
-		map[string]string{"duration_ms": fmt.Sprintf("%d", ms), "decision": decision})
+		map[string]string{"duration_ms": strconv.FormatInt(ms, 10), "decision": decision})
 
 	return Outcome{Engine: a.eng.engine, SourceDB: active, Decision: decision}, nil
+}
+
+// seedFresh handles the `!exists` arm of runBranchScoped: the active
+// slot is empty, so seed this branch's data (durable/parent via fill,
+// else dump, else empty). Returns (builtEmpty, decision). Extracted
+// verbatim from runBranchScoped's `case !exists` block.
+func (a branchScopedArgs) seedFresh(ctx context.Context, active, branch string) (bool, string, error) {
+	filled, how, ferr := a.fill(ctx, active, branch)
+	if ferr != nil {
+		return false, "", ferr
+	}
+	builtEmpty := false
+	if !filled {
+		if err := a.eng.drv.Empty(ctx, active); err != nil {
+			return false, "", fmt.Errorf("empty active %s: %w", active, err)
+		}
+		builtEmpty = true
+		if dp, ok, derr := dumpReady(a.d.Dump, a.worktreePath); derr != nil {
+			return false, "", derr
+		} else if ok && a.loadDump != nil {
+			if err := a.loadDump(ctx, active, dp); err != nil {
+				return false, "", fmt.Errorf("load dump %s: %w", dp, err)
+			}
+			how = "dump"
+		} else {
+			how = "empty"
+		}
+	}
+	return builtEmpty, "seed:" + how, nil
+}
+
+// swapBranch handles the `old != branch` arm of runBranchScoped: a
+// branch switch. It preserves the OLD branch's data into its durable
+// copy, advances the marker, then fills the active slot with THIS
+// branch's data. Returns the decision. Extracted verbatim from
+// runBranchScoped's `case old != branch` block.
+func (a branchScopedArgs) swapBranch(ctx context.Context, active, old, branch string) (string, error) {
+	if err := a.eng.drv.Capture(ctx, active, a.eng.durable(active, old)); err != nil {
+		return "", fmt.Errorf("capture old branch %q: %w", old, err)
+	}
+	// Advance the marker to the NEW branch the instant old's data is
+	// safe in its durable copy — BEFORE fill mutates the active slot.
+	// If the daemon dies mid-fill, the next prepare sees old==branch
+	// and takes the noop path instead of re-capturing the (now
+	// new-branch) active back into durable(old) and clobbering it.
+	// The trade-off is a possibly-stale active on crash, recoverable
+	// with `treeman db reset`; no durable copy is ever destroyed.
+	if err := a.st.SetActiveBranch(ctx, a.repoID, a.worktreeID, active, branch, a.eng.engine); err != nil {
+		return "", fmt.Errorf("record active-branch marker (pre-fill): %w", err)
+	}
+	filled, how, ferr := a.fill(ctx, active, branch)
+	if ferr != nil {
+		return "", ferr
+	}
+	if !filled {
+		// No durable copy and no resolvable parent: the data we just
+		// captured (old branch's state) IS the branch point for a
+		// new branch forked off old. Leave it in place.
+		how = "branch-point"
+	}
+	return "swap:" + how, nil
 }
 
 // fill populates `active` with `branch`'s data. Order: the branch's own
@@ -545,9 +600,7 @@ func (a branchScopedArgs) runStep(ctx context.Context, spec runner.Spec, active,
 
 func (a branchScopedArgs) event(ctx context.Context, typ, msg string, extra map[string]string) {
 	fields := map[string]string{"engine": a.eng.engine, "mode": "branch_scoped"}
-	for k, v := range extra {
-		fields[k] = v
-	}
+	maps.Copy(fields, extra)
 	_ = a.st.WriteEvent(ctx, store.LevelInfo, typ, msg, a.repoID, a.worktreeID, "", 0, fields)
 }
 
@@ -784,7 +837,7 @@ func localBranches(ctx context.Context, repoRoot string) []string {
 		return nil
 	}
 	var branches []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if b := strings.TrimSpace(line); b != "" {
 			branches = append(branches, b)
 		}

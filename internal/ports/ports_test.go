@@ -49,7 +49,7 @@ func pickFreePort(t *testing.T) uint16 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return uint16(n)
+	return uint16(n) //nolint:gosec // n parsed from a live TCP listener addr; always a valid 0-65535 port
 }
 
 func TestAllocateAssignsPortsInOrder(t *testing.T) {
@@ -91,7 +91,7 @@ func TestAllocateSkipsHeldPortAndPicksNext(t *testing.T) {
 	defer func() { _ = l.Close() }()
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	pn, _ := strconv.Atoi(p)
-	held := uint16(pn)
+	held := uint16(pn) //nolint:gosec // pn parsed from a live TCP listener addr; always a valid 0-65535 port
 	next := pickFreePort(t)
 	cfg := &config.Config{
 		Ports: map[string]config.PortSpec{
@@ -124,7 +124,7 @@ func TestAllocateExhaustsRange(t *testing.T) {
 	defer func() { _ = l.Close() }()
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	pn, _ := strconv.Atoi(p)
-	port := uint16(pn)
+	port := uint16(pn) //nolint:gosec // pn parsed from a live TCP listener addr; always a valid 0-65535 port
 	cfg := &config.Config{
 		Ports: map[string]config.PortSpec{
 			"only": {Range: config.PortRange{Min: port, Max: port}},
@@ -156,7 +156,7 @@ func TestAllocateReleasesEarlierSlotsOnLaterFailure(t *testing.T) {
 	defer func() { _ = l.Close() }()
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	pn, _ := strconv.Atoi(p)
-	held := uint16(pn)
+	held := uint16(pn) //nolint:gosec // pn parsed from a live TCP listener addr; always a valid 0-65535 port
 	if held == a {
 		t.Skipf("test prerequisite: free port (%d) collided with held port (%d)", a, held)
 	}

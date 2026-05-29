@@ -15,6 +15,7 @@ import (
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/wt"
@@ -140,28 +141,7 @@ func FinalizeWorktree(
 	// the main worktree's branch_scoped active DB is the bare,
 	// overlay-resolved name the root `.env` already targets).
 	if len(cfg.Patches) > 0 && !isMain {
-		portMap, _ := st.Store.LoadWorktreePorts(ctx, wtID)
-		tplCtx := template.FromSlug(sl).WithPorts(portMap)
-		files := make([]string, 0, len(cfg.Patches))
-		for _, p := range cfg.Patches {
-			files = append(files, p.File)
-			res, err := patcher.Apply(p, wtRoot, tplCtx)
-			if err != nil {
-				slog.Warn("patch failed", "wt", wtRoot, "file", p.File, "err", err)
-				continue
-			}
-			if res.Outcome == patcher.Updated {
-				_ = st.Store.WriteEvent(ctx, store.LevelInfo, "patch_applied",
-					fmt.Sprintf("driver=%s file=%s", res.Driver, res.File),
-					repoID, wtID, "", 0, map[string]string{
-						"driver": res.Driver,
-						"file":   res.File,
-					})
-			}
-		}
-		if err := patcher.EnsureFilter(ctx, wtRoot, files); err != nil {
-			slog.Warn("install patch filter", "wt", wtRoot, "err", err)
-		}
+		applyFinalizePatches(ctx, st, &cfg, wtRoot, sl, repoID, wtID)
 	}
 
 	// Three-step setup pipeline: on-create-before-engines actions →
@@ -172,38 +152,12 @@ func FinalizeWorktree(
 	// Phase boundaries double as cancellation checkpoints: a
 	// concurrent TeardownWorktree fires `cancel` via CancelFinalize,
 	// and the next check bails before prepare creates databases.
-	if err := ctx.Err(); err != nil {
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
-			"finalize aborted before pre-hooks", repoID, wtID, "", 0, nil)
-		return nil
-	}
-	if err := runTriggerActions(ctx, st, "on-create-before-engines",
-		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
-		isMain, repoID, wtID, inheritedEnv); err != nil {
+	done, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl, isMain, repoID, wtID, inheritedEnv)
+	if err != nil {
 		return err
 	}
-	if err := ctx.Err(); err != nil {
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
-			"finalize aborted before prepare", repoID, wtID, "", 0, nil)
+	if done {
 		return nil
-	}
-	if len(cfg.Databases) > 0 {
-		if _, err := prepare.Run(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return fmt.Errorf("prepare: %w", err)
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
-			"finalize aborted before post-hooks", repoID, wtID, "", 0, nil)
-		return nil
-	}
-	if err := runTriggerActions(ctx, st, "on-create-after-engines",
-		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
-		isMain, repoID, wtID, inheritedEnv); err != nil {
-		return err
 	}
 
 	// Start (or keep) the per-worktree fsnotify watcher so subsequent
@@ -216,6 +170,112 @@ func FinalizeWorktree(
 		"daemon-detached setup + prepare complete",
 		repoID, wtID, "", 0, nil)
 	return nil
+}
+
+// applyFinalizePatches re-applies the top-level `patches:` against the
+// current HEAD's slug and re-asserts the git clean/smudge filter.
+// Idempotent; failures are logged but non-fatal. Extracted from
+// FinalizeWorktree to keep that function under the complexity gate.
+func applyFinalizePatches(
+	ctx context.Context,
+	st *State,
+	cfg *config.Config,
+	wtRoot string,
+	sl slug.Slug,
+	repoID, wtID int64,
+) {
+	portMap, _ := st.Store.LoadWorktreePorts(ctx, wtID)
+	tplCtx := template.FromSlug(sl).WithPorts(portMap)
+	files := make([]string, 0, len(cfg.Patches))
+	for _, p := range cfg.Patches {
+		files = append(files, p.File)
+		res, err := patcher.Apply(p, wtRoot, tplCtx)
+		if err != nil {
+			slog.Warn("patch failed", "wt", wtRoot, "file", p.File, "err", err)
+			continue
+		}
+		if res.Outcome == patcher.Updated {
+			_ = st.Store.WriteEvent(ctx, store.LevelInfo, "patch_applied",
+				fmt.Sprintf("driver=%s file=%s", res.Driver, res.File),
+				repoID, wtID, "", 0, map[string]string{
+					"driver": res.Driver,
+					"file":   res.File,
+				})
+		}
+	}
+	if err := patcher.EnsureFilter(ctx, wtRoot, files); err != nil {
+		slog.Warn("install patch filter", "wt", wtRoot, "err", err)
+	}
+}
+
+// runFinalizeSetupPipeline runs the three-step setup pipeline:
+// on-create-before-engines actions → engine prepare →
+// on-create-after-engines actions. Each phase boundary is a
+// cancellation checkpoint: when a concurrent TeardownWorktree fires
+// `cancel`, the next check writes a wt_finalize_cancelled event and
+// returns (done=true, nil) so the caller stops short of starting the
+// watcher / emitting the done event. A non-nil error aborts the
+// pipeline. Extracted from FinalizeWorktree to keep that function
+// under the cyclomatic-complexity gate.
+func runFinalizeSetupPipeline(
+	ctx context.Context,
+	st *State,
+	cfg *config.Config,
+	repoRoot, wtRoot string,
+	sl slug.Slug,
+	isMain bool,
+	repoID, wtID int64,
+	inheritedEnv map[string]string,
+) (done bool, err error) {
+	if cancelledBefore(ctx, st, "pre-hooks", repoID, wtID) {
+		return true, nil
+	}
+	if err := runTriggerActions(ctx, st, "on-create-before-engines",
+		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
+		isMain, repoID, wtID, inheritedEnv); err != nil {
+		return false, err
+	}
+	if cancelledBefore(ctx, st, "prepare", repoID, wtID) {
+		return true, nil
+	}
+	if len(cfg.Databases) > 0 {
+		_, prepErr := prepare.Run(ctx, cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv)
+		// A cancelled context means a concurrent teardown preempted
+		// prepare — a clean stop regardless of whether prepare.Run
+		// surfaced an error on the way out. Mirrors the un-extracted
+		// FinalizeWorktreeForWatch path; nilerr can't tell this
+		// ctx-cancellation guard apart from a swallowed prepare error.
+		if ctx.Err() != nil {
+			return true, nil //nolint:nilerr // cancellation is a clean stop, not an error
+		}
+		if prepErr != nil {
+			return false, fmt.Errorf("prepare: %w", prepErr)
+		}
+	}
+	if cancelledBefore(ctx, st, "post-hooks", repoID, wtID) {
+		return true, nil
+	}
+	if err := runTriggerActions(ctx, st, "on-create-after-engines",
+		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
+		isMain, repoID, wtID, inheritedEnv); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// cancelledBefore is a phase-boundary cancellation checkpoint: when a
+// concurrent TeardownWorktree has fired `cancel`, it records a
+// wt_finalize_cancelled event naming the phase about to be skipped and
+// reports true so the pipeline bails. Isolating the ctx.Err() check
+// here keeps the "cancelled, not an error" return out of the call
+// site's error-handling flow.
+func cancelledBefore(ctx context.Context, st *State, phase string, repoID, wtID int64) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
+		"finalize aborted before "+phase, repoID, wtID, "", 0, nil)
+	return true
 }
 
 // FinalizeWorktreeForWatch is the watcher-driven re-prepare path.

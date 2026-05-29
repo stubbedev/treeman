@@ -139,7 +139,7 @@ func NewState(bg context.Context, s *store.Store) *State {
 	return &State{
 		Store:             s,
 		StartedAtUnix:     time.Now().Unix(),
-		PID:               uint32(syscallPid()),
+		PID:               uint32(syscallPid()), //nolint:gosec // a PID is non-negative and fits uint32
 		BgCtx:             bg,
 		watchers:          map[string]*WatcherEntry{},
 		wtWatchers:        map[string]*WatcherEntry{},
@@ -392,7 +392,7 @@ func (st *State) LockRepoTeardown(repoPath string) *sync.Mutex {
 func (st *State) WatcherCount() uint32 {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return uint32(len(st.watchers))
+	return uint32(len(st.watchers)) //nolint:gosec // watcher count is small and non-negative
 }
 
 // RegisterWatcher inserts (or replaces) an entry; Phase 10 wires the

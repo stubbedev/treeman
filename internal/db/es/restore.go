@@ -50,7 +50,7 @@ func (d *Driver) Restore(ctx context.Context, sourcePrefix, dumpPath string) err
 		if buf.Len() == 0 {
 			return nil
 		}
-		req, err := http.NewRequestWithContext(ctx, "POST", d.Base+"/_bulk", bytes.NewReader(buf.Bytes()))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.Base+"/_bulk", bytes.NewReader(buf.Bytes()))
 		if err != nil {
 			return err
 		}
@@ -113,7 +113,7 @@ func (d *Driver) Restore(ctx context.Context, sourcePrefix, dumpPath string) err
 // refresh forces a refresh on the indices matching pattern so any
 // just-bulk-loaded docs are searchable + visible to _clone.
 func (d *Driver) refresh(ctx context.Context, pattern string) error {
-	req, err := http.NewRequestWithContext(ctx, "POST", d.Base+"/"+pattern+"/_refresh", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.Base+"/"+pattern+"/_refresh", nil)
 	if err != nil {
 		return err
 	}

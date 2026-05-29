@@ -80,7 +80,7 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	if r.LastUsedAt == 0 {
 		r.LastUsedAt = now
 	}
-	var repoID interface{}
+	var repoID any
 	if r.RepoID > 0 {
 		repoID = r.RepoID
 	}
@@ -120,11 +120,11 @@ type SnapshotEvictionCandidate struct {
 // repo, ordered by LRU (`last_used_at` ascending). Used by the
 // inline GC fired after a fresh RecordSnapshot.
 //
-// `cap == 0` is treated as "no cap" and returns an empty slice
+// `keep == 0` is treated as "no cap" and returns an empty slice
 // (defense against a misconfigured config that would otherwise wipe
 // every cached template).
-func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, cap uint32) ([]SnapshotEvictionCandidate, error) {
-	if cap == 0 || repoID == 0 {
+func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, keep uint32) ([]SnapshotEvictionCandidate, error) {
+	if keep == 0 || repoID == 0 {
 		return nil, nil
 	}
 	rows, err := s.DB.QueryContext(ctx, `
@@ -132,7 +132,7 @@ func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, cap uint32) 
 		FROM snapshots
 		WHERE repo_id = ?
 		ORDER BY last_used_at DESC
-		LIMIT -1 OFFSET ?`, repoID, cap)
+		LIMIT -1 OFFSET ?`, repoID, keep)
 	if err != nil {
 		return nil, err
 	}

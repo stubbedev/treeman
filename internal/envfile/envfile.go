@@ -10,6 +10,7 @@ package envfile
 
 import (
 	"bufio"
+	"maps"
 	"os"
 	"strings"
 )
@@ -51,15 +52,15 @@ func Parse(input string) EnvFile {
 			continue
 		}
 		line = strings.TrimPrefix(line, "export ")
-		eq := strings.IndexByte(line, '=')
-		if eq < 0 {
+		before, after, ok := strings.Cut(line, "=")
+		if !ok {
 			continue
 		}
-		key := strings.TrimSpace(line[:eq])
+		key := strings.TrimSpace(before)
 		if !validKey(key) {
 			continue
 		}
-		raw := strings.TrimSpace(line[eq+1:])
+		raw := strings.TrimSpace(after)
 		value := stripQuotesAndComment(raw)
 		expanded := expand(value, out.Vars)
 		out.Vars[key] = expanded
@@ -102,9 +103,7 @@ func ReadLayered(paths []string) EnvFile {
 		if one.Source != "" {
 			out.Source = one.Source
 		}
-		for k, v := range one.Vars {
-			out.Vars[k] = v
-		}
+		maps.Copy(out.Vars, one.Vars)
 	}
 	return out
 }
@@ -113,15 +112,16 @@ func validKey(key string) bool {
 	if key == "" {
 		return false
 	}
-	first := key[0]
-	if !((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_') {
-		return false
-	}
-	for i := 1; i < len(key); i++ {
+	for i := range len(key) {
 		c := key[i]
-		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
-			return false
+		isAlpha := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'
+		isDigit := c >= '0' && c <= '9'
+		// First char must be a letter or underscore; digits are allowed
+		// only from the second char on.
+		if isAlpha || (i > 0 && isDigit) {
+			continue
 		}
+		return false
 	}
 	return true
 }
@@ -135,8 +135,8 @@ func stripQuotesAndComment(s string) string {
 		}
 	}
 	// Strip inline comments on unquoted values: `VAL # note`.
-	if idx := strings.Index(s, " #"); idx >= 0 {
-		return strings.TrimRight(s[:idx], " \t")
+	if before, _, ok := strings.Cut(s, " #"); ok {
+		return strings.TrimRight(before, " \t")
 	}
 	return s
 }

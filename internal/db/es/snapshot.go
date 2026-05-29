@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -59,7 +60,7 @@ func (d *Driver) IndexExists(ctx context.Context, name string) (bool, error) {
 // flip back to false so the app keeps working.
 func (d *Driver) SnapshotCreate(ctx context.Context, sourcePrefix, templatePrefix string) error {
 	if sourcePrefix == templatePrefix {
-		return fmt.Errorf("snapshot create: source and template prefixes must differ")
+		return errors.New("snapshot create: source and template prefixes must differ")
 	}
 	srcIndices, err := d.ListMatching(ctx, sourcePrefix)
 	if err != nil {
@@ -82,7 +83,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, sourcePrefix, templatePrefi
 // to spin up paratest-style worker prefixes.
 func (d *Driver) SnapshotRestore(ctx context.Context, templatePrefix, targetPrefix string) error {
 	if templatePrefix == targetPrefix {
-		return fmt.Errorf("snapshot restore: template and target prefixes must differ")
+		return errors.New("snapshot restore: template and target prefixes must differ")
 	}
 	tplIndices, err := d.ListMatching(ctx, templatePrefix)
 	if err != nil {
@@ -112,7 +113,6 @@ func (d *Driver) cloneIndices(ctx context.Context, srcIndices []string, srcPrefi
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(4)
 	for _, src := range srcIndices {
-		src := src
 		// Map `<srcPrefix><rest>` → `<dstPrefix><rest>`.
 		rest := strings.TrimPrefix(src, srcPrefix)
 		dst := dstPrefix + rest
@@ -180,13 +180,16 @@ func (d *Driver) cloneAPICall(ctx context.Context, src, dst string) error {
 // When true, the index is read-only (required for the clone source);
 // when false, the app can write again.
 func (d *Driver) setIndexBlock(ctx context.Context, name string, readOnly bool) error {
-	payload, _ := json.Marshal(map[string]any{
+	payload, err := json.Marshal(map[string]any{
 		"index": map[string]any{
 			"blocks": map[string]any{
 				"write": readOnly,
 			},
 		},
 	})
+	if err != nil {
+		return fmt.Errorf("PUT /%s/_settings: marshal payload: %w", name, err)
+	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPut,
 		d.Base+"/"+name+"/_settings", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
