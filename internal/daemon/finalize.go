@@ -31,9 +31,39 @@ func FinalizeWorktree(
 	st *State,
 	repoPath, worktreePath string,
 	inheritedEnv map[string]string,
-) error {
+) (err error) {
 	repoRoot := repoPath
 	wtRoot := worktreePath
+	// Captured by the terminal-event defer below. Populated once the
+	// row identity is known so a hook/prepare error after that point
+	// always produces a wt_finalize event scoped to the right row.
+	var (
+		termRepoID int64
+		termWtID   int64
+	)
+	defer func() {
+		if err == nil {
+			return
+		}
+		if termWtID == 0 {
+			// Pre-identity error (LoadResolved, EnsureRepo,
+			// ResolveIdentity): we don't have a row to attach a
+			// terminal event to. Let the dispatch-level safety net at
+			// dispatch.go log a global wt_finalize error instead.
+			return
+		}
+		// Terminal event for `finalizeState` — without this, a
+		// prepare/hook failure leaves the row derived as preparing
+		// forever (see #11). Swallow the returned error afterwards so
+		// dispatch doesn't double-log the same failure as a second
+		// (row-less) wt_finalize event.
+		_ = st.Store.WriteEvent(ctx, store.LevelError, "wt_finalize", err.Error(),
+			termRepoID, termWtID, "", 0, map[string]string{
+				"repo_path":     repoRoot,
+				"worktree_path": wtRoot,
+			})
+		err = nil
+	}()
 
 	// Derive a cancellable ctx that TeardownWorktree can preempt via
 	// CancelFinalize. ctx.Err() is consulted at each phase boundary
@@ -78,6 +108,7 @@ func FinalizeWorktree(
 		return err
 	}
 	sl, wtID, isMain := id.Slug, id.WtID, id.IsMain
+	termRepoID, termWtID = repoID, wtID
 
 	// Cache the user's shell env per-worktree so daemon-driven re-
 	// runs (HEAD watcher, file watcher) can rehydrate PATH etc.
