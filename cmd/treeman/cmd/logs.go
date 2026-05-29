@@ -264,7 +264,11 @@ included, so the original terminal colors round-trip.`,
 			var name string
 			if c.NArg() >= 1 {
 				name = c.Args().First()
-				wtID, _ = st.LookupWorktreeID(ctx, repoID, name)
+				var lookupErr error
+				wtID, lookupErr = st.LookupWorktreeID(ctx, repoID, name)
+				if lookupErr != nil {
+					return lookupErr
+				}
 				if wtID == 0 {
 					return fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
 				}
@@ -435,7 +439,10 @@ func buildFilterWithScope(ctx context.Context, c *cli.Command) (filterScope, err
 
 	// Explicit --worktree wins over cwd auto-resolve.
 	if wantWT != "" {
-		id, _ := st.LookupWorktreeID(ctx, scope.Filter.RepoID, wantWT)
+		id, err := st.LookupWorktreeID(ctx, scope.Filter.RepoID, wantWT)
+		if err != nil {
+			return scope, err
+		}
 		if id == 0 {
 			return scope, fmt.Errorf("no worktree matches %q (try `treeman wt list`)", wantWT)
 		}

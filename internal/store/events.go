@@ -146,25 +146,114 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 	return out, rows.Err()
 }
 
-// LookupWorktreeID returns the worktree id whose basename, slug, or
-// branch matches `name` (or 0 if no match) for an optional repo
-// scope. Used by `logs tail --worktree NAME` to translate a user-
-// facing handle into a SQL filter.
+// WorktreeMatch is one candidate row returned by LookupWorktreeMatches.
+// Kind records WHICH column produced the hit so callers can apply
+// match-rank precedence (branch beats slug, slug beats path).
+type WorktreeMatch struct {
+	ID     int64
+	Slug   string
+	Branch string
+	Path   string
+	Kind   string // "slug" | "branch" | "basename"
+}
+
+// LookupWorktreeID returns the worktree id whose slug, branch, or
+// basename matches `name` (or 0 if no match). With ambiguous slugs
+// (two tickets, two worktrees, one slug) this surfaces a non-nil
+// error AND a zero id so callers can render the candidate list
+// instead of the historic misleading "no worktree matches".
+//
+// Match ranking: exact branch > exact slug > basename. Multiple
+// rows tying at the same rank produce an ambiguous-match error;
+// otherwise the top-ranked row wins regardless of how many rows
+// match at lower ranks (a branch hit beats N slug hits).
 func (s *Store) LookupWorktreeID(ctx context.Context, repoID int64, name string) (int64, error) {
-	q := `SELECT id FROM worktrees WHERE deleted_at IS NULL AND
+	matches, err := s.LookupWorktreeMatches(ctx, repoID, name)
+	if err != nil {
+		return 0, err
+	}
+	if len(matches) == 0 {
+		return 0, nil
+	}
+	winners := pickByRank(matches)
+	if len(winners) == 1 {
+		return winners[0].ID, nil
+	}
+	return 0, ambiguousMatchError(name, winners)
+}
+
+// LookupWorktreeMatches returns every active worktree row whose
+// slug, branch, or basename matches `name`. Rows are returned newest-
+// id first within each match kind; callers that want a single winner
+// should run them through `pickByRank` (see LookupWorktreeID).
+//
+// Used by the lookup paths that need to surface candidates on
+// ambiguity instead of silently picking one.
+func (s *Store) LookupWorktreeMatches(ctx context.Context, repoID int64, name string) ([]WorktreeMatch, error) {
+	q := `SELECT id, slug, COALESCE(branch,''), path,
+		     CASE
+		       WHEN branch = ?       THEN 'branch'
+		       WHEN slug = ?         THEN 'slug'
+		       ELSE                       'basename'
+		     END AS kind
+		FROM worktrees WHERE deleted_at IS NULL AND
 		(slug = ? OR branch = ? OR path LIKE ? COLLATE NOCASE)`
-	args := []any{name, name, "%/" + name}
+	args := []any{name, name, name, name, "%/" + name}
 	if repoID > 0 {
 		q += " AND repo_id = ?"
 		args = append(args, repoID)
 	}
-	q += " ORDER BY id DESC LIMIT 1"
-	var id int64
-	row := s.DB.QueryRowContext(ctx, q, args...)
-	if err := row.Scan(&id); err != nil {
-		return 0, nil
+	q += " ORDER BY id DESC"
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
 	}
-	return id, nil
+	defer func() { _ = rows.Close() }()
+	var out []WorktreeMatch
+	for rows.Next() {
+		var m WorktreeMatch
+		if err := rows.Scan(&m.ID, &m.Slug, &m.Branch, &m.Path, &m.Kind); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// pickByRank returns the subset of matches at the highest-priority
+// kind (branch > slug > basename). Ties at the top rank are returned
+// verbatim so callers can detect ambiguity.
+func pickByRank(matches []WorktreeMatch) []WorktreeMatch {
+	for _, kind := range []string{"branch", "slug", "basename"} {
+		var hit []WorktreeMatch
+		for _, m := range matches {
+			if m.Kind == kind {
+				hit = append(hit, m)
+			}
+		}
+		if len(hit) > 0 {
+			return hit
+		}
+	}
+	return nil
+}
+
+// ambiguousMatchError formats the "you asked for X, here are the
+// candidates" message used when the lookup ranking left more than
+// one row tied at the top. Worktree paths are included so the user
+// can disambiguate by typing a unique branch or path component.
+func ambiguousMatchError(name string, matches []WorktreeMatch) error {
+	var b strings.Builder
+	b.WriteString("ambiguous worktree ")
+	b.WriteString(fmt.Sprintf("%q", name))
+	b.WriteString(" — ")
+	b.WriteString(fmt.Sprintf("%d candidates:", len(matches)))
+	for _, m := range matches {
+		b.WriteString("\n  ")
+		b.WriteString(fmt.Sprintf("id=%d slug=%s branch=%s path=%s", m.ID, m.Slug, m.Branch, m.Path))
+	}
+	b.WriteString("\n(pass a more specific branch name or path to disambiguate)")
+	return fmt.Errorf("%s", b.String())
 }
 
 // HookRun is one row from the `hook_runs` table.

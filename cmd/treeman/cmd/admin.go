@@ -324,7 +324,10 @@ never wipe the whole table.
 					}
 				}
 				if wname := c.String("worktree"); wname != "" {
-					wid, _ := st.LookupWorktreeID(ctx, f.RepoID, wname)
+					wid, err := st.LookupWorktreeID(ctx, f.RepoID, wname)
+					if err != nil {
+						return err
+					}
 					if wid == 0 {
 						return fmt.Errorf("no worktree matches %q", wname)
 					}

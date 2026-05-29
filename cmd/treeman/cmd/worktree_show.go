@@ -328,7 +328,10 @@ func formatPortMap(ports map[string]uint16) string {
 
 func loadWorktreeRow(ctx context.Context, st *store.Store, repoID int64, name string) (worktreeRow, error) {
 	var wt worktreeRow
-	id, _ := st.LookupWorktreeID(ctx, repoID, name)
+	id, err := st.LookupWorktreeID(ctx, repoID, name)
+	if err != nil {
+		return wt, err
+	}
 	if id == 0 {
 		return wt, fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
 	}

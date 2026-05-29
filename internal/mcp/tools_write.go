@@ -402,7 +402,10 @@ func registryUnregisterTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in r
 	if err != nil {
 		return nil, registryUnregisterOut{}, fmt.Errorf("lookup repo %s: %w", repoRoot, err)
 	}
-	wtID, _ := st.LookupWorktreeID(ctx, repoID, in.Name)
+	wtID, err := st.LookupWorktreeID(ctx, repoID, in.Name)
+	if err != nil {
+		return nil, registryUnregisterOut{}, err
+	}
 	if wtID == 0 {
 		return nil, registryUnregisterOut{}, fmt.Errorf("no worktree matches %q", in.Name)
 	}
@@ -590,7 +593,10 @@ func logsPurgeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsPurgeI
 			}
 		}
 		if in.Worktree != "" {
-			wid, _ := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
+			wid, err := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
+			if err != nil {
+				return nil, logsPurgeOut{}, err
+			}
 			if wid == 0 {
 				return nil, logsPurgeOut{}, fmt.Errorf("no worktree matches %q", in.Worktree)
 			}

@@ -92,7 +92,10 @@ func logsWaitTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsWaitIn)
 			}
 		}
 		if in.Worktree != "" {
-			wid, _ := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
+			wid, err := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
+			if err != nil {
+				return nil, logsWaitOut{}, err
+			}
 			if wid == 0 {
 				return nil, logsWaitOut{}, fmt.Errorf("no worktree matches %q", in.Worktree)
 			}
