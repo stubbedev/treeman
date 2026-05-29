@@ -110,7 +110,7 @@ func mysqlConfig(wt string, ref config.ContainerRef) *config.Config {
 		Databases: []config.DatabaseConfig{
 			{
 				Engine: "mysql", NameTemplate: sanitize(ref.Container) + "_{slug}",
-				Dump: &config.DumpSpec{Path: "seed.sql"},
+				Dump: config.DumpList{{Path: "seed.sql"}},
 			},
 		},
 	}
@@ -128,7 +128,7 @@ func postgresConfig(wt string, ref config.ContainerRef) *config.Config {
 		Databases: []config.DatabaseConfig{
 			{
 				Engine: "postgres", NameTemplate: sanitize(ref.Container) + "_{slug}",
-				Dump: &config.DumpSpec{Path: "seed.sql"},
+				Dump: config.DumpList{{Path: "seed.sql"}},
 			},
 		},
 	}

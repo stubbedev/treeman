@@ -92,6 +92,96 @@ func TestPostgresEndToEnd(t *testing.T) {
 	}
 }
 
+// TestMultipleDumpsLoadInOrder covers `dump:` as a SEQUENCE. base.sql
+// creates a table; extras.sql inserts rows that reference it. They must
+// be loaded in the declared order or the second statement would fail
+// against a missing table — proving the loader walks the list serially
+// rather than racing or reordering.
+func TestMultipleDumpsLoadInOrder(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "postgres:15432", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:15432", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	fixtures := filepath.Join(wt, "fixtures")
+	if err := os.MkdirAll(fixtures, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(fixtures, "base.sql"),
+		"CREATE TABLE widgets (id INT PRIMARY KEY, name TEXT);\nINSERT INTO widgets VALUES (1, 'Alpha');\n")
+	mustWrite(t, filepath.Join(fixtures, "extras.sql"),
+		"INSERT INTO widgets VALUES (2, 'Beta');\nINSERT INTO widgets VALUES (3, 'Gamma');\n")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Postgres: &config.PostgresConn{
+				Host: "127.0.0.1", Port: 15432, User: "postgres", Password: "pgpw",
+			},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "postgres",
+			NameTemplate: "tm_mdump_{slug}",
+			Dump: config.DumpList{
+				{Path: "fixtures/base.sql"},
+				{Path: "fixtures/extras.sql"},
+			},
+		}},
+	}
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "postgres", false)
+	t.Logf("multi-dump cold: source=%s fp=%s", o.SourceDB, o.Fingerprint[:12])
+	assertTables(t, "127.0.0.1:15432", o.SourceDB, []string{"widgets"})
+	assertWidgetCount(t, "127.0.0.1:15432", o.SourceDB, 3)
+
+	// Reordering the same files MUST flip the fingerprint — the
+	// combined hash is order-sensitive by design (different order
+	// would mean different DB content). Use InspectFingerprint with a
+	// blank engineVersion on both sides so the only varying input is
+	// the dump order.
+	rep1 := prepare.InspectFingerprint(env.Ctx, env.Store, cfg.Databases[0], wt, o.SourceDB, "")
+	swappedCfg := cfg.Databases[0]
+	swappedCfg.Dump = config.DumpList{
+		{Path: "fixtures/extras.sql"},
+		{Path: "fixtures/base.sql"},
+	}
+	rep2 := prepare.InspectFingerprint(env.Ctx, env.Store, swappedCfg, wt, o.SourceDB, "")
+	if rep1.Fingerprint == rep2.Fingerprint {
+		t.Errorf("reordering dumps must change the fingerprint (rep1=%s rep2=%s)",
+			rep1.Fingerprint[:12], rep2.Fingerprint[:12])
+	}
+}
+
+func mustWrite(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func assertWidgetCount(t *testing.T, addr, dbName string, want int) {
+	t.Helper()
+	dsn := fmt.Sprintf("postgres://postgres:pgpw@%s/%s?sslmode=disable", addr, dbName)
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", dbName, err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM widgets").Scan(&n); err != nil {
+		t.Fatalf("count widgets in %s: %v", dbName, err)
+	}
+	if n != want {
+		t.Errorf("widgets count in %s = %d, want %d", dbName, n, want)
+	}
+}
+
 // pgDBExists reports whether a database named `name` lives in the
 // cluster — checked from the `postgres` maintenance DB so it works even
 // after `name` has been dropped.
@@ -125,7 +215,7 @@ func buildConfig() *config.Config {
 			{
 				Engine:       "postgres",
 				NameTemplate: "treeman_e2e_{slug}",
-				Dump:         &config.DumpSpec{Path: "fixtures/seed.sql"},
+				Dump:         config.DumpList{{Path: "fixtures/seed.sql"}},
 				Migrate: &config.Step{
 					Run: "./fixtures/migrate.sh",
 					Env: map[string]string{

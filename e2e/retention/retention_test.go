@@ -71,7 +71,7 @@ func TestCapPerRepoEvictsOldSnapshots(t *testing.T) {
 				{
 					Engine:       "mysql",
 					NameTemplate: fmt.Sprintf("tm_ret_%d_{slug}", i),
-					Dump:         &config.DumpSpec{Path: "seed.sql"},
+					Dump:         config.DumpList{{Path: "seed.sql"}},
 				},
 			},
 		}

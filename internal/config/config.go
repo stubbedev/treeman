@@ -1151,10 +1151,22 @@ type DatabaseConfig struct {
 	// config-load time — typos fail loud.
 	NameTemplate string `yaml:"name_template,omitempty"`
 
-	// Source dump used to seed clones. Path is relative to the repo
-	// root. Treeman hashes this file into the snapshot key, so
-	// changes invalidate the cache.
-	Dump *DumpSpec `yaml:"dump,omitempty"`
+	// Source dump(s) used to seed the source DB before migrate/seed
+	// run. Each path is relative to the repo root. Treeman hashes
+	// every dump into the snapshot key, so changes invalidate the
+	// cache. Three shapes:
+	//
+	//   dump: seed.sql                       # bare string
+	//   dump: { path: seed.sql, optional: true }  # mapping
+	//   dump:                                # sequence
+	//     - base.sql
+	//     - { path: extras.sql, optional: true }
+	//
+	// Sequence entries load in declared ORDER, so a base schema dump
+	// followed by per-feature patches is supported without splicing
+	// them into one file. Order matters for the fingerprint too —
+	// reordering reproducible dumps is a content change.
+	Dump DumpList `yaml:"dump,omitempty"`
 
 	// Migrate is the shell command that brings a freshly-loaded
 	// source DB up to the current schema. Required when any input
@@ -1456,7 +1468,57 @@ type Step struct {
 	Env map[string]string `yaml:"env,omitempty"`
 }
 
-// DumpSpec — `dump:` sub-block of a DatabaseConfig. Accepts either
+// DumpList is the resolved value of the `dump:` config key. It accepts
+// three input shapes — a bare path string, a single mapping, or a
+// SEQUENCE of either — and yields an ordered list of DumpSpec entries.
+// See the field comment on DatabaseConfig.Dump for the YAML forms.
+type DumpList []DumpSpec
+
+// UnmarshalYAML accepts string, mapping, or sequence(of string|mapping).
+// DumpSpec already handles string-or-mapping itself, so this just
+// dispatches on top-level shape and recurses for sequence entries.
+func (l *DumpList) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode, yaml.MappingNode:
+		var d DumpSpec
+		if err := node.Decode(&d); err != nil {
+			return err
+		}
+		*l = DumpList{d}
+		return nil
+	case yaml.SequenceNode:
+		out := make(DumpList, len(node.Content))
+		for i, child := range node.Content {
+			if err := child.Decode(&out[i]); err != nil {
+				return fmt.Errorf("dump[%d] (line %d): %w", i, child.Line, err)
+			}
+		}
+		*l = out
+		return nil
+	default:
+		return fmt.Errorf("dump (line %d): want a string, mapping, or sequence", node.Line)
+	}
+}
+
+// JSONSchema documents the polymorphic shape (string / mapping / array).
+func (DumpList) JSONSchema() *jsonschema.Schema {
+	single := DumpSpec{}.JSONSchema()
+	// DumpSpec.JSONSchema returns a oneOf [string, mapping]. Flatten
+	// those into the DumpList oneOf alongside the new array form so
+	// docs surface every accepted shape side by side.
+	opts := append([]*jsonschema.Schema{}, single.OneOf...)
+	opts = append(opts, &jsonschema.Schema{
+		Type:        "array",
+		Items:       single,
+		Description: "Ordered list of dumps (each a string or mapping); loaded in declared order. Order is part of the snapshot fingerprint.",
+	})
+	return &jsonschema.Schema{
+		OneOf:       opts,
+		Description: "Source dump(s). Accepts a bare path string, a single mapping, or an ordered array of either.",
+	}
+}
+
+// DumpSpec — one entry of a DatabaseConfig.Dump list. Accepts either
 // a bare string (`dump: storage/dumps/seed.sql.gz`) or a full
 // mapping (`dump: { path: ..., optional: true }`).
 //

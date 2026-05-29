@@ -89,10 +89,10 @@ func TestMongoArchiveRestore(t *testing.T) {
 					{
 						Engine:       "mongodb",
 						NameTemplate: fmt.Sprintf("tm_mgd_%s_{slug}", c.name),
-						Dump: &config.DumpSpec{
+						Dump: config.DumpList{{
 							Path:     "dump.archive",
 							SourceDB: seedDB,
-						},
+						}},
 					},
 				},
 			}

@@ -90,7 +90,7 @@ func buildConfig() *config.Config {
 			{
 				Engine:       "mysql",
 				NameTemplate: "treeman_e2e_{slug}",
-				Dump:         &config.DumpSpec{Path: "fixtures/seed.sql"},
+				Dump:         config.DumpList{{Path: "fixtures/seed.sql"}},
 				Migrate: &config.Step{
 					Run: "./fixtures/migrate.sh",
 					Env: map[string]string{

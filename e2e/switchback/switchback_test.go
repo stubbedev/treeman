@@ -61,7 +61,7 @@ INSERT INTO beta VALUES (10, 'ten'), (20, 'twenty');
 				{
 					Engine:       "mysql",
 					NameTemplate: "tm_swb_{slug}",
-					Dump:         &config.DumpSpec{Path: "seed.sql"},
+					Dump:         config.DumpList{{Path: "seed.sql"}},
 				},
 			},
 		}
@@ -117,6 +117,88 @@ INSERT INTO beta VALUES (10, 'ten'), (20, 'twenty');
 	}
 	t.Logf("B2 hit:  fp=%s (same as B1)", b2.Fingerprint[:12])
 	assertCount(t, b2.SourceDB, "beta", 2)
+}
+
+// TestCrossWorktreeCacheReuse pins the v5 win: two DIFFERENT worktrees
+// (different slugs → different source DB names) with IDENTICAL inputs
+// share ONE template. The first cold-builds; the second is a CACHE HIT
+// off the first's template — no redundant rebuild. It also covers the
+// folded source restore: the second worktree's own bare source DB is
+// populated on the cache hit (the source is restored as part of the
+// clone fan-out, not skipped).
+//
+// Before v5 the source DB name was mixed into the fingerprint, so these
+// two worktrees produced distinct fingerprints and BOTH cold-built —
+// this test would have failed at the second AssertOutcome.
+func TestCrossWorktreeCacheReuse(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mysql:13376", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:13376", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	seed := []byte(`
+CREATE TABLE gamma (id INT PRIMARY KEY, val VARCHAR(32));
+INSERT INTO gamma VALUES (1, 'one'), (2, 'two'), (3, 'three');
+`)
+	// Identical content, two distinct worktree checkouts.
+	wt1 := writeWT(t, seed)
+	wt2 := writeWT(t, seed)
+
+	mkCfg := func() *config.Config {
+		return &config.Config{
+			Connections: config.ConnectionsConfig{
+				Mysql: &config.MysqlConn{
+					Host: "127.0.0.1", Port: 13376,
+					User: "root", Password: "rootpw",
+				},
+			},
+			Databases: []config.DatabaseConfig{
+				{
+					Engine:       "mysql",
+					NameTemplate: "tm_xwt_{slug}",
+					Dump:         config.DumpList{{Path: "seed.sql"}},
+				},
+			},
+		}
+	}
+
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "tm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	env1 := mkEnv(t, st, wt1, "feature-one")
+	env2 := mkEnv(t, st, wt2, "feature-two")
+
+	// First worktree: cold build, creates the shared template.
+	o1 := harness.AssertOutcome(t, env1.RunPrepare(t, mkCfg()), "mysql", false)
+	t.Logf("wt1 cold: source=%s fp=%s tmpl=%s", o1.SourceDB, o1.Fingerprint[:12], o1.TemplateName)
+	assertCount(t, o1.SourceDB, "gamma", 3)
+
+	// Second worktree, identical content but a different slug: CACHE HIT.
+	o2 := harness.AssertOutcome(t, env2.RunPrepare(t, mkCfg()), "mysql", true)
+	t.Logf("wt2 hit:  source=%s fp=%s tmpl=%s", o2.SourceDB, o2.Fingerprint[:12], o2.TemplateName)
+	if o2.Fingerprint != o1.Fingerprint {
+		t.Errorf("identical inputs must share a fingerprint: %s vs %s",
+			o1.Fingerprint[:12], o2.Fingerprint[:12])
+	}
+	if o2.TemplateName != o1.TemplateName {
+		t.Errorf("identical inputs must share a template: %s vs %s",
+			o1.TemplateName, o2.TemplateName)
+	}
+	if o2.SourceDB == o1.SourceDB {
+		t.Errorf("distinct worktrees must keep distinct source DBs: both %s", o2.SourceDB)
+	}
+	// Folded source restore: wt2's own bare source DB is populated.
+	assertCount(t, o2.SourceDB, "gamma", 3)
 }
 
 func mkEnv(t *testing.T, st *store.Store, wt, branch string) *harness.Env {

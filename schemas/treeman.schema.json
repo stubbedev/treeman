@@ -196,8 +196,8 @@
           "description": "Template for the per-worktree database/index name. Supports\n`{slug}`, `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`\n(see the `template` package for definitions). Example:\n`app_{slug}` → `app_feature-x`. Required for engines that\nscope by database name (MySQL, Postgres, Mongo). Validated at\nconfig-load time — typos fail loud."
         },
         "dump": {
-          "$ref": "#/$defs/DumpSpec",
-          "description": "Source dump used to seed clones. Path is relative to the repo\nroot. Treeman hashes this file into the snapshot key, so\nchanges invalidate the cache."
+          "$ref": "#/$defs/DumpList",
+          "description": "Source dump(s) used to seed the source DB before migrate/seed\nrun. Each path is relative to the repo root. Treeman hashes\nevery dump into the snapshot key, so changes invalidate the\ncache. Three shapes:\n\n  dump: seed.sql                       # bare string\n  dump: { path: seed.sql, optional: true }  # mapping\n  dump:                                # sequence\n    - base.sql\n    - { path: extras.sql, optional: true }\n\nSequence entries load in declared ORDER, so a base schema dump\nfollowed by per-feature patches is supported without splicing\nthem into one file. Order matters for the fingerprint too —\nreordering reproducible dumps is a content change."
         },
         "migrate": {
           "$ref": "#/$defs/Step",
@@ -259,7 +259,7 @@
       "type": "object",
       "description": "DatabaseOverlay holds the subset of `DatabaseConfig` fields that\ncan be tweaked per-context (main wt vs linked wt). Engine + Dump\nare intentionally absent — changing engines per-context produces\nschema chaos, and main / linked worktrees should always share the\nsame seed dump for snapshot-cache coherence.\n\nField semantics:\n\n  - Strings: empty value means \"inherit\". Setting to a non-empty\n    value replaces the base template.\n  - TestClones: nil pointer means \"inherit\". A non-nil value\n    replaces the entire spec (Clones + NameTemplate).\n  - Fanout: nil pointer means \"inherit\". A non-nil value (including\n    0) replaces the base — necessary because uint32(0) is a valid\n    \"use per-engine default\" sentinel that's distinct from \"no\n    override\"."
     },
-    "DumpSpec": {
+    "DumpList": {
       "oneOf": [
         {
           "type": "string",
@@ -286,9 +286,44 @@
             "path"
           ],
           "description": "Full dump mapping with optional `optional` + `source_db`."
+        },
+        {
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "Bare path string. Equivalent to `{path: \u003cthis string\u003e}`."
+              },
+              {
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "Dump file path, repo-root-relative. Required."
+                  },
+                  "optional": {
+                    "type": "boolean",
+                    "description": "When true, missing dump is not an error."
+                  },
+                  "source_db": {
+                    "type": "string",
+                    "description": "MongoDB only: the database the archive was dumped from; remapped into the per-worktree target DB via mongorestore --nsFrom/--nsTo. Ignored by other engines."
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "path"
+                ],
+                "description": "Full dump mapping with optional `optional` + `source_db`."
+              }
+            ],
+            "description": "Source dump file. Bare string OR `{path, optional, source_db}` mapping."
+          },
+          "type": "array",
+          "description": "Ordered list of dumps (each a string or mapping); loaded in declared order. Order is part of the snapshot fingerprint."
         }
       ],
-      "description": "Source dump file. Bare string OR `{path, optional, source_db}` mapping."
+      "description": "Source dump(s). Accepts a bare path string, a single mapping, or an ordered array of either."
     },
     "EsConn": {
       "oneOf": [

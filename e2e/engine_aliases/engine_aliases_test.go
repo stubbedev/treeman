@@ -52,7 +52,7 @@ func TestEngineAliases(t *testing.T) {
 				Databases: []config.DatabaseConfig{{
 					Engine:       alias,
 					NameTemplate: "tmal_" + alias + "_{slug}",
-					Dump:         &config.DumpSpec{Path: "seed.sql"},
+					Dump:         config.DumpList{{Path: "seed.sql"}},
 				}},
 			}
 			o := harness.AssertOutcome(t, harness.NewEnv(t, wt).RunPrepare(t, cfg), alias, false)
@@ -73,7 +73,7 @@ func TestEngineAliases(t *testing.T) {
 			Databases: []config.DatabaseConfig{{
 				Engine:       "postgresql",
 				NameTemplate: "tmal_pg_{slug}",
-				Dump:         &config.DumpSpec{Path: "seed.sql"},
+				Dump:         config.DumpList{{Path: "seed.sql"}},
 			}},
 		}
 		o := harness.AssertOutcome(t, harness.NewEnv(t, wt).RunPrepare(t, cfg), "postgresql", false)
@@ -93,7 +93,7 @@ func TestEngineAliases(t *testing.T) {
 			Databases: []config.DatabaseConfig{{
 				Engine:    "opensearch",
 				KeyPrefix: "tmal_os_{slug}_",
-				Dump:      &config.DumpSpec{Path: "dump.ndjson"},
+				Dump:      config.DumpList{{Path: "dump.ndjson"}},
 			}},
 		}
 		o := harness.AssertOutcome(t, harness.NewEnv(t, wt).RunPrepare(t, cfg), "opensearch", false)

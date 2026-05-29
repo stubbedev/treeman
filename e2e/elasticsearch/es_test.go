@@ -17,6 +17,7 @@ import (
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 func TestElasticsearchEndToEnd(t *testing.T) {
@@ -121,6 +122,69 @@ func TestElasticsearchEndToEnd(t *testing.T) {
 	})
 }
 
+// TestCrossWorktreeCacheReuseRestoresSource pins engine parity (issue #9):
+// on a cache hit, the user-facing source prefix must be repopulated from
+// the template the same way mysql/postgres/redis do — not just the
+// clones. Two worktrees with identical content share one template (post-
+// v5 fingerprint); the second is a cache hit AND its bare source prefix
+// holds the same data as the first. Pre-parity this test would fail at
+// the wt2 assertDocCount: ES cache-hit only fanned out clones, leaving
+// the bare prefix empty.
+func TestCrossWorktreeCacheReuseRestoresSource(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "es:19200", 120*time.Second, func() error {
+		resp, err := http.Get("http://127.0.0.1:19200/_cluster/health?wait_for_status=yellow&timeout=5s")
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("cluster not ready: %s", resp.Status)
+		}
+		return nil
+	})
+
+	wt1 := t.TempDir()
+	wt2 := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt1, "fixtures"))
+	copyTree(t, "fixtures", filepath.Join(wt2, "fixtures"))
+
+	// Shared store so wt2 can see wt1's snapshot row and cache-hit off it.
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "tm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	env1 := harness.NewEnvShared(t, st, wt1, "feature-one")
+	env2 := harness.NewEnvShared(t, st, wt2, "feature-two")
+
+	// wt1: cold build seeds source + clones from the dump.
+	o1 := harness.AssertOutcome(t, env1.RunPrepare(t, buildConfig()), "elasticsearch", false)
+	t.Logf("wt1 cold: source=%s template=%s", o1.SourceDB, o1.TemplateName)
+	assertDocCount(t, o1.SourceDB+"products", 2)
+	assertDocCount(t, o1.SourceDB+"orders", 1)
+
+	// wt2: identical content → cache hit. With the parity fix the bare
+	// source prefix is repopulated as part of the fan-out, so its
+	// indices match wt1's.
+	o2 := harness.AssertOutcome(t, env2.RunPrepare(t, buildConfig()), "elasticsearch", true)
+	t.Logf("wt2 hit:  source=%s template=%s", o2.SourceDB, o2.TemplateName)
+	if o2.Fingerprint != o1.Fingerprint {
+		t.Errorf("identical inputs must share a fingerprint: %s vs %s", o1.Fingerprint[:12], o2.Fingerprint[:12])
+	}
+	if o2.TemplateName != o1.TemplateName {
+		t.Errorf("identical inputs must share a template: %s vs %s", o1.TemplateName, o2.TemplateName)
+	}
+	if o2.SourceDB == o1.SourceDB {
+		t.Errorf("distinct worktrees must keep distinct source prefixes: both %s", o2.SourceDB)
+	}
+	// Parity proof: wt2's own bare source prefix is populated.
+	assertDocCount(t, o2.SourceDB+"products", 2)
+	assertDocCount(t, o2.SourceDB+"orders", 1)
+}
+
 func buildConfig() *config.Config {
 	return &config.Config{
 		Connections: config.ConnectionsConfig{
@@ -131,7 +195,7 @@ func buildConfig() *config.Config {
 				Engine:       "elasticsearch",
 				NameTemplate: "treeman_e2e_{slug}",
 				KeyPrefix:    "wte2e_{slug}_",
-				Dump:         &config.DumpSpec{Path: "fixtures/dump.ndjson"},
+				Dump:         config.DumpList{{Path: "fixtures/dump.ndjson"}},
 			},
 		},
 	}

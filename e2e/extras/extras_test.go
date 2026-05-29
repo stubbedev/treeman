@@ -75,7 +75,7 @@ exit 0
 			{
 				Engine:       "mysql",
 				NameTemplate: "tm_xtr_dopt_{slug}",
-				Dump:         &config.DumpSpec{Path: "missing-seed.sql", Optional: true},
+				Dump:         config.DumpList{{Path: "missing-seed.sql", Optional: true}},
 				Migrate: &config.Step{
 					Run: "./migrate.sh",
 					Env: map[string]string{"DB_DATABASE": "{target_db}"},
@@ -126,7 +126,7 @@ func TestDumpRequiredFailsCleanly(t *testing.T) {
 			{
 				Engine:       "mysql",
 				NameTemplate: "tm_xtr_dreq_{slug}",
-				Dump:         &config.DumpSpec{Path: "missing-seed.sql"}, // optional: false
+				Dump:         config.DumpList{{Path: "missing-seed.sql"}}, // optional: false
 			},
 		},
 	}
@@ -156,7 +156,7 @@ func TestFanoutCapIsHonored(t *testing.T) {
 			{
 				Engine:       "mysql",
 				NameTemplate: "tm_xtr_fan_{slug}",
-				Dump:         &config.DumpSpec{Path: "seed.sql"},
+				Dump:         config.DumpList{{Path: "seed.sql"}},
 				Fanout:       2, // cap at 2 concurrent clones
 				TestClones: &config.TestClonesSpec{
 					Clones:       config.ClonesSetting{Fixed: 6},

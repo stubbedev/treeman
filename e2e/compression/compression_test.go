@@ -103,7 +103,7 @@ func TestCompressionFormatsLoadEndToEnd(t *testing.T) {
 					{
 						Engine:       "mysql",
 						NameTemplate: fmt.Sprintf("tm_cmp_%s_{slug}", c.name),
-						Dump:         &config.DumpSpec{Path: "seed.sql"},
+						Dump:         config.DumpList{{Path: "seed.sql"}},
 					},
 				},
 			}

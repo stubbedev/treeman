@@ -16,6 +16,7 @@ import (
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 func TestMongoEndToEnd(t *testing.T) {
@@ -100,6 +101,70 @@ func TestMongoEndToEnd(t *testing.T) {
 	if !mongoDBExists(t, o3.TemplateName) {
 		t.Errorf("template DB %s was dropped by teardown (cache must survive)", o3.TemplateName)
 	}
+}
+
+// TestCrossWorktreeCacheReuseRestoresSource pins engine parity (issue #9):
+// on a cache hit, the user-facing source database must be repopulated
+// from the template the same way mysql/postgres/redis do — not just the
+// clones. Two worktrees with identical content share one template (post-
+// v5 fingerprint); the second is a cache hit AND its bare source DB
+// holds the same data as the first. Pre-parity this test would fail at
+// the wt2 assertProductCount: Mongo cache-hit only fanned out clones,
+// and Mongo creates databases lazily, so wt2's source name never even
+// existed as a database.
+func TestCrossWorktreeCacheReuseRestoresSource(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mongo:27117", 60*time.Second, func() error {
+		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		c, err := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27117"))
+		if err != nil {
+			return err
+		}
+		defer c.Disconnect(pingCtx)
+		return c.Ping(pingCtx, nil)
+	})
+
+	wt1 := t.TempDir()
+	wt2 := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt1, "fixtures"))
+	copyTree(t, "fixtures", filepath.Join(wt2, "fixtures"))
+
+	// Shared store so wt2 can see wt1's snapshot row and cache-hit off it.
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "tm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	env1 := harness.NewEnvShared(t, st, wt1, "feature-one")
+	env2 := harness.NewEnvShared(t, st, wt2, "feature-two")
+
+	// wt1: cold build seeds source + clones.
+	o1 := harness.AssertOutcome(t, env1.RunPrepare(t, buildConfig()), "mongodb", false)
+	t.Logf("wt1 cold: source=%s template=%s", o1.SourceDB, o1.TemplateName)
+	assertProductCount(t, o1.SourceDB, 3)
+
+	// wt2: identical content → cache hit. With the parity fix the bare
+	// source DB is repopulated as part of the fan-out, so it exists with
+	// the seeded products.
+	o2 := harness.AssertOutcome(t, env2.RunPrepare(t, buildConfig()), "mongodb", true)
+	t.Logf("wt2 hit:  source=%s template=%s", o2.SourceDB, o2.TemplateName)
+	if o2.Fingerprint != o1.Fingerprint {
+		t.Errorf("identical inputs must share a fingerprint: %s vs %s", o1.Fingerprint[:12], o2.Fingerprint[:12])
+	}
+	if o2.TemplateName != o1.TemplateName {
+		t.Errorf("identical inputs must share a template: %s vs %s", o1.TemplateName, o2.TemplateName)
+	}
+	if o2.SourceDB == o1.SourceDB {
+		t.Errorf("distinct worktrees must keep distinct source DBs: both %s", o2.SourceDB)
+	}
+	// Parity proof: wt2's own bare source DB exists and is populated.
+	if !mongoDBExists(t, o2.SourceDB) {
+		t.Fatalf("wt2 source DB %s should exist after cache-hit source restore", o2.SourceDB)
+	}
+	assertProductCount(t, o2.SourceDB, 3)
 }
 
 // mongoDBExists reports whether a database named `name` is listed by the

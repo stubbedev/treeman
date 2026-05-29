@@ -59,7 +59,7 @@ func TestPostgresComposeService(t *testing.T) {
 			},
 		},
 		Databases: []config.DatabaseConfig{{
-			Engine: "postgres", NameTemplate: "mxpg_svc_{slug}", Dump: &config.DumpSpec{Path: "seed.sql"},
+			Engine: "postgres", NameTemplate: "mxpg_svc_{slug}", Dump: config.DumpList{{Path: "seed.sql"}},
 		}},
 	}
 	o := harness.AssertOutcome(t, harness.NewEnv(t, wt).RunPrepare(t, cfg), "postgres", false)
@@ -82,7 +82,7 @@ func TestPostgresClonesAuto(t *testing.T) {
 			Postgres: &config.PostgresConn{Host: "127.0.0.1", Port: 15440, User: "postgres", Password: "pgpw"},
 		},
 		Databases: []config.DatabaseConfig{{
-			Engine: "postgres", NameTemplate: "mxpg_ca_{slug}", Dump: &config.DumpSpec{Path: "seed.sql"},
+			Engine: "postgres", NameTemplate: "mxpg_ca_{slug}", Dump: config.DumpList{{Path: "seed.sql"}},
 			TestClones: &config.TestClonesSpec{Clones: config.ClonesSetting{Auto: true}, NameTemplate: "mxpg_ca_{slug}_w{n}"},
 		}},
 	}

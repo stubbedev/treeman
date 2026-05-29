@@ -379,8 +379,10 @@ type branchScopedArgs struct {
 	inheritedEnv map[string]string
 
 	eng *branchEngine
-	// loadDump loads the static fallback dump into the active namespace.
-	loadDump func(ctx context.Context, active, dumpPath string) error
+	// loadDump loads one static fallback dump entry into the active
+	// namespace. seedFresh calls it once per resolved dumpFile so the
+	// per-entry SourceDB (mongo namespace remap) is honoured.
+	loadDump func(ctx context.Context, active string, dump dumpFile) error
 	// resolveParent, when non-nil, overrides the default git-upstream +
 	// store base-branch resolver. Only tests set it; production leaves it
 	// nil so `fill` uses resolveBaseSourceDB.
@@ -496,11 +498,15 @@ func (a branchScopedArgs) seedFresh(ctx context.Context, active, branch string) 
 			return false, "", fmt.Errorf("empty active %s: %w", active, err)
 		}
 		builtEmpty = true
-		if dp, ok, derr := dumpReady(a.d.Dump, a.worktreePath); derr != nil {
+		dumps, derr := dumpsReady(a.d.Dump, a.worktreePath)
+		if derr != nil {
 			return false, "", derr
-		} else if ok && a.loadDump != nil {
-			if err := a.loadDump(ctx, active, dp); err != nil {
-				return false, "", fmt.Errorf("load dump %s: %w", dp, err)
+		}
+		if len(dumps) > 0 && a.loadDump != nil {
+			for _, dr := range dumps {
+				if err := a.loadDump(ctx, active, dr); err != nil {
+					return false, "", fmt.Errorf("load dump %s: %w", dr.Path, err)
+				}
 			}
 			how = "dump"
 		} else {

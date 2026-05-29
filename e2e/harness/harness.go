@@ -113,6 +113,34 @@ func NewEnv(t *testing.T, wtPath string) *Env {
 	}
 }
 
+// NewEnvShared is NewEnv but with the store supplied by the caller, so
+// two envs can share a single SQLite snapshot table. Used by cross-
+// worktree cache-reuse tests where wt2 must see the snapshot row wt1
+// just wrote. `branch` lets each env carry a distinct slug-input even
+// when its worktree path is colocated with another's t.TempDir.
+func NewEnvShared(t *testing.T, st *store.Store, wtPath, branch string) *Env {
+	t.Helper()
+	ctx := context.Background()
+	repoID, err := st.EnsureRepo(ctx, wtPath, filepath.Base(wtPath))
+	if err != nil {
+		t.Fatalf("ensure repo: %v", err)
+	}
+	sl := slug.For(wtPath, branch)
+	wtID, err := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, branch)
+	if err != nil {
+		t.Fatalf("ensure worktree: %v", err)
+	}
+	return &Env{
+		Ctx:      ctx,
+		Store:    st,
+		RepoID:   repoID,
+		WTID:     wtID,
+		Slug:     sl,
+		RepoPath: wtPath,
+		WTPath:   wtPath,
+	}
+}
+
 // RunPrepare calls prepare.Run against the env's stored worktree.
 // Returns the per-DB Outcomes so the test can assert on cache-hit
 // status and database/template names.

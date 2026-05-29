@@ -84,7 +84,7 @@ func runAutoCase(t *testing.T, prefix string, markers map[string]string) {
 		Databases: []config.DatabaseConfig{{
 			Engine:       "mysql",
 			NameTemplate: prefix + "_{slug}",
-			Dump:         &config.DumpSpec{Path: "seed.sql"},
+			Dump:         config.DumpList{{Path: "seed.sql"}},
 			TestClones: &config.TestClonesSpec{
 				Clones:       config.ClonesSetting{Auto: true},
 				NameTemplate: prefix + "_{slug}_w{n}",

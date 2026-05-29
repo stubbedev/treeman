@@ -160,6 +160,24 @@ func TestSiblingWorktreeDBsSurviveMainWtColdBuild(t *testing.T) {
 		t.Fatalf("sibling es index didn't materialise: %v", sibESBefore)
 	}
 
+	// Post-v5 the snapshot fingerprint is content-only: the main
+	// worktree (bare `sibling_e2e`) and the sibling share inputs, so
+	// they share a fingerprint. The main prepare would otherwise CACHE
+	// HIT off the sibling's just-built template and never run the
+	// cold-build DROP this regression test exists to guard. Clear the
+	// repo's snapshot rows to force a cache miss so the bare-named cold
+	// build (and its exact DropDatabase / slug-anchored prefix drops)
+	// is actually exercised.
+	cands, err := st.ListSnapshotsForRepo(ctx, repoID)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+	for _, c := range cands {
+		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
+			t.Fatalf("clear snapshot %s: %v", c.Fingerprint, err)
+		}
+	}
+
 	// Now run prepare for the MAIN worktree with the main_worktree
 	// overlay applied. Overlay rebinds the source name to a bare
 	// `sibling_e2e` / `sibling_mongo` — under the pre-fix code this

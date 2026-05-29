@@ -58,7 +58,7 @@ INSERT INTO widgets VALUES (1, 'one'), (2, 'two'), (3, 'three');`), 0o644); err 
 			{
 				Engine:       "mysql",
 				NameTemplate: "tm_fan_{slug}",
-				Dump:         &config.DumpSpec{Path: "seed.sql"},
+				Dump:         config.DumpList{{Path: "seed.sql"}},
 				TestClones: &config.TestClonesSpec{
 					Clones:       config.ClonesSetting{Fixed: nClones},
 					NameTemplate: "tm_fan_{slug}_w{n}",

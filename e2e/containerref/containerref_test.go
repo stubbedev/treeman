@@ -77,7 +77,7 @@ func TestContainerRefPublishedPort(t *testing.T) {
 			{
 				Engine:       "mysql",
 				NameTemplate: "tm_ctr_pub_{slug}",
-				Dump:         &config.DumpSpec{Path: "seed.sql"},
+				Dump:         config.DumpList{{Path: "seed.sql"}},
 			},
 		},
 	}
@@ -117,7 +117,7 @@ func TestContainerRefBridgeIP(t *testing.T) {
 			{
 				Engine:       "mysql",
 				NameTemplate: "tm_ctr_brg_{slug}",
-				Dump:         &config.DumpSpec{Path: "seed.sql"},
+				Dump:         config.DumpList{{Path: "seed.sql"}},
 			},
 		},
 	}
@@ -169,7 +169,7 @@ func TestContainerRefComposeService(t *testing.T) {
 		Databases: []config.DatabaseConfig{{
 			Engine:       "mysql",
 			NameTemplate: "tm_ctr_svc_{slug}",
-			Dump:         &config.DumpSpec{Path: "seed.sql"},
+			Dump:         config.DumpList{{Path: "seed.sql"}},
 		}},
 	}
 	env := harness.NewEnv(t, wt)

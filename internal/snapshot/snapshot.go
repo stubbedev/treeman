@@ -2,9 +2,14 @@
 // fan-out logic.
 //
 // A SnapshotKey is the cache key the prepare orchestrator uses to
-// look up a built template DB: identical (engine, source DB name,
-// migrations_hash, dump_hash, lockfile_hashes) means an existing
-// template can be restored instead of rebuilt from scratch.
+// look up a built template DB. The key is purely CONTENT-addressed:
+// identical (engine, engine_version, migrations_hash, dump_hash,
+// lockfile_hashes) means an existing template can be restored
+// instead of rebuilt from scratch. The database *name* the template
+// is restored into is deliberately NOT part of the key — a template
+// built for `app_testing` is byte-identical to one built for
+// `app_testing_feature-x`, so every worktree of the same repo/branch
+// shares one template instead of cold-building its own.
 package snapshot
 
 import (
@@ -25,17 +30,20 @@ import (
 // hashes that feed it. v3 hashes the canonical field stream directly
 // into blake3 (no JSON intermediate). v4 dropped the Framework field
 // (framework dispatch was removed; the migrate command is declared
-// per-repo in YAML). Every existing _tm_… template rebuilds once
-// after each bump.
-const FormatVersion uint32 = 4
+// per-repo in YAML). v5 dropped SourceDBName: a template's content is
+// independent of the database name it's restored into, so keying on
+// the name fragmented the cache per-worktree and forced redundant
+// cold builds. Every existing _tm_… template rebuilds once after each
+// bump.
+const FormatVersion uint32 = 5
 
 // Key fingerprints a snapshot. Two prepare runs that share every
-// field can reuse the same template DB.
+// field can reuse the same template DB. The key is content-only — it
+// intentionally omits the source DB name (see FormatVersion v5).
 type Key struct {
 	FormatVersion     uint32            `json:"format_version"`
 	Engine            string            `json:"engine"`
 	EngineVersion     string            `json:"engine_version"`
-	SourceDBName      string            `json:"source_db_name"`
 	HashMode          string            `json:"hash_mode"`
 	MigrationsHashHex string            `json:"migrations_hash_hex"`
 	DumpHashHex       string            `json:"dump_hash_hex,omitempty"`
@@ -43,7 +51,7 @@ type Key struct {
 }
 
 // New constructs a Key with the format version pinned.
-func New(engine, engineVersion, sourceDB, hashMode, migrationsHash, dumpHash string, lockfileHashes map[string]string) Key {
+func New(engine, engineVersion, hashMode, migrationsHash, dumpHash string, lockfileHashes map[string]string) Key {
 	if lockfileHashes == nil {
 		lockfileHashes = map[string]string{}
 	}
@@ -51,7 +59,6 @@ func New(engine, engineVersion, sourceDB, hashMode, migrationsHash, dumpHash str
 		FormatVersion:     FormatVersion,
 		Engine:            engine,
 		EngineVersion:     engineVersion,
-		SourceDBName:      sourceDB,
 		HashMode:          hashMode,
 		MigrationsHashHex: migrationsHash,
 		DumpHashHex:       dumpHash,
@@ -83,7 +90,6 @@ func (k Key) Fingerprint() string {
 	for _, s := range []string{
 		k.Engine,
 		k.EngineVersion,
-		k.SourceDBName,
 		k.HashMode,
 		k.MigrationsHashHex,
 		k.DumpHashHex,
