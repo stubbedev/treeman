@@ -693,9 +693,13 @@ func prepareMySQL(
 	// of this run's) and clone + migrate from there instead of a full
 	// cold build. The migration framework's own ledger skips the
 	// already-applied files so only the new ones run.
-	out, done, err = mysqlIncrementalBuild(ctx, drv, cfg, d, tplCtx, worktreePath, st,
+	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
-		inheritedEnv, started)
+		inheritedEnv, started, incrementalOps{
+			exists:          drv.DatabaseExists,
+			snapshotRestore: drv.SnapshotRestore,
+			snapshotCreate:  drv.SnapshotCreate,
+		})
 	if done || err != nil {
 		return out, err
 	}
@@ -957,8 +961,29 @@ func mysqlSnapshotAndRecord(
 	return nil
 }
 
-// mysqlIncrementalBuild looks for a content-prefix ancestor template
-// and, when found, clones it into the source DB and runs only `migrate`
+// incrementalOps bundles the engine-specific primitives the generic
+// `tryIncrementalBuild` orchestrator needs. Each engine driver exposes
+// these under different concrete types (DatabaseExists vs PrefixExists
+// vs ListMatching), so wrapping them in `func` values lets one helper
+// drive every engine.
+type incrementalOps struct {
+	// exists reports whether a namespace (DB name for name-scoped
+	// engines, key/index prefix for prefix-scoped engines) is present
+	// on the engine. Used to detect a ghost ancestor whose SQLite row
+	// outlived its template DB.
+	exists func(ctx context.Context, name string) (bool, error)
+	// snapshotRestore copies a template namespace into a target. Same
+	// signature as cloneRestorer; engines already expose this for the
+	// cache-hit and fan-out paths so no new driver method is needed.
+	snapshotRestore cloneRestorer
+	// snapshotCreate copies a populated source into a NEW template
+	// (mysql DDL+INSERT, postgres CREATE DATABASE TEMPLATE, mongo $out,
+	// redis COPY, ES _clone). Wraps the per-driver SnapshotCreate.
+	snapshotCreate func(ctx context.Context, source, template string) error
+}
+
+// tryIncrementalBuild looks for a content-prefix ancestor template and,
+// when found, clones it into the source namespace and runs only `migrate`
 // on top — letting the framework's own migrations ledger skip the
 // already-applied files. Dump-load and seed are skipped (the ancestor
 // template already includes them). On success it records a NEW snapshot
@@ -967,30 +992,35 @@ func mysqlSnapshotAndRecord(
 // path. (Outcome{}, false, nil) means "no incremental possible, do the
 // full cold build."
 //
-// Contract mirrors mysqlCacheHit: any error inside is converted into
-// a fall-through so the cold-build path can still recover. The new
-// `prepare_incremental_start` / `prepare_incremental_fallback` events
-// surface why the path was taken or abandoned.
+// Generic across all five engines: takes engine-specific primitives
+// (exists / snapshotRestore / snapshotCreate) in an `incrementalOps`
+// struct so the orchestration is written once.
 //
-//nolint:gocyclo // one self-contained orchestrator with explicit fall-through events — splitting just spreads the same branches across helpers without simplifying review
-func mysqlIncrementalBuild(
+// Contract mirrors the cache-hit fallbacks: any error inside is
+// converted into a fall-through so the cold-build path can still
+// recover. The `prepare_incremental_start` /
+// `prepare_incremental_fallback` events surface why the path was taken
+// or abandoned.
+//
+//nolint:gocyclo,funlen // one self-contained orchestrator with explicit fall-through events — splitting just spreads the same branches across helpers without simplifying review
+func tryIncrementalBuild(
 	ctx context.Context,
-	drv *dbmysql.Driver,
 	cfg *config.Config,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
 	worktreePath string,
 	st *store.Store,
 	repoID, worktreeID int64,
-	sourceDB, templateName, version string,
+	source, templateName, version string,
 	maxConns int,
 	key snapshot.Key,
 	inputs map[string]store.InputVector,
 	inheritedEnv map[string]string,
 	started time.Time,
+	ops incrementalOps,
 ) (Outcome, bool, error) {
 	commandsHash := key.LockfileHashes[store.CommandsHashKey]
-	anc, _ := st.FindAncestorSnapshot(ctx, repoID, "mysql", version, key.DumpHashHex, commandsHash, inputs)
+	anc, _ := st.FindAncestorSnapshot(ctx, repoID, d.Engine, version, key.DumpHashHex, commandsHash, inputs)
 	if anc == nil {
 		return Outcome{}, false, nil
 	}
@@ -999,21 +1029,21 @@ func mysqlIncrementalBuild(
 	unpinAnc := snapshot.Pin(anc.Fingerprint)
 	defer unpinAnc()
 
-	exists, _ := drv.DatabaseExists(ctx, anc.TemplateName)
+	exists, _ := ops.exists(ctx, anc.TemplateName)
 	if !exists {
-		// Ghost row: SQLite remembers the template but MySQL doesn't.
-		// Clear the row so future preps stop picking it as an ancestor
-		// and fall through to a full cold build for this run.
+		// Ghost row: SQLite remembers the template but the engine
+		// doesn't. Clear the row so future preps stop picking it and
+		// fall through to a full cold build for this run.
 		_ = st.DeleteSnapshot(ctx, anc.Fingerprint)
 		return Outcome{}, false, nil
 	}
 
 	delta := vectorDelta(anc.Inputs, inputs)
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_incremental_start",
-		fmt.Sprintf("engine=mysql ancestor=%s files_added=%d", anc.TemplateName, delta),
+		fmt.Sprintf("engine=%s ancestor=%s files_added=%d", d.Engine, anc.TemplateName, delta),
 		repoID, worktreeID, "", 0, map[string]string{
-			"engine":               "mysql",
-			"source_db":            sourceDB,
+			"engine":               d.Engine,
+			"source_db":            source,
 			"template":             templateName,
 			"fingerprint":          key.Fingerprint(),
 			"ancestor_template":    anc.TemplateName,
@@ -1024,42 +1054,61 @@ func mysqlIncrementalBuild(
 	// Restore ancestor template → source. SnapshotRestore drops the
 	// target first, so any stale source contents are cleared.
 	restoreStart := time.Now()
-	if err := drv.SnapshotRestore(ctx, anc.TemplateName, sourceDB); err != nil {
+	if err := ops.snapshotRestore(ctx, anc.TemplateName, source); err != nil {
 		_ = st.WriteEvent(ctx, store.LevelWarn, "prepare_incremental_fallback",
 			fmt.Sprintf("ancestor restore failed: %v", err),
 			repoID, worktreeID, "", 0, map[string]string{
-				"engine":               "mysql",
+				"engine":               d.Engine,
 				"ancestor_template":    anc.TemplateName,
 				"ancestor_fingerprint": anc.Fingerprint,
 				"error":                err.Error(),
 			})
 		return Outcome{}, false, nil
 	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "incremental-restore", restoreStart)
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "incremental-restore", restoreStart)
 
 	if d.Migrate != nil {
 		migrateStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "mysql", "migrate", sourceDB))
-		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
+		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, d.Engine, "migrate", source))
+		out, err := runner.Run(ctx, spec, worktreePath, source, tplCtx, inheritedEnv)
 		if err != nil {
-			return Outcome{}, false, fmt.Errorf("incremental migrate %s: %w", sourceDB, err)
+			return Outcome{}, false, fmt.Errorf("incremental migrate %s: %w", source, err)
 		}
 		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "mysql", sourceDB, "migrate", out)
-			return Outcome{}, false, fmt.Errorf("%s", runner.FormatError("incremental migrate", sourceDB, out))
+			emitRunnerError(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", out)
+			return Outcome{}, false, fmt.Errorf("%s", runner.FormatError("incremental migrate", source, out))
 		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", migrateStart)
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", migrateStart)
 	}
 
-	if err := mysqlSnapshotAndRecord(ctx, drv, cfg, d, st, repoID, worktreeID, sourceDB, templateName, version, key, inputs); err != nil {
-		return Outcome{}, false, err
+	snapStart := time.Now()
+	if err := ops.snapshotCreate(ctx, source, templateName); err != nil {
+		return Outcome{}, false, fmt.Errorf("incremental snapshot create %s → %s: %w", source, templateName, err)
 	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "snapshot-create", snapStart)
+	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
+		Fingerprint:    key.Fingerprint(),
+		Engine:         d.Engine,
+		EngineVersion:  version,
+		SourceDB:       source,
+		TemplateName:   templateName,
+		MigrationsHash: key.MigrationsHashHex,
+		DumpHash:       key.DumpHashHex,
+		LockfileHashes: key.LockfileHashes,
+		Inputs:         inputs,
+		RepoID:         repoID,
+	})
+	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
+		evictCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		snapshot.EvictExcess(evictCtx, cfg, st, repoID)
+	}()
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
 		return Outcome{}, false, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName,
+	if err := fanOutClones(ctx, st, repoID, worktreeID, ops.snapshotRestore, templateName,
 		clones, d.Engine, d.Fanout, maxConns); err != nil {
 		return Outcome{}, false, err
 	}
@@ -1069,8 +1118,8 @@ func mysqlIncrementalBuild(
 		fmt.Sprintf("incremental clones=%d duration=%dms ancestor=%s files_added=%d",
 			len(clones), ms, anc.TemplateName, delta),
 		repoID, worktreeID, "", 0, map[string]string{
-			"engine":               "mysql",
-			"source_db":            sourceDB,
+			"engine":               d.Engine,
+			"source_db":            source,
 			"template":             templateName,
 			"clones":               strconv.Itoa(len(clones)),
 			"fingerprint":          key.Fingerprint(),
@@ -1083,7 +1132,7 @@ func mysqlIncrementalBuild(
 
 	return Outcome{
 		Engine:          d.Engine,
-		SourceDB:        sourceDB,
+		SourceDB:        source,
 		TemplateName:    templateName,
 		Fingerprint:     key.Fingerprint(),
 		CacheHit:        false,
@@ -1112,6 +1161,8 @@ func vectorDelta(ancestor, current map[string]store.InputVector) int {
 // primitive — fast because pg copies on-disk files instead of
 // replaying SQL. Cache hit path identical to MySQL: SQLite
 // fingerprint lookup + pg_database existence check.
+//
+//nolint:funlen // mirrors the linear cache-hit / incremental / cold-build / fanout flow used by every engine; extracting helpers just spreads the same conditions across functions
 func preparePostgres(
 	ctx context.Context,
 	cfg *config.Config,
@@ -1181,6 +1232,22 @@ func preparePostgres(
 		return out, err
 	}
 
+	// Per-input vectors used for ancestor lookup AND persisted into
+	// the new snapshot row so future preps can build incrementally
+	// off this one. Mirrors prepareMySQL.
+	inputs := computeInputVectors(ctx, st, d, worktreePath)
+
+	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
+		inheritedEnv, started, incrementalOps{
+			exists:          drv.DatabaseExists,
+			snapshotRestore: drv.SnapshotRestore,
+			snapshotCreate:  drv.SnapshotCreate,
+		})
+	if done || err != nil {
+		return out, err
+	}
+
 	if err := postgresColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
@@ -1193,6 +1260,7 @@ func preparePostgres(
 		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
 		SourceDB: sourceDB, TemplateName: templateName,
 		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
+		Inputs: inputs,
 		RepoID: repoID,
 	})
 	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
@@ -1455,6 +1523,19 @@ func prepareMongo(
 		return out, err
 	}
 
+	inputs := computeInputVectors(ctx, st, d, worktreePath)
+
+	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, sourceDB, templateName, version, 0, key, inputs,
+		inheritedEnv, started, incrementalOps{
+			exists:          drv.DatabaseExists,
+			snapshotRestore: drv.SnapshotRestore,
+			snapshotCreate:  drv.SnapshotCreate,
+		})
+	if done || err != nil {
+		return out, err
+	}
+
 	if err := mongoColdBuildSteps(ctx, drv, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
@@ -1467,6 +1548,7 @@ func prepareMongo(
 		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
 		SourceDB: sourceDB, TemplateName: templateName,
 		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
+		Inputs: inputs,
 		RepoID: repoID,
 	})
 	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
@@ -1738,6 +1820,19 @@ func prepareRedisPrefix(
 		return out, err
 	}
 
+	inputs := computeInputVectors(ctx, st, d, worktreePath)
+
+	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, sourcePrefix, templatePrefix, version, 0, key, inputs,
+		inheritedEnv, started, incrementalOps{
+			exists:          drv.PrefixExists,
+			snapshotRestore: drv.SnapshotRestore,
+			snapshotCreate:  drv.SnapshotCreate,
+		})
+	if done || err != nil {
+		return out, err
+	}
+
 	// Cold build: drop source, run seed, snapshot template, fanout.
 	if err := redisColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
 		return Outcome{}, err
@@ -1751,6 +1846,7 @@ func prepareRedisPrefix(
 		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
 		SourceDB: sourcePrefix, TemplateName: templatePrefix,
 		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
+		Inputs: inputs,
 		RepoID: repoID,
 	})
 	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
@@ -1990,6 +2086,22 @@ func prepareES(
 		return out, err
 	}
 
+	inputs := computeInputVectors(ctx, st, d, worktreePath)
+
+	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, sourcePrefix, templatePrefix, version, 0, key, inputs,
+		inheritedEnv, started, incrementalOps{
+			exists: func(ctx context.Context, name string) (bool, error) {
+				m, err := drv.ListMatching(ctx, name)
+				return len(m) > 0, err
+			},
+			snapshotRestore: drv.SnapshotRestore,
+			snapshotCreate:  drv.SnapshotCreate,
+		})
+	if done || err != nil {
+		return out, err
+	}
+
 	if err := esColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
@@ -2002,6 +2114,7 @@ func prepareES(
 		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
 		SourceDB: sourcePrefix, TemplateName: templatePrefix,
 		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
+		Inputs: inputs,
 		RepoID: repoID,
 	})
 	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx

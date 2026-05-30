@@ -185,6 +185,71 @@ func TestCrossWorktreeCacheReuseRestoresSource(t *testing.T) {
 	assertDocCount(t, o2.SourceDB+"orders", 1)
 }
 
+// TestIncrementalAncestorBuild proves task #4 wired to elasticsearch:
+// adding a NEW file under an `inputs:` glob (an extending vector, never
+// an edit) makes the next prep build from the cached ancestor template
+// — clone every index via the native `_clone` API, skip the NDJSON dump
+// reload, just register the new snapshot — instead of dropping the
+// source prefix and re-streaming the bulk file.
+func TestIncrementalAncestorBuild(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "es:19200", 120*time.Second, func() error {
+		resp, err := http.Get("http://127.0.0.1:19200/_cluster/health?wait_for_status=yellow&timeout=5s")
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("cluster not ready: %s", resp.Status)
+		}
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	extrasDir := filepath.Join(wt, "extras")
+	if err := os.MkdirAll(extrasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extrasDir, "a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := buildConfig()
+	cfg.Databases[0].Inputs = append(cfg.Databases[0].Inputs, config.Input{
+		Glob:  "extras/*.txt",
+		Label: "extras",
+	})
+
+	env := harness.NewEnv(t, wt)
+	o1 := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "elasticsearch", false)
+	if o1.IncrementalBase != "" {
+		t.Fatalf("pass 1 should be cold; got base=%s", o1.IncrementalBase)
+	}
+	assertDocCount(t, o1.SourceDB+"products", 2)
+	assertDocCount(t, o1.SourceDB+"orders", 1)
+	t.Logf("pass1 cold: fp=%s tmpl=%s", o1.Fingerprint[:12], o1.TemplateName)
+
+	if err := os.WriteFile(filepath.Join(extrasDir, "b.txt"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	o2 := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "elasticsearch", false)
+	if o2.IncrementalBase != o1.Fingerprint {
+		t.Errorf("pass 2 should build incrementally from pass 1; got IncrementalBase=%q want %q",
+			o2.IncrementalBase, o1.Fingerprint)
+	}
+	if o2.Fingerprint == o1.Fingerprint {
+		t.Errorf("pass 2 must produce a NEW fingerprint: still %s", o1.Fingerprint[:12])
+	}
+	t.Logf("pass2 incremental: fp=%s base=%s", o2.Fingerprint[:12], o2.IncrementalBase[:12])
+	// Source prefix carries the loaded indices from the ancestor template
+	// (the dump did NOT re-stream — we skipped it via incremental).
+	assertDocCount(t, o2.SourceDB+"products", 2)
+	assertDocCount(t, o2.SourceDB+"orders", 1)
+}
+
 func buildConfig() *config.Config {
 	return &config.Config{
 		Connections: config.ConnectionsConfig{

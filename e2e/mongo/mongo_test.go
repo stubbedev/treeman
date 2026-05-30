@@ -103,6 +103,71 @@ func TestMongoEndToEnd(t *testing.T) {
 	}
 }
 
+// TestIncrementalAncestorBuild proves task #4 wired to mongo: adding a
+// NEW file under an `inputs:` glob (the prefix of an existing vector
+// gets extended, never edited) makes the next prep build from the
+// cached ancestor template — clone the seeded collections via $out,
+// skip dump/seed, just register the new snapshot — instead of dropping
+// the source DB and re-running the seed.
+func TestIncrementalAncestorBuild(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mongo:27117", 60*time.Second, func() error {
+		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		c, err := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27117"))
+		if err != nil {
+			return err
+		}
+		defer c.Disconnect(pingCtx)
+		return c.Ping(pingCtx, nil)
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	extrasDir := filepath.Join(wt, "extras")
+	if err := os.MkdirAll(extrasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extrasDir, "a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := buildConfig()
+	cfg.Databases[0].Inputs = append(cfg.Databases[0].Inputs, config.Input{
+		Glob:  "extras/*.txt",
+		Label: "extras",
+	})
+
+	env := harness.NewEnv(t, wt)
+	o1 := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mongodb", false)
+	if o1.IncrementalBase != "" {
+		t.Fatalf("pass 1 should be cold; got base=%s", o1.IncrementalBase)
+	}
+	assertProductCount(t, o1.SourceDB, 3)
+	t.Logf("pass1 cold: fp=%s tmpl=%s", o1.Fingerprint[:12], o1.TemplateName)
+
+	if err := os.WriteFile(filepath.Join(extrasDir, "b.txt"), []byte("b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	o2 := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mongodb", false)
+	if o2.IncrementalBase != o1.Fingerprint {
+		t.Errorf("pass 2 should build incrementally from pass 1; got IncrementalBase=%q want %q",
+			o2.IncrementalBase, o1.Fingerprint)
+	}
+	if o2.Fingerprint == o1.Fingerprint {
+		t.Errorf("pass 2 must produce a NEW fingerprint: still %s", o1.Fingerprint[:12])
+	}
+	t.Logf("pass2 incremental: fp=%s base=%s", o2.Fingerprint[:12], o2.IncrementalBase[:12])
+	// Source DB carries the seeded products from the ancestor template
+	// (the seed step did NOT re-run — we skipped it via incremental).
+	if !mongoDBExists(t, o2.SourceDB) {
+		t.Fatalf("wt2 source DB %s should exist after incremental clone", o2.SourceDB)
+	}
+	assertProductCount(t, o2.SourceDB, 3)
+}
+
 // TestCrossWorktreeCacheReuseRestoresSource pins engine parity (issue #9):
 // on a cache hit, the user-facing source database must be repopulated
 // from the template the same way mysql/postgres/redis do — not just the

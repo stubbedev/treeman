@@ -165,6 +165,52 @@ func mustWrite(t *testing.T, path, body string) {
 	}
 }
 
+// TestIncrementalAncestorBuild proves task #4 wired to postgres: adding
+// a new migration on top of an already-cached template builds
+// incrementally from the cached ancestor (clone via CREATE DATABASE
+// TEMPLATE + migrate the new file only) instead of cold-rebuilding from
+// the dump + replaying every migration. The fixture migrate.sh is
+// ledger-aware (`_treeman_e2e_migrations`) so cloning the ancestor
+// carries its partial ledger forward and only the new file actually
+// runs.
+func TestIncrementalAncestorBuild(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "postgres:15432", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:15432", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	env := harness.NewEnv(t, wt)
+
+	o1 := harness.AssertOutcome(t, env.RunPrepare(t, buildConfig()), "postgres", false)
+	if o1.IncrementalBase != "" {
+		t.Fatalf("pass 1 (first cold build) should not be incremental; got base=%s", o1.IncrementalBase)
+	}
+	t.Logf("pass1 cold: fp=%s tmpl=%s", o1.Fingerprint[:12], o1.TemplateName)
+
+	addMigration(t, wt)
+
+	o2 := harness.AssertOutcome(t, env.RunPrepare(t, buildConfig()), "postgres", false)
+	if o2.IncrementalBase != o1.Fingerprint {
+		t.Errorf("pass 2 should build incrementally from pass 1; got IncrementalBase=%q want %q",
+			o2.IncrementalBase, o1.Fingerprint)
+	}
+	if o2.Fingerprint == o1.Fingerprint {
+		t.Errorf("pass 2 must produce a NEW fingerprint (extra migration): still %s", o1.Fingerprint[:12])
+	}
+	t.Logf("pass2 incremental: fp=%s tmpl=%s base=%s",
+		o2.Fingerprint[:12], o2.TemplateName, o2.IncrementalBase[:12])
+
+	assertTables(t, "127.0.0.1:15432", o2.SourceDB, []string{"products", "orders", "shipments"})
+}
+
 func assertWidgetCount(t *testing.T, addr, dbName string, want int) {
 	t.Helper()
 	dsn := fmt.Sprintf("postgres://postgres:pgpw@%s/%s?sslmode=disable", addr, dbName)
