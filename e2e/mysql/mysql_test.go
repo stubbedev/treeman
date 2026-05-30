@@ -209,6 +209,122 @@ func TestIncrementalAncestorBuild(t *testing.T) {
 	assertTablesPresent(t, "127.0.0.1:13306", o2.SourceDB, []string{"products", "orders", "shipments"})
 }
 
+// TestMySQLDumpLoadViaDockerExec proves the mysql dump-load dispatcher
+// picks the docker-exec fast path when ContainerRef is set. The
+// physical-clone test asserts on the SNAPSHOT-create strategy event
+// (which fires later in the same prepare run); this one zooms in on
+// the dump-load phase event to confirm the dispatcher fired correctly
+// for the dump too.
+func TestMySQLDumpLoadViaDockerExec(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	cfg := buildConfig()
+	cfg.Connections.Mysql.Port = 3306
+	cfg.Connections.Mysql.ContainerRef = config.ContainerRef{
+		Container: "treeman-e2e-mysql",
+	}
+
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mysql", false)
+
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"prepare_phase"},
+		Phases:     []string{"dump-load"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawDockerExec bool
+	for _, e := range evs {
+		t.Logf("phase event: %s", e.Message)
+		if strings.Contains(e.Message, "strategy=docker-exec") {
+			sawDockerExec = true
+		}
+	}
+	if !sawDockerExec {
+		t.Errorf("expected strategy=docker-exec for dump-load — ContainerRef should have selected mysql-in-container")
+	}
+	assertTablesPresent(t, "127.0.0.1:13306", o.SourceDB, []string{"products", "orders"})
+}
+
+// TestPhysicalClonePreconditionsFailSkipsToLogical proves the safe
+// fallback: when the physical-clone preconditions fail (here: source
+// schema has a non-InnoDB table), SnapshotCreate falls back to the
+// logical INSERT-SELECT path and the cold build completes normally.
+// The snapshot_clone_strategy event reports strategy=logical.
+func TestPhysicalClonePreconditionsFailSkipsToLogical(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	// Override the fixture migrations dir with a single migration that
+	// creates a MEMORY-engine table. listInnoDBTables sees that and
+	// returns physicalSkippedError, which the dispatcher converts to
+	// a debug log + fall-through to the logical clone.
+	if err := os.MkdirAll(filepath.Join(wt, "fixtures/migrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Copy the fixture migrate.sh + seed.sql; only the migrations dir
+	// differs from the default fixtures.
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	mem := `CREATE TABLE volatile_cache (id INT PRIMARY KEY) ENGINE=MEMORY;` + "\n"
+	if err := os.WriteFile(
+		filepath.Join(wt, "fixtures/migrations/2024_02_01_000001_memory_table.sql"),
+		[]byte(mem), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := buildConfig()
+	cfg.Connections.Mysql.Port = 3306
+	cfg.Connections.Mysql.ContainerRef = config.ContainerRef{
+		Container: "treeman-e2e-mysql",
+	}
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mysql", false)
+	t.Logf("cold build with MEMORY table: source=%s template=%s", o.SourceDB, o.TemplateName)
+
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"snapshot_clone_strategy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) == 0 {
+		t.Fatal("no snapshot_clone_strategy events — instrumentation regression")
+	}
+	for _, e := range evs {
+		t.Logf("clone strategy event: %s", e.Message)
+		if strings.Contains(e.Message, "strategy=physical") {
+			t.Errorf("expected strategy=logical (MEMORY table forbids physical clone); got physical: %s", e.Message)
+		}
+	}
+
+	// The source DB must still carry every table including the MEMORY
+	// one — the logical fallback handles all engines, not just InnoDB.
+	assertTablesPresent(t, "127.0.0.1:13306", o.SourceDB, []string{"products", "orders", "volatile_cache"})
+}
+
 // TestPhysicalCloneViaContainerExec proves task #6: when the MySQL
 // connection carries a ContainerRef, treeman's SnapshotCreate runs
 // InnoDB transferable tablespaces via `docker exec cp` instead of the

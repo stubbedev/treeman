@@ -30,9 +30,13 @@ import (
 //     available — selected when neither CLI path is.
 //
 // Compression (gzip/zstd/bzip2/xz) is auto-detected from the dump's
-// magic bytes. Every literal `{target_db}` token in the file is
-// substituted with `targetPrefix` before sending, mirroring the ES
-// dump's templating convention.
+// magic bytes.
+//
+// Unlike the ES NDJSON loader, redis dumps are passed through
+// VERBATIM with NO `{target_db}` token substitution: RESP is a
+// length-prefixed binary protocol, so changing key bytes would desync
+// the `$<N>` length headers and corrupt the stream. If you need per-
+// worktree key prefixes, embed them at dump-generation time.
 //
 // Returns the strategy that actually ran. Fast-path FAILURES (CLI ran
 // but exited non-zero) are downgraded to a warn log + fall-through, so
@@ -75,7 +79,7 @@ func tryDockerExecRedisCLI(ctx context.Context, conn *config.RedisConn, targetPr
 	if _, err := exec.LookPath(engineBin); err != nil {
 		return false, nil //nolint:nilerr // engine binary missing; fall through
 	}
-	body, err := readSubstitutedDump(dumpPath, targetPrefix)
+	body, err := readDump(dumpPath, targetPrefix)
 	if err != nil {
 		return false, err
 	}
@@ -106,7 +110,7 @@ func tryNativeCLIRedisCLI(ctx context.Context, conn *config.RedisConn, targetPre
 	if pw := passwordFromURL(conn.URL); pw != "" {
 		args = append(args, "-a", pw)
 	}
-	body, err := readSubstitutedDump(dumpPath, targetPrefix)
+	body, err := readDump(dumpPath, targetPrefix)
 	if err != nil {
 		return false, err
 	}
@@ -125,7 +129,7 @@ func tryNativeCLIRedisCLI(ctx context.Context, conn *config.RedisConn, targetPre
 // go-redis client. Commands are batched into pipelines of 1000 to keep
 // the round-trip cost down without unbounded memory growth.
 func (d *Driver) restoreViaDriver(ctx context.Context, targetPrefix, dumpPath string) error {
-	body, err := readSubstitutedDump(dumpPath, targetPrefix)
+	body, err := readDump(dumpPath, targetPrefix)
 	if err != nil {
 		return err
 	}
@@ -172,10 +176,13 @@ func (d *Driver) restoreViaDriver(ctx context.Context, targetPrefix, dumpPath st
 	return flush()
 }
 
-// readSubstitutedDump opens dumpPath (auto-decompressed), substitutes
-// every literal `{target_db}` token with targetPrefix, and returns the
-// resulting RESP bytes.
-func readSubstitutedDump(dumpPath, targetPrefix string) ([]byte, error) {
+// readDump opens dumpPath (auto-decompressed) and returns the raw RESP
+// bytes verbatim. Unlike ES NDJSON, RESP is length-prefixed binary, so
+// we deliberately do NOT substitute `{target_db}` tokens — doing so
+// would desync the `$<N>` headers and corrupt the stream. Keys must be
+// embedded at dump-generation time. The targetPrefix arg is retained
+// for signature symmetry with the other engines' readers but ignored.
+func readDump(dumpPath, _ string) ([]byte, error) {
 	rc, _, err := dumpload.OpenDump(dumpPath)
 	if err != nil {
 		return nil, err
@@ -185,7 +192,7 @@ func readSubstitutedDump(dumpPath, targetPrefix string) ([]byte, error) {
 	if _, err := raw.ReadFrom(rc); err != nil {
 		return nil, err
 	}
-	return bytes.ReplaceAll(raw.Bytes(), []byte("{target_db}"), []byte(targetPrefix)), nil
+	return raw.Bytes(), nil
 }
 
 // readRESPArray reads one `*N\r\n$L\r\nDATA\r\n…` array from r and

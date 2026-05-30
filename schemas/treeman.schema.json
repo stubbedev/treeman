@@ -37,7 +37,7 @@
         },
         "container_engine": {
           "type": "string",
-          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
+          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`."
         }
       },
       "additionalProperties": false,
@@ -394,7 +394,7 @@
         },
         "container_engine": {
           "type": "string",
-          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`."
+          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`."
         },
         "match": {
           "oneOf": [

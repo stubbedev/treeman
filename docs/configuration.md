@@ -405,7 +405,7 @@ so a container restart settles within one retry.
 connections:
   mysql:
     container: myapp-mysql        # raw container name (`docker run --name`)
-    container_engine: docker      # docker | podman | nerdctl | finch | orbctl | …
+    container_engine: docker      # docker | podman | nerdctl | finch | …
     container_network: myapp_net  # optional: pin which network's IP to use
     port: 3306                    # internal port; defaults to engine default
     user: root
@@ -428,8 +428,9 @@ container's `Config.Env`. Skip the password block when you've
 already declared the secret on the container itself.
 
 **Engines.** Anything that supports `inspect` and `ps --filter
-label=...` works — `docker`, `podman`, `nerdctl`, `finch`,
-`orbctl`, `lima nerdctl`. Default is `docker`.
+label=...` works — `docker`, `podman`, `nerdctl`, `finch`. Default
+is `docker`. OrbStack users keep the default — its CLI is a docker
+symlink, so `container_engine: docker` already drives it.
 
 **Running treeman inside a devcontainer.** treeman detects
 `/.dockerenv`, `/run/.containerenv`, `REMOTE_CONTAINERS=true` and

@@ -369,7 +369,7 @@ type ConnectionsConfig struct {
 // network alongside any explicit ones).
 //
 // `ContainerEngine` is the engine binary — `docker` (default),
-// `podman`, `nerdctl`, `finch`, `orbctl`. Any binary that supports
+// `podman`, `nerdctl`, `finch`. Any binary that supports
 // `inspect` and `ps --filter label=...` works.
 //
 // When treeman itself runs inside a container (devcontainer, CI,
@@ -398,8 +398,9 @@ type ContainerRef struct {
 	ComposeProject string `yaml:"compose_project,omitempty"`
 
 	// Container engine binary: `docker` (default), `podman`,
-	// `nerdctl`, `finch`, `orbctl`. Any binary that supports
-	// `inspect` and `ps --filter label=...` works.
+	// `nerdctl`, `finch`. Any binary that supports
+	// `inspect` and `ps --filter label=...` works. OrbStack users
+	// keep the `docker` default — its CLI is a docker symlink.
 	ContainerEngine string `yaml:"container_engine,omitempty"`
 
 	// Docker network name. When the container is attached to several
@@ -1023,7 +1024,7 @@ type Action struct {
 	ComposeProject string `yaml:"compose_project,omitempty"`
 
 	// Engine is the container engine binary: `docker` (default),
-	// `podman`, `nerdctl`, `finch`, `orbctl`.
+	// `podman`, `nerdctl`, `finch`.
 	Engine string `yaml:"container_engine,omitempty"`
 }
 
@@ -1056,7 +1057,7 @@ func (Action) JSONSchema() *jsonschema.Schema {
 	})
 	props.Set("container_engine", &jsonschema.Schema{
 		Type:        "string",
-		Description: "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.",
+		Description: "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`.",
 	})
 	return &jsonschema.Schema{
 		Type:                 "object",

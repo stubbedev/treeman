@@ -246,12 +246,41 @@ func (a *archiveReader) readHeader() error {
 	if magic != archiveMagic {
 		return fmt.Errorf("not a mongodump archive (magic %#x; want %#x)", magic, archiveMagic)
 	}
-	// Prelude: one BSON doc with concurrent_collections + namespace
-	// metadata list. We currently skip it (no index replay).
+	// Prelude wire format:
+	//
+	//   [Header BSON: {concurrent_collections, server_version, ...}]
+	//   [CollectionMetadata BSON for ns1]
+	//   [CollectionMetadata BSON for ns2]
+	//   ...
+	//   [TERMINATOR (0xFFFFFFFF)]
+	//
+	// We don't currently parse the metadata (index replay is a TODO);
+	// just consume every doc up to the terminator so the body-stream
+	// parser sees the first NamespaceHeader exactly where it should.
+	// Reading one BSON doc and stopping (the old bug) misclassified
+	// subsequent CollectionMetadata BSONs as namespace headers and
+	// body documents, doubling rows for archives with >1 collection.
 	if _, err := readBSONDoc(a.r); err != nil {
-		return fmt.Errorf("prelude doc: %w", err)
+		return fmt.Errorf("prelude header doc: %w", err)
 	}
-	return nil
+	for {
+		var head [4]byte
+		if _, err := io.ReadFull(a.r, head[:]); err != nil {
+			return fmt.Errorf("prelude metadata: %w", err)
+		}
+		sz := binary.LittleEndian.Uint32(head[:])
+		if sz == archiveTerminator {
+			return nil
+		}
+		if sz < 5 {
+			return fmt.Errorf("invalid prelude BSON length %d", sz)
+		}
+		body := make([]byte, sz-4)
+		if _, err := io.ReadFull(a.r, body); err != nil {
+			return fmt.Errorf("prelude metadata body: %w", err)
+		}
+		// metadata is discarded; future work: parse for index defs.
+	}
 }
 
 // next returns the next document in the archive along with its
@@ -292,14 +321,29 @@ func (a *archiveReader) next() (ns string, doc bson.Raw, terminate bool, err err
 		copy(raw[4:], body)
 
 		if !a.inBlock {
-			// Namespace header: extract ns and start the block.
+			// Namespace header: extract db + collection and start the
+			// block. mongo-tools encodes namespace headers as separate
+			// `db` and `collection` fields (NOT a combined `ns`); an
+			// optional EOF flag closes a namespace's stream without
+			// any body documents to follow.
 			var meta struct {
-				NS string `bson:"ns"`
+				DB         string `bson:"db"`
+				Collection string `bson:"collection"`
+				EOF        bool   `bson:"EOF"`
 			}
 			if uerr := bson.Unmarshal(raw, &meta); uerr != nil {
 				return "", nil, false, fmt.Errorf("namespace header bson: %w", uerr)
 			}
-			a.curNs = meta.NS
+			if meta.EOF {
+				// EOF marker for an empty namespace block; reset and
+				// peek the next item without entering the body state.
+				a.curNs = ""
+				continue
+			}
+			if meta.DB == "" || meta.Collection == "" {
+				return "", nil, false, fmt.Errorf("namespace header missing db/collection: %s.%s", meta.DB, meta.Collection)
+			}
+			a.curNs = meta.DB + "." + meta.Collection
 			a.inBlock = true
 			continue
 		}

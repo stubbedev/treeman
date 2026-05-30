@@ -1,5 +1,5 @@
 // Package containerip resolves connectivity details for a named
-// container (docker / podman / nerdctl / finch / orbctl / lima), so
+// container (docker / podman / nerdctl / finch), so
 // treeman can dial DB services that run inside a container with no
 // published port, behind a compose service name, or from inside a
 // devcontainer that shares a network with the database.
@@ -59,7 +59,7 @@ type Opts struct {
 	// service lookup to. Defaults to COMPOSE_PROJECT_NAME if unset.
 	ComposeProject string
 	// Engine is the container engine binary (docker, podman,
-	// nerdctl, finch, orbctl). Default "docker".
+	// nerdctl, finch). Default "docker".
 	Engine string
 	// Network is the preferred docker network name when the
 	// container is attached to several. Resolution picks this

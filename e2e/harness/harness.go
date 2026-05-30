@@ -193,7 +193,7 @@ func SkipIfNoDocker(t *testing.T) {
 }
 
 // SkipIfNoEngine is SkipIfNoDocker generalised to any docker-CLI-
-// compatible container engine (podman, nerdctl, finch, orbctl …).
+// compatible container engine (podman, nerdctl, finch …).
 // Probes `<engine> info` as the readiness check — every engine
 // treeman targets implements it, and a successful run guarantees
 // the daemon socket / VM is reachable.

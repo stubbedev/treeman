@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -183,6 +184,61 @@ func TestCrossWorktreeCacheReuseRestoresSource(t *testing.T) {
 	// Parity proof: wt2's own bare source prefix is populated.
 	assertDocCount(t, o2.SourceDB+"products", 2)
 	assertDocCount(t, o2.SourceDB+"orders", 1)
+}
+
+// TestDumpLoadViaDockerExec proves the ES dump-load dispatcher picks
+// the docker-exec fast path when ContainerRef is set: `docker exec -i
+// CID curl -X POST http://localhost:9200/_bulk` from inside the
+// container instead of host→TCP HTTP. Asserts strategy=docker-exec on
+// the dump-load phase event AND that the bulk-loaded indices carry
+// the expected doc counts.
+func TestDumpLoadViaDockerExec(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "es:19200", 120*time.Second, func() error {
+		resp, err := http.Get("http://127.0.0.1:19200/_cluster/health?wait_for_status=yellow&timeout=5s")
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("cluster not ready: %s", resp.Status)
+		}
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	cfg := buildConfig()
+	// In-container URL; containerip rewrites host to the bridge IP and
+	// 9200 is what ES listens on inside the container.
+	cfg.Connections.Elasticsearch.URL = "http://127.0.0.1:9200"
+	cfg.Connections.Elasticsearch.ContainerRef = config.ContainerRef{
+		Container: "treeman-e2e-es",
+	}
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "elasticsearch", false)
+
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"prepare_phase"},
+		Phases:     []string{"dump-load"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawDockerExec bool
+	for _, e := range evs {
+		t.Logf("phase event: %s", e.Message)
+		if strings.Contains(e.Message, "strategy=docker-exec") {
+			sawDockerExec = true
+		}
+	}
+	if !sawDockerExec {
+		t.Errorf("expected strategy=docker-exec — ContainerRef should have selected curl-in-container")
+	}
+	assertDocCount(t, o.SourceDB+"products", 2)
+	assertDocCount(t, o.SourceDB+"orders", 1)
 }
 
 // TestIncrementalAncestorBuild proves task #4 wired to elasticsearch:

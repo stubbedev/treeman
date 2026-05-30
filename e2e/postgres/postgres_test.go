@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,6 +253,60 @@ func TestPostgresFanoutConcurrency(t *testing.T) {
 			"(consider lowering fanOutLimits[postgres] in internal/prepare/prepare.go)",
 			parallelism)
 	}
+}
+
+// TestDumpLoadViaDockerExec proves the postgres dump-load dispatcher
+// picks the docker-exec fast path when ContainerRef is set on the
+// connection. The path is the same shape as the MySQL one: `docker
+// exec -i CID psql …` instead of host→TCP psql or Go statement
+// streaming. Asserts strategy=docker-exec on the per-dump phase event
+// AND that the dumped tables landed.
+func TestDumpLoadViaDockerExec(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "postgres:15432", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:15432", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	cfg := buildConfig()
+	// Port=5432 is the in-container port; containerip rewrites Host to
+	// the bridge IP (Linux) or published-port mapping (Mac/Win).
+	cfg.Connections.Postgres.Port = 5432
+	cfg.Connections.Postgres.ContainerRef = config.ContainerRef{
+		Container: "treeman-e2e-postgres",
+	}
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "postgres", false)
+
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"prepare_phase"},
+		Phases:     []string{"dump-load"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) == 0 {
+		t.Fatal("no dump-load prepare_phase events recorded")
+	}
+	var sawDockerExec bool
+	for _, e := range evs {
+		t.Logf("phase event: %s", e.Message)
+		if strings.Contains(e.Message, "strategy=docker-exec") {
+			sawDockerExec = true
+		}
+	}
+	if !sawDockerExec {
+		t.Errorf("expected strategy=docker-exec — ContainerRef should have selected the fast path")
+	}
+	assertTables(t, "127.0.0.1:15432", o.SourceDB, []string{"products", "orders"})
 }
 
 // TestIncrementalAncestorBuild proves task #4 wired to postgres: adding

@@ -1,81 +1,62 @@
 # treeman
 
 **Per-worktree development environment helper.** Spin up isolated
-databases, search indices, and parallel test clones per git
-worktree; tear them down on delete; keep them in sync as your
-migrations or fixtures change. Language- and framework-agnostic —
-runs the same way against a Laravel + MySQL repo, a Rails +
-Postgres repo, a Django + Postgres repo, a Go + golang-migrate
-service, or a Rust + sqlx workspace.
+databases, search indices, and parallel test clones for each git
+worktree — torn down on delete, kept in sync as your migrations and
+fixtures change. Language- and framework-agnostic.
 
 Pure wire-protocol DB access (Go `database/sql` for MySQL +
-PostgreSQL, the official Mongo / Redis / Elasticsearch SDKs); no
-shelling out to `mysql` / `psql` / `mongosh` / `redis-cli`.
-Single user-mode daemon, thin CLI client, SQLite-backed event log.
+PostgreSQL, the official Mongo / Redis / Elasticsearch SDKs) — no
+shelling out to `mysql` / `psql` / `mongosh` / `redis-cli`. A single
+user-mode daemon, a thin CLI client, and a SQLite-backed event log.
 
 ---
 
 ## Why treeman
 
-Git worktrees give every branch its own checkout — but the
-checkout alone isn't enough. A working tree needs:
+A git worktree gives every branch its own checkout — but a working
+tree also needs its own database, `N` test-runner clones fanning out
+from a cached template, migrations applied, `.env`-style config patched
+to the per-worktree DB names, install hooks run, and teardown that drops
+every namespace on delete. treeman owns that lifecycle:
+`treeman wt create FOO` and `treeman wt delete FOO` are the only
+commands you type.
 
-- a database scoped to that worktree (e.g. `myapp_test_proj_123`)
-  so parallel branches don't trample each other's data
-- `N` test-runner clones of that database fanning out from a
-  single cached template, so the project's parallel test runner
-  (paratest, pest, pytest-xdist, Jest workers, Go `-parallel`,
-  cargo nextest, …) gets a fresh DB per worker
-- the project's migrations applied to the source DB
-- `.env`-style config (or `phpunit.xml`, `pyproject.toml`, etc.)
-  patched to point at the per-worktree DB names
-- post-create install hooks (composer / yarn / pnpm / go mod /
-  cargo / bundler / pip …) running in parallel
-- pre-delete teardown that drops every per-worktree namespace
-  (DB, Redis index, ES index prefix) when you're done
+## Supported engines
 
-treeman owns that lifecycle. `treeman wt create FOO` /
-`treeman wt delete FOO` are the only commands you type; a SQLite
-event log records every step.
+| Engine | Variants | Per-worktree isolation |
+|---|---|---|
+| MySQL | MariaDB, TiDB | Separate database |
+| PostgreSQL | — | Separate database |
+| MongoDB | — | Separate database |
+| Redis | Valkey, DragonflyDB † | Key-prefix in DB 0 (cluster-safe, no 16-DB cap) |
+| Elasticsearch | OpenSearch | Index-name prefix |
 
-## At a glance
+MariaDB, TiDB, and OpenSearch are first-class aliases of their parent
+engine. † treeman has no dedicated Valkey/DragonflyDB driver, but they
+speak the Redis wire protocol — declare them as `engine: redis`.
 
-- **Per-worktree namespaces** for MySQL / MariaDB / TiDB,
-  PostgreSQL, MongoDB, Redis (key-prefix in DB 0 — cluster-mode
-  safe, no 16-DB cap), Elasticsearch / OpenSearch (index-name
-  prefix).
-- **Snapshot cache** with LRU eviction — repeated `wt create` on
-  the same migrations + dump hits a cached template DB. Cap-per-
-  repo (default 8) keeps engine disk usage bounded.
-- **Hook lifecycle** — declarative `on-create-before-engines` /
-  `on-create-after-engines` / `on-delete-before-engines` /
-  `on-delete-after-engines` / `on-checkout` / `on-file-change`
-  trigger lists. Actions in one list run in parallel; the
-  `run:` steps inside one action chain sequentially with `&&`.
-- **Parallel test runner support** — `clones: auto` detects
-  worker counts from 19+ runners (paratest / pest / phpunit,
-  pytest-xdist, jest / vitest / playwright, parallel_tests,
-  cargo-nextest, etc.) by inspecting the repo's config files.
-- **File watcher** (fsnotify) for live updates — input edits
-  re-fingerprint each affected database; the dispatch picks
-  `auto | delta | rebuild` based on whether the new hash hits
-  a cached template, needs a partial migrate-up, or a full
-  cold-build.
-- **MCP server** — `treeman mcp` exposes treeman to Claude Code /
-  Claude Desktop / Cursor as a structured tool surface for
-  **configuration + diagnosis**: authoring/validating
-  `.treeman.yaml` (`config_get`, `config_validate`,
-  `config_schema`, `config_set`, `init_repo`, `schema_install`,
-  `fw_detect`), reading the event log + hook output
-  (`logs_query`, `logs_hooks`, `hook_log_read`), querying live
-  engine state (`db_query`, `db_schema_dump`, `engine_status`),
-  and inspecting the snapshot cache (`snapshots_list`,
-  `snapshot_inspect`).
-- **Single static binary** per platform — no CGo, no system
-  libraries; CI cross-builds `{linux,darwin}` × `{amd64,arm64}`.
+## Features
 
-See [docs/](docs/) for the deep dives — CLI reference,
-configuration schema, AI integration, internals.
+- **Snapshot cache** — repeated `wt create` on the same migrations +
+  dump hits a cached template DB; LRU eviction with a per-repo cap
+  (default 8) bounds disk use.
+- **Hook lifecycle** — declarative create / delete / checkout /
+  file-change trigger lists; actions in a list run in parallel, the
+  `run:` steps within an action chain sequentially.
+- **Parallel test runner support** — `clones: auto` detects worker
+  counts from 19+ runners (paratest, pytest-xdist, jest / vitest,
+  cargo-nextest, …) by inspecting the repo's config files.
+- **File watcher** — fsnotify re-fingerprints affected databases on
+  input edits and picks `auto | delta | rebuild`.
+- **MCP server** — `treeman mcp` exposes config authoring/validation,
+  event-log + hook-output queries, live engine state, and snapshot
+  inspection to Claude Code / Desktop / Cursor.
+- **Single static binary** per platform — no CGo, no system libraries;
+  CI cross-builds `{linux,darwin}` × `{amd64,arm64}`.
+
+See [docs/](docs/) for the deep dives — CLI reference, configuration
+schema, AI integration, internals.
 
 ---
 

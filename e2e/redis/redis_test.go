@@ -6,7 +6,9 @@ import (
 	"context"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 func TestRedisEndToEnd(t *testing.T) {
@@ -162,6 +165,167 @@ func TestIncrementalAncestorBuild(t *testing.T) {
 	// Source prefix carries the seeded keys from the ancestor template
 	// (the seed script did NOT re-run — we skipped it via incremental).
 	assertKeyCount(t, o2.SourceDB, 3)
+}
+
+// TestRedisDumpLoadViaDockerExec proves the redis dump-load dispatcher
+// picks the docker-exec fast path when ContainerRef is set: `docker
+// exec -i CID redis-cli --pipe` from inside the container. Asserts
+// strategy=docker-exec on the dump-load phase event AND that the keys
+// landed.
+func TestRedisDumpLoadViaDockerExec(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "redis:16379", 30*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:16379", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	resp := []byte("" +
+		"*3\r\n$3\r\nSET\r\n$9\r\nwte2ex:k1\r\n$2\r\nv1\r\n" +
+		"*3\r\n$3\r\nSET\r\n$9\r\nwte2ex:k2\r\n$2\r\nv2\r\n" +
+		"*3\r\n$3\r\nSET\r\n$9\r\nwte2ex:k3\r\n$2\r\nv3\r\n",
+	)
+	dumpPath := filepath.Join(wt, "seed.resp")
+	if err := os.WriteFile(dumpPath, resp, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Redis: &config.RedisConn{
+				// In-container URL; containerip rewrites host to the
+				// bridge IP; 6379 is what redis listens on inside.
+				URL: "redis://127.0.0.1:6379",
+				ContainerRef: config.ContainerRef{
+					Container: "treeman-e2e-redis",
+				},
+			},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "redis",
+			NameTemplate: "treeman_e2e_{slug}",
+			KeyPrefix:    "wte2ex:",
+			Dump:         config.DumpList{{Path: "seed.resp"}},
+		}},
+	}
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "redis", false)
+
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"prepare_phase"},
+		Phases:     []string{"dump-load"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawDockerExec bool
+	for _, e := range evs {
+		t.Logf("phase event: %s", e.Message)
+		if strings.Contains(e.Message, "strategy=docker-exec") {
+			sawDockerExec = true
+		}
+	}
+	if !sawDockerExec {
+		t.Errorf("expected strategy=docker-exec — ContainerRef should have selected redis-cli-in-container")
+	}
+	assertKeyCount(t, o.SourceDB, 3)
+}
+
+// TestRedisDumpWireFallback proves the Go-native RESP parser + go-redis
+// Pipeline fallback completes a cold build when redis-cli is NOT on
+// PATH and ContainerRef isn't set. Hand-builds a small RESP-encoded
+// dump file (the format `redis-cli --pipe` accepts) so we don't need
+// the CLI even to GENERATE the fixture.
+func TestRedisDumpWireFallback(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "redis:16379", 30*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:16379", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	// Hand-built RESP stream: 3 SET commands with LITERAL keys. RESP
+	// is length-prefixed binary, so per-worktree templating happens at
+	// dump-generation time — not at load (a byte-level substitution
+	// would desync the `$<N>` headers). Hardcoding the prefix here
+	// matches what a real user-supplied RESP dump would carry.
+	resp := []byte("" +
+		"*3\r\n$3\r\nSET\r\n$9\r\nwte2ew:k1\r\n$2\r\nv1\r\n" +
+		"*3\r\n$3\r\nSET\r\n$9\r\nwte2ew:k2\r\n$2\r\nv2\r\n" +
+		"*3\r\n$3\r\nSET\r\n$9\r\nwte2ew:k3\r\n$2\r\nv3\r\n",
+	)
+	dumpPath := filepath.Join(wt, "seed.resp")
+	if err := os.WriteFile(dumpPath, resp, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Narrow PATH so the dispatcher's native-CLI + docker-exec paths
+	// both skip (no redis-cli) and the wire fallback runs. docker still
+	// needed for compose teardown.
+	sandbox := t.TempDir()
+	for _, bin := range []string{"docker", "sh"} {
+		full, perr := exec.LookPath(bin)
+		if perr != nil {
+			continue
+		}
+		_ = os.Symlink(full, filepath.Join(sandbox, bin))
+	}
+	t.Setenv("PATH", sandbox)
+	if _, err := exec.LookPath("redis-cli"); err == nil {
+		t.Fatal("PATH sandbox leak: redis-cli still resolvable")
+	}
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Redis: &config.RedisConn{URL: "redis://127.0.0.1:16379"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "redis",
+			NameTemplate: "treeman_e2e_{slug}",
+			// Literal KeyPrefix (no {slug}) so the run's sourcePrefix
+			// matches the keys baked into the RESP fixture exactly.
+			KeyPrefix: "wte2ew:",
+			Dump:      config.DumpList{{Path: "seed.resp"}},
+		}},
+	}
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "redis", false)
+	t.Logf("wire fallback: source=%s template=%s", o.SourceDB, o.TemplateName)
+
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"prepare_phase"},
+		Phases:     []string{"dump-load"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) == 0 {
+		t.Fatal("no dump-load prepare_phase events recorded")
+	}
+	var sawWire bool
+	for _, e := range evs {
+		t.Logf("phase event: %s", e.Message)
+		if strings.Contains(e.Message, "strategy=wire") {
+			sawWire = true
+		}
+	}
+	if !sawWire {
+		t.Errorf("expected strategy=wire — fast path leaked through")
+	}
+	// All 3 keys present under the worktree's source prefix.
+	assertKeyCount(t, o.SourceDB, 3)
 }
 
 func buildConfig() *config.Config {

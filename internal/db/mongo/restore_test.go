@@ -20,16 +20,19 @@ func TestArchiveReader_BasicStream(t *testing.T) {
 	if err := binary.Write(&buf, binary.LittleEndian, archiveMagic); err != nil {
 		t.Fatal(err)
 	}
-	// Prelude (a real mongodump archive's prelude carries collection
-	// metadata; a minimal { concurrent_collections: 1 } satisfies the
-	// reader's "consume one BSON doc" contract).
+	// Prelude (a real mongodump archive's prelude is one Header BSON
+	// followed by N CollectionMetadata BSONs, terminated by 0xFFFFFFFF).
+	// The minimal valid form: just the header + terminator.
 	preludeBSON, err := bson.Marshal(bson.M{"concurrent_collections": int32(1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	buf.Write(preludeBSON)
+	if err := binary.Write(&buf, binary.LittleEndian, archiveTerminator); err != nil {
+		t.Fatal(err)
+	}
 	// Namespace header: identifies the next block as testdb.coll.
-	nsBSON, err := bson.Marshal(bson.M{"ns": "testdb.coll"})
+	nsBSON, err := bson.Marshal(bson.M{"db": "testdb", "collection": "coll"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,16 +92,17 @@ func TestArchiveReader_BasicStream(t *testing.T) {
 func TestArchiveReader_MultipleNamespaces(t *testing.T) {
 	var buf bytes.Buffer
 	mustWriteUint32(t, &buf, archiveMagic)
-	mustMarshalInto(t, &buf, bson.M{"concurrent_collections": int32(1)})
+	mustMarshalInto(t, &buf, bson.M{"concurrent_collections": int32(2)})
+	mustWriteUint32(t, &buf, archiveTerminator) // end of prelude
 
 	// First block: db1.coll1 with two documents.
-	mustMarshalInto(t, &buf, bson.M{"ns": "db1.coll1"})
+	mustMarshalInto(t, &buf, bson.M{"db": "db1", "collection": "coll1"})
 	mustMarshalInto(t, &buf, bson.M{"_id": int32(1)})
 	mustMarshalInto(t, &buf, bson.M{"_id": int32(2)})
 	mustWriteUint32(t, &buf, archiveTerminator)
 
 	// Second block: db2.coll2 with one document.
-	mustMarshalInto(t, &buf, bson.M{"ns": "db2.coll2"})
+	mustMarshalInto(t, &buf, bson.M{"db": "db2", "collection": "coll2"})
 	mustMarshalInto(t, &buf, bson.M{"_id": int32(99)})
 	mustWriteUint32(t, &buf, archiveTerminator)
 

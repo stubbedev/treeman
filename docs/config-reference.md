@@ -151,7 +151,7 @@ Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or pa
 
 #### `container_engine` *(string)*
 
-Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.
+Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`.
 
 ### AutoFetchConfig
 
@@ -496,7 +496,7 @@ Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or pa
 
 #### `container_engine` *(string)*
 
-Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.
+Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`.
 
 #### `match` *(one of: string, array of string)*
 
