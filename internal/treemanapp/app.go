@@ -44,6 +44,7 @@ func New() *cli.Command {
 			cmd.RegistryCmd(),
 			cmd.SnapshotsCmd(),
 			cmd.MCPCmd(),
+			cmd.NotifyCmd(),
 			cmd.PatchFilterCmd(),
 		},
 	}

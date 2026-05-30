@@ -16,8 +16,8 @@ import (
 func registerSyncReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "sync_status",
-		Description: "Answers \"why isn't my branch up to date?\" — per-repo + per-worktree git sync state: last-fetch time, fetch failures, next-retry, ahead/behind, dirty flag, last skip reason (dirty|no_upstream|non_ff|detached_head|rebase_conflict).",
-		Annotations: readOnlyAnno("Sync status", true),
+		Description: "Report per-repo + per-worktree git sync state: last-fetch time, fetch failures, next-retry, ahead/behind, dirty flag, last skip reason (dirty|no_upstream|non_ff|detached_head|rebase_conflict). Use to answer \"why isn't my branch up to date?\".",
+		Annotations: readOnlyAnno("Report sync status", true),
 	}, syncStatusTool)
 }
 

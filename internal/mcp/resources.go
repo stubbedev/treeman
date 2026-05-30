@@ -23,63 +23,63 @@ func registerResources(srv *mcpsdk.Server) {
 	srv.AddResource(&mcpsdk.Resource{
 		URI:         "treeman://config/raw",
 		Name:        "treeman.yaml (raw)",
-		Description: "The current repo's .treeman.yaml on disk, byte-for-byte. Returns 404 if no repo is detected from cwd or the file is missing.",
+		Description: "Read the current repo's .treeman.yaml on disk, byte-for-byte. Returns 404 if no repo is detected from cwd or the file is missing.",
 		MIMEType:    "application/yaml",
 	}, rawConfigResource)
 
 	srv.AddResource(&mcpsdk.Resource{
 		URI:         "treeman://config/resolved",
 		Name:        "Resolved config",
-		Description: "The .treeman.yaml after env/secret substitution + defaults, marshalled as YAML. Use this to see what treeman actually executes against.",
+		Description: "Read the .treeman.yaml after env/secret substitution + defaults, marshalled as YAML. Use to see what treeman actually executes against.",
 		MIMEType:    "application/yaml",
 	}, resolvedConfigResource)
 
 	srv.AddResource(&mcpsdk.Resource{
 		URI:         "treeman://config/schema",
 		Name:        "Config JSON Schema",
-		Description: "The JSON Schema for .treeman.yaml, generated via reflection from config.Config. Use this to validate a config before writing it.",
+		Description: "Get the JSON Schema for .treeman.yaml, generated via reflection from config.Config. Use to validate a config before writing it.",
 		MIMEType:    "application/json",
 	}, schemaResource)
 
 	srv.AddResource(&mcpsdk.Resource{
 		URI:         "treeman://logs/recent",
 		Name:        "Recent events (200)",
-		Description: "The 200 most recent event-log rows across every repo + worktree, oldest-first. One JSON object per line (NDJSON).",
+		Description: "Read the 200 most recent event-log rows across every repo + worktree, oldest-first. One JSON object per line (NDJSON).",
 		MIMEType:    "application/x-ndjson",
 	}, recentLogsResource)
 
 	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
 		URITemplate: "treeman://worktrees/{slug}/events",
 		Name:        "Worktree events",
-		Description: "The 200 most recent events for one worktree (resolved by slug, branch, or basename). Attach this as context when diagnosing a specific worktree to avoid pulling unrelated noise from logs/recent.",
+		Description: "Read the 200 most recent events for one worktree (resolved by slug, branch, or basename). Attach as context when diagnosing a specific worktree to avoid pulling unrelated noise from logs/recent.",
 		MIMEType:    "application/x-ndjson",
 	}, worktreeEventsResource)
 
 	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
 		URITemplate: "treeman://worktrees/{slug}/hooks",
 		Name:        "Worktree hook runs",
-		Description: "The 50 most recent hook_run rows for one worktree. Use this to see what setup/teardown commands ran, their exit codes, and their stdout/stderr tails.",
+		Description: "Read the 50 most recent hook_run rows for one worktree. Use to see what setup/teardown commands ran, their exit codes, and stdout/stderr tails.",
 		MIMEType:    "application/json",
 	}, worktreeHooksResource)
 
 	srv.AddResource(&mcpsdk.Resource{
 		URI:         "treeman://daemon/state",
 		Name:        "Daemon live state",
-		Description: "Live runtime view of treemand: in-flight prepares/teardowns, watcher set, per-repo backoff timers. Same data as the daemon_state tool but attachable as context (cheaper than re-invoking each turn).",
+		Description: "Read treemand's runtime state: in-flight prepares/teardowns, watcher set, per-repo backoff timers. Same data as daemon_state but attachable as context (cheaper than re-invoking each turn).",
 		MIMEType:    "application/json",
 	}, daemonStateResource)
 
 	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
 		URITemplate: "treeman://repos/{repo}/snapshots",
 		Name:        "Repo snapshot cache",
-		Description: "Cached snapshots (template DBs) for one repo, capped at 100. {repo} is the URL-encoded absolute repo path; use 'cwd' to mean the current dir's repo. Cheaper than calling snapshots_list every turn.",
+		Description: "Read cached snapshots (template DBs) for one repo, capped at 100. {repo} is the URL-encoded absolute repo path; use 'cwd' to mean the current dir's repo. Cheaper than calling snapshots_list every turn.",
 		MIMEType:    "application/json",
 	}, repoSnapshotsResource)
 
 	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
 		URITemplate: "treeman://repos/{repo}/branches",
 		Name:        "Repo branches",
-		Description: "Local + origin-only branches for one repo, annotated with worktree occupancy. {repo} is the URL-encoded absolute repo path; use 'cwd' to mean the current dir's repo.",
+		Description: "Read local + origin-only branches for one repo, annotated with worktree occupancy. {repo} is the URL-encoded absolute repo path; use 'cwd' to mean the current dir's repo.",
 		MIMEType:    "application/json",
 	}, repoBranchesResource)
 }

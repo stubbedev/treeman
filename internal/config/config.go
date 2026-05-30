@@ -123,6 +123,13 @@ type Config struct {
 	// labels, hover lines, custom bar formats). Lives in the global
 	// config since the widget aggregates worktrees across every repo.
 	Status StatusConfig `yaml:"status,omitempty"`
+
+	// Notifications opts into desktop notifications (notify-send on
+	// Linux, the native banner via osascript on macOS) when a worktree
+	// changes lifecycle state. Off by default. Lives in the global
+	// config since the daemon that emits them is a single cross-repo
+	// process.
+	Notifications NotificationsConfig `yaml:"notifications,omitempty"`
 }
 
 // StatusConfig configures `treeman status` — the bar/waybar widget
@@ -239,6 +246,52 @@ func (a AutoFetchConfig) ResolvedMode() string {
 	default:
 		return "ff"
 	}
+}
+
+// NotificationsConfig — `notifications:` block. Opt-in desktop
+// notifications fired by the daemon when a worktree crosses a lifecycle
+// status boundary. Backend is auto-detected per OS (notify-send on
+// Linux, `osascript -e 'display notification'` on macOS); platforms
+// without a known sender silently no-op.
+//
+// Each notification is keyed to one of the four `treeman status`
+// buckets:
+//   - stable: a worktree finished preparing and is ready (finalize done)
+//   - up:     a worktree began preparing (finalize started)
+//   - down:   a worktree began tearing down
+//   - failed: a worktree's finalize errored
+//
+// `up` and `down` are transient and chatty, so the default
+// (`events:` unset) only notifies on `stable` + `failed` — ready and
+// errored, the two resting states worth surfacing. Set `events:`
+// explicitly to opt into the transient ones, or to a subset.
+type NotificationsConfig struct {
+	// Enabled toggles the whole feature. Off by default — every
+	// existing install sees zero behaviour change until it's set.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Events is the set of status buckets that fire a notification.
+	// Allowed values: stable, up, down, failed. When unset (nil) the
+	// default of [stable, failed] applies (see applyDefaults). An
+	// explicit empty list (`events: []`) disables every bucket while
+	// leaving the feature otherwise "enabled" — useful as a base for a
+	// per-repo override that re-adds buckets.
+	Events []string `yaml:"events,omitempty" jsonschema:"enum=stable,enum=up,enum=down,enum=failed"`
+
+	// Backend forces a specific sender instead of OS auto-detection.
+	// Allowed values: auto (default), notify-send, osascript, none.
+	// `none` disables sending without unsetting `enabled` — handy to
+	// mute notifications on one host while keeping the shared config.
+	Backend string `yaml:"backend,omitempty" jsonschema:"enum=auto,enum=notify-send,enum=osascript,enum=none"`
+}
+
+// NotifyOn reports whether the given status bucket should fire a
+// notification under this config. A disabled config never fires.
+func (n NotificationsConfig) NotifyOn(bucket string) bool {
+	if !n.Enabled {
+		return false
+	}
+	return slices.Contains(n.Events, bucket)
 }
 
 // MainWorktreeConfig — `main_worktree:` block. Opt-in handle that
@@ -1825,6 +1878,12 @@ func applyDefaults(cfg *Config) {
 		// Set explicitly to a negative value to mean "never prune"
 		// (handled by callers as <= 0).
 		cfg.Logs.KeepDays = 14
+	}
+	// Default notification buckets: the two resting states (ready +
+	// errored). nil means "key absent" → apply default; an explicit
+	// `events: []` is left empty (notify on nothing).
+	if cfg.Notifications.Events == nil {
+		cfg.Notifications.Events = []string{"stable", "failed"}
 	}
 	applyStatusDefaults(cfg)
 }

@@ -79,11 +79,10 @@ type Store struct {
 }
 
 // EventHook is the callback registered via RegisterEventHook. Fires
-// once per successful WriteEvent. Implementations MUST return quickly
-// (the call is on the WriteEvent path); spawn a goroutine if any
-// real work is needed. ID is best-effort: populated on the sync path,
-// 0 on the batched path (the daemon's flush doesn't query lastrowid
-// per row).
+// once per WriteEvent (both sync and batched paths). Implementations
+// MUST return quickly — the call is on the WriteEvent path — and spawn
+// a goroutine if any real work (DB lookups, exec) is needed. The Event's
+// ID is best-effort: populated on the sync path, 0 on the batched path.
 type EventHook func(Event)
 
 // pendingEvent is one buffered events-table row awaiting flush.

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -88,6 +89,30 @@ func (c *Config) Validate() error {
 		errs = appendIfErr(errs, validatePatch(c.Patches[i], fmt.Sprintf("patches[%d]", i), allowedPorts))
 	}
 
+	errs = appendIfErr(errs, validateNotifications(c.Notifications))
+
+	return errors.Join(errs...)
+}
+
+// validateNotifications rejects unknown `events:` buckets and an
+// unrecognised `backend:`, so a typo (`stabel`, `notifysend`) surfaces
+// at config-load instead of silently never firing.
+func validateNotifications(n NotificationsConfig) error {
+	var errs []error
+	allowedBuckets := []string{"stable", "up", "down", "failed"}
+	for i, b := range n.Events {
+		if !slices.Contains(allowedBuckets, b) {
+			errs = appendIfErr(errs, fmt.Errorf(
+				"notifications.events[%d]: unknown bucket %q (allowed: %s)",
+				i, b, strings.Join(allowedBuckets, ", ")))
+		}
+	}
+	switch n.Backend {
+	case "", "auto", "notify-send", "osascript", "none":
+	default:
+		errs = appendIfErr(errs, fmt.Errorf(
+			"notifications.backend: unknown backend %q (allowed: auto, notify-send, osascript, none)", n.Backend))
+	}
 	return errors.Join(errs...)
 }
 

@@ -617,6 +617,40 @@
       ],
       "description": "MySQL connection — bare DSN string OR structured object."
     },
+    "NotificationsConfig": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled toggles the whole feature. Off by default — every\nexisting install sees zero behaviour change until it's set."
+        },
+        "events": {
+          "items": {
+            "type": "string",
+            "enum": [
+              "stable",
+              "up",
+              "down",
+              "failed"
+            ]
+          },
+          "type": "array",
+          "description": "Events is the set of status buckets that fire a notification.\nAllowed values: stable, up, down, failed. When unset (nil) the\ndefault of [stable, failed] applies (see applyDefaults). An\nexplicit empty list (`events: []`) disables every bucket while\nleaving the feature otherwise \"enabled\" — useful as a base for a\nper-repo override that re-adds buckets."
+        },
+        "backend": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "notify-send",
+            "osascript",
+            "none"
+          ],
+          "description": "Backend forces a specific sender instead of OS auto-detection.\nAllowed values: auto (default), notify-send, osascript, none.\n`none` disables sending without unsetting `enabled` — handy to\nmute notifications on one host while keeping the shared config."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "NotificationsConfig — `notifications:` block. Opt-in desktop\nnotifications fired by the daemon when a worktree crosses a lifecycle\nstatus boundary. Backend is auto-detected per OS (notify-send on\nLinux, `osascript -e 'display notification'` on macOS); platforms\nwithout a known sender silently no-op.\n\nEach notification is keyed to one of the four `treeman status`\nbuckets:\n  - stable: a worktree finished preparing and is ready (finalize done)\n  - up:     a worktree began preparing (finalize started)\n  - down:   a worktree began tearing down\n  - failed: a worktree's finalize errored\n\n`up` and `down` are transient and chatty, so the default\n(`events:` unset) only notifies on `stable` + `failed` — ready and\nerrored, the two resting states worth surfacing. Set `events:`\nexplicitly to opt into the transient ones, or to a subset."
+    },
     "Patch": {
       "properties": {
         "file": {
@@ -1001,6 +1035,10 @@
     "status": {
       "$ref": "#/$defs/StatusConfig",
       "description": "Status configures the `treeman status` widget output (icons,\nlabels, hover lines, custom bar formats). Lives in the global\nconfig since the widget aggregates worktrees across every repo."
+    },
+    "notifications": {
+      "$ref": "#/$defs/NotificationsConfig",
+      "description": "Notifications opts into desktop notifications (notify-send on\nLinux, the native banner via osascript on macOS) when a worktree\nchanges lifecycle state. Off by default. Lives in the global\nconfig since the daemon that emits them is a single cross-repo\nprocess."
     }
   },
   "additionalProperties": false,

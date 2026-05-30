@@ -41,8 +41,8 @@ func registerReadTools(srv *mcpsdk.Server) {
 func registerCoreReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "doctor",
-		Description: "First call when something is wrong with treeman. Checks daemon, .treeman.yaml load, JSON schema install, framework detection, and registry/git drift. Returns ok|warn|fail|skip per check + remediation hints.",
-		Annotations: readOnlyAnno("Treeman doctor", true),
+		Description: "Run treeman health checks — daemon, .treeman.yaml load, JSON schema install, framework detection, registry/git drift. Call this first whenever something is wrong. Returns ok|warn|fail|skip per check + a remediation hint.",
+		Annotations: readOnlyAnno("Run treeman doctor", true),
 	}, doctorTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -60,7 +60,7 @@ func registerCoreReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_schema",
 		Description: "Get the JSON Schema for .treeman.yaml (reflected from config.Config). Use to drive autocomplete or pre-validate a proposed body.",
-		Annotations: readOnlyAnno("Config JSON Schema", false),
+		Annotations: readOnlyAnno("Get config schema", false),
 	}, configSchemaTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -80,14 +80,14 @@ func registerWorktreeReadTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_show",
-		Description: "Full dossier for one worktree: slug, branch, path, ports, branch_scoped active-namespace, recent events. Call before prepare_run/hook_run to confirm the worktree exists + reached finalize.",
+		Description: "Show the full dossier for one worktree: slug, branch, path, ports, branch_scoped active-namespace, recent events. Call before prepare_run/hook_run to confirm the worktree exists + reached finalize.",
 		Annotations: readOnlyAnno("Show worktree", false),
 	}, worktreeShowTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "branch_scoped_status",
-		Description: "Answers \"which branches can I resume?\" and \"why did the swap re-seed?\" — per branch_scoped DB: active namespace, occupying branch, and resumable durable copies. No-op when no DBs are branch_scoped.",
-		Annotations: readOnlyAnno("Branch-scoped status", true),
+		Description: "Inspect every branch_scoped DB — active namespace, occupying branch, resumable durable copies. Use to answer \"which branches can I resume?\" and \"why did the swap re-seed?\". No-op when no DBs are branch_scoped.",
+		Annotations: readOnlyAnno("Inspect branch-scoped status", true),
 	}, branchScopedStatusTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -113,14 +113,14 @@ func registerWorktreeReadTools(srv *mcpsdk.Server) {
 func registerLogsReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_query",
-		Description: "PRIMARY diagnostic tool — query the SQLite event log. Every prepare/finalize/teardown/hook/watcher emits events. Filters AND-combine: levels, event_types, phases, since (10m|2h|RFC3339), payload_like, run_id (8-char correlation id). For waiting on a live flow use logs_wait; for end-to-end prepare debugging use the diagnose-prepare-failure prompt.",
+		Description: "Query the SQLite event log — the PRIMARY diagnostic surface. Every prepare/finalize/teardown/hook/watcher emits events. Filters AND-combine: levels, event_types, phases, since (10m|2h|RFC3339), payload_like, run_id (8-char correlation id). To wait on a live flow use logs_wait; to debug an end-to-end prepare use the diagnose-prepare-failure prompt.",
 		Annotations: readOnlyAnno("Query event log", false),
 	}, logsQueryTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_hooks",
-		Description: "Recent hook_run rows for one worktree: command, exit code, stdout/stderr tails. Pair with hook_log_read for full bodies.",
-		Annotations: readOnlyAnno("Hook run history", false),
+		Description: "List recent hook_run rows for one worktree — command, exit code, stdout/stderr tails. Pair with hook_log_read for full bodies.",
+		Annotations: readOnlyAnno("List hook runs", false),
 	}, logsHooksTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -141,13 +141,13 @@ func registerDaemonReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_status",
 		Description: "Check treemand: version, PID, watcher count. Returns status=running|not-running. Call before any daemon-backed action (prepare_run, worktree_create). If not-running, follow with daemon_control(action=\"start\"). For the rich runtime view (in-flight prepares, queued teardowns, backoff timers), use daemon_state.",
-		Annotations: readOnlyAnno("Daemon status", true),
+		Annotations: readOnlyAnno("Check daemon status", true),
 	}, daemonStatusTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_state",
-		Description: "Rich runtime view of treemand — currently-running finalize/teardown goroutines (with age), watcher set (repo + per-worktree + lifecycle), per-repo sync backoff timers, last-skip reasons. Answers \"is the daemon already busy with this worktree?\" without scanning logs.",
-		Annotations: readOnlyAnno("Daemon state", true),
+		Description: "Inspect treemand's runtime state — currently-running finalize/teardown goroutines (with age), watcher set (repo + per-worktree + lifecycle), per-repo sync backoff timers, last-skip reasons. Use to answer \"is the daemon already busy with this worktree?\" without scanning logs.",
+		Annotations: readOnlyAnno("Inspect daemon state", true),
 	}, daemonStateTool)
 }
 
@@ -162,7 +162,7 @@ func registerPlanningReadTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "inputs_fingerprint",
-		Description: "Answers \"why did prepare cold-build instead of cache-hit?\" — per-database input-hash breakdown + whether a matching snapshot exists. Pair with snapshot_inspect on the expected fingerprint. Set probe_engine=true for a cache-comparable engine_version (slower).",
+		Description: "Compute the per-database input-hash breakdown + check whether a matching snapshot exists. Use to answer \"why did prepare cold-build instead of cache-hit?\". Pair with snapshot_inspect on the expected fingerprint. Set probe_engine=true for a cache-comparable engine_version (slower).",
 		Annotations: readOnlyAnno("Inspect input hashes", true),
 	}, inputsFingerprintTool)
 

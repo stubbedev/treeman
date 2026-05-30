@@ -618,3 +618,25 @@ drop every cached snapshot for this repo and force the next prepare to rebuild
 
 run the Model Context Protocol server (stdio transport)
 
+### `treeman notify`
+
+desktop notification helpers
+
+### `treeman notify test`
+
+send a sample desktop notification to verify the backend
+
+```
+Fires a single test banner through the configured (or
+auto-detected) notification backend, so you can confirm notify-send
+(Linux) / osascript (macOS) actually shows a notification before
+enabling notifications: in your config.
+
+Works regardless of notifications.enabled — it tests the transport, not
+the opt-in. Use --backend to probe a specific sender.
+```
+
+| Flag | Usage |
+|---|---|
+| `-b`, `--backend` | auto \| notify-send \| osascript \| none (default: notifications.backend, else auto) |
+

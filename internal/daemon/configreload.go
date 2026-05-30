@@ -223,6 +223,12 @@ func (cr *ConfigReloader) ReloadAll(ctx context.Context) {
 	for _, p := range paths {
 		cr.reloadOne(ctx, p)
 	}
+	// Re-read the global `notifications:` block so toggling it on/off
+	// (or changing the bucket list / backend) in
+	// `~/.config/treeman/config.yaml` takes effect live, without a
+	// daemon restart. Lives here (not reloadOne) because notifications
+	// are global-only and ReloadAll is the global-config seam.
+	RegisterNotifier(cr.st)
 	_ = cr.st.Store.WriteEvent(ctx, store.LevelInfo, "config_reloaded",
 		"config reload restarted watchers (all repos)", 0, 0, "", 0,
 		map[string]string{"scope": "all"})

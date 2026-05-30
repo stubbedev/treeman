@@ -111,6 +111,14 @@ func run() error {
 	_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_started", "treemand listening",
 		0, 0, "", 0, map[string]string{"socket": sockPath})
 
+	// Desktop notifications (opt-in via the global `notifications:`
+	// block). Registered after the store + batcher are up so the hook
+	// can fan lifecycle events out to notify-send / osascript.
+	// ConfigReloader.ReloadAll re-registers it on every global-config
+	// reload (fsnotify edit, SIGHUP, or config_reload RPC), so changes
+	// take effect live without a restart.
+	daemon.RegisterNotifier(st)
+
 	// Config reloader. Subscribes to the global config dir
 	// `~/.config/treeman/` immediately; per-repo dirs are added below
 	// as we resume watchers (and by `startRepoWatcher` for new repos
@@ -300,6 +308,9 @@ func hupReloadLoop(ctx context.Context, st *daemon.State, cr *daemon.ConfigReloa
 			return
 		case <-hupCh:
 			slog.Info("SIGHUP received — reloading config")
+			// ReloadAll re-registers the desktop notifier from the
+			// refreshed global config, so SIGHUP picks up
+			// `notifications:` edits too.
 			cr.ReloadAll(st.BgCtx)
 		}
 	}

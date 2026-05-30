@@ -53,6 +53,10 @@ protocol).
 - **MCP server** — `treeman mcp` exposes config authoring/validation,
   event-log + hook-output queries, live engine state, and snapshot
   inspection to Claude Code / Desktop / Cursor.
+- **Desktop notifications** — opt-in `notifications:` block fires
+  `notify-send` (Linux) / native banners (macOS) when a worktree turns
+  ready, fails, or starts/finishes preparing; configurable per status
+  bucket, hot-reloaded without a restart.
 - **Single static binary** per platform — no CGo, no system libraries;
   CI cross-builds `{linux,darwin}` × `{amd64,arm64}`.
 

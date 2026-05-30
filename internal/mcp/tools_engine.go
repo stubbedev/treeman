@@ -39,13 +39,13 @@ import (
 func registerEngineReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "engine_status",
-		Description: "Answers \"are my databases up?\" — probes every engine in .treeman.yaml. Reachable? version? per-DB summary. Call before prepare_run/worktree_create against a fresh env, and as the second step in diagnose-prepare-failure.",
-		Annotations: readOnlyAnno("Engine status probe", true),
+		Description: "Probe every engine in .treeman.yaml — reachable? version? per-DB summary. Use to answer \"are my databases up?\". Call before prepare_run/worktree_create against a fresh env, and as the second step in diagnose-prepare-failure.",
+		Annotations: readOnlyAnno("Probe engine status", true),
 	}, engineStatusTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_schema_dump",
-		Description: "Live schema for ONE database — mysql/postgres: CREATE TABLEs, mongo: collection list + samples, ES: index mapping, redis: SCAN-driven key summary. Use when reasoning about live shape vs. what migrations expect. db = the rendered per-worktree name (find via worktree_show or snapshot_inspect). Capped at max_tables (default 200).",
+		Description: "Dump the live schema for ONE database — mysql/postgres: CREATE TABLEs, mongo: collection list + samples, ES: index mapping, redis: SCAN-driven key summary. Use to reason about live shape vs. what migrations expect. db = the rendered per-worktree name (find via worktree_show or snapshot_inspect). Capped at max_tables (default 200).",
 		Annotations: readOnlyAnno("Dump live schema", true),
 	}, dbSchemaDumpTool)
 

@@ -123,6 +123,14 @@ Status configures the `treeman status` widget output (icons,
 labels, hover lines, custom bar formats). Lives in the global
 config since the widget aggregates worktrees across every repo.
 
+### `notifications` *([NotificationsConfig](#notificationsconfig))*
+
+Notifications opts into desktop notifications (notify-send on
+Linux, the native banner via osascript on macOS) when a worktree
+changes lifecycle state. Off by default. Lives in the global
+config since the daemon that emits them is a single cross-repo
+process.
+
 ## Types
 
 ### Action
@@ -640,6 +648,49 @@ mongodb connection — bare URL string OR structured object.
 ### MysqlConn
 
 MySQL connection — bare DSN string OR structured object.
+
+### NotificationsConfig
+
+NotificationsConfig — `notifications:` block. Opt-in desktop
+notifications fired by the daemon when a worktree crosses a lifecycle
+status boundary. Backend is auto-detected per OS (notify-send on
+Linux, `osascript -e 'display notification'` on macOS); platforms
+without a known sender silently no-op.
+
+Each notification is keyed to one of the four `treeman status`
+buckets:
+  - stable: a worktree finished preparing and is ready (finalize done)
+  - up:     a worktree began preparing (finalize started)
+  - down:   a worktree began tearing down
+  - failed: a worktree's finalize errored
+
+`up` and `down` are transient and chatty, so the default
+(`events:` unset) only notifies on `stable` + `failed` — ready and
+errored, the two resting states worth surfacing. Set `events:`
+explicitly to opt into the transient ones, or to a subset.
+
+#### `enabled` *(boolean)*
+
+Enabled toggles the whole feature. Off by default — every
+existing install sees zero behaviour change until it's set.
+
+#### `events` *(array of string)*
+
+Events is the set of status buckets that fire a notification.
+Allowed values: stable, up, down, failed. When unset (nil) the
+default of [stable, failed] applies (see applyDefaults). An
+explicit empty list (`events: []`) disables every bucket while
+leaving the feature otherwise "enabled" — useful as a base for a
+per-repo override that re-adds buckets.
+
+#### `backend` *(string)*
+
+Backend forces a specific sender instead of OS auto-detection.
+Allowed values: auto (default), notify-send, osascript, none.
+`none` disables sending without unsetting `enabled` — handy to
+mute notifications on one host while keeping the shared config.
+
+_Allowed: `auto`, `notify-send`, `osascript`, `none`_
 
 ### Patch
 
