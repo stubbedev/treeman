@@ -189,14 +189,24 @@ func WriteFile(t *testing.T, dir, rel, body string) string {
 // a noisy compose error.
 func SkipIfNoDocker(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker not installed")
+	SkipIfNoEngine(t, "docker")
+}
+
+// SkipIfNoEngine is SkipIfNoDocker generalised to any docker-CLI-
+// compatible container engine (podman, nerdctl, finch, orbctl …).
+// Probes `<engine> info` as the readiness check — every engine
+// treeman targets implements it, and a successful run guarantees
+// the daemon socket / VM is reachable.
+func SkipIfNoEngine(t *testing.T, engine string) {
+	t.Helper()
+	if _, err := exec.LookPath(engine); err != nil {
+		t.Skipf("%s not installed", engine)
 	}
-	cmd := exec.Command("docker", "info")
+	cmd := exec.Command(engine, "info")
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Run(); err != nil {
-		t.Skipf("docker daemon not reachable: %v", err)
+		t.Skipf("%s daemon not reachable: %v", engine, err)
 	}
 }
 

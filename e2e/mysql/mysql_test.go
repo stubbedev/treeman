@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 func TestMySQLEndToEnd(t *testing.T) {
@@ -205,6 +207,73 @@ func TestIncrementalAncestorBuild(t *testing.T) {
 	// inside the cloned ancestor template skipped the already-applied
 	// files and ran only the new 2024_02_01 migration.
 	assertTablesPresent(t, "127.0.0.1:13306", o2.SourceDB, []string{"products", "orders", "shipments"})
+}
+
+// TestPhysicalCloneViaContainerExec proves task #6: when the MySQL
+// connection carries a ContainerRef, treeman's SnapshotCreate runs
+// InnoDB transferable tablespaces via `docker exec cp` instead of the
+// per-row INSERT … SELECT loader. We assert by querying the new
+// `snapshot_clone_strategy` event for strategy=physical AND verifying
+// the cloned template carries the same rows as the source.
+func TestPhysicalCloneViaContainerExec(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	cfg := buildConfig()
+	// The container is named `treeman-e2e-mysql` in this suite's
+	// docker-compose.yml. Setting ContainerRef enables the physical
+	// clone fast path inside SnapshotCreate. Port becomes the IN-
+	// CONTAINER port (3306); the containerip resolver rewrites Host
+	// to the bridge IP on Linux or the published-port mapping on
+	// macOS/Windows.
+	cfg.Connections.Mysql.Port = 3306
+	cfg.Connections.Mysql.ContainerRef = config.ContainerRef{
+		Container: "treeman-e2e-mysql",
+	}
+
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mysql", false)
+	t.Logf("cold build: source=%s template=%s", o.SourceDB, o.TemplateName)
+
+	// Assert at least one snapshot_clone_strategy event with strategy=physical.
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"snapshot_clone_strategy"},
+	})
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	if len(evs) == 0 {
+		t.Fatal("no snapshot_clone_strategy events — instrumentation regression")
+	}
+	var sawPhysical bool
+	for _, e := range evs {
+		if strings.Contains(e.Message, "strategy=physical") {
+			sawPhysical = true
+			t.Logf("clone strategy event: %s", e.Message)
+		} else {
+			t.Logf("non-physical strategy event: %s", e.Message)
+		}
+	}
+	if !sawPhysical {
+		t.Errorf("expected at least one strategy=physical event; got events but none physical:\n%v", evs)
+	}
+
+	// Data correctness: the template must carry the seeded rows. The
+	// migrate step runs against the source, then physical clone copies
+	// the .ibd files; if the IMPORT ran cleanly the rows are present.
+	assertTablesPresent(t, "127.0.0.1:13306", o.TemplateName, []string{"products", "orders"})
+	assertRowCount(t, "127.0.0.1:13306", o.TemplateName, "products", 3)
 }
 
 func assertTablesPresent(t *testing.T, addr, dbName string, want []string) {

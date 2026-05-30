@@ -11,8 +11,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
 
 	"golang.org/x/sync/errgroup"
 
@@ -49,6 +51,30 @@ func isTableExistsErr(err error) bool {
 type Driver struct {
 	DB  *sql.DB
 	cfg config.MysqlConn
+
+	// strategyMu guards lastCloneStrategy. Callers query via
+	// LastCloneStrategy after a SnapshotCreate to learn which path
+	// (physical / logical) actually ran for observability.
+	strategyMu        sync.Mutex
+	lastCloneStrategy CloneStrategy
+}
+
+// LastCloneStrategy returns the CloneStrategy used by the most recent
+// SnapshotCreate call on this driver. "" before any call. Used by the
+// prepare layer to emit a snapshot_clone_strategy event so users can
+// see whether the fast physical path or the logical fallback ran.
+func (d *Driver) LastCloneStrategy() CloneStrategy {
+	d.strategyMu.Lock()
+	defer d.strategyMu.Unlock()
+	return d.lastCloneStrategy
+}
+
+// setLastStrategy is the writer side of LastCloneStrategy. Called from
+// SnapshotCreate's dispatcher under strategyMu.
+func (d *Driver) setLastStrategy(s CloneStrategy) {
+	d.strategyMu.Lock()
+	d.lastCloneStrategy = s
+	d.strategyMu.Unlock()
 }
 
 // Connect opens a pooled mysql connection at the server level (no
@@ -238,7 +264,47 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 	return d.EnsureDB(ctx, name)
 }
 
-// SnapshotCreate clones `source` into `template` in two phases:
+// SnapshotCreate clones `source` into `template` using the fastest
+// available strategy:
+//
+//  1. PHYSICAL: InnoDB transferable tablespaces. Requires
+//     `connections.mysql.container` / `compose_service` to be set so
+//     treeman can `<container-engine> exec cp` the .ibd / .cfg files
+//     inside the container (preserving the mysql:mysql ownership the
+//     server needs to IMPORT them). Several times faster than the
+//     logical path on non-trivial schemas because it skips the
+//     INSERT ... SELECT round-trips entirely. See physical_clone.go.
+//
+//  2. LOGICAL: the serial-DDL + parallel-INSERT-SELECT loader (see
+//     logicalSnapshotCreate). Always available; picked when the
+//     physical preconditions aren't met OR when physical was
+//     attempted but failed (the warning is logged and the fall-back
+//     takes over).
+//
+// The strategy chosen for this call is recorded on the Driver and
+// retrievable via LastCloneStrategy(); the prepare layer reads it to
+// emit a snapshot_clone_strategy event.
+func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
+	if ok, perr := d.tryPhysicalSnapshotCreate(ctx, source, template); ok {
+		d.setLastStrategy(CloneStrategyPhysical)
+		return nil
+	} else if perr != nil {
+		var skip *physicalSkippedError
+		if errors.As(perr, &skip) {
+			slog.Debug("mysql physical clone preconditions not met; using logical fallback",
+				"source", source, "template", template, "reason", skip.reason)
+		} else {
+			slog.Warn("mysql physical clone failed; falling back to logical clone",
+				"source", source, "template", template, "error", perr)
+		}
+	}
+	d.setLastStrategy(CloneStrategyLogical)
+	return d.logicalSnapshotCreate(ctx, source, template)
+}
+
+// logicalSnapshotCreate is the pre-physical implementation kept as the
+// always-available fallback. Clones `source` into `template` in two
+// phases:
 //
 //  1. Serial DDL pass on a single connection — every base table's
 //     `CREATE TABLE` runs against the new template, and the
@@ -255,7 +321,7 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 // Views replay serially afterwards because views can reference
 // other views / tables and engines reject CREATE VIEW against a
 // missing dependency.
-func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
+func (d *Driver) logicalSnapshotCreate(ctx context.Context, source, template string) error {
 	qsource, err := ident.QuoteMySQL(source)
 	if err != nil {
 		return err

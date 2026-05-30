@@ -149,6 +149,27 @@ const (
 	cacheMissTemplateGone = "template_gone"
 )
 
+// emitCloneStrategy records which SnapshotCreate path the engine
+// driver actually took (currently physical / logical for mysql; the
+// other engines have only one path so they don't emit). Pair with
+// the prepare_phase `snapshot-create` event: that one says HOW LONG
+// it took, this one says WHICH MECHANISM.
+func emitCloneStrategy(ctx context.Context, st *store.Store, repoID, worktreeID int64,
+	engine, sourceDB, templateName, strategy string,
+) {
+	if st == nil || strategy == "" {
+		return
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_clone_strategy",
+		fmt.Sprintf("engine=%s strategy=%s template=%s", engine, strategy, templateName),
+		repoID, worktreeID, "snapshot-create", 0, map[string]string{
+			"engine":    engine,
+			"source_db": sourceDB,
+			"template":  templateName,
+			"strategy":  strategy,
+		})
+}
+
 // emitCacheMiss writes a snapshot_cache_miss event explaining why a
 // cache-hit lookup failed and what the engine is about to do instead
 // (cold-build or incremental). Pair with the existing
@@ -648,6 +669,7 @@ func RunFiltered(
 	return outcomes, nil
 }
 
+//nolint:funlen // mirrors the linear cache-hit / incremental / cold-build / fanout flow used by every engine; extracting helpers just spreads the same conditions across functions
 func prepareMySQL(
 	ctx context.Context,
 	cfg *config.Config,
@@ -732,7 +754,14 @@ func prepareMySQL(
 		inheritedEnv, started, incrementalOps{
 			exists:          drv.DatabaseExists,
 			snapshotRestore: drv.SnapshotRestore,
-			snapshotCreate:  drv.SnapshotCreate,
+			snapshotCreate: func(ctx context.Context, src, tmpl string) error {
+				if cerr := drv.SnapshotCreate(ctx, src, tmpl); cerr != nil {
+					return cerr
+				}
+				emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, src, tmpl,
+					string(drv.LastCloneStrategy()))
+				return nil
+			},
 		})
 	if done || err != nil {
 		return out, err
@@ -975,6 +1004,7 @@ func mysqlSnapshotAndRecord(
 		return fmt.Errorf("snapshot create %s → %s: %w", sourceDB, templateName, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
+	emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, sourceDB, templateName, string(drv.LastCloneStrategy()))
 	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
 		Fingerprint:    key.Fingerprint(),
 		Engine:         d.Engine,
