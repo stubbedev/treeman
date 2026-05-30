@@ -333,6 +333,14 @@ func handleConn(ctx context.Context, conn net.Conn, st *daemon.State, shutdown c
 		if err := dec.Decode(&req); err != nil {
 			return
 		}
+		if daemon.IsStreamingMethod(req.Method) {
+			// Streaming methods own the connection for the duration of
+			// the subscription. Caller closing the socket (or our ctx
+			// cancelling) ends the stream; we don't loop for more
+			// requests on the same conn.
+			daemon.DispatchStreaming(ctx, st, enc, req)
+			return
+		}
 		resp := daemon.Dispatch(ctx, st, shutdown, req)
 		if err := enc.Encode(&resp); err != nil {
 			return

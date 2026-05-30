@@ -57,6 +57,24 @@ clients that want a restricted surface should enforce that at the
 agent-policy layer (Claude Code's tool allow-list, Cursor's MCP
 allow rules, etc.), not here.
 
+### Destructive-action confirmation (elicitation)
+
+`worktree_delete`, `snapshots_purge`, `db_reset`, and `repo_remove`
+gate their mutation behind an MCP `notifications/elicitation`
+confirmation when invoked with `dry_run=false`. Clients that support
+elicitation (Claude Desktop, etc.) get a confirmation pop-up before
+the action runs; clients that don't support it (or that error out)
+fall through to proceed so non-interactive agents aren't blocked.
+
+Per-call overrides:
+
+- `dry_run=true` — skip elicitation; return the plan instead.
+- `ack=true` — skip elicitation; proceed (use when the agent has
+  already secured user approval out-of-band).
+
+Refusals (decline/cancel) come back as `refused: "<reason>"` on the
+tool result with no mutation performed.
+
 ## Tools exposed
 
 | Tool | What it does |
@@ -65,12 +83,14 @@ allow rules, etc.), not here.
 | `config_get`, `config_validate`, `config_schema`, `config_diff` | Read/validate the YAML config. `config_get` output is redacted (passwords in resolved connection strings). |
 | `worktree_list`, `worktree_show`, `snapshots_list` | Registry + snapshot-cache queries. `worktree_show` also reports allocated ports and branch_scoped active-namespace state. |
 | `branch_scoped_status` | Per branch_scoped database: active namespace, which branch's data occupies it now, and which local branches have a resumable durable copy. |
-| `logs_query`, `logs_hooks`, `logs_wait`, `logs_subscribe` | Event log + hook run history. `logs_wait` blocks until N matches; `logs_subscribe` streams events live via MCP progress + logging notifications. Output is run through a secret-redaction pass before returning to the client. |
+| `logs_query`, `logs_hooks`, `logs_wait`, `logs_subscribe` | Event log + hook run history. `logs_wait` blocks until N matches via SQLite polling; **`logs_subscribe` prefers push mode** — opens a streaming RPC subscription to the daemon so events arrive without polling, falling back to 500ms polling only when the daemon is unreachable. The result's `mode` field reports which path was used. Output runs through a secret-redaction pass. |
 | `fw_detect`, `slug_compute`, `inputs_fingerprint` | Detection + fingerprint helpers. `inputs_fingerprint` answers "why did prepare cold-build instead of cache-hit?". |
 | `prepare_dry_run` | Render the prepare pipeline plan WITHOUT executing — per-DB rendered name, dump files, migrate/seed commands, fanout count, expected fingerprint. |
 | `connection_probe` | Dry-test a connection string (or the repo's configured connection) — reachable, version, latency. Use to iterate on credentials before committing them. |
+| `engine_logs` | Tail container logs for one configured engine (`docker logs --tail N --since S` or `podman`/`nerdctl`/`finch` per the connection block). Closes the "why is MySQL refusing connections?" gap. Errors with a clear message when the engine has no container ref. |
+| `prompts_list` | List every registered MCP prompt with its when-to-use trigger. Discovery backup for clients with weak prompt UI. |
 | `config_write`, `config_set`, `hook_run`, `prepare_run` | Replace the whole YAML body, patch a single field by dotted path, run a hook phase (`env_overrides` lets you tweak one var for the run), run the prepare pipeline. |
-| `db_reset` | Re-sync a worktree's `branch_scoped` databases from the live base branch. Destructive for the current branch's working data; `dry_run=true` previews. |
+| `db_reset` | Re-sync a worktree's `branch_scoped` databases from the live base branch. Destructive for the current branch's working data; `dry_run=true` previews, `ack=true` skips elicitation. |
 | `init_repo`, `schema_install` | Scaffold `.treeman.yaml`; install the JSON Schema and wire its modeline. |
 | `registry_register`, `registry_unregister`, `registry_repair`, `worktree_repair` | Mutate the SQLite worktree registry directly. `registry_repair` diffs git vs SQLite. `worktree_repair` reconciles ports / finalize state / snapshot templates for one worktree. |
 | `repo_remove` | Drop a whole REPO from the SQLite registry (cascades to its worktrees/events/snapshots/hook_runs). `dry_run=true` counts cascaded rows first. External resources are not touched; refuses by default if active worktrees exist. |

@@ -68,7 +68,23 @@ type Store struct {
 	batchCancel context.CancelFunc
 	batchDone   chan struct{}
 	batchActive bool
+
+	// Event-hook registry. Hooks fire after every successful WriteEvent
+	// insert (both sync and batched paths). Used by the daemon's
+	// streaming RPC to fan-out events to MCP subscribers without
+	// polling SQLite. Hooks are best-effort — slow or panicking hooks
+	// don't block WriteEvent.
+	hookMu sync.RWMutex
+	hooks  map[string]EventHook
 }
+
+// EventHook is the callback registered via RegisterEventHook. Fires
+// once per successful WriteEvent. Implementations MUST return quickly
+// (the call is on the WriteEvent path); spawn a goroutine if any
+// real work is needed. ID is best-effort: populated on the sync path,
+// 0 on the batched path (the daemon's flush doesn't query lastrowid
+// per row).
+type EventHook func(Event)
 
 // pendingEvent is one buffered events-table row awaiting flush.
 type pendingEvent struct {
@@ -117,6 +133,89 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{DB: db}, nil
+}
+
+// RegisterEventHook installs a callback that fires after every
+// WriteEvent insert (both sync and batched paths). id is a caller-
+// chosen unique key — re-registering the same id replaces the prior
+// hook. Hooks see a best-effort Event: ID is populated on the sync
+// path, 0 on the batched path. Cheap to register/unregister; takes
+// only the hook write-lock briefly.
+func (s *Store) RegisterEventHook(id string, fn EventHook) {
+	if id == "" || fn == nil {
+		return
+	}
+	s.hookMu.Lock()
+	if s.hooks == nil {
+		s.hooks = map[string]EventHook{}
+	}
+	s.hooks[id] = fn
+	s.hookMu.Unlock()
+}
+
+// UnregisterEventHook removes the named hook. No-op when the id was
+// never registered. Idempotent.
+func (s *Store) UnregisterEventHook(id string) {
+	s.hookMu.Lock()
+	delete(s.hooks, id)
+	s.hookMu.Unlock()
+}
+
+// fireEventHooks invokes every registered hook with ev. Panics in a
+// hook are recovered + logged so one misbehaving subscriber can't kill
+// the WriteEvent path. Hooks run synchronously under the read-lock —
+// they must return quickly (subscribers fan out in their own
+// goroutines).
+func (s *Store) fireEventHooks(ev Event) {
+	s.hookMu.RLock()
+	if len(s.hooks) == 0 {
+		s.hookMu.RUnlock()
+		return
+	}
+	hooks := make([]EventHook, 0, len(s.hooks))
+	for _, fn := range s.hooks {
+		hooks = append(hooks, fn)
+	}
+	s.hookMu.RUnlock()
+	for _, fn := range hooks {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Warn("event hook panic", "panic", fmt.Sprint(r))
+				}
+			}()
+			fn(ev)
+		}()
+	}
+}
+
+// pendingEventToEvent rebuilds an Event from the buffered row shape
+// used on the batched path. ID is 0 because the batched insert
+// doesn't capture lastrowid per row — subscribers that need ordering
+// should rely on Ts instead.
+func pendingEventToEvent(p pendingEvent) Event {
+	ev := Event{
+		Ts:          p.tsMillis,
+		Level:       p.level,
+		EventType:   p.eventType,
+		PayloadJSON: p.payload,
+	}
+	if v, ok := p.repoID.(int64); ok {
+		ev.RepoID = sql.NullInt64{Int64: v, Valid: true}
+	}
+	if v, ok := p.worktreeID.(int64); ok {
+		ev.WorktreeID = sql.NullInt64{Int64: v, Valid: true}
+	}
+	if v, ok := p.phase.(string); ok {
+		ev.Phase = v
+	}
+	if v, ok := p.message.(string); ok {
+		ev.Message = v
+	}
+	if v, ok := p.durationMs.(int64); ok {
+		ev.DurationMs = sql.NullInt64{Int64: v, Valid: true}
+	}
+	return ev
 }
 
 // Close shuts down the underlying pool. If the event batcher is
@@ -945,16 +1044,29 @@ func (s *Store) WriteEvent(ctx context.Context,
 			default:
 			}
 		}
+		// Fire hooks even on the batched path so subscribers see the
+		// event without waiting for the next flush. ID is 0 (assigned
+		// at flush time) — subscribers that need an ID can look it up
+		// via QueryEvents.
+		s.fireEventHooks(pendingEventToEvent(row))
 		return nil
 	}
 	s.batchMu.Unlock()
 
-	_, err = s.DB.ExecContext(ctx,
+	res, err := s.DB.ExecContext(ctx,
 		`INSERT INTO events(ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		row.tsMillis, row.level, row.repoID, row.worktreeID,
 		row.eventType, row.phase, row.message, row.payload, row.durationMs)
-	return err
+	if err != nil {
+		return err
+	}
+	ev := pendingEventToEvent(row)
+	if id, idErr := res.LastInsertId(); idErr == nil {
+		ev.ID = id
+	}
+	s.fireEventHooks(ev)
+	return nil
 }
 
 // injectRunID stamps the ctx-bound run_id into payload so every event

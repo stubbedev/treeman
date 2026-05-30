@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	dbes "github.com/stubbedev/treeman/internal/db/es"
 	"github.com/stubbedev/treeman/internal/db/ident"
 	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
@@ -70,6 +72,12 @@ func registerEngineReadTools(srv *mcpsdk.Server) {
 		Description: "Dry-test a connection string against an engine without writing it to .treeman.yaml. Tightens the setup loop — iterate on credentials, observe reachable/version/latency, then commit via config_set. dsn forms: mysql://user:pw@host:port, postgres://…, mongodb://…, redis://…, http(s)://…(ES). Omit dsn to probe the repo's currently-configured connection.",
 		Annotations: readOnlyAnno("Probe connection", true),
 	}, connectionProbeTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "engine_logs",
+		Description: "Tail the container logs for one configured engine — `docker logs --tail N --since S` (or podman/nerdctl/finch per the connection block's container_engine). Closes the \"why is MySQL refusing connections?\" gap so the agent doesn't have to leave MCP for the diagnosis. Errors with a clear message when the engine's connection block has no container/compose ref (raw host engines need host-side log access).",
+		Annotations: readOnlyAnno("Tail engine logs", true),
+	}, engineLogsTool)
 }
 
 func registerEngineWriteTools(srv *mcpsdk.Server) {
@@ -1322,6 +1330,131 @@ func probeESConn(ctx context.Context, dsn, repo string) (bool, string, error) {
 	}
 	v, _ := drv.EngineVersion(ctx)
 	return true, v, nil
+}
+
+// ─── engine_logs ────────────────────────────────────────────────────
+
+type engineLogsIn struct {
+	Repo   string `json:"repo,omitempty"`
+	Engine string `json:"engine"          jsonschema:"mysql|mariadb|tidb|postgres|postgresql|mongodb|redis|elasticsearch|opensearch"`
+	Lines  int    `json:"lines,omitempty" jsonschema:"max lines returned (default 200, max 5000)"`
+	Since  string `json:"since,omitempty" jsonschema:"only logs newer than this — duration like 10m|2h (default empty = no since filter)"`
+}
+
+type engineLogsOut struct {
+	Engine        string `json:"engine"`
+	ContainerID   string `json:"container_id,omitempty"`
+	ContainerName string `json:"container_name,omitempty"`
+	EngineBinary  string `json:"engine_binary"            jsonschema:"docker|podman|nerdctl|finch — the binary used to run logs"`
+	Lines         int    `json:"lines"`
+	Body          string `json:"body"`
+}
+
+// engineLogsTool shells out to `<engine_binary> logs --tail N [--since S]`
+// for the container backing one configured engine. Read-only — the
+// engine's logs are stdout, not engine state. Refuses when the
+// engine's connection block has no container_ref (raw host engines
+// need out-of-band log access).
+func engineLogsTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in engineLogsIn,
+) (*mcpsdk.CallToolResult, engineLogsOut, error) {
+	cfg, err := loadCfgForRepo(in.Repo)
+	if err != nil {
+		return nil, engineLogsOut{}, err
+	}
+	ref, err := containerRefForEngine(cfg, in.Engine)
+	if err != nil {
+		return nil, engineLogsOut{}, err
+	}
+	lines := in.Lines
+	if lines <= 0 {
+		lines = 200
+	}
+	if lines > 5000 {
+		lines = 5000
+	}
+	bin := ref.ContainerEngine
+	if bin == "" {
+		bin = "docker"
+	}
+	id, err := containerip.ContainerID(containerip.Opts{
+		Container:      ref.Container,
+		ComposeService: ref.ComposeService,
+		ComposeProject: ref.ComposeProject,
+		Engine:         bin,
+	})
+	if err != nil {
+		return nil, engineLogsOut{}, fmt.Errorf("resolve container: %w", err)
+	}
+	args := []string{"logs", "--tail", strconv.Itoa(lines)}
+	if in.Since != "" {
+		args = append(args, "--since", in.Since)
+	}
+	args = append(args, id)
+	cmd := exec.CommandContext(ctx, bin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, engineLogsOut{}, fmt.Errorf("%s logs: %w (output: %s)", bin, err, string(output))
+	}
+	body := redactSecrets(string(output))
+	name := ref.Container
+	if name == "" {
+		name = ref.ComposeService
+	}
+	return nil, engineLogsOut{
+		Engine:        strings.ToLower(in.Engine),
+		ContainerID:   id,
+		ContainerName: name,
+		EngineBinary:  bin,
+		Lines:         strings.Count(body, "\n"),
+		Body:          body,
+	}, nil
+}
+
+// containerRefForEngine returns the ContainerRef from the engine's
+// connection block. Errors when the connection isn't configured or
+// has no container/compose ref — agents need an explicit signal
+// for "this engine isn't containerised" so they can suggest host
+// logs instead.
+func containerRefForEngine(cfg *config.Config, eng string) (*config.ContainerRef, error) {
+	fam, ok := engine.Canonical(eng)
+	if !ok {
+		return nil, fmt.Errorf("unsupported engine: %s", eng)
+	}
+	var ref *config.ContainerRef
+	switch fam {
+	case engine.FamilyMySQL:
+		if cfg.Connections.Mysql == nil {
+			return nil, errors.New("connections.mysql not configured")
+		}
+		ref = &cfg.Connections.Mysql.ContainerRef
+	case engine.FamilyPostgres:
+		if cfg.Connections.Postgres == nil {
+			return nil, errors.New("connections.postgres not configured")
+		}
+		ref = &cfg.Connections.Postgres.ContainerRef
+	case engine.FamilyMongo:
+		if cfg.Connections.Mongodb == nil {
+			return nil, errors.New("connections.mongodb not configured")
+		}
+		ref = &cfg.Connections.Mongodb.ContainerRef
+	case engine.FamilyRedis:
+		if cfg.Connections.Redis == nil {
+			return nil, errors.New("connections.redis not configured")
+		}
+		ref = &cfg.Connections.Redis.ContainerRef
+	case engine.FamilyES:
+		if cfg.Connections.Elasticsearch == nil {
+			return nil, errors.New("connections.elasticsearch not configured")
+		}
+		ref = &cfg.Connections.Elasticsearch.ContainerRef
+	}
+	if ref == nil || (ref.Container == "" && ref.ComposeService == "") {
+		return nil, fmt.Errorf("engine %s has no container/compose ref — check the host engine logs directly", eng)
+	}
+	return ref, nil
 }
 
 // yamlScalar fills a config struct from a bare DSN scalar by routing

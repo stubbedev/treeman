@@ -7,6 +7,113 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// promptSpec pairs a prompt definition with its handler. Defined as
+// a slice rather than inline AddPrompt calls so the prompts_list tool
+// can iterate the same source-of-truth registry.
+type promptSpec struct {
+	def     *mcpsdk.Prompt
+	handler mcpsdk.PromptHandler
+	// WhenToUse is the trigger phrase agents should match on. Surfaced
+	// only via the prompts_list tool (the MCP Prompt protocol type
+	// has no equivalent field) — keeps clients with weak prompt UI
+	// from missing the natural-language activation cue.
+	WhenToUse string
+}
+
+// allPrompts is the single source of truth for prompts. registerPrompts
+// iterates it to wire AddPrompt calls; promptsListTool returns it as
+// JSON for discoverability on clients that hide MCP prompts.
+var allPrompts = []promptSpec{
+	{
+		def: &mcpsdk.Prompt{
+			Name:        "diagnose-prepare-failure",
+			Title:       "Diagnose a failed prepare",
+			Description: "Walks through the chain of tool calls needed to localize a failing prepare: pull recent error events, identify the engine that failed, check engine reachability, inspect the cached snapshot, and surface the actual root-cause line. Pass worktree to scope to one worktree, or run_id to scope to one prepare invocation.",
+			Arguments: []*mcpsdk.PromptArgument{
+				{Name: "worktree", Description: "slug, branch, or basename to scope the investigation", Required: false},
+				{
+					Name:        "run_id",
+					Description: "8-char correlation id; preferred when known (much narrower scope than worktree)",
+					Required:    false,
+				},
+			},
+		},
+		handler:   diagnosePreparePrompt,
+		WhenToUse: `user says "why did prepare fail" / "what went wrong" / "the cold build is broken"`,
+	},
+	{
+		def: &mcpsdk.Prompt{
+			Name:        "scaffold-from-framework",
+			Title:       "Scaffold .treeman.yaml for the detected framework",
+			Description: "Detects the framework in the current repo, drafts a .treeman.yaml from the matching scaffold template, validates it, and writes it after the user reviews the diff. Stops short of executing prepare so the user controls the first cold build.",
+			Arguments: []*mcpsdk.PromptArgument{
+				{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
+			},
+		},
+		handler:   scaffoldFromFrameworkPrompt,
+		WhenToUse: `user wants a .treeman.yaml scaffolded but is willing to review before running prepare`,
+	},
+	{
+		def: &mcpsdk.Prompt{
+			Name:        "cache-cleanup",
+			Title:       "Hunt orphan snapshots and drop them",
+			Description: "Lists every cached snapshot for the current repo, probes each one to see whether the engine-side template still exists, and drops the orphans (SQLite rows whose template was deleted out-of-band on the engine). The agent confirms before each drop.",
+			Arguments: []*mcpsdk.PromptArgument{
+				{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
+			},
+		},
+		handler:   cacheCleanupPrompt,
+		WhenToUse: `prepare keeps cold-building / cache seems wrong / snapshot rows look stale; safer than snapshots_purge`,
+	},
+	{
+		def: &mcpsdk.Prompt{
+			Name:        "worktree-setup",
+			Title:       "Create a worktree end-to-end",
+			Description: "Walks through picking an unoccupied branch, computing the slug, creating the worktree (which triggers prepare + setup hooks), waiting for finalize, and reporting the result. Best when the user says \"set me up a worktree for branch X\" but hasn't decided how to verify success.",
+			Arguments: []*mcpsdk.PromptArgument{
+				{
+					Name:        "branch",
+					Description: "branch name to base the worktree on; omit to let the agent recommend one from branches_list",
+					Required:    false,
+				},
+				{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
+			},
+		},
+		handler:   worktreeSetupPrompt,
+		WhenToUse: `user says "set me up a worktree" / "make me a worktree for X" / "start working on branch Y"`,
+	},
+	{
+		def: &mcpsdk.Prompt{
+			Name:        "migration-trial",
+			Title:       "Trial a migration in an ephemeral worktree",
+			Description: "Creates a throw-away worktree, runs the user's migrate step against it, reports the outcome (plus any schema deltas via db_schema_dump), and tears the worktree down. Use this to validate a migration change BEFORE merging — without polluting any existing worktree's database state.",
+			Arguments: []*mcpsdk.PromptArgument{
+				{Name: "branch", Description: "branch carrying the migration to trial", Required: true},
+				{
+					Name:        "db_index",
+					Description: "index into databases[] to focus the schema diff on; omit to skip the diff step",
+					Required:    false,
+				},
+				{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
+			},
+		},
+		handler:   migrationTrialPrompt,
+		WhenToUse: `user wants to validate a migration without committing to it / "is this migration safe?"`,
+	},
+	{
+		def: &mcpsdk.Prompt{
+			Name:        "bootstrap-new-repo",
+			Title:       "Set up treeman in a fresh repo end-to-end",
+			Description: "Walks through first-time enrollment: framework detect → engine connection probe per engine → init_repo → schema_install → daemon ensure → registry_register → first prepare → verify. Use when the user wants treeman wired into a repo that has no .treeman.yaml yet.",
+			Arguments: []*mcpsdk.PromptArgument{
+				{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
+			},
+		},
+		handler:   bootstrapNewRepoPrompt,
+		WhenToUse: `repo has no .treeman.yaml yet; user wants treeman fully wired up from scratch`,
+	},
+}
+
 // registerPrompts binds the canned multi-step workflows treeman
 // exposes as MCP prompts. Prompts encode the *order* of tool calls
 // for tasks where there's a known-good recipe — diagnosing a failed
@@ -18,75 +125,55 @@ import (
 // names the artifacts to inspect. The agent then drives the tool
 // calls; treeman does not pre-execute them.
 func registerPrompts(srv *mcpsdk.Server) {
-	srv.AddPrompt(&mcpsdk.Prompt{
-		Name:        "diagnose-prepare-failure",
-		Title:       "Diagnose a failed prepare",
-		Description: "Walks through the chain of tool calls needed to localize a failing prepare: pull recent error events, identify the engine that failed, check engine reachability, inspect the cached snapshot, and surface the actual root-cause line. Pass worktree to scope to one worktree, or run_id to scope to one prepare invocation.",
-		Arguments: []*mcpsdk.PromptArgument{
-			{Name: "worktree", Description: "slug, branch, or basename to scope the investigation", Required: false},
-			{
-				Name:        "run_id",
-				Description: "8-char correlation id; preferred when known (much narrower scope than worktree)",
-				Required:    false,
-			},
-		},
-	}, diagnosePreparePrompt)
+	for _, p := range allPrompts {
+		srv.AddPrompt(p.def, p.handler)
+	}
+}
 
-	srv.AddPrompt(&mcpsdk.Prompt{
-		Name:        "scaffold-from-framework",
-		Title:       "Scaffold .treeman.yaml for the detected framework",
-		Description: "Detects the framework in the current repo, drafts a .treeman.yaml from the matching scaffold template, validates it, and writes it after the user reviews the diff. Stops short of executing prepare so the user controls the first cold build.",
-		Arguments: []*mcpsdk.PromptArgument{
-			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
-		},
-	}, scaffoldFromFrameworkPrompt)
+// ─── prompts_list (discoverability tool) ────────────────────────────
 
-	srv.AddPrompt(&mcpsdk.Prompt{
-		Name:        "cache-cleanup",
-		Title:       "Hunt orphan snapshots and drop them",
-		Description: "Lists every cached snapshot for the current repo, probes each one to see whether the engine-side template still exists, and drops the orphans (SQLite rows whose template was deleted out-of-band on the engine). The agent confirms before each drop.",
-		Arguments: []*mcpsdk.PromptArgument{
-			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
-		},
-	}, cacheCleanupPrompt)
+type promptsListIn struct{}
 
-	srv.AddPrompt(&mcpsdk.Prompt{
-		Name:        "worktree-setup",
-		Title:       "Create a worktree end-to-end",
-		Description: "Walks through picking an unoccupied branch, computing the slug, creating the worktree (which triggers prepare + setup hooks), waiting for finalize, and reporting the result. Best when the user says \"set me up a worktree for branch X\" but hasn't decided how to verify success.",
-		Arguments: []*mcpsdk.PromptArgument{
-			{
-				Name:        "branch",
-				Description: "branch name to base the worktree on; omit to let the agent recommend one from branches_list",
-				Required:    false,
-			},
-			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
-		},
-	}, worktreeSetupPrompt)
+type promptsListArgEntry struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Required    bool   `json:"required,omitempty"`
+}
 
-	srv.AddPrompt(&mcpsdk.Prompt{
-		Name:        "migration-trial",
-		Title:       "Trial a migration in an ephemeral worktree",
-		Description: "Creates a throw-away worktree, runs the user's migrate step against it, reports the outcome (plus any schema deltas via db_schema_dump), and tears the worktree down. Use this to validate a migration change BEFORE merging — without polluting any existing worktree's database state.",
-		Arguments: []*mcpsdk.PromptArgument{
-			{Name: "branch", Description: "branch carrying the migration to trial", Required: true},
-			{
-				Name:        "db_index",
-				Description: "index into databases[] to focus the schema diff on; omit to skip the diff step",
-				Required:    false,
-			},
-			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
-		},
-	}, migrationTrialPrompt)
+type promptsListEntry struct {
+	Name        string                `json:"name"`
+	Title       string                `json:"title"`
+	Description string                `json:"description"`
+	WhenToUse   string                `json:"when_to_use,omitempty"`
+	Arguments   []promptsListArgEntry `json:"arguments,omitempty"`
+}
 
-	srv.AddPrompt(&mcpsdk.Prompt{
-		Name:        "bootstrap-new-repo",
-		Title:       "Set up treeman in a fresh repo end-to-end",
-		Description: "Walks through first-time enrollment: framework detect → engine connection probe per engine → init_repo → schema_install → daemon ensure → registry_register → first prepare → verify. Use when the user wants treeman wired into a repo that has no .treeman.yaml yet.",
-		Arguments: []*mcpsdk.PromptArgument{
-			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
-		},
-	}, bootstrapNewRepoPrompt)
+type promptsListOut struct {
+	Prompts []promptsListEntry `json:"prompts"`
+}
+
+// promptsListTool returns every registered prompt as a flat list with
+// the when-to-use trigger phrases. Backup discovery surface for clients
+// whose MCP-prompts UI is hidden or hard to find.
+func promptsListTool(_ context.Context, _ *mcpsdk.CallToolRequest, _ promptsListIn) (*mcpsdk.CallToolResult, promptsListOut, error) {
+	out := promptsListOut{Prompts: make([]promptsListEntry, 0, len(allPrompts))}
+	for _, p := range allPrompts {
+		entry := promptsListEntry{
+			Name:        p.def.Name,
+			Title:       p.def.Title,
+			Description: p.def.Description,
+			WhenToUse:   p.WhenToUse,
+		}
+		for _, a := range p.def.Arguments {
+			entry.Arguments = append(entry.Arguments, promptsListArgEntry{
+				Name:        a.Name,
+				Description: a.Description,
+				Required:    a.Required,
+			})
+		}
+		out.Prompts = append(out.Prompts, entry)
+	}
+	return nil, out, nil
 }
 
 // userMsg wraps a string in the one-user-message-result shape every

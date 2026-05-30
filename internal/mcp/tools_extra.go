@@ -26,6 +26,7 @@ import (
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
@@ -157,19 +158,29 @@ type logsSubscribeIn struct {
 
 // logsSubscribeOut mirrors logsWaitOut. Streaming is a side-effect via
 // notifications; the final return carries the collected batch so an
-// agent that ignored notifications still sees what happened.
+// agent that ignored notifications still sees what happened. Mode
+// records whether events came via daemon push or a polling fallback —
+// useful for debugging "did my streaming actually stream".
 type logsSubscribeOut struct {
 	Events        []store.Event `json:"events"`
 	TimedOut      bool          `json:"timed_out"`
 	Anchor        int64         `json:"anchor_id"          jsonschema:"highest event id at the moment the subscription started"`
 	Notifications int           `json:"notifications_sent" jsonschema:"how many notifications were dispatched to the session"`
+	Mode          string        `json:"mode"               jsonschema:"push (daemon streaming) | poll (sqlite fallback when daemon unreachable)"`
 }
 
 // logsSubscribeTool blocks until min_count new events match the filter
 // (or timeout). For each matching event it fires a progress + logging
 // notification on the ServerSession so an interactive client can
-// surface events as they happen. Returns the full collected batch on
-// exit; min_count guards forward progress, timeout guards liveness.
+// surface events as they happen.
+//
+// Two delivery paths:
+//   - push (preferred): open a streaming RPC subscription to the
+//     daemon. Each WriteEvent fires a store hook that fans the event
+//     down the socket — zero polling.
+//   - poll (fallback): when the daemon is unreachable, fall back to
+//     500ms SQLite polling. Same notification shape; agents can't tell
+//     the difference except via the Mode field in the result.
 func logsSubscribeTool(
 	ctx context.Context,
 	req *mcpsdk.CallToolRequest,
@@ -187,9 +198,103 @@ func logsSubscribeTool(
 		timeout = 10 * time.Minute
 	}
 
+	// progressToken is supplied by the client in CallToolParams._meta.
+	var progressToken any
+	if req != nil && req.Params != nil {
+		progressToken = req.Params.GetProgressToken()
+	}
+
+	// Try the daemon-push path first.
+	out, ok := subscribePushPath(ctx, req, in, minCount, timeout, progressToken)
+	if ok {
+		return nil, out, nil
+	}
+	// Fallback: poll SQLite. Same shape; Mode=poll lets agents tell.
+	return nil, subscribePollPath(ctx, req, in, minCount, timeout, progressToken), nil
+}
+
+// subscribePushPath opens an rpc.SubscribeEvents stream and consumes
+// events as they arrive. Returns ok=false (and the caller falls back
+// to polling) on dial failure — the daemon may not be running.
+func subscribePushPath(
+	ctx context.Context,
+	req *mcpsdk.CallToolRequest,
+	in logsSubscribeIn,
+	minCount int,
+	timeout time.Duration,
+	progressToken any,
+) (logsSubscribeOut, bool) {
+	resolvedRepo, _ := resolveRepo(in.Repo)
+	resolvedWT, _ := resolveWorktreePath(ctx, resolvedRepo, in.Worktree)
+	stream, cancel, err := rpc.SubscribeEvents(ctx, rpc.EventSubscribeArgs{
+		RepoPath:     resolvedRepo,
+		WorktreePath: resolvedWT,
+		Levels:       validateLevels(in.Levels),
+		EventTypes:   in.EventTypes,
+		Phases:       in.Phases,
+		RunID:        in.RunID,
+	})
+	if err != nil {
+		return logsSubscribeOut{Mode: "poll"}, false
+	}
+	defer cancel()
+
+	deadline := time.Now().Add(timeout)
+	deadlineCh := time.After(timeout)
+	var collected []store.Event
+	notifications := 0
+	for {
+		select {
+		case env, open := <-stream:
+			if !open {
+				// Stream closed by daemon (or ctx). Treat as timeout
+				// if we haven't met min_count.
+				if len(collected) >= minCount {
+					return logsSubscribeOut{
+						Events: collected, Notifications: notifications, Mode: "push",
+					}, true
+				}
+				return logsSubscribeOut{
+					Events: collected, TimedOut: true, Notifications: notifications, Mode: "push",
+				}, true
+			}
+			ev := envelopeToEvent(env)
+			ev.Message = redactSecrets(ev.Message)
+			ev.PayloadJSON = redactSecrets(ev.PayloadJSON)
+			collected = append(collected, ev)
+			notifications += dispatchEventNotification(ctx, req, progressToken, len(collected), minCount, ev)
+			if len(collected) >= minCount {
+				return logsSubscribeOut{
+					Events: collected, Notifications: notifications, Mode: "push",
+				}, true
+			}
+		case <-deadlineCh:
+			return logsSubscribeOut{
+				Events: collected, TimedOut: true, Notifications: notifications, Mode: "push",
+			}, true
+		case <-ctx.Done():
+			return logsSubscribeOut{
+				Events: collected, TimedOut: true, Notifications: notifications, Mode: "push",
+			}, true
+		}
+		// Drain inner deadline check (loop body never sleeps).
+		_ = deadline
+	}
+}
+
+// subscribePollPath is the original SQLite-polling implementation,
+// retained as the daemon-down fallback.
+func subscribePollPath(
+	ctx context.Context,
+	req *mcpsdk.CallToolRequest,
+	in logsSubscribeIn,
+	minCount int,
+	timeout time.Duration,
+	progressToken any,
+) logsSubscribeOut {
 	st, err := openStore(ctx)
 	if err != nil {
-		return nil, logsSubscribeOut{}, err
+		return logsSubscribeOut{Mode: "poll"}
 	}
 	defer func() { _ = st.Close() }()
 
@@ -204,20 +309,11 @@ func logsSubscribeTool(
 		OldestFirst: true,
 	}
 	if err := applyRepoWorktreeFilter(ctx, st, &f, in.Repo, in.Worktree); err != nil {
-		return nil, logsSubscribeOut{}, err
+		return logsSubscribeOut{Mode: "poll"}
 	}
 
 	anchor := newestMatchingID(ctx, st, f)
 	f.AfterID = anchor
-
-	// progressToken is supplied by the client in CallToolParams._meta.
-	// When absent, NotifyProgress still goes out (just unscoped) — but
-	// many clients drop it on the floor, so we log too.
-	var progressToken any
-	if req != nil && req.Params != nil {
-		progressToken = req.Params.GetProgressToken()
-	}
-
 	deadline := time.Now().Add(timeout)
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
@@ -227,7 +323,7 @@ func logsSubscribeTool(
 	for {
 		evs, err := st.QueryEvents(ctx, f)
 		if err != nil {
-			return nil, logsSubscribeOut{Anchor: anchor, Notifications: notifications}, err
+			return logsSubscribeOut{Anchor: anchor, Notifications: notifications, Mode: "poll"}
 		}
 		for _, e := range evs {
 			e.Message = redactSecrets(e.Message)
@@ -239,23 +335,67 @@ func logsSubscribeTool(
 			notifications += dispatchEventNotification(ctx, req, progressToken, len(collected), minCount, e)
 		}
 		if len(collected) >= minCount {
-			return nil, logsSubscribeOut{
-				Events: collected, Anchor: anchor, Notifications: notifications,
-			}, nil
+			return logsSubscribeOut{Events: collected, Anchor: anchor, Notifications: notifications, Mode: "poll"}
 		}
 		if time.Now().After(deadline) {
-			return nil, logsSubscribeOut{
-				Events: collected, Anchor: anchor, TimedOut: true, Notifications: notifications,
-			}, nil
+			return logsSubscribeOut{Events: collected, Anchor: anchor, TimedOut: true, Notifications: notifications, Mode: "poll"}
 		}
 		select {
 		case <-ctx.Done():
-			return nil, logsSubscribeOut{
-				Events: collected, Anchor: anchor, TimedOut: true, Notifications: notifications,
-			}, ctx.Err()
+			return logsSubscribeOut{Events: collected, Anchor: anchor, TimedOut: true, Notifications: notifications, Mode: "poll"}
 		case <-tick.C:
 		}
 	}
+}
+
+// envelopeToEvent flattens an rpc.EventEnvelope back onto a store.Event
+// so notification dispatch + the final return shape match the polling
+// path exactly.
+func envelopeToEvent(env rpc.EventEnvelope) store.Event {
+	ev := store.Event{
+		ID:          env.ID,
+		Ts:          env.Ts,
+		Level:       env.Level,
+		EventType:   env.EventType,
+		Phase:       env.Phase,
+		Message:     env.Message,
+		PayloadJSON: env.PayloadJSON,
+	}
+	if env.RepoID != 0 {
+		ev.RepoID.Valid = true
+		ev.RepoID.Int64 = env.RepoID
+	}
+	if env.WorktreeID != 0 {
+		ev.WorktreeID.Valid = true
+		ev.WorktreeID.Int64 = env.WorktreeID
+	}
+	if env.DurationMs != 0 {
+		ev.DurationMs.Valid = true
+		ev.DurationMs.Int64 = env.DurationMs
+	}
+	return ev
+}
+
+// resolveWorktreePath resolves a worktree slug/branch/basename to its
+// absolute path via the registry. Returns empty when nothing matches
+// — the streaming subscribe args treat empty as "no worktree scope".
+func resolveWorktreePath(ctx context.Context, repoRoot, name string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = st.Close() }()
+	repoID, _ := st.LookupRepoID(ctx, repoRoot)
+	wtID, err := st.LookupWorktreeID(ctx, repoID, name)
+	if err != nil || wtID == 0 {
+		return "", err
+	}
+	var p string
+	_ = st.DB.QueryRowContext(ctx, `SELECT path FROM worktrees WHERE id = ?`, wtID).Scan(&p)
+	return p, nil
 }
 
 // dispatchEventNotification fires a progress-notification (always) and

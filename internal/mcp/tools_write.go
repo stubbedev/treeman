@@ -172,14 +172,16 @@ type dbResetIn struct {
 	Repo     string `json:"repo,omitempty"`
 	Engine   string `json:"engine,omitempty"   jsonschema:"restrict to one engine family: mysql|postgres|mongodb|redis|elasticsearch (aliases like mariadb/postgresql/valkey/dragonfly accepted); omit to reset all branch_scoped databases"`
 	DryRun   bool   `json:"dry_run,omitempty"  jsonschema:"plan only — return the active-namespace + current-branch durable names that WOULD be dropped without performing the reset"`
+	Ack      bool   `json:"ack,omitempty"      jsonschema:"skip the elicitation confirmation prompt"`
 }
 type dbResetOut struct {
 	Outcomes  []prepare.Outcome        `json:"outcomes,omitempty"`
 	DryRun    bool                     `json:"dry_run,omitempty"`
 	WouldDrop []prepare.BranchScopedDB `json:"would_drop,omitempty" jsonschema:"per-database state that would be dropped + re-seeded from the parent branch"`
+	Refused   string                   `json:"refused,omitempty"`
 }
 
-func dbResetTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbResetIn) (*mcpsdk.CallToolResult, dbResetOut, error) {
+func dbResetTool(ctx context.Context, req *mcpsdk.CallToolRequest, in dbResetIn) (*mcpsdk.CallToolResult, dbResetOut, error) {
 	if in.DryRun {
 		dbs, err := runBranchScopedStatus(ctx, in.Worktree, in.Repo)
 		if err != nil {
@@ -196,6 +198,10 @@ func dbResetTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbResetIn) (
 			dbs = filtered
 		}
 		return nil, dbResetOut{DryRun: true, WouldDrop: dbs}, nil
+	}
+	if ok, reason := confirmDestructive(ctx, req, false, in.Ack,
+		"Reset branch_scoped DBs to the base branch? Current branch's working data will be DROPPED."); !ok {
+		return nil, dbResetOut{Refused: reason}, nil
 	}
 	outs, err := runDbReset(ctx, in.Worktree, in.Repo, strings.ToLower(in.Engine))
 	if err != nil {
@@ -463,12 +469,14 @@ type repoRemoveIn struct {
 	Repo   string `json:"repo,omitempty"`
 	Force  bool   `json:"force,omitempty"   jsonschema:"remove even when active worktrees exist"`
 	DryRun bool   `json:"dry_run,omitempty" jsonschema:"plan only — count cascaded child rows (worktrees/events/snapshots/hook_runs) without removing anything"`
+	Ack    bool   `json:"ack,omitempty"     jsonschema:"skip the elicitation confirmation prompt"`
 }
 type repoRemoveOut struct {
 	RepoPath  string         `json:"repo"`
 	Via       string         `json:"via,omitempty"        jsonschema:"daemon|sqlite — which path performed the delete"`
 	DryRun    bool           `json:"dry_run,omitempty"`
 	WouldDrop map[string]int `json:"would_drop,omitempty" jsonschema:"counts by table that would be cascaded on remove"`
+	Refused   string         `json:"refused,omitempty"`
 }
 
 // repoRemoveTool drops a repo from the registry. Tool surface was
@@ -478,7 +486,7 @@ type repoRemoveOut struct {
 // filters keep working.
 func repoRemoveTool(
 	ctx context.Context,
-	_ *mcpsdk.CallToolRequest,
+	req *mcpsdk.CallToolRequest,
 	in repoRemoveIn,
 ) (*mcpsdk.CallToolResult, repoRemoveOut, error) {
 	repoRoot, err := resolveRepo(in.Repo)
@@ -491,6 +499,10 @@ func repoRemoveTool(
 			return nil, repoRemoveOut{}, err
 		}
 		return nil, repoRemoveOut{RepoPath: repoRoot, DryRun: true, WouldDrop: counts}, nil
+	}
+	if ok, reason := confirmDestructive(ctx, req, false, in.Ack,
+		"Remove repo "+repoRoot+" from the registry? Cascades to events/snapshots/hook_runs rows."); !ok {
+		return nil, repoRemoveOut{RepoPath: repoRoot, Refused: reason}, nil
 	}
 	// Prefer the daemon RPC so live watchers stop in-process; fall
 	// back to direct SQLite when the daemon isn't running.
@@ -576,6 +588,7 @@ func registryRepairTool(
 type snapshotsPurgeIn struct {
 	Repo   string `json:"repo,omitempty"`
 	DryRun bool   `json:"dry_run,omitempty" jsonschema:"plan only — return how many snapshots WOULD be dropped (with their fingerprints + engines) without touching engines or SQLite"`
+	Ack    bool   `json:"ack,omitempty"     jsonschema:"skip the elicitation confirmation prompt"`
 }
 type snapshotsPurgeOut struct {
 	Repo          string             `json:"repo"`
@@ -584,11 +597,12 @@ type snapshotsPurgeOut struct {
 	DryRun        bool               `json:"dry_run,omitempty"`
 	WouldDrop     int                `json:"would_drop,omitempty"`
 	WouldDropRows []snapshotsListRow `json:"would_drop_rows,omitempty"`
+	Refused       string             `json:"refused,omitempty"`
 }
 
 func snapshotsPurgeTool(
 	ctx context.Context,
-	_ *mcpsdk.CallToolRequest,
+	req *mcpsdk.CallToolRequest,
 	in snapshotsPurgeIn,
 ) (*mcpsdk.CallToolResult, snapshotsPurgeOut, error) {
 	repoRoot, err := resolveRepo(in.Repo)
@@ -608,6 +622,10 @@ func snapshotsPurgeTool(
 			WouldDrop:     len(list.Snapshots),
 			WouldDropRows: list.Snapshots,
 		}, nil
+	}
+	if ok, reason := confirmDestructive(ctx, req, false, in.Ack,
+		"Purge ALL cached snapshots for "+repoRoot+"? Every prepare will cold-rebuild from scratch."); !ok {
+		return nil, snapshotsPurgeOut{Repo: repoRoot, Refused: reason}, nil
 	}
 	cfg, err := resolve.LoadResolved(repoRoot)
 	if err != nil {
@@ -740,16 +758,19 @@ type worktreeDeleteIn struct {
 	Repo   string `json:"repo,omitempty"`
 	Force  bool   `json:"force,omitempty"`
 	DryRun bool   `json:"dry_run,omitempty" jsonschema:"plan only — return what would be torn down (path, DBs by engine + rendered name) without dispatching teardown"`
+	Ack    bool   `json:"ack,omitempty"     jsonschema:"skip the elicitation confirmation prompt (for non-interactive agents that have already gotten user approval)"`
 }
 
 // worktreeDeleteResult is the structured response. When DryRun=true the
 // `dry_run`/`would_drop` fields are populated and the wt.DeleteResult
-// fields stay zero (no teardown ran).
+// fields stay zero (no teardown ran). Refused=true when elicitation
+// returned decline/cancel.
 type worktreeDeleteResult struct {
 	wt.DeleteResult
 	DryRun          bool                `json:"dry_run,omitempty"`
 	WouldDropDBs    []worktreeDropEntry `json:"would_drop_dbs,omitempty"`
 	WouldRemovePath string              `json:"would_remove_path,omitempty"`
+	Refused         string              `json:"refused,omitempty"           jsonschema:"set when elicitation refused — value is the reason (declined|cancelled|...)"`
 }
 
 type worktreeDropEntry struct {
@@ -760,7 +781,7 @@ type worktreeDropEntry struct {
 
 func worktreeDeleteTool(
 	ctx context.Context,
-	_ *mcpsdk.CallToolRequest,
+	req *mcpsdk.CallToolRequest,
 	in worktreeDeleteIn,
 ) (*mcpsdk.CallToolResult, worktreeDeleteResult, error) {
 	if in.Name == "" {
@@ -776,6 +797,10 @@ func worktreeDeleteTool(
 			return nil, worktreeDeleteResult{}, err
 		}
 		return nil, plan, nil
+	}
+	if ok, reason := confirmDestructive(ctx, req, false, in.Ack,
+		fmt.Sprintf("Delete worktree %q? This drops its databases + removes the on-disk path.", in.Name)); !ok {
+		return nil, worktreeDeleteResult{Refused: reason}, nil
 	}
 	res, err := wt.Delete(ctx, wt.DeleteRequest{
 		RepoRoot: repoRoot,

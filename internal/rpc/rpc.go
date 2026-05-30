@@ -68,6 +68,10 @@ const (
 	MethodSyncNow          = "sync_now"
 	MethodSyncStatus       = "sync_status"
 	MethodDaemonState      = "daemon_state"
+	// MethodEventSubscribe opens a STREAMING subscription: one request
+	// → many responses (one per matching event) over the same socket
+	// connection, until ctx cancels or client closes.
+	MethodEventSubscribe = "event_subscribe"
 )
 
 // Request is the envelope every CLI message uses. Exactly one of the
@@ -84,6 +88,7 @@ type Request struct {
 	RepoRemove       *RepoRemoveArgs       `json:",omitempty"`
 	SyncNow          *SyncNowArgs          `json:",omitempty"`
 	SyncStatus       *SyncStatusArgs       `json:",omitempty"`
+	EventSubscribe   *EventSubscribeArgs   `json:",omitempty"`
 }
 
 // MarshalJSON flattens the discriminator + the matching args struct
@@ -160,6 +165,15 @@ func populateWrapperB(r Request, wrapper map[string]any) {
 		if r.SyncStatus != nil {
 			wrapper["repo_path"] = r.SyncStatus.RepoPath
 		}
+	case MethodEventSubscribe:
+		if r.EventSubscribe != nil {
+			wrapper["repo_path"] = r.EventSubscribe.RepoPath
+			wrapper["worktree_path"] = r.EventSubscribe.WorktreePath
+			wrapper["levels"] = r.EventSubscribe.Levels
+			wrapper["event_types"] = r.EventSubscribe.EventTypes
+			wrapper["phases"] = r.EventSubscribe.Phases
+			wrapper["run_id"] = r.EventSubscribe.RunID
+		}
 	}
 }
 
@@ -225,6 +239,16 @@ func (r *Request) UnmarshalJSON(data []byte) error {
 	case MethodSyncStatus:
 		r.SyncStatus = &SyncStatusArgs{}
 		return decodeFields(raw, map[string]any{"repo_path": &r.SyncStatus.RepoPath})
+	case MethodEventSubscribe:
+		r.EventSubscribe = &EventSubscribeArgs{}
+		return decodeFields(raw, map[string]any{
+			"repo_path":     &r.EventSubscribe.RepoPath,
+			"worktree_path": &r.EventSubscribe.WorktreePath,
+			"levels":        &r.EventSubscribe.Levels,
+			"event_types":   &r.EventSubscribe.EventTypes,
+			"phases":        &r.EventSubscribe.Phases,
+			"run_id":        &r.EventSubscribe.RunID,
+		})
 	default:
 		return fmt.Errorf("rpc: unknown method %q", r.Method)
 	}
@@ -317,6 +341,37 @@ type SyncWorktreeStatus struct {
 	LastSkipReason string `json:"last_skip_reason,omitempty"`
 }
 
+// EventSubscribeArgs — open a streaming subscription. Filters
+// AND-combine; empty fields match everything. The subscription
+// fires on EVERY future WriteEvent on the daemon's store; historical
+// events are NOT replayed (use logs_query for backfill, then subscribe
+// for live-tail).
+type EventSubscribeArgs struct {
+	RepoPath     string   `json:"repo_path,omitempty"`
+	WorktreePath string   `json:"worktree_path,omitempty"`
+	Levels       []string `json:"levels,omitempty"`
+	EventTypes   []string `json:"event_types,omitempty"`
+	Phases       []string `json:"phases,omitempty"`
+	RunID        string   `json:"run_id,omitempty"`
+}
+
+// EventEnvelope is one streamed event row. Mirrors store.Event (minus
+// the ID nullables) so the daemon can flatten in-memory Event values
+// onto the wire without an extra serialisation hop. ID is best-effort
+// (0 on the batched WriteEvent path).
+type EventEnvelope struct {
+	ID          int64  `json:"id,omitempty"`
+	Ts          int64  `json:"ts"`
+	Level       string `json:"level"`
+	EventType   string `json:"event_type"`
+	Phase       string `json:"phase,omitempty"`
+	Message     string `json:"message,omitempty"`
+	PayloadJSON string `json:"payload_json,omitempty"`
+	RepoID      int64  `json:"repo_id,omitempty"`
+	WorktreeID  int64  `json:"worktree_id,omitempty"`
+	DurationMs  int64  `json:"duration_ms,omitempty"`
+}
+
 // RepoRemoveArgs — drop a repo from the SQLite registry. Daemon stops
 // every watcher attached to the repo first. Force=false refuses the
 // removal when active (`deleted_at IS NULL`) worktrees still exist.
@@ -345,7 +400,12 @@ const (
 	KindSyncResult             = "sync_result"
 	KindSyncStatus             = "sync_status"
 	KindDaemonState            = "daemon_state"
-	KindError                  = "error"
+	// KindEvent is the per-event envelope emitted on a streaming
+	// MethodEventSubscribe response. One emitted per matching event;
+	// the subscription has no terminal "done" envelope — it ends when
+	// the connection closes.
+	KindEvent = "event"
+	KindError = "error"
 )
 
 // Response is the envelope. Tagged-union shape with `kind` as the
@@ -371,6 +431,9 @@ type Response struct {
 	SyncErrors  []string         `json:"sync_errors,omitempty"`
 	// DaemonState
 	State *DaemonStateSnapshot `json:"state,omitempty"`
+	// Streaming event subscription — one Response with Kind=KindEvent
+	// per matching event.
+	Event *EventEnvelope `json:"event,omitempty"`
 	// Error
 	Message string `json:"message,omitempty"`
 }
@@ -416,6 +479,75 @@ type WatcherSummary struct {
 }
 
 // ─────────────────────────── client ───────────────────────────
+
+// SubscribeEvents opens a streaming event subscription. Returns an
+// already-running goroutine that feeds matching events down the
+// returned channel until ctx cancels, the daemon disconnects, or the
+// caller calls cancel. The channel is closed when the subscription
+// ends.
+//
+// Unlike Call, this dials with NO deadline on the connection — the
+// subscription is intentionally long-lived. ctx-cancel is the only
+// supported shutdown.
+//
+// Returns (nil, nil, err) on dial / initial-handshake failure so
+// callers can fall back to a polling path.
+func SubscribeEvents(ctx context.Context, args EventSubscribeArgs) (<-chan EventEnvelope, func(), error) {
+	path, err := SocketPath()
+	if err != nil {
+		return nil, nil, err
+	}
+	d := net.Dialer{Timeout: 1500 * time.Millisecond}
+	conn, err := d.DialContext(ctx, "unix", path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial %s: %w", path, err)
+	}
+	req := Request{Method: MethodEventSubscribe, EventSubscribe: &args}
+	if err := json.NewEncoder(conn).Encode(&req); err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("encode subscribe: %w", err)
+	}
+
+	out := make(chan EventEnvelope, 64)
+	subCtx, cancel := context.WithCancel(ctx)
+
+	// Closer fired by both the caller (via the returned cancel) and the
+	// context-watch goroutine (when parent ctx ends). Closing the
+	// underlying conn unblocks the read loop.
+	stop := func() {
+		cancel()
+		_ = conn.Close()
+	}
+
+	go func() {
+		<-subCtx.Done()
+		_ = conn.Close()
+	}()
+
+	go func() {
+		defer close(out)
+		defer cancel()
+		dec := json.NewDecoder(conn)
+		for {
+			var resp Response
+			if err := dec.Decode(&resp); err != nil {
+				return
+			}
+			if resp.Kind == KindError {
+				return
+			}
+			if resp.Kind == KindEvent && resp.Event != nil {
+				select {
+				case out <- *resp.Event:
+				case <-subCtx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	return out, stop, nil
+}
 
 // Call dials the daemon, sends one Request, reads one Response,
 // closes. Default timeout 5s for I/O.

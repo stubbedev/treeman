@@ -2,18 +2,21 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/runid"
+	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/version"
 	"github.com/stubbedev/treeman/internal/watcher"
@@ -187,6 +190,161 @@ func handleSyncNow(ctx context.Context, st *State, req rpc.Request) rpc.Response
 		SyncedRepos: statuses,
 		SyncErrors:  errs,
 	}
+}
+
+// IsStreamingMethod reports whether req.Method is a one-request →
+// many-response streaming subscription. The socket accept loop checks
+// this before dispatching so streaming methods skip the one-shot
+// Dispatch path and route through DispatchStreaming instead.
+func IsStreamingMethod(method string) bool {
+	return method == rpc.MethodEventSubscribe
+}
+
+// DispatchStreaming handles a streaming RPC method. Writes Response
+// envelopes to enc as events arrive until ctx cancels, the client
+// closes (next enc.Encode fails), or the underlying subscription
+// ends. Returns when the connection should be torn down. Errors are
+// logged + swallowed; the connection close terminates the stream.
+func DispatchStreaming(ctx context.Context, st *State, enc *json.Encoder, req rpc.Request) {
+	switch req.Method {
+	case rpc.MethodEventSubscribe:
+		streamEvents(ctx, st, enc, req)
+	default:
+		// Best-effort error envelope; ignore write failures (client
+		// has likely already closed).
+		_ = enc.Encode(&rpc.Response{Kind: rpc.KindError, Message: "not a streaming method: " + req.Method}) //nolint:errchkjson
+	}
+}
+
+// streamEvents registers a hook on st.Store that filters events
+// against args and writes matching ones to enc as KindEvent responses.
+// Blocks until ctx cancels, the client closes, or a write fails.
+// Filter semantics: every non-empty field is AND-combined; empty
+// fields match everything (matches logs_query exactly).
+func streamEvents(ctx context.Context, st *State, enc *json.Encoder, req rpc.Request) {
+	args := rpc.EventSubscribeArgs{}
+	if req.EventSubscribe != nil {
+		args = *req.EventSubscribe
+	}
+	repoID, worktreeID := resolveSubscribeIDs(ctx, st, args)
+
+	// Buffered channel keeps the hook fast even when the socket peer
+	// is slow. On overflow, oldest events are dropped (the agent gets
+	// "we missed some events" via the run_id gap, not a stall).
+	const bufSize = 256
+	ch := make(chan rpc.EventEnvelope, bufSize)
+	hookID := fmt.Sprintf("sub:%p", ch)
+	filter := buildSubscribeFilter(args, repoID, worktreeID)
+
+	st.Store.RegisterEventHook(hookID, func(ev store.Event) {
+		if !filter(ev) {
+			return
+		}
+		select {
+		case ch <- toEnvelope(ev):
+		default:
+			// Buffer full — drop. Subscriber-side gap detection is on
+			// the user; we never block WriteEvent.
+		}
+	})
+	defer st.Store.UnregisterEventHook(hookID)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-ch:
+			resp := rpc.Response{Kind: rpc.KindEvent, Event: &ev}
+			if err := enc.Encode(&resp); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// resolveSubscribeIDs resolves the repo/worktree path filters to ids
+// once before the hot path, so every WriteEvent doesn't re-look-up.
+func resolveSubscribeIDs(ctx context.Context, st *State, args rpc.EventSubscribeArgs) (repoID, worktreeID int64) {
+	if args.RepoPath != "" {
+		if id, err := st.Store.LookupRepoID(ctx, args.RepoPath); err == nil {
+			repoID = id
+		}
+	}
+	if args.WorktreePath != "" {
+		row, err := st.Store.LookupActiveWorktreeByPath(ctx, args.WorktreePath)
+		if err == nil && row.ID != 0 {
+			worktreeID = row.ID
+		}
+	}
+	return repoID, worktreeID
+}
+
+// buildSubscribeFilter closes over the resolved args + ids and returns
+// the per-event predicate. Extracted from streamEvents to keep the
+// outer function under the cyclomatic-complexity budget.
+func buildSubscribeFilter(args rpc.EventSubscribeArgs, repoID, worktreeID int64) func(store.Event) bool {
+	return func(ev store.Event) bool {
+		if repoID != 0 && (!ev.RepoID.Valid || ev.RepoID.Int64 != repoID) {
+			return false
+		}
+		if worktreeID != 0 && (!ev.WorktreeID.Valid || ev.WorktreeID.Int64 != worktreeID) {
+			return false
+		}
+		if len(args.Levels) > 0 && !containsCI(args.Levels, ev.Level) {
+			return false
+		}
+		if len(args.EventTypes) > 0 && !containsCI(args.EventTypes, ev.EventType) {
+			return false
+		}
+		if len(args.Phases) > 0 && !containsCI(args.Phases, ev.Phase) {
+			return false
+		}
+		if args.RunID != "" && !payloadHasRunID(ev.PayloadJSON, args.RunID) {
+			return false
+		}
+		return true
+	}
+}
+
+// containsCI reports whether needle is in haystack, case-insensitive.
+// Cheap because the filter slices are typically 1-3 entries.
+func containsCI(haystack []string, needle string) bool {
+	for _, h := range haystack {
+		if strings.EqualFold(h, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// payloadHasRunID reports whether the payload_json string carries
+// `"run_id":"<id>"`. Substring check is good enough — run_ids are
+// 8-char hex so collisions with other fields are vanishingly rare.
+func payloadHasRunID(payload, runID string) bool {
+	return strings.Contains(payload, `"run_id":"`+runID+`"`)
+}
+
+// toEnvelope flattens a store.Event onto the wire EventEnvelope shape.
+func toEnvelope(ev store.Event) rpc.EventEnvelope {
+	out := rpc.EventEnvelope{
+		ID:          ev.ID,
+		Ts:          ev.Ts,
+		Level:       ev.Level,
+		EventType:   ev.EventType,
+		Phase:       ev.Phase,
+		Message:     ev.Message,
+		PayloadJSON: ev.PayloadJSON,
+	}
+	if ev.RepoID.Valid {
+		out.RepoID = ev.RepoID.Int64
+	}
+	if ev.WorktreeID.Valid {
+		out.WorktreeID = ev.WorktreeID.Int64
+	}
+	if ev.DurationMs.Valid {
+		out.DurationMs = ev.DurationMs.Int64
+	}
+	return out
 }
 
 // handleDaemonState assembles a rich runtime view of the daemon's

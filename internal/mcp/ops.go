@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/gitenv"
@@ -287,6 +289,50 @@ func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) (
 		return nil, err
 	}
 	return prepare.BranchScopedStatus(ctx, &cfg, repoRoot, wt, id.WtID, st)
+}
+
+// confirmDestructive asks the user via MCP elicitation before running
+// a destructive action. Returns (true, "") when the agent should
+// proceed: dry_run=true short-circuits to true, ack=true skips
+// elicitation, an elicitation error (client doesn't support it)
+// falls through to true, and an "accept" response returns true. Only
+// an explicit "decline"/"cancel" stops the action.
+//
+// The intent: clients that DO support elicitation (Claude Desktop,
+// etc.) get a confirmation pop-up; clients that don't are unchanged.
+// Agents that want to bypass confirmation entirely can pass ack=true.
+func confirmDestructive(
+	ctx context.Context,
+	req *mcpsdk.CallToolRequest,
+	dryRun, ack bool,
+	message string,
+) (bool, string) {
+	if dryRun || ack {
+		return true, ""
+	}
+	if req == nil || req.Session == nil {
+		return true, ""
+	}
+	res, err := req.Session.Elicit(ctx, &mcpsdk.ElicitParams{
+		Mode:    "confirmation",
+		Message: message,
+	})
+	if err != nil || res == nil {
+		// Client doesn't support elicitation (or it errored). Fall
+		// through — refusing would break non-interactive agents that
+		// can't even ask the question.
+		return true, ""
+	}
+	switch res.Action {
+	case "accept":
+		return true, ""
+	case "decline":
+		return false, "user declined"
+	case "cancel":
+		return false, "user cancelled"
+	default:
+		return false, "user action: " + res.Action
+	}
 }
 
 // runHookPhase synchronously executes one hook phase. Mirrors cmd's

@@ -131,7 +131,7 @@ func registerLogsReadTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_subscribe",
-		Description: "Live-stream events as they arrive via MCP progress notifications (when the client supplied a progressToken in _meta). Same filter shape as logs_wait. Each matching event becomes a notifications/progress + a notifications/message; the final tool return carries the full collected batch + a timed_out flag. Use for long prepares so the user sees progress without polling.",
+		Description: "Live-stream events as they arrive via MCP progress notifications. Prefers push mode (streaming RPC subscription to the daemon, zero polling); falls back to 500ms SQLite polling when the daemon is unreachable. Each matching event becomes a notifications/progress + notifications/message; the final return carries the collected batch + a mode field (push|poll). Same filter shape as logs_wait.",
 		Annotations: readOnlyAnno("Stream events live", false),
 	}, logsSubscribeTool)
 }
@@ -171,6 +171,12 @@ func registerPlanningReadTools(srv *mcpsdk.Server) {
 		Description: "Render the prepare pipeline plan for a worktree WITHOUT executing — per-database: rendered source-db name, dump files that would be loaded, migrate + seed commands (with env), fanout count, expected fingerprint. No engine I/O. Use to reason about the pipeline before invoking prepare_run, or to debug why a step ran what it did.",
 		Annotations: readOnlyAnno("Plan prepare pipeline", false),
 	}, prepareDryRunTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "prompts_list",
+		Description: "List every MCP prompt treeman registers — name, title, description, arguments, and a when-to-use trigger phrase. Use when the client doesn't surface MCP prompts prominently and you want to discover the canned multi-step workflows (diagnose-prepare-failure, worktree-setup, bootstrap-new-repo, …) without invoking each one.",
+		Annotations: readOnlyAnno("List prompts", false),
+	}, promptsListTool)
 }
 
 // ─── doctor ───────────────────────────────────────────────────────

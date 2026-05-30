@@ -49,9 +49,11 @@ func TestServerRegistersExpectedTools(t *testing.T) {
 		"daemon_status", "daemon_state",
 		"snapshots_list", "logs_wait", "logs_subscribe", "branches_list",
 		"config_diff", "inputs_fingerprint", "prepare_dry_run",
+		"prompts_list",
 		// engine
 		"engine_status", "db_schema_dump", "db_query", "snapshot_inspect",
 		"hook_log_read", "snapshot_drop", "db_dump", "connection_probe",
+		"engine_logs",
 		// write
 		"prepare_run", "db_reset", "hook_run", "config_write", "config_set",
 		"registry_register", "registry_unregister", "registry_repair",
