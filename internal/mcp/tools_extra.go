@@ -17,11 +17,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
-	dbes "github.com/stubbedev/treeman/internal/db/es"
-	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
-	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
-	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
-	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -813,63 +808,13 @@ func inputsFingerprintTool(
 // engine_version field and can investigate via engine_status.
 func probeEngineVersion(ctx context.Context, cfg *config.Config, eng string) string {
 	fam, _ := engine.Canonical(eng)
-	switch fam {
-	case engine.FamilyMySQL:
-		if cfg.Connections.Mysql == nil {
-			return ""
-		}
-		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-		if err != nil {
-			return ""
-		}
-		defer func() { _ = drv.Close() }()
-		v, _ := drv.EngineVersion(ctx)
-		return v
-	case engine.FamilyPostgres:
-		if cfg.Connections.Postgres == nil {
-			return ""
-		}
-		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-		if err != nil {
-			return ""
-		}
-		defer func() { _ = drv.Close() }()
-		v, _ := drv.EngineVersion(ctx)
-		return v
-	case engine.FamilyMongo:
-		if cfg.Connections.Mongodb == nil {
-			return ""
-		}
-		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-		if err != nil {
-			return ""
-		}
-		defer func() { _ = drv.Close(ctx) }()
-		v, _ := drv.EngineVersion(ctx)
-		return v
-	case engine.FamilyRedis:
-		if cfg.Connections.Redis == nil {
-			return ""
-		}
-		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-		if err != nil {
-			return ""
-		}
-		defer func() { _ = drv.Close() }()
-		v, _ := drv.EngineVersion(ctx)
-		return v
-	case engine.FamilyES:
-		if cfg.Connections.Elasticsearch == nil {
-			return ""
-		}
-		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-		if err != nil {
-			return ""
-		}
-		v, _ := drv.EngineVersion(ctx)
-		return v
+	conn, configured, err := connectEngine(ctx, cfg, fam)
+	if !configured || err != nil {
+		return ""
 	}
-	return ""
+	defer func() { _ = conn.Close() }()
+	v, _ := conn.EngineVersion(ctx)
+	return v
 }
 
 // ─── prepare_dry_run ────────────────────────────────────────────────
