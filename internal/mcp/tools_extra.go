@@ -17,6 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/engineconn"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -808,7 +809,7 @@ func inputsFingerprintTool(
 // engine_version field and can investigate via engine_status.
 func probeEngineVersion(ctx context.Context, cfg *config.Config, eng string) string {
 	fam, _ := engine.Canonical(eng)
-	conn, configured, err := connectEngine(ctx, cfg, fam)
+	conn, configured, err := engineconn.Connect(ctx, cfg, fam)
 	if !configured || err != nil {
 		return ""
 	}

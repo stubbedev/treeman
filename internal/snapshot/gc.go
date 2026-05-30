@@ -2,17 +2,12 @@ package snapshot
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
-	dbes "github.com/stubbedev/treeman/internal/db/es"
-	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
-	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
-	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
-	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/db/engineconn"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -149,59 +144,15 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 	if !ok {
 		return fmt.Errorf("eviction: unsupported engine %q", c.Engine)
 	}
-	switch fam {
-	case engine.FamilyMySQL:
-		if cfg.Connections.Mysql == nil {
-			return errors.New("connections.mysql not configured")
-		}
-		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close() }()
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	case engine.FamilyPostgres:
-		if cfg.Connections.Postgres == nil {
-			return errors.New("connections.postgres not configured")
-		}
-		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close() }()
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	case engine.FamilyMongo:
-		if cfg.Connections.Mongodb == nil {
-			return errors.New("connections.mongodb not configured")
-		}
-		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close(ctx) }()
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	case engine.FamilyES:
-		if cfg.Connections.Elasticsearch == nil {
-			return errors.New("connections.elasticsearch not configured")
-		}
-		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-		if err != nil {
-			return err
-		}
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	case engine.FamilyRedis:
-		if cfg.Connections.Redis == nil {
-			return errors.New("connections.redis not configured")
-		}
-		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = drv.Close() }()
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	default:
-		return fmt.Errorf("eviction: unsupported engine family %q (alias %q)", fam, c.Engine)
+	conn, configured, err := engineconn.Connect(ctx, cfg, fam)
+	if !configured {
+		return fmt.Errorf("connections.%s not configured", fam)
 	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	return conn.DropSnapshot(ctx, c.TemplateName)
 }
 
 // SweepByAge drops every cached template whose `last_used_at` is

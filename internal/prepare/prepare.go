@@ -32,6 +32,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/dumpload"
+	"github.com/stubbedev/treeman/internal/db/engineconn"
 	dbes "github.com/stubbedev/treeman/internal/db/es"
 	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
@@ -2506,35 +2507,50 @@ func teardownOne(
 	if d.BranchScoped {
 		return teardownBranchScoped(ctx, cfg, d, repoID, worktreeID, st)
 	}
-	switch fam, _ := engine.Canonical(d.Engine); fam {
-	case engine.FamilyMySQL:
-		return teardownMySQL(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
-	case engine.FamilyPostgres:
-		return teardownPostgres(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
-	case engine.FamilyMongo:
-		return teardownMongo(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
-	case engine.FamilyRedis:
-		return teardownRedis(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
-	case engine.FamilyES:
-		return teardownES(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
+	fam, ok := engine.Canonical(d.Engine)
+	if !ok {
+		// Unknown engine — log + event so a typo'd `engine: postgress`
+		// doesn't turn worktree teardown into a silent no-op (same
+		// shape as the cold-build sibling-wipe that originally hid in
+		// the event log).
+		_ = st.WriteEvent(ctx, store.LevelWarn, "db_teardown_skipped",
+			fmt.Sprintf("teardown skipped: unknown engine %q (allowed: %s)", d.Engine, engine.KnownList()),
+			repoID, worktreeID, "", 0, map[string]any{
+				"engine": d.Engine, "slug": sl,
+			})
+		return nil
 	}
-	// Unknown engine — log + event so a typo'd `engine: postgress`
-	// doesn't turn worktree teardown into a silent no-op (same
-	// shape as the cold-build sibling-wipe that originally hid in
-	// the event log).
-	_ = st.WriteEvent(ctx, store.LevelWarn, "db_teardown_skipped",
-		fmt.Sprintf("teardown skipped: unknown engine %q (allowed: %s)", d.Engine, engine.KnownList()),
-		repoID, worktreeID, "", 0, map[string]any{
-			"engine": d.Engine, "slug": sl,
-		})
-	return nil
+	// Engine isn't wired up — nothing was ever created. Silent skip,
+	// matching the prepare side.
+	if !engineconn.Configured(cfg, fam) {
+		return nil
+	}
+	// Name-scoped engines (mysql/postgres/mongo) reap the rendered
+	// name_template family; prefix-scoped engines (redis/es) reap the
+	// rendered key_prefix, which is required.
+	tmpl := d.NameTemplate
+	if fam.Scope() == engine.ScopePrefix {
+		if d.KeyPrefix == "" {
+			return fmt.Errorf("%s: missing key_prefix", fam)
+		}
+		tmpl = d.KeyPrefix
+	}
+	target, err := template.Render(tmpl, tplCtx)
+	if err != nil {
+		return err
+	}
+	conn, _, err := engineconn.Connect(ctx, cfg, fam)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	return teardownGeneric(ctx, string(fam), target, sl, repoID, worktreeID, st, conn.DropMatching)
 }
 
 // teardownGeneric drops the already-rendered per-worktree `target`
-// (database name or key/index prefix) via the engine's `drop` closure and
-// writes the `db_drop` event. The shared tail of every engine's teardown;
-// the per-engine connect/close and the name-vs-prefix source stay in the
-// thin wrappers below.
+// (database name or key/index prefix) via `drop` and writes the `db_drop`
+// event — the shared tail of teardownOne, kept separate so the event
+// shape lives in one place.
 func teardownGeneric(
 	ctx context.Context,
 	engineLabel, target, sl string,
@@ -2552,153 +2568,4 @@ func teardownGeneric(
 			"engine": engineLabel, "slug": sl, "target": target, "count": count,
 		})
 	return nil
-}
-
-// dropMatchingCount adapts a driver's DropMatching([]string) signature to
-// the teardownGeneric drop closure's (int) count.
-func dropMatchingCount(
-	drop func(context.Context, string) ([]string, error),
-) func(context.Context, string) (int, error) {
-	return func(ctx context.Context, target string) (int, error) {
-		dropped, err := drop(ctx, target)
-		return len(dropped), err
-	}
-}
-
-// teardownMySQL drops the per-worktree MySQL database family.
-func teardownMySQL(
-	ctx context.Context,
-	cfg *config.Config,
-	d config.DatabaseConfig,
-	tplCtx template.Context,
-	sl string,
-	repoID, worktreeID int64,
-	st *store.Store,
-) error {
-	if cfg.Connections.Mysql == nil {
-		// Nothing to drop — engine isn't wired up. Silent skip
-		// (matches the prepare side; the database was never
-		// created in the first place).
-		return nil
-	}
-	drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = drv.Close() }()
-	name, err := template.Render(d.NameTemplate, tplCtx)
-	if err != nil {
-		return err
-	}
-	return teardownGeneric(ctx, "mysql", name, sl, repoID, worktreeID, st,
-		dropMatchingCount(drv.DropMatching))
-}
-
-// teardownPostgres drops the per-worktree Postgres database family.
-func teardownPostgres(
-	ctx context.Context,
-	cfg *config.Config,
-	d config.DatabaseConfig,
-	tplCtx template.Context,
-	sl string,
-	repoID, worktreeID int64,
-	st *store.Store,
-) error {
-	if cfg.Connections.Postgres == nil {
-		return nil
-	}
-	drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = drv.Close() }()
-	name, err := template.Render(d.NameTemplate, tplCtx)
-	if err != nil {
-		return err
-	}
-	return teardownGeneric(ctx, "postgres", name, sl, repoID, worktreeID, st,
-		dropMatchingCount(drv.DropMatching))
-}
-
-// teardownMongo drops the per-worktree MongoDB database family.
-func teardownMongo(
-	ctx context.Context,
-	cfg *config.Config,
-	d config.DatabaseConfig,
-	tplCtx template.Context,
-	sl string,
-	repoID, worktreeID int64,
-	st *store.Store,
-) error {
-	if cfg.Connections.Mongodb == nil {
-		return nil
-	}
-	drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = drv.Close(ctx) }()
-	name, err := template.Render(d.NameTemplate, tplCtx)
-	if err != nil {
-		return err
-	}
-	return teardownGeneric(ctx, "mongodb", name, sl, repoID, worktreeID, st,
-		dropMatchingCount(drv.DropMatching))
-}
-
-// teardownRedis drops the per-worktree Redis key prefix.
-func teardownRedis(
-	ctx context.Context,
-	cfg *config.Config,
-	d config.DatabaseConfig,
-	tplCtx template.Context,
-	sl string,
-	repoID, worktreeID int64,
-	st *store.Store,
-) error {
-	if cfg.Connections.Redis == nil {
-		return nil
-	}
-	if d.KeyPrefix == "" {
-		return errors.New("redis: missing key_prefix")
-	}
-	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = drv.Close() }()
-	prefix, err := template.Render(d.KeyPrefix, tplCtx)
-	if err != nil {
-		return err
-	}
-	return teardownGeneric(ctx, "redis", prefix, sl, repoID, worktreeID, st, drv.DropPrefix)
-}
-
-// teardownES drops the per-worktree Elasticsearch / OpenSearch index
-// prefix.
-func teardownES(
-	ctx context.Context,
-	cfg *config.Config,
-	d config.DatabaseConfig,
-	tplCtx template.Context,
-	sl string,
-	repoID, worktreeID int64,
-	st *store.Store,
-) error {
-	if cfg.Connections.Elasticsearch == nil {
-		return nil
-	}
-	if d.KeyPrefix == "" {
-		return errors.New("es: missing key_prefix")
-	}
-	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-	if err != nil {
-		return err
-	}
-	prefix, err := template.Render(d.KeyPrefix, tplCtx)
-	if err != nil {
-		return err
-	}
-	return teardownGeneric(ctx, "elasticsearch", prefix, sl, repoID, worktreeID, st,
-		dropMatchingCount(drv.DropMatching))
 }
