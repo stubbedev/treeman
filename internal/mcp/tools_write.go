@@ -79,7 +79,7 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "registry_unregister",
-		Description: "Mark a WORKTREE deleted in SQLite without touching git or external resources (DBs + on-disk path stay). Use when the on-disk worktree was removed externally. Idempotent.",
+		Description: "Mark a WORKTREE deleted in SQLite without touching git or external resources (DBs + on-disk path stay). Use when the on-disk worktree was removed externally. Pass dry_run=true to preview which row would be marked, ack=true to skip confirmation. Idempotent.",
 		Annotations: writeAnno("Unregister worktree", true, true, false),
 	}, registryUnregisterTool)
 
@@ -109,7 +109,7 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "logs_purge",
-		Description: "Delete event-log rows. Filters AND-combine; pass older_than=24h to drop anything older. At least one filter is REQUIRED to prevent a full wipe.",
+		Description: "Delete event-log rows. Filters AND-combine; pass older_than=24h to drop anything older. At least one filter is REQUIRED to prevent a full wipe. Pass dry_run=true to preview the matched-row count; ack=true to skip confirmation.",
 		Annotations: writeAnno("Purge events", true, false, false),
 	}, logsPurgeTool)
 
@@ -417,17 +417,21 @@ func registryRegisterTool(
 }
 
 type registryUnregisterIn struct {
-	Repo string `json:"repo,omitempty"`
-	Name string `json:"name"           jsonschema:"slug, branch, or basename of the worktree"`
+	Repo   string `json:"repo,omitempty"`
+	Name   string `json:"name"              jsonschema:"slug, branch, or basename of the worktree"`
+	DryRun bool   `json:"dry_run,omitempty" jsonschema:"plan only — resolve the worktree row + return its path/id without marking it deleted"`
+	Ack    bool   `json:"ack,omitempty"     jsonschema:"skip the elicitation confirmation prompt"`
 }
 type registryUnregisterOut struct {
 	WorktreeID int64  `json:"worktree_id"`
 	Path       string `json:"path"`
+	DryRun     bool   `json:"dry_run,omitempty"`
+	Refused    string `json:"refused,omitempty"`
 }
 
 func registryUnregisterTool(
 	ctx context.Context,
-	_ *mcpsdk.CallToolRequest,
+	req *mcpsdk.CallToolRequest,
 	in registryUnregisterIn,
 ) (*mcpsdk.CallToolResult, registryUnregisterOut, error) {
 	if in.Name == "" {
@@ -455,6 +459,23 @@ func registryUnregisterTool(
 	}
 	var path string
 	_ = st.DB.QueryRowContext(ctx, `SELECT path FROM worktrees WHERE id = ?`, wtID).Scan(&path)
+	if in.DryRun {
+		return nil, registryUnregisterOut{WorktreeID: wtID, Path: path, DryRun: true}, nil
+	}
+	if ok, reason := confirmDestructive(
+		ctx,
+		req,
+		false,
+		in.Ack,
+		fmt.Sprintf(
+			"Mark worktree %q (id=%d, path=%s) deleted in the registry? On-disk path + databases will NOT be touched.",
+			in.Name,
+			wtID,
+			path,
+		),
+	); !ok {
+		return nil, registryUnregisterOut{WorktreeID: wtID, Path: path, Refused: reason}, nil
+	}
 	if err := st.MarkWorktreeDeleted(ctx, wtID); err != nil {
 		return nil, registryUnregisterOut{}, err
 	}
@@ -659,12 +680,17 @@ type logsPurgeIn struct {
 	OlderThan  string   `json:"older_than,omitempty"  jsonschema:"duration (24h, 7d) or RFC3339 cutoff — events older than this are purged"`
 	Levels     []string `json:"levels,omitempty"`
 	EventTypes []string `json:"event_types,omitempty"`
+	DryRun     bool     `json:"dry_run,omitempty"     jsonschema:"plan only — report how many rows the filter currently matches without deleting"`
+	Ack        bool     `json:"ack,omitempty"         jsonschema:"skip the elicitation confirmation prompt"`
 }
 type logsPurgeOut struct {
-	RowsRemoved int64 `json:"rows_removed"`
+	RowsRemoved int64  `json:"rows_removed"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+	WouldRemove int64  `json:"would_remove,omitempty"`
+	Refused     string `json:"refused,omitempty"`
 }
 
-func logsPurgeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsPurgeIn) (*mcpsdk.CallToolResult, logsPurgeOut, error) {
+func logsPurgeTool(ctx context.Context, req *mcpsdk.CallToolRequest, in logsPurgeIn) (*mcpsdk.CallToolResult, logsPurgeOut, error) {
 	// At least one filter required so an empty input can never wipe
 	// the entire events table.
 	if in.Repo == "" && in.Worktree == "" && in.OlderThan == "" && len(in.Levels) == 0 && len(in.EventTypes) == 0 {
@@ -688,6 +714,20 @@ func logsPurgeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsPurgeI
 	defer func() { _ = st.Close() }()
 	if err := applyRepoWorktreeFilter(ctx, st, &f, in.Repo, in.Worktree); err != nil {
 		return nil, logsPurgeOut{}, err
+	}
+	if in.DryRun {
+		n, err := st.CountEvents(ctx, f)
+		if err != nil {
+			return nil, logsPurgeOut{}, err
+		}
+		return nil, logsPurgeOut{DryRun: true, WouldRemove: n}, nil
+	}
+	// Quote the matched count in the confirmation so the user sees
+	// the blast radius before approving.
+	matched, _ := st.CountEvents(ctx, f)
+	if ok, reason := confirmDestructive(ctx, req, false, in.Ack,
+		fmt.Sprintf("Purge %d event-log row(s) matching the filter?", matched)); !ok {
+		return nil, logsPurgeOut{Refused: reason}, nil
 	}
 	n, err := st.PurgeEvents(ctx, f)
 	if err != nil {
@@ -762,11 +802,17 @@ type worktreeDeleteIn struct {
 }
 
 // worktreeDeleteResult is the structured response. When DryRun=true the
-// `dry_run`/`would_drop` fields are populated and the wt.DeleteResult
-// fields stay zero (no teardown ran). Refused=true when elicitation
-// returned decline/cancel.
+// `dry_run`/`would_drop` fields are populated and the wt.* fields stay
+// zero (no teardown ran). Refused is set when elicitation returned
+// decline/cancel.
+//
+// wt.DeleteResult fields are promoted explicitly rather than embedded
+// so a future field add on wt.DeleteResult cannot silently collide
+// with `dry_run` / `refused` / `would_*`.
 type worktreeDeleteResult struct {
-	wt.DeleteResult
+	WtPath          string              `json:"wt_path,omitempty"`
+	Status          wt.DeleteStatus     `json:"status,omitempty"`
+	LogPath         string              `json:"log_path,omitempty"`
 	DryRun          bool                `json:"dry_run,omitempty"`
 	WouldDropDBs    []worktreeDropEntry `json:"would_drop_dbs,omitempty"`
 	WouldRemovePath string              `json:"would_remove_path,omitempty"`
@@ -807,7 +853,11 @@ func worktreeDeleteTool(
 		Target:   in.Name,
 		Force:    in.Force,
 	}, wt.NoopSink{})
-	return nil, worktreeDeleteResult{DeleteResult: res}, err
+	return nil, worktreeDeleteResult{
+		WtPath:  res.WtPath,
+		Status:  res.Status,
+		LogPath: res.LogPath,
+	}, err
 }
 
 // ─── daemon_control ───────────────────────────────────────────────

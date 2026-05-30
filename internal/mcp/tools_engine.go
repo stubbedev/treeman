@@ -83,7 +83,7 @@ func registerEngineReadTools(srv *mcpsdk.Server) {
 func registerEngineWriteTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_drop",
-		Description: "Evict ONE snapshot by fingerprint (engine-side template + SQLite row). Next prepare cold-rebuilds. Call snapshot_inspect first to confirm. For orphan sweeps the cache-cleanup prompt is safer than calling this directly.",
+		Description: "Evict ONE snapshot by fingerprint (engine-side template + SQLite row). Next prepare cold-rebuilds. Call snapshot_inspect first to confirm. Engine-drop failures abort before the SQLite row is touched, so partial failures leave a recoverable state. Pass dry_run=true to preview, ack=true to skip confirmation. For orphan sweeps the cache-cleanup prompt is safer than calling this directly.",
 		Annotations: writeAnno("Drop snapshot", true, true, true),
 	}, snapshotDropTool)
 
@@ -629,6 +629,8 @@ func snapshotInspectTool(
 type snapshotDropIn struct {
 	Fingerprint string `json:"fingerprint"`
 	Repo        string `json:"repo,omitempty"`
+	DryRun      bool   `json:"dry_run,omitempty" jsonschema:"plan only — resolve the snapshot row + report what would be dropped (engine, template name) without mutating SQLite or the engine"`
+	Ack         bool   `json:"ack,omitempty"     jsonschema:"skip the elicitation confirmation prompt"`
 }
 type snapshotDropOut struct {
 	Dropped       bool   `json:"dropped"`
@@ -636,9 +638,19 @@ type snapshotDropOut struct {
 	EngineDropErr string `json:"engine_drop_err,omitempty"`
 	Engine        string `json:"engine,omitempty"`
 	Template      string `json:"template,omitempty"`
+	DryRun        bool   `json:"dry_run,omitempty"`
+	Refused       string `json:"refused,omitempty"`
 }
 
-func snapshotDropTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapshotDropIn) (*mcpsdk.CallToolResult, snapshotDropOut, error) {
+// snapshotDropTool deletes ONE cached snapshot — engine-side template
+// AND the SQLite row. Engine-drop failures abort BEFORE the SQLite
+// delete so the agent never sees Dropped=true while an orphan template
+// remains on the engine.
+func snapshotDropTool(
+	ctx context.Context,
+	req *mcpsdk.CallToolRequest,
+	in snapshotDropIn,
+) (*mcpsdk.CallToolResult, snapshotDropOut, error) {
 	if in.Fingerprint == "" {
 		return nil, snapshotDropOut{}, errors.New("fingerprint required")
 	}
@@ -655,18 +667,41 @@ func snapshotDropTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapsho
 		return nil, snapshotDropOut{}, fmt.Errorf("no snapshot with fingerprint %s", in.Fingerprint)
 	}
 	out := snapshotDropOut{Engine: rec.Engine, Template: rec.TemplateName}
+	if in.DryRun {
+		out.DryRun = true
+		return nil, out, nil
+	}
+	if ok, reason := confirmDestructive(
+		ctx,
+		req,
+		false,
+		in.Ack,
+		fmt.Sprintf(
+			"Drop snapshot %s (engine=%s template=%s)? Engine template + SQLite row will be deleted.",
+			in.Fingerprint,
+			rec.Engine,
+			rec.TemplateName,
+		),
+	); !ok {
+		out.Refused = reason
+		return nil, out, nil
+	}
 
 	cfg, cfgErr := loadCfgForRepo(in.Repo)
-	if cfgErr == nil {
-		if dropErr := dropTemplate(ctx, cfg, rec.Engine, rec.TemplateName); dropErr != nil {
-			out.EngineDropped = false
-			out.EngineDropErr = dropErr.Error()
-		} else {
-			out.EngineDropped = true
-		}
-	} else {
+	if cfgErr != nil {
 		out.EngineDropErr = "load config: " + cfgErr.Error()
+		return nil, out, fmt.Errorf("load config: %w", cfgErr)
 	}
+	if dropErr := dropTemplate(ctx, cfg, rec.Engine, rec.TemplateName); dropErr != nil {
+		// Don't proceed to the SQLite delete: leaving the row in
+		// place AND the orphan template means the next snapshot_inspect
+		// will surface the orphan correctly. Deleting the row here
+		// would silently lose the link.
+		out.EngineDropped = false
+		out.EngineDropErr = dropErr.Error()
+		return nil, out, fmt.Errorf("drop engine template: %w", dropErr)
+	}
+	out.EngineDropped = true
 	if err := st.DeleteSnapshot(ctx, in.Fingerprint); err != nil {
 		return nil, out, fmt.Errorf("delete snapshot row: %w", err)
 	}

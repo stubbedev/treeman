@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -233,7 +234,13 @@ func streamEvents(ctx context.Context, st *State, enc *json.Encoder, req rpc.Req
 	// "we missed some events" via the run_id gap, not a stall).
 	const bufSize = 256
 	ch := make(chan rpc.EventEnvelope, bufSize)
-	hookID := fmt.Sprintf("sub:%p", ch)
+	// Hook id combines a channel-pointer fingerprint (already unique
+	// per allocation) with random bytes so two subscriptions whose
+	// channel addresses happen to alias after GC can't share or
+	// clobber registrations. crypto/rand is overkill but cheap once.
+	var salt [4]byte
+	_, _ = cryptorand.Read(salt[:])
+	hookID := fmt.Sprintf("sub:%p:%x", ch, salt[:])
 	filter := buildSubscribeFilter(args, repoID, worktreeID)
 
 	st.Store.RegisterEventHook(hookID, func(ev store.Event) {
@@ -283,6 +290,14 @@ func resolveSubscribeIDs(ctx context.Context, st *State, args rpc.EventSubscribe
 // the per-event predicate. Extracted from streamEvents to keep the
 // outer function under the cyclomatic-complexity budget.
 func buildSubscribeFilter(args rpc.EventSubscribeArgs, repoID, worktreeID int64) func(store.Event) bool {
+	// Match SQLite LIKE semantics for PayloadLike: wrap a bare needle in
+	// `%…%` so callers can pass either an LIKE-style pattern (`%key%`)
+	// or a plain substring. Mirrors store.EventFilter.PayloadLike's
+	// behaviour so push and poll mode produce identical results.
+	payloadNeedle := args.PayloadLike
+	if payloadNeedle != "" && !strings.ContainsAny(payloadNeedle, "%_") {
+		payloadNeedle = "%" + payloadNeedle + "%"
+	}
 	return func(ev store.Event) bool {
 		if repoID != 0 && (!ev.RepoID.Valid || ev.RepoID.Int64 != repoID) {
 			return false
@@ -299,11 +314,53 @@ func buildSubscribeFilter(args rpc.EventSubscribeArgs, repoID, worktreeID int64)
 		if len(args.Phases) > 0 && !containsCI(args.Phases, ev.Phase) {
 			return false
 		}
+		if payloadNeedle != "" && !payloadLikeMatch(ev.PayloadJSON, payloadNeedle) {
+			return false
+		}
 		if args.RunID != "" && !payloadHasRunID(ev.PayloadJSON, args.RunID) {
 			return false
 		}
 		return true
 	}
+}
+
+// payloadLikeMatch implements the subset of SQL LIKE semantics that
+// store.EventFilter.PayloadLike uses: `%` matches any run, `_` matches
+// one char. Sufficient for matching against payload_json substrings;
+// the daemon never sees user-controlled LIKE patterns outside this
+// path so a hand-rolled matcher beats spinning up a regex.
+func payloadLikeMatch(payload, pattern string) bool {
+	return likeMatch(payload, pattern)
+}
+
+// likeMatch is the iterative LIKE matcher. Greedy on `%`, falling
+// back via a recorded-start index — the standard trick that gives
+// O(n*m) worst case for the rare nested-wildcard pattern without
+// recursion overhead.
+func likeMatch(s, p string) bool {
+	si, pi := 0, 0
+	starPi, matchSi := -1, 0
+	for si < len(s) {
+		switch {
+		case pi < len(p) && p[pi] == '%':
+			starPi = pi
+			matchSi = si
+			pi++
+		case pi < len(p) && (p[pi] == '_' || p[pi] == s[si]):
+			si++
+			pi++
+		case starPi != -1:
+			pi = starPi + 1
+			matchSi++
+			si = matchSi
+		default:
+			return false
+		}
+	}
+	for pi < len(p) && p[pi] == '%' {
+		pi++
+	}
+	return pi == len(p)
 }
 
 // containsCI reports whether needle is in haystack, case-insensitive.

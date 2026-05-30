@@ -452,8 +452,35 @@ func (s *Store) PruneOldLogs(ctx context.Context, cutoffMs int64) (int64, error)
 // expect (events accumulate, but a single repo rarely tops 100k rows).
 func (s *Store) PurgeEvents(ctx context.Context, f EventFilter) (int64, error) {
 	q := "DELETE FROM events"
-	where := []string{}
-	args := []any{}
+	where, args := purgeEventsWhere(f)
+	q = appendWhere(q, where)
+	res, err := s.DB.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// CountEvents reports how many event rows currently match f. Shares
+// the predicate set with PurgeEvents so a dry-run preview ("how many
+// rows would the same filter purge?") matches the destructive call
+// exactly. Returns 0 + nil on no-rows; the caller distinguishes via
+// the err return.
+func (s *Store) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	q := "SELECT COUNT(*) FROM events"
+	where, args := purgeEventsWhere(f)
+	q = appendWhere(q, where)
+	var n int64
+	if err := s.DB.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// purgeEventsWhere is the shared WHERE-clause builder for PurgeEvents
+// + CountEvents. Mirrors the predicate set in queryEventsWhere but
+// without the joined-worktree filters that PurgeEvents doesn't apply.
+func purgeEventsWhere(f EventFilter) (where []string, args []any) {
 	if f.RepoID > 0 {
 		where = append(where, "repo_id = ?")
 		args = append(args, f.RepoID)
@@ -482,14 +509,19 @@ func (s *Store) PurgeEvents(ctx context.Context, f EventFilter) (int64, error) {
 			args = append(args, v)
 		}
 	}
-	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ") //nolint:gosec // only placeholder fragments joined; values are parameterized
+	return where, args
+}
+
+// appendWhere appends a WHERE clause to q when fragments is non-empty.
+// Centralised so PurgeEvents + CountEvents share the same concatenation
+// site (and the same single gosec exemption — every fragment is a
+// hard-coded predicate template; user input only flows through the
+// args slice).
+func appendWhere(q string, fragments []string) string {
+	if len(fragments) == 0 {
+		return q
 	}
-	res, err := s.DB.ExecContext(ctx, q, args...)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return q + " WHERE " + strings.Join(fragments, " AND ")
 }
 
 func placeholders(n int) string {

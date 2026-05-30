@@ -7,10 +7,10 @@
 //
 // Every config knob is covered:
 //   - enabled            → an enabled config fires; the negative cases
-//                          below also prove a non-listed bucket is muted.
+//     below also prove a non-listed bucket is muted.
 //   - events (default)   → [stable, failed] fire; transient up/down don't.
 //   - events (custom)    → an explicit [up, down] list flips which
-//                          buckets notify, proving the list is honoured.
+//     buckets notify, proving the list is honoured.
 //
 // No real desktop backend is needed (the fake Sender captures sends), so
 // this suite runs anywhere.

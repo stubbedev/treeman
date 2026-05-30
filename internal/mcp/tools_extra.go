@@ -216,6 +216,11 @@ func logsSubscribeTool(
 // subscribePushPath opens an rpc.SubscribeEvents stream and consumes
 // events as they arrive. Returns ok=false (and the caller falls back
 // to polling) on dial failure — the daemon may not be running.
+//
+// Pristine push: every filter field in subscribePollPath is also
+// passed to rpc.SubscribeEvents below, and the Anchor (= max event
+// id at subscription time) is computed from the local store before
+// the stream opens so the output shape matches poll exactly.
 func subscribePushPath(
 	ctx context.Context,
 	req *mcpsdk.CallToolRequest,
@@ -226,12 +231,20 @@ func subscribePushPath(
 ) (logsSubscribeOut, bool) {
 	resolvedRepo, _ := resolveRepo(in.Repo)
 	resolvedWT, _ := resolveWorktreePath(ctx, resolvedRepo, in.Worktree)
+
+	// Compute the same Anchor poll mode reports. Required so agents
+	// can correlate the subscription start with logs_query results
+	// regardless of mode. Best-effort: an unopenable store leaves
+	// Anchor=0 (subscription still works, no historical anchor).
+	anchor := pushAnchor(ctx, in)
+
 	stream, cancel, err := rpc.SubscribeEvents(ctx, rpc.EventSubscribeArgs{
 		RepoPath:     resolvedRepo,
 		WorktreePath: resolvedWT,
 		Levels:       validateLevels(in.Levels),
 		EventTypes:   in.EventTypes,
 		Phases:       in.Phases,
+		PayloadLike:  in.PayloadLike,
 		RunID:        in.RunID,
 	})
 	if err != nil {
@@ -239,7 +252,6 @@ func subscribePushPath(
 	}
 	defer cancel()
 
-	deadline := time.Now().Add(timeout)
 	deadlineCh := time.After(timeout)
 	var collected []store.Event
 	notifications := 0
@@ -249,13 +261,10 @@ func subscribePushPath(
 			if !open {
 				// Stream closed by daemon (or ctx). Treat as timeout
 				// if we haven't met min_count.
-				if len(collected) >= minCount {
-					return logsSubscribeOut{
-						Events: collected, Notifications: notifications, Mode: "push",
-					}, true
-				}
+				timedOut := len(collected) < minCount
 				return logsSubscribeOut{
-					Events: collected, TimedOut: true, Notifications: notifications, Mode: "push",
+					Events: collected, Anchor: anchor, TimedOut: timedOut,
+					Notifications: notifications, Mode: "push",
 				}, true
 			}
 			ev := envelopeToEvent(env)
@@ -265,21 +274,46 @@ func subscribePushPath(
 			notifications += dispatchEventNotification(ctx, req, progressToken, len(collected), minCount, ev)
 			if len(collected) >= minCount {
 				return logsSubscribeOut{
-					Events: collected, Notifications: notifications, Mode: "push",
+					Events: collected, Anchor: anchor,
+					Notifications: notifications, Mode: "push",
 				}, true
 			}
 		case <-deadlineCh:
 			return logsSubscribeOut{
-				Events: collected, TimedOut: true, Notifications: notifications, Mode: "push",
+				Events: collected, Anchor: anchor, TimedOut: true,
+				Notifications: notifications, Mode: "push",
 			}, true
 		case <-ctx.Done():
 			return logsSubscribeOut{
-				Events: collected, TimedOut: true, Notifications: notifications, Mode: "push",
+				Events: collected, Anchor: anchor, TimedOut: true,
+				Notifications: notifications, Mode: "push",
 			}, true
 		}
-		// Drain inner deadline check (loop body never sleeps).
-		_ = deadline
 	}
+}
+
+// pushAnchor returns the highest event id matching the filter at
+// subscription open time. Symmetric with poll mode's newestMatchingID
+// call so the Anchor field has the same meaning across both paths.
+// Errors collapse to 0 — push mode still works, the agent just sees
+// "no anchor" in the result.
+func pushAnchor(ctx context.Context, in logsSubscribeIn) int64 {
+	st, err := openStore(ctx)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = st.Close() }()
+	f := store.EventFilter{
+		Levels:      validateLevels(in.Levels),
+		EventTypes:  in.EventTypes,
+		Phases:      in.Phases,
+		PayloadLike: in.PayloadLike,
+		RunID:       in.RunID,
+	}
+	if err := applyRepoWorktreeFilter(ctx, st, &f, in.Repo, in.Worktree); err != nil {
+		return 0
+	}
+	return newestMatchingID(ctx, st, f)
 }
 
 // subscribePollPath is the original SQLite-polling implementation,

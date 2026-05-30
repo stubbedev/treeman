@@ -172,6 +172,7 @@ func populateWrapperB(r Request, wrapper map[string]any) {
 			wrapper["levels"] = r.EventSubscribe.Levels
 			wrapper["event_types"] = r.EventSubscribe.EventTypes
 			wrapper["phases"] = r.EventSubscribe.Phases
+			wrapper["payload_like"] = r.EventSubscribe.PayloadLike
 			wrapper["run_id"] = r.EventSubscribe.RunID
 		}
 	}
@@ -247,6 +248,7 @@ func (r *Request) UnmarshalJSON(data []byte) error {
 			"levels":        &r.EventSubscribe.Levels,
 			"event_types":   &r.EventSubscribe.EventTypes,
 			"phases":        &r.EventSubscribe.Phases,
+			"payload_like":  &r.EventSubscribe.PayloadLike,
 			"run_id":        &r.EventSubscribe.RunID,
 		})
 	default:
@@ -346,12 +348,19 @@ type SyncWorktreeStatus struct {
 // fires on EVERY future WriteEvent on the daemon's store; historical
 // events are NOT replayed (use logs_query for backfill, then subscribe
 // for live-tail).
+//
+// IMPORTANT: every filter field here MUST be mirrored in the MCP
+// logs_subscribe push path so push and poll modes produce identical
+// result sets. New fields go in three places: this struct, the
+// MarshalJSON/UnmarshalJSON branches in rpc.go, and the per-event
+// filter in daemon/dispatch.go buildSubscribeFilter.
 type EventSubscribeArgs struct {
 	RepoPath     string   `json:"repo_path,omitempty"`
 	WorktreePath string   `json:"worktree_path,omitempty"`
 	Levels       []string `json:"levels,omitempty"`
 	EventTypes   []string `json:"event_types,omitempty"`
 	Phases       []string `json:"phases,omitempty"`
+	PayloadLike  string   `json:"payload_like,omitempty"`
 	RunID        string   `json:"run_id,omitempty"`
 }
 
