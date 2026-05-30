@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -91,7 +92,30 @@ func newEnv(t *testing.T) *env {
 		runtimeDir: t.TempDir(),
 		dbPath:     filepath.Join(t.TempDir(), "treeman.db"),
 	}
+	// A command like `wt delete` auto-spawns the daemon to run an async
+	// teardown; left running, it keeps writing the SQLite DB / sockets
+	// into these temp dirs and races t.TempDir's RemoveAll cleanup
+	// ("directory not empty"). Registered here so it runs before this
+	// env's temp-dir removals (cleanups are LIFO).
+	t.Cleanup(func() { stopDaemon(t, e) })
 	return e
+}
+
+// stopDaemon requests a graceful daemon shutdown and waits until status
+// reports not-running (the process has exited and released the DB +
+// socket), so a daemon spawned during the test can't keep writing into
+// the temp dirs while they're being removed. Best-effort: when no daemon
+// was spawned, `daemon status` reports not-running immediately.
+func stopDaemon(t *testing.T, e *env) {
+	t.Helper()
+	_ = e.run(t, e.home, "daemon", "stop")
+	for range 50 {
+		res := e.run(t, e.home, "daemon", "status", "--json")
+		if strings.Contains(res.stdout, `"status":"not-running"`) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (e *env) block() []string {

@@ -19,6 +19,11 @@ import (
 func makeWorktreeFixture(t *testing.T, e *env) (repo, wtA, wtB string) {
 	t.Helper()
 	repo = newGitRepo(t)
+	// `wt delete` against this fixture auto-spawns a daemon that does the
+	// git-worktree teardown inside `repo` asynchronously. Stop + drain it
+	// before the repo's temp dir is removed (registered after newGitRepo
+	// so it runs first under LIFO cleanup) to avoid a RemoveAll race.
+	t.Cleanup(func() { stopDaemon(t, e) })
 	writeConfig(t, repo, minimalConfig)
 	wtA = filepath.Join(repo, ".worktrees", "feat_a")
 	wtB = filepath.Join(repo, ".worktrees", "feat_b")
