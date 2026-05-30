@@ -16,29 +16,115 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log/slog"
+
+	"github.com/stubbedev/treeman/internal/config"
 )
 
-// LoadMySQL streams `dumpPath` into `targetDB` via the supplied
-// *sql.DB. Returns the number of statements applied.
+// LoadMySQL applies `dumpPath` to `targetDB` using the fastest
+// available path. Strategy is selected in order:
+//
+//  1. `<container-engine> exec -i CID mysql …` — when `conn` is non-nil
+//     and `conn.ContainerRef` resolves to a running container. Fastest
+//     because the CLI talks to mysqld over an in-container unix socket.
+//  2. Native `mysql` CLI on PATH piping the (decompressed) dump. Skips
+//     the per-statement round-trips that the wire loader pays.
+//  3. Wire-protocol streaming over the existing *sql.DB connection.
+//     Always available, and the only path used when `conn` is nil.
+//
+// `conn` is optional: pass it so the fast paths can read host/port/
+// user/password; pass nil to force the wire path (used by branch-
+// scoped loadDump callers that only carry a *sql.DB).
+//
+// Returns the strategy that actually ran so callers can record it as
+// an event. A fast-path FAILURE (exec ran but exited non-zero) is
+// downgraded to a warning log + fall-through to the next strategy, so
+// a misconfigured CLI on a dev box can never block a cold build.
 //
 // Compression (gzip/zstd/bzip2/xz) is auto-detected from the file's
-// magic bytes — extension is not consulted. Uses streamStatements
-// internally so a 10GB dump is bounded by the largest statement
-// size (typically ~64MB for mysqldump extended-inserts), not the
-// file size.
-func LoadMySQL(ctx context.Context, db *sql.DB, targetDB, dumpPath string) (uint64, error) {
+// magic bytes — extension is not consulted.
+func LoadMySQL(ctx context.Context, db *sql.DB, conn *config.MysqlConn, targetDB, dumpPath string) (LoadStrategy, error) {
+	if ok, err := runFastPathMySQL(ctx, conn, targetDB, dumpPath, tryDockerExecMySQL); ok {
+		return StrategyDockerExec, nil
+	} else if err != nil {
+		slog.Warn("dump-load fast path (docker exec) failed; falling through", "error", err)
+	}
+	if ok, err := runFastPathMySQL(ctx, conn, targetDB, dumpPath, tryNativeCLIMySQL); ok {
+		return StrategyNativeCLI, nil
+	} else if err != nil {
+		slog.Warn("dump-load fast path (native CLI) failed; falling through", "error", err)
+	}
+	return StrategyWire, loadMySQLViaWire(ctx, db, targetDB, dumpPath)
+}
+
+// LoadPostgres mirrors LoadMySQL for pgx-backed databases. The `db`
+// arg must be a connection scoped to `targetDB` (pg has no USE); the
+// wire-protocol fallback uses it directly. The fast paths consult
+// `conn` and reconnect via the CLI.
+func LoadPostgres(ctx context.Context, db *sql.DB, conn *config.PostgresConn, targetDB, dumpPath string) (LoadStrategy, error) {
+	if ok, err := runFastPathPostgres(ctx, conn, targetDB, dumpPath, tryDockerExecPostgres); ok {
+		return StrategyDockerExec, nil
+	} else if err != nil {
+		slog.Warn("dump-load fast path (docker exec) failed; falling through", "error", err)
+	}
+	if ok, err := runFastPathPostgres(ctx, conn, targetDB, dumpPath, tryNativeCLIPostgres); ok {
+		return StrategyNativeCLI, nil
+	} else if err != nil {
+		slog.Warn("dump-load fast path (native CLI) failed; falling through", "error", err)
+	}
+	return StrategyWire, loadPostgresViaWire(ctx, db, dumpPath)
+}
+
+// runFastPathMySQL opens the dump (with compression sniffing), hands
+// the decompressed reader to `attempt`, and forwards the (ok, err)
+// triple back to the dispatcher. Centralises file open + close so
+// each tryXxx helper stays focused on the exec mechanics.
+func runFastPathMySQL(ctx context.Context, conn *config.MysqlConn, targetDB, dumpPath string,
+	attempt func(context.Context, *config.MysqlConn, string, io.Reader) (bool, error),
+) (bool, error) {
+	if conn == nil {
+		return false, nil
+	}
 	f, _, err := OpenDump(dumpPath)
 	if err != nil {
-		return 0, err
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	return attempt(ctx, conn, targetDB, f)
+}
+
+// runFastPathPostgres mirrors runFastPathMySQL for the psql helpers.
+func runFastPathPostgres(ctx context.Context, conn *config.PostgresConn, targetDB, dumpPath string,
+	attempt func(context.Context, *config.PostgresConn, string, io.Reader) (bool, error),
+) (bool, error) {
+	if conn == nil {
+		return false, nil
+	}
+	f, _, err := OpenDump(dumpPath)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	return attempt(ctx, conn, targetDB, f)
+}
+
+// loadMySQLViaWire is the original statement-streaming loader. Uses
+// streamStatements internally so a 10GB dump is bounded by the largest
+// single statement size (typically ~64MB for mysqldump extended-
+// inserts), not the file size.
+func loadMySQLViaWire(ctx context.Context, db *sql.DB, targetDB, dumpPath string) error {
+	f, _, err := OpenDump(dumpPath)
+	if err != nil {
+		return err
 	}
 	defer func() { _ = f.Close() }()
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer func() { _ = conn.Close() }()
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("USE `%s`", targetDB)); err != nil {
-		return 0, fmt.Errorf("USE `%s`: %w", targetDB, err)
+		return fmt.Errorf("USE `%s`: %w", targetDB, err)
 	}
 	for _, s := range []string{
 		"SET SESSION foreign_key_checks=0",
@@ -47,32 +133,32 @@ func LoadMySQL(ctx context.Context, db *sql.DB, targetDB, dumpPath string) (uint
 	} {
 		_, _ = conn.ExecContext(ctx, s) // best-effort; some flags need SUPER
 	}
-	return streamStatements(ctx, f, func(stmt string) error {
+	_, err = streamStatements(ctx, f, func(stmt string) error {
 		_, err := conn.ExecContext(ctx, stmt)
 		return err
 	})
+	return err
 }
 
-// LoadPostgres mirrors LoadMySQL for pgx-backed databases.
-// Compression auto-detection works identically.
-func LoadPostgres(ctx context.Context, db *sql.DB, targetDB, dumpPath string) (uint64, error) {
+// loadPostgresViaWire is the original statement-streaming loader.
+// Caller must have opened db against the target database (pg has no
+// USE), which it always does (preparePostgres uses OpenScoped).
+func loadPostgresViaWire(ctx context.Context, db *sql.DB, dumpPath string) error {
 	f, _, err := OpenDump(dumpPath)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer func() { _ = f.Close() }()
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer func() { _ = conn.Close() }()
-	// pg/`USE` doesn't exist; caller is expected to have opened db
-	// against the right database (i.e. a DB-scoped connection).
-	_ = targetDB
-	return streamStatements(ctx, f, func(stmt string) error {
+	_, err = streamStatements(ctx, f, func(stmt string) error {
 		_, err := conn.ExecContext(ctx, stmt)
 		return err
 	})
+	return err
 }
 
 // streamStatements walks `r` and invokes onStmt for each `;`-

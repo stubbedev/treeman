@@ -3,55 +3,124 @@ package mongo
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os/exec"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/dumpload"
 )
 
-// Restore loads a `mongodump --archive` archive into targetDB via
-// the `mongorestore` CLI. Compression (gzip/zstd/bzip2/xz) is
-// auto-detected from the archive's magic bytes:
+// Restore loads a `mongodump --archive` archive into `targetDB`. It
+// picks the fastest available path:
 //
-//   - none/gzip: passed natively to mongorestore via `--archive=<path>`
-//     (plus `--gzip` for gzip). Lets mongorestore stream the file
-//     directly without extra Go-side copies.
-//   - zstd/bzip2/xz: decompressed in-process and piped to
-//     mongorestore via stdin (`--archive` with no `=path`).
+//  1. `<container-engine> exec -i CID mongorestore …` when the
+//     connection's ContainerRef resolves to a running container.
+//  2. Host `mongorestore` CLI on PATH, piping the archive over stdin.
+//  3. Pure-Go wire-protocol fallback that parses the BSON archive
+//     stream itself and inserts every doc via the official mongo Go
+//     driver. Always available — selected when neither CLI path is.
 //
-// `sourceDB` names the DB the archive was made from (e.g. the
-// production DB the engineer ran `mongodump --db=` against).
-// Treeman remaps it to `targetDB` via mongorestore's `--nsFrom`/
-// `--nsTo` flags. mongorestore requires the asterisk count to
-// match between from/to, so we use `<source>.*` → `<target>.*`
-// (one star — collection names pass through). Pass sourceDB=""
-// to restore without renaming (archive must already use the
+// `sourceDB` names the DB the archive was made from (`mongodump
+// --db=`). All three strategies remap it onto `targetDB`. Pass
+// sourceDB="" to skip the rename (the archive must already use the
 // target name).
 //
-// Requires mongorestore on PATH. Returns a clear error if the
-// binary isn't installed.
-func Restore(ctx context.Context, uri, targetDB, sourceDB, dumpPath string) error {
+// Returns the strategy that actually ran so callers can log it. Fast-
+// path FAILURES (CLI ran but exited non-zero) are downgraded to a
+// warn log + fall-through, so a dev box missing mongorestore can
+// never block a cold build.
+func Restore(ctx context.Context, conn *config.MongoConn, targetDB, sourceDB, dumpPath string) (dumpload.LoadStrategy, error) {
+	if ok, err := tryDockerExecMongoRestore(ctx, conn, targetDB, sourceDB, dumpPath); ok {
+		return dumpload.StrategyDockerExec, nil
+	} else if err != nil {
+		slog.Warn("mongo restore fast path (docker exec) failed; falling through", "error", err)
+	}
+	if ok, err := tryNativeCLIMongoRestore(ctx, conn, targetDB, sourceDB, dumpPath); ok {
+		return dumpload.StrategyNativeCLI, nil
+	} else if err != nil {
+		slog.Warn("mongo restore fast path (native CLI) failed; falling through", "error", err)
+	}
+	return dumpload.StrategyWire, restoreViaDriver(ctx, conn, targetDB, sourceDB, dumpPath)
+}
+
+// tryDockerExecMongoRestore runs mongorestore INSIDE the engine
+// container via `<engine> exec -i`. Returns (true, nil) on success,
+// (false, nil) when the container ref isn't set / not resolvable, and
+// (false, err) when exec ran but failed.
+func tryDockerExecMongoRestore(ctx context.Context, conn *config.MongoConn, targetDB, sourceDB, dumpPath string) (bool, error) {
+	if conn == nil || (conn.Container == "" && conn.ComposeService == "") {
+		return false, nil
+	}
+	opts := containerip.Opts{
+		Container:      conn.Container,
+		ComposeService: conn.ComposeService,
+		ComposeProject: conn.ComposeProject,
+		Engine:         conn.ContainerEngine,
+		Network:        conn.Network,
+	}
+	cid, cerr := containerip.ContainerID(opts)
+	if cerr != nil {
+		return false, nil
+	}
+	engineBin := opts.Engine
+	if engineBin == "" {
+		engineBin = "docker"
+	}
+	if _, err := exec.LookPath(engineBin); err != nil {
+		return false, nil
+	}
+	args := []string{
+		"exec", "-i", cid, "mongorestore",
+		"--archive", "--drop", "--quiet", "--uri=" + conn.URI,
+	}
+	if sourceDB != "" && sourceDB != targetDB {
+		args = append(args, "--nsFrom="+sourceDB+".*", "--nsTo="+targetDB+".*")
+	}
+	rc, format, oerr := dumpload.OpenDump(dumpPath)
+	if oerr != nil {
+		return false, oerr
+	}
+	defer func() { _ = rc.Close() }()
+	if format == dumpload.FormatGzip {
+		args = append(args, "--gzip")
+	}
+	cmd := exec.CommandContext(ctx, engineBin, args...)
+	cmd.Stdin = rc
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return false, fmt.Errorf("%s exec mongorestore: %w (stderr: %s)", engineBin, err, stderr.String())
+	}
+	return true, nil
+}
+
+// tryNativeCLIMongoRestore runs the host's `mongorestore` CLI when
+// it's on PATH.
+func tryNativeCLIMongoRestore(ctx context.Context, conn *config.MongoConn, targetDB, sourceDB, dumpPath string) (bool, error) {
+	if conn == nil {
+		return false, nil
+	}
 	if _, err := exec.LookPath("mongorestore"); err != nil {
-		return fmt.Errorf("mongorestore not found on PATH: %w", err)
+		return false, nil
+	}
+	args := []string{"--uri=" + conn.URI, "--drop", "--quiet"}
+	if sourceDB != "" && sourceDB != targetDB {
+		args = append(args, "--nsFrom="+sourceDB+".*", "--nsTo="+targetDB+".*")
 	}
 	rc, format, err := dumpload.OpenDump(dumpPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = rc.Close() }()
-
-	args := []string{
-		"--uri=" + uri,
-		"--drop",
-		"--quiet",
-	}
-	if sourceDB != "" && sourceDB != targetDB {
-		args = append(args,
-			"--nsFrom="+sourceDB+".*",
-			"--nsTo="+targetDB+".*",
-		)
-	}
-
 	var cmd *exec.Cmd
 	switch format {
 	case dumpload.FormatNone:
@@ -66,8 +135,208 @@ func Restore(ctx context.Context, uri, targetDB, sourceDB, dumpPath string) erro
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("mongorestore (%s): %w: %s", format, err, stderr.String())
+	if rerr := cmd.Run(); rerr != nil {
+		return false, fmt.Errorf("mongorestore (%s): %w: %s", format, rerr, stderr.String())
+	}
+	return true, nil
+}
+
+// restoreViaDriver is the pure-Go wire-protocol fallback. It parses
+// the `mongodump --archive` stream itself and inserts every doc via
+// the official mongo Go driver, which speaks the same BSON wire
+// protocol the CLI does. Compression is auto-detected via
+// dumpload.OpenDump.
+//
+// Limitations of this fallback (documented + tolerated, NOT silent):
+//   - Indexes encoded in the prelude's collection metadata are NOT
+//     replayed. Most dev workflows rebuild them via the migrate step
+//     after the dump applies, so this rarely surfaces. We log a
+//     `wire fallback used: indexes not replayed` warning so the
+//     operator can decide whether to install mongorestore.
+//   - Per-doc inserts (not bulk-write batching). Adequate for the
+//     small seed dumps treeman typically handles; could be batched
+//     later if measurement shows it's worth the complexity.
+func restoreViaDriver(ctx context.Context, conn *config.MongoConn, targetDB, sourceDB, dumpPath string) error {
+	if conn == nil || conn.URI == "" {
+		return errors.New("mongo wire restore: missing connection URI")
+	}
+	client, err := mongo.Connect(options.Client().ApplyURI(conn.URI))
+	if err != nil {
+		return fmt.Errorf("mongo connect for wire restore: %w", err)
+	}
+	defer func() { _ = client.Disconnect(ctx) }()
+
+	rc, _, err := dumpload.OpenDump(dumpPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rc.Close() }()
+
+	r := &archiveReader{r: rc}
+	if err := r.readHeader(); err != nil {
+		return fmt.Errorf("read archive header: %w", err)
+	}
+
+	dropped := map[string]bool{}
+	for {
+		ns, doc, terminate, rerr := r.next()
+		if rerr != nil {
+			return rerr
+		}
+		if terminate {
+			break
+		}
+		dbName, coll := splitNamespace(ns)
+		if dbName == "" || coll == "" {
+			continue
+		}
+		if sourceDB != "" && dbName == sourceDB {
+			dbName = targetDB
+		}
+		// Drop-then-restore mirrors `mongorestore --drop`. We drop the
+		// destination collection on first encounter so a partially-
+		// loaded run is replaced wholesale, never doubled.
+		key := dbName + "." + coll
+		if !dropped[key] {
+			_ = client.Database(dbName).Collection(coll).Drop(ctx)
+			dropped[key] = true
+		}
+		if _, err := client.Database(dbName).Collection(coll).InsertOne(ctx, doc); err != nil {
+			return fmt.Errorf("insert into %s.%s: %w", dbName, coll, err)
+		}
+	}
+
+	slog.Warn("mongo restore: wire-protocol fallback used; indexes not replayed",
+		"path", dumpPath, "target_db", targetDB,
+		"hint", "install mongorestore on PATH or set ContainerRef on connections.mongodb for the fast path")
+	return nil
+}
+
+// archiveMagic is the first four bytes every `mongodump --archive`
+// stream begins with.
+const archiveMagic uint32 = 0x8199e26d
+
+// archiveTerminator marks the end of a namespace block or the end of
+// the archive (two terminators in a row).
+const archiveTerminator uint32 = 0xFFFFFFFF
+
+// archiveReader walks a mongodump archive stream:
+//
+//	[4-byte magic][prelude BSON][ block ... ]*[terminator][terminator]
+//
+// where each block is:
+//
+//	[namespace header BSON][document BSON]*[terminator]
+//
+// The header BSON carries `ns` (and metadata we don't currently
+// replay); subsequent BSON docs (until the terminator) belong to that
+// namespace.
+type archiveReader struct {
+	r       io.Reader
+	curNs   string
+	atEnd   bool
+	inBlock bool
+}
+
+func (a *archiveReader) readHeader() error {
+	var magic uint32
+	if err := binary.Read(a.r, binary.LittleEndian, &magic); err != nil {
+		return err
+	}
+	if magic != archiveMagic {
+		return fmt.Errorf("not a mongodump archive (magic %#x; want %#x)", magic, archiveMagic)
+	}
+	// Prelude: one BSON doc with concurrent_collections + namespace
+	// metadata list. We currently skip it (no index replay).
+	if _, err := readBSONDoc(a.r); err != nil {
+		return fmt.Errorf("prelude doc: %w", err)
 	}
 	return nil
+}
+
+// next returns the next document in the archive along with its
+// fully-qualified namespace, or terminate=true when the archive ends.
+func (a *archiveReader) next() (ns string, doc bson.Raw, terminate bool, err error) {
+	if a.atEnd {
+		return "", nil, true, nil
+	}
+	for {
+		// Peek the next 4 bytes: either a terminator (0xFFFFFFFF) or
+		// the length prefix of a BSON document.
+		var head [4]byte
+		if _, err := io.ReadFull(a.r, head[:]); err != nil {
+			if errors.Is(err, io.EOF) {
+				a.atEnd = true
+				return "", nil, true, nil
+			}
+			return "", nil, false, err
+		}
+		sz := binary.LittleEndian.Uint32(head[:])
+		if sz == archiveTerminator {
+			// End of a namespace block; the next iteration peeks
+			// again to see whether the archive ended (another
+			// terminator → EOF) or a new block starts.
+			a.inBlock = false
+			a.curNs = ""
+			continue
+		}
+		if sz < 5 {
+			return "", nil, false, fmt.Errorf("invalid BSON length %d", sz)
+		}
+		body := make([]byte, sz-4)
+		if _, err := io.ReadFull(a.r, body); err != nil {
+			return "", nil, false, err
+		}
+		raw := make([]byte, sz)
+		copy(raw[:4], head[:])
+		copy(raw[4:], body)
+
+		if !a.inBlock {
+			// Namespace header: extract ns and start the block.
+			var meta struct {
+				NS string `bson:"ns"`
+			}
+			if uerr := bson.Unmarshal(raw, &meta); uerr != nil {
+				return "", nil, false, fmt.Errorf("namespace header bson: %w", uerr)
+			}
+			a.curNs = meta.NS
+			a.inBlock = true
+			continue
+		}
+		return a.curNs, raw, false, nil
+	}
+}
+
+// readBSONDoc reads one length-prefixed BSON document from r and
+// returns its raw bytes (including the length prefix). Used for the
+// archive prelude which we skip after parsing the magic.
+func readBSONDoc(r io.Reader) (bson.Raw, error) {
+	var head [4]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return nil, err
+	}
+	sz := binary.LittleEndian.Uint32(head[:])
+	if sz < 5 {
+		return nil, fmt.Errorf("invalid BSON length %d", sz)
+	}
+	body := make([]byte, sz-4)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
+	}
+	out := make([]byte, sz)
+	copy(out[:4], head[:])
+	copy(out[4:], body)
+	return out, nil
+}
+
+// splitNamespace splits a `db.collection` namespace into its two
+// pieces. Returns ("", "") for malformed inputs so the caller can
+// skip them without erroring.
+func splitNamespace(ns string) (string, string) {
+	for i := range len(ns) {
+		if ns[i] == '.' {
+			return ns[:i], ns[i+1:]
+		}
+	}
+	return "", ""
 }

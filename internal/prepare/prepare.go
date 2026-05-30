@@ -140,13 +140,13 @@ func dumpsReady(dumps config.DumpList, worktreePath string) ([]dumpFile, error) 
 }
 
 // emitDumpLoadPhase emits a per-dump dump-load event tagged with the
-// dump's path + index/total so a multi-dump cold build is legible in
-// the event stream. Mirrors emitPhaseDone's shape with extra `path`,
-// `index`, `total` fields. Use this in place of emitPhaseDone in
-// dump-load loops so the user can attribute time to a specific file
-// in a multi-dump config.
+// dump's path + index/total + the dispatcher `strategy` (docker-exec /
+// native-cli / wire). Mirrors emitPhaseDone's shape with extra `path`,
+// `index`, `total`, `strategy` fields. Use this in place of
+// emitPhaseDone in dump-load loops so the user can attribute time to a
+// specific file AND see which fast-path actually ran.
 func emitDumpLoadPhase(ctx context.Context, st *store.Store, repoID, worktreeID int64,
-	engine, sourceDB, path string, index, total int, stepStart time.Time,
+	engine, sourceDB, path string, index, total int, stepStart time.Time, strategy string,
 ) {
 	if st == nil {
 		return
@@ -154,8 +154,8 @@ func emitDumpLoadPhase(ctx context.Context, st *store.Store, repoID, worktreeID 
 	durMs := time.Since(stepStart).Milliseconds()
 	base := filepath.Base(path)
 	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_phase",
-		fmt.Sprintf("%s/%s phase=dump-load dump=%s (%d/%d) duration=%dms",
-			engine, sourceDB, base, index+1, total, durMs),
+		fmt.Sprintf("%s/%s phase=dump-load dump=%s (%d/%d) strategy=%s duration=%dms",
+			engine, sourceDB, base, index+1, total, strategy, durMs),
 		repoID, worktreeID, "dump-load", durMs, map[string]string{
 			"engine":      engine,
 			"source_db":   sourceDB,
@@ -163,6 +163,7 @@ func emitDumpLoadPhase(ctx context.Context, st *store.Store, repoID, worktreeID 
 			"path":        path,
 			"index":       strconv.Itoa(index),
 			"total":       strconv.Itoa(total),
+			"strategy":    strategy,
 		})
 }
 
@@ -654,7 +655,7 @@ func prepareMySQL(
 			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
 			eng: &branchEngine{drv: mysqlNS{drv}, scope: scopeName, engine: "mysql"},
 			loadDump: func(ctx context.Context, active string, dump dumpFile) error {
-				_, e := dumpload.LoadMySQL(ctx, drv.DB, active, dump.Path)
+				_, e := dumpload.LoadMySQL(ctx, drv.DB, cfg.Connections.Mysql, active, dump.Path)
 				return e
 			},
 		})
@@ -722,7 +723,7 @@ func prepareMySQL(
 	// prefix drop would wipe sibling worktrees. Stale per-test
 	// clones from a prior cold-build get overwritten by exact name
 	// in SnapshotRestore during fanout below.
-	if err := mysqlColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
+	if err := mysqlColdBuildSteps(ctx, drv, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
 
@@ -861,6 +862,7 @@ func mysqlCacheHit(
 func mysqlColdBuildSteps(
 	ctx context.Context,
 	drv *dbmysql.Driver,
+	cfg *config.Config,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
 	worktreePath string,
@@ -883,10 +885,11 @@ func mysqlColdBuildSteps(
 	}
 	for i, dr := range dumps {
 		stepStart := time.Now()
-		if _, err := dumpload.LoadMySQL(ctx, drv.DB, sourceDB, dr.Path); err != nil {
+		strategy, err := dumpload.LoadMySQL(ctx, drv.DB, cfg.Connections.Mysql, sourceDB, dr.Path)
+		if err != nil {
 			return fmt.Errorf("load dump %s: %w", dr.Path, err)
 		}
-		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourceDB, dr.Path, i, len(dumps), stepStart)
+		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourceDB, dr.Path, i, len(dumps), stepStart, string(strategy))
 	}
 	if d.Migrate != nil {
 		stepStart := time.Now()
@@ -1204,7 +1207,7 @@ func preparePostgres(
 					return e
 				}
 				defer func() { _ = scoped.Close() }()
-				_, e = dumpload.LoadPostgres(ctx, scoped, active, dump.Path)
+				_, e = dumpload.LoadPostgres(ctx, scoped, cfg.Connections.Postgres, active, dump.Path)
 				return e
 			},
 		})
@@ -1248,7 +1251,7 @@ func preparePostgres(
 		return out, err
 	}
 
-	if err := postgresColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
+	if err := postgresColdBuildSteps(ctx, drv, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
 	snapStart := time.Now()
@@ -1385,6 +1388,7 @@ func postgresCacheHit(
 func postgresColdBuildSteps(
 	ctx context.Context,
 	drv *dbpostgres.Driver,
+	cfg *config.Config,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
 	worktreePath string,
@@ -1418,11 +1422,12 @@ func postgresColdBuildSteps(
 		}
 		for i, dr := range dumps {
 			stepStart := time.Now()
-			if _, err := dumpload.LoadPostgres(ctx, scoped, sourceDB, dr.Path); err != nil {
+			strategy, lerr := dumpload.LoadPostgres(ctx, scoped, cfg.Connections.Postgres, sourceDB, dr.Path)
+			if lerr != nil {
 				_ = scoped.Close()
-				return fmt.Errorf("load dump %s: %w", dr.Path, err)
+				return fmt.Errorf("load dump %s: %w", dr.Path, lerr)
 			}
-			emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourceDB, dr.Path, i, len(dumps), stepStart)
+			emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourceDB, dr.Path, i, len(dumps), stepStart, string(strategy))
 		}
 		_ = scoped.Close()
 	}
@@ -1496,7 +1501,8 @@ func prepareMongo(
 			loadDump: func(ctx context.Context, active string, dump dumpFile) error {
 				// Per-entry SourceDB: each dump in the list can carry its own
 				// `source_db:` for `--nsFrom=<source_db>.* --nsTo=<active>.*`.
-				return dbmongo.Restore(ctx, cfg.Connections.Mongodb.URI, active, dump.SourceDB, dump.Path)
+				_, e := dbmongo.Restore(ctx, cfg.Connections.Mongodb, active, dump.SourceDB, dump.Path)
+				return e
 			},
 		})
 	}
@@ -1692,10 +1698,11 @@ func mongoColdBuildSteps(
 	}
 	for i, dr := range dumps {
 		stepStart := time.Now()
-		if err := dbmongo.Restore(ctx, cfg.Connections.Mongodb.URI, sourceDB, dr.SourceDB, dr.Path); err != nil {
-			return fmt.Errorf("mongo restore %s: %w", dr.Path, err)
+		strategy, rerr := dbmongo.Restore(ctx, cfg.Connections.Mongodb, sourceDB, dr.SourceDB, dr.Path)
+		if rerr != nil {
+			return fmt.Errorf("mongo restore %s: %w", dr.Path, rerr)
 		}
-		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourceDB, dr.Path, i, len(dumps), stepStart)
+		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourceDB, dr.Path, i, len(dumps), stepStart, string(strategy))
 	}
 	if d.Migrate != nil {
 		stepStart := time.Now()
@@ -1834,7 +1841,7 @@ func prepareRedisPrefix(
 	}
 
 	// Cold build: drop source, run seed, snapshot template, fanout.
-	if err := redisColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
+	if err := redisColdBuildSteps(ctx, drv, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
 	snapStart := time.Now()
@@ -1958,6 +1965,7 @@ func redisCacheHit(
 func redisColdBuildSteps(
 	ctx context.Context,
 	drv *dbredis.Driver,
+	cfg *config.Config,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
 	worktreePath string,
@@ -1980,6 +1988,22 @@ func redisColdBuildSteps(
 	}
 	emitColdBuildDrop(ctx, st, repoID, worktreeID, "redis",
 		fmt.Sprintf("%s* (%d)", sourcePrefix, droppedCount))
+	// Dump-load: redis dumps are RESP pipe-format files (the same shape
+	// `redis-cli --pipe` accepts). The dispatcher picks docker exec /
+	// native CLI / wire fallback the same way every other engine does.
+	dumps, derr := dumpsReady(d.Dump, worktreePath)
+	if derr != nil {
+		return derr
+	}
+	for i, dr := range dumps {
+		stepStart := time.Now()
+		strategy, lerr := drv.Restore(ctx, cfg.Connections.Redis, sourcePrefix, dr.Path)
+		if lerr != nil {
+			return fmt.Errorf("load dump %s: %w", dr.Path, lerr)
+		}
+		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, dr.Path,
+			i, len(dumps), stepStart, string(strategy))
+	}
 	if d.Migrate != nil {
 		stepStart := time.Now()
 		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "redis", "migrate", sourcePrefix))
@@ -2102,7 +2126,7 @@ func prepareES(
 		return out, err
 	}
 
-	if err := esColdBuildSteps(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
+	if err := esColdBuildSteps(ctx, drv, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
 	snapStart := time.Now()
@@ -2233,6 +2257,7 @@ func esCacheHit(
 func esColdBuildSteps(
 	ctx context.Context,
 	drv *dbes.Driver,
+	cfg *config.Config,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
 	worktreePath string,
@@ -2263,10 +2288,12 @@ func esColdBuildSteps(
 	}
 	for i, dr := range dumps {
 		stepStart := time.Now()
-		if err := drv.Restore(ctx, sourcePrefix, dr.Path); err != nil {
-			return fmt.Errorf("es restore %s: %w", dr.Path, err)
+		strategy, rerr := drv.DispatchRestore(ctx, cfg.Connections.Elasticsearch, sourcePrefix, dr.Path)
+		if rerr != nil {
+			return fmt.Errorf("es restore %s: %w", dr.Path, rerr)
 		}
-		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, dr.Path, i, len(dumps), stepStart)
+		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, dr.Path,
+			i, len(dumps), stepStart, string(strategy))
 	}
 	if d.Migrate != nil {
 		stepStart := time.Now()
