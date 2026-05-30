@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -289,8 +290,11 @@ func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) (
 }
 
 // runHookPhase synchronously executes one hook phase. Mirrors cmd's
-// RunHookPhase but with no CLI surface.
-func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome, error) {
+// RunHookPhase but with no CLI surface. envOverrides (when non-nil)
+// are merged on top of the captured os.Environ() so an MCP caller can
+// tweak one var (e.g. retry a flaky setup with `DEBUG=1`) without
+// editing .treeman.yaml.
+func runHookPhase(ctx context.Context, phase, worktree string, envOverrides map[string]string) (hooks.RunOutcome, error) {
 	wt, branch := resolveWorktree(worktree)
 	repoRoot, err := gitenv.MainRoot(wt)
 	if err != nil {
@@ -301,6 +305,7 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 		return hooks.RunOutcome{}, err
 	}
 	env := captureEnv()
+	maps.Copy(env, envOverrides)
 
 	st, dbErr := openStore(ctx)
 	var repoID, wtID int64

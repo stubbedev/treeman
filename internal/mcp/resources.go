@@ -61,6 +61,27 @@ func registerResources(srv *mcpsdk.Server) {
 		Description: "The 50 most recent hook_run rows for one worktree. Use this to see what setup/teardown commands ran, their exit codes, and their stdout/stderr tails.",
 		MIMEType:    "application/json",
 	}, worktreeHooksResource)
+
+	srv.AddResource(&mcpsdk.Resource{
+		URI:         "treeman://daemon/state",
+		Name:        "Daemon live state",
+		Description: "Live runtime view of treemand: in-flight prepares/teardowns, watcher set, per-repo backoff timers. Same data as the daemon_state tool but attachable as context (cheaper than re-invoking each turn).",
+		MIMEType:    "application/json",
+	}, daemonStateResource)
+
+	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "treeman://repos/{repo}/snapshots",
+		Name:        "Repo snapshot cache",
+		Description: "Cached snapshots (template DBs) for one repo, capped at 100. {repo} is the URL-encoded absolute repo path; use 'cwd' to mean the current dir's repo. Cheaper than calling snapshots_list every turn.",
+		MIMEType:    "application/json",
+	}, repoSnapshotsResource)
+
+	srv.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "treeman://repos/{repo}/branches",
+		Name:        "Repo branches",
+		Description: "Local + origin-only branches for one repo, annotated with worktree occupancy. {repo} is the URL-encoded absolute repo path; use 'cwd' to mean the current dir's repo.",
+		MIMEType:    "application/json",
+	}, repoBranchesResource)
 }
 
 func rawConfigResource(_ context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
@@ -199,6 +220,79 @@ func worktreeHooksResource(ctx context.Context, req *mcpsdk.ReadResourceRequest)
 	return &mcpsdk.ReadResourceResult{
 		Contents: []*mcpsdk.ResourceContents{{URI: req.Params.URI, MIMEType: "application/json", Text: string(body)}},
 	}, nil
+}
+
+// daemonStateResource is the resource counterpart to daemon_state.
+func daemonStateResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+	body, err := json.MarshalIndent(collectDaemonState(ctx), "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return &mcpsdk.ReadResourceResult{
+		Contents: []*mcpsdk.ResourceContents{{URI: req.Params.URI, MIMEType: "application/json", Text: string(body)}},
+	}, nil
+}
+
+// repoSnapshotsResource returns the cached-snapshot list for one repo.
+// {repo} placeholder accepts the literal "cwd" (or empty) to mean
+// "resolve from current working dir" so an interactive client doesn't
+// need to URL-encode an absolute path.
+func repoSnapshotsResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+	repo, ok := parseRepoResourceURI(req.Params.URI, "/snapshots")
+	if !ok {
+		return nil, mcpsdk.ResourceNotFoundError(req.Params.URI)
+	}
+	out, err := collectRepoSnapshots(ctx, repo, 100)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return &mcpsdk.ReadResourceResult{
+		Contents: []*mcpsdk.ResourceContents{{URI: req.Params.URI, MIMEType: "application/json", Text: string(body)}},
+	}, nil
+}
+
+// repoBranchesResource returns the branch list for one repo. See
+// repoSnapshotsResource for the {repo} placeholder convention.
+func repoBranchesResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+	repo, ok := parseRepoResourceURI(req.Params.URI, "/branches")
+	if !ok {
+		return nil, mcpsdk.ResourceNotFoundError(req.Params.URI)
+	}
+	out, err := collectRepoBranches(ctx, repo, 200)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return &mcpsdk.ReadResourceResult{
+		Contents: []*mcpsdk.ResourceContents{{URI: req.Params.URI, MIMEType: "application/json", Text: string(body)}},
+	}, nil
+}
+
+// parseRepoResourceURI extracts the {repo} placeholder from
+// `treeman://repos/<repo>/<suffix>`. Returns empty repo (meaning "cwd")
+// when the placeholder literally equals "cwd" or "" — letting clients
+// avoid URL-encoding an absolute path for the common case.
+func parseRepoResourceURI(uri, suffix string) (repo string, ok bool) {
+	const prefix = "treeman://repos/"
+	if !strings.HasPrefix(uri, prefix) {
+		return "", false
+	}
+	rest := uri[len(prefix):]
+	if !strings.HasSuffix(rest, suffix) {
+		return "", false
+	}
+	repo = rest[:len(rest)-len(suffix)]
+	if repo == "cwd" {
+		repo = ""
+	}
+	return repo, true
 }
 
 func recentLogsResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {

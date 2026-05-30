@@ -46,15 +46,17 @@ func TestServerRegistersExpectedTools(t *testing.T) {
 		"doctor", "config_get", "config_validate", "config_schema",
 		"worktree_list", "worktree_show", "branch_scoped_status",
 		"logs_query", "logs_hooks", "fw_detect", "slug_compute",
-		"daemon_status", "snapshots_list", "logs_wait", "branches_list",
-		"config_diff", "inputs_fingerprint",
+		"daemon_status", "daemon_state",
+		"snapshots_list", "logs_wait", "logs_subscribe", "branches_list",
+		"config_diff", "inputs_fingerprint", "prepare_dry_run",
 		// engine
 		"engine_status", "db_schema_dump", "db_query", "snapshot_inspect",
-		"hook_log_read", "snapshot_drop", "db_dump",
+		"hook_log_read", "snapshot_drop", "db_dump", "connection_probe",
 		// write
 		"prepare_run", "db_reset", "hook_run", "config_write", "config_set",
 		"registry_register", "registry_unregister", "registry_repair",
-		"registry_remove", "snapshots_purge", "logs_purge",
+		"repo_remove", "worktree_repair",
+		"snapshots_purge", "logs_purge",
 		"schema_install", "init_repo", "daemon_control",
 		"worktree_create", "worktree_delete",
 		// sync

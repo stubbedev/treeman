@@ -78,6 +78,15 @@ func registerPrompts(srv *mcpsdk.Server) {
 			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
 		},
 	}, migrationTrialPrompt)
+
+	srv.AddPrompt(&mcpsdk.Prompt{
+		Name:        "bootstrap-new-repo",
+		Title:       "Set up treeman in a fresh repo end-to-end",
+		Description: "Walks through first-time enrollment: framework detect → engine connection probe per engine → init_repo → schema_install → daemon ensure → registry_register → first prepare → verify. Use when the user wants treeman wired into a repo that has no .treeman.yaml yet.",
+		Arguments: []*mcpsdk.PromptArgument{
+			{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
+		},
+	}, bootstrapNewRepoPrompt)
 }
 
 // userMsg wraps a string in the one-user-message-result shape every
@@ -264,6 +273,53 @@ func ifEmpty(s, dflt string) string {
 		return dflt
 	}
 	return s
+}
+
+func bootstrapNewRepoPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcpsdk.GetPromptResult, error) {
+	repo := req.Params.Arguments["repo"]
+	repoArg := ""
+	if repo != "" {
+		repoArg = "repo=\"" + repo + "\""
+	}
+	repoArgComma := ""
+	if repoArg != "" {
+		repoArgComma = repoArg + ", "
+	}
+
+	text := fmt.Sprintf(
+		`Set up treeman in this repo end-to-end. The repo has (or you suspect has) no .treeman.yaml — your job is to drive it from zero to a working first prepare. ASK before running anything destructive or anything that hits a live engine the user hasn't explicitly OK'd.
+
+Execute these tool calls in order:
+
+1. config_get (%s) — confirm there is no .treeman.yaml yet (or that the user wants to start over). If one exists and the user does NOT want to overwrite, STOP and tell them to use the worktree-setup prompt instead.
+
+2. fw_detect (%s) — list detected migration + test frameworks. If none, STOP and tell the user treeman has no scaffold template for this stack — they'll need to write .treeman.yaml manually.
+
+3. init_repo (%sforce=false) — generate the scaffold. On "file exists", ASK before passing force=true.
+
+4. config_get (%sresolved=true) — show the resolved config. For EACH engine in cfg.connections, in parallel:
+   • connection_probe (engine="<name>", repo="<repo>") — confirm reachable. If unreachable, tell the user the exact engine + error and ASK whether to (a) edit the connection via config_set, (b) skip prepare and let them fix it, or (c) abort.
+
+5. schema_install (%starget=repo) — wire up editor autocomplete for .treeman.yaml.
+
+6. daemon_status — confirm treemand is up. If not, call daemon_control(action="start") and verify status flips to running.
+
+7. registry_register (%spath="<repo>") — enroll the repo so the daemon's watcher attaches.
+
+8. prepare_run (%s) — run the FIRST prepare. This is the longest step; pair with logs_wait if you want to surface progress. If it fails, IMMEDIATELY chain into the diagnose-prepare-failure prompt.
+
+9. engine_status — verify every configured engine has the expected per-worktree database after prepare.
+
+Report: which frameworks were detected, which engines were probed (reachable vs not), the scaffolded .treeman.yaml path, the first prepare's duration + outcome, and one short paragraph telling the user what to verify before creating their first worktree.`,
+		repoArg,
+		repoArg,
+		repoArgComma,
+		repoArgComma,
+		repoArgComma,
+		repoArgComma,
+		repoArg,
+	)
+	return userMsg(text), nil
 }
 
 func cacheCleanupPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcpsdk.GetPromptResult, error) {

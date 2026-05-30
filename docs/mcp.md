@@ -61,19 +61,53 @@ allow rules, etc.), not here.
 
 | Tool | What it does |
 |---|---|
-| `doctor`, `daemon_status` | Health checks. |
-| `config_get`, `config_validate`, `config_schema` | Read/validate the YAML config. `config_get` output is redacted (passwords in resolved connection strings). |
+| `doctor`, `daemon_status`, `daemon_state` | Health checks. `daemon_state` adds a rich runtime view: in-flight finalize/teardown work, watcher set, per-repo sync backoff timers. |
+| `config_get`, `config_validate`, `config_schema`, `config_diff` | Read/validate the YAML config. `config_get` output is redacted (passwords in resolved connection strings). |
 | `worktree_list`, `worktree_show`, `snapshots_list` | Registry + snapshot-cache queries. `worktree_show` also reports allocated ports and branch_scoped active-namespace state. |
 | `branch_scoped_status` | Per branch_scoped database: active namespace, which branch's data occupies it now, and which local branches have a resumable durable copy. |
-| `logs_query`, `logs_hooks` | Event log + hook run history. Output is run through a secret-redaction pass (URI userinfo, AWS/GitHub tokens, JWTs, `KEY=value` for password/secret/token-shaped keys) before returning to the client. |
-| `fw_detect`, `slug_compute` | Detection helpers. |
-| `config_write`, `config_set`, `hook_run`, `prepare_run` | Replace the whole YAML body, patch a single field by dotted path, run a hook phase, run the prepare pipeline. |
-| `db_reset` | Re-sync a worktree's `branch_scoped` databases from the live base branch: drop each one's active namespace + the current branch's durable copy, then re-seed from the parent. Destructive for the current branch's working data; other branches' durable copies are kept. Optional `engine` restricts it to one family. |
-| `init_repo`, `schema_install` | Scaffold `.treeman.yaml`; install the JSON Schema (`target=repo` / `target=global` / `target=url`) and wire its modeline. Both in-process. |
-| `registry_register`, `registry_unregister`, `registry_repair` | Mutate the SQLite worktree registry directly. `repair` diffs `git worktree list` vs SQLite and auto-reconciles drift. |
-| `snapshots_purge`, `logs_purge` | Wipe the snapshot cache (forces next prepare to rebuild) / delete event-log rows by filter (at least one filter required). |
+| `logs_query`, `logs_hooks`, `logs_wait`, `logs_subscribe` | Event log + hook run history. `logs_wait` blocks until N matches; `logs_subscribe` streams events live via MCP progress + logging notifications. Output is run through a secret-redaction pass before returning to the client. |
+| `fw_detect`, `slug_compute`, `inputs_fingerprint` | Detection + fingerprint helpers. `inputs_fingerprint` answers "why did prepare cold-build instead of cache-hit?". |
+| `prepare_dry_run` | Render the prepare pipeline plan WITHOUT executing — per-DB rendered name, dump files, migrate/seed commands, fanout count, expected fingerprint. |
+| `connection_probe` | Dry-test a connection string (or the repo's configured connection) — reachable, version, latency. Use to iterate on credentials before committing them. |
+| `config_write`, `config_set`, `hook_run`, `prepare_run` | Replace the whole YAML body, patch a single field by dotted path, run a hook phase (`env_overrides` lets you tweak one var for the run), run the prepare pipeline. |
+| `db_reset` | Re-sync a worktree's `branch_scoped` databases from the live base branch. Destructive for the current branch's working data; `dry_run=true` previews. |
+| `init_repo`, `schema_install` | Scaffold `.treeman.yaml`; install the JSON Schema and wire its modeline. |
+| `registry_register`, `registry_unregister`, `registry_repair`, `worktree_repair` | Mutate the SQLite worktree registry directly. `registry_repair` diffs git vs SQLite. `worktree_repair` reconciles ports / finalize state / snapshot templates for one worktree. |
+| `repo_remove` | Drop a whole REPO from the SQLite registry (cascades to its worktrees/events/snapshots/hook_runs). `dry_run=true` counts cascaded rows first. External resources are not touched; refuses by default if active worktrees exist. |
+| `snapshots_purge`, `logs_purge` | Wipe the snapshot cache (`dry_run=true` previews) / delete event-log rows by filter (at least one filter required). |
 | `daemon_control` | Start / stop treemand. Prefers the installed systemd/launchd unit; otherwise forks the `treemand` binary (start) or sends the shutdown RPC (stop). |
-| `worktree_create`, `worktree_delete` | Run the full git + hooks + prepare lifecycle in-process via `internal/wt`. The heavy tail (hooks + prepare for create; teardown for delete) is dispatched to the daemon; on daemon-unreachable the orchestrator spawns a detached `treeman wt finalize --local` / `wt delete --detached` child and returns immediately. Returns a structured result (`wt_path`, `status`, `slug`, `worktree_id`, `log_path`, `ports`). |
+| `worktree_create`, `worktree_delete` | Run the full git + hooks + prepare lifecycle in-process via `internal/wt`. `worktree_delete` accepts `dry_run=true` to preview the per-engine namespaces that would be dropped. The heavy tail is dispatched to the daemon; on daemon-unreachable the orchestrator spawns a detached child and returns immediately. |
+
+## Resources
+
+Resources are read-only context attachments — cheaper than re-invoking
+tools each turn.
+
+| URI | What |
+|---|---|
+| `treeman://config/raw` | The repo's `.treeman.yaml` byte-for-byte. |
+| `treeman://config/resolved` | Post-substitution view (env vars + connection strings rendered, credentials redacted). |
+| `treeman://config/schema` | JSON Schema for `.treeman.yaml`. |
+| `treeman://logs/recent` | The 200 most recent event-log rows (NDJSON). |
+| `treeman://worktrees/{slug}/events` | Per-worktree event-log slice. |
+| `treeman://worktrees/{slug}/hooks` | Per-worktree hook_run rows. |
+| `treeman://daemon/state` | Mirrors `daemon_state` — in-flight prepares/teardowns, watcher set, backoff timers. |
+| `treeman://repos/{repo}/snapshots` | Cached snapshots for one repo. Use `cwd` for the placeholder to mean "the current dir's repo". |
+| `treeman://repos/{repo}/branches` | Branch list with worktree occupancy. Same `cwd` placeholder. |
+
+## Prompts
+
+Prompts encode multi-step workflows so an agent doesn't reinvent each
+flow. Invoke from your MCP client to get a tailored briefing.
+
+| Name | What |
+|---|---|
+| `bootstrap-new-repo` | First-time enrollment: detect → probe engines → init → schema_install → daemon ensure → register → first prepare. |
+| `scaffold-from-framework` | Detect → scaffold `.treeman.yaml` → validate → review. Stops short of running prepare. |
+| `worktree-setup` | Pick branch → daemon ensure → create → wait → verify. |
+| `diagnose-prepare-failure` | Drives `logs_query` → `engine_status` → `snapshot_inspect` → root-cause report. |
+| `cache-cleanup` | Hunt orphan snapshots (template gone, SQLite row remains) and drop only those. |
+| `migration-trial` | Throw-away worktree → run migration → schema diff → tear down. |
 
 ## Claude Code
 

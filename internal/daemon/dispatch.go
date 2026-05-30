@@ -80,6 +80,9 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 	case rpc.MethodSyncStatus:
 		return handleSyncStatus(ctx, st, req)
 
+	case rpc.MethodDaemonState:
+		return handleDaemonState(st)
+
 	default:
 		return errResp("unknown method: " + req.Method)
 	}
@@ -183,6 +186,51 @@ func handleSyncNow(ctx context.Context, st *State, req rpc.Request) rpc.Response
 		Kind:        rpc.KindSyncResult,
 		SyncedRepos: statuses,
 		SyncErrors:  errs,
+	}
+}
+
+// handleDaemonState assembles a rich runtime view of the daemon's
+// in-memory state — watcher set, in-flight finalize/teardown work,
+// per-repo sync backoff timers. Used by MCP's daemon_state tool so an
+// agent can reason about "is the daemon already busy with X?" without
+// reading event logs.
+func handleDaemonState(st *State) rpc.Response {
+	now := time.Now()
+	watchers := st.ListWatchers()
+	repos := make([]rpc.WatcherSummary, len(watchers))
+	for i, w := range watchers {
+		repos[i] = rpc.WatcherSummary{Repo: w.Repo, WorktreeCount: w.WorktreeCount}
+	}
+	finalizes := st.SnapshotInFlightFinalizes()
+	inFlightFinalizes := make([]rpc.InFlightWork, 0, len(finalizes))
+	for p, startedAt := range finalizes {
+		inFlightFinalizes = append(inFlightFinalizes, rpc.InFlightWork{
+			WorktreePath:  p,
+			StartedAtUnix: startedAt.Unix(),
+			AgeSeconds:    int64(now.Sub(startedAt).Seconds()),
+		})
+	}
+	backoffs := st.SnapshotSyncBackoffs()
+	backoffList := make([]rpc.SyncBackoffEntry, 0, len(backoffs))
+	for repo, e := range backoffs {
+		backoffList = append(backoffList, rpc.SyncBackoffEntry{
+			RepoPath:       repo,
+			ConsecFailures: e.Failures,
+			NextRetryUnix:  e.NextRetryUnix,
+		})
+	}
+	return rpc.Response{
+		Kind: rpc.KindDaemonState,
+		State: &rpc.DaemonStateSnapshot{
+			WatcherCount:      st.WatcherCount(),
+			Watchers:          repos,
+			WorktreeWatchers:  st.ListWtWatcherPaths(),
+			LifecycleWatchers: st.ListLifecycleWatcherPaths(),
+			InFlightFinalizes: inFlightFinalizes,
+			InFlightTeardowns: st.SnapshotInFlightTeardowns(),
+			SyncBackoffs:      backoffList,
+			SyncLastSkips:     st.SnapshotSyncLastSkips(),
+		},
 	}
 }
 

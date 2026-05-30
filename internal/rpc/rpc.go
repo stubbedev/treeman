@@ -67,6 +67,7 @@ const (
 	MethodShutdown         = "shutdown"
 	MethodSyncNow          = "sync_now"
 	MethodSyncStatus       = "sync_status"
+	MethodDaemonState      = "daemon_state"
 )
 
 // Request is the envelope every CLI message uses. Exactly one of the
@@ -177,7 +178,7 @@ func (r *Request) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch r.Method {
-	case MethodStatus, MethodPing, MethodWatcherList, MethodShutdown:
+	case MethodStatus, MethodPing, MethodWatcherList, MethodShutdown, MethodDaemonState:
 		return nil
 	case MethodRepoRegister:
 		r.RepoRegister = &RepoRegisterArgs{}
@@ -343,6 +344,7 @@ const (
 	KindWorktreeTeardownQueued = "worktree_teardown_queued"
 	KindSyncResult             = "sync_result"
 	KindSyncStatus             = "sync_status"
+	KindDaemonState            = "daemon_state"
 	KindError                  = "error"
 )
 
@@ -367,8 +369,44 @@ type Response struct {
 	// SyncResult / SyncStatus
 	SyncedRepos []SyncRepoStatus `json:"synced_repos,omitempty"`
 	SyncErrors  []string         `json:"sync_errors,omitempty"`
+	// DaemonState
+	State *DaemonStateSnapshot `json:"state,omitempty"`
 	// Error
 	Message string `json:"message,omitempty"`
+}
+
+// DaemonStateSnapshot is the rich runtime view returned by
+// MethodDaemonState — what treemand is doing right now. Used by MCP's
+// daemon_state tool / treeman://daemon/state resource so the agent can
+// reason about "is the daemon already finalising this worktree, or do
+// I dispatch one?". Everything is snapshotted at call time; nothing
+// remains live after the call returns.
+type DaemonStateSnapshot struct {
+	WatcherCount      uint32             `json:"watcher_count"`
+	Watchers          []WatcherSummary   `json:"watchers,omitempty"`
+	WorktreeWatchers  []string           `json:"worktree_watchers,omitempty"`
+	LifecycleWatchers []string           `json:"lifecycle_watchers,omitempty"`
+	InFlightFinalizes []InFlightWork     `json:"in_flight_finalizes,omitempty"`
+	InFlightTeardowns []string           `json:"in_flight_teardowns,omitempty"`
+	SyncBackoffs      []SyncBackoffEntry `json:"sync_backoffs,omitempty"`
+	SyncLastSkips     map[string]string  `json:"sync_last_skips,omitempty"`
+}
+
+// InFlightWork pairs a worktree path with when the in-flight goroutine
+// started — surfaces hung finalizes the agent can wait on (or escalate).
+type InFlightWork struct {
+	WorktreePath  string `json:"worktree_path"`
+	StartedAtUnix int64  `json:"started_at_unix"`
+	AgeSeconds    int64  `json:"age_seconds"`
+}
+
+// SyncBackoffEntry surfaces the per-repo auto-fetch backoff state so
+// the agent can answer "why isn't this repo fetching?". NextRetryUnix
+// = 0 means eligible now.
+type SyncBackoffEntry struct {
+	RepoPath       string `json:"repo_path"`
+	ConsecFailures int    `json:"consec_failures"`
+	NextRetryUnix  int64  `json:"next_retry_unix"`
 }
 
 // WatcherSummary — one row of the WatcherList response.

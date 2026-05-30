@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -139,10 +141,184 @@ func newestMatchingID(ctx context.Context, st *store.Store, f store.EventFilter)
 	return evs[0].ID
 }
 
+// ─── logs_subscribe ─────────────────────────────────────────────────
+
+type logsSubscribeIn struct {
+	Repo           string   `json:"repo,omitempty"`
+	Worktree       string   `json:"worktree,omitempty"        jsonschema:"slug, branch, or basename"`
+	Levels         []string `json:"levels,omitempty"`
+	EventTypes     []string `json:"event_types,omitempty"`
+	Phases         []string `json:"phases,omitempty"`
+	PayloadLike    string   `json:"payload_like,omitempty"`
+	RunID          string   `json:"run_id,omitempty"          jsonschema:"correlation id — usually the right scope for live streaming"`
+	MinCount       int      `json:"min_count,omitempty"       jsonschema:"return after this many new events arrive (default 1)"`
+	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"give up after this many seconds (default 60, max 600)"`
+}
+
+// logsSubscribeOut mirrors logsWaitOut. Streaming is a side-effect via
+// notifications; the final return carries the collected batch so an
+// agent that ignored notifications still sees what happened.
+type logsSubscribeOut struct {
+	Events        []store.Event `json:"events"`
+	TimedOut      bool          `json:"timed_out"`
+	Anchor        int64         `json:"anchor_id"          jsonschema:"highest event id at the moment the subscription started"`
+	Notifications int           `json:"notifications_sent" jsonschema:"how many notifications were dispatched to the session"`
+}
+
+// logsSubscribeTool blocks until min_count new events match the filter
+// (or timeout). For each matching event it fires a progress + logging
+// notification on the ServerSession so an interactive client can
+// surface events as they happen. Returns the full collected batch on
+// exit; min_count guards forward progress, timeout guards liveness.
+func logsSubscribeTool(
+	ctx context.Context,
+	req *mcpsdk.CallToolRequest,
+	in logsSubscribeIn,
+) (*mcpsdk.CallToolResult, logsSubscribeOut, error) {
+	minCount := in.MinCount
+	if minCount <= 0 {
+		minCount = 1
+	}
+	timeout := time.Duration(in.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	if timeout > 10*time.Minute {
+		timeout = 10 * time.Minute
+	}
+
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, logsSubscribeOut{}, err
+	}
+	defer func() { _ = st.Close() }()
+
+	f := store.EventFilter{
+		Levels:      validateLevels(in.Levels),
+		EventTypes:  in.EventTypes,
+		Phases:      in.Phases,
+		PayloadLike: in.PayloadLike,
+		RunID:       in.RunID,
+		HydrateWT:   true,
+		Limit:       200,
+		OldestFirst: true,
+	}
+	if err := applyRepoWorktreeFilter(ctx, st, &f, in.Repo, in.Worktree); err != nil {
+		return nil, logsSubscribeOut{}, err
+	}
+
+	anchor := newestMatchingID(ctx, st, f)
+	f.AfterID = anchor
+
+	// progressToken is supplied by the client in CallToolParams._meta.
+	// When absent, NotifyProgress still goes out (just unscoped) — but
+	// many clients drop it on the floor, so we log too.
+	var progressToken any
+	if req != nil && req.Params != nil {
+		progressToken = req.Params.GetProgressToken()
+	}
+
+	deadline := time.Now().Add(timeout)
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+
+	var collected []store.Event
+	notifications := 0
+	for {
+		evs, err := st.QueryEvents(ctx, f)
+		if err != nil {
+			return nil, logsSubscribeOut{Anchor: anchor, Notifications: notifications}, err
+		}
+		for _, e := range evs {
+			e.Message = redactSecrets(e.Message)
+			e.PayloadJSON = redactSecrets(e.PayloadJSON)
+			collected = append(collected, e)
+			if e.ID > f.AfterID {
+				f.AfterID = e.ID
+			}
+			notifications += dispatchEventNotification(ctx, req, progressToken, len(collected), minCount, e)
+		}
+		if len(collected) >= minCount {
+			return nil, logsSubscribeOut{
+				Events: collected, Anchor: anchor, Notifications: notifications,
+			}, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, logsSubscribeOut{
+				Events: collected, Anchor: anchor, TimedOut: true, Notifications: notifications,
+			}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, logsSubscribeOut{
+				Events: collected, Anchor: anchor, TimedOut: true, Notifications: notifications,
+			}, ctx.Err()
+		case <-tick.C:
+		}
+	}
+}
+
+// dispatchEventNotification fires a progress-notification (always) and
+// a logging-message (best-effort) for one event. Returns the number of
+// notifications successfully sent (0–2). Errors are swallowed — losing
+// a notification shouldn't fail the tool call.
+func dispatchEventNotification(
+	ctx context.Context,
+	req *mcpsdk.CallToolRequest,
+	progressToken any,
+	progress, total int,
+	e store.Event,
+) int {
+	if req == nil || req.Session == nil {
+		return 0
+	}
+	sent := 0
+	msg := fmt.Sprintf("[%s] %s %s", e.Level, e.EventType, e.Message)
+	if err := req.Session.NotifyProgress(ctx, &mcpsdk.ProgressNotificationParams{
+		ProgressToken: progressToken,
+		Message:       msg,
+		Progress:      float64(progress),
+		Total:         float64(total),
+	}); err == nil {
+		sent++
+	}
+	// LoggingMessage gets ignored unless the client called SetLevel —
+	// best-effort.
+	if err := req.Session.Log(ctx, &mcpsdk.LoggingMessageParams{
+		Level:  mapEventLevel(e.Level),
+		Logger: "treeman",
+		Data: map[string]any{
+			"event_id":   e.ID,
+			"event_type": e.EventType,
+			"message":    e.Message,
+			"phase":      e.Phase,
+			"level":      e.Level,
+		},
+	}); err == nil {
+		sent++
+	}
+	return sent
+}
+
+// mapEventLevel maps treeman's level strings (debug|info|warn|error) to
+// the MCP LoggingLevel enum (RFC 5424 syslog levels).
+func mapEventLevel(lvl string) mcpsdk.LoggingLevel {
+	switch strings.ToLower(lvl) {
+	case "debug":
+		return mcpsdk.LoggingLevel("debug")
+	case "warn", "warning":
+		return mcpsdk.LoggingLevel("warning")
+	case "error":
+		return mcpsdk.LoggingLevel("error")
+	}
+	return mcpsdk.LoggingLevel("info")
+}
+
 // ─── branches_list ──────────────────────────────────────────────────
 
 type branchesListIn struct {
-	Repo string `json:"repo,omitempty"`
+	Repo  string `json:"repo,omitempty"`
+	Limit int    `json:"limit,omitempty" jsonschema:"max branches returned (default 200, max 1000)"`
 }
 
 type branchesListEntry struct {
@@ -163,17 +339,28 @@ type branchesListOut struct {
 // branches already occupy a worktree. Mirrors the CLI's `treeman
 // branches` minus the column-formatting glue.
 func branchesListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in branchesListIn) (*mcpsdk.CallToolResult, branchesListOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+	out, err := collectRepoBranches(ctx, in.Repo, in.Limit)
 	if err != nil {
 		return nil, branchesListOut{}, err
 	}
+	return nil, out, nil
+}
+
+// collectRepoBranches is the shared implementation for the
+// branches_list tool and the treeman://repos/{repo}/branches
+// resource. limit≤0 → default 200, capped at 1000.
+func collectRepoBranches(ctx context.Context, repo string, limit int) (branchesListOut, error) {
+	repoRoot, err := resolveRepo(repo)
+	if err != nil {
+		return branchesListOut{}, err
+	}
 	local, err := gitcmd.String(ctx, repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads")
 	if err != nil {
-		return nil, branchesListOut{}, fmt.Errorf("list local branches: %w", err)
+		return branchesListOut{}, fmt.Errorf("list local branches: %w", err)
 	}
 	remote, err := gitcmd.String(ctx, repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin")
 	if err != nil {
-		return nil, branchesListOut{}, fmt.Errorf("list remote branches: %w", err)
+		return branchesListOut{}, fmt.Errorf("list remote branches: %w", err)
 	}
 	current, _ := gitcmd.String(ctx, repoRoot, "symbolic-ref", "--short", "HEAD")
 	current = strings.TrimSpace(current)
@@ -218,11 +405,20 @@ func branchesListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in branche
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if len(names) > limit {
+		names = names[:limit]
+	}
 	out := branchesListOut{Repo: repoRoot, Branches: make([]branchesListEntry, 0, len(names))}
 	for _, n := range names {
 		out.Branches = append(out.Branches, *entries[n])
 	}
-	return nil, out, nil
+	return out, nil
 }
 
 // ─── config_diff ────────────────────────────────────────────────────
@@ -500,6 +696,135 @@ func probeEngineVersion(ctx context.Context, cfg *config.Config, eng string) str
 		return v
 	}
 	return ""
+}
+
+// ─── prepare_dry_run ────────────────────────────────────────────────
+
+type prepareDryRunIn struct {
+	Worktree string `json:"worktree,omitempty" jsonschema:"defaults to cwd's worktree"`
+	Repo     string `json:"repo,omitempty"`
+}
+
+type prepareDryRunDB struct {
+	DBIndex      int                       `json:"db_index"`
+	Engine       string                    `json:"engine"`
+	SourceDB     string                    `json:"source_db,omitempty"`
+	KeyPrefix    string                    `json:"key_prefix,omitempty"`
+	BranchScoped bool                      `json:"branch_scoped,omitempty"`
+	Dumps        []prepareDryRunDump       `json:"dumps,omitempty"`
+	Migrate      *prepareDryRunStep        `json:"migrate,omitempty"`
+	Seed         *prepareDryRunStep        `json:"seed,omitempty"`
+	FanoutTarget int                       `json:"fanout_target,omitempty"`
+	Fingerprint  prepare.FingerprintReport `json:"fingerprint"`
+	Notes        []string                  `json:"notes,omitempty"`
+}
+
+type prepareDryRunDump struct {
+	Path     string `json:"path"`
+	Exists   bool   `json:"exists"`
+	Optional bool   `json:"optional,omitempty"`
+}
+
+type prepareDryRunStep struct {
+	Run string            `json:"run"`
+	Env map[string]string `json:"env,omitempty"`
+}
+
+type prepareDryRunOut struct {
+	WorktreePath string            `json:"worktree_path"`
+	Repo         string            `json:"repo"`
+	Slug         string            `json:"slug"`
+	Databases    []prepareDryRunDB `json:"databases"`
+}
+
+// prepareDryRunTool walks cfg.Databases and produces a per-DB plan
+// describing exactly what prepare_run would do without executing
+// anything. Useful as a sanity check before a destructive cold build
+// and as a debugging surface for "what command did treeman actually
+// run?"-style questions.
+func prepareDryRunTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in prepareDryRunIn,
+) (*mcpsdk.CallToolResult, prepareDryRunOut, error) {
+	wt, _ := resolveWorktree(in.Worktree)
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, prepareDryRunOut{}, err
+	}
+	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wt)
+	if err != nil {
+		return nil, prepareDryRunOut{}, fmt.Errorf("load resolved config: %w", err)
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, prepareDryRunOut{}, err
+	}
+	defer func() { _ = st.Close() }()
+	sl := slug.For(wt, "")
+	tplCtx := template.FromSlug(sl)
+	out := prepareDryRunOut{WorktreePath: wt, Repo: repoRoot, Slug: sl.Value}
+	for i, d := range cfg.Databases {
+		out.Databases = append(out.Databases, planOneDatabase(ctx, st, d, i, wt, tplCtx))
+	}
+	return nil, out, nil
+}
+
+// planOneDatabase renders the dry-run plan for one configured database.
+// Extracted from prepareDryRunTool so the outer function stays under
+// the cyclomatic-complexity budget; the per-DB block has its own
+// branching for templates, dump entries, migrate/seed, and fanout.
+func planOneDatabase(
+	ctx context.Context,
+	st *store.Store,
+	d config.DatabaseConfig,
+	idx int,
+	wt string,
+	tplCtx template.Context,
+) prepareDryRunDB {
+	entry := prepareDryRunDB{DBIndex: idx, Engine: d.Engine, BranchScoped: d.BranchScoped}
+	if d.NameTemplate != "" {
+		if n, rErr := template.Render(d.NameTemplate, tplCtx); rErr == nil {
+			entry.SourceDB = n
+		}
+	}
+	if d.KeyPrefix != "" {
+		if p, rErr := template.Render(d.KeyPrefix, tplCtx); rErr == nil {
+			entry.KeyPrefix = p
+		}
+	}
+	for _, ds := range d.Dump {
+		abs := ds.Path
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(wt, ds.Path)
+		}
+		ok := false
+		if _, sErr := os.Stat(abs); sErr == nil {
+			ok = true
+		}
+		entry.Dumps = append(entry.Dumps, prepareDryRunDump{Path: abs, Exists: ok, Optional: ds.Optional})
+	}
+	if d.Migrate != nil {
+		entry.Migrate = &prepareDryRunStep{Run: d.Migrate.Run, Env: d.Migrate.Env}
+	}
+	if d.Seed != nil {
+		entry.Seed = &prepareDryRunStep{Run: d.Seed.Run, Env: d.Seed.Env}
+	}
+	if d.TestClones != nil {
+		if d.TestClones.Clones.Auto {
+			entry.FanoutTarget = -1 // -1 → "auto: derived from runner config at prepare time"
+		} else {
+			entry.FanoutTarget = int(d.TestClones.Clones.Fixed)
+		}
+	}
+	entry.Fingerprint = prepare.InspectFingerprint(ctx, st, d, wt, entry.SourceDB, "")
+	if d.Migrate != nil && d.Migrate.Run == "" {
+		entry.Notes = append(entry.Notes, "migrate.run is empty — prepare will skip migrate")
+	}
+	if len(d.Dump) == 0 && d.Engine != "redis" && !d.BranchScoped {
+		entry.Notes = append(entry.Notes, "no dump configured — source DB will start empty before migrate")
+	}
+	return entry
 }
 
 // branchOccupancyFromStore mirrors the CLI's branchOccupancy helper:

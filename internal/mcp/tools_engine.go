@@ -18,6 +18,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
 	dbes "github.com/stubbedev/treeman/internal/db/es"
@@ -36,45 +37,51 @@ import (
 func registerEngineReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "engine_status",
-		Description: "Probe every engine declared in .treeman.yaml. For each: reachable? version? per-DB summary (database list for mysql/postgres/mongo; index list for ES; DBSIZE for redis). Call this when the user asks \"are my databases up?\" or before driving prepare_run/worktree_create against a fresh environment.",
+		Description: "Answers \"are my databases up?\" — probes every engine in .treeman.yaml. Reachable? version? per-DB summary. Call before prepare_run/worktree_create against a fresh env, and as the second step in diagnose-prepare-failure.",
 		Annotations: readOnlyAnno("Engine status probe", true),
 	}, engineStatusTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_schema_dump",
-		Description: "Return the live schema for ONE database on a configured engine. mysql/postgres → every table's CREATE TABLE. mongodb → collection list + first-doc samples. elasticsearch → index mapping JSON. redis → SCAN-driven key-pattern summary. engine = the engine string from databases[].engine; db = the rendered per-worktree database/prefix name (use snapshot_inspect or worktree_show to find it). Use when reasoning about live shape vs. what migrations expect.",
+		Description: "Live schema for ONE database — mysql/postgres: CREATE TABLEs, mongo: collection list + samples, ES: index mapping, redis: SCAN-driven key summary. Use when reasoning about live shape vs. what migrations expect. db = the rendered per-worktree name (find via worktree_show or snapshot_inspect). Capped at max_tables (default 200).",
 		Annotations: readOnlyAnno("Dump live schema", true),
 	}, dbSchemaDumpTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_query",
-		Description: "Run a READ-ONLY query against a configured engine. SQL engines (mysql/postgres) — only SELECT/SHOW/EXPLAIN/DESCRIBE/WITH accepted; mutations are REFUSED with an error. MongoDB → find-style filter JSON against a named collection. Elasticsearch → JSON _search body against an index. Redis → one command from {GET, MGET, SMEMBERS, HGETALL, KEYS, SCAN, EXISTS, TYPE, TTL, LRANGE, ZRANGE, HKEYS, HVALS, HGET, HMGET, DBSIZE, INFO, PING}. Returns rows/docs/hits as JSON. Use for inspecting live data or verifying a migration's effect.",
+		Description: "Run a READ-ONLY query against a configured engine — verifies migration effects or inspects live data. SQL: SELECT/SHOW/EXPLAIN/DESCRIBE/WITH only (mutations refused). Mongo: find-style filter JSON. ES: _search body. Redis: GET/MGET/SMEMBERS/HGETALL/KEYS/SCAN/EXISTS/TYPE/TTL/LRANGE/ZRANGE/HKEYS/HVALS/HGET/HMGET/DBSIZE/INFO/PING.",
 		Annotations: readOnlyAnno("Run read-only query", true),
 	}, dbQueryTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_inspect",
-		Description: "Resolve ONE snapshot (by fingerprint, or by engine+source_db) and report: SQLite row contents, whether the engine-side template still exists, template size, engine version at snapshot time. Call this BEFORE snapshot_drop to confirm you're dropping the right one — and routinely when diagnosing \"cache hit but prepare still failed\": template_exists=false on a fingerprint means the row is an orphan and the next prepare will (correctly) cold-build.",
+		Description: "Inspect ONE snapshot (by fingerprint, or engine+source_db) — SQLite row + does the engine-side template still exist + size + engine version. Call before snapshot_drop. Diagnoses \"cache hit but prepare failed\": template_exists=false → orphan row, next prepare will (correctly) cold-build. For sweeps use the cache-cleanup prompt.",
 		Annotations: readOnlyAnno("Inspect snapshot", true),
 	}, snapshotInspectTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "hook_log_read",
-		Description: "Read the FULL hook log file for one (worktree, phase, group_idx). Hook logs live at <worktree>/.treeman-hooks/<phase>-<group>.log. logs_hooks / hook_runs only stores 16KB tails — use this when you need more context than the tail. max_bytes=N returns just the trailing N bytes (and flags truncated=true).",
+		Description: "Read the FULL hook log file for one (worktree, phase, group_idx). logs_hooks only keeps 16KB tails — use this when you need more. max_bytes=N returns just the trailing N bytes.",
 		Annotations: readOnlyAnno("Read hook log", false),
 	}, hookLogReadTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "connection_probe",
+		Description: "Dry-test a connection string against an engine without writing it to .treeman.yaml. Tightens the setup loop — iterate on credentials, observe reachable/version/latency, then commit via config_set. dsn forms: mysql://user:pw@host:port, postgres://…, mongodb://…, redis://…, http(s)://…(ES). Omit dsn to probe the repo's currently-configured connection.",
+		Annotations: readOnlyAnno("Probe connection", true),
+	}, connectionProbeTool)
 }
 
 func registerEngineWriteTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_drop",
-		Description: "Delete ONE snapshot by fingerprint. Drops the engine-side template (DB / index-prefix / key-prefix / collection-set) AND removes the SQLite row. The next prepare for that fingerprint will cold-rebuild. Use for evicting one stale entry without nuking the rest of the cache; the cache-cleanup prompt drives this for known-orphan sweeps. Call snapshot_inspect first to confirm you're dropping the right fingerprint.",
+		Description: "Evict ONE snapshot by fingerprint (engine-side template + SQLite row). Next prepare cold-rebuilds. Call snapshot_inspect first to confirm. For orphan sweeps the cache-cleanup prompt is safer than calling this directly.",
 		Annotations: writeAnno("Drop snapshot", true, true, true),
 	}, snapshotDropTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_dump",
-		Description: "Generate a dump of a live engine database to disk. Supported engines: mysql (and mariadb/tidb aliases) -> mysqldump; postgres (and postgresql alias) -> pg_dump --format=plain --clean --if-exists; mongodb -> mongodump --archive; elasticsearch (and opensearch alias) -> scroll API NDJSON _bulk with {target_db} prefix substitution. Redis dumps are intentionally not implemented (redis cold-build uses a seed step, not a dump file, so there is no restore counterpart). output_dir defaults to <repo>/storage/dumps. Use this to refresh the seed dump treeman uses for cold builds (commit the new file then trigger prepare_run). Returns the absolute path + byte count.",
+		Description: "Refresh the seed dump used for cold builds — runs mysqldump / pg_dump / mongodump / ES scroll-bulk. Commit the new file then trigger prepare_run. Redis intentionally not implemented (uses a seed step, not a dump). output_dir defaults to <repo>/storage/dumps.",
 		Annotations: writeAnno("Dump database", false, false, true),
 	}, dbDumpTool)
 }
@@ -224,14 +231,16 @@ func probeES(ctx context.Context, cfg *config.Config) engineProbeResult {
 // ─── db_schema_dump ─────────────────────────────────────────────────
 
 type dbSchemaIn struct {
-	Repo   string `json:"repo,omitempty"`
-	Engine string `json:"engine"         jsonschema:"mysql|mariadb|tidb|postgres|postgresql|mongodb|redis|elasticsearch"`
-	DB     string `json:"db"`
+	Repo      string `json:"repo,omitempty"`
+	Engine    string `json:"engine"               jsonschema:"mysql|mariadb|tidb|postgres|postgresql|mongodb|redis|elasticsearch"`
+	DB        string `json:"db"`
+	MaxTables int    `json:"max_tables,omitempty" jsonschema:"sql/mongo: cap on the number of tables/collections returned (default 200). truncated=true is set in the output when the cap kicks in."`
 }
 type dbSchemaOut struct {
-	Engine string         `json:"engine"`
-	DB     string         `json:"db"`
-	Schema map[string]any `json:"schema"`
+	Engine    string         `json:"engine"`
+	DB        string         `json:"db"`
+	Schema    map[string]any `json:"schema"`
+	Truncated bool           `json:"truncated,omitempty"`
 }
 
 func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchemaIn) (*mcpsdk.CallToolResult, dbSchemaOut, error) {
@@ -261,7 +270,49 @@ func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchem
 		return nil, out, err
 	}
 	out.Schema = schema
+	out.Truncated = capSchemaTables(out.Schema, in.MaxTables)
 	return nil, out, nil
+}
+
+// capSchemaTables trims the per-table/per-collection maps in a schema
+// payload to maxTables entries. mysql/postgres land in `tables`; mongo
+// uses `collections` + `samples`. ES returns one nested `mappings`
+// blob (no obvious per-key cap), redis already returns a count summary.
+// Returns true when anything was dropped so the caller can flag truncated.
+func capSchemaTables(schema map[string]any, maxTables int) bool {
+	if maxTables <= 0 {
+		maxTables = 200
+	}
+	truncated := false
+	if tables, ok := schema["tables"].(map[string]any); ok && len(tables) > maxTables {
+		keys := make([]string, 0, len(tables))
+		for k := range tables {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		capped := map[string]any{}
+		for _, k := range keys[:maxTables] {
+			capped[k] = tables[k]
+		}
+		schema["tables"] = capped
+		schema["tables_total"] = len(keys)
+		truncated = true
+	}
+	if cols, ok := schema["collections"].([]string); ok && len(cols) > maxTables {
+		schema["collections"] = cols[:maxTables]
+		schema["collections_total"] = len(cols)
+		if samples, ok := schema["samples"].(map[string]any); ok {
+			kept := map[string]any{}
+			for _, c := range cols[:maxTables] {
+				if s, ok := samples[c]; ok {
+					kept[c] = s
+				}
+			}
+			schema["samples"] = kept
+		}
+		truncated = true
+	}
+	return truncated
 }
 
 func dbSchemaMySQL(ctx context.Context, cfg *config.Config, db string) (map[string]any, error) {
@@ -1082,4 +1133,205 @@ func decodeSQLValue(v any) any {
 		return string(b)
 	}
 	return v
+}
+
+// ─── connection_probe ───────────────────────────────────────────────
+
+type connectionProbeIn struct {
+	Engine string `json:"engine"         jsonschema:"mysql|mariadb|tidb|postgres|postgresql|mongodb|redis|elasticsearch|opensearch"`
+	DSN    string `json:"dsn,omitempty"  jsonschema:"connection string. mysql://user:pw@host:port, postgres://…, mongodb://…, redis://…, http(s)://…(ES). Omit to probe the repo's configured connection for this engine."`
+	Repo   string `json:"repo,omitempty" jsonschema:"only used when dsn is empty — selects the .treeman.yaml whose connection block to probe"`
+}
+
+type connectionProbeOut struct {
+	Engine    string `json:"engine"`
+	Reachable bool   `json:"reachable"`
+	Version   string `json:"version,omitempty"`
+	LatencyMs int64  `json:"latency_ms"`
+	Source    string `json:"source"            jsonschema:"dsn|config — which connection block was probed"`
+	Error     string `json:"error,omitempty"`
+}
+
+// connectionProbeTool dials the supplied DSN (or the repo's configured
+// connection when dsn is empty) and returns reachability + version +
+// latency. The Connect call is timed so the agent can decide whether a
+// slow handshake is the actual problem. Failures are reported as
+// reachable=false rather than a tool error so the agent gets the error
+// text without having to parse a transport-level failure.
+func connectionProbeTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in connectionProbeIn,
+) (*mcpsdk.CallToolResult, connectionProbeOut, error) {
+	out := connectionProbeOut{Engine: strings.ToLower(in.Engine)}
+	fam, ok := engine.Canonical(in.Engine)
+	if !ok {
+		out.Error = "unsupported engine: " + in.Engine
+		return nil, out, nil
+	}
+	if in.DSN == "" {
+		out.Source = "config"
+	} else {
+		out.Source = "dsn"
+	}
+	start := time.Now()
+	reachable, version, err := probeConnection(ctx, fam, in.DSN, in.Repo)
+	out.LatencyMs = time.Since(start).Milliseconds()
+	out.Reachable = reachable
+	out.Version = version
+	if err != nil {
+		// Redact in case the DSN itself contained credentials and the
+		// engine echoed it back in the error.
+		out.Error = redactSecrets(err.Error())
+	}
+	return nil, out, nil
+}
+
+// probeConnection dispatches on engine family. For DSN-supplied probes,
+// builds an in-memory connection config; for config-supplied probes,
+// loads the repo's configured block.
+func probeConnection(ctx context.Context, fam engine.Family, dsn, repo string) (bool, string, error) {
+	switch fam {
+	case engine.FamilyMySQL:
+		return probeMySQLConn(ctx, dsn, repo)
+	case engine.FamilyPostgres:
+		return probePostgresConn(ctx, dsn, repo)
+	case engine.FamilyMongo:
+		return probeMongoConn(ctx, dsn, repo)
+	case engine.FamilyRedis:
+		return probeRedisConn(ctx, dsn, repo)
+	case engine.FamilyES:
+		return probeESConn(ctx, dsn, repo)
+	}
+	return false, "", fmt.Errorf("no probe handler for family %s", fam)
+}
+
+func probeMySQLConn(ctx context.Context, dsn, repo string) (bool, string, error) {
+	var cfg config.MysqlConn
+	if dsn != "" {
+		if err := yamlScalar(&cfg, dsn); err != nil {
+			return false, "", err
+		}
+	} else {
+		c, err := loadCfgForRepo(repo)
+		if err != nil {
+			return false, "", err
+		}
+		if c.Connections.Mysql == nil {
+			return false, "", errors.New("connections.mysql not configured")
+		}
+		cfg = *c.Connections.Mysql
+	}
+	drv, err := dbmysql.Connect(ctx, cfg)
+	if err != nil {
+		return false, "", err
+	}
+	defer func() { _ = drv.Close() }()
+	v, _ := drv.EngineVersion(ctx)
+	return true, v, nil
+}
+
+func probePostgresConn(ctx context.Context, dsn, repo string) (bool, string, error) {
+	var cfg config.PostgresConn
+	if dsn != "" {
+		if err := yamlScalar(&cfg, dsn); err != nil {
+			return false, "", err
+		}
+	} else {
+		c, err := loadCfgForRepo(repo)
+		if err != nil {
+			return false, "", err
+		}
+		if c.Connections.Postgres == nil {
+			return false, "", errors.New("connections.postgres not configured")
+		}
+		cfg = *c.Connections.Postgres
+	}
+	drv, err := dbpostgres.Connect(ctx, cfg)
+	if err != nil {
+		return false, "", err
+	}
+	defer func() { _ = drv.Close() }()
+	v, _ := drv.EngineVersion(ctx)
+	return true, v, nil
+}
+
+func probeMongoConn(ctx context.Context, dsn, repo string) (bool, string, error) {
+	var cfg config.MongoConn
+	if dsn != "" {
+		cfg.URI = dsn
+	} else {
+		c, err := loadCfgForRepo(repo)
+		if err != nil {
+			return false, "", err
+		}
+		if c.Connections.Mongodb == nil {
+			return false, "", errors.New("connections.mongodb not configured")
+		}
+		cfg = *c.Connections.Mongodb
+	}
+	drv, err := dbmongo.Connect(ctx, cfg)
+	if err != nil {
+		return false, "", err
+	}
+	defer func() { _ = drv.Close(ctx) }()
+	v, _ := drv.EngineVersion(ctx)
+	return true, v, nil
+}
+
+func probeRedisConn(ctx context.Context, dsn, repo string) (bool, string, error) {
+	var cfg config.RedisConn
+	if dsn != "" {
+		cfg.URL = dsn
+	} else {
+		c, err := loadCfgForRepo(repo)
+		if err != nil {
+			return false, "", err
+		}
+		if c.Connections.Redis == nil {
+			return false, "", errors.New("connections.redis not configured")
+		}
+		cfg = *c.Connections.Redis
+	}
+	drv, err := dbredis.Connect(ctx, cfg)
+	if err != nil {
+		return false, "", err
+	}
+	defer func() { _ = drv.Close() }()
+	v, _ := drv.EngineVersion(ctx)
+	return true, v, nil
+}
+
+func probeESConn(ctx context.Context, dsn, repo string) (bool, string, error) {
+	var cfg config.EsConn
+	if dsn != "" {
+		cfg.URL = dsn
+	} else {
+		c, err := loadCfgForRepo(repo)
+		if err != nil {
+			return false, "", err
+		}
+		if c.Connections.Elasticsearch == nil {
+			return false, "", errors.New("connections.elasticsearch not configured")
+		}
+		cfg = *c.Connections.Elasticsearch
+	}
+	drv, err := dbes.Connect(ctx, cfg)
+	if err != nil {
+		return false, "", err
+	}
+	v, _ := drv.EngineVersion(ctx)
+	return true, v, nil
+}
+
+// yamlScalar fills a config struct from a bare DSN scalar by routing
+// through its UnmarshalYAML (where the DSN-vs-mapping logic lives).
+// Marshalling the string and re-unmarshalling avoids duplicating each
+// engine's DSN parser here.
+func yamlScalar(v any, dsn string) error {
+	b, err := yaml.Marshal(dsn)
+	if err != nil {
+		return err
+	}
+	return yaml.Unmarshal(b, v)
 }

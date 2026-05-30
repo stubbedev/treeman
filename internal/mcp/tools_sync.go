@@ -16,7 +16,7 @@ import (
 func registerSyncReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "sync_status",
-		Description: "Report per-repo + per-worktree git sync state: last-fetch time, consecutive fetch failures, next-retry time, ahead/behind counts against upstream, dirty flag, and the last skip reason (dirty|no_upstream|non_ff|detached_head|rebase_conflict). Use this to answer \"why isn't my branch up to date?\" without grepping logs_query.",
+		Description: "Answers \"why isn't my branch up to date?\" — per-repo + per-worktree git sync state: last-fetch time, fetch failures, next-retry, ahead/behind, dirty flag, last skip reason (dirty|no_upstream|non_ff|detached_head|rebase_conflict).",
 		Annotations: readOnlyAnno("Sync status", true),
 	}, syncStatusTool)
 }
@@ -24,7 +24,7 @@ func registerSyncReadTools(srv *mcpsdk.Server) {
 func registerSyncWriteTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "sync_now",
-		Description: "Trigger an immediate `git fetch --all --prune` + advance (ff or rebase per config) without waiting for the auto-fetch tick. path scopes the work: empty → every registered repo; repo root → that repo + all linked worktrees; worktree path → fetch the owning repo then advance only that wt. Bypasses the auto-fetch backoff gate so users can punch through an offline-mode pause. Returns the same shape as sync_status.",
+		Description: "Force an immediate `git fetch --all --prune` + advance (ff or rebase per config) without waiting for the auto-fetch tick. Bypasses the offline-mode backoff. path scopes the work: empty → all repos, repo root → that repo + worktrees, worktree path → that wt only. Returns same shape as sync_status.",
 		Annotations: writeAnno("Sync now", false, true, true),
 	}, syncNowTool)
 }
