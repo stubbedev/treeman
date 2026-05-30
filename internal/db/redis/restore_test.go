@@ -20,7 +20,7 @@ func TestReadRESPArray_Basic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readRESPArray: %v", err)
 	}
-	got := []string{}
+	got := make([]string, 0, len(parts))
 	for _, p := range parts {
 		got = append(got, string(p))
 	}

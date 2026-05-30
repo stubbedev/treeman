@@ -139,6 +139,39 @@ func dumpsReady(dumps config.DumpList, worktreePath string) ([]dumpFile, error) 
 	return out, nil
 }
 
+// Cache-miss reason constants surfaced on `snapshot_cache_miss` events.
+// `cacheMissNoRow` means LookupSnapshot returned nil (this fingerprint
+// has never been built, or its row was GC'd). `cacheMissTemplateGone`
+// means SQLite still has the row but the template DB / prefix is
+// missing on the engine (someone dropped it out-of-band).
+const (
+	cacheMissNoRow        = "no_row"
+	cacheMissTemplateGone = "template_gone"
+)
+
+// emitCacheMiss writes a snapshot_cache_miss event explaining why a
+// cache-hit lookup failed and what the engine is about to do instead
+// (cold-build or incremental). Pair with the existing
+// snapshot_cache_hit event: every prepare emits exactly one of the
+// two for each declared database, so a user grepping the event stream
+// can always tell which branch fired and why.
+func emitCacheMiss(ctx context.Context, st *store.Store, repoID, worktreeID int64,
+	engine, sourceDB, fingerprint, reason string,
+) {
+	if st == nil {
+		return
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_miss",
+		fmt.Sprintf("engine=%s source=%s reason=%s fingerprint=%s",
+			engine, sourceDB, reason, fingerprint),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine":      engine,
+			"source_db":   sourceDB,
+			"fingerprint": fingerprint,
+			"reason":      reason,
+		})
+}
+
 // emitDumpLoadPhase emits a per-dump dump-load event tagged with the
 // dump's path + index/total + the dispatcher `strategy` (docker-exec /
 // native-cli / wire). Mirrors emitPhaseDone's shape with extra `path`,
@@ -795,6 +828,7 @@ func mysqlCacheHit(
 	// cold build), matching the original `err == nil && rec != nil` guard.
 	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
 	if rec == nil {
+		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissNoRow)
 		return Outcome{}, false, nil
 	}
 	// Touch the row BEFORE DatabaseExists so a concurrent
@@ -852,6 +886,7 @@ func mysqlCacheHit(
 	}
 	// Row stale (template was dropped externally). Wipe so the
 	// cold-build path below overwrites it cleanly.
+	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissTemplateGone)
 	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	return Outcome{}, false, nil
 }
@@ -1327,6 +1362,7 @@ func postgresCacheHit(
 	// cold build), matching the original `err == nil && rec != nil` guard.
 	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
 	if rec == nil {
+		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissNoRow)
 		return Outcome{}, false, nil
 	}
 	// Touch row early so concurrent EvictExcess sees this template
@@ -1377,6 +1413,7 @@ func postgresCacheHit(
 			CacheHit: true, Clones: clones,
 		}, true, nil
 	}
+	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissTemplateGone)
 	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	return Outcome{}, false, nil
 }
@@ -1611,6 +1648,7 @@ func mongoCacheHit(
 	// cold build), matching the original `err == nil && rec != nil` guard.
 	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
 	if rec == nil {
+		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissNoRow)
 		return Outcome{}, false, nil
 	}
 	// Touch row early so concurrent EvictExcess sees this template
@@ -1662,6 +1700,7 @@ func mongoCacheHit(
 			CacheHit: true, Clones: clones,
 		}, true, nil
 	}
+	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissTemplateGone)
 	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	return Outcome{}, false, nil
 }
@@ -1910,6 +1949,7 @@ func redisCacheHit(
 	// cold build), matching the original `err == nil && rec != nil` guard.
 	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
 	if rec == nil {
+		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, key.Fingerprint(), cacheMissNoRow)
 		return Outcome{}, false, nil
 	}
 	// Touch row early so concurrent EvictExcess sees this template
@@ -1955,6 +1995,7 @@ func redisCacheHit(
 			CacheHit: true, Clones: clones,
 		}, true, nil
 	}
+	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, key.Fingerprint(), cacheMissTemplateGone)
 	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	return Outcome{}, false, nil
 }
@@ -2195,6 +2236,7 @@ func esCacheHit(
 	// cold build), matching the original `err == nil && rec != nil` guard.
 	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
 	if rec == nil {
+		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, key.Fingerprint(), cacheMissNoRow)
 		return Outcome{}, false, nil
 	}
 	// Touch row early so concurrent EvictExcess sees this template
@@ -2246,6 +2288,7 @@ func esCacheHit(
 			CacheHit: true, Clones: clones,
 		}, true, nil
 	}
+	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, key.Fingerprint(), cacheMissTemplateGone)
 	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 	return Outcome{}, false, nil
 }
