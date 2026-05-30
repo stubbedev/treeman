@@ -248,14 +248,6 @@ Glob pattern for individual migration files within
 `migration_dirs`. Example: `[0-9]*_*.py` (alembic) or
 `V*__*.sql` (flyway).
 
-#### `hash_mode` *(string)*
-
-Hash strategy applied to the migration files: `filename`
-(default) or `checksum`. Maps to the `hash:` field on each
-emitted Input.
-
-_Allowed: `filename`, `checksum`_
-
 #### `lockfiles` *(array of string)*
 
 Lockfiles whose contents are folded into the snapshot hash
@@ -311,11 +303,23 @@ Template for the per-worktree database/index name. Supports
 scope by database name (MySQL, Postgres, Mongo). Validated at
 config-load time — typos fail loud.
 
-#### `dump` *([DumpSpec](#dumpspec))*
+#### `dump` *([DumpList](#dumplist))*
 
-Source dump used to seed clones. Path is relative to the repo
-root. Treeman hashes this file into the snapshot key, so
-changes invalidate the cache.
+Source dump(s) used to seed the source DB before migrate/seed
+run. Each path is relative to the repo root. Treeman hashes
+every dump into the snapshot key, so changes invalidate the
+cache. Three shapes:
+
+  dump: seed.sql                       # bare string
+  dump: { path: seed.sql, optional: true }  # mapping
+  dump:                                # sequence
+    - base.sql
+    - { path: extras.sql, optional: true }
+
+Sequence entries load in declared ORDER, so a base schema dump
+followed by per-feature patches is supported without splicing
+them into one file. Order matters for the fingerprint too —
+reordering reproducible dumps is a content change.
 
 #### `migrate` *([Step](#step))*
 
@@ -458,9 +462,9 @@ Field semantics:
 
 #### `fanout` *(integer)*
 
-### DumpSpec
+### DumpList
 
-Source dump file. Bare string OR `{path, optional, source_db}` mapping.
+Source dump(s). Accepts a bare path string, a single mapping, or an ordered array of either.
 
 ### EsConn
 
