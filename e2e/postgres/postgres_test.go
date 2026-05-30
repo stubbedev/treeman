@@ -17,6 +17,7 @@ import (
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 func TestPostgresEndToEnd(t *testing.T) {
@@ -162,6 +163,94 @@ func mustWrite(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// TestPostgresFanoutConcurrency probes whether the Postgres clone
+// fan-out actually runs in parallel server-side. `CREATE DATABASE …
+// TEMPLATE` requires no connections to the template AND takes locks
+// on pg_database, so multiple concurrent restores from the same
+// template may serialize regardless of the outer goroutine count.
+//
+// The probe runs a cold build (to populate a template), then asserts
+// the cache-hit fan-out into N clones produces some real overlap:
+//
+//	parallelism = sum(per-clone duration) / wall-clock duration
+//
+// 1.0 means perfectly serial, N means perfectly parallel. We require
+// at least 1.5 — a weak lower bound that catches accidental full
+// serialisation without flaking on shared-CI noise. The actual factor
+// is logged so a future tightening / cap reduction in fanOutLimits
+// has concrete data to lean on.
+func TestPostgresFanoutConcurrency(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "postgres:15432", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:15432", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	cfg := buildConfig()
+	// 8 clones: large enough to expose serialisation without
+	// overwhelming the dev box's max_connections (~100).
+	cfg.Databases[0].TestClones = &config.TestClonesSpec{
+		Clones:       config.ClonesSetting{Fixed: 8},
+		NameTemplate: "tm_pgcc_{slug}_w{n}",
+	}
+	env := harness.NewEnv(t, wt)
+
+	// Cold build: creates the template + first fan-out. Re-running with
+	// the same inputs hits the cache and exercises the parallel
+	// SnapshotRestore path we want to measure.
+	_ = harness.AssertOutcome(t, env.RunPrepare(t, cfg), "postgres", false)
+
+	// Only count events emitted from THIS point forward — the prior cold
+	// build also produced clone_restore_done events, and including those
+	// would double-count and inflate the parallelism factor.
+	probeStartMs := time.Now().UnixMilli()
+	wallStart := time.Now()
+	o2 := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "postgres", true)
+	wallMs := time.Since(wallStart).Milliseconds()
+	if got := len(o2.Clones); got < 8 {
+		t.Fatalf("expected ≥8 clones in fan-out, got %d", got)
+	}
+
+	// Pull per-clone restore durations from the event stream. Each
+	// clone_restore_done event carries the clone's wall-clock duration
+	// in DurationMs.
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"clone_restore_done"},
+		SinceMs:    probeStartMs,
+	})
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	if len(evs) == 0 {
+		t.Fatal("no clone_restore_done events recorded — fanout instrumentation regression")
+	}
+	var sumDur int64
+	for _, e := range evs {
+		if e.DurationMs.Valid {
+			sumDur += e.DurationMs.Int64
+		}
+	}
+	if wallMs <= 0 {
+		t.Fatalf("wall duration not measured (got %dms)", wallMs)
+	}
+	parallelism := float64(sumDur) / float64(wallMs)
+	t.Logf("postgres fan-out: clones=%d wall=%dms sum=%dms parallelism=%.2f",
+		len(evs), wallMs, sumDur, parallelism)
+	if parallelism < 1.5 {
+		t.Errorf("parallelism factor %.2f < 1.5 — postgres fan-out appears to be serialising "+
+			"(consider lowering fanOutLimits[postgres] in internal/prepare/prepare.go)",
+			parallelism)
 	}
 }
 
