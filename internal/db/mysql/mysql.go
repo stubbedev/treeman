@@ -57,6 +57,15 @@ type Driver struct {
 	// (physical / logical) actually ran for observability.
 	strategyMu        sync.Mutex
 	lastCloneStrategy CloneStrategy
+
+	// stagesMu guards stages. Keyed by template name, each entry holds
+	// a sync.Once that exports the (immutable) template's InnoDB
+	// tablespaces to a staging dir exactly once. SnapshotRestore then
+	// imports from staging without re-taking FLUSH TABLES … FOR EXPORT
+	// on the shared template, so a fan-out of N restores no longer
+	// serializes on that per-template export lock. See physical_stage.go.
+	stagesMu sync.Mutex
+	stages   map[string]*templateStage
 }
 
 // LastCloneStrategy returns the CloneStrategy used by the most recent
@@ -664,8 +673,28 @@ func backtickJoin(cols []string) (string, error) {
 	return b.String(), nil
 }
 
-// SnapshotRestore re-creates `target` from `template`. Symmetric to
-// SnapshotCreate.
+// SnapshotRestore re-creates `target` from `template`.
+//
+// Restore is the fan-out hot path: a single prepare clones one immutable
+// template into N test databases concurrently. The physical clone in
+// SnapshotCreate takes FLUSH TABLES <template>.* FOR EXPORT on the
+// shared template and holds it across the .ibd copy, so N concurrent
+// restores serialize on that one export lock — the dominant cost of a
+// wide fan-out.
+//
+// To remove that contention the template's tablespaces are exported to
+// a staging dir exactly once (ensureStage / stageTemplate, guarded by a
+// per-template sync.Once); every restore then imports from staging via
+// physicalRestoreFromStage, which copies plain files and takes no lock
+// on the template. The fan-out is then bounded by disk + IMPORT, not by
+// a serial export lock.
+//
+// Fallback chain is preserved exactly: when staging is unavailable
+// (no ContainerRef, engine binary absent, empty secure_file_priv,
+// non-InnoDB tables, …) or fails, the restore falls back to the always-
+// available logical clone. Physical staging is never re-attempted via
+// SnapshotCreate here — calling logicalSnapshotCreate directly avoids a
+// pointless second FLUSH-FOR-EXPORT probe per clone.
 func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
 	qtarget, err := ident.QuoteMySQL(target)
 	if err != nil {
@@ -677,16 +706,39 @@ func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) e
 	if _, err := d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
 		return err
 	}
-	return d.SnapshotCreate(ctx, template, target)
+
+	st := d.ensureStage(ctx, template)
+	switch {
+	case st.skip != nil:
+		slog.Debug("mysql physical staging unavailable; using logical restore",
+			"template", template, "reason", st.skip.reason)
+	case st.err != nil:
+		slog.Warn("mysql physical staging failed; using logical restore",
+			"template", template, "error", st.err)
+	default:
+		rerr := d.physicalRestoreFromStage(ctx, st, template, target)
+		if rerr == nil {
+			d.setLastStrategy(CloneStrategyPhysical)
+			return nil
+		}
+		slog.Warn("mysql physical restore-from-stage failed; using logical restore",
+			"template", template, "target", target, "error", rerr)
+	}
+	d.setLastStrategy(CloneStrategyLogical)
+	return d.logicalSnapshotCreate(ctx, template, target)
 }
 
-// DropSnapshot drops a template DB. Idempotent.
+// DropSnapshot drops a template DB. Idempotent. Also reaps any staging
+// dir holding that template's exported tablespaces (best-effort — a
+// fresh daemon that never staged this template still resolves the path
+// from secure_file_priv, so eviction across process restarts is clean).
 func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
 	qtemplate, err := ident.QuoteMySQL(template)
 	if err != nil {
 		return err
 	}
 	_, err = d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
+	d.dropStage(ctx, template)
 	return err
 }
 

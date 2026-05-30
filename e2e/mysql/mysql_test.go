@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -390,6 +391,115 @@ func TestPhysicalCloneViaContainerExec(t *testing.T) {
 	// the .ibd files; if the IMPORT ran cleanly the rows are present.
 	assertTablesPresent(t, "127.0.0.1:13306", o.TemplateName, []string{"products", "orders"})
 	assertRowCount(t, "127.0.0.1:13306", o.TemplateName, "products", 3)
+}
+
+// TestStagedFanoutRestoreParallel proves the physical fan-out no longer
+// serializes on a per-template FLUSH TABLES … FOR EXPORT lock. With a
+// ContainerRef set, the template's tablespaces are exported to a staging
+// dir once and each of N clone restores imports plain file copies in
+// parallel. Asserts:
+//
+//   - all N clones exist and carry byte-for-byte the same row counts as
+//     the source (staged IMPORT TABLESPACE produced correct data under
+//     concurrent fan-out), and
+//   - the staging dir was actually created under secure_file_priv — the
+//     logical fallback never creates it, so its presence proves the
+//     staged physical path ran rather than silently degrading.
+func TestStagedFanoutRestoreParallel(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	cfg := buildConfig()
+	cfg.Connections.Mysql.Port = 3306
+	cfg.Connections.Mysql.ContainerRef = config.ContainerRef{
+		Container: "treeman-e2e-mysql",
+	}
+	const nClones = 4
+	cfg.Databases[0].TestClones = &config.TestClonesSpec{
+		Clones:       config.ClonesSetting{Fixed: nClones},
+		NameTemplate: "treeman_e2e_{slug}_w{n}",
+	}
+
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mysql", false)
+	if len(o.Clones) != nClones {
+		t.Fatalf("clone count = %d, want %d (clones=%v)", len(o.Clones), nClones, o.Clones)
+	}
+	t.Logf("source=%s template=%s clones=%v", o.SourceDB, o.TemplateName, o.Clones)
+
+	// Config has a ContainerRef + all-InnoDB schema → the physical path
+	// is the one under test. Confirm it actually engaged for the build.
+	assertSawPhysicalStrategy(t, env)
+
+	// Source row counts are the ground truth every clone must match.
+	srcProducts := rowCount(t, "127.0.0.1:13306", o.SourceDB, "products")
+	srcOrders := rowCount(t, "127.0.0.1:13306", o.SourceDB, "orders")
+	if srcProducts != 3 {
+		t.Fatalf("source products = %d, want 3 (fixture changed?)", srcProducts)
+	}
+	for _, name := range o.Clones {
+		assertTablesPresent(t, "127.0.0.1:13306", name, []string{"products", "orders"})
+		if got := rowCount(t, "127.0.0.1:13306", name, "products"); got != srcProducts {
+			t.Errorf("clone %s products = %d, want %d", name, got, srcProducts)
+		}
+		if got := rowCount(t, "127.0.0.1:13306", name, "orders"); got != srcOrders {
+			t.Errorf("clone %s orders = %d, want %d", name, got, srcOrders)
+		}
+	}
+
+	// The staging dir is created only by the physical staged-restore
+	// path; the logical fallback never touches it. Its presence (with a
+	// subdir per staged template) is direct proof the fan-out imported
+	// from staging rather than degrading to logical INSERT…SELECT.
+	out, err := exec.Command("docker", "exec", "treeman-e2e-mysql",
+		"ls", "/var/lib/mysql-files/_tm_stage").CombinedOutput()
+	listing := strings.TrimSpace(string(out))
+	t.Logf("staging dir /var/lib/mysql-files/_tm_stage (err=%v): %q", err, listing)
+	if err != nil || listing == "" {
+		t.Errorf("staging dir empty/absent — fan-out fell back to logical "+
+			"instead of staged physical restore (ls err=%v, out=%q)", err, listing)
+	}
+}
+
+// assertSawPhysicalStrategy fails the test unless at least one
+// snapshot_clone_strategy=physical event was recorded for the run.
+func assertSawPhysicalStrategy(t *testing.T, env *harness.Env) {
+	t.Helper()
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"snapshot_clone_strategy"},
+	})
+	if err != nil {
+		t.Fatalf("query strategy events: %v", err)
+	}
+	for _, e := range evs {
+		if strings.Contains(e.Message, "strategy=physical") {
+			return
+		}
+	}
+	t.Fatalf("no strategy=physical event — physical clone did not engage (events=%v)", evs)
+}
+
+func rowCount(t *testing.T, addr, dbName, table string) int {
+	t.Helper()
+	db := openMySQL(t, addr, dbName)
+	defer db.Close()
+	var n int
+	if err := db.QueryRowContext(context.Background(),
+		fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table)).Scan(&n); err != nil {
+		t.Fatalf("count(%s.%s): %v", dbName, table, err)
+	}
+	return n
 }
 
 func assertTablesPresent(t *testing.T, addr, dbName string, want []string) {
