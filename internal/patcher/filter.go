@@ -43,6 +43,13 @@ import (
 	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
 
+// reSectionHeader matches an INI/TOML `[section]` header at line start.
+// Hoisted to package scope because iniSection/tomlSection are on the
+// hot clean/smudge path (they run on every `git status`/`git add` of a
+// patched file) and previously recompiled this constant pattern on
+// every call.
+var reSectionHeader = regexp.MustCompile(`(?m)^\[`)
+
 // Smudge applies one Patch's `set:` to `content` in memory. Mirrors
 // `Apply`'s patch-write step exactly — same driver dispatch, same
 // renderTemplates flow — but returns a string instead of writing
@@ -232,7 +239,12 @@ func restoreINIFromHead(content, headContent string, dottedKeys []string) string
 		if headSec == "" || curSec == "" {
 			continue
 		}
-		lineRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `\s*=.*$`)
+		// Allow leading indentation so an indented `  k = v` key — which
+		// go-ini (extractINI) happily reports as present — is matched here
+		// too. Without the `[ \t]*` prefix the splice would silently miss
+		// it, leaving the smudged value in place and the file permanently
+		// git-dirty. Mirrors spliceAssignValue's `^\s*key` on the apply side.
+		lineRe := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(key) + `\s*=.*$`)
 		headLine := lineRe.FindString(headSec)
 		if headLine == "" {
 			continue
@@ -254,8 +266,7 @@ func restoreINIFromHead(content, headContent string, dottedKeys []string) string
 func iniSection(content, section string) (string, int, int) {
 	if section == "" || strings.EqualFold(section, "DEFAULT") {
 		// Body before first explicit [section].
-		re := regexp.MustCompile(`(?m)^\[`)
-		loc := re.FindStringIndex(content)
+		loc := reSectionHeader.FindStringIndex(content)
 		if loc == nil {
 			return content, 0, len(content)
 		}
@@ -269,8 +280,7 @@ func iniSection(content, section string) (string, int, int) {
 	}
 	bodyStart := loc[1]
 	// Next section header or EOF.
-	nextRe := regexp.MustCompile(`(?m)^\[`)
-	nextLoc := nextRe.FindStringIndex(content[bodyStart:])
+	nextLoc := reSectionHeader.FindStringIndex(content[bodyStart:])
 	bodyEnd := len(content)
 	if nextLoc != nil {
 		bodyEnd = bodyStart + nextLoc[0]
@@ -298,7 +308,9 @@ func restoreTOMLFromHead(content, headContent string, dottedKeys []string) strin
 		if headSec == "" || curSec == "" {
 			continue
 		}
-		lineRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `\s*=.*$`)
+		// Indentation-tolerant for the same reason as restoreINIFromHead:
+		// TOML permits indented keys and go-toml (extractTOML) accepts them.
+		lineRe := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(key) + `\s*=.*$`)
 		headLine := lineRe.FindString(headSec)
 		if headLine == "" {
 			continue
@@ -316,8 +328,7 @@ func restoreTOMLFromHead(content, headContent string, dottedKeys []string) strin
 // applyContent.
 func tomlSection(content, table string) (string, int, int) {
 	if table == "" {
-		re := regexp.MustCompile(`(?m)^\[`)
-		loc := re.FindStringIndex(content)
+		loc := reSectionHeader.FindStringIndex(content)
 		if loc == nil {
 			return content, 0, len(content)
 		}
@@ -329,8 +340,7 @@ func tomlSection(content, table string) (string, int, int) {
 		return "", -1, -1
 	}
 	bodyStart := loc[1]
-	nextRe := regexp.MustCompile(`(?m)^\[`)
-	nextLoc := nextRe.FindStringIndex(content[bodyStart:])
+	nextLoc := reSectionHeader.FindStringIndex(content[bodyStart:])
 	bodyEnd := len(content)
 	if nextLoc != nil {
 		bodyEnd = bodyStart + nextLoc[0]
@@ -350,25 +360,37 @@ func tomlSection(content, table string) (string, int, int) {
 // surface. Documented as a known limitation.
 func restoreYAMLFromHead(content, headContent string, headVals map[string]string, present []string) (string, error) {
 	fallback := []string{}
+	// HEAD is immutable across the loop, so parse it once rather than
+	// once per key (was 2N parses for N keys). `content` is mutated by
+	// each splice, shifting byte offsets, so it must still be reparsed
+	// per key.
+	headRoot, headOK := yamlRootNode(headContent)
 	for _, k := range present {
 		segs, err := yamlpatch.ParsePath(k)
 		if err != nil {
 			fallback = append(fallback, k)
 			continue
 		}
-		hLine, hStart, hEnd, ok := yamlScalarLineBytes(headContent, segs)
+		if !headOK {
+			fallback = append(fallback, k)
+			continue
+		}
+		hLine, _, _, ok := yamlScalarLineBytesNode(headContent, headRoot, segs)
 		if !ok {
 			fallback = append(fallback, k)
 			continue
 		}
-		_, cStart, cEnd, ok := yamlScalarLineBytes(content, segs)
+		curRoot, ok := yamlRootNode(content)
+		if !ok {
+			fallback = append(fallback, k)
+			continue
+		}
+		_, cStart, cEnd, ok := yamlScalarLineBytesNode(content, curRoot, segs)
 		if !ok {
 			fallback = append(fallback, k)
 			continue
 		}
 		content = content[:cStart] + hLine + content[cEnd:]
-		_ = hStart
-		_ = hEnd
 	}
 	if len(fallback) > 0 {
 		subset := make(map[string]string, len(fallback))
@@ -386,21 +408,31 @@ func restoreYAMLFromHead(content, headContent string, headVals map[string]string
 	return content, nil
 }
 
-// yamlScalarLineBytes parses `doc`, walks `segs` to the terminal
-// scalar, and returns that line's bytes + the start/end offsets in
-// `doc`. The returned line includes the leading indent so a splice
-// of head-line into content-line preserves indent depth. Empty +
-// false when the terminal isn't a scalar (mapping/sequence terminals
-// are unsupported — they'd require multi-line block detection).
-func yamlScalarLineBytes(doc string, segs []yamlpatch.Segment) (string, int, int, bool) {
+// yamlRootNode parses `doc` and returns its top content node (the
+// document node unwrapped). False if the doc doesn't parse or is empty.
+// Split out from yamlScalarLineBytesNode so callers can parse an
+// immutable document once and walk it for many keys.
+func yamlRootNode(doc string) (*yaml.Node, bool) {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte(doc), &root); err != nil {
-		return "", 0, 0, false
+		return nil, false
 	}
 	n := &root
 	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
 		n = n.Content[0]
 	}
+	return n, true
+}
+
+// yamlScalarLineBytesNode walks a pre-parsed `root` (from yamlRootNode
+// over `doc`) along `segs` to the terminal scalar, and returns that
+// line's bytes + the start/end offsets in `doc`. The returned line
+// includes the leading indent so a splice of head-line into
+// content-line preserves indent depth. Empty + false when the terminal
+// isn't a scalar (mapping/sequence terminals are unsupported — they'd
+// require multi-line block detection).
+func yamlScalarLineBytesNode(doc string, root *yaml.Node, segs []yamlpatch.Segment) (string, int, int, bool) {
+	n := root
 	for _, seg := range segs {
 		switch {
 		case seg.IsIndex:

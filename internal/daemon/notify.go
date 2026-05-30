@@ -80,7 +80,7 @@ func dispatchNotification(
 		return
 	}
 	repo, target := notificationSubject(ctx, st, ev)
-	if err := sender.Send(notify.Compose(bucket, repo, target)); err != nil {
+	if err := sender.Send(ctx, notify.Compose(bucket, repo, target)); err != nil {
 		slog.Warn("notifications: send failed", "bucket", bucket, "err", err)
 	}
 }

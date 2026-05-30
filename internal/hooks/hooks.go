@@ -95,7 +95,7 @@ func RunHooksOrphan(
 		}
 		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
 		// Default cwd is the repo root, not the (deleted) worktree.
-		cmdStr, err := renderAction(entry, repoRoot)
+		cmdStr, err := renderAction(ctx, entry, repoRoot)
 		if err != nil {
 			return out, err
 		}
@@ -161,7 +161,7 @@ func RunHooks(
 			continue
 		}
 		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
-		cmdStr, err := renderAction(entry, worktreePath)
+		cmdStr, err := renderAction(ctx, entry, worktreePath)
 		if err != nil {
 			return out, err
 		}
@@ -237,7 +237,7 @@ func lastBytes(b []byte, n int) string {
 // `defaultCwd` is the worktree root — used when the action's `cwd`
 // is empty on the host path. In the container path the absence of
 // `cwd` means "use the container's WORKDIR" (no `-w` flag).
-func renderAction(a config.Action, defaultCwd string) (string, error) {
+func renderAction(ctx context.Context, a config.Action, defaultCwd string) (string, error) {
 	if len(a.Run) == 0 {
 		return "", nil
 	}
@@ -257,7 +257,7 @@ func renderAction(a config.Action, defaultCwd string) (string, error) {
 	if engine == "" {
 		engine = "docker"
 	}
-	id, err := containerip.ContainerID(containerip.Opts{
+	id, err := containerip.ContainerID(ctx, containerip.Opts{
 		Container:      a.Container,
 		ComposeService: a.ComposeService,
 		ComposeProject: a.ComposeProject,

@@ -1018,12 +1018,21 @@ func mysqlSnapshotAndRecord(
 	// background context with a hard deadline so a stalled DROP
 	// (e.g. lock contention) can't leak this goroutine forever.
 	// Errors are logged inside EvictExcess.
-	go func() { //nolint:gosec // detached cache eviction with its own deadline; must outlive the prepare request ctx
+	spawnEvict(cfg, st, repoID)
+	return nil
+}
+
+// spawnEvict fires LRU snapshot eviction for a repo in a detached
+// goroutine. It uses a fresh background context with a hard 5-minute
+// deadline so a stalled DROP (e.g. engine lock contention) can never
+// leak the goroutine forever, and so the eviction outlives the prepare
+// request's own context. Errors are logged inside EvictExcess.
+func spawnEvict(cfg *config.Config, st *store.Store, repoID int64) {
+	go func() {
 		evictCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		snapshot.EvictExcess(evictCtx, cfg, st, repoID)
 	}()
-	return nil
 }
 
 // incrementalOps bundles the engine-specific primitives the generic
@@ -1163,11 +1172,7 @@ func tryIncrementalBuild(
 		Inputs:         inputs,
 		RepoID:         repoID,
 	})
-	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
-		evictCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		snapshot.EvictExcess(evictCtx, cfg, st, repoID)
-	}()
+	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
@@ -1328,9 +1333,7 @@ func preparePostgres(
 		Inputs: inputs,
 		RepoID: repoID,
 	})
-	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
-		snapshot.EvictExcess(context.Background(), cfg, st, repoID)
-	}()
+	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
@@ -1621,9 +1624,7 @@ func prepareMongo(
 		Inputs: inputs,
 		RepoID: repoID,
 	})
-	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
-		snapshot.EvictExcess(context.Background(), cfg, st, repoID)
-	}()
+	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
@@ -1922,9 +1923,7 @@ func prepareRedisPrefix(
 		Inputs: inputs,
 		RepoID: repoID,
 	})
-	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
-		snapshot.EvictExcess(context.Background(), cfg, st, repoID)
-	}()
+	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
@@ -2209,9 +2208,7 @@ func prepareES(
 		Inputs: inputs,
 		RepoID: repoID,
 	})
-	go func() { //nolint:gosec // detached cache eviction; must outlive the prepare request ctx
-		snapshot.EvictExcess(context.Background(), cfg, st, repoID)
-	}()
+	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {

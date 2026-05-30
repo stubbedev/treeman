@@ -69,7 +69,7 @@ type scrollResp struct {
 func (d *Driver) openScroll(ctx context.Context, prefix string) (string, []scrollHit, error) {
 	body := `{"size":1000,"query":{"match_all":{}}}`
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		d.Base+"/"+prefix+"*/_search?scroll=5m", strings.NewReader(body))
+		d.Base+"/"+escSeg(prefix)+"*/_search?scroll=5m", strings.NewReader(body))
 	if err != nil {
 		return "", nil, err
 	}

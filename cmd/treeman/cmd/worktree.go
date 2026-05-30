@@ -379,8 +379,8 @@ func enrichWtRows(ctx context.Context, st *store.Store, all []wtRow, withStatus,
 			r.HeadTs = headCommitTs(r.Path)
 		}
 		if withStatus || asJSON {
-			dirty, dErr := worktreeDirty(r.Path)
-			unpushed, uErr := gitenv.HasUnpushedCommits(r.Path)
+			dirty, dErr := worktreeDirty(ctx, r.Path)
+			unpushed, uErr := gitenv.HasUnpushedCommits(ctx, r.Path)
 			r.Dirty = dirty
 			r.Unpushed = unpushed
 			switch {
@@ -465,8 +465,8 @@ func headCommitTs(path string) int64 {
 // `git status --porcelain` is non-empty. Returns false + error on
 // unreadable git state (treated as not-dirty so a missing repo doesn't
 // produce a misleading `*` marker).
-func worktreeDirty(path string) (bool, error) {
-	clean, err := gitenv.IsWorktreeClean(path)
+func worktreeDirty(ctx context.Context, path string) (bool, error) {
+	clean, err := gitenv.IsWorktreeClean(ctx, path)
 	if err != nil {
 		return false, err
 	}
@@ -790,7 +790,7 @@ func wtBack() *cli.Command {
 				return err
 			}
 
-			clean, err := gitenv.IsWorktreeClean(wtRoot)
+			clean, err := gitenv.IsWorktreeClean(ctx, wtRoot)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "git status failed: %v; --remove aborted\n", err)
 				fmt.Println(repoRoot)
@@ -801,7 +801,7 @@ func wtBack() *cli.Command {
 				fmt.Println(repoRoot)
 				return nil
 			}
-			unpushed, _ := gitenv.HasUnpushedCommits(wtRoot)
+			unpushed, _ := gitenv.HasUnpushedCommits(ctx, wtRoot)
 			if unpushed && !c.Bool("force") {
 				fmt.Fprintln(os.Stderr, "worktree has commits ahead of upstream; refusing --remove (pass --force to override)")
 				fmt.Println(repoRoot)
@@ -996,7 +996,7 @@ func wtGo() *cli.Command {
 			}
 
 			// (2) main clean → checkout there.
-			mainClean, _ := gitenv.IsWorktreeClean(repoRoot)
+			mainClean, _ := gitenv.IsWorktreeClean(ctx, repoRoot)
 			if mainClean {
 				if err := runCheckoutIn(repoRoot); err != nil {
 					return err

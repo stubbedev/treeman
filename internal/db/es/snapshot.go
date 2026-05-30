@@ -34,7 +34,10 @@ import (
 // IndexExists reports whether `name` is a live index in the cluster.
 // Uses HEAD /<name> which returns 200 / 404.
 func (d *Driver) IndexExists(ctx context.Context, name string) (bool, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, d.Base+"/"+name, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, d.Base+"/"+escSeg(name), nil)
+	if err != nil {
+		return false, err
+	}
 	resp, err := d.HTTP.Do(req)
 	if err != nil {
 		return false, err
@@ -190,8 +193,11 @@ func (d *Driver) setIndexBlock(ctx context.Context, name string, readOnly bool) 
 	if err != nil {
 		return fmt.Errorf("PUT /%s/_settings: marshal payload: %w", name, err)
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPut,
-		d.Base+"/"+name+"/_settings", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		d.Base+"/"+escSeg(name)+"/_settings", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.HTTP.Do(req)
 	if err != nil {

@@ -40,29 +40,42 @@ func EvictExcess(ctx context.Context, cfg *config.Config, st *store.Store, repoI
 		slog.Warn("snapshot eviction lookup", "repo_id", repoID, "err", err)
 		return
 	}
-	if len(candidates) == 0 {
-		return
-	}
-	for _, c := range candidates {
+	evictCandidates(ctx, cfg, st, candidates, repoID, "snapshot_evict", "snapshot eviction",
+		func(c store.SnapshotEvictionCandidate) string {
+			return fmt.Sprintf("evicted %s (%s)", c.TemplateName, c.Engine)
+		})
+}
+
+// evictCandidates drops each candidate's engine-side template and SQLite
+// row, then writes one eviction event. Shared by the LRU / per-source /
+// age sweeps — the only things that vary between them are the candidate
+// query (done by the caller), the repo scope, the event type, the log
+// prefix, and the message text.
+//
+// Pinned fingerprints (held by an in-flight prepare) are skipped — the
+// sweep is best-effort and the next tick picks them up once the pin
+// clears. A per-candidate drop/delete failure is logged and skipped so
+// one bad row can't strand the rest; the row survives for a later retry.
+//
+// The size sweep (running-total accounting) and PurgeRepo (no pin check,
+// error-collecting) keep their own loops.
+func evictCandidates(
+	ctx context.Context, cfg *config.Config, st *store.Store,
+	cands []store.SnapshotEvictionCandidate, repoID int64,
+	eventType, logPrefix string, msg func(store.SnapshotEvictionCandidate) string,
+) {
+	for _, c := range cands {
 		if IsPinned(c.Fingerprint) {
-			// In-flight prepare holds this fingerprint. Skip — the
-			// sweep is best-effort and the next tick will pick it up
-			// once the pin clears.
 			continue
 		}
 		if err := dropTemplate(ctx, cfg, c); err != nil {
-			slog.Warn("snapshot eviction drop", "template", c.TemplateName,
-				"engine", c.Engine, "err", err)
-			// Continue so a missing row for one engine doesn't block
-			// pruning others. The row stays so a retry can pick it
-			// up next time.
+			slog.Warn(logPrefix+" drop", "template", c.TemplateName, "engine", c.Engine, "err", err)
 			continue
 		}
 		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
-			slog.Warn("snapshot eviction delete row", "fp", c.Fingerprint, "err", err)
+			slog.Warn(logPrefix+" delete row", "fp", c.Fingerprint, "template", c.TemplateName, "err", err)
 		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_evict",
-			fmt.Sprintf("evicted %s (%s)", c.TemplateName, c.Engine),
+		_ = st.WriteEvent(ctx, store.LevelInfo, eventType, msg(c),
 			repoID, 0, "", 0, map[string]string{
 				"engine":      c.Engine,
 				"template":    c.TemplateName,
@@ -125,26 +138,10 @@ func SweepBySource(ctx context.Context, cfg *config.Config, st *store.Store) {
 		slog.Warn("snapshot source sweep query", "err", err)
 		return
 	}
-	for _, c := range cands {
-		if IsPinned(c.Fingerprint) {
-			continue
-		}
-		if err := dropTemplate(ctx, cfg, c); err != nil {
-			slog.Warn("snapshot source sweep drop", "template", c.TemplateName, "err", err)
-			continue
-		}
-		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
-			slog.Warn("snapshot source sweep delete row",
-				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
-		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_source_evict",
-			fmt.Sprintf("evicted %s (over keep_per_source=%d)", c.TemplateName, keep),
-			0, 0, "", 0, map[string]string{
-				"engine":      c.Engine,
-				"template":    c.TemplateName,
-				"fingerprint": c.Fingerprint,
-			})
-	}
+	evictCandidates(ctx, cfg, st, cands, 0, "snapshot_source_evict", "snapshot source sweep",
+		func(c store.SnapshotEvictionCandidate) string {
+			return fmt.Sprintf("evicted %s (over keep_per_source=%d)", c.TemplateName, keep)
+		})
 }
 
 func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvictionCandidate) error {
@@ -223,26 +220,10 @@ func SweepByAge(ctx context.Context, cfg *config.Config, st *store.Store) {
 		slog.Warn("snapshot age sweep query", "err", err)
 		return
 	}
-	for _, c := range cands {
-		if IsPinned(c.Fingerprint) {
-			continue
-		}
-		if err := dropTemplate(ctx, cfg, c); err != nil {
-			slog.Warn("snapshot age sweep drop", "template", c.TemplateName, "err", err)
-			continue
-		}
-		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
-			slog.Warn("snapshot age sweep delete row",
-				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
-		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_age_evict",
-			fmt.Sprintf("evicted %s (older than %dd)", c.TemplateName, days),
-			0, 0, "", 0, map[string]string{
-				"engine":      c.Engine,
-				"template":    c.TemplateName,
-				"fingerprint": c.Fingerprint,
-			})
-	}
+	evictCandidates(ctx, cfg, st, cands, 0, "snapshot_age_evict", "snapshot age sweep",
+		func(c store.SnapshotEvictionCandidate) string {
+			return fmt.Sprintf("evicted %s (older than %dd)", c.TemplateName, days)
+		})
 }
 
 // SweepBySize evicts the largest cached templates until total

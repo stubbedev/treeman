@@ -71,13 +71,16 @@ func resolveRepo(override string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return gitenv.MainRoot(abs)
+		// MainRoot is a fast local git probe; resolveRepo has ~37 callers
+		// across the mcp tool handlers, so Background avoids cascading a
+		// ctx param through all of them for what is a local lookup.
+		return gitenv.MainRoot(context.Background(), abs)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
-	return gitenv.MainRoot(cwd)
+	return gitenv.MainRoot(context.Background(), cwd)
 }
 
 // resolveWorktree expands "" → cwd, then canonicalises to an
@@ -164,7 +167,7 @@ func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.O
 	wt, branch := resolveWorktree(worktree)
 	repoRoot, err := resolveRepo(repoOverride)
 	if err != nil {
-		repoRoot, err = gitenv.MainRoot(wt)
+		repoRoot, err = gitenv.MainRoot(ctx, wt)
 		if err != nil {
 			return nil, err
 		}
@@ -201,7 +204,7 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 	wt, branch := resolveWorktree(worktree)
 	repoRoot, err := resolveRepo(repoOverride)
 	if err != nil {
-		repoRoot, err = gitenv.MainRoot(wt)
+		repoRoot, err = gitenv.MainRoot(ctx, wt)
 		if err != nil {
 			return nil, err
 		}
@@ -269,7 +272,7 @@ func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) (
 	wt, branch := resolveWorktree(worktree)
 	repoRoot, err := resolveRepo(repoOverride)
 	if err != nil {
-		repoRoot, err = gitenv.MainRoot(wt)
+		repoRoot, err = gitenv.MainRoot(ctx, wt)
 		if err != nil {
 			return nil, err
 		}
@@ -342,7 +345,7 @@ func confirmDestructive(
 // editing .treeman.yaml.
 func runHookPhase(ctx context.Context, phase, worktree string, envOverrides map[string]string) (hooks.RunOutcome, error) {
 	wt, branch := resolveWorktree(worktree)
-	repoRoot, err := gitenv.MainRoot(wt)
+	repoRoot, err := gitenv.MainRoot(ctx, wt)
 	if err != nil {
 		return hooks.RunOutcome{}, err
 	}

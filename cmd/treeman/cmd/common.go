@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,7 +18,10 @@ import (
 // the gitlink → `<main>/.git` → `<main>`, so callers always see
 // the checkout that owns `.treeman.yaml` and the seed dump.
 func DiscoverRepoRoot(start string) (string, error) {
-	root, err := gitenv.MainRoot(start)
+	// MainRoot is a fast local git probe with no upstream deadline; the
+	// CLI helper chain has no ctx to thread without cascading through the
+	// whole cmd tree, so Background is used here.
+	root, err := gitenv.MainRoot(context.Background(), start)
 	if err != nil {
 		return "", fmt.Errorf("discover repo root from %s: %w", start, err)
 	}

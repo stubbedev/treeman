@@ -1,6 +1,9 @@
 package notify
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestBucketMapsLifecycleEvents(t *testing.T) {
 	cases := []struct {
@@ -66,7 +69,7 @@ func TestNewSenderNoneIsUnavailable(t *testing.T) {
 	if s.Available() {
 		t.Error("none backend reported available")
 	}
-	if err := s.Send(Notification{Title: "t", Body: "b"}); err != nil {
+	if err := s.Send(context.Background(), Notification{Title: "t", Body: "b"}); err != nil {
 		t.Errorf("none.Send returned error: %v", err)
 	}
 }

@@ -18,7 +18,7 @@ type fakeSender struct{ ch chan notify.Notification }
 func newFakeSender() *fakeSender { return &fakeSender{ch: make(chan notify.Notification, 8)} }
 
 func (f *fakeSender) Available() bool { return true }
-func (f *fakeSender) Send(n notify.Notification) error {
+func (f *fakeSender) Send(_ context.Context, n notify.Notification) error {
 	f.ch <- n
 	return nil
 }

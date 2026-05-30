@@ -58,6 +58,7 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 		"idx_hook_runs_worktree",
 		"idx_repos_path_nocase",
 		"idx_snapshots_lru",
+		"idx_snapshots_migrations",
 		"idx_snapshots_repo_lru",
 		"idx_worktree_ports_one_per_port",
 		"idx_worktree_ports_one_per_slot",

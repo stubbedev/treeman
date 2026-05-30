@@ -68,7 +68,7 @@ func tryDockerExecRedisCLI(ctx context.Context, conn *config.RedisConn, targetPr
 		Engine:         conn.ContainerEngine,
 		Network:        conn.Network,
 	}
-	cid, cerr := containerip.ContainerID(opts)
+	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return false, nil //nolint:nilerr // container not resolvable; fall through
 	}

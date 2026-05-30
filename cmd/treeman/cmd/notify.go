@@ -76,7 +76,7 @@ the opt-in. Use --backend to probe a specific sender.`,
 				Body:    "Desktop notifications are working.",
 				Urgency: notify.UrgencyNormal,
 			}
-			if err := sender.Send(n); err != nil {
+			if err := sender.Send(ctx, n); err != nil {
 				return fmt.Errorf("send test notification: %w", err)
 			}
 			fmt.Printf("sent a test notification via %s\n", displayBackend(backend))

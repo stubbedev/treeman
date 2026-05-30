@@ -13,6 +13,7 @@
 package resolve
 
 import (
+	"context"
 	"net/url"
 	"path/filepath"
 	"slices"
@@ -127,7 +128,10 @@ func ApplyEnvCredentials(cfg *config.Config, repoRoot string) {
 // loading. Drivers will surface the real connectivity error later.
 func fillFromContainerEnv(cfg *config.Config) {
 	if m := cfg.Connections.Mysql; m != nil && m.Password == "" && (m.Container != "" || m.ComposeService != "") {
-		env, _ := containerip.EnvLookup(containerip.Opts{
+		// No ctx available here: fillFromContainerEnv is reached via the
+		// cached LoadResolved loaders which have no ctx, and threading one
+		// through every config-load call site is out of scope.
+		env, _ := containerip.EnvLookup(context.Background(), containerip.Opts{
 			Container:      m.Container,
 			ComposeService: m.ComposeService,
 			ComposeProject: m.ComposeProject,
@@ -141,7 +145,7 @@ func fillFromContainerEnv(cfg *config.Config) {
 		}
 	}
 	if p := cfg.Connections.Postgres; p != nil && p.Password == "" && (p.Container != "" || p.ComposeService != "") {
-		env, _ := containerip.EnvLookup(containerip.Opts{
+		env, _ := containerip.EnvLookup(context.Background(), containerip.Opts{
 			Container:      p.Container,
 			ComposeService: p.ComposeService,
 			ComposeProject: p.ComposeProject,

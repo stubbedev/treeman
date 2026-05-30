@@ -1,6 +1,7 @@
 package containerip
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -36,7 +37,7 @@ func TestRewritePreservesUnknownSchemes(t *testing.T) {
 }
 
 func TestResolveEmptyContainerReturnsEmpty(t *testing.T) {
-	ip, err := Resolve("", "")
+	ip, err := Resolve(context.Background(), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func TestNormEngineDefaultsToDocker(t *testing.T) {
 // a binary that cannot exist and assert the error names it — proves the
 // field is honored without needing podman/nerdctl installed.
 func TestContainerEngineSelectsBinary(t *testing.T) {
-	_, err := ContainerID(Opts{ComposeService: "svc", Engine: "tm-bogus-engine-xyz"})
+	_, err := ContainerID(context.Background(), Opts{ComposeService: "svc", Engine: "tm-bogus-engine-xyz"})
 	if err == nil {
 		t.Fatal("expected error for non-existent engine binary")
 	}
@@ -79,7 +80,7 @@ func TestComposeProjectResolution(t *testing.T) {
 
 	mustErrWithProject := func(opts Opts, wantProject string) {
 		t.Helper()
-		_, err := ContainerID(opts)
+		_, err := ContainerID(context.Background(), opts)
 		if err == nil {
 			t.Fatalf("expected error (bogus engine) for %+v", opts)
 		}

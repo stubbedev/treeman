@@ -28,7 +28,7 @@ import (
 // user's configured values; the function only overwrites them when
 // container-IP resolution succeeds.
 func ResolveAndProbe(ctx context.Context, engine string, opts containerip.Opts, host *string, port *uint16) error {
-	if addr, err := containerip.ResolveAddr(opts); err != nil {
+	if addr, err := containerip.ResolveAddr(ctx, opts); err != nil {
 		return fmt.Errorf("resolve container: %w", err)
 	} else if addr != nil {
 		*host = addr.Host
@@ -41,7 +41,7 @@ func ResolveAndProbe(ctx context.Context, engine string, opts containerip.Opts, 
 			return err
 		}
 		containerip.RefreshOpts(opts)
-		addr, e := containerip.ResolveAddr(opts)
+		addr, e := containerip.ResolveAddr(ctx, opts)
 		if e != nil || addr == nil {
 			return err
 		}

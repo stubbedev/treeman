@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -24,6 +25,13 @@ type Driver struct {
 	HTTP *http.Client
 }
 
+// escSeg percent-escapes a single URL path segment (an index name or
+// name prefix) so characters outside the index-name charset cannot
+// alter the request path or inject query parameters. Valid ES index
+// names (lowercase letters, digits, `-_.+`) pass through unchanged, so
+// the common case stays byte-identical.
+func escSeg(s string) string { return url.PathEscape(s) }
+
 // Connect probes reachability + returns a Driver. Auth (api key /
 // basic) is left for a future patch; the local-dev target uses
 // unauthenticated Elasticsearch.
@@ -38,7 +46,7 @@ func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 			Network:        cfg.Network,
 			InternalPort:   containerip.URIPort(url, 9200),
 		}
-		addr, err := containerip.ResolveAddr(opts)
+		addr, err := containerip.ResolveAddr(ctx, opts)
 		if err != nil {
 			return nil, fmt.Errorf("resolve container: %w", err)
 		}
@@ -132,7 +140,7 @@ func (d *Driver) DropMatchingFiltered(ctx context.Context, prefix string, keep f
 	g.SetLimit(limit)
 	for _, n := range names {
 		g.Go(func() error {
-			if _, err := d.delete(gctx, "/"+n); err != nil {
+			if _, err := d.delete(gctx, "/"+escSeg(n)); err != nil {
 				return fmt.Errorf("DELETE %s: %w", n, err)
 			}
 			return nil
@@ -146,7 +154,7 @@ func (d *Driver) DropMatchingFiltered(ctx context.Context, prefix string, keep f
 
 // ListMatching returns every index whose name starts with prefix.
 func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, error) {
-	body, err := d.get(ctx, "/_cat/indices/"+prefix+"*?h=index&format=json")
+	body, err := d.get(ctx, "/_cat/indices/"+escSeg(prefix)+"*?h=index&format=json")
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +180,10 @@ func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, err
 }
 
 func (d *Driver) get(ctx context.Context, path string) ([]byte, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, d.Base+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.Base+path, nil)
+	if err != nil {
+		return nil, err
+	}
 	resp, err := d.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -189,7 +200,10 @@ func (d *Driver) get(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (d *Driver) delete(ctx context.Context, path string) (int, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, d.Base+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, d.Base+path, nil)
+	if err != nil {
+		return 0, err
+	}
 	resp, err := d.HTTP.Do(req)
 	if err != nil {
 		return 0, err

@@ -116,6 +116,10 @@ func (d *Driver) OpenScoped(ctx context.Context, dbName string) (*sql.DB, error)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres %s: %w", dbName, err)
 	}
+	// Apply the same pool tuning as the primary Connect pool so scoped
+	// handles don't inherit the stdlib MaxIdleConns=2 / no-max-lifetime
+	// defaults (idle-connection churn + stale conns across server recycle).
+	adapter.ConfigurePool(db, int(d.cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres %s: %w", dbName, err)
@@ -204,9 +208,15 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 }
 
 func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, error) {
+	// Escape LIKE metacharacters in the prefix so a literal `_` (present in
+	// every templated `name_<slug>`) is not treated as a single-char
+	// wildcard — otherwise DropMatching/FlushDatabase could reap sibling
+	// databases. Postgres LIKE uses backslash as the default escape char,
+	// matching the MySQL driver's identical guard.
+	like := strings.NewReplacer(`\`, `\\`, `_`, `\_`, `%`, `\%`).Replace(prefix) + "%"
 	rows, err := d.DB.QueryContext(ctx,
 		"SELECT datname FROM pg_database WHERE datname LIKE $1 ORDER BY datname",
-		prefix+"%")
+		like)
 	if err != nil {
 		return nil, err
 	}

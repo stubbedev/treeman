@@ -30,15 +30,13 @@ import (
 //     repos that aren't git repos — rare).
 //
 // Returns "" + error when none of these find a root.
-func MainRoot(start string) (string, error) {
+func MainRoot(ctx context.Context, start string) (string, error) {
 	if abs, err := filepath.Abs(start); err == nil {
 		start = abs
 	}
 
 	// git-common-dir resolves linked worktrees → main repo's .git.
-	// Background ctx is fine: this is a fast local probe and callers
-	// upstream don't have a cancellation deadline to honor.
-	common, err := gitcmd.String(context.Background(), start, "rev-parse", "--git-common-dir")
+	common, err := gitcmd.String(ctx, start, "rev-parse", "--git-common-dir")
 	if err == nil {
 		if !filepath.IsAbs(common) {
 			// `git rev-parse` returns relative paths inside the
@@ -86,11 +84,11 @@ func IsLinkedWorktree(path string) bool {
 // worktree is empty — no uncommitted changes, no untracked files.
 // Used by `wt back --remove-if-clean` and equivalent safety
 // checks.
-func IsWorktreeClean(path string) (bool, error) {
+func IsWorktreeClean(ctx context.Context, path string) (bool, error) {
 	// `git status` is read-only from treeman's POV but updates the
 	// index lock by default — pass readOnly=false so we don't disable
 	// GIT_OPTIONAL_LOCKS for what is, semantically, a query.
-	out, err := gitcmd.Output(context.Background(), path, "status", "--porcelain")
+	out, err := gitcmd.Output(ctx, path, "status", "--porcelain")
 	if err != nil {
 		return false, err
 	}
@@ -100,11 +98,11 @@ func IsWorktreeClean(path string) (bool, error) {
 // HasUnpushedCommits returns true when the worktree's HEAD has
 // commits not reachable from its upstream tracking branch. Used to
 // avoid silently dropping work on auto-remove.
-func HasUnpushedCommits(path string) (bool, error) {
+func HasUnpushedCommits(ctx context.Context, path string) (bool, error) {
 	// `git -C <path> rev-list @{upstream}..HEAD --count` — empty
 	// upstream returns non-zero exit which we treat as "no tracking
 	// branch yet → can't be unpushed".
-	count, err := gitcmd.String(context.Background(), path, "rev-list", "@{upstream}..HEAD", "--count")
+	count, err := gitcmd.String(ctx, path, "rev-list", "@{upstream}..HEAD", "--count")
 	if err != nil {
 		// No upstream — treat as no unpushed work.
 		return false, nil //nolint:nilerr // no tracking branch means nothing can be unpushed
@@ -114,7 +112,7 @@ func HasUnpushedCommits(path string) (bool, error) {
 
 // DetectBranch reads the HEAD of a worktree (handles gitlink files
 // for linked worktrees). Returns "" if detached HEAD or unreadable.
-func DetectBranch(worktree string) string {
+func DetectBranch(_ context.Context, worktree string) string {
 	headPath := filepath.Join(worktree, ".git", "HEAD")
 	if fi, err := os.Stat(headPath); err != nil || fi.IsDir() {
 		// gitlink file — follow it.

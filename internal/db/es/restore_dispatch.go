@@ -61,7 +61,7 @@ func tryDockerExecESBulk(ctx context.Context, conn *config.EsConn, sourcePrefix,
 		Engine:         conn.ContainerEngine,
 		Network:        conn.Network,
 	}
-	cid, cerr := containerip.ContainerID(opts)
+	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return false, nil //nolint:nilerr // container not resolvable; fall through to wire HTTP
 	}

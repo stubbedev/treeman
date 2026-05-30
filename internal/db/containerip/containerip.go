@@ -121,7 +121,7 @@ func (o Opts) empty() bool {
 //     - else use the preferred network's IPAddress + InternalPort.
 //  4. When inspect fails AND we're inside a container, fall back
 //     to host.docker.internal at InternalPort.
-func ResolveAddr(opts Opts) (*Addr, error) {
+func ResolveAddr(ctx context.Context, opts Opts) (*Addr, error) {
 	if opts.empty() {
 		return nil, nil
 	}
@@ -134,7 +134,7 @@ func ResolveAddr(opts Opts) (*Addr, error) {
 	}
 	mu.Unlock()
 
-	addr, err := resolveUncached(opts)
+	addr, err := resolveUncached(ctx, opts)
 	if err != nil {
 		// Last-resort fallback for treeman-in-container: try the
 		// host loopback alias before bubbling the error up.
@@ -156,18 +156,18 @@ func ResolveAddr(opts Opts) (*Addr, error) {
 	return addr, nil
 }
 
-func resolveUncached(opts Opts) (*Addr, error) {
+func resolveUncached(ctx context.Context, opts Opts) (*Addr, error) {
 	engine := opts.normEngine()
-	if InsideContainer() && !engineSocketReachable(engine) {
+	if InsideContainer() && !engineSocketReachable(ctx, engine) {
 		// Skip the inspect path entirely — let the caller's
 		// configured host (sibling compose DNS) handle it.
 		return nil, nil
 	}
-	id, err := resolveContainerID(opts)
+	id, err := resolveContainerID(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	info, err := inspectContainer(engine, id)
+	info, err := inspectContainer(ctx, engine, id)
 	if err != nil {
 		return nil, err
 	}
@@ -195,11 +195,11 @@ func resolveUncached(opts Opts) (*Addr, error) {
 // that don't want the full Addr shape (e.g. URI rewrites that only
 // substitute the host part). Returns the empty string for empty
 // `container` so callers can fall through to their configured Host.
-func Resolve(container, engine string) (string, error) {
+func Resolve(ctx context.Context, container, engine string) (string, error) {
 	if container == "" {
 		return "", nil
 	}
-	addr, err := ResolveAddr(Opts{Container: container, Engine: engine})
+	addr, err := ResolveAddr(ctx, Opts{Container: container, Engine: engine})
 	if err != nil {
 		return "", err
 	}
@@ -240,12 +240,12 @@ func RefreshOpts(opts Opts) {
 // Container ref this is the ref itself; for a ComposeService it
 // runs `<engine> ps -q --filter label=...` to find the running
 // container.
-func ContainerID(opts Opts) (string, error) {
-	return resolveContainerID(opts)
+func ContainerID(ctx context.Context, opts Opts) (string, error) {
+	return resolveContainerID(ctx, opts)
 }
 
 // resolveContainerID is the internal alias kept for older callers.
-func resolveContainerID(opts Opts) (string, error) {
+func resolveContainerID(ctx context.Context, opts Opts) (string, error) {
 	if opts.Container != "" {
 		return opts.Container, nil
 	}
@@ -261,7 +261,7 @@ func resolveContainerID(opts Opts) (string, error) {
 	if project != "" {
 		args = append(args, "--filter", "label=com.docker.compose.project="+project)
 	}
-	out, err := exec.CommandContext(context.Background(), engine, args...).Output()
+	out, err := exec.CommandContext(ctx, engine, args...).Output()
 	if err != nil {
 		return "", fmt.Errorf("%s ps -q (service=%s, project=%s): %w", engine, opts.ComposeService, project, err)
 	}
@@ -291,8 +291,8 @@ type inspectInfo struct {
 	} `json:"Config"`
 }
 
-func inspectContainer(engine, id string) (*inspectInfo, error) {
-	out, err := exec.CommandContext(context.Background(), engine, "inspect", id).Output()
+func inspectContainer(ctx context.Context, engine, id string) (*inspectInfo, error) {
+	out, err := exec.CommandContext(ctx, engine, "inspect", id).Output()
 	if err != nil {
 		return nil, fmt.Errorf("%s inspect %s: %w", engine, id, err)
 	}
@@ -373,16 +373,16 @@ func (i *inspectInfo) publishedHostPort(internalPort uint16) (uint16, bool) {
 // map. Empty map + nil error when opts has no container ref or
 // inspect fails (callers treat this as "no autodiscovery
 // available", not a fatal error).
-func EnvLookup(opts Opts) (map[string]string, error) {
+func EnvLookup(ctx context.Context, opts Opts) (map[string]string, error) {
 	if opts.empty() {
 		return nil, nil
 	}
 	engine := opts.normEngine()
-	id, err := resolveContainerID(opts)
+	id, err := resolveContainerID(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	info, err := inspectContainer(engine, id)
+	info, err := inspectContainer(ctx, engine, id)
 	if err != nil {
 		return nil, err
 	}

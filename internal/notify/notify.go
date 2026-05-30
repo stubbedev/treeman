@@ -9,6 +9,8 @@
 // without ever shelling out to notify-send / osascript.
 package notify
 
+import "context"
+
 // Urgency is the notification priority hint. notify-send maps it to
 // `--urgency`; macOS has no per-banner urgency so it's ignored there.
 type Urgency string
@@ -31,7 +33,7 @@ type Notification struct {
 type Sender interface {
 	// Send delivers the notification. Returns an error when the backend
 	// is unavailable or the send failed.
-	Send(n Notification) error
+	Send(ctx context.Context, n Notification) error
 	// Available reports whether the backend can actually deliver (the
 	// binary exists / the platform is supported). Lets the daemon skip
 	// registering the notifier — and log once — instead of failing on
@@ -66,5 +68,5 @@ func NewSender(backend string) Sender {
 // as the platform fallback where no native sender exists.
 type noopSender struct{}
 
-func (noopSender) Send(Notification) error { return nil }
-func (noopSender) Available() bool         { return false }
+func (noopSender) Send(context.Context, Notification) error { return nil }
+func (noopSender) Available() bool                          { return false }

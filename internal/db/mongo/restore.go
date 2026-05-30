@@ -67,7 +67,7 @@ func tryDockerExecMongoRestore(ctx context.Context, conn *config.MongoConn, targ
 		Engine:         conn.ContainerEngine,
 		Network:        conn.Network,
 	}
-	cid, cerr := containerip.ContainerID(opts)
+	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return false, nil
 	}

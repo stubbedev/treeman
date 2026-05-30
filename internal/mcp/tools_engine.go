@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -116,13 +117,23 @@ func engineStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in engineS
 	if err != nil {
 		return nil, engineStatusOut{}, err
 	}
-	out := engineStatusOut{}
-	out.Engines = append(out.Engines, probeMySQL(ctx, cfg))
-	out.Engines = append(out.Engines, probePostgres(ctx, cfg))
-	out.Engines = append(out.Engines, probeMongo(ctx, cfg))
-	out.Engines = append(out.Engines, probeRedis(ctx, cfg))
-	out.Engines = append(out.Engines, probeES(ctx, cfg))
-	return nil, out, nil
+	// Probe every engine concurrently — each connect+version+list is an
+	// independent network round-trip, so serial probing blocked to the
+	// dial timeout of each unreachable engine in turn. Results are
+	// written to distinct slice indices (no shared mutation) and the
+	// fixed order is preserved.
+	probes := []func(context.Context, *config.Config) engineProbeResult{
+		probeMySQL, probePostgres, probeMongo, probeRedis, probeES,
+	}
+	results := make([]engineProbeResult, len(probes))
+	var wg sync.WaitGroup
+	for i, probe := range probes {
+		wg.Go(func() {
+			results[i] = probe(ctx, cfg)
+		})
+	}
+	wg.Wait()
+	return nil, engineStatusOut{Engines: results}, nil
 }
 
 func probeMySQL(ctx context.Context, cfg *config.Config) engineProbeResult {
@@ -1414,7 +1425,7 @@ func engineLogsTool(
 	if bin == "" {
 		bin = "docker"
 	}
-	id, err := containerip.ContainerID(containerip.Opts{
+	id, err := containerip.ContainerID(ctx, containerip.Opts{
 		Container:      ref.Container,
 		ComposeService: ref.ComposeService,
 		ComposeProject: ref.ComposeProject,

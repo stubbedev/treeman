@@ -197,7 +197,7 @@ func TestInheritedEnvReachesSubprocess(t *testing.T) {
 
 func TestRenderActionChainsWithAnd(t *testing.T) {
 	a := config.Action{Run: []string{"echo a", "echo b"}}
-	got, err := renderAction(a, "/tmp/x")
+	got, err := renderAction(context.Background(), a, "/tmp/x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestRenderActionChainsWithAnd(t *testing.T) {
 func TestRenderActionGroupLevelCwd(t *testing.T) {
 	// Explicit cwd on the Action applies to every step.
 	a := config.Action{Run: []string{"yarn install", "yarn build"}, Cwd: "frontend"}
-	got, err := renderAction(a, "/tmp/x")
+	got, err := renderAction(context.Background(), a, "/tmp/x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestRenderActionWrapsInDockerExec(t *testing.T) {
 		Run:       []string{"composer install", "php artisan migrate"},
 		Cwd:       "/var/www/html",
 	}
-	got, err := renderAction(a, "/host/wt")
+	got, err := renderAction(context.Background(), a, "/host/wt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestRenderActionWrapsInDockerExec(t *testing.T) {
 
 func TestRenderActionNoContainerPassesThrough(t *testing.T) {
 	entry := config.Action{Run: []string{"echo hi"}}
-	got, err := renderAction(entry, "/host/wt")
+	got, err := renderAction(context.Background(), entry, "/host/wt")
 	if err != nil {
 		t.Fatal(err)
 	}

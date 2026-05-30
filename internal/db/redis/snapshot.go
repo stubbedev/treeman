@@ -30,13 +30,34 @@ import (
 // config knob if needed.
 const DBIndex = 0
 
+// globEscape escapes the glob metacharacters Redis SCAN/KEYS MATCH
+// patterns recognise (`*`, `?`, `[`, `]`, `\`) so a prefix is matched
+// literally. Without this a prefix containing any of these would be
+// interpreted as a wildcard and could match — and therefore drop or
+// copy — unrelated keys. The trailing `*` callers append for the
+// prefix wildcard is added AFTER escaping and so stays a wildcard.
+func globEscape(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := range len(s) {
+		switch c := s[i]; c {
+		case '*', '?', '[', ']', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
 // PrefixExists reports whether ANY key matching `prefix*` lives in
 // Redis. Used by the cache-hit path as the equivalent of MySQL's
 // `DatabaseExists`. SCAN with COUNT=1 is the cheapest probe — it
 // stops as soon as the first matching key shows up.
 func (d *Driver) PrefixExists(ctx context.Context, prefix string) (bool, error) {
 	c := d.client()
-	iter := c.Scan(ctx, 0, prefix+"*", 1).Iterator()
+	iter := c.Scan(ctx, 0, globEscape(prefix)+"*", 1).Iterator()
 	if iter.Next(ctx) {
 		return true, nil
 	}
@@ -64,7 +85,7 @@ func (d *Driver) DropPrefixFiltered(ctx context.Context, prefix string, keep fun
 		return 0, errors.New("redis: refusing to drop empty prefix (would wipe every key)")
 	}
 	c := d.client()
-	iter := c.Scan(ctx, 0, prefix+"*", 1000).Iterator()
+	iter := c.Scan(ctx, 0, globEscape(prefix)+"*", 1000).Iterator()
 	var batch []string
 	deleted := 0
 	flush := func() error {
@@ -204,7 +225,7 @@ func versionAtLeast(v string, wantMajor, wantMinor int) bool {
 func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix string) error {
 	c := d.client()
 
-	iter := c.Scan(ctx, 0, srcPrefix+"*", 1000).Iterator()
+	iter := c.Scan(ctx, 0, globEscape(srcPrefix)+"*", 1000).Iterator()
 	pipe := c.Pipeline()
 	pending := 0
 	flush := func() error {
@@ -257,7 +278,7 @@ func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix stri
 func (d *Driver) copyByPrefixDumpRestore(ctx context.Context, srcPrefix, dstPrefix string) error {
 	c := d.client()
 
-	iter := c.Scan(ctx, 0, srcPrefix+"*", 1000).Iterator()
+	iter := c.Scan(ctx, 0, globEscape(srcPrefix)+"*", 1000).Iterator()
 	var batch []string
 
 	flush := func() error {

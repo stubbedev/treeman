@@ -62,7 +62,7 @@ func tryDockerExecMySQL(ctx context.Context, conn *config.MysqlConn, targetDB st
 		return false, nil
 	}
 	opts := containerOpts(conn.ContainerRef)
-	cid, cerr := containerip.ContainerID(opts)
+	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return false, nil //nolint:nilerr // container not resolvable; fall through to the next strategy
 	}
@@ -135,7 +135,7 @@ func tryDockerExecPostgres(ctx context.Context, conn *config.PostgresConn, targe
 		return false, nil
 	}
 	opts := containerOpts(conn.ContainerRef)
-	cid, cerr := containerip.ContainerID(opts)
+	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return false, nil //nolint:nilerr // container not resolvable; fall through to the next strategy
 	}

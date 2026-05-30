@@ -34,7 +34,7 @@ func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 			Network:        cfg.Network,
 			InternalPort:   containerip.URIPort(uri, 27017),
 		}
-		addr, err := containerip.ResolveAddr(opts)
+		addr, err := containerip.ResolveAddr(ctx, opts)
 		if err != nil {
 			return nil, fmt.Errorf("resolve container: %w", err)
 		}

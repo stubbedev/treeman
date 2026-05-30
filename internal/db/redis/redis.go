@@ -45,7 +45,7 @@ func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
 			Network:        cfg.Network,
 			InternalPort:   containerip.URIPort(url, 6379),
 		}
-		addr, err := containerip.ResolveAddr(opts)
+		addr, err := containerip.ResolveAddr(ctx, opts)
 		if err != nil {
 			return nil, fmt.Errorf("resolve container: %w", err)
 		}

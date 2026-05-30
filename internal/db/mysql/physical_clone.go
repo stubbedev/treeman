@@ -81,7 +81,7 @@ func (d *Driver) tryPhysicalSnapshotCreate(ctx context.Context, source, template
 		Engine:         d.cfg.ContainerEngine,
 		Network:        d.cfg.Network,
 	}
-	cid, err := containerip.ContainerID(opts)
+	cid, err := containerip.ContainerID(ctx, opts)
 	if err != nil {
 		return false, &physicalSkippedError{reason: "container not resolvable: " + err.Error()}
 	}

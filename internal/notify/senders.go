@@ -22,7 +22,7 @@ func (notifySendSender) Available() bool {
 	return err == nil
 }
 
-func (notifySendSender) Send(n Notification) error {
+func (notifySendSender) Send(ctx context.Context, n Notification) error {
 	path, err := exec.LookPath("notify-send")
 	if err != nil {
 		return fmt.Errorf("notify-send not found: %w", err)
@@ -31,7 +31,7 @@ func (notifySendSender) Send(n Notification) error {
 	if urgency == "" {
 		urgency = string(UrgencyNormal)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	// notify-send <summary> <body>. App name keeps the banner grouped
 	// under "treeman" in notification centres that support grouping.
@@ -53,12 +53,12 @@ func (osascriptSender) Available() bool {
 	return err == nil
 }
 
-func (osascriptSender) Send(n Notification) error {
+func (osascriptSender) Send(ctx context.Context, n Notification) error {
 	path, err := exec.LookPath("osascript")
 	if err != nil {
 		return fmt.Errorf("osascript not found: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), sendTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	// Build the AppleScript with -e and pass title/body as separate
 	// arguments referenced positionally, so a quote or backslash in the
