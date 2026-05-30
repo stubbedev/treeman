@@ -940,9 +940,45 @@ func cacheHitGeneric(
 	}, true, nil
 }
 
+// runPhase runs one cold-build runner phase (migrate or seed) against
+// `target` (the source DB name or key/index prefix), with the full
+// instrumentation every engine now shares: a per-phase log file, a
+// `prepare_runner_error` event + formatted error on a non-zero exit, and
+// a `prepare_phase` done event with the step duration. `phase` is
+// "migrate" or "seed". A nil-spec phase is the caller's concern (guard on
+// d.Migrate / d.Seed). The engine label is d.Engine throughout so logs,
+// events, and the log path all agree on the configured engine name.
+//
+// NOTE: the incremental-build path (tryIncrementalBuild) keeps its own
+// migrate invocation — its error wording and event flow are deliberately
+// distinct ("incremental migrate") and must not be folded in here.
+func runPhase(
+	ctx context.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath, target, phase string,
+	spec runner.Spec,
+	inheritedEnv map[string]string,
+) error {
+	stepStart := time.Now()
+	spec = spec.WithLogPath(runnerLogPath(worktreePath, d.Engine, phase, target))
+	out, err := runner.Run(ctx, spec, worktreePath, target, tplCtx, inheritedEnv)
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", phase, target, err)
+	}
+	if out.ExitCode != 0 {
+		emitRunnerError(ctx, st, repoID, worktreeID, d.Engine, target, phase, out)
+		return fmt.Errorf("%s", runner.FormatError(phase+" source", target, out))
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, target, phase, stepStart)
+	return nil
+}
+
 // mysqlColdBuildSteps runs the MySQL cold-build populate phase: drop +
 // recreate the source DB, optionally load a dump, then run migrate and
-// seed. Extracted verbatim from prepareMySQL's cold-build block.
+// seed.
 func mysqlColdBuildSteps(
 	ctx context.Context,
 	drv *dbmysql.Driver,
@@ -976,30 +1012,38 @@ func mysqlColdBuildSteps(
 		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourceDB, dr.Path, i, len(dumps), stepStart, string(strategy))
 	}
 	if d.Migrate != nil {
-		stepStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "mysql", "migrate", sourceDB))
-		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("migrate source %s: %w", sourceDB, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourceDB,
+			"migrate",
+			runner.FromMigrate(*d.Migrate),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "mysql", sourceDB, "migrate", out)
-			return fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
 	}
 	if d.Seed != nil {
-		stepStart := time.Now()
-		spec := runner.FromSeed(*d.Seed).WithLogPath(runnerLogPath(worktreePath, "mysql", "seed", sourceDB))
-		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("seed source %s: %w", sourceDB, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourceDB,
+			"seed",
+			runner.FromSeed(*d.Seed),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "mysql", sourceDB, "seed", out)
-			return fmt.Errorf("%s", runner.FormatError("seed source", sourceDB, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
 	return nil
 }
@@ -1008,6 +1052,32 @@ func mysqlColdBuildSteps(
 // source, records the SQLite snapshot row, and fires the detached LRU
 // eviction sweep. Extracted verbatim from prepareMySQL's snapshot/record
 // block.
+// recordSnapshot writes the SQLite snapshot row for a freshly-built
+// template. Identical across every engine and across both the cold-build
+// and incremental paths — only the engine label, version, source/template
+// names, and input vectors vary.
+func recordSnapshot(
+	ctx context.Context,
+	st *store.Store,
+	key snapshot.Key,
+	engine, version, source, template string,
+	inputs map[string]store.InputVector,
+	repoID int64,
+) {
+	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
+		Fingerprint:    key.Fingerprint(),
+		Engine:         engine,
+		EngineVersion:  version,
+		SourceDB:       source,
+		TemplateName:   template,
+		MigrationsHash: key.MigrationsHashHex,
+		DumpHash:       key.DumpHashHex,
+		LockfileHashes: key.LockfileHashes,
+		Inputs:         inputs,
+		RepoID:         repoID,
+	})
+}
+
 func mysqlSnapshotAndRecord(
 	ctx context.Context,
 	drv *dbmysql.Driver,
@@ -1025,18 +1095,7 @@ func mysqlSnapshotAndRecord(
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
 	emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, sourceDB, templateName, string(drv.LastCloneStrategy()))
-	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
-		Fingerprint:    key.Fingerprint(),
-		Engine:         d.Engine,
-		EngineVersion:  version,
-		SourceDB:       sourceDB,
-		TemplateName:   templateName,
-		MigrationsHash: key.MigrationsHashHex,
-		DumpHash:       key.DumpHashHex,
-		LockfileHashes: key.LockfileHashes,
-		Inputs:         inputs,
-		RepoID:         repoID,
-	})
+	recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName, inputs, repoID)
 	// Fire-and-forget LRU eviction for this repo. Uses a fresh
 	// background context with a hard deadline so a stalled DROP
 	// (e.g. lock contention) can't leak this goroutine forever.
@@ -1099,7 +1158,7 @@ type incrementalOps struct {
 // `prepare_incremental_fallback` events surface why the path was taken
 // or abandoned.
 //
-//nolint:gocyclo,funlen // one self-contained orchestrator with explicit fall-through events — splitting just spreads the same branches across helpers without simplifying review
+//nolint:gocyclo // one self-contained orchestrator with explicit fall-through events — splitting just spreads the same branches across helpers without simplifying review
 func tryIncrementalBuild(
 	ctx context.Context,
 	cfg *config.Config,
@@ -1183,18 +1242,7 @@ func tryIncrementalBuild(
 		return Outcome{}, false, fmt.Errorf("incremental snapshot create %s → %s: %w", source, templateName, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "snapshot-create", snapStart)
-	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
-		Fingerprint:    key.Fingerprint(),
-		Engine:         d.Engine,
-		EngineVersion:  version,
-		SourceDB:       source,
-		TemplateName:   templateName,
-		MigrationsHash: key.MigrationsHashHex,
-		DumpHash:       key.DumpHashHex,
-		LockfileHashes: key.LockfileHashes,
-		Inputs:         inputs,
-		RepoID:         repoID,
-	})
+	recordSnapshot(ctx, st, key, d.Engine, version, source, templateName, inputs, repoID)
 	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
@@ -1363,13 +1411,7 @@ func preparePostgres(
 		return Outcome{}, fmt.Errorf("snapshot create %s → %s: %w", sourceDB, templateName, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
-	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
-		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
-		SourceDB: sourceDB, TemplateName: templateName,
-		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
-		Inputs: inputs,
-		RepoID: repoID,
-	})
+	recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName, inputs, repoID)
 	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
@@ -1458,30 +1500,38 @@ func postgresColdBuildSteps(
 		_ = scoped.Close()
 	}
 	if d.Migrate != nil {
-		stepStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "postgres", "migrate", sourceDB))
-		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("migrate source %s: %w", sourceDB, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourceDB,
+			"migrate",
+			runner.FromMigrate(*d.Migrate),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "postgres", sourceDB, "migrate", out)
-			return fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
 	}
 	if d.Seed != nil {
-		stepStart := time.Now()
-		spec := runner.FromSeed(*d.Seed).WithLogPath(runnerLogPath(worktreePath, "postgres", "seed", sourceDB))
-		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("seed source %s: %w", sourceDB, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourceDB,
+			"seed",
+			runner.FromSeed(*d.Seed),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "postgres", sourceDB, "seed", out)
-			return fmt.Errorf("%s", runner.FormatError("seed source", sourceDB, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
 	return nil
 }
@@ -1592,13 +1642,7 @@ func prepareMongo(
 		return Outcome{}, fmt.Errorf("mongo snapshot create %s → %s: %w", sourceDB, templateName, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
-	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
-		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
-		SourceDB: sourceDB, TemplateName: templateName,
-		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
-		Inputs: inputs,
-		RepoID: repoID,
-	})
+	recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName, inputs, repoID)
 	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
@@ -1669,28 +1713,38 @@ func mongoColdBuildSteps(
 		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourceDB, dr.Path, i, len(dumps), stepStart, string(strategy))
 	}
 	if d.Migrate != nil {
-		stepStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "mongodb", "migrate", sourceDB))
-		out, err := runner.Run(ctx, spec, worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("migrate source %s: %w", sourceDB, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourceDB,
+			"migrate",
+			runner.FromMigrate(*d.Migrate),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "mongodb", sourceDB, "migrate", out)
-			return fmt.Errorf("%s", runner.FormatError("migrate source", sourceDB, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "migrate", stepStart)
 	}
 	if d.Seed != nil {
-		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourceDB, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("seed source %s: %w", sourceDB, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourceDB,
+			"seed",
+			runner.FromSeed(*d.Seed),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			return fmt.Errorf("seed source %s exit %d: %s", sourceDB, out.ExitCode, out.StderrTail)
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "seed", stepStart)
 	}
 	return nil
 }
@@ -1827,13 +1881,7 @@ func prepareRedisPrefix(
 		return Outcome{}, fmt.Errorf("redis snapshot create %s → %s: %w", sourcePrefix, templatePrefix, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "snapshot-create", snapStart)
-	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
-		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
-		SourceDB: sourcePrefix, TemplateName: templatePrefix,
-		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
-		Inputs: inputs,
-		RepoID: repoID,
-	})
+	recordSnapshot(ctx, st, key, d.Engine, version, sourcePrefix, templatePrefix, inputs, repoID)
 	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
@@ -1911,28 +1959,38 @@ func redisColdBuildSteps(
 			i, len(dumps), stepStart, string(strategy))
 	}
 	if d.Migrate != nil {
-		stepStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "redis", "migrate", sourcePrefix))
-		out, err := runner.Run(ctx, spec, worktreePath, sourcePrefix, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("migrate redis %s: %w", sourcePrefix, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourcePrefix,
+			"migrate",
+			runner.FromMigrate(*d.Migrate),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "redis", sourcePrefix, "migrate", out)
-			return fmt.Errorf("%s", runner.FormatError("migrate redis", sourcePrefix, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "migrate", stepStart)
 	}
 	if d.Seed != nil {
-		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("seed redis %s: %w", sourcePrefix, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourcePrefix,
+			"seed",
+			runner.FromSeed(*d.Seed),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			return fmt.Errorf("seed redis %s exit %d: %s", sourcePrefix, out.ExitCode, out.StderrTail)
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "seed", stepStart)
 	}
 	return nil
 }
@@ -2064,13 +2122,7 @@ func prepareES(
 		return Outcome{}, fmt.Errorf("es snapshot create %s → %s: %w", sourcePrefix, templatePrefix, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "snapshot-create", snapStart)
-	_ = st.RecordSnapshot(ctx, store.SnapshotRecord{
-		Fingerprint: key.Fingerprint(), Engine: d.Engine, EngineVersion: version,
-		SourceDB: sourcePrefix, TemplateName: templatePrefix,
-		MigrationsHash: key.MigrationsHashHex, DumpHash: key.DumpHashHex, LockfileHashes: key.LockfileHashes,
-		Inputs: inputs,
-		RepoID: repoID,
-	})
+	recordSnapshot(ctx, st, key, d.Engine, version, sourcePrefix, templatePrefix, inputs, repoID)
 	spawnEvict(cfg, st, repoID)
 
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
@@ -2148,28 +2200,38 @@ func esColdBuildSteps(
 			i, len(dumps), stepStart, string(strategy))
 	}
 	if d.Migrate != nil {
-		stepStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, "elasticsearch", "migrate", sourcePrefix))
-		out, err := runner.Run(ctx, spec, worktreePath, sourcePrefix, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("migrate es %s: %w", sourcePrefix, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourcePrefix,
+			"migrate",
+			runner.FromMigrate(*d.Migrate),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, "elasticsearch", sourcePrefix, "migrate", out)
-			return fmt.Errorf("%s", runner.FormatError("migrate es", sourcePrefix, out))
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "migrate", stepStart)
 	}
 	if d.Seed != nil {
-		stepStart := time.Now()
-		out, err := runner.Run(ctx, runner.FromSeed(*d.Seed), worktreePath, sourcePrefix, tplCtx, inheritedEnv)
-		if err != nil {
-			return fmt.Errorf("seed es %s: %w", sourcePrefix, err)
+		if err := runPhase(
+			ctx,
+			st,
+			repoID,
+			worktreeID,
+			d,
+			tplCtx,
+			worktreePath,
+			sourcePrefix,
+			"seed",
+			runner.FromSeed(*d.Seed),
+			inheritedEnv,
+		); err != nil {
+			return err
 		}
-		if out.ExitCode != 0 {
-			return fmt.Errorf("seed es %s exit %d: %s", sourcePrefix, out.ExitCode, out.StderrTail)
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "seed", stepStart)
 	}
 	return nil
 }

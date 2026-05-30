@@ -117,7 +117,11 @@ func (c mongoConn) DropMatching(ctx context.Context, n string) (int, error) {
 	return len(dropped), err
 }
 func (c mongoConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
-func (mongoConn) SizeKB(context.Context, string) int64               { return 0 }
+
+func (c mongoConn) SizeKB(ctx context.Context, n string) int64 {
+	b, _ := c.d.DataSizeBytes(ctx, n)
+	return b / 1024
+}
 
 type redisConn struct{ d *dbredis.Driver }
 
@@ -131,7 +135,11 @@ func (c redisConn) DropMatching(ctx context.Context, n string) (int, error) {
 	return c.d.DropPrefix(ctx, n)
 }
 func (c redisConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
-func (redisConn) SizeKB(context.Context, string) int64               { return 0 }
+
+// SizeKB is 0 for Redis: prefix size has no cheap server-side query —
+// it would need a SCAN + per-key MEMORY USAGE, too expensive for an
+// inspection probe. Left unimplemented rather than stubbed misleadingly.
+func (redisConn) SizeKB(context.Context, string) int64 { return 0 }
 
 // esConn — the ES driver holds no closable handle, so Close is a no-op.
 type esConn struct{ d *dbes.Driver }
@@ -148,7 +156,11 @@ func (c esConn) DropMatching(ctx context.Context, n string) (int, error) {
 	return len(dropped), err
 }
 func (c esConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
-func (esConn) SizeKB(context.Context, string) int64               { return 0 }
+
+func (c esConn) SizeKB(ctx context.Context, n string) int64 {
+	b, _ := c.d.StoreSizeBytes(ctx, n)
+	return b / 1024
+}
 
 // Configured reports whether `fam` has a connection block in cfg —
 // i.e. whether Connect would return configured=true. Lets callers cheaply

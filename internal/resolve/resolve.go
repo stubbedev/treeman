@@ -197,10 +197,8 @@ func resolveMysql(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.
 	}
 	if u, src, ok := pickURL(env, "MYSQL_URL", []string{"mysql", "mariadb", "tidb"}); ok {
 		m := mysqlFromURL(u)
-		if u.User != nil {
-			if p, ok := u.User.Password(); ok && nonEmpty(p) {
-				m.Password = p
-			}
+		if p, ok := urlPassword(u); ok {
+			m.Password = p
 		}
 		return &resolvedConn[config.MysqlConn]{Conn: m, Source: src}
 	}
@@ -245,12 +243,8 @@ func springMysql(env envfile.EnvFile) (config.MysqlConn, bool) {
 		return config.MysqlConn{}, false
 	}
 	m := mysqlFromURL(u)
-	if pwd, ok := env.Get("SPRING_DATASOURCE_PASSWORD"); ok && nonEmpty(pwd) {
-		m.Password = pwd
-	} else if u.User != nil {
-		if p, ok := u.User.Password(); ok && nonEmpty(p) {
-			m.Password = p
-		}
+	if pw, ok := springPassword(env, u); ok {
+		m.Password = pw
 	}
 	if user, ok := env.Get("SPRING_DATASOURCE_USERNAME"); ok {
 		m.User = user
@@ -283,19 +277,15 @@ func resolvePostgres(cfg *config.Config, env envfile.EnvFile) *resolvedConn[conf
 	}
 	if u, src, ok := pickURL(env, "POSTGRES_URL", []string{"postgres", "postgresql", "cockroach", "cockroachdb"}); ok {
 		p := postgresFromURL(u)
-		if u.User != nil {
-			if pp, ok := u.User.Password(); ok && nonEmpty(pp) {
-				p.Password = pp
-			}
+		if pw, ok := urlPassword(u); ok {
+			p.Password = pw
 		}
 		return &resolvedConn[config.PostgresConn]{Conn: p, Source: src}
 	}
 	if u, src, ok := pickURL(env, "PG_URL", []string{"postgres", "postgresql", "cockroach", "cockroachdb"}); ok {
 		p := postgresFromURL(u)
-		if u.User != nil {
-			if pp, ok := u.User.Password(); ok && nonEmpty(pp) {
-				p.Password = pp
-			}
+		if pw, ok := urlPassword(u); ok {
+			p.Password = pw
 		}
 		return &resolvedConn[config.PostgresConn]{Conn: p, Source: src}
 	}
@@ -316,12 +306,8 @@ func springPostgres(env envfile.EnvFile) (config.PostgresConn, bool) {
 		return config.PostgresConn{}, false
 	}
 	p := postgresFromURL(u)
-	if pwd, ok := env.Get("SPRING_DATASOURCE_PASSWORD"); ok && nonEmpty(pwd) {
-		p.Password = pwd
-	} else if u.User != nil {
-		if pp, ok := u.User.Password(); ok && nonEmpty(pp) {
-			p.Password = pp
-		}
+	if pw, ok := springPassword(env, u); ok {
+		p.Password = pw
 	}
 	if user, ok := env.Get("SPRING_DATASOURCE_USERNAME"); ok {
 		p.User = user
@@ -623,6 +609,29 @@ func buildUserInfo(user, pass string) string {
 
 func nonEmpty(s string) bool {
 	return s != "" && s != "null"
+}
+
+// urlPassword returns the URL's embedded password when present and
+// non-empty. Centralises the `u.User != nil && Password() ok &&
+// nonEmpty` dance repeated by every engine's URL/JDBC parsing.
+func urlPassword(u *url.URL) (string, bool) {
+	if u == nil || u.User == nil {
+		return "", false
+	}
+	if p, ok := u.User.Password(); ok && nonEmpty(p) {
+		return p, true
+	}
+	return "", false
+}
+
+// springPassword resolves the password for a Spring datasource: an
+// explicit SPRING_DATASOURCE_PASSWORD wins, otherwise fall back to any
+// password embedded in the JDBC URL.
+func springPassword(env envfile.EnvFile, u *url.URL) (string, bool) {
+	if pwd, ok := env.Get("SPRING_DATASOURCE_PASSWORD"); ok && nonEmpty(pwd) {
+		return pwd, true
+	}
+	return urlPassword(u)
 }
 
 func firstEnv(env envfile.EnvFile, keys ...string) string {

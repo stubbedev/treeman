@@ -521,9 +521,12 @@ func (c *MysqlConn) UnmarshalYAML(node *yaml.Node) error {
 }
 
 // JSONSchema for MysqlConn: scalar DSN OR full structured object.
-func (MysqlConn) JSONSchema() *jsonschema.Schema {
+// sqlConnStructSchema reflects the structured-object form shared by the
+// MySQL and Postgres connection types — they carry the identical field
+// set, so the schema is generated once here.
+func sqlConnStructSchema() *jsonschema.Schema {
 	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
-	obj := r.Reflect(&struct {
+	return r.Reflect(&struct {
 		Host         string       `yaml:"host,omitempty"`
 		Port         uint16       `yaml:"port,omitempty"`
 		User         string       `yaml:"user"`
@@ -531,42 +534,99 @@ func (MysqlConn) JSONSchema() *jsonschema.Schema {
 		PoolMax      uint32       `yaml:"pool_max,omitempty"`
 		ContainerRef ContainerRef `yaml:",inline"`
 	}{})
+}
+
+// dsnOrStructSchema wraps the shared structured form in a OneOf with the
+// bare-DSN string alternative. `dsnDesc` documents the string form;
+// `desc` is the overall connection description.
+func dsnOrStructSchema(dsnDesc, desc string) *jsonschema.Schema {
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
-			{Type: "string", Description: "DSN: `mysql://user:pass@host:port/dbname`. Equivalent to the structured form below."},
-			obj,
+			{Type: "string", Description: dsnDesc},
+			sqlConnStructSchema(),
 		},
-		Description: "MySQL connection — bare DSN string OR structured object.",
+		Description: desc,
 	}
 }
 
-// parseMysqlDSN fills cfg from a URL-form DSN.
-func parseMysqlDSN(dsn string, cfg *MysqlConn) error {
+func (MysqlConn) JSONSchema() *jsonschema.Schema {
+	return dsnOrStructSchema(
+		"DSN: `mysql://user:pass@host:port/dbname`. Equivalent to the structured form below.",
+		"MySQL connection — bare DSN string OR structured object.",
+	)
+}
+
+// dsnParts holds the fields parsed from a URL-style DSN. The has* flags
+// preserve the "field was present in the DSN" distinction so the caller
+// only overwrites its struct's defaults for values the DSN actually
+// specified (a bare `user@host` must not blank an existing password).
+type dsnParts struct {
+	host        string
+	port        uint16
+	hasPort     bool
+	user        string
+	hasUser     bool
+	password    string
+	hasPassword bool
+}
+
+// parseConnDSN parses host/port/user/password from a URL-style DSN,
+// validating the scheme against `schemes`. `label` prefixes error
+// messages; `schemeHint` is the human-readable accepted-scheme string in
+// the scheme error. Shared by the mysql and postgres DSN parsers.
+func parseConnDSN(dsn, label, schemeHint string, schemes ...string) (dsnParts, error) {
+	var p dsnParts
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return fmt.Errorf("parse mysql DSN: %w", err)
+		return p, fmt.Errorf("parse %s DSN: %w", label, err)
 	}
-	if u.Scheme != "mysql" && u.Scheme != "mariadb" {
-		return fmt.Errorf("mysql DSN: scheme must be mysql(:|maria:)//, got %q", u.Scheme)
+	if !slices.Contains(schemes, u.Scheme) {
+		return p, fmt.Errorf("%s DSN: scheme must be %s, got %q", label, schemeHint, u.Scheme)
 	}
-	cfg.Host = u.Hostname()
-	if p := u.Port(); p != "" {
-		n, err := strconv.Atoi(p)
+	p.host = u.Hostname()
+	if ps := u.Port(); ps != "" {
+		n, err := strconv.Atoi(ps)
 		if err != nil {
-			return fmt.Errorf("mysql DSN port: %w", err)
+			return p, fmt.Errorf("%s DSN port: %w", label, err)
 		}
 		if n < 0 || n > 65535 {
-			return fmt.Errorf("mysql DSN port out of range: %d", n)
+			return p, fmt.Errorf("%s DSN port out of range: %d", label, n)
 		}
-		cfg.Port = uint16(n)
-
+		p.port = uint16(n)
+		p.hasPort = true
 	}
 	if u.User != nil {
-		cfg.User = u.User.Username()
+		p.hasUser = true
+		p.user = u.User.Username()
 		if pw, ok := u.User.Password(); ok {
-			cfg.Password = pw
+			p.password = pw
+			p.hasPassword = true
 		}
 	}
+	return p, nil
+}
+
+// applyDSNParts writes the parsed DSN fields into a connection struct's
+// host/port/user/password, only for fields the DSN actually specified.
+func applyDSNParts(p dsnParts, host *string, port *uint16, user, password *string) {
+	*host = p.host
+	if p.hasPort {
+		*port = p.port
+	}
+	if p.hasUser {
+		*user = p.user
+		if p.hasPassword {
+			*password = p.password
+		}
+	}
+}
+
+func parseMysqlDSN(dsn string, cfg *MysqlConn) error {
+	p, err := parseConnDSN(dsn, "mysql", "mysql(:|maria:)//", "mysql", "mariadb")
+	if err != nil {
+		return err
+	}
+	applyDSNParts(p, &cfg.Host, &cfg.Port, &cfg.User, &cfg.Password)
 	return nil
 }
 
@@ -609,54 +669,19 @@ func (c *PostgresConn) UnmarshalYAML(node *yaml.Node) error {
 
 // JSONSchema for PostgresConn: scalar DSN OR full structured object.
 func (PostgresConn) JSONSchema() *jsonschema.Schema {
-	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
-	obj := r.Reflect(&struct {
-		Host         string       `yaml:"host,omitempty"`
-		Port         uint16       `yaml:"port,omitempty"`
-		User         string       `yaml:"user"`
-		Password     string       `yaml:"password,omitempty"`
-		PoolMax      uint32       `yaml:"pool_max,omitempty"`
-		ContainerRef ContainerRef `yaml:",inline"`
-	}{})
-	return &jsonschema.Schema{
-		OneOf: []*jsonschema.Schema{
-			{
-				Type:        "string",
-				Description: "DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below.",
-			},
-			obj,
-		},
-		Description: "Postgres connection — bare DSN string OR structured object.",
-	}
+	return dsnOrStructSchema(
+		"DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below.",
+		"Postgres connection — bare DSN string OR structured object.",
+	)
 }
 
 // parsePostgresDSN fills cfg from a URL-form DSN.
 func parsePostgresDSN(dsn string, cfg *PostgresConn) error {
-	u, err := url.Parse(dsn)
+	p, err := parseConnDSN(dsn, "postgres", "postgres(ql)://", "postgres", "postgresql")
 	if err != nil {
-		return fmt.Errorf("parse postgres DSN: %w", err)
+		return err
 	}
-	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
-		return fmt.Errorf("postgres DSN: scheme must be postgres(ql)://, got %q", u.Scheme)
-	}
-	cfg.Host = u.Hostname()
-	if p := u.Port(); p != "" {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			return fmt.Errorf("postgres DSN port: %w", err)
-		}
-		if n < 0 || n > 65535 {
-			return fmt.Errorf("postgres DSN port out of range: %d", n)
-		}
-		cfg.Port = uint16(n)
-
-	}
-	if u.User != nil {
-		cfg.User = u.User.Username()
-		if pw, ok := u.User.Password(); ok {
-			cfg.Password = pw
-		}
-	}
+	applyDSNParts(p, &cfg.Host, &cfg.Port, &cfg.User, &cfg.Password)
 	return nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/sync/errgroup"
@@ -63,6 +64,19 @@ func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 }
 
 func (d *Driver) Close(ctx context.Context) error { return d.Client.Disconnect(ctx) }
+
+// DataSizeBytes returns the logical document size (dbStats.dataSize) of
+// the named database in bytes, or 0 on error. Used by the MCP
+// snapshot-inspect size estimate.
+func (d *Driver) DataSizeBytes(ctx context.Context, name string) (int64, error) {
+	var res struct {
+		DataSize float64 `bson:"dataSize"`
+	}
+	if err := d.Client.Database(name).RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&res); err != nil {
+		return 0, err
+	}
+	return int64(res.DataSize), nil
+}
 
 // DropMatching drops every database whose name starts with prefix.
 // Returns the names that were actually dropped.

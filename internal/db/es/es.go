@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -177,6 +178,29 @@ func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, err
 		out = append(out, r.Index)
 	}
 	return out, nil
+}
+
+// StoreSizeBytes sums the on-disk store.size (in bytes) of every index
+// matching `<prefix>*`, or 0 on error / no matching indices. Used by the
+// MCP snapshot-inspect size estimate.
+func (d *Driver) StoreSizeBytes(ctx context.Context, prefix string) (int64, error) {
+	body, err := d.get(ctx, "/_cat/indices/"+escSeg(prefix)+"*?bytes=b&h=store.size&format=json")
+	if err != nil {
+		return 0, err
+	}
+	var rows []struct {
+		Size string `json:"store.size"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, r := range rows {
+		if n, perr := strconv.ParseInt(strings.TrimSpace(r.Size), 10, 64); perr == nil {
+			total += n
+		}
+	}
+	return total, nil
 }
 
 func (d *Driver) get(ctx context.Context, path string) ([]byte, error) {
