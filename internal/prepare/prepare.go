@@ -284,12 +284,9 @@ type cloneRestorer func(ctx context.Context, template, target string) error
 // `CREATE DATABASE … TEMPLATE` statement; the bottleneck is disk
 // throughput (block-copy of template files), so an outer wider than
 // 8 just thrashes seeks without improving wall-clock — cap there.
-var fanOutLimits = map[string]int{
-	"mysql":      4,
-	"mariadb":    4,
-	"tidb":       4,
-	"postgres":   8,
-	"postgresql": 8,
+var fanOutLimits = map[engine.Family]int{
+	engine.FamilyMySQL:    4,
+	engine.FamilyPostgres: 8,
 }
 
 // innerConnsPerRestore models how many backend connections one
@@ -299,12 +296,9 @@ var fanOutLimits = map[string]int{
 // dominant term; Postgres only needs the one CREATE DATABASE
 // session. Unknown engines collapse to 1 (no inner parallelism
 // assumed).
-var innerConnsPerRestore = map[string]int{
-	"mysql":      mysqlInnerPerRestore,
-	"mariadb":    mysqlInnerPerRestore,
-	"tidb":       mysqlInnerPerRestore,
-	"postgres":   1,
-	"postgresql": 1,
+var innerConnsPerRestore = map[engine.Family]int{
+	engine.FamilyMySQL:    mysqlInnerPerRestore,
+	engine.FamilyPostgres: 1,
 }
 
 // mysqlInnerPerRestore mirrors mysqlCloneFanout in the mysql driver.
@@ -322,9 +316,9 @@ const mysqlInnerPerRestore = 6
 // a misconfigured `max_connections=10000` doesn't spawn thousands of
 // restorer goroutines. Per-call `len(clones)` clamping happens at
 // the use site.
-func autoTuneOuter(engine string, maxConns int) int {
-	inner := max(innerConnsPerRestore[engine], 1)
-	defaultCap := fanOutLimits[engine]
+func autoTuneOuter(fam engine.Family, maxConns int) int {
+	inner := max(innerConnsPerRestore[fam], 1)
+	defaultCap := fanOutLimits[fam]
 	if defaultCap < 2 {
 		defaultCap = 4
 	}
@@ -480,15 +474,16 @@ func fanOutClones(
 // result is clamped to [2, numClones]. autoTuned reports whether the
 // max-connections heuristic was used (surfaced in the fanout_start
 // event payload).
-func fanOutLimit(override uint32, maxConns, numClones int, engine string) (limit int, autoTuned bool) {
+func fanOutLimit(override uint32, maxConns, numClones int, eng string) (limit int, autoTuned bool) {
+	fam, _ := engine.Canonical(eng)
 	switch {
 	case override > 0:
 		limit = int(override)
 	case maxConns > 0:
-		limit = autoTuneOuter(engine, maxConns)
+		limit = autoTuneOuter(fam, maxConns)
 		autoTuned = true
 	default:
-		limit = fanOutLimits[engine]
+		limit = fanOutLimits[fam]
 		if limit == 0 {
 			limit = runtime.GOMAXPROCS(0)
 		}
@@ -622,24 +617,26 @@ func RunFiltered(
 				o   Outcome
 				err error
 			)
-			switch d.Engine {
-			case "mysql", "mariadb", "tidb":
-				o, err = prepareMySQL(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			case "postgres", "postgresql":
-				o, err = preparePostgres(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			case "mongodb":
-				o, err = prepareMongo(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			case "redis":
-				o, err = prepareRedis(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			case "elasticsearch", "opensearch":
-				o, err = prepareES(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			default:
+			fam, ok := engine.Canonical(d.Engine)
+			if !ok {
 				// Engine not recognised. Surface via event so the
 				// user notices, but don't fail the whole prepare run.
 				_ = st.WriteEvent(gctx, store.LevelWarn, "prepare_unsupported_engine",
 					fmt.Sprintf("engine=%s not recognised", d.Engine),
 					repoID, worktreeID, "", 0, nil)
 				return nil
+			}
+			switch fam {
+			case engine.FamilyMySQL:
+				o, err = prepareMySQL(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+			case engine.FamilyPostgres:
+				o, err = preparePostgres(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+			case engine.FamilyMongo:
+				o, err = prepareMongo(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+			case engine.FamilyRedis:
+				o, err = prepareRedis(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+			case engine.FamilyES:
+				o, err = prepareES(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			}
 			if err != nil {
 				return err
@@ -2728,16 +2725,16 @@ func teardownOne(
 	if d.BranchScoped {
 		return teardownBranchScoped(ctx, cfg, d, repoID, worktreeID, st)
 	}
-	switch d.Engine {
-	case "mysql", "mariadb", "tidb":
+	switch fam, _ := engine.Canonical(d.Engine); fam {
+	case engine.FamilyMySQL:
 		return teardownMySQL(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
-	case "postgres", "postgresql":
+	case engine.FamilyPostgres:
 		return teardownPostgres(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
-	case "mongodb":
+	case engine.FamilyMongo:
 		return teardownMongo(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
-	case "redis":
+	case engine.FamilyRedis:
 		return teardownRedis(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
-	case "elasticsearch", "opensearch":
+	case engine.FamilyES:
 		return teardownES(ctx, cfg, d, tplCtx, sl, repoID, worktreeID, st)
 	}
 	// Unknown engine — log + event so a typo'd `engine: postgress`

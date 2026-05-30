@@ -20,6 +20,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
@@ -440,9 +441,10 @@ func inputsFingerprintTool(
 // are swallowed (empty string) so a half-up environment doesn't
 // crash the introspection call — the caller will see an empty
 // engine_version field and can investigate via engine_status.
-func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) string {
-	switch engine {
-	case "mysql", "mariadb", "tidb":
+func probeEngineVersion(ctx context.Context, cfg *config.Config, eng string) string {
+	fam, _ := engine.Canonical(eng)
+	switch fam {
+	case engine.FamilyMySQL:
 		if cfg.Connections.Mysql == nil {
 			return ""
 		}
@@ -453,7 +455,7 @@ func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) 
 		defer func() { _ = drv.Close() }()
 		v, _ := drv.EngineVersion(ctx)
 		return v
-	case "postgres", "postgresql":
+	case engine.FamilyPostgres:
 		if cfg.Connections.Postgres == nil {
 			return ""
 		}
@@ -464,7 +466,7 @@ func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) 
 		defer func() { _ = drv.Close() }()
 		v, _ := drv.EngineVersion(ctx)
 		return v
-	case "mongodb":
+	case engine.FamilyMongo:
 		if cfg.Connections.Mongodb == nil {
 			return ""
 		}
@@ -475,7 +477,7 @@ func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) 
 		defer func() { _ = drv.Close(ctx) }()
 		v, _ := drv.EngineVersion(ctx)
 		return v
-	case "redis":
+	case engine.FamilyRedis:
 		if cfg.Connections.Redis == nil {
 			return ""
 		}
@@ -486,7 +488,7 @@ func probeEngineVersion(ctx context.Context, cfg *config.Config, engine string) 
 		defer func() { _ = drv.Close() }()
 		v, _ := drv.EngineVersion(ctx)
 		return v
-	case "elasticsearch", "opensearch":
+	case engine.FamilyES:
 		if cfg.Connections.Elasticsearch == nil {
 			return ""
 		}

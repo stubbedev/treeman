@@ -241,19 +241,21 @@ func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchem
 	}
 	out := dbSchemaOut{Engine: in.Engine, DB: in.DB, Schema: map[string]any{}}
 	var schema map[string]any
-	switch in.Engine {
-	case "mysql", "mariadb", "tidb":
-		schema, err = dbSchemaMySQL(ctx, cfg, in.DB)
-	case "postgres", "postgresql":
-		schema, err = dbSchemaPostgres(ctx, cfg, in.DB)
-	case "mongodb":
-		schema, err = dbSchemaMongo(ctx, cfg, in.DB)
-	case "elasticsearch", "opensearch":
-		schema, err = dbSchemaES(ctx, cfg, in.DB)
-	case "redis":
-		schema, err = dbSchemaRedis(ctx, cfg, in.DB)
-	default:
+	fam, ok := engine.Canonical(in.Engine)
+	if !ok {
 		return nil, out, fmt.Errorf("unsupported engine: %s", in.Engine)
+	}
+	switch fam {
+	case engine.FamilyMySQL:
+		schema, err = dbSchemaMySQL(ctx, cfg, in.DB)
+	case engine.FamilyPostgres:
+		schema, err = dbSchemaPostgres(ctx, cfg, in.DB)
+	case engine.FamilyMongo:
+		schema, err = dbSchemaMongo(ctx, cfg, in.DB)
+	case engine.FamilyES:
+		schema, err = dbSchemaES(ctx, cfg, in.DB)
+	case engine.FamilyRedis:
+		schema, err = dbSchemaRedis(ctx, cfg, in.DB)
 	}
 	if err != nil {
 		return nil, out, err
@@ -351,19 +353,21 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 	out := dbQueryOut{Engine: in.Engine}
 	var rows []any
 	var cols []string
-	switch in.Engine {
-	case "mysql", "mariadb", "tidb":
-		rows, cols, err = dbQueryMySQL(ctx, cfg, in)
-	case "postgres", "postgresql":
-		rows, cols, err = dbQueryPostgres(ctx, cfg, in)
-	case "mongodb":
-		rows, err = dbQueryMongo(ctx, cfg, in)
-	case "elasticsearch", "opensearch":
-		rows, err = dbQueryES(ctx, cfg, in)
-	case "redis":
-		rows, err = dbQueryRedis(ctx, cfg, in)
-	default:
+	fam, ok := engine.Canonical(in.Engine)
+	if !ok {
 		return nil, out, fmt.Errorf("unsupported engine: %s", in.Engine)
+	}
+	switch fam {
+	case engine.FamilyMySQL:
+		rows, cols, err = dbQueryMySQL(ctx, cfg, in)
+	case engine.FamilyPostgres:
+		rows, cols, err = dbQueryPostgres(ctx, cfg, in)
+	case engine.FamilyMongo:
+		rows, err = dbQueryMongo(ctx, cfg, in)
+	case engine.FamilyES:
+		rows, err = dbQueryES(ctx, cfg, in)
+	case engine.FamilyRedis:
+		rows, err = dbQueryRedis(ctx, cfg, in)
 	}
 	if err != nil {
 		return nil, out, err

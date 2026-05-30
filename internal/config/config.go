@@ -1141,8 +1141,9 @@ type DatabaseConfig struct {
 	// Engine discriminator. Gates which connection block is dialed
 	// and which sub-fields (dump, migrations, namespaces) are valid.
 	// `postgresql` is an alias for `postgres`; `opensearch` is an
-	// alias for `elasticsearch`.
-	Engine string `yaml:"engine" jsonschema:"enum=mysql,enum=mariadb,enum=tidb,enum=postgres,enum=postgresql,enum=mongodb,enum=redis,enum=elasticsearch,enum=opensearch"`
+	// alias for `elasticsearch`; `valkey` and `dragonfly` are aliases
+	// for `redis` (same wire protocol, same key-prefix scoping).
+	Engine string `yaml:"engine" jsonschema:"enum=mysql,enum=mariadb,enum=tidb,enum=postgres,enum=postgresql,enum=mongodb,enum=redis,enum=valkey,enum=dragonfly,enum=elasticsearch,enum=opensearch"`
 
 	// Template for the per-worktree database/index name. Supports
 	// `{slug}`, `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`

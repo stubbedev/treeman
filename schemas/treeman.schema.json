@@ -178,10 +178,12 @@
             "postgresql",
             "mongodb",
             "redis",
+            "valkey",
+            "dragonfly",
             "elasticsearch",
             "opensearch"
           ],
-          "description": "Engine discriminator. Gates which connection block is dialed\nand which sub-fields (dump, migrations, namespaces) are valid.\n`postgresql` is an alias for `postgres`; `opensearch` is an\nalias for `elasticsearch`."
+          "description": "Engine discriminator. Gates which connection block is dialed\nand which sub-fields (dump, migrations, namespaces) are valid.\n`postgresql` is an alias for `postgres`; `opensearch` is an\nalias for `elasticsearch`; `valkey` and `dragonfly` are aliases\nfor `redis` (same wire protocol, same key-prefix scoping)."
         },
         "name_template": {
           "type": "string",

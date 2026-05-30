@@ -29,12 +29,13 @@ commands you type.
 | MySQL | MariaDB, TiDB | Separate database |
 | PostgreSQL | — | Separate database |
 | MongoDB | — | Separate database |
-| Redis | Valkey, DragonflyDB † | Key-prefix in DB 0 (cluster-safe, no 16-DB cap) |
+| Redis | Valkey, DragonflyDB | Key-prefix in DB 0 (cluster-safe, no 16-DB cap) |
 | Elasticsearch | OpenSearch | Index-name prefix |
 
-MariaDB, TiDB, and OpenSearch are first-class aliases of their parent
-engine. † treeman has no dedicated Valkey/DragonflyDB driver, but they
-speak the Redis wire protocol — declare them as `engine: redis`.
+Variants are first-class aliases — declare `engine: mariadb`, `tidb`,
+`valkey`, `dragonfly`, or `opensearch` and treeman routes it to the
+parent engine's driver (Valkey/DragonflyDB ride the Redis wire
+protocol).
 
 ## Features
 

@@ -290,9 +290,10 @@ PG pg_database lock contention acceptable, etc.).
 Engine discriminator. Gates which connection block is dialed
 and which sub-fields (dump, migrations, namespaces) are valid.
 `postgresql` is an alias for `postgres`; `opensearch` is an
-alias for `elasticsearch`.
+alias for `elasticsearch`; `valkey` and `dragonfly` are aliases
+for `redis` (same wire protocol, same key-prefix scoping).
 
-_Allowed: `mysql`, `mariadb`, `tidb`, `postgres`, `postgresql`, `mongodb`, `redis`, `elasticsearch`, `opensearch`_
+_Allowed: `mysql`, `mariadb`, `tidb`, `postgres`, `postgresql`, `mongodb`, `redis`, `valkey`, `dragonfly`, `elasticsearch`, `opensearch`_
 
 #### `name_template` *(string)*
 

@@ -1,0 +1,23 @@
+services:
+  # Valkey ships redis-cli (and valkey-cli) in-image, so it seeds the
+  # same way the redis stack does. It also doubles as the redis-cli
+  # client box that seeds dragonfly over the compose network, since the
+  # dragonfly image carries no CLI of its own.
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: treeman-e2e-valkey
+    ports:
+      - "16380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  dragonfly:
+    image: ghcr.io/dragonflydb/dragonfly:latest
+    container_name: treeman-e2e-dragonfly
+    ports:
+      - "16381:6379"
+    ulimits:
+      memlock: -1

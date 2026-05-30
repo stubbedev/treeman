@@ -220,7 +220,12 @@ func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix stri
 	for iter.Next(ctx) {
 		src := iter.Val()
 		dst := dstPrefix + strings.TrimPrefix(src, srcPrefix)
-		pipe.Copy(ctx, src, dst, DBIndex, true) // REPLACE so re-runs are idempotent
+		// Plain `COPY src dst REPLACE` — no `DB n` option. treeman only
+		// ever operates in logical DB 0 (DBIndex), so the cross-DB
+		// option is redundant, and DragonflyDB (RESP-compatible but
+		// single-DB) rejects `COPY … DB 0` with a syntax error. The
+		// bare form is accepted by Redis 6.2+, Valkey, and DragonflyDB.
+		pipe.Do(ctx, "COPY", src, dst, "REPLACE") // REPLACE so re-runs are idempotent
 		pending++
 		if pending >= 100 {
 			if err := flush(); err != nil {

@@ -277,7 +277,7 @@ re-sync branch_scoped databases from the live base branch (defaults to the cwd's
 | Flag | Usage |
 |---|---|
 | `-r`, `--repo` |  |
-| `--engine` | restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted) |
+| `--engine` | restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql/valkey/dragonfly accepted) |
 | `--json` |  |
 
 ### `treeman db status`

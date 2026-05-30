@@ -162,7 +162,7 @@ func prepareTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in prepareIn) (
 type dbResetIn struct {
 	Worktree string `json:"worktree,omitempty" jsonschema:"defaults to cwd's worktree"`
 	Repo     string `json:"repo,omitempty"`
-	Engine   string `json:"engine,omitempty"   jsonschema:"restrict to one engine family: mysql|postgres|mongodb|redis|elasticsearch (aliases like mariadb/postgresql accepted); omit to reset all branch_scoped databases"`
+	Engine   string `json:"engine,omitempty"   jsonschema:"restrict to one engine family: mysql|postgres|mongodb|redis|elasticsearch (aliases like mariadb/postgresql/valkey/dragonfly accepted); omit to reset all branch_scoped databases"`
 }
 type dbResetOut struct {
 	Outcomes []prepare.Outcome `json:"outcomes"`

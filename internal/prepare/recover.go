@@ -10,6 +10,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
@@ -90,16 +91,16 @@ func recoverTestClone(
 	repoID, worktreeID int64,
 	st *store.Store,
 ) error {
-	switch d.Engine {
-	case "mysql", "mariadb", "tidb":
+	switch fam, _ := engine.Canonical(d.Engine); fam {
+	case engine.FamilyMySQL:
 		return recoverTestCloneMySQL(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
-	case "postgres", "postgresql":
+	case engine.FamilyPostgres:
 		return recoverTestClonePostgres(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
-	case "mongodb":
+	case engine.FamilyMongo:
 		return recoverTestCloneMongo(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
-	case "redis":
+	case engine.FamilyRedis:
 		return recoverTestCloneRedis(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
-	case "elasticsearch", "opensearch":
+	case engine.FamilyES:
 		return recoverTestCloneES(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
 	}
 	return nil

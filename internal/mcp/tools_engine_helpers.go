@@ -76,9 +76,10 @@ func snapshotRecordToMap(r *store.SnapshotRecord) map[string]any {
 // returns a size estimate where the engine exposes one. Errors are
 // silently dropped (exists=false) — the caller surfaces them via the
 // SQLite row's recorded state.
-func probeTemplate(ctx context.Context, cfg *config.Config, engine, template string) (bool, int64, string) {
-	switch engine {
-	case "mysql", "mariadb", "tidb":
+func probeTemplate(ctx context.Context, cfg *config.Config, eng, template string) (bool, int64, string) {
+	fam, _ := engine.Canonical(eng)
+	switch fam {
+	case engine.FamilyMySQL:
 		if cfg.Connections.Mysql == nil {
 			return false, 0, ""
 		}
@@ -100,7 +101,7 @@ func probeTemplate(ctx context.Context, cfg *config.Config, engine, template str
 			FROM information_schema.tables WHERE table_schema = ?
 		`, template).Scan(&size)
 		return true, size / 1024, ver
-	case "postgres", "postgresql":
+	case engine.FamilyPostgres:
 		if cfg.Connections.Postgres == nil {
 			return false, 0, ""
 		}
@@ -117,7 +118,7 @@ func probeTemplate(ctx context.Context, cfg *config.Config, engine, template str
 		var size int64
 		_ = drv.DB.QueryRowContext(ctx, "SELECT pg_database_size($1)/1024", template).Scan(&size)
 		return true, size, ver
-	case "mongodb":
+	case engine.FamilyMongo:
 		if cfg.Connections.Mongodb == nil {
 			return false, 0, ""
 		}
@@ -129,7 +130,7 @@ func probeTemplate(ctx context.Context, cfg *config.Config, engine, template str
 		exists, _ := drv.DatabaseExists(ctx, template)
 		ver, _ := drv.EngineVersion(ctx)
 		return exists, 0, ver
-	case "redis":
+	case engine.FamilyRedis:
 		if cfg.Connections.Redis == nil {
 			return false, 0, ""
 		}
@@ -141,7 +142,7 @@ func probeTemplate(ctx context.Context, cfg *config.Config, engine, template str
 		ok, _ := drv.PrefixExists(ctx, template)
 		ver, _ := drv.EngineVersion(ctx)
 		return ok, 0, ver
-	case "elasticsearch", "opensearch":
+	case engine.FamilyES:
 		if cfg.Connections.Elasticsearch == nil {
 			return false, 0, ""
 		}

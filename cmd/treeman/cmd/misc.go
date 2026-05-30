@@ -117,7 +117,7 @@ func DbCmd() *cli.Command {
 					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 					&cli.StringFlag{
 						Name:  "engine",
-						Usage: "restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted)",
+						Usage: "restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql/valkey/dragonfly accepted)",
 					},
 					&cli.BoolFlag{Name: "json"},
 				},
