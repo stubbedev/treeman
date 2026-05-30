@@ -731,7 +731,21 @@ func prepareMySQL(
 	// the cold build and just clone the template into paratest DBs.
 	// Inputs feed the fingerprint, so any user-meaningful change
 	// invalidates the cache naturally — no force-rebuild knob.
-	out, done, err := mysqlCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, key, maxConns, started)
+	out, done, err := cacheHitGeneric(
+		ctx,
+		drv.DatabaseExists,
+		drv.SnapshotRestore,
+		d,
+		tplCtx,
+		worktreePath,
+		st,
+		repoID,
+		worktreeID,
+		sourceDB,
+		key,
+		maxConns,
+		started,
+	)
 	if done || err != nil {
 		return out, err
 	}
@@ -831,15 +845,23 @@ func prepareMySQL(
 	}, nil
 }
 
-// mysqlCacheHit handles the MySQL fingerprint-cache fast path. It
-// returns (out, true, nil) when the cached template was reused and the
-// caller should return `out`; (Outcome{}, false, nil) when the cache
-// missed or fell back (caller must cold-build); (Outcome{}, false, err)
-// on a hard error. Extracted verbatim from prepareMySQL — the prior
-// `goto mysqlColdBuild` jumps become `return Outcome{}, false, nil`.
-func mysqlCacheHit(
+// cacheHitGeneric is the engine-agnostic fingerprint-cache fast path
+// shared by every engine. Returns (out, true, nil) when the cached
+// template was reused and the caller should return `out`; (Outcome{},
+// false, nil) when the cache missed or the template vanished mid-flight
+// (caller must cold-build); (Outcome{}, false, err) on a hard error.
+//
+// `exists` is the driver's namespace-presence probe (DatabaseExists for
+// name-scoped engines, PrefixExists/IndexExists for prefix-scoped ones)
+// and `restore` is its template→target clone. `maxConns` bounds the
+// clone fan-out (0 for engines with no connection cap). Behaviour is
+// identical across engines — only these two closures, the connection
+// cap, and the engine label vary, so the five per-engine copies collapse
+// into this one.
+func cacheHitGeneric(
 	ctx context.Context,
-	drv *dbmysql.Driver,
+	exists func(context.Context, string) (bool, error),
+	restore func(context.Context, string, string) error,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
 	worktreePath string,
@@ -857,64 +879,64 @@ func mysqlCacheHit(
 		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissNoRow)
 		return Outcome{}, false, nil
 	}
-	// Touch the row BEFORE DatabaseExists so a concurrent
-	// EvictExcess sees this template as most-recently-used and
-	// won't pick it as LRU while we're about to use it.
+	// Touch the row BEFORE the existence probe so a concurrent
+	// EvictExcess sees this template as most-recently-used and won't
+	// pick it as the LRU victim while we're about to use it.
 	_ = st.TouchSnapshot(ctx, key.Fingerprint())
-	if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-			"template="+rec.TemplateName,
-			repoID, worktreeID, "", 0, map[string]string{
-				"engine":      d.Engine,
-				"source_db":   sourceDB,
-				"template":    rec.TemplateName,
-				"fingerprint": key.Fingerprint(),
-			})
-		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-		if err != nil {
-			return Outcome{}, false, err
-		}
-		// Cache-hit skips the cold-build path that populates the
-		// source DB via dump+migrate. Restore source from the
-		// template so non-parallel runs (single `php artisan test`,
-		// dev shells, tinker — anything that reads DB_DATABASE
-		// without the `_test_N` suffix paratest appends) have a
-		// populated DB at the user-facing name_template. The source is
-		// folded into the clone fan-out so it's repopulated in parallel
-		// with the clones rather than serially before them.
-		//
-		// If the template disappears mid-flight (race with
-		// EvictExcess between DatabaseExists and the restore/fanout),
-		// fall through to cold build instead of failing wt_finalize.
-		if err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, drv.SnapshotRestore,
-			d, rec.TemplateName, sourceDB, clones, maxConns, key.Fingerprint()); err != nil {
-			return Outcome{}, false, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
-		}
-		ms := time.Since(started).Milliseconds()
-		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-			repoID, worktreeID, "", 0, map[string]string{
-				"source_db":   sourceDB,
-				"template":    rec.TemplateName,
-				"clones":      strconv.Itoa(len(clones)),
-				"fingerprint": key.Fingerprint(),
-				"cache_hit":   "true",
-				"duration_ms": strconv.FormatInt(ms, 10),
-			})
-		return Outcome{
-			Engine:       d.Engine,
-			SourceDB:     sourceDB,
-			TemplateName: rec.TemplateName,
-			Fingerprint:  key.Fingerprint(),
-			CacheHit:     true,
-			Clones:       clones,
-		}, true, nil
+	alive, _ := exists(ctx, rec.TemplateName)
+	if !alive {
+		// Row stale (template was dropped externally). Wipe so the
+		// cold-build path overwrites it cleanly.
+		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissTemplateGone)
+		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
+		return Outcome{}, false, nil
 	}
-	// Row stale (template was dropped externally). Wipe so the
-	// cold-build path below overwrites it cleanly.
-	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissTemplateGone)
-	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-	return Outcome{}, false, nil
+	_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+		"template="+rec.TemplateName,
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine":      d.Engine,
+			"source_db":   sourceDB,
+			"template":    rec.TemplateName,
+			"fingerprint": key.Fingerprint(),
+		})
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	if err != nil {
+		return Outcome{}, false, err
+	}
+	// Cache-hit skips the cold-build path that populates the source DB
+	// via dump+migrate. Restore source from the template so non-parallel
+	// runs (a single test command, dev shells — anything that reads the
+	// user-facing name_template without a per-worker suffix) see a
+	// populated DB. The source is folded into the clone fan-out so it's
+	// repopulated in parallel with the clones rather than serially first.
+	//
+	// If the template disappears mid-flight (race with EvictExcess
+	// between the existence probe and the restore/fanout), fall through
+	// to cold build instead of failing wt_finalize.
+	if err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, restore,
+		d, rec.TemplateName, sourceDB, clones, maxConns, key.Fingerprint()); err != nil {
+		return Outcome{}, false, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
+	}
+	ms := time.Since(started).Milliseconds()
+	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+		fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine":      d.Engine,
+			"source_db":   sourceDB,
+			"template":    rec.TemplateName,
+			"clones":      strconv.Itoa(len(clones)),
+			"fingerprint": key.Fingerprint(),
+			"cache_hit":   "true",
+			"duration_ms": strconv.FormatInt(ms, 10),
+		})
+	return Outcome{
+		Engine:       d.Engine,
+		SourceDB:     sourceDB,
+		TemplateName: rec.TemplateName,
+		Fingerprint:  key.Fingerprint(),
+		CacheHit:     true,
+		Clones:       clones,
+	}, true, nil
 }
 
 // mysqlColdBuildSteps runs the MySQL cold-build populate phase: drop +
@@ -1297,7 +1319,21 @@ func preparePostgres(
 		})
 
 	// Cache hit? Fingerprint covers every declared input.
-	out, done, err := postgresCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, key, maxConns, started)
+	out, done, err := cacheHitGeneric(
+		ctx,
+		drv.DatabaseExists,
+		drv.SnapshotRestore,
+		d,
+		tplCtx,
+		worktreePath,
+		st,
+		repoID,
+		worktreeID,
+		sourceDB,
+		key,
+		maxConns,
+		started,
+	)
 	if done || err != nil {
 		return out, err
 	}
@@ -1368,84 +1404,6 @@ func preparePostgres(
 		Engine: d.Engine, SourceDB: sourceDB, TemplateName: templateName,
 		Fingerprint: key.Fingerprint(), CacheHit: false, Clones: clones,
 	}, nil
-}
-
-// postgresCacheHit handles the Postgres fingerprint-cache fast path.
-// Contract mirrors mysqlCacheHit: (out, true, nil) → return out;
-// (Outcome{}, false, nil) → fall through to cold build; (_, false, err)
-// → hard error. Extracted verbatim from preparePostgres — the prior
-// `goto pgColdBuild` jumps become `return Outcome{}, false, nil`.
-func postgresCacheHit(
-	ctx context.Context,
-	drv *dbpostgres.Driver,
-	d config.DatabaseConfig,
-	tplCtx template.Context,
-	worktreePath string,
-	st *store.Store,
-	repoID, worktreeID int64,
-	sourceDB string,
-	key snapshot.Key,
-	maxConns int,
-	started time.Time,
-) (Outcome, bool, error) {
-	// A LookupSnapshot error is treated as a cache miss (fall through to
-	// cold build), matching the original `err == nil && rec != nil` guard.
-	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
-	if rec == nil {
-		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissNoRow)
-		return Outcome{}, false, nil
-	}
-	// Touch row early so concurrent EvictExcess sees this template
-	// as most-recently-used and skips it as LRU candidate.
-	_ = st.TouchSnapshot(ctx, key.Fingerprint())
-	if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-			"template="+rec.TemplateName,
-			repoID, worktreeID, "", 0, map[string]string{
-				"engine":      "postgres",
-				"source_db":   sourceDB,
-				"template":    rec.TemplateName,
-				"fingerprint": key.Fingerprint(),
-			})
-		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-		if err != nil {
-			return Outcome{}, false, err
-		}
-		// Cache-hit skips the cold-build path that populates the
-		// source DB via dump+migrate. Restore source from the
-		// template so non-parallel runs (single test command,
-		// dev shells — anything that reads the user-facing
-		// name_template without the per-worker suffix) have a
-		// populated DB. The source is folded into the clone fan-out so
-		// it's repopulated in parallel with the clones.
-		//
-		// If the template disappears mid-flight (race with
-		// EvictExcess between DatabaseExists and the restore/
-		// fanout calls), fall through to cold build.
-		if err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, drv.SnapshotRestore,
-			d, rec.TemplateName, sourceDB, clones, maxConns, key.Fingerprint()); err != nil {
-			return Outcome{}, false, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
-		}
-		ms := time.Since(started).Milliseconds()
-		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-			repoID, worktreeID, "", 0, map[string]string{
-				"source_db":   sourceDB,
-				"template":    rec.TemplateName,
-				"clones":      strconv.Itoa(len(clones)),
-				"fingerprint": key.Fingerprint(),
-				"cache_hit":   "true",
-				"duration_ms": strconv.FormatInt(ms, 10),
-			})
-		return Outcome{
-			Engine: d.Engine, SourceDB: sourceDB,
-			TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-			CacheHit: true, Clones: clones,
-		}, true, nil
-	}
-	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissTemplateGone)
-	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-	return Outcome{}, false, nil
 }
 
 // postgresColdBuildSteps runs the Postgres cold-build populate phase:
@@ -1532,6 +1490,8 @@ func postgresColdBuildSteps(
 // dump archive, run the seed step, snapshot the per-collection
 // template, fan clones out. Cache-hit short-circuits straight to
 // the per-collection $out clone.
+//
+//nolint:funlen // mirrors the linear cache-hit / incremental / cold-build / fanout flow used by every engine; extracting helpers just spreads the same conditions across functions
 func prepareMongo(
 	ctx context.Context,
 	cfg *config.Config,
@@ -1591,7 +1551,21 @@ func prepareMongo(
 		})
 
 	// Cache hit?
-	out, done, err := mongoCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, key, started)
+	out, done, err := cacheHitGeneric(
+		ctx,
+		drv.DatabaseExists,
+		drv.SnapshotRestore,
+		d,
+		tplCtx,
+		worktreePath,
+		st,
+		repoID,
+		worktreeID,
+		sourceDB,
+		key,
+		0,
+		started,
+	)
 	if done || err != nil {
 		return out, err
 	}
@@ -1653,84 +1627,6 @@ func prepareMongo(
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
-}
-
-// mongoCacheHit handles the MongoDB fingerprint-cache fast path.
-// Contract mirrors mysqlCacheHit: (out, true, nil) → return out;
-// (Outcome{}, false, nil) → fall through to cold build; (_, false, err)
-// → hard error. Extracted verbatim from prepareMongo — the prior
-// `goto mongoColdBuild` jump becomes `return Outcome{}, false, nil`.
-func mongoCacheHit(
-	ctx context.Context,
-	drv *dbmongo.Driver,
-	d config.DatabaseConfig,
-	tplCtx template.Context,
-	worktreePath string,
-	st *store.Store,
-	repoID, worktreeID int64,
-	sourceDB string,
-	key snapshot.Key,
-	started time.Time,
-) (Outcome, bool, error) {
-	// A LookupSnapshot error is treated as a cache miss (fall through to
-	// cold build), matching the original `err == nil && rec != nil` guard.
-	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
-	if rec == nil {
-		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissNoRow)
-		return Outcome{}, false, nil
-	}
-	// Touch row early so concurrent EvictExcess sees this template
-	// as most-recently-used and skips it as LRU candidate.
-	_ = st.TouchSnapshot(ctx, key.Fingerprint())
-	if exists, _ := drv.DatabaseExists(ctx, rec.TemplateName); exists {
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-			"template="+rec.TemplateName,
-			repoID, worktreeID, "", 0, map[string]string{
-				"engine":      "mongodb",
-				"source_db":   sourceDB,
-				"template":    rec.TemplateName,
-				"fingerprint": key.Fingerprint(),
-			})
-		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-		if err != nil {
-			return Outcome{}, false, err
-		}
-		// Cache-hit skips the cold-build path that populates the source
-		// DB via dump+migrate. Restore source from the template so
-		// non-parallel runs (single test command, dev shells, anything
-		// reading the bare name_template without a per-worker suffix)
-		// see populated data — parity with mysql/postgres/redis. The
-		// source is folded into the clone fan-out so it's repopulated
-		// in parallel with the clones.
-		//
-		// If the template disappears mid-flight (race with
-		// EvictExcess), fall through to cold build instead of
-		// failing wt_finalize.
-		if err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, drv.SnapshotRestore,
-			d, rec.TemplateName, sourceDB, clones, 0, key.Fingerprint()); err != nil {
-			return Outcome{}, false, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
-		}
-		ms := time.Since(started).Milliseconds()
-		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-			repoID, worktreeID, "", 0, map[string]string{
-				"engine":      "mongodb",
-				"source_db":   sourceDB,
-				"template":    rec.TemplateName,
-				"clones":      strconv.Itoa(len(clones)),
-				"fingerprint": key.Fingerprint(),
-				"cache_hit":   "true",
-				"duration_ms": strconv.FormatInt(ms, 10),
-			})
-		return Outcome{
-			Engine: d.Engine, SourceDB: sourceDB,
-			TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-			CacheHit: true, Clones: clones,
-		}, true, nil
-	}
-	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissTemplateGone)
-	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-	return Outcome{}, false, nil
 }
 
 // mongoColdBuildSteps runs the MongoDB cold-build populate phase: drop
@@ -1889,7 +1785,21 @@ func prepareRedisPrefix(
 		})
 
 	// Cache hit?
-	out, done, err := redisCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, key, started)
+	out, done, err := cacheHitGeneric(
+		ctx,
+		drv.PrefixExists,
+		drv.SnapshotRestore,
+		d,
+		tplCtx,
+		worktreePath,
+		st,
+		repoID,
+		worktreeID,
+		sourcePrefix,
+		key,
+		0,
+		started,
+	)
 	if done || err != nil {
 		return out, err
 	}
@@ -1952,78 +1862,6 @@ func prepareRedisPrefix(
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
-}
-
-// redisCacheHit handles the Redis-prefix fingerprint-cache fast path.
-// Contract mirrors mysqlCacheHit: (out, true, nil) → return out;
-// (Outcome{}, false, nil) → fall through to cold build; (_, false, err)
-// → hard error. Extracted verbatim from prepareRedisPrefix — the prior
-// `goto redisColdBuild` jumps become `return Outcome{}, false, nil`.
-func redisCacheHit(
-	ctx context.Context,
-	drv *dbredis.Driver,
-	d config.DatabaseConfig,
-	tplCtx template.Context,
-	worktreePath string,
-	st *store.Store,
-	repoID, worktreeID int64,
-	sourcePrefix string,
-	key snapshot.Key,
-	started time.Time,
-) (Outcome, bool, error) {
-	// A LookupSnapshot error is treated as a cache miss (fall through to
-	// cold build), matching the original `err == nil && rec != nil` guard.
-	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
-	if rec == nil {
-		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, key.Fingerprint(), cacheMissNoRow)
-		return Outcome{}, false, nil
-	}
-	// Touch row early so concurrent EvictExcess sees this template
-	// as most-recently-used and skips it as LRU candidate.
-	_ = st.TouchSnapshot(ctx, key.Fingerprint())
-	alive, _ := drv.PrefixExists(ctx, rec.TemplateName)
-	if alive {
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-			"template="+rec.TemplateName,
-			repoID, worktreeID, "", 0, map[string]string{
-				"engine":      "redis",
-				"source_db":   sourcePrefix,
-				"template":    rec.TemplateName,
-				"fingerprint": key.Fingerprint(),
-			})
-		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-		if err != nil {
-			return Outcome{}, false, err
-		}
-		// Restore template → source so the worktree app sees fresh
-		// data, folded into the clone fan-out so it runs in parallel.
-		// If the template disappears mid-flight (race with
-		// EvictExcess), fall through to cold build.
-		if err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, drv.SnapshotRestore,
-			d, rec.TemplateName, sourcePrefix, clones, 0, key.Fingerprint()); err != nil {
-			return Outcome{}, false, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
-		}
-		ms := time.Since(started).Milliseconds()
-		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-			repoID, worktreeID, "", 0, map[string]string{
-				"engine":      "redis",
-				"source_db":   sourcePrefix,
-				"template":    rec.TemplateName,
-				"clones":      strconv.Itoa(len(clones)),
-				"fingerprint": key.Fingerprint(),
-				"cache_hit":   "true",
-				"duration_ms": strconv.FormatInt(ms, 10),
-			})
-		return Outcome{
-			Engine: d.Engine, SourceDB: sourcePrefix,
-			TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-			CacheHit: true, Clones: clones,
-		}, true, nil
-	}
-	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, key.Fingerprint(), cacheMissTemplateGone)
-	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-	return Outcome{}, false, nil
 }
 
 // redisColdBuildSteps runs the Redis-prefix cold-build populate phase:
@@ -2113,6 +1951,8 @@ func redisColdBuildSteps(
 // (which populates the indices), then `SnapshotCreate` to copy
 // `<source-prefix>*` into `<template-prefix>*`, then fan out clones
 // into per-worker prefixes.
+//
+//nolint:funlen // mirrors the linear cache-hit / incremental / cold-build / fanout flow used by every engine; extracting helpers just spreads the same conditions across functions
 func prepareES(
 	ctx context.Context,
 	cfg *config.Config,
@@ -2172,7 +2012,29 @@ func prepareES(
 		})
 
 	// Cache hit? Verify by listing indices under the template prefix.
-	out, done, err := esCacheHit(ctx, drv, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, key, started)
+	// ES isolation is prefix-scoped: a cached template "exists" when ANY
+	// index carries its prefix, so probe via ListMatching rather than the
+	// exact-name IndexExists (which would always miss a prefix template
+	// and force a needless cold rebuild on every cross-worktree reuse).
+	esTemplateExists := func(ctx context.Context, prefix string) (bool, error) {
+		matched, e := drv.ListMatching(ctx, prefix)
+		return len(matched) > 0, e
+	}
+	out, done, err := cacheHitGeneric(
+		ctx,
+		esTemplateExists,
+		drv.SnapshotRestore,
+		d,
+		tplCtx,
+		worktreePath,
+		st,
+		repoID,
+		worktreeID,
+		sourcePrefix,
+		key,
+		0,
+		started,
+	)
 	if done || err != nil {
 		return out, err
 	}
@@ -2237,84 +2099,6 @@ func prepareES(
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
-}
-
-// esCacheHit handles the Elasticsearch fingerprint-cache fast path.
-// Contract mirrors mysqlCacheHit: (out, true, nil) → return out;
-// (Outcome{}, false, nil) → fall through to cold build; (_, false, err)
-// → hard error. Extracted verbatim from prepareES — the prior
-// `goto esColdBuild` jump becomes `return Outcome{}, false, nil`.
-func esCacheHit(
-	ctx context.Context,
-	drv *dbes.Driver,
-	d config.DatabaseConfig,
-	tplCtx template.Context,
-	worktreePath string,
-	st *store.Store,
-	repoID, worktreeID int64,
-	sourcePrefix string,
-	key snapshot.Key,
-	started time.Time,
-) (Outcome, bool, error) {
-	// A LookupSnapshot error is treated as a cache miss (fall through to
-	// cold build), matching the original `err == nil && rec != nil` guard.
-	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
-	if rec == nil {
-		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, key.Fingerprint(), cacheMissNoRow)
-		return Outcome{}, false, nil
-	}
-	// Touch row early so concurrent EvictExcess sees this template
-	// as most-recently-used and skips it as LRU candidate.
-	_ = st.TouchSnapshot(ctx, key.Fingerprint())
-	alive, _ := drv.ListMatching(ctx, rec.TemplateName)
-	if len(alive) > 0 {
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
-			fmt.Sprintf("template=%s indices=%d", rec.TemplateName, len(alive)),
-			repoID, worktreeID, "", 0, map[string]string{
-				"engine":      "elasticsearch",
-				"source_db":   sourcePrefix,
-				"template":    rec.TemplateName,
-				"fingerprint": key.Fingerprint(),
-			})
-		clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-		if err != nil {
-			return Outcome{}, false, err
-		}
-		// Cache-hit skips the cold-build path that populates the source
-		// prefix via dump+migrate. Restore source from the template so
-		// non-parallel runs (single test command, dev shells, anything
-		// reading the bare key_prefix without a per-worker suffix) see
-		// populated indices — parity with mysql/postgres/redis. The
-		// source is folded into the clone fan-out so it's repopulated
-		// in parallel with the clones.
-		//
-		// If the template disappears mid-flight (race with EvictExcess),
-		// fall through to cold build.
-		if err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, drv.SnapshotRestore,
-			d, rec.TemplateName, sourcePrefix, clones, 0, key.Fingerprint()); err != nil {
-			return Outcome{}, false, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
-		}
-		ms := time.Since(started).Milliseconds()
-		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
-			fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
-			repoID, worktreeID, "", 0, map[string]string{
-				"engine":      "elasticsearch",
-				"source_db":   sourcePrefix,
-				"template":    rec.TemplateName,
-				"clones":      strconv.Itoa(len(clones)),
-				"fingerprint": key.Fingerprint(),
-				"cache_hit":   "true",
-				"duration_ms": strconv.FormatInt(ms, 10),
-			})
-		return Outcome{
-			Engine: d.Engine, SourceDB: sourcePrefix,
-			TemplateName: rec.TemplateName, Fingerprint: key.Fingerprint(),
-			CacheHit: true, Clones: clones,
-		}, true, nil
-	}
-	emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, key.Fingerprint(), cacheMissTemplateGone)
-	_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-	return Outcome{}, false, nil
 }
 
 // esColdBuildSteps runs the Elasticsearch cold-build populate phase:
@@ -2746,8 +2530,42 @@ func teardownOne(
 	return nil
 }
 
-// teardownMySQL drops the per-worktree MySQL database family. Extracted
-// verbatim from teardownOne's `mysql` switch arm.
+// teardownGeneric drops the already-rendered per-worktree `target`
+// (database name or key/index prefix) via the engine's `drop` closure and
+// writes the `db_drop` event. The shared tail of every engine's teardown;
+// the per-engine connect/close and the name-vs-prefix source stay in the
+// thin wrappers below.
+func teardownGeneric(
+	ctx context.Context,
+	engineLabel, target, sl string,
+	repoID, worktreeID int64,
+	st *store.Store,
+	drop func(context.Context, string) (int, error),
+) error {
+	count, err := drop(ctx, target)
+	if err != nil {
+		return err
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+		fmt.Sprintf("%s: %s (%d)", engineLabel, target, count),
+		repoID, worktreeID, "", 0, map[string]any{
+			"engine": engineLabel, "slug": sl, "target": target, "count": count,
+		})
+	return nil
+}
+
+// dropMatchingCount adapts a driver's DropMatching([]string) signature to
+// the teardownGeneric drop closure's (int) count.
+func dropMatchingCount(
+	drop func(context.Context, string) ([]string, error),
+) func(context.Context, string) (int, error) {
+	return func(ctx context.Context, target string) (int, error) {
+		dropped, err := drop(ctx, target)
+		return len(dropped), err
+	}
+}
+
+// teardownMySQL drops the per-worktree MySQL database family.
 func teardownMySQL(
 	ctx context.Context,
 	cfg *config.Config,
@@ -2772,20 +2590,11 @@ func teardownMySQL(
 	if err != nil {
 		return err
 	}
-	dropped, err := drv.DropMatching(ctx, name)
-	if err != nil {
-		return err
-	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-		fmt.Sprintf("mysql: %s (%d)", name, len(dropped)),
-		repoID, worktreeID, "", 0, map[string]any{
-			"engine": "mysql", "slug": sl, "target": name, "count": len(dropped),
-		})
-	return nil
+	return teardownGeneric(ctx, "mysql", name, sl, repoID, worktreeID, st,
+		dropMatchingCount(drv.DropMatching))
 }
 
 // teardownPostgres drops the per-worktree Postgres database family.
-// Extracted verbatim from teardownOne's `postgres` switch arm.
 func teardownPostgres(
 	ctx context.Context,
 	cfg *config.Config,
@@ -2807,20 +2616,11 @@ func teardownPostgres(
 	if err != nil {
 		return err
 	}
-	dropped, err := drv.DropMatching(ctx, name)
-	if err != nil {
-		return err
-	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-		fmt.Sprintf("postgres: %s (%d)", name, len(dropped)),
-		repoID, worktreeID, "", 0, map[string]any{
-			"engine": "postgres", "slug": sl, "target": name, "count": len(dropped),
-		})
-	return nil
+	return teardownGeneric(ctx, "postgres", name, sl, repoID, worktreeID, st,
+		dropMatchingCount(drv.DropMatching))
 }
 
 // teardownMongo drops the per-worktree MongoDB database family.
-// Extracted verbatim from teardownOne's `mongodb` switch arm.
 func teardownMongo(
 	ctx context.Context,
 	cfg *config.Config,
@@ -2842,20 +2642,11 @@ func teardownMongo(
 	if err != nil {
 		return err
 	}
-	dropped, err := drv.DropMatching(ctx, name)
-	if err != nil {
-		return err
-	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-		fmt.Sprintf("mongodb: %s (%d)", name, len(dropped)),
-		repoID, worktreeID, "", 0, map[string]any{
-			"engine": "mongodb", "slug": sl, "target": name, "count": len(dropped),
-		})
-	return nil
+	return teardownGeneric(ctx, "mongodb", name, sl, repoID, worktreeID, st,
+		dropMatchingCount(drv.DropMatching))
 }
 
-// teardownRedis drops the per-worktree Redis key prefix. Extracted
-// verbatim from teardownOne's `redis` switch arm.
+// teardownRedis drops the per-worktree Redis key prefix.
 func teardownRedis(
 	ctx context.Context,
 	cfg *config.Config,
@@ -2880,20 +2671,11 @@ func teardownRedis(
 	if err != nil {
 		return err
 	}
-	dropped, err := drv.DropPrefix(ctx, prefix)
-	if err != nil {
-		return err
-	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-		fmt.Sprintf("redis: %s (%d)", prefix, dropped),
-		repoID, worktreeID, "", 0, map[string]any{
-			"engine": "redis", "slug": sl, "target": prefix, "count": dropped,
-		})
-	return nil
+	return teardownGeneric(ctx, "redis", prefix, sl, repoID, worktreeID, st, drv.DropPrefix)
 }
 
 // teardownES drops the per-worktree Elasticsearch / OpenSearch index
-// prefix. Extracted verbatim from teardownOne's `elasticsearch` arm.
+// prefix.
 func teardownES(
 	ctx context.Context,
 	cfg *config.Config,
@@ -2917,14 +2699,6 @@ func teardownES(
 	if err != nil {
 		return err
 	}
-	dropped, err := drv.DropMatching(ctx, prefix)
-	if err != nil {
-		return err
-	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
-		fmt.Sprintf("elasticsearch: %s (%d)", prefix, len(dropped)),
-		repoID, worktreeID, "", 0, map[string]any{
-			"engine": "elasticsearch", "slug": sl, "target": prefix, "count": len(dropped),
-		})
-	return nil
+	return teardownGeneric(ctx, "elasticsearch", prefix, sl, repoID, worktreeID, st,
+		dropMatchingCount(drv.DropMatching))
 }
