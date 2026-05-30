@@ -3,14 +3,36 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
+	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/store"
 )
+
+// shortSocketPath returns a unix-socket path short enough to bind on
+// macOS (104-byte sun_path limit). t.TempDir() on macOS roots tests
+// under /var/folders/<hash>/T/<TestName>/NNN/ which can exceed the
+// limit; pinning the parent at os.TempDir() with a tiny basename
+// keeps the path well inside the cap.
+//
+// CI hit `bind: invalid argument` on macos-latest before this helper
+// landed. See: https://man7.org/linux/man-pages/man7/unix.7.html
+// (Linux is 108 bytes, macOS is 104 — pick the lower bound).
+var sockCounter atomic.Uint64
+
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	n := sockCounter.Add(1)
+	p := filepath.Join(os.TempDir(), fmt.Sprintf("tm-%d-%d.sock", os.Getpid(), n))
+	t.Cleanup(func() { _ = os.Remove(p) })
+	return p
+}
 
 // TestStreamingSubscribe_EndToEnd spins up a unix-socket listener,
 // opens an rpc.SubscribeEvents stream against it, writes events to
@@ -21,7 +43,7 @@ func TestStreamingSubscribe_EndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	sockPath := filepath.Join(t.TempDir(), "treeman.sock")
+	sockPath := shortSocketPath(t)
 	t.Setenv("TREEMAN_SOCKET", sockPath)
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
@@ -98,7 +120,7 @@ func TestStreamingSubscribe_EndToEnd(t *testing.T) {
 func TestStreamingSubscribe_LevelFilter(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	sockPath := filepath.Join(t.TempDir(), "treeman.sock")
+	sockPath := shortSocketPath(t)
 	t.Setenv("TREEMAN_SOCKET", sockPath)
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
