@@ -20,34 +20,11 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	gosqlmysql "github.com/go-sql-driver/mysql"
-
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/ident"
 )
-
-// mysqlErrTableExists is MySQL/MariaDB Error 1050 ("Table '%s' already
-// exists"). Surfaces in two distinct scenarios during snapshot clone:
-//   - The target schema isn't actually empty (a prior aborted restore
-//     left tables behind that DROP DATABASE then DROP TABLE should
-//     have cleaned up but didn't on all engine versions/configurations).
-//   - An orphan InnoDB tablespace file (.ibd) exists in the schema
-//     directory without a matching data-dictionary entry. The next
-//     CREATE TABLE tries to write the same path and 1050s.
-//
-// Both are recoverable by issuing DROP TABLE IF EXISTS for the
-// specific table — that force-frees the dictionary row + tablespace
-// file — and retrying CREATE TABLE. See SnapshotCreate.
-const mysqlErrTableExists = 1050
-
-// isTableExistsErr returns true when err is a *mysql.MySQLError with
-// Number == 1050.
-func isTableExistsErr(err error) bool {
-	var me *gosqlmysql.MySQLError
-	return errors.As(err, &me) && me.Number == mysqlErrTableExists
-}
 
 // Driver wraps a *sql.DB plus the connection config used to open it.
 type Driver struct {
@@ -522,47 +499,42 @@ func (d *Driver) cloneTablesDDL(ctx context.Context, source, qsource, qtemplate 
 	if err != nil {
 		return nil, fmt.Errorf("list columns for %s: %w", qsource, err)
 	}
+	// Collect every table's CREATE statement, then run them in ONE
+	// multi-statement exec instead of a CREATE round trip per table —
+	// the same round-trip collapse applied to the physical restore
+	// path. The template was just DROP+CREATE DATABASE'd by the caller,
+	// so it's empty and the per-table 1050 stale-table retry can't fire
+	// (hence no need for it here); applyCloneSession disabled
+	// foreign_key_checks, so out-of-order CREATEs are fine.
+	var createBatch strings.Builder
 	for _, tbl := range tables {
-		if err := recreateTableDDL(ctx, conn, qsource, tbl.name); err != nil {
+		stmt, err := showCreateTable(ctx, conn, qsource, tbl.name)
+		if err != nil {
 			return nil, err
 		}
+		createBatch.WriteString(stmt)
+		createBatch.WriteString(";\n")
 		jobs = append(jobs, tableJob{name: tbl.name, cols: colsByTable[tbl.name]})
+	}
+	if createBatch.Len() > 0 {
+		if _, err := conn.ExecContext(ctx, createBatch.String()); err != nil {
+			return nil, fmt.Errorf("batch create tables on %s: %w", qtemplate, err)
+		}
 	}
 	return jobs, nil
 }
 
-// recreateTableDDL copies one table's schema from source into the
-// connection's current (template) database via SHOW CREATE TABLE +
-// CREATE TABLE, force-dropping and retrying on MySQL 1050.
-func recreateTableDDL(ctx context.Context, conn *sql.Conn, qsource, name string) error {
+// showCreateTable returns the CREATE TABLE statement for qsource.name.
+func showCreateTable(ctx context.Context, conn *sql.Conn, qsource, name string) (string, error) {
 	qtbl, err := ident.QuoteMySQL(name)
 	if err != nil {
-		return err
+		return "", err
 	}
-	row := conn.QueryRowContext(ctx, "SHOW CREATE TABLE "+qsource+"."+qtbl)
 	var gotName, createStmt string
-	if err := row.Scan(&gotName, &createStmt); err != nil {
-		return fmt.Errorf("SHOW CREATE TABLE %s.%s: %w", qsource, qtbl, err)
+	if err := conn.QueryRowContext(ctx, "SHOW CREATE TABLE "+qsource+"."+qtbl).Scan(&gotName, &createStmt); err != nil {
+		return "", fmt.Errorf("SHOW CREATE TABLE %s.%s: %w", qsource, qtbl, err)
 	}
-	if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-		// MySQL 1050 = "Table already exists". Most often
-		// caused by a prior aborted restore that left the
-		// schema half-populated (or an orphan InnoDB .ibd
-		// file post-crash). Force-drop the leftover and
-		// retry so the fanout completes instead of bailing
-		// the whole prepare. Conservative: only retry on
-		// 1050; any other CREATE TABLE failure still aborts.
-		if !isTableExistsErr(err) {
-			return fmt.Errorf("recreate %s: %w", qtbl, err)
-		}
-		if _, dropErr := conn.ExecContext(ctx, "DROP TABLE IF EXISTS "+qtbl); dropErr != nil {
-			return fmt.Errorf("recreate %s: drop stale table: %w (after %w)", qtbl, dropErr, err)
-		}
-		if _, retryErr := conn.ExecContext(ctx, createStmt); retryErr != nil {
-			return fmt.Errorf("recreate %s after dropping stale table: %w", qtbl, retryErr)
-		}
-	}
-	return nil
+	return createStmt, nil
 }
 
 // cloneViews replays every view from source into the template on a
