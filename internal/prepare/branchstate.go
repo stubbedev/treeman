@@ -156,9 +156,9 @@ func (a mysqlNS) DropDurable(ctx context.Context, durable string) error {
 }
 
 func (a mysqlNS) Watermark(ctx context.Context, ns string) (string, error) {
-	// Server-wide token — MySQL has no always-on per-database write
-	// counter. ns is ignored; coarseness only ever yields false-dirty.
-	return a.d.WriteWatermark(ctx)
+	// Per-database when performance_schema tracks table writes; else the
+	// driver falls back to a server-wide counter (sound, coarser).
+	return a.d.WriteWatermark(ctx, ns)
 }
 
 type postgresNS struct{ d *dbpostgres.Driver }

@@ -358,18 +358,62 @@ func (d *Driver) sourceDataBytes(ctx context.Context, db string) (int64, error) 
 	return n.Int64, nil
 }
 
-// WriteWatermark returns a sound, monotonic write-counter token for the
-// server: the sum of Innodb_rows_inserted + Innodb_rows_updated +
-// Innodb_rows_deleted from SHOW GLOBAL STATUS. These InnoDB counters are
-// always-on (not gated on performance_schema) and only ever increase, so
-// an unchanged token between two calls PROVES no row was written on the
-// server in between — sufficient to conclude a specific database is
-// untouched. It is server-wide (coarser than per-DB), which can yield
-// false-dirty results on a busy multi-database server, never false-clean.
+// WriteWatermark returns a sound, monotonic write-counter token for `db`.
+// An unchanged token between two calls PROVES no row was written, so the
+// caller can safely skip a redundant capture; the counters only ever
+// increase, so a write can never hide behind an equal token (false-clean
+// is impossible — false-dirty only costs a needless capture).
 //
-// The token is engine-internal and opaque; callers only test it for
-// equality. An error returns "" so the caller declines to skip work.
-func (d *Driver) WriteWatermark(ctx context.Context) (string, error) {
+// Two sources, in order:
+//
+//  1. PER-DATABASE: SUM(COUNT_WRITE) over `db`'s tables from
+//     performance_schema.table_io_waits_summary_by_table. Used ONLY when
+//     the relevant instrument + consumer are verified ENABLED — otherwise
+//     COUNT_WRITE pins at 0 and would falsely read "clean". This is the
+//     precise signal: a write to a sibling database does not move it.
+//  2. SERVER-WIDE fallback: Innodb_rows_{inserted,updated,deleted} from
+//     SHOW GLOBAL STATUS — always-on (not performance_schema-gated) and
+//     sound, but coarse (a sibling database's writes mark `db` dirty).
+//
+// The token is tagged with its source ("ps:<db>:" vs "ir:") so a runtime
+// flip between the two modes can never compare equal to a stale token.
+// An error returns "" so the caller declines to skip work.
+func (d *Driver) WriteWatermark(ctx context.Context, db string) (string, error) {
+	if tracked, _ := d.perfSchemaWritesTracked(ctx); tracked {
+		var sum sql.NullInt64
+		if err := d.DB.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(COUNT_WRITE), 0)
+			 FROM performance_schema.table_io_waits_summary_by_table
+			 WHERE OBJECT_SCHEMA = ?`, db).Scan(&sum); err == nil {
+			return "ps:" + db + ":" + strconv.FormatInt(sum.Int64, 10), nil
+		}
+		// Fall through to the global counter on any query error.
+	}
+	return d.globalRowWatermark(ctx)
+}
+
+// perfSchemaWritesTracked reports whether table-level write counts are
+// actually being recorded — i.e. the table-io instrument AND the global
+// instrumentation consumer are both ENABLED. If either is off (or
+// performance_schema is disabled entirely, surfacing as a query error),
+// COUNT_WRITE is untrustworthy and the caller must NOT use the per-db
+// path. Closing this hole is what makes the per-db watermark sound.
+func (d *Driver) perfSchemaWritesTracked(ctx context.Context) (bool, error) {
+	var inst, cons sql.NullString
+	if err := d.DB.QueryRowContext(ctx, `
+		SELECT
+			(SELECT ENABLED FROM performance_schema.setup_instruments
+			   WHERE NAME = 'wait/io/table/sql/handler' LIMIT 1),
+			(SELECT ENABLED FROM performance_schema.setup_consumers
+			   WHERE NAME = 'global_instrumentation' LIMIT 1)`).Scan(&inst, &cons); err != nil {
+		return false, err
+	}
+	return inst.Valid && inst.String == "YES" && cons.Valid && cons.String == "YES", nil
+}
+
+// globalRowWatermark is the always-available server-wide fallback: the
+// sum of the monotonic Innodb_rows_* counters from SHOW GLOBAL STATUS.
+func (d *Driver) globalRowWatermark(ctx context.Context) (string, error) {
 	rows, err := d.DB.QueryContext(ctx,
 		`SHOW GLOBAL STATUS WHERE Variable_name IN
 		 ('Innodb_rows_inserted','Innodb_rows_updated','Innodb_rows_deleted')`)

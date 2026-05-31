@@ -21,6 +21,7 @@ import (
 
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
+	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -129,12 +130,11 @@ func TestMigrateGateMySQL(t *testing.T) {
 }
 
 // TestCaptureGateMySQL: after a clean resume the outgoing capture is
-// skipped (live InnoDB watermark unchanged), but a write before the next
+// skipped (live write watermark unchanged), but a write before the next
 // switch forces the capture — and that capture preserves the new row.
-//
-// Relies on this package's dedicated MySQL (port 13390) and on e2e tests
-// running sequentially within the package, so the server-wide InnoDB
-// watermark moves only in response to this test's own writes.
+// On MySQL 8.x the watermark is the per-database performance_schema
+// write count; isolation from sibling databases is covered by
+// TestMultiWorktreeCaptureGateMySQL.
 func TestCaptureGateMySQL(t *testing.T) {
 	harness.SkipIfNoDocker(t)
 	waitMySQL(t)
@@ -412,7 +412,7 @@ func TestMultiWorktreeCaptureGatePostgres(t *testing.T) {
 
 	// Write into B's active DB. B's per-database watermark advances; A's
 	// must NOT — so A's next switch can still skip.
-	pgExec(t, activeB, "INSERT INTO items(v) VALUES('B-noise')")
+	pgExec(t, activeB, "INSERT INTO items(v) VALUES('bnoise')")
 
 	// A clean bounce: must still skip despite the concurrent write in B.
 	drivePrepare(t, st, cfg, wtA, repoID, wtIDA, "feature")
@@ -423,7 +423,138 @@ func TestMultiWorktreeCaptureGatePostgres(t *testing.T) {
 	// Data isolation: A resumes only A's rows; B kept its own + the noise.
 	drivePrepare(t, st, cfg, wtA, repoID, wtIDA, "develop")
 	pgAssertItems(t, activeA, "a")
-	pgAssertItems(t, activeB, "B-noise", "b")
+	pgAssertItems(t, activeB, "bnoise", "b")
+}
+
+// TestMultiWorktreeCaptureGateMySQL proves the per-database MySQL
+// watermark (performance_schema, enabled by default on 8.x) isolates
+// sibling worktrees: a write into one worktree's active database must NOT
+// dirty another's capture gate. Before the per-db watermark this could
+// not hold — the server-wide Innodb_rows_* counter saw every database's
+// writes — so this is the regression guard for that upgrade.
+func TestMultiWorktreeCaptureGateMySQL(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitMySQL(t)
+	ctx := context.Background()
+
+	st := openStore(t)
+	root := t.TempDir()
+	repoID, err := st.EnsureRepo(ctx, root, "multimysql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtA := filepath.Join(root, "a")
+	wtB := filepath.Join(root, "b")
+	for _, p := range []string{wtA, wtB} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wtIDA, err := st.EnsureWorktree(ctx, repoID, wtA, slug.For(wtA, "").Value, "develop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtIDB, err := st.EnsureWorktree(ctx, repoID, wtB, slug.For(wtB, "").Value, "develop")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mysql: &config.MysqlConn{Host: "127.0.0.1", Port: 13390, User: "root", Password: "rootpw"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mysql",
+			NameTemplate: "tm_bsmwmy_{slug}",
+			BranchScoped: true,
+		}},
+	}
+
+	bring := func(wtPath string, wtID int64) string {
+		active := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop")
+		mustExec(t, active, "CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(32))")
+		mustExec(t, active, "INSERT INTO items(v) VALUES('"+filepath.Base(wtPath)+"')")
+		drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+		mustExec(t, active, "INSERT INTO items(v) VALUES('feat-"+filepath.Base(wtPath)+"')")
+		drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop") // resume → clean
+		return active
+	}
+
+	activeA := bring(wtA, wtIDA)
+	activeB := bring(wtB, wtIDB)
+	t.Cleanup(func() { dropMySQL(t, activeA); dropMySQL(t, activeB) })
+
+	if activeA == activeB {
+		t.Fatalf("sibling worktrees must get distinct active databases, both = %s", activeA)
+	}
+
+	skipsA := countEvents(t, st, wtIDA, "capture_skip")
+
+	// Write into B's active DB. With a per-database watermark, A's gate
+	// must be unaffected — so A's next switch still skips.
+	mustExec(t, activeB, "INSERT INTO items(v) VALUES('bnoise')")
+
+	drivePrepare(t, st, cfg, wtA, repoID, wtIDA, "feature")
+	if got := countEvents(t, st, wtIDA, "capture_skip"); got != skipsA+1 {
+		t.Fatalf("per-db watermark must isolate A from B's write: capture_skip %d → %d (want +1)", skipsA, got)
+	}
+
+	drivePrepare(t, st, cfg, wtA, repoID, wtIDA, "develop")
+	assertItems(t, activeA, "a")
+	assertItems(t, activeB, "bnoise", "b")
+}
+
+// TestMySQLWatermarkSourceSelection covers the watermark SOURCE choice
+// against a real server — the part the capture-gate tests can't, since
+// MySQL 8.x always has performance_schema on:
+//
+//  1. instrument enabled  → per-database token ("ps:")
+//  2. instrument disabled → fall back to the global counter ("ir:"),
+//     NOT a falsely-clean pinned-0 performance_schema read. This is the
+//     soundness guard for the per-db watermark.
+func TestMySQLWatermarkSourceSelection(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitMySQL(t)
+	ctx := context.Background()
+
+	drv, err := dbmysql.Connect(ctx, config.MysqlConn{
+		Host: "127.0.0.1", Port: 13390, User: "root", Password: "rootpw",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = drv.Close() }()
+
+	// performance_schema on by default → per-database token.
+	wm, err := drv.WriteWatermark(ctx, "mysql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(wm, "ps:") {
+		t.Fatalf("instrument enabled must use the per-db token, got %q", wm)
+	}
+
+	// Disable the table-io instrument. COUNT_WRITE then pins at 0, which
+	// would read falsely "clean" — the guard must instead fall back to
+	// the always-on global counter.
+	if _, err := drv.DB.ExecContext(ctx,
+		`UPDATE performance_schema.setup_instruments SET ENABLED='NO'
+		 WHERE NAME='wait/io/table/sql/handler'`); err != nil {
+		t.Fatalf("disable instrument: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = drv.DB.ExecContext(context.Background(),
+			`UPDATE performance_schema.setup_instruments SET ENABLED='YES'
+			 WHERE NAME='wait/io/table/sql/handler'`)
+	})
+
+	wm2, err := drv.WriteWatermark(ctx, "mysql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(wm2, "ir:") {
+		t.Fatalf("instrument disabled must fall back to the global counter, got %q", wm2)
+	}
 }
 
 // TestCaptureNeverSkippedRedis: same soundness floor for redis.
