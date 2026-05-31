@@ -673,29 +673,49 @@ func backtickJoin(cols []string) (string, error) {
 	return b.String(), nil
 }
 
-// SnapshotRestore re-creates `target` from `template`.
+// SnapshotRestore re-creates `target` from `template` with a single
+// direct clone. Symmetric to SnapshotCreate. Use this for one-shot
+// restores (incremental ancestor→source); for restoring one template
+// into many targets use SnapshotRestoreStaged, which amortizes the
+// export across the fan-out.
+func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
+	qtarget, err := ident.QuoteMySQL(target)
+	if err != nil {
+		return err
+	}
+	if err := ident.ValidateMySQL(template); err != nil {
+		return err
+	}
+	if _, err := d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
+		return err
+	}
+	return d.SnapshotCreate(ctx, template, target)
+}
+
+// SnapshotRestoreStaged re-creates `target` from `template`, importing
+// from a once-per-template export instead of cloning the template
+// directly. It is the fan-out path: one prepare clones a single
+// immutable template into N targets concurrently, and the direct
+// physical clone (SnapshotCreate) takes FLUSH TABLES <template>.* FOR
+// EXPORT on the shared template and holds it across the .ibd copy — so N
+// concurrent direct restores serialize on that one export lock.
 //
-// Restore is the fan-out hot path: a single prepare clones one immutable
-// template into N test databases concurrently. The physical clone in
-// SnapshotCreate takes FLUSH TABLES <template>.* FOR EXPORT on the
-// shared template and holds it across the .ibd copy, so N concurrent
-// restores serialize on that one export lock — the dominant cost of a
-// wide fan-out.
+// Staging exports the template's tablespaces to a staging dir exactly
+// once (ensureStage / stageTemplate, guarded by a per-template
+// sync.Once); every restore then imports plain file copies from staging
+// (physicalRestoreFromStage) and takes no lock on the template, so the
+// fan-out is bounded by disk + IMPORT rather than a serial export lock.
 //
-// To remove that contention the template's tablespaces are exported to
-// a staging dir exactly once (ensureStage / stageTemplate, guarded by a
-// per-template sync.Once); every restore then imports from staging via
-// physicalRestoreFromStage, which copies plain files and takes no lock
-// on the template. The fan-out is then bounded by disk + IMPORT, not by
-// a serial export lock.
+// Staging trades one extra file copy (template→staging) for that
+// parallelism, so it only pays off when the same template is restored
+// more than once — hence single restores use SnapshotRestore instead.
 //
-// Fallback chain is preserved exactly: when staging is unavailable
+// Fallback chain matches the direct path: when staging is unavailable
 // (no ContainerRef, engine binary absent, empty secure_file_priv,
 // non-InnoDB tables, …) or fails, the restore falls back to the always-
-// available logical clone. Physical staging is never re-attempted via
-// SnapshotCreate here — calling logicalSnapshotCreate directly avoids a
-// pointless second FLUSH-FOR-EXPORT probe per clone.
-func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
+// available logical clone. logicalSnapshotCreate is called directly so
+// no redundant FLUSH-FOR-EXPORT probe runs per clone.
+func (d *Driver) SnapshotRestoreStaged(ctx context.Context, template, target string) error {
 	qtarget, err := ident.QuoteMySQL(target)
 	if err != nil {
 		return err

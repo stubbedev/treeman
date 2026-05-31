@@ -69,7 +69,7 @@ func (e *physicalSkippedError) Error() string {
 // still want it explicit so the logical fallback never trips on
 // "Schema directory already exists".
 //
-//nolint:cyclop,funlen // one linear orchestrator with explicit precondition checks; splitting just spreads the same branches across helpers without simplifying review
+//nolint:cyclop // one linear orchestrator with explicit precondition checks; splitting just spreads the same branches across helpers without simplifying review
 func (d *Driver) tryPhysicalSnapshotCreate(ctx context.Context, source, template string) (ok bool, err error) {
 	if d.cfg.Container == "" && d.cfg.ComposeService == "" {
 		return false, &physicalSkippedError{reason: "no ContainerRef on connections.mysql"}
@@ -188,29 +188,20 @@ func (d *Driver) tryPhysicalSnapshotCreate(ctx context.Context, source, template
 		return false, fmt.Errorf("FLUSH TABLES FOR EXPORT: %w", err)
 	}
 
-	// Copy .ibd + .cfg from <datadir>/source/X.* → <datadir>/template/X.*.
-	// `--user mysql` is load-bearing: by default `docker exec` runs as
-	// root, so cp would create files owned by root:root, and mysqld
-	// (running as the mysql user inside the container) couldn't open
-	// them for IMPORT TABLESPACE (-rw-r----- with root:root ownership
-	// is opaque to a non-root mysql user). Running cp as the mysql
-	// user makes the new files inherit mysql:mysql ownership.
+	// Copy .ibd + .cfg from <datadir>/source/X.* → <datadir>/template/X.*
+	// in a single docker exec (see copyTablespaces: per-file exec startup
+	// otherwise dominates for many-table schemas). `--user mysql` is
+	// load-bearing: the default exec user is root, so files would be
+	// root-owned and opaque to the non-root mysqld for IMPORT TABLESPACE;
+	// running cp as mysql makes them inherit mysql:mysql ownership.
 	srcDir := datadir + "/" + source
 	dstDir := datadir + "/" + template
-	for _, t := range tables {
-		for _, ext := range []string{".cfg", ".ibd"} {
-			cmd := exec.CommandContext(ctx, engineBin, "exec", "--user", "mysql", cid,
-				"cp", srcDir+"/"+t+ext, dstDir+"/"+t+ext)
-			if out, cerr := cmd.CombinedOutput(); cerr != nil {
-				_, _ = lockConn.ExecContext(ctx, "UNLOCK TABLES")
-				return false, fmt.Errorf("%s exec cp %s/%s%s: %w (%s)",
-					engineBin, source, t, ext, cerr, strings.TrimSpace(string(out)))
-			}
-		}
+	copyErr := copyTablespaces(ctx, engineBin, cid, srcDir, dstDir, tables)
+	if _, err := lockConn.ExecContext(ctx, "UNLOCK TABLES"); err != nil && copyErr == nil {
+		copyErr = fmt.Errorf("UNLOCK TABLES: %w", err)
 	}
-
-	if _, err := lockConn.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
-		return false, fmt.Errorf("UNLOCK TABLES: %w", err)
+	if copyErr != nil {
+		return false, copyErr
 	}
 
 	for _, t := range tables {

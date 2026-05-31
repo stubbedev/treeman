@@ -735,7 +735,7 @@ func prepareMySQL(
 	out, done, err := cacheHitGeneric(
 		ctx,
 		drv.DatabaseExists,
-		drv.SnapshotRestore,
+		drv.SnapshotRestoreStaged,
 		d,
 		tplCtx,
 		worktreePath,
@@ -764,8 +764,9 @@ func prepareMySQL(
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
 		inheritedEnv, started, incrementalOps{
-			exists:          drv.DatabaseExists,
-			snapshotRestore: drv.SnapshotRestore,
+			exists:                drv.DatabaseExists,
+			snapshotRestore:       drv.SnapshotRestore,
+			snapshotRestoreFanout: drv.SnapshotRestoreStaged,
 			snapshotCreate: func(ctx context.Context, src, tmpl string) error {
 				if cerr := drv.SnapshotCreate(ctx, src, tmpl); cerr != nil {
 					return cerr
@@ -815,7 +816,7 @@ func prepareMySQL(
 		st,
 		repoID,
 		worktreeID,
-		drv.SnapshotRestore,
+		drv.SnapshotRestoreStaged,
 		templateName,
 		clones,
 		d.Engine,
@@ -1131,7 +1132,15 @@ type incrementalOps struct {
 	// snapshotRestore copies a template namespace into a target. Same
 	// signature as cloneRestorer; engines already expose this for the
 	// cache-hit and fan-out paths so no new driver method is needed.
+	// Used for the single ancestor→source restore — keep it on the
+	// direct one-copy path.
 	snapshotRestore cloneRestorer
+	// snapshotRestoreFanout, when non-nil, restores the freshly-built
+	// template into the test clones; falls back to snapshotRestore when
+	// nil. Lets mysql use its export-once staged restore for the
+	// many-clone fan-out without paying the extra staging copy on the
+	// single ancestor→source restore above.
+	snapshotRestoreFanout cloneRestorer
 	// snapshotCreate copies a populated source into a NEW template
 	// (mysql DDL+INSERT, postgres CREATE DATABASE TEMPLATE, mongo $out,
 	// redis COPY, ES _clone). Wraps the per-driver SnapshotCreate.
@@ -1249,7 +1258,11 @@ func tryIncrementalBuild(
 	if err != nil {
 		return Outcome{}, false, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, ops.snapshotRestore, templateName,
+	fanoutRestore := ops.snapshotRestore
+	if ops.snapshotRestoreFanout != nil {
+		fanoutRestore = ops.snapshotRestoreFanout
+	}
+	if err := fanOutClones(ctx, st, repoID, worktreeID, fanoutRestore, templateName,
 		clones, d.Engine, d.Fanout, maxConns); err != nil {
 		return Outcome{}, false, err
 	}

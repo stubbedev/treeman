@@ -209,17 +209,24 @@ func exportFlushList(schema string, tables []string) ([]string, error) {
 	return out, nil
 }
 
-// copyTablespaces copies each table's .cfg + .ibd from srcDir to dstDir
-// inside the container as the mysql user. .cfg is copied first so a
-// reader never sees an .ibd without its layout descriptor.
+// copyTablespaces copies every table's .cfg + .ibd from srcDir into the
+// destination directory dstDir inside the container, as the mysql user,
+// in a SINGLE docker exec.
+//
+// Batching is the whole point: `docker exec` process startup (tens of ms)
+// dominates the actual byte copy for the typical many-tiny-tables schema
+// (e.g. 200+ tables, tens of MB total). A per-file exec loop spends ~20s
+// of pure spawn overhead per clone; one cp with all source paths and a
+// trailing destination dir collapses that to a single process.
 func copyTablespaces(ctx context.Context, engineBin, cid, srcDir, dstDir string, tables []string) error {
+	args := make([]string, 0, 2*len(tables)+2)
+	args = append(args, "cp")
 	for _, t := range tables {
-		for _, ext := range []string{".cfg", ".ibd"} {
-			if err := dockerExecMysql(ctx, engineBin, cid,
-				"cp", srcDir+"/"+t+ext, dstDir+"/"+t+ext); err != nil {
-				return fmt.Errorf("cp %s%s: %w", t, ext, err)
-			}
-		}
+		args = append(args, srcDir+"/"+t+".cfg", srcDir+"/"+t+".ibd")
+	}
+	args = append(args, dstDir+"/")
+	if err := dockerExecMysql(ctx, engineBin, cid, args...); err != nil {
+		return fmt.Errorf("batch cp %d tablespaces: %w", len(tables), err)
 	}
 	return nil
 }
