@@ -4,6 +4,7 @@ package mongo_e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -321,5 +322,120 @@ func assertProductCount(t *testing.T, dbName string, want int) {
 	}
 	if int(n) != want {
 		t.Errorf("products count = %d, want %d (db=%s)", n, want, dbName)
+	}
+}
+
+// TestBeefyMongoDumpRestoreFanout exercises the in-container
+// mongodump|mongorestore clone path (activated by setting a ContainerRef
+// on the connection) at scale: many collections × many docs, fanned out
+// to several clones. Asserts every clone is a complete copy. With the
+// tools present in the mongo image the dump/restore path runs; if it
+// ever failed it would fall back to $out and still pass — so this is a
+// correctness guard for the fast path, not merely a smoke test.
+func TestBeefyMongoDumpRestoreFanout(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mongo:27117", 60*time.Second, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		c, err := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27117"))
+		if err != nil {
+			return err
+		}
+		defer c.Disconnect(ctx)
+		return c.Ping(ctx, nil)
+	})
+
+	const (
+		nColls   = 10
+		nDocs    = 2000
+		nClones  = 4
+		sampleCt = 4
+	)
+
+	wt := t.TempDir()
+	seed := fmt.Sprintf(`#!/usr/bin/env sh
+set -eu
+: "${MONGO_DB:?MONGO_DB not set}"
+container="${MONGO_CONTAINER:-treeman-e2e-mongo}"
+docker exec -i "$container" mongosh --quiet --eval "
+db = db.getSiblingDB('$MONGO_DB');
+for (let c = 0; c < %d; c++) {
+  const name = 'c' + c;
+  db[name].deleteMany({});
+  const docs = [];
+  for (let i = 0; i < %d; i++) docs.push({k: 'row' + i, v: i});
+  db[name].insertMany(docs);
+}
+print('seeded');
+"
+`, nColls, nDocs)
+	if err := os.WriteFile(filepath.Join(wt, "seed.sh"), []byte(seed), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "schema.txt"), []byte("beefy-v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			// Internal port + ContainerRef: the daemon resolves the
+			// container's address to connect, and the clone path runs
+			// mongodump|mongorestore inside the container.
+			Mongodb: &config.MongoConn{
+				URI:          "mongodb://127.0.0.1:27017",
+				ContainerRef: config.ContainerRef{Container: "treeman-e2e-mongo"},
+			},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mongodb",
+			NameTemplate: "treeman_beefy_{slug}",
+			Seed: &config.Step{
+				Run: "./seed.sh",
+				Env: map[string]string{"MONGO_DB": "{target_db}", "MONGO_CONTAINER": "treeman-e2e-mongo"},
+			},
+			Inputs: []config.Input{{Glob: "schema.txt", Label: "schema"}},
+			TestClones: &config.TestClonesSpec{
+				Clones:       config.ClonesSetting{Fixed: nClones},
+				NameTemplate: "treeman_beefy_{slug}_w{n}",
+			},
+		}},
+	}
+
+	env := harness.NewEnv(t, wt)
+	start := time.Now()
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mongodb", false)
+	t.Logf("beefy mongo: %d colls × %d docs → %d clones in %s (source=%s)",
+		nColls, nDocs, nClones, time.Since(start).Round(time.Millisecond), o.SourceDB)
+	if len(o.Clones) != nClones {
+		t.Fatalf("clone count = %d, want %d", len(o.Clones), nClones)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	c, err := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27117"))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer c.Disconnect(ctx)
+
+	for _, clone := range o.Clones {
+		colls, err := c.Database(clone).ListCollectionNames(ctx, bson.D{})
+		if err != nil {
+			t.Fatalf("list collections in %s: %v", clone, err)
+		}
+		if len(colls) != nColls {
+			t.Errorf("clone %s collection count = %d, want %d", clone, len(colls), nColls)
+		}
+		for s := range sampleCt {
+			coll := fmt.Sprintf("c%d", s*nColls/sampleCt)
+			n, err := c.Database(clone).Collection(coll).CountDocuments(ctx, struct{}{})
+			if err != nil {
+				t.Fatalf("count %s.%s: %v", clone, coll, err)
+			}
+			if int(n) != nDocs {
+				t.Errorf("clone %s coll %s docs = %d, want %d", clone, coll, n, nDocs)
+			}
+		}
 	}
 }

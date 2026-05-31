@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -20,6 +21,13 @@ import (
 // Driver wraps the mongo Client.
 type Driver struct {
 	Client *mongo.Client
+	cfg    config.MongoConn
+
+	// dumpToolsOnce caches whether mongodump+mongorestore exist in the
+	// configured container, so the dump/restore fast path is probed
+	// once rather than per clone.
+	dumpToolsOnce sync.Once
+	dumpToolsOK   bool
 }
 
 // Connect parses cfg.URI, probes TCP reachability (when the URI
@@ -60,7 +68,7 @@ func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 		_ = c.Disconnect(ctx)
 		return nil, fmt.Errorf("mongo ping: %w", err)
 	}
-	return &Driver{Client: c}, nil
+	return &Driver{Client: c, cfg: cfg}, nil
 }
 
 func (d *Driver) Close(ctx context.Context) error { return d.Client.Disconnect(ctx) }

@@ -99,10 +99,12 @@ func (d *Driver) DropDatabase(ctx context.Context, name string) error {
 	return d.Client.Database(name).Drop(ctx)
 }
 
-// cloneDatabase is the shared inner loop for SnapshotCreate /
-// SnapshotRestore: list source collections, fan out the per-
-// collection clones (limit 6 — same as DropMatching), copy indexes.
-func (d *Driver) cloneDatabase(ctx context.Context, source, dest string) error {
+// cloneViaOut is the wire-protocol clone — the fallback cloneDatabase
+// uses when the in-container mongodump/mongorestore tools aren't
+// available (see dumprestore.go). Lists source collections, fans out the
+// per-collection $out clones (limit 6 — same as DropMatching), copies
+// indexes.
+func (d *Driver) cloneViaOut(ctx context.Context, source, dest string) error {
 	srcDB := d.Client.Database(source)
 	colls, err := srcDB.ListCollectionNames(ctx, bson.D{})
 	if err != nil {
