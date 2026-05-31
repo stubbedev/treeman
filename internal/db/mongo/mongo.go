@@ -28,6 +28,12 @@ type Driver struct {
 	// once rather than per clone.
 	dumpToolsOnce sync.Once
 	dumpToolsOK   bool
+
+	// archives caches a per-template `mongodump --archive` so a fan-out
+	// dumps the (immutable, fingerprint-named) template once and each
+	// clone restores from that archive. Keyed by template DB name →
+	// *mongoArchive. See dumprestore.go.
+	archives sync.Map
 }
 
 // Connect parses cfg.URI, probes TCP reachability (when the URI

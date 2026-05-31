@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/stubbedev/treeman/internal/db/containerip"
 )
@@ -43,9 +44,21 @@ func (d *Driver) cloneDatabase(ctx context.Context, source, dest string) error {
 	return d.cloneViaOut(ctx, source, dest)
 }
 
-// cloneViaDumpRestore runs one in-container mongodump|mongorestore pipe.
-// Returns errCloneToolsUnavailable (wrapped) when the preconditions
-// aren't met so the caller falls back without noise.
+// mongoArchive is the once-per-template dump cache: a fan-out dumps the
+// immutable template to an archive file once, then every clone restores
+// from it. Exactly one of err / (path set) is meaningful after `once`.
+type mongoArchive struct {
+	once sync.Once
+	path string
+	err  error
+}
+
+// cloneViaDumpRestore copies `source` → `dest` using the in-container
+// tools. For a fingerprint-named snapshot template (immutable) it dumps
+// to a cached archive once and restores N clones from it; for any other
+// source it runs a single mongodump|mongorestore pipe. Returns
+// errCloneToolsUnavailable (wrapped) when preconditions aren't met so
+// the caller falls back to $out without noise.
 func (d *Driver) cloneViaDumpRestore(ctx context.Context, source, dest string) error {
 	cid, engineBin, err := d.resolveContainer(ctx)
 	if err != nil {
@@ -54,21 +67,78 @@ func (d *Driver) cloneViaDumpRestore(ctx context.Context, source, dest string) e
 	if !d.dumpToolsAvailable(ctx, engineBin, cid) {
 		return fmt.Errorf("%w: mongodump/mongorestore not on PATH in %s", errCloneToolsUnavailable, cid)
 	}
-
 	uri := d.inContainerURI()
-	// mongorestore --drop drops each destination collection before
-	// restoring it, so a re-run is idempotent. --nsFrom/--nsTo remap the
-	// dumped `source.*` namespaces onto `dest.*`. --archive with no path
-	// streams over the pipe, so no scratch file is written.
+
+	if isSnapshotTemplate(source) {
+		return d.cloneViaArchive(ctx, cid, engineBin, uri, source, dest)
+	}
+
+	// Non-template source (e.g. building the template itself): single
+	// streamed pipe, no scratch file. --drop makes re-runs idempotent.
 	script := fmt.Sprintf(
 		"mongodump --uri=%s --db=%s --archive | mongorestore --uri=%s --archive --nsInclude=%s --nsFrom=%s --nsTo=%s --drop",
 		shQuote(uri), shQuote(source), shQuote(uri),
 		shQuote(source+".*"), shQuote(source+".*"), shQuote(dest+".*"),
 	)
-	full := []string{"exec", cid, "sh", "-c", script}
-	if out, cerr := exec.CommandContext(ctx, engineBin, full...).CombinedOutput(); cerr != nil {
-		return fmt.Errorf("%s exec mongodump|mongorestore %s→%s: %w (%s)",
-			engineBin, source, dest, cerr, strings.TrimSpace(string(out)))
+	return dockerExecSh(ctx, engineBin, cid, script,
+		fmt.Sprintf("mongodump|mongorestore %s→%s", source, dest))
+}
+
+// cloneViaArchive dumps `source` to a cached archive once (guarded by
+// sync.Once) then restores it into `dest`, remapping the source.*
+// namespaces onto dest.*. The N-clone fan-out thus pays a single dump.
+func (d *Driver) cloneViaArchive(ctx context.Context, cid, engineBin, uri, source, dest string) error {
+	v, _ := d.archives.LoadOrStore(source, &mongoArchive{})
+	a, _ := v.(*mongoArchive)
+	a.once.Do(func() {
+		path := mongoStageDir + "/" + source + ".archive"
+		dump := fmt.Sprintf("mkdir -p %s && mongodump --uri=%s --db=%s --archive=%s",
+			shQuote(mongoStageDir), shQuote(uri), shQuote(source), shQuote(path))
+		if err := dockerExecSh(ctx, engineBin, cid, dump, "mongodump "+source); err != nil {
+			a.err = err
+			return
+		}
+		a.path = path
+	})
+	if a.err != nil {
+		return a.err
+	}
+	restore := fmt.Sprintf(
+		"mongorestore --uri=%s --archive=%s --nsInclude=%s --nsFrom=%s --nsTo=%s --drop",
+		shQuote(uri), shQuote(a.path), shQuote(source+".*"), shQuote(source+".*"), shQuote(dest+".*"),
+	)
+	return dockerExecSh(ctx, engineBin, cid, restore,
+		fmt.Sprintf("mongorestore %s→%s", source, dest))
+}
+
+// mongoStageDir is the in-container scratch dir for cached dump archives.
+const mongoStageDir = "/tmp/_tm_mongo_stage"
+
+// isSnapshotTemplate reports whether `name` is a fingerprint-keyed
+// snapshot template — content-addressed and therefore immutable, so its
+// dump archive is safe to cache and reuse across the fan-out.
+func isSnapshotTemplate(name string) bool {
+	return strings.HasPrefix(name, "_tm")
+}
+
+// dropArchive best-effort removes a template's cached dump archive and
+// forgets the in-memory entry. Silent on every failure — the archive is
+// a cache, not state.
+func (d *Driver) dropArchive(ctx context.Context, template string) {
+	d.archives.Delete(template)
+	cid, engineBin, err := d.resolveContainer(ctx)
+	if err != nil {
+		return
+	}
+	_ = dockerExecSh(ctx, engineBin, cid,
+		"rm -f "+shQuote(mongoStageDir+"/"+template+".archive"), "rm archive")
+}
+
+// dockerExecSh runs `<engine> exec <cid> sh -c <script>` and wraps any
+// failure with `what` for context.
+func dockerExecSh(ctx context.Context, engineBin, cid, script, what string) error {
+	if out, err := exec.CommandContext(ctx, engineBin, "exec", cid, "sh", "-c", script).CombinedOutput(); err != nil {
+		return fmt.Errorf("%s exec %s: %w (%s)", engineBin, what, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

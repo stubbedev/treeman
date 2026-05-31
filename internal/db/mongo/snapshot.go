@@ -85,8 +85,9 @@ func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) e
 }
 
 // DropSnapshot drops the named template database. Used by the
-// snapshot GC sweep.
+// snapshot GC sweep. Also reaps the cached dump archive (best-effort).
 func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
+	d.dropArchive(ctx, template)
 	return d.Client.Database(template).Drop(ctx)
 }
 
