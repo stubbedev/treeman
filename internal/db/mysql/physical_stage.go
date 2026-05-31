@@ -35,6 +35,7 @@ type templateStage struct {
 
 	dir       string   // container path holding the exported .ibd/.cfg
 	tables    []string // InnoDB base tables captured from the template
+	createSQL []string // SHOW CREATE TABLE per table, aligned with tables
 	cid       string   // resolved container id
 	engineBin string   // container engine binary (docker/podman/…)
 	datadir   string   // mysql @@datadir inside the container
@@ -154,6 +155,15 @@ func (d *Driver) stageTemplate(ctx context.Context, st *templateStage, template 
 		return
 	}
 
+	// Capture each table's CREATE statement once, here, instead of in
+	// every restore: the schema is identical for all clones, so a
+	// per-clone SHOW CREATE is N× redundant work on the fan-out hot path.
+	createSQL, err := d.captureCreateDDL(ctx, template, tables)
+	if err != nil {
+		st.err = err
+		return
+	}
+
 	flushList, err := exportFlushList(template, tables)
 	if err != nil {
 		st.err = err
@@ -189,6 +199,35 @@ func (d *Driver) stageTemplate(ctx context.Context, st *templateStage, template 
 	st.datadir = datadir
 	st.dir = stageDir
 	st.tables = tables
+	st.createSQL = createSQL
+}
+
+// captureCreateDDL reads each table's CREATE statement from `schema`.
+// Run once per template (at stage time); the result is reused by every
+// restore so the fan-out never re-issues SHOW CREATE per clone.
+func (d *Driver) captureCreateDDL(ctx context.Context, schema string, tables []string) ([]string, error) {
+	qschema, err := ident.QuoteMySQL(schema)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := d.DB.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	out := make([]string, len(tables))
+	for i, t := range tables {
+		qt, qerr := ident.QuoteMySQL(t)
+		if qerr != nil {
+			return nil, qerr
+		}
+		var name, stmt string
+		if serr := conn.QueryRowContext(ctx, "SHOW CREATE TABLE "+qschema+"."+qt).Scan(&name, &stmt); serr != nil {
+			return nil, fmt.Errorf("SHOW CREATE TABLE %s.%s: %w", qschema, qt, serr)
+		}
+		out[i] = stmt
+	}
+	return out, nil
 }
 
 // exportFlushList renders the `schema`.`table` list for a FLUSH TABLES …
@@ -240,12 +279,8 @@ func copyTablespaces(ctx context.Context, engineBin, cid, srcDir, dstDir string,
 //
 // On any failure past the target CREATE the partially-built target is
 // dropped so the caller's logical fallback gets a clean slate.
-func (d *Driver) physicalRestoreFromStage(ctx context.Context, st *templateStage, template, target string) (err error) {
+func (d *Driver) physicalRestoreFromStage(ctx context.Context, st *templateStage, target string) (err error) {
 	qtarget, err := ident.QuoteMySQL(target)
-	if err != nil {
-		return err
-	}
-	qtemplate, err := ident.QuoteMySQL(template)
 	if err != nil {
 		return err
 	}
@@ -283,27 +318,74 @@ func (d *Driver) physicalRestoreFromStage(ctx context.Context, st *templateStage
 	if _, err := prepConn.ExecContext(ctx, "USE "+qtarget); err != nil {
 		return fmt.Errorf("USE %s: %w", qtarget, err)
 	}
-	for _, t := range st.tables {
-		if err := recreateAndDiscard(ctx, prepConn, qtemplate, t); err != nil {
-			return err
-		}
+
+	// Recreate the schema + discard every tablespace in ONE multi-
+	// statement round-trip (DSN sets multiStatements=true), using the
+	// CREATE DDL captured once at stage time. A per-table loop is
+	// ~2×N_tables round-trips per clone — the new bottleneck once the
+	// per-file cp was batched away. foreign_key_checks/unique_checks are
+	// already disabled on prepConn, so out-of-order CREATEs are fine, and
+	// the staged target is freshly created so no stale-table 1050 retry
+	// (the per-table path's only reason to exist) is needed.
+	createDiscard, err := buildCreateDiscardScript(st.createSQL, st.tables)
+	if err != nil {
+		return err
+	}
+	if _, err := prepConn.ExecContext(ctx, createDiscard); err != nil {
+		return fmt.Errorf("recreate+discard schema for %s: %w", target, err)
 	}
 
 	if err := copyTablespaces(ctx, st.engineBin, st.cid, st.dir, st.datadir+"/"+target, st.tables); err != nil {
 		return fmt.Errorf("copy staged tablespaces → %s: %w", target, err)
 	}
 
-	for _, t := range st.tables {
-		qt, qerr := ident.QuoteMySQL(t)
-		if qerr != nil {
-			return qerr
-		}
-		if _, err := prepConn.ExecContext(ctx, "ALTER TABLE "+qt+" IMPORT TABLESPACE"); err != nil {
-			return fmt.Errorf("IMPORT TABLESPACE %s: %w", t, err)
-		}
+	importSQL, err := buildImportScript(st.tables)
+	if err != nil {
+		return err
+	}
+	if _, err := prepConn.ExecContext(ctx, importSQL); err != nil {
+		return fmt.Errorf("import tablespaces for %s: %w", target, err)
 	}
 	ok = true
 	return nil
+}
+
+// buildCreateDiscardScript renders one multi-statement batch that
+// recreates each table from its captured CREATE DDL and immediately
+// discards the freshly-created tablespace so the staged .ibd can be
+// imported into the slot. createSQL is aligned with tables.
+func buildCreateDiscardScript(createSQL, tables []string) (string, error) {
+	if len(createSQL) != len(tables) {
+		return "", fmt.Errorf("createSQL/tables length mismatch: %d vs %d", len(createSQL), len(tables))
+	}
+	var b strings.Builder
+	for i, t := range tables {
+		qt, err := ident.QuoteMySQL(t)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(createSQL[i])
+		b.WriteString(";\nALTER TABLE ")
+		b.WriteString(qt)
+		b.WriteString(" DISCARD TABLESPACE;\n")
+	}
+	return b.String(), nil
+}
+
+// buildImportScript renders one multi-statement batch that attaches the
+// copied .ibd for every table via IMPORT TABLESPACE.
+func buildImportScript(tables []string) (string, error) {
+	var b strings.Builder
+	for _, t := range tables {
+		qt, err := ident.QuoteMySQL(t)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString("ALTER TABLE ")
+		b.WriteString(qt)
+		b.WriteString(" IMPORT TABLESPACE;\n")
+	}
+	return b.String(), nil
 }
 
 // dropStage best-effort removes a template's staging dir. Resolves the

@@ -186,18 +186,19 @@ func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 // DropMatching drops every database whose name starts with prefix.
 // Returns the names that were actually dropped.
 //
-// DROPs run in parallel (limit 6) because each `wt delete` typically
-// fans out across source + template + N paratest clones (1+1+8 = 10
-// databases on a default setup), and DROP DATABASE serializes only
-// on the pg_database-equivalent lock — independent names don't
-// contend.
+// DROPs run in parallel because each `wt delete` typically fans out
+// across source + template + N paratest clones (1+1+8 = 10 databases on
+// a default setup), and DROP DATABASE serializes only on the
+// pg_database-equivalent lock — independent names don't contend. The cap
+// (16) covers the whole default fan-out in one wave while still bounding
+// concurrency on a pathologically large match set.
 func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
 	matched, err := d.ListMatching(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
 	g, gctx := errgroup.WithContext(ctx)
-	limit := 6
+	limit := 16
 	if limit > len(matched) && len(matched) > 0 {
 		limit = len(matched)
 	}
@@ -736,7 +737,7 @@ func (d *Driver) SnapshotRestoreStaged(ctx context.Context, template, target str
 		slog.Warn("mysql physical staging failed; using logical restore",
 			"template", template, "error", st.err)
 	default:
-		rerr := d.physicalRestoreFromStage(ctx, st, template, target)
+		rerr := d.physicalRestoreFromStage(ctx, st, target)
 		if rerr == nil {
 			d.setLastStrategy(CloneStrategyPhysical)
 			return nil
