@@ -20,6 +20,12 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	// Registers the "mysql" driver with database/sql. Load-bearing: this
+	// package's Connect calls sql.Open("mysql", …), so the driver must be
+	// registered wherever the daemon imports this package — independent
+	// of any test file's own blank import.
+	_ "github.com/go-sql-driver/mysql"
+
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
