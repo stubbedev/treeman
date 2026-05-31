@@ -125,6 +125,19 @@ func FinalizeWorktree(
 		"daemon-detached setup + prepare beginning",
 		repoID, wtID, "", 0, nil)
 
+	// Wait for `git worktree add` to finish checking out the tree
+	// before firing hooks. Watcher-triggered finalize can race: the
+	// new worktree dir + .git file land first, the daemon's filesystem
+	// watcher sees them and dispatches finalize, but git is still
+	// writing subdirs. A user `on-create-before-engines` hook with a
+	// `cwd: frontend` then fails with `cd: can't cd to frontend`. CLI-
+	// triggered finalize is already past the git wait so this is a
+	// near-zero-cost no-op there. Bounded so a wedged checkout still
+	// surfaces a clear error rather than blocking forever.
+	if err := waitForCheckoutSettled(ctx, st, wtRoot, repoID, wtID, 60*time.Second); err != nil {
+		return err
+	}
+
 	// Re-apply top-level patches: every finalize evaluates them
 	// against the current HEAD's slug. Idempotent — Unchanged is a
 	// no-op write, and EnsureFilter re-asserts the git clean/smudge
@@ -635,4 +648,64 @@ func detectBranch(worktree string) string {
 		return ref
 	}
 	return ""
+}
+
+// waitForCheckoutSettled blocks until every top-level entry recorded in
+// HEAD exists on disk inside wtRoot, or `timeout` elapses. Run before
+// firing setup hooks so a hook with a `cwd: <subdir>` action never
+// races a still-running `git worktree add` that hasn't reached that
+// subdir yet. CLI-triggered finalize already completed git checkout
+// before this point, so the first probe succeeds instantly; the wait
+// only kicks in on the watcher-triggered path.
+//
+// Emits a `checkout_wait` event when the wait was non-trivial (>50ms)
+// so an unusually slow checkout shows up in the log timeline.
+func waitForCheckoutSettled(ctx context.Context, st *State, wtRoot string, repoID, wtID int64, timeout time.Duration) error {
+	started := time.Now()
+	deadline := started.Add(timeout)
+	for {
+		if isCheckoutSettled(ctx, wtRoot) {
+			waited := time.Since(started)
+			if waited > 50*time.Millisecond {
+				_ = st.Store.WriteEvent(ctx, store.LevelInfo, "checkout_wait",
+					fmt.Sprintf("git worktree add settled after %dms", waited.Milliseconds()),
+					repoID, wtID, "", waited.Milliseconds(), map[string]any{
+						"waited_ms": waited.Milliseconds(),
+					})
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("git worktree add did not settle in %s; top-level HEAD entries missing under %s", timeout, wtRoot)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(75 * time.Millisecond):
+		}
+	}
+}
+
+// isCheckoutSettled reports whether every top-level path in HEAD exists
+// on disk inside wtRoot. `git worktree add` writes the entries in tree
+// order, so the LAST one to appear is the latest top-level entry — once
+// every one is present the working tree is materialized.
+func isCheckoutSettled(ctx context.Context, wtRoot string) bool {
+	if _, err := os.Stat(filepath.Join(wtRoot, ".git")); err != nil {
+		return false
+	}
+	out, err := exec.CommandContext(ctx, "git", "-C", wtRoot, "ls-tree", "--name-only", "HEAD").Output()
+	if err != nil {
+		// Unborn HEAD / pre-commit repo: nothing to wait for.
+		return true
+	}
+	for name := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		if name == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(wtRoot, name)); err != nil {
+			return false
+		}
+	}
+	return true
 }
