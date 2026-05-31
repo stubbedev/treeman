@@ -471,6 +471,104 @@ func TestStagedFanoutRestoreParallel(t *testing.T) {
 	}
 }
 
+// TestBeefyFanoutManyTables stresses the physical fan-out at the scale
+// that actually triggered the regressions: MANY tables (table count, not
+// row count, drives the per-table docker-exec and per-statement
+// round-trip costs that made 2.5.x slower than the logical clone). It
+// seeds a wide schema, fans out to several clones, and asserts every
+// clone is a complete, correct copy — guarding against any future
+// serial-copy regression silently corrupting or slowing the fan-out.
+func TestBeefyFanoutManyTables(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	const (
+		nTables   = 80
+		rowsEach  = 500
+		nClones   = 4
+		rowsCheck = 7 // tables to fully row-count per clone (sampling keeps the test quick)
+	)
+
+	wt := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wt, "beefy.sql"), []byte(genBeefySeed(nTables, rowsEach)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mysql: &config.MysqlConn{
+				Host: "127.0.0.1", Port: 3306, User: "root", Password: "rootpw",
+				ContainerRef: config.ContainerRef{Container: "treeman-e2e-mysql"},
+			},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mysql",
+			NameTemplate: "treeman_beefy_{slug}",
+			Dump:         config.DumpList{{Path: "beefy.sql"}},
+			TestClones: &config.TestClonesSpec{
+				Clones:       config.ClonesSetting{Fixed: nClones},
+				NameTemplate: "treeman_beefy_{slug}_w{n}",
+			},
+		}},
+	}
+
+	env := harness.NewEnv(t, wt)
+	start := time.Now()
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mysql", false)
+	t.Logf("beefy cold build: %d tables × %d rows → %d clones in %s (source=%s)",
+		nTables, rowsEach, nClones, time.Since(start).Round(time.Millisecond), o.SourceDB)
+
+	if len(o.Clones) != nClones {
+		t.Fatalf("clone count = %d, want %d", len(o.Clones), nClones)
+	}
+	assertSawPhysicalStrategy(t, env)
+
+	// Every clone must hold all nTables with the right row counts. Table
+	// presence is checked in full; row counts are sampled across the
+	// schema to keep the assertion fast while still covering the batched
+	// IMPORT path end to end.
+	wantTables := make([]string, nTables)
+	for i := range wantTables {
+		wantTables[i] = fmt.Sprintf("t%02d", i)
+	}
+	for _, clone := range o.Clones {
+		assertTablesPresent(t, "127.0.0.1:13306", clone, wantTables)
+		for s := range rowsCheck {
+			tbl := fmt.Sprintf("t%02d", s*nTables/rowsCheck)
+			if got := rowCount(t, "127.0.0.1:13306", clone, tbl); got != rowsEach {
+				t.Errorf("clone %s table %s rows = %d, want %d", clone, tbl, got, rowsEach)
+			}
+		}
+	}
+}
+
+// genBeefySeed renders a dump with `tables` InnoDB tables, each carrying
+// `rows` rows. Many narrow tables is the shape that exercises the
+// per-table clone cost.
+func genBeefySeed(tables, rows int) string {
+	var b strings.Builder
+	for i := range tables {
+		fmt.Fprintf(&b, "CREATE TABLE t%02d (id INT PRIMARY KEY AUTO_INCREMENT, k VARCHAR(64), v INT) ENGINE=InnoDB;\n", i)
+		fmt.Fprintf(&b, "INSERT INTO t%02d (k, v) VALUES ", i)
+		for r := range rows {
+			if r > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, "('row%d',%d)", r, r)
+		}
+		b.WriteString(";\n")
+	}
+	return b.String()
+}
+
 // assertSawPhysicalStrategy fails the test unless at least one
 // snapshot_clone_strategy=physical event was recorded for the run.
 func assertSawPhysicalStrategy(t *testing.T, env *harness.Env) {
