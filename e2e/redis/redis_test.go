@@ -404,3 +404,73 @@ func assertKeyCount(t *testing.T, prefix string, want int) {
 		t.Errorf("key count under %s = %d, want %d", prefix, count, want)
 	}
 }
+
+// TestBeefyRedisCopyFanout proves the server-side COPY clone stays fast
+// and correct at scale: 50k keys under the source prefix, fanned out to
+// 4 clone prefixes, each verified to hold every key. Guards against a
+// regression replacing pipelined COPY with a slow per-key round trip.
+func TestBeefyRedisCopyFanout(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "redis:16379", 30*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:16379", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	const (
+		nKeys   = 50000
+		nClones = 4
+	)
+	wt := t.TempDir()
+	// seq | sed builds nKeys `SET <prefix>k<n> <n>` lines piped into
+	// redis-cli --pipe (one bulk load), so the seed itself isn't the
+	// bottleneck the clone is being measured against.
+	seed := `#!/usr/bin/env sh
+set -eu
+: "${REDIS_PREFIX:?REDIS_PREFIX not set}"
+container="${REDIS_CONTAINER:-treeman-e2e-redis}"
+seq 1 50000 | sed "s/.*/SET ${REDIS_PREFIX}k& &/" | docker exec -i "$container" redis-cli --pipe
+`
+	if err := os.WriteFile(filepath.Join(wt, "seed.sh"), []byte(seed), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "schema.txt"), []byte("beefy-v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Redis: &config.RedisConn{URL: "redis://127.0.0.1:16379"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "redis",
+			NameTemplate: "treeman_beefy_{slug}",
+			KeyPrefix:    "beefy:{slug}:",
+			Seed: &config.Step{
+				Run: "./seed.sh",
+				Env: map[string]string{"REDIS_PREFIX": "{target_db}", "REDIS_CONTAINER": "treeman-e2e-redis"},
+			},
+			Inputs: []config.Input{{Glob: "schema.txt", Label: "keyset"}},
+			TestClones: &config.TestClonesSpec{
+				Clones:       config.ClonesSetting{Fixed: nClones},
+				NameTemplate: "beefy:{slug}:w{n}:",
+			},
+		}},
+	}
+
+	env := harness.NewEnv(t, wt)
+	start := time.Now()
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "redis", false)
+	t.Logf("beefy redis: %d keys → %d clones in %s (source=%s)",
+		nKeys, nClones, time.Since(start).Round(time.Millisecond), o.SourceDB)
+	if len(o.Clones) != nClones {
+		t.Fatalf("clone count = %d, want %d", len(o.Clones), nClones)
+	}
+	for _, clone := range o.Clones {
+		assertKeyCount(t, clone, nKeys)
+	}
+}

@@ -494,3 +494,60 @@ func keys(m map[string]bool) []string {
 	}
 	return out
 }
+
+// TestBeefyPostgresTemplateFanout proves the native CREATE DATABASE …
+// TEMPLATE clone stays fast and correct at scale: a 50k-row source
+// fanned out to 4 clones, each verified to hold every row. Guards
+// against a future regression replacing the file-level template copy
+// with a row-by-row dump/restore.
+func TestBeefyPostgresTemplateFanout(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "postgres:15432", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:15432", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	const (
+		nRows   = 50000
+		nClones = 4
+	)
+	wt := t.TempDir()
+	seed := fmt.Sprintf(
+		"CREATE TABLE widgets (id serial PRIMARY KEY, k text, v int);\n"+
+			"INSERT INTO widgets (k, v) SELECT 'row'||g, g FROM generate_series(1,%d) g;\n", nRows)
+	if err := os.WriteFile(filepath.Join(wt, "beefy.sql"), []byte(seed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Postgres: &config.PostgresConn{Host: "127.0.0.1", Port: 15432, User: "postgres", Password: "pgpw"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "postgres",
+			NameTemplate: "tm_beefy_{slug}",
+			Dump:         config.DumpList{{Path: "beefy.sql"}},
+			TestClones: &config.TestClonesSpec{
+				Clones:       config.ClonesSetting{Fixed: nClones},
+				NameTemplate: "tm_beefy_{slug}_w{n}",
+			},
+		}},
+	}
+
+	env := harness.NewEnv(t, wt)
+	start := time.Now()
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "postgres", false)
+	t.Logf("beefy pg: %d rows → %d clones in %s (source=%s)",
+		nRows, nClones, time.Since(start).Round(time.Millisecond), o.SourceDB)
+	if len(o.Clones) != nClones {
+		t.Fatalf("clone count = %d, want %d", len(o.Clones), nClones)
+	}
+	for _, clone := range o.Clones {
+		assertWidgetCount(t, "127.0.0.1:15432", clone, nRows)
+	}
+}

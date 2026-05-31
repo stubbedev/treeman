@@ -368,3 +368,65 @@ func assertDocCount(t *testing.T, index string, want int) {
 		t.Errorf("%s doc count = %d, want %d", index, out.Count, want)
 	}
 }
+
+// TestBeefyEsCloneFanout proves the native _clone API stays fast and
+// correct at scale: a 20k-doc source index, fanned out to 4 clone
+// prefixes, each verified to hold every doc. Guards against a regression
+// replacing segment-level _clone with a doc-by-doc reindex.
+func TestBeefyEsCloneFanout(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "es:19200", 120*time.Second, func() error {
+		resp, err := http.Get("http://127.0.0.1:19200/_cluster/health?wait_for_status=yellow&timeout=5s")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("health HTTP %d", resp.StatusCode)
+		}
+		return nil
+	})
+
+	const (
+		nDocs   = 20000
+		nClones = 4
+	)
+	wt := t.TempDir()
+	var nd strings.Builder
+	for i := range nDocs {
+		fmt.Fprintf(&nd, `{"index":{"_index":"{target_db}big","_id":"%d"}}`+"\n", i)
+		fmt.Fprintf(&nd, `{"k":"row%d","v":%d}`+"\n", i, i)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "beefy.ndjson"), []byte(nd.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Elasticsearch: &config.EsConn{URL: "http://127.0.0.1:19200"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "elasticsearch",
+			NameTemplate: "treeman_beefy_{slug}",
+			KeyPrefix:    "wtbeefy_{slug}_",
+			Dump:         config.DumpList{{Path: "beefy.ndjson"}},
+			TestClones: &config.TestClonesSpec{
+				Clones:       config.ClonesSetting{Fixed: nClones},
+				NameTemplate: "wtbeefy_{slug}_w{n}_",
+			},
+		}},
+	}
+
+	env := harness.NewEnv(t, wt)
+	start := time.Now()
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "elasticsearch", false)
+	t.Logf("beefy es: %d docs → %d clones in %s (source=%s)",
+		nDocs, nClones, time.Since(start).Round(time.Millisecond), o.SourceDB)
+	if len(o.Clones) != nClones {
+		t.Fatalf("clone count = %d, want %d", len(o.Clones), nClones)
+	}
+	for _, clone := range o.Clones {
+		assertDocCount(t, clone+"big", nDocs)
+	}
+}
