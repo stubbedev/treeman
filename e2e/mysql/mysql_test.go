@@ -267,6 +267,7 @@ func TestMySQLDumpLoadViaDockerExec(t *testing.T) {
 // The snapshot_clone_strategy event reports strategy=logical.
 func TestPhysicalClonePreconditionsFailSkipsToLogical(t *testing.T) {
 	harness.SkipIfNoDocker(t)
+	t.Setenv("TREEMAN_MYSQL_PHYSICAL_MIN_BYTES", "0") // force physical attempt on small fixtures
 	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
 	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
 		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
@@ -334,6 +335,7 @@ func TestPhysicalClonePreconditionsFailSkipsToLogical(t *testing.T) {
 // the cloned template carries the same rows as the source.
 func TestPhysicalCloneViaContainerExec(t *testing.T) {
 	harness.SkipIfNoDocker(t)
+	t.Setenv("TREEMAN_MYSQL_PHYSICAL_MIN_BYTES", "0") // force physical on small fixtures
 	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
 	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
 		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
@@ -407,6 +409,7 @@ func TestPhysicalCloneViaContainerExec(t *testing.T) {
 //     staged physical path ran rather than silently degrading.
 func TestStagedFanoutRestoreParallel(t *testing.T) {
 	harness.SkipIfNoDocker(t)
+	t.Setenv("TREEMAN_MYSQL_PHYSICAL_MIN_BYTES", "0") // force physical staging on small fixtures
 	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
 	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
 		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
@@ -480,6 +483,7 @@ func TestStagedFanoutRestoreParallel(t *testing.T) {
 // serial-copy regression silently corrupting or slowing the fan-out.
 func TestBeefyFanoutManyTables(t *testing.T) {
 	harness.SkipIfNoDocker(t)
+	t.Setenv("TREEMAN_MYSQL_PHYSICAL_MIN_BYTES", "0") // force physical at scale to guard the staged path
 	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
 	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
 		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
@@ -653,4 +657,48 @@ func keysOf(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestAutoStrategyPicksLogicalForSmall guards the size-aware default:
+// with no threshold override the tiny fixtures fall well under the 1 GiB
+// floor, so the clone path must pick logical even though a ContainerRef
+// makes physical possible. This is the common case (small per-worktree
+// test DBs) and the reason physical is no longer the unconditional path.
+func TestAutoStrategyPicksLogicalForSmall(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	t.Cleanup(harness.ComposeUp(t, harness.MustAbs(".")))
+	harness.WaitForReady(t, "mysql:13306", 60*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", "127.0.0.1:13306", 1*time.Second)
+		if err != nil {
+			return err
+		}
+		_ = c.Close()
+		return nil
+	})
+
+	wt := t.TempDir()
+	copyTree(t, "fixtures", filepath.Join(wt, "fixtures"))
+	cfg := buildConfig()
+	cfg.Connections.Mysql.Port = 3306
+	cfg.Connections.Mysql.ContainerRef = config.ContainerRef{Container: "treeman-e2e-mysql"}
+
+	env := harness.NewEnv(t, wt)
+	o := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mysql", false)
+
+	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"snapshot_clone_strategy"},
+	})
+	if err != nil {
+		t.Fatalf("query strategy events: %v", err)
+	}
+	if len(evs) == 0 {
+		t.Fatal("no snapshot_clone_strategy events — instrumentation regression")
+	}
+	for _, e := range evs {
+		if strings.Contains(e.Message, "strategy=physical") {
+			t.Errorf("auto picked physical for a tiny source; want logical: %s", e.Message)
+		}
+	}
+	assertTablesPresent(t, "127.0.0.1:13306", o.SourceDB, []string{"products", "orders"})
 }

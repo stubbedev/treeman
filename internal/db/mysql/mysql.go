@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -295,6 +297,10 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 // retrievable via LastCloneStrategy(); the prepare layer reads it to
 // emit a snapshot_clone_strategy event.
 func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
+	if d.chooseStrategy(ctx, source) == CloneStrategyLogical {
+		d.setLastStrategy(CloneStrategyLogical)
+		return d.logicalSnapshotCreate(ctx, source, template)
+	}
 	if ok, perr := d.tryPhysicalSnapshotCreate(ctx, source, template); ok {
 		d.setLastStrategy(CloneStrategyPhysical)
 		return nil
@@ -310,6 +316,53 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 	}
 	d.setLastStrategy(CloneStrategyLogical)
 	return d.logicalSnapshotCreate(ctx, source, template)
+}
+
+// defaultPhysicalCloneMinBytes is the source-size floor at/above which
+// the clone path switches from the logical INSERT…SELECT loader to
+// InnoDB transferable tablespaces. Below it logical is faster: physical
+// pays a fixed per-table FLUSH/copy/IMPORT cost that dominates for the
+// common many-small-tables schema, while logical scales with row volume
+// (cheap when tables are small). 1 GiB is deliberately conservative.
+const defaultPhysicalCloneMinBytes int64 = 1 << 30
+
+// physicalCloneMinBytes returns the threshold, honoring an optional
+// TREEMAN_MYSQL_PHYSICAL_MIN_BYTES override. The env var is an internal
+// tuning/test hook (not a documented config knob) — e2e tests set it to
+// 0 to exercise the physical path on small fixtures.
+func physicalCloneMinBytes() int64 {
+	if v := os.Getenv("TREEMAN_MYSQL_PHYSICAL_MIN_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return defaultPhysicalCloneMinBytes
+}
+
+// chooseStrategy picks the optimal clone strategy for `db` by source
+// size: physical only once the data is large enough to amortize its
+// per-table overhead, logical otherwise. A size-probe error falls back
+// to logical (the always-correct path). No user knob — treeman always
+// takes the faster path for the data at hand.
+func (d *Driver) chooseStrategy(ctx context.Context, db string) CloneStrategy {
+	bytes, err := d.sourceDataBytes(ctx, db)
+	if err != nil || bytes < physicalCloneMinBytes() {
+		return CloneStrategyLogical
+	}
+	return CloneStrategyPhysical
+}
+
+// sourceDataBytes returns the on-disk size (data + index length) of
+// every table in `db`, summed. Used by the auto strategy selector.
+func (d *Driver) sourceDataBytes(ctx context.Context, db string) (int64, error) {
+	var n sql.NullInt64
+	err := d.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0)
+		 FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?`, db).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n.Int64, nil
 }
 
 // logicalSnapshotCreate is the pre-physical implementation kept as the
@@ -726,6 +779,14 @@ func (d *Driver) SnapshotRestoreStaged(ctx context.Context, template, target str
 	}
 	if _, err := d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
 		return err
+	}
+
+	// Honor the strategy selector: for small templates the logical
+	// restore beats staged physical (same per-table-overhead trade-off
+	// as SnapshotCreate), so don't stage at all.
+	if d.chooseStrategy(ctx, template) == CloneStrategyLogical {
+		d.setLastStrategy(CloneStrategyLogical)
+		return d.logicalSnapshotCreate(ctx, template, target)
 	}
 
 	st := d.ensureStage(ctx, template)
