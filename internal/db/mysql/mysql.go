@@ -322,6 +322,16 @@ func physicalCloneMinBytes() int64 {
 	return defaultPhysicalCloneMinBytes
 }
 
+// PreferLogicalFor reports whether the auto strategy selector picks
+// logical for `db`. The prepare layer reads this to decide whether the
+// cold-build path can fan source → [template + clones] in one parallel
+// wave (logical clones don't share a per-source FLUSH lock); the
+// physical path keeps its 2-step snapshot-create + staged-restore flow
+// where the staging dir absorbs the lock contention.
+func (d *Driver) PreferLogicalFor(ctx context.Context, db string) bool {
+	return d.chooseStrategy(ctx, db) == CloneStrategyLogical
+}
+
 // chooseStrategy picks the optimal clone strategy for `db` by source
 // size: physical only once the data is large enough to amortize its
 // per-table overhead, logical otherwise. A size-probe error falls back

@@ -802,28 +802,43 @@ func prepareMySQL(
 		return Outcome{}, err
 	}
 
-	// Build the template snapshot, then clone it into paratest DBs.
-	if err := mysqlSnapshotAndRecord(ctx, drv, cfg, d, st, repoID, worktreeID, sourceDB, templateName, version, key, inputs); err != nil {
-		return Outcome{}, err
-	}
-
+	// Template + clones: logical strategy can be fanned out from source
+	// in one parallel wave (template + N clones together) because logical
+	// INSERT…SELECT doesn't share a per-source FLUSH lock. The physical
+	// strategy keeps the 2-step path (build template, then staged restore
+	// to clones) where the staging dir absorbs the FOR EXPORT
+	// serialization that N+1 concurrent physical clones would otherwise
+	// hit on the source.
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(
-		ctx,
-		st,
-		repoID,
-		worktreeID,
-		drv.SnapshotRestoreStaged,
-		templateName,
-		clones,
-		d.Engine,
-		d.Fanout,
-		maxConns,
-	); err != nil {
-		return Outcome{}, err
+	if drv.PreferLogicalFor(ctx, sourceDB) {
+		if err := mysqlMergedColdFanout(ctx, drv, cfg, d, st, repoID, worktreeID,
+			sourceDB, templateName, version, key, inputs, clones, maxConns); err != nil {
+			return Outcome{}, err
+		}
+	} else {
+		if err := mysqlSnapshotAndRecord(
+			ctx,
+			drv,
+			cfg,
+			d,
+			st,
+			repoID,
+			worktreeID,
+			sourceDB,
+			templateName,
+			version,
+			key,
+			inputs,
+		); err != nil {
+			return Outcome{}, err
+		}
+		if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestoreStaged,
+			templateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
+			return Outcome{}, err
+		}
 	}
 
 	ms := time.Since(started).Milliseconds()
@@ -1101,6 +1116,133 @@ func mysqlSnapshotAndRecord(
 	// background context with a hard deadline so a stalled DROP
 	// (e.g. lock contention) can't leak this goroutine forever.
 	// Errors are logged inside EvictExcess.
+	spawnEvict(cfg, st, repoID)
+	return nil
+}
+
+// mysqlMergedColdFanout fans source → [template + clones...] in ONE
+// parallel wave when the strategy selector picked logical. Saves the
+// serial snapshot-create-then-restore round trip the 2-step path pays
+// (~10s on a 200-table schema) and keeps every target reading from the
+// freshly-built source DB while its pages are still hot in the buffer
+// pool. Mirrors the build_helper.d prepare flow that originally
+// inspired this codebase: 9 concurrent INSERT…SELECT clones from one
+// source, capped by the same auto-tuned connection budget as
+// fanOutClones.
+//
+// Logical clones don't share a per-source FLUSH lock, so concurrent
+// SnapshotCreate from the same source is safe; the physical path's
+// FLUSH TABLES … FOR EXPORT would serialize, which is why the
+// dispatcher keeps it on the 2-step staged path.
+func mysqlMergedColdFanout(
+	ctx context.Context,
+	drv *dbmysql.Driver,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	st *store.Store,
+	repoID, worktreeID int64,
+	sourceDB, templateName, version string,
+	key snapshot.Key,
+	inputs map[string]store.InputVector,
+	clones []string,
+	maxConns int,
+) error {
+	targets := make([]string, 0, len(clones)+1)
+	targets = append(targets, templateName)
+	targets = append(targets, clones...)
+
+	limit, autoTuned := fanOutLimit(d.Fanout, maxConns, len(targets), d.Engine)
+	started := time.Now()
+	_ = st.WriteEvent(ctx, store.LevelInfo, "fanout_start",
+		fmt.Sprintf("engine=%s source=%s targets=%d (template+%d clones) limit=%d", d.Engine, sourceDB, len(targets), len(clones), limit),
+		repoID, worktreeID, "", 0, map[string]any{
+			"engine":     d.Engine,
+			"source":     sourceDB,
+			"template":   templateName,
+			"targets":    len(targets),
+			"limit":      limit,
+			"auto_tuned": autoTuned,
+			"max_conns":  maxConns,
+			"merged":     true,
+		})
+
+	var (
+		okCount   atomic.Uint32
+		failCount atomic.Uint32
+		slowestMs atomic.Int64
+		slowestMu sync.Mutex
+		slowestDB string
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(limit)
+	for _, tgt := range targets {
+		g.Go(func() error {
+			cloneStart := time.Now()
+			err := drv.SnapshotCreate(gctx, sourceDB, tgt)
+			dur := time.Since(cloneStart).Milliseconds()
+			if err != nil {
+				failCount.Add(1)
+				_ = st.WriteEvent(gctx, store.LevelWarn, "clone_restore_fail",
+					fmt.Sprintf("engine=%s source=%s db=%s err=%v", d.Engine, sourceDB, tgt, err),
+					repoID, worktreeID, "", dur, map[string]any{
+						"engine": d.Engine,
+						"source": sourceDB,
+						"db":     tgt,
+						"error":  err.Error(),
+					})
+				return fmt.Errorf("snapshot create %s → %s: %w", sourceDB, tgt, err)
+			}
+			okCount.Add(1)
+			_ = st.WriteEvent(gctx, store.LevelDebug, "clone_restore_done",
+				fmt.Sprintf("engine=%s db=%s", d.Engine, tgt),
+				repoID, worktreeID, "", dur, map[string]any{
+					"engine": d.Engine,
+					"source": sourceDB,
+					"db":     tgt,
+				})
+			if cur := slowestMs.Load(); dur > cur {
+				slowestMu.Lock()
+				if dur > slowestMs.Load() {
+					slowestMs.Store(dur)
+					slowestDB = tgt
+				}
+				slowestMu.Unlock()
+			}
+			return nil
+		})
+	}
+	gErr := g.Wait()
+
+	totalMs := time.Since(started).Milliseconds()
+	level := store.LevelInfo
+	if failCount.Load() > 0 {
+		level = store.LevelError
+	}
+	slowestMu.Lock()
+	slowDB := slowestDB
+	slowestMu.Unlock()
+	_ = st.WriteEvent(ctx, level, "fanout_done",
+		fmt.Sprintf("engine=%s ok=%d fail=%d slowest=%dms (merged)", d.Engine, okCount.Load(), failCount.Load(), slowestMs.Load()),
+		repoID, worktreeID, "", totalMs, map[string]any{
+			"engine":     d.Engine,
+			"source":     sourceDB,
+			"template":   templateName,
+			"ok":         okCount.Load(),
+			"fail":       failCount.Load(),
+			"slowest_ms": slowestMs.Load(),
+			"slowest_db": slowDB,
+			"merged":     true,
+		})
+	if gErr != nil {
+		return gErr
+	}
+
+	// Synthetic snapshot-create event so downstream observers (and the
+	// existing TestMySQLEndToEnd-style assertions) still see the
+	// template's strategy + a per-template phase boundary.
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", started)
+	emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, sourceDB, templateName, string(drv.LastCloneStrategy()))
+	recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName, inputs, repoID)
 	spawnEvict(cfg, st, repoID)
 	return nil
 }
