@@ -49,6 +49,12 @@ type nsDriver interface {
 		ns string,
 	) error // remove the namespace entirely (EXACT for name-scoped; prefix for prefix-scoped)
 	DropDurable(ctx context.Context, durable string) error
+	// Watermark returns a sound, monotonic, per-namespace write-counter
+	// token for `ns`. Unchanged between two calls ⇒ provably no writes to
+	// `ns` in between (counters only increase, so a write can't hide). ""
+	// means the engine exposes no sound cheap signal — the caller must NOT
+	// skip a capture. Any probe error also returns "".
+	Watermark(ctx context.Context, ns string) (string, error)
 }
 
 // bsScope distinguishes how an engine carves up isolation.
@@ -149,6 +155,12 @@ func (a mysqlNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
 
+func (a mysqlNS) Watermark(ctx context.Context, ns string) (string, error) {
+	// Server-wide token — MySQL has no always-on per-database write
+	// counter. ns is ignored; coarseness only ever yields false-dirty.
+	return a.d.WriteWatermark(ctx)
+}
+
 type postgresNS struct{ d *dbpostgres.Driver }
 
 func (a postgresNS) Exists(ctx context.Context, ns string) (bool, error) {
@@ -179,6 +191,10 @@ func (a postgresNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
 
+func (a postgresNS) Watermark(ctx context.Context, ns string) (string, error) {
+	return a.d.WriteWatermark(ctx, ns)
+}
+
 type mongoNS struct{ d *dbmongo.Driver }
 
 func (a mongoNS) Exists(ctx context.Context, ns string) (bool, error) {
@@ -205,6 +221,13 @@ func (a mongoNS) Drop(ctx context.Context, ns string) error {
 
 func (a mongoNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
+}
+
+func (a mongoNS) Watermark(ctx context.Context, ns string) (string, error) {
+	// No sound, cheap, per-database write counter in mongo (opcounters
+	// are server-wide and reset on restart; db.stats sizes can net to
+	// zero after offsetting writes). Decline to skip captures.
+	return "", nil
 }
 
 type redisNS struct{ d *dbredis.Driver }
@@ -235,6 +258,12 @@ func (a redisNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
 }
 
+func (a redisNS) Watermark(ctx context.Context, ns string) (string, error) {
+	// No sound, cheap, per-prefix write counter in redis. Decline to
+	// skip captures.
+	return "", nil
+}
+
 type esNS struct{ d *dbes.Driver }
 
 func (a esNS) Exists(ctx context.Context, ns string) (bool, error) {
@@ -262,6 +291,10 @@ func (a esNS) Drop(ctx context.Context, ns string) error {
 
 func (a esNS) DropDurable(ctx context.Context, durable string) error {
 	return a.d.DropSnapshot(ctx, durable)
+}
+
+func (a esNS) Watermark(ctx context.Context, ns string) (string, error) {
+	return a.d.WriteWatermark(ctx, ns)
 }
 
 // branchScopeFor reports the scope + canonical engine label for a
@@ -378,6 +411,14 @@ type branchScopedArgs struct {
 	worktreeID   int64
 	inheritedEnv map[string]string
 
+	// migrateFP is the content fingerprint of this database's migration
+	// inputs (migrations + lockfile + commands + engine version), used to
+	// skip a redundant migrate when a resumed branch's inputs are
+	// unchanged since its durable copy was last migrated. Empty disables
+	// the skip (always migrate) — the safe default for callers that don't
+	// supply it.
+	migrateFP string
+
 	eng *branchEngine
 	// loadDump loads one static fallback dump entry into the active
 	// namespace. seedFresh calls it once per resolved dumpFile so the
@@ -464,16 +505,37 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 		return Outcome{}, fmt.Errorf("record active-branch marker: %w", err)
 	}
 
+	migrated := false
 	if a.d.Migrate != nil {
-		if err := a.runStep(ctx, runner.FromMigrate(*a.d.Migrate), active, "migrate"); err != nil {
-			return Outcome{}, err
+		prevFP, hasPrev, _ := a.st.GetBranchMigrated(ctx, a.worktreeID, active, branch)
+		if migrateNeeded(builtEmpty, hasPrev, prevFP, a.migrateFP) {
+			if err := a.runStep(ctx, runner.FromMigrate(*a.d.Migrate), active, "migrate"); err != nil {
+				return Outcome{}, err
+			}
+			migrated = true
+			// Record the fingerprint only when we have one; an empty
+			// fingerprint can never be matched, so the next prepare
+			// re-migrates (correct — we couldn't prove it was at head).
+			if a.migrateFP != "" {
+				_ = a.st.SetBranchMigrated(ctx, a.worktreeID, active, branch, a.migrateFP)
+			}
+		} else {
+			a.event(ctx, "migrate_skip",
+				fmt.Sprintf("engine=%s active=%s branch=%s migrate skipped (inputs unchanged)", a.eng.engine, active, branch),
+				map[string]string{"fingerprint": a.migrateFP})
 		}
 	}
+	seeded := false
 	if a.d.Seed != nil && builtEmpty {
 		if err := a.runStep(ctx, runner.FromSeed(*a.d.Seed), active, "seed"); err != nil {
 			return Outcome{}, err
 		}
+		seeded = true
 	}
+
+	// Lever-1 bookkeeping: record whether `active` now mirrors `branch`'s
+	// durable copy so the next swap can skip a redundant capture.
+	a.recordClean(ctx, active, branch, decision, migrated, seeded)
 
 	ms := time.Since(started).Milliseconds()
 	a.event(ctx, "prepare_done",
@@ -522,7 +584,14 @@ func (a branchScopedArgs) seedFresh(ctx context.Context, active, branch string) 
 // branch's data. Returns the decision. Extracted verbatim from
 // runBranchScoped's `case old != branch` block.
 func (a branchScopedArgs) swapBranch(ctx context.Context, active, old, branch string) (string, error) {
-	if err := a.eng.drv.Capture(ctx, active, a.eng.durable(active, old)); err != nil {
+	// Lever 1: skip capturing old → durable(old) when `active` provably
+	// still mirrors that durable copy. Sound because the watermark is a
+	// monotonic write counter — an unchanged value cannot hide a write.
+	if a.captureRedundant(ctx, active, old) {
+		a.event(ctx, "capture_skip",
+			fmt.Sprintf("engine=%s active=%s branch=%s capture skipped (no writes since resume)", a.eng.engine, active, old),
+			map[string]string{"old_branch": old})
+	} else if err := a.eng.drv.Capture(ctx, active, a.eng.durable(active, old)); err != nil {
 		return "", fmt.Errorf("capture old branch %q: %w", old, err)
 	}
 	// Advance the marker to the NEW branch the instant old's data is
@@ -546,6 +615,83 @@ func (a branchScopedArgs) swapBranch(ctx context.Context, active, old, branch st
 		how = "branch-point"
 	}
 	return "swap:" + how, nil
+}
+
+// migrateNeeded reports whether the branch_scoped migrate step must run.
+// It runs when the active namespace was just built empty/from-dump
+// (builtEmpty), when no prior migrated-fingerprint is recorded for this
+// branch (hasPrev=false), when the recorded fingerprint differs from the
+// current inputs, or when the current fingerprint is empty (no inputs to
+// trust). Otherwise the resumed durable copy is already at head — skip.
+func migrateNeeded(builtEmpty, hasPrev bool, prevFP, curFP string) bool {
+	if builtEmpty || curFP == "" || !hasPrev {
+		return true
+	}
+	return prevFP != curFP
+}
+
+// captureSkippable reports whether the outgoing branch's capture can be
+// safely skipped: `active` is known to mirror that branch's durable copy
+// (prevClean), the durable copy still exists, and a freshly probed
+// watermark is non-empty and equals the one recorded when the mirror was
+// established (proving zero writes since). A "" watermark — an engine
+// without a sound signal, or a probe error — is never skippable.
+func captureSkippable(prevClean, durableExists bool, prevWM, curWM string) bool {
+	return prevClean && durableExists && curWM != "" && curWM == prevWM
+}
+
+// captureRedundant probes the live state to decide whether swapBranch may
+// skip capturing `active` into durable(old). Any probe error falls back to
+// "not redundant" (capture), so a transient failure never risks data loss.
+func (a branchScopedArgs) captureRedundant(ctx context.Context, active, old string) bool {
+	prevClean, prevWM, ok, err := a.st.GetActiveBranchClean(ctx, a.worktreeID, active)
+	if err != nil || !ok || !prevClean {
+		return false
+	}
+	durExists, derr := a.eng.drv.Exists(ctx, a.eng.durable(active, old))
+	if derr != nil {
+		return false
+	}
+	curWM, werr := a.eng.drv.Watermark(ctx, active)
+	if werr != nil {
+		return false
+	}
+	return captureSkippable(prevClean, durExists, prevWM, curWM)
+}
+
+// recordClean writes the lever-1 bookkeeping at the end of a prepare:
+// whether `active` currently mirrors `branch`'s durable copy, plus the
+// watermark observed now. Clean is true only when the data came straight
+// from a durable restore (resume) or an adopt with no migrate/seed/write
+// since — and only when the engine exposes a sound watermark. A `noop`
+// (same branch already loaded) carries the prior clean state forward iff
+// the watermark is unchanged. Everything else is recorded dirty.
+func (a branchScopedArgs) recordClean(ctx context.Context, active, branch, decision string, migrated, seeded bool) {
+	dirty := func() {
+		_ = a.st.SetActiveBranchClean(ctx, a.repoID, a.worktreeID, active, branch, a.eng.engine, false, "")
+	}
+	if migrated || seeded {
+		dirty()
+		return
+	}
+	if decision == "noop" {
+		prevClean, prevWM, ok, err := a.st.GetActiveBranchClean(ctx, a.worktreeID, active)
+		if err == nil && ok && prevClean {
+			if w, werr := a.eng.drv.Watermark(ctx, active); werr == nil && w != "" && w == prevWM {
+				_ = a.st.SetActiveBranchClean(ctx, a.repoID, a.worktreeID, active, branch, a.eng.engine, true, prevWM)
+				return
+			}
+		}
+		dirty()
+		return
+	}
+	if decision == "adopt" || strings.HasSuffix(decision, ":resume") {
+		if w, werr := a.eng.drv.Watermark(ctx, active); werr == nil && w != "" {
+			_ = a.st.SetActiveBranchClean(ctx, a.repoID, a.worktreeID, active, branch, a.eng.engine, true, w)
+			return
+		}
+	}
+	dirty()
 }
 
 // fill populates `active` with `branch`'s data. Order: the branch's own
@@ -675,6 +821,7 @@ func teardownBranchScoped(
 		return err
 	}
 	_ = st.ClearActiveBranch(ctx, worktreeID, active)
+	_ = st.ClearBranchMigratedForKey(ctx, worktreeID, active)
 	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
 		fmt.Sprintf("%s: dropped active %s (branch_scoped; durable copies kept)", d.Engine, active),
 		repoID, worktreeID, "", 0, map[string]any{"engine": d.Engine, "active": active})
@@ -758,6 +905,7 @@ func resetActiveNamespace(ctx context.Context, eng *branchEngine, st *store.Stor
 	if err := eng.drv.Drop(ctx, active); err != nil {
 		return err
 	}
+	_ = st.ClearBranchMigratedForKey(ctx, worktreeID, active)
 	return st.ClearActiveBranch(ctx, worktreeID, active)
 }
 

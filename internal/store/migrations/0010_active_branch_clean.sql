@@ -1,0 +1,21 @@
+-- Lever-1 capture-skip bookkeeping for the branch-scoped swap lifecycle.
+--
+-- `clean` marks that the active namespace is byte-identical to the durable
+-- copy of the branch currently occupying it (true only right after a
+-- durable/parent restore with no migrate/seed/app-write since). `watermark`
+-- is a sound, monotonic, per-namespace write counter captured at that
+-- moment (mysql Innodb_rows_*, postgres pg_stat_database, es indexing
+-- stats; empty for engines without a sound cheap signal).
+--
+-- On the next branch switch, if `clean` is still set AND a freshly probed
+-- watermark equals `watermark`, no write occurred since the restore, so the
+-- outgoing branch's data already equals its durable copy and the Capture
+-- step is redundant. An unchanged watermark CANNOT hide a write (counters
+-- are cumulative), so the skip is sound — false-dirty is possible (we
+-- capture needlessly), false-clean is not.
+--
+-- Defaults are the safe values: clean=0 forces a capture, so any row that
+-- predates this migration (or any marker-advance that resets these) behaves
+-- exactly like the pre-lever-1 always-capture path.
+ALTER TABLE active_branch_db ADD COLUMN clean INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE active_branch_db ADD COLUMN watermark TEXT NOT NULL DEFAULT '';

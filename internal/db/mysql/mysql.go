@@ -358,6 +358,40 @@ func (d *Driver) sourceDataBytes(ctx context.Context, db string) (int64, error) 
 	return n.Int64, nil
 }
 
+// WriteWatermark returns a sound, monotonic write-counter token for the
+// server: the sum of Innodb_rows_inserted + Innodb_rows_updated +
+// Innodb_rows_deleted from SHOW GLOBAL STATUS. These InnoDB counters are
+// always-on (not gated on performance_schema) and only ever increase, so
+// an unchanged token between two calls PROVES no row was written on the
+// server in between — sufficient to conclude a specific database is
+// untouched. It is server-wide (coarser than per-DB), which can yield
+// false-dirty results on a busy multi-database server, never false-clean.
+//
+// The token is engine-internal and opaque; callers only test it for
+// equality. An error returns "" so the caller declines to skip work.
+func (d *Driver) WriteWatermark(ctx context.Context) (string, error) {
+	rows, err := d.DB.QueryContext(ctx,
+		`SHOW GLOBAL STATUS WHERE Variable_name IN
+		 ('Innodb_rows_inserted','Innodb_rows_updated','Innodb_rows_deleted')`)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = rows.Close() }()
+	var sum int64
+	for rows.Next() {
+		var name string
+		var val sql.NullInt64
+		if err := rows.Scan(&name, &val); err != nil {
+			return "", err
+		}
+		sum += val.Int64
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return "ir:" + strconv.FormatInt(sum, 10), nil
+}
+
 // logicalSnapshotCreate is the pre-physical implementation kept as the
 // always-available fallback. Clones `source` into `template` in two
 // phases:

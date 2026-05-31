@@ -203,6 +203,35 @@ func (d *Driver) StoreSizeBytes(ctx context.Context, prefix string) (int64, erro
 	return total, nil
 }
 
+// WriteWatermark returns a sound, monotonic, per-prefix write-counter
+// token: the summed primaries indexing.index_total + delete_total across
+// every index matching `prefix*`, from the _stats/indexing API. Those
+// counters are always tracked and only increase, so an unchanged token
+// proves no document was indexed or deleted under the prefix in between.
+// Any transport/parse error (including a not-yet-created prefix → HTTP
+// 404) returns "" so the caller declines to skip work.
+func (d *Driver) WriteWatermark(ctx context.Context, prefix string) (string, error) {
+	body, err := d.get(ctx, "/"+escSeg(prefix)+"*/_stats/indexing?format=json")
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		All struct {
+			Primaries struct {
+				Indexing struct {
+					IndexTotal  int64 `json:"index_total"`
+					DeleteTotal int64 `json:"delete_total"`
+				} `json:"indexing"`
+			} `json:"primaries"`
+		} `json:"_all"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", err
+	}
+	total := parsed.All.Primaries.Indexing.IndexTotal + parsed.All.Primaries.Indexing.DeleteTotal
+	return "es:" + strconv.FormatInt(total, 10), nil
+}
+
 func (d *Driver) get(ctx context.Context, path string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.Base+path, nil)
 	if err != nil {

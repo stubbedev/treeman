@@ -706,7 +706,8 @@ func prepareMySQL(
 		return runBranchScoped(ctx, branchScopedArgs{
 			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
 			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
-			eng: &branchEngine{drv: mysqlNS{drv}, scope: scopeName, engine: "mysql"},
+			migrateFP: computeSnapshotKey(ctx, st, d, worktreePath, version).Fingerprint(),
+			eng:       &branchEngine{drv: mysqlNS{drv}, scope: scopeName, engine: "mysql"},
 			loadDump: func(ctx context.Context, active string, dump dumpFile) error {
 				_, e := dumpload.LoadMySQL(ctx, drv.DB, cfg.Connections.Mysql, active, dump.Path)
 				return e
@@ -1493,7 +1494,8 @@ func preparePostgres(
 		return runBranchScoped(ctx, branchScopedArgs{
 			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
 			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
-			eng: &branchEngine{drv: postgresNS{drv}, scope: scopeName, engine: "postgres"},
+			migrateFP: computeSnapshotKey(ctx, st, d, worktreePath, version).Fingerprint(),
+			eng:       &branchEngine{drv: postgresNS{drv}, scope: scopeName, engine: "postgres"},
 			loadDump: func(ctx context.Context, active string, dump dumpFile) error {
 				scoped, e := drv.OpenScoped(ctx, active)
 				if e != nil {
@@ -1730,7 +1732,8 @@ func prepareMongo(
 		return runBranchScoped(ctx, branchScopedArgs{
 			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
 			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
-			eng: &branchEngine{drv: mongoNS{drv}, scope: scopeName, engine: "mongodb"},
+			migrateFP: computeSnapshotKey(ctx, st, d, worktreePath, version).Fingerprint(),
+			eng:       &branchEngine{drv: mongoNS{drv}, scope: scopeName, engine: "mongodb"},
 			loadDump: func(ctx context.Context, active string, dump dumpFile) error {
 				// Per-entry SourceDB: each dump in the list can carry its own
 				// `source_db:` for `--nsFrom=<source_db>.* --nsTo=<active>.*`.
@@ -2195,18 +2198,18 @@ func prepareES(
 		return Outcome{}, err
 	}
 
+	version, _ := drv.EngineVersion(ctx)
 	if d.BranchScoped {
 		return runBranchScoped(ctx, branchScopedArgs{
 			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
 			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
-			eng: &branchEngine{drv: esNS{drv}, scope: scopePrefix, engine: "elasticsearch"},
+			migrateFP: computeSnapshotKey(ctx, st, d, worktreePath, version).Fingerprint(),
+			eng:       &branchEngine{drv: esNS{drv}, scope: scopePrefix, engine: "elasticsearch"},
 			loadDump: func(ctx context.Context, active string, dump dumpFile) error {
 				return drv.Restore(ctx, active, dump.Path)
 			},
 		})
 	}
-
-	version, _ := drv.EngineVersion(ctx)
 	key := computeSnapshotKey(ctx, st, d, worktreePath, version)
 	// ES forbids index names starting with `_`, so we use a
 	// dedicated prefix (tm_<fingerprint>_) for the template indices.

@@ -151,6 +151,25 @@ func (d *Driver) MaxConnections(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// WriteWatermark returns a sound, monotonic, PER-DATABASE write-counter
+// token: tup_inserted + tup_updated + tup_deleted from pg_stat_database
+// for `db`. The statistics collector is on by default (track_counts) and
+// these counters only increase, so an unchanged token between two calls
+// proves `db` received no row writes in between. Per-database (unlike the
+// server-wide MySQL token), so it isn't perturbed by writes to sibling
+// databases. An error or a missing row returns "" so the caller declines
+// to skip work.
+func (d *Driver) WriteWatermark(ctx context.Context, db string) (string, error) {
+	var n sql.NullInt64
+	err := d.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(tup_inserted,0) + COALESCE(tup_updated,0) + COALESCE(tup_deleted,0)
+		 FROM pg_stat_database WHERE datname = $1`, db).Scan(&n)
+	if err != nil {
+		return "", err
+	}
+	return "pg:" + strconv.FormatInt(n.Int64, 10), nil
+}
+
 func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 	qname, err := ident.QuotePostgres(name)
 	if err != nil {

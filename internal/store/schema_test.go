@@ -32,6 +32,7 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 	wantTables := []string{
 		"_treeman_migrations",
 		"active_branch_db",
+		"branch_db_migrated",
 		"dir_hashes",
 		"events",
 		"file_hashes",
