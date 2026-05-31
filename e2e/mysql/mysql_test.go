@@ -472,6 +472,19 @@ func TestStagedFanoutRestoreParallel(t *testing.T) {
 		t.Errorf("staging dir empty/absent — fan-out fell back to logical "+
 			"instead of staged physical restore (ls err=%v, out=%q)", err, listing)
 	}
+
+	// Pass 2 — cache hit: identical inputs must restore source + clones
+	// from the cached template (staged physical restore on the hit path)
+	// without a rebuild, and every clone stays correct.
+	o2 := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mysql", true)
+	if len(o2.Clones) != nClones {
+		t.Fatalf("pass2 clone count = %d, want %d", len(o2.Clones), nClones)
+	}
+	for _, name := range o2.Clones {
+		if got := rowCount(t, "127.0.0.1:13306", name, "products"); got != srcProducts {
+			t.Errorf("pass2 clone %s products = %d, want %d", name, got, srcProducts)
+		}
+	}
 }
 
 // TestBeefyFanoutManyTables stresses the physical fan-out at the scale

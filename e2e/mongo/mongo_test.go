@@ -438,4 +438,21 @@ print('seeded');
 			}
 		}
 	}
+
+	// Pass 2 — cache hit: identical inputs reuse the cached template +
+	// dump archive (mongorestore-from-archive on the hit path), no
+	// rebuild, and every clone stays complete.
+	o2 := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "mongodb", true)
+	if len(o2.Clones) != nClones {
+		t.Fatalf("pass2 clone count = %d, want %d", len(o2.Clones), nClones)
+	}
+	for _, clone := range o2.Clones {
+		n, err := c.Database(clone).Collection("c0").CountDocuments(ctx, struct{}{})
+		if err != nil {
+			t.Fatalf("pass2 count %s.c0: %v", clone, err)
+		}
+		if int(n) != nDocs {
+			t.Errorf("pass2 clone %s c0 docs = %d, want %d", clone, n, nDocs)
+		}
+	}
 }
