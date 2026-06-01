@@ -60,7 +60,13 @@ func baseBranchOf(ctx context.Context, repoRoot, branch string) string {
 // pointed at `develop` on the remote but the worktree's
 // `@{upstream}` was unset. The main-wt fallback fills that gap.
 func resolveBaseBranch(ctx context.Context, st *store.Store, repoRoot string, repoID int64, newBranch string) string {
-	if b := baseBranchOf(ctx, repoRoot, newBranch); b != "" {
+	// A pushed feature branch tracks its OWN remote (`git push -u`
+	// sets `@{upstream}` to `origin/<newBranch>`), so baseBranchOf
+	// returns newBranch itself. That is not a base — discard it and
+	// fall through to the main-worktree fallback so the branch still
+	// seeds from `develop`. Without the `b != newBranch` guard every
+	// pushed feature branch silently degraded to `seed:empty`.
+	if b := baseBranchOf(ctx, repoRoot, newBranch); b != "" && b != newBranch {
 		return b
 	}
 	mainBranch := lookupMainBranch(ctx, st, repoRoot, repoID)

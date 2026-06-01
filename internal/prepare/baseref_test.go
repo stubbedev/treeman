@@ -195,6 +195,44 @@ func TestResolveBaseBranch_EmptyWhenBranchEqualsMain(t *testing.T) {
 	}
 }
 
+// TestResolveBaseBranch_FallsBackWhenUpstreamIsSelf covers a pushed
+// feature branch: `git push -u` sets `@{upstream}` to
+// `origin/feature/KON-1`, so baseBranchOf returns the branch itself.
+// That is not a base — the `b != newBranch` guard must discard it and
+// take the main-worktree fallback to `develop`. Without the guard the
+// branch degraded to `seed:empty` (parent resolved to its own active
+// DB, which fill skips).
+func TestResolveBaseBranch_FallsBackWhenUpstreamIsSelf(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	gitRun(t, repo, "init", "-q", "-b", "develop")
+	gitRun(t, repo, "config", "user.email", "t@t")
+	gitRun(t, repo, "config", "user.name", "t")
+	gitRun(t, repo, "commit", "-q", "--allow-empty", "-m", "v1")
+	gitRun(t, repo, "branch", "feature/KON-1")
+	gitRun(t, repo, "checkout", "-q", "feature/KON-1")
+	gitRun(t, repo, "commit", "-q", "--allow-empty", "-m", "v2")
+	gitRun(t, repo, "checkout", "-q", "develop")
+	// Simulate `git push -u`: the branch tracks its OWN remote branch.
+	gitRun(t, repo, "remote", "add", "origin", repo)
+	gitRun(t, repo, "config", "branch.feature/KON-1.remote", "origin")
+	gitRun(t, repo, "config", "branch.feature/KON-1.merge", "refs/heads/feature/KON-1")
+
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "tm.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	got := resolveBaseBranch(ctx, st, repo, 0, "feature/KON-1")
+	if got != "develop" {
+		t.Fatalf("want develop (self-upstream discarded, main-wt fallback), got %q", got)
+	}
+}
+
 func TestRenderMainBaseDBUsesOverlay(t *testing.T) {
 	cfg := &config.Config{
 		Databases: []config.DatabaseConfig{
