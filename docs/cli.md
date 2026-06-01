@@ -470,6 +470,24 @@ Examples:
 | `-r`, `--repo` |  |
 | `--json` |  |
 
+### `treeman config history`
+
+list stored .treeman.yaml generations for this repo
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--json` |  |
+
+### `treeman config restore`
+
+write a stored generation back to .treeman.yaml
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--json` |  |
+
 ### `treeman schema`
 
 JSON schema helpers
