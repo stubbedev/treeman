@@ -159,14 +159,16 @@ func Install(repoRoot string, t Target) (resolved string, modelineChanged bool, 
 		return "", false, fmt.Errorf("schema: invalid target %d", t)
 	}
 	if t != TargetURL {
-		// The global config accepts a narrower key set than a repo
-		// `.treeman.yaml`, so the global install gets the scope-filtered
-		// schema. Repo + URL keep the full union schema.
-		render := Render
+		// Each config layer accepts a different key subset, so each gets
+		// its scope-filtered schema: the global config drops repo-only
+		// keys, the repo `.treeman.yaml` drops global-only keys. This is
+		// what makes the scope split a hard break in editors too — a
+		// daemon: block in a repo file shows as an unknown key.
+		scope := ScopeRepo
 		if t == TargetGlobal {
-			render = func() ([]byte, error) { return RenderScoped(ScopeGlobal) }
+			scope = ScopeGlobal
 		}
-		body, err := render()
+		body, err := RenderScoped(scope)
 		if err != nil {
 			return "", false, err
 		}

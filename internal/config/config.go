@@ -1779,11 +1779,74 @@ func LoadGlobal() (Config, error) {
 	var cfg Config
 	applyDefaults(&cfg)
 	if g, ok := globalConfigPath(); ok {
+		if err := checkLayerScope(g, "global"); err != nil {
+			return cfg, err
+		}
 		if err := mergeYAMLFile(&cfg, g); err != nil {
 			return cfg, err
 		}
 	}
 	return cfg, nil
+}
+
+// checkLayerScope hard-rejects top-level keys that don't belong in the
+// given layer: a `scope:"global"` key (daemon, snapshots, logs, status,
+// notifications) in a repo `.treeman.yaml`, or a `scope:"repo"` key
+// (databases, patches, hooks, main_worktree, env_sources) in the
+// user-global config. `scope:"both"` keys are allowed in either. `layer`
+// is "global" or "repo". Missing/empty files pass. Unknown keys are left
+// to the decoder (KnownFields is off, so they're ignored) — this only
+// polices placement of recognised keys.
+//
+// This is a hard break: there is no flag to relax it. The layered merge
+// makes a misplaced key silently inert (e.g. a repo `daemon:` block the
+// daemon never reads), so surfacing it as an error is strictly better
+// than the old silent-no-op behaviour.
+func checkLayerScope(path, layer string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(b, &root); err != nil {
+		// Let mergeYAMLFile surface the parse error with its own wording.
+		return nil
+	}
+	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	scopes := FieldScopes()
+	mapping := root.Content[0]
+	var other string
+	switch layer {
+	case "global":
+		other = "repo"
+	default:
+		other = "global"
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		key := mapping.Content[i].Value
+		if scopes[key] == other {
+			return fmt.Errorf("%s: key %q belongs in the %s config, not the %s config — %s",
+				path, key, other, layer, scopeHint(other))
+		}
+	}
+	return nil
+}
+
+// scopeHint points the user at the right file for a misplaced key.
+func scopeHint(scope string) string {
+	if scope == "global" {
+		gp, _ := globalConfigPath()
+		return "move it to " + gp + " (or run `treeman init --global`)"
+	}
+	return "move it to the repo's .treeman.yaml"
 }
 
 // LoadLayered reads global + repo + repo-local YAML files into a
@@ -1793,16 +1856,22 @@ func LoadLayered(repoRoot string) (Config, error) {
 	var cfg Config
 	applyDefaults(&cfg)
 	if g, ok := globalConfigPath(); ok {
+		if err := checkLayerScope(g, "global"); err != nil {
+			return cfg, err
+		}
 		if err := mergeYAMLFile(&cfg, g); err != nil {
 			return cfg, err
 		}
 	}
 	if repoRoot != "" {
-		if err := mergeYAMLFile(&cfg, filepath.Join(repoRoot, ".treeman.yaml")); err != nil {
-			return cfg, err
-		}
-		if err := mergeYAMLFile(&cfg, filepath.Join(repoRoot, ".treeman.local.yaml")); err != nil {
-			return cfg, err
+		for _, name := range []string{".treeman.yaml", ".treeman.local.yaml"} {
+			p := filepath.Join(repoRoot, name)
+			if err := checkLayerScope(p, "repo"); err != nil {
+				return cfg, err
+			}
+			if err := mergeYAMLFile(&cfg, p); err != nil {
+				return cfg, err
+			}
 		}
 	}
 	normaliseAliases(&cfg)
@@ -1819,18 +1888,25 @@ func LoadLayeredForWorktree(mainRoot, wtRoot string) (Config, error) {
 	var cfg Config
 	applyDefaults(&cfg)
 	if g, ok := globalConfigPath(); ok {
+		if err := checkLayerScope(g, "global"); err != nil {
+			return cfg, err
+		}
 		if err := mergeYAMLFile(&cfg, g); err != nil {
 			return cfg, err
 		}
 	}
-	if err := mergeYAMLFile(&cfg, filepath.Join(mainRoot, ".treeman.yaml")); err != nil {
-		return cfg, err
-	}
-	if err := mergeYAMLFile(&cfg, filepath.Join(mainRoot, ".treeman.local.yaml")); err != nil {
-		return cfg, err
+	repoFiles := []string{
+		filepath.Join(mainRoot, ".treeman.yaml"),
+		filepath.Join(mainRoot, ".treeman.local.yaml"),
 	}
 	if wtRoot != "" && wtRoot != mainRoot {
-		if err := mergeYAMLFile(&cfg, filepath.Join(wtRoot, ".treeman.local.yaml")); err != nil {
+		repoFiles = append(repoFiles, filepath.Join(wtRoot, ".treeman.local.yaml"))
+	}
+	for _, p := range repoFiles {
+		if err := checkLayerScope(p, "repo"); err != nil {
+			return cfg, err
+		}
+		if err := mergeYAMLFile(&cfg, p); err != nil {
 			return cfg, err
 		}
 	}

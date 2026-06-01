@@ -1997,11 +1997,26 @@ func prepareRedisPrefix(
 			"fingerprint": key.Fingerprint(),
 		})
 
+	// Sibling-safe snapshot ops: under the main-wt overlay sourcePrefix is
+	// bare and prefixes every sibling worktree's `<sourcePrefix><slug>_*`
+	// keys. Filter the SOURCE of every capture and the TARGET drop of every
+	// restore so cache-hit / incremental / cold-build never pull in or wipe
+	// a sibling's keys. Template prefixes are hash-derived and never
+	// collide, so existence probes stay unfiltered.
+	rdOthers := siblingSlugs(ctx, st, repoID, worktreeID)
+	rdKeep := func(k string) bool { return !nameOwnedByOtherSlug(k, rdOthers) }
+	rdRestore := func(ctx context.Context, templatePrefix, target string) error {
+		return drv.SnapshotRestoreFiltered(ctx, templatePrefix, target, rdKeep)
+	}
+	rdCreate := func(ctx context.Context, src, templatePrefix string) error {
+		return drv.SnapshotCreateFiltered(ctx, src, templatePrefix, rdKeep)
+	}
+
 	// Cache hit?
 	out, done, err := cacheHitGeneric(
 		ctx,
 		drv.PrefixExists,
-		drv.SnapshotRestore,
+		rdRestore,
 		d,
 		tplCtx,
 		worktreePath,
@@ -2023,8 +2038,8 @@ func prepareRedisPrefix(
 		repoID, worktreeID, sourcePrefix, templatePrefix, version, 0, key, inputs,
 		inheritedEnv, started, incrementalOps{
 			exists:          drv.PrefixExists,
-			snapshotRestore: drv.SnapshotRestore,
-			snapshotCreate:  drv.SnapshotCreate,
+			snapshotRestore: rdRestore,
+			snapshotCreate:  rdCreate,
 		})
 	if done || err != nil {
 		return out, err
@@ -2035,7 +2050,7 @@ func prepareRedisPrefix(
 		return Outcome{}, err
 	}
 	snapStart := time.Now()
-	if err := drv.SnapshotCreate(ctx, sourcePrefix, templatePrefix); err != nil {
+	if err := rdCreate(ctx, sourcePrefix, templatePrefix); err != nil {
 		return Outcome{}, fmt.Errorf("redis snapshot create %s → %s: %w", sourcePrefix, templatePrefix, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "snapshot-create", snapStart)
@@ -2046,7 +2061,7 @@ func prepareRedisPrefix(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templatePrefix, clones, d.Engine, d.Fanout, 0); err != nil {
+	if err := fanOutClones(ctx, st, repoID, worktreeID, rdRestore, templatePrefix, clones, d.Engine, d.Fanout, 0); err != nil {
 		return Outcome{}, err
 	}
 
@@ -2210,6 +2225,21 @@ func prepareES(
 			},
 		})
 	}
+	// Sibling-safe snapshot ops: under the main-wt overlay sourcePrefix is
+	// bare and prefixes every sibling worktree's `<sourcePrefix>_<slug>_*`
+	// indices. Filter the SOURCE of every capture and the TARGET drop of
+	// every restore so cache-hit / incremental / cold-build never pull in
+	// or wipe a sibling's data. Template prefixes are hash-derived and
+	// never collide, so existence probes stay unfiltered.
+	esOthers := siblingSlugs(ctx, st, repoID, worktreeID)
+	esKeep := func(n string) bool { return !nameOwnedByOtherSlug(n, esOthers) }
+	esRestore := func(ctx context.Context, templatePrefix, target string) error {
+		return drv.SnapshotRestoreFiltered(ctx, templatePrefix, target, esKeep)
+	}
+	esCreate := func(ctx context.Context, src, templatePrefix string) error {
+		return drv.SnapshotCreateFiltered(ctx, src, templatePrefix, esKeep)
+	}
+
 	key := computeSnapshotKey(ctx, st, d, worktreePath, version)
 	// ES forbids index names starting with `_`, so we use a
 	// dedicated prefix (tm_<fingerprint>_) for the template indices.
@@ -2240,7 +2270,7 @@ func prepareES(
 	out, done, err := cacheHitGeneric(
 		ctx,
 		esTemplateExists,
-		drv.SnapshotRestore,
+		esRestore,
 		d,
 		tplCtx,
 		worktreePath,
@@ -2265,8 +2295,8 @@ func prepareES(
 				m, err := drv.ListMatching(ctx, name)
 				return len(m) > 0, err
 			},
-			snapshotRestore: drv.SnapshotRestore,
-			snapshotCreate:  drv.SnapshotCreate,
+			snapshotRestore: esRestore,
+			snapshotCreate:  esCreate,
 		})
 	if done || err != nil {
 		return out, err
@@ -2276,7 +2306,7 @@ func prepareES(
 		return Outcome{}, err
 	}
 	snapStart := time.Now()
-	if err := drv.SnapshotCreate(ctx, sourcePrefix, templatePrefix); err != nil {
+	if err := esCreate(ctx, sourcePrefix, templatePrefix); err != nil {
 		return Outcome{}, fmt.Errorf("es snapshot create %s → %s: %w", sourcePrefix, templatePrefix, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "snapshot-create", snapStart)
@@ -2287,7 +2317,7 @@ func prepareES(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templatePrefix, clones, d.Engine, d.Fanout, 0); err != nil {
+	if err := fanOutClones(ctx, st, repoID, worktreeID, esRestore, templatePrefix, clones, d.Engine, d.Fanout, 0); err != nil {
 		return Outcome{}, err
 	}
 

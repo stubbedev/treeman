@@ -59,7 +59,7 @@ func registerCoreReadTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_schema",
-		Description: "Get the JSON Schema for .treeman.yaml (reflected from config.Config). Use to drive autocomplete or pre-validate a proposed body.",
+		Description: "Get the JSON Schema for treeman config (reflected from config.Config). scope=repo (default, .treeman.yaml keys) | global (~/.config/treeman/config.yaml keys) | full. Repo and global accept different key subsets — daemon/snapshots/logs/status/notifications are global-only; databases/patches/hooks/main_worktree/env_sources are repo-only.",
 		Annotations: readOnlyAnno("Get config schema", false),
 	}, configSchemaTool)
 
@@ -68,6 +68,12 @@ func registerCoreReadTools(srv *mcpsdk.Server) {
 		Description: "Preview the effect of a proposed .treeman.yaml body — returns added/removed/changed dotted paths. Call before config_write. Parse errors short-circuit the diff.",
 		Annotations: readOnlyAnno("Diff config", false),
 	}, configDiffTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "config_history",
+		Description: "List stored generations of .treeman.yaml for a repo — every config_set/config_write/main-enable snapshots the prior content into SQLite (per-repo, newest-first). Returns {generation, created_at, bytes}. Pair with config_restore to roll back a bad edit.",
+		Annotations: readOnlyAnno("List config history", false),
+	}, configHistoryTool)
 }
 
 // registerWorktreeReadTools binds the worktree-introspection tools.
@@ -385,6 +391,46 @@ func redactMap(m map[string]any) map[string]any {
 	return out
 }
 
+type configHistoryIn struct {
+	Repo string `json:"repo,omitempty" jsonschema:"repo root override (defaults to cwd)"`
+}
+type configGenerationOut struct {
+	Generation int64  `json:"generation"`
+	CreatedAt  string `json:"created_at"`
+	Bytes      int    `json:"bytes"`
+}
+type configHistoryOut struct {
+	Repo        string                `json:"repo"`
+	Path        string                `json:"path"`
+	Generations []configGenerationOut `json:"generations"`
+}
+
+func configHistoryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configHistoryIn) (*mcpsdk.CallToolResult, configHistoryOut, error) {
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, configHistoryOut{}, err
+	}
+	p := filepath.Join(repoRoot, ".treeman.yaml")
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, configHistoryOut{}, err
+	}
+	defer func() { _ = st.Close() }()
+	gens, err := st.ListConfigGenerations(ctx, repoRoot, p)
+	if err != nil {
+		return nil, configHistoryOut{}, err
+	}
+	out := configHistoryOut{Repo: repoRoot, Path: p, Generations: make([]configGenerationOut, 0, len(gens))}
+	for _, g := range gens {
+		out.Generations = append(out.Generations, configGenerationOut{
+			Generation: g.Generation,
+			CreatedAt:  time.UnixMilli(g.CreatedAt).UTC().Format(time.RFC3339),
+			Bytes:      len(g.Content),
+		})
+	}
+	return nil, out, nil
+}
+
 type configValidateIn struct {
 	Repo string `json:"repo,omitempty"`
 }
@@ -413,13 +459,28 @@ func configValidateTool(
 	return nil, configValidateOut{OK: true, Repo: repoRoot, Databases: len(cfg.Databases)}, nil
 }
 
-type configSchemaIn struct{}
+type configSchemaIn struct {
+	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml keys) | global (~/.config/treeman/config.yaml keys) | full (every key). Repo and global accept different key subsets."`
+}
 
 // configSchemaTool returns the JSON Schema as a map[string]any so
 // the SDK serialises it as a nested object instead of the byte-array
-// shape that json.RawMessage produces by default.
-func configSchemaTool(_ context.Context, _ *mcpsdk.CallToolRequest, _ configSchemaIn) (*mcpsdk.CallToolResult, map[string]any, error) {
-	b, err := schema.Render()
+// shape that json.RawMessage produces by default. Defaults to the
+// repo-scoped schema — the one that validates `.treeman.yaml`, which is
+// what an agent pre-validating a repo config body wants.
+func configSchemaTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSchemaIn) (*mcpsdk.CallToolResult, map[string]any, error) {
+	var sc schema.Scope
+	switch strings.ToLower(in.Scope) {
+	case "", "repo":
+		sc = schema.ScopeRepo
+	case "global":
+		sc = schema.ScopeGlobal
+	case "full":
+		sc = schema.ScopeFull
+	default:
+		return nil, nil, fmt.Errorf("invalid scope %q (want repo|global|full)", in.Scope)
+	}
+	b, err := schema.RenderScoped(sc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -427,7 +488,7 @@ func configSchemaTool(_ context.Context, _ *mcpsdk.CallToolRequest, _ configSche
 	if err := json.Unmarshal(b, &out); err != nil {
 		return nil, nil, err
 	}
-	return nil, map[string]any{"schema": out}, nil
+	return nil, map[string]any{"schema": out, "scope": string(sc)}, nil
 }
 
 // ─── worktree_list / show ─────────────────────────────────────────

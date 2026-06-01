@@ -178,11 +178,17 @@ sync-docs:
 # every `just check` to keep the canonical schema URL in sync with
 # the binary on disk. CI asserts no drift on PRs and auto-commits
 # on master pushes.
+#
+# The canonical schema is REPO-scoped: it validates `.treeman.yaml`
+# (the file `treeman init`'s modeline points at via the URL), so it
+# excludes global-only keys (daemon, snapshots, logs, status,
+# notifications). The global config gets its own scoped schema from
+# `treeman schema install --global` / `treeman init --global`.
 sync-schema:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p schemas
-    go run ./cmd/treeman schema dump --out schemas/treeman.schema.json
+    go run ./cmd/treeman schema dump --scope repo --out schemas/treeman.schema.json
     if [ -n "$(git status --porcelain schemas/treeman.schema.json)" ]; then
         echo "sync-schema: regenerated schemas/treeman.schema.json"
     else

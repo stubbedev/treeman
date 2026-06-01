@@ -225,6 +225,133 @@ func TestSiblingWorktreeDBsSurviveMainWtColdBuild(t *testing.T) {
 	}
 }
 
+// TestSiblingESIndicesSurviveMainWtCacheHit guards the cache-hit restore
+// path, which TestSiblingWorktreeDBsSurviveMainWtColdBuild deliberately
+// skips by clearing snapshot rows. The main worktree shares the sibling's
+// content-only fingerprint, so its prepare CACHE HITS the sibling's
+// template and restores it into the bare overlay prefix `chk_`. That
+// restore drops `chk_*` first — a prefix of the sibling's `chk_<slug>_*`
+// indices — so without the sibling filter it wipes the sibling's live
+// data. A populating seed is required so the cached template is non-empty
+// (an empty template fails the cache-hit existence probe → cold build,
+// which never exercises this path). Redis shares the identical wiring
+// (rdRestore) and is covered at the driver level by the branchscoped
+// reset tests.
+func TestSiblingESIndicesSurviveMainWtCacheHit(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	composeDir := harness.MustAbs(".")
+	t.Cleanup(harness.ComposeUp(t, composeDir))
+
+	harness.WaitForReady(t, "es:19299", 120*time.Second, func() error {
+		resp, err := http.Get(esURL + "/_cluster/health")
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		return nil
+	})
+
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "treeman-test.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	siblingPath := t.TempDir()
+	mainPath := t.TempDir()
+	repoID, err := st.EnsureRepo(ctx, mainPath, "siblings-cachehit-e2e")
+	if err != nil {
+		t.Fatalf("ensure repo: %v", err)
+	}
+	siblingSlug := slug.Slug{Value: "kon_77001", Source: slug.SourceTicket}
+	mainSlug := slug.Slug{Value: "main_master", Source: slug.SourceTicket}
+	siblingWtID, err := st.EnsureWorktree(ctx, repoID, siblingPath, siblingSlug.Value, "bugfix/KON-77001")
+	if err != nil {
+		t.Fatalf("ensure sibling wt: %v", err)
+	}
+	mainWtID, err := st.EnsureWorktree(ctx, repoID, mainPath, mainSlug.Value, "master")
+	if err != nil {
+		t.Fatalf("ensure main wt: %v", err)
+	}
+
+	t.Cleanup(func() {
+		deleteESPattern(t, "chk_*")
+	})
+
+	// Build the sibling: the seed creates `chk_<slug>_seeded`, so the cached
+	// template is non-empty and main will cache-hit it.
+	if _, err := prepare.Run(ctx, cacheHitESConfig(), siblingPath, siblingSlug, st, repoID, siblingWtID, nil); err != nil {
+		t.Fatalf("sibling prepare: %v", err)
+	}
+	// Extra live sibling index (no template counterpart) — the canary a
+	// bare-prefix restore would wipe.
+	mustCreateESIndex(t, "chk_"+siblingSlug.Value+"_canary")
+
+	sibBefore := listESIndicesWithPrefix(t, "chk_"+siblingSlug.Value+"_")
+	if len(sibBefore) < 2 {
+		t.Fatalf("sibling es indices didn't materialise (want seeded+canary): %v", sibBefore)
+	}
+
+	// Main prepare with the bare overlay prefix. Do NOT clear snapshots → it
+	// cache-hits the sibling template and restores into bare `chk_`.
+	mainCfg := cacheHitESConfig()
+	mainCfg.MainWorktree = config.MainWorktreeConfig{
+		Enabled:   true,
+		Databases: []config.DatabaseOverlay{{KeyPrefix: "chk_"}},
+	}
+	config.ApplyMainWorktreeOverlay(mainCfg)
+	mainOuts, err := prepare.Run(ctx, mainCfg, mainPath, mainSlug, st, repoID, mainWtID, nil)
+	if err != nil {
+		t.Fatalf("main prepare: %v", err)
+	}
+	// Guard against a vacuous pass: the regression only exists on the
+	// cache-hit path, so fail loudly if main didn't actually cache-hit.
+	if es := outcomeFor(t, mainOuts, "elasticsearch"); !es.CacheHit {
+		t.Fatalf("main es prepare did not cache-hit (got %+v) — test would not exercise the restore path", es)
+	}
+
+	sibAfter := listESIndicesWithPrefix(t, "chk_"+siblingSlug.Value+"_")
+	if missing := setDiff(sibBefore, sibAfter); len(missing) > 0 {
+		t.Errorf("ES CACHE-HIT SIBLING-WIPE REGRESSION: %d sibling indices gone after main cache-hit: %v\nbefore=%v after=%v",
+			len(missing), missing, sibBefore, sibAfter)
+	}
+}
+
+// cacheHitESConfig is a single-engine ES config whose seed populates the
+// source prefix (so the cached template is non-empty). The seed runs on the
+// host via `sh -c`, curling the ES container's published port; `{target_db}`
+// renders to the per-worktree key prefix.
+func cacheHitESConfig() *config.Config {
+	return &config.Config{
+		Connections: config.ConnectionsConfig{
+			Elasticsearch: &config.EsConn{URL: esURL},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:    "elasticsearch",
+			KeyPrefix: "chk_{slug}_",
+			Seed: &config.Step{
+				Run: `curl -sf -X PUT "` + esURL + `/${ESP}seeded/_doc/1?refresh=true" -H 'Content-Type: application/json' -d '{"v":"x"}'`,
+				Env: map[string]string{"ESP": "{target_db}"},
+			},
+		}},
+	}
+}
+
+// deleteESPattern best-effort deletes indices matching a wildcard.
+func deleteESPattern(t *testing.T, pattern string) {
+	t.Helper()
+	req, _ := http.NewRequest("DELETE", esURL+"/"+pattern+"?ignore_unavailable=true", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
 func siblingConfig() *config.Config {
 	clones := config.ClonesSetting{Fixed: 2}
 	return &config.Config{

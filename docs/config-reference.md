@@ -7,30 +7,270 @@ reflection that produces `schemas/treeman.schema.json`).
 Run `just sync-docs` after touching a config field to refresh.
 For worked examples and guidance see [configuration.md](configuration.md).
 
+## Config layers
+
+treeman reads config from two files that merge into one effective config:
+
+1. **User-global** — `~/.config/treeman/config.yaml` (`$XDG_CONFIG_HOME/treeman/config.yaml`). Machine-wide defaults shared by every repo. Scaffold it with `treeman init --global`.
+2. **Per-repo** — `<repo>/.treeman.yaml` (plus an optional git-ignored `.treeman.local.yaml` overlay). Project-specific settings.
+
+Later layers override earlier ones. Each top-level key has a **scope** that determines which file it may appear in — a key in the wrong file is a hard error at load time (no flag relaxes it):
+
+- **global** — only valid in the user-global config.
+- **repo** — only valid in a repo `.treeman.yaml`.
+- **both** — valid in either; the global value is the default, a repo value overrides it.
+
+| Key | Scope |
+|-----|-------|
+| `daemon` | global |
+| `connections` | both |
+| `snapshots` | global |
+| `worktrees` | both |
+| `env_sources` | repo |
+| `patches` | repo |
+| `databases` | repo |
+| `hooks` | repo |
+| `debounce_ms` | both |
+| `frameworks` | both |
+| `logs` | global |
+| `auto_fetch` | both |
+| `main_worktree` | repo |
+| `ports` | both |
+| `status` | global |
+| `notifications` | global |
+
+## Generated examples
+
+Complete examples covering every key valid in each layer, generated from the schema (placeholder values — replace with real ones).
+
+### User-global `~/.config/treeman/config.yaml`
+
+```yaml
+# Daemon process settings: socket path, log level, log database
+daemon:
+    log_level: '...'
+# Connection blocks per supported engine (MySQL, Postgres,
+connections:
+    mysql: '...'
+    postgres: '...'
+    mongodb: '...'
+    redis: '...'
+    elasticsearch: '...'
+# Snapshot cache settings: where post-migration template
+snapshots:
+    cap_per_repo: 0
+    keep_per_source: 0
+    max_age_days: 0
+    max_total_gb: 0
+    gc_interval_minutes: 0
+# Worktree creation/deletion behaviour: root path, symlink mirrors,
+worktrees:
+    root: '...'
+    links:
+        - '...'
+    copies:
+        - '...'
+# DebounceMs is the file-watcher debounce window in
+debounce_ms: 0
+# User-defined migration frameworks keyed by name. Use this when
+frameworks:
+    <name>:
+        markers:
+            - '...'
+        migration_dirs:
+            - '...'
+        file_pattern: '...'
+        lockfiles:
+            - '...'
+        engine_hint: '...'
+# Logs retention. Daemon-side prune drops rows older than
+logs:
+    keep_days: 0
+# AutoFetch policy. Daemon-side periodic `git fetch --all --prune`
+auto_fetch:
+    enabled: false
+    interval_minutes: 0
+    mode: ff
+# Ports declares per-worktree port slots. Each entry is a named
+ports:
+    <name>:
+        - 0
+# Status configures the `treeman status` widget output (icons,
+status:
+    icons:
+        stable: '...'
+        up: '...'
+        down: '...'
+        failed: '...'
+    labels:
+        stable: '...'
+        up: '...'
+        down: '...'
+        failed: '...'
+    separator: '...'
+    header: '...'
+    row: '...'
+    main_marker: '...'
+    formats:
+        <name>: '...'
+# Notifications opts into desktop notifications (notify-send on
+notifications:
+    enabled: false
+    events:
+        - stable
+    backend: auto
+```
+
+### Per-repo `.treeman.yaml`
+
+```yaml
+# Connection blocks per supported engine (MySQL, Postgres,
+connections:
+    mysql: '...'
+    postgres: '...'
+    mongodb: '...'
+    redis: '...'
+    elasticsearch: '...'
+# Worktree creation/deletion behaviour: root path, symlink mirrors,
+worktrees:
+    root: '...'
+    links:
+        - '...'
+    copies:
+        - '...'
+# EnvSources is the ordered list of `.env*` files the credential
+env_sources:
+    - '...'
+# Files to rewrite inside each worktree with per-worktree values
+patches:
+    - file: '...'
+      format: dotenv
+      set:
+        <name>: '...'
+# One entry per database the project owns. Each entry pairs an
+databases:
+    - engine: mysql
+      name_template: '...'
+      dump: '...'
+      migrate:
+        run: '...'
+        env:
+            <name>: '...'
+      seed:
+        run: '...'
+        env:
+            <name>: '...'
+      inputs:
+        - '...'
+      test_clones:
+        clones: auto
+        name_template: '...'
+      key_prefix: '...'
+      fanout: 0
+      branch_scoped: false
+# Lifecycle hooks fired around worktree create/delete. Two phases:
+hooks:
+    on-create-before-engines:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    on-create-after-engines:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    on-delete-before-engines:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    on-delete-after-engines:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    on-checkout:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    on-file-change:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+          match: '...'
+# DebounceMs is the file-watcher debounce window in
+debounce_ms: 0
+# User-defined migration frameworks keyed by name. Use this when
+frameworks:
+    <name>:
+        markers:
+            - '...'
+        migration_dirs:
+            - '...'
+        file_pattern: '...'
+        lockfiles:
+            - '...'
+        engine_hint: '...'
+# AutoFetch policy. Daemon-side periodic `git fetch --all --prune`
+auto_fetch:
+    enabled: false
+    interval_minutes: 0
+    mode: ff
+# MainWorktree opts the repo's main checkout (repo root) into the
+main_worktree:
+    enabled: false
+    databases:
+        - name_template: '...'
+          key_prefix: '...'
+          test_clones:
+            clones: auto
+            name_template: '...'
+          fanout: 0
+# Ports declares per-worktree port slots. Each entry is a named
+ports:
+    <name>:
+        - 0
+```
+
 ## Top-level keys
 
-### `daemon` *([DaemonConfig](#daemonconfig))*
+### `daemon` *([DaemonConfig](#daemonconfig))* _[global]_
 
 Daemon process settings: socket path, log level, log database
 location. Typically lives in the user-global config.
 
-### `connections` *([ConnectionsConfig](#connectionsconfig))*
+### `connections` *([ConnectionsConfig](#connectionsconfig))* _[both]_
 
 Connection blocks per supported engine (MySQL, Postgres,
 MongoDB, Redis, Elasticsearch). Treeman dials these to create
 per-worktree clone databases, run migrations.
 
-### `snapshots` *([SnapshotsConfig](#snapshotsconfig))*
+### `snapshots` *([SnapshotsConfig](#snapshotsconfig))* _[global]_
 
 Snapshot cache settings: where post-migration template
 snapshots are cached on disk, plus retention/eviction policy.
 
-### `worktrees` *([WorktreesConfig](#worktreesconfig))*
+### `worktrees` *([WorktreesConfig](#worktreesconfig))* _[both]_
 
 Worktree creation/deletion behaviour: root path, symlink mirrors,
 async vs sync semantics for hooks.
 
-### `env_sources` *(array of string)*
+### `env_sources` *(array of string)* _[repo]_
 
 EnvSources is the ordered list of `.env*` files the credential
 resolver consults when looking up DB passwords and other
@@ -40,7 +280,7 @@ to the default search order:
   .env.test.local → .env.testing.local
 Per-worktree rewriting of these files lives in `patches:`.
 
-### `patches` *(array of [Patch](#patch))*
+### `patches` *(array of [Patch](#patch))* _[repo]_
 
 Files to rewrite inside each worktree with per-worktree values
 (slug-substituted DB names, cache prefixes, etc.). Supports
@@ -56,46 +296,46 @@ Re-applied on every `treeman wt finalize` so a branch switch
 inside an existing worktree re-evaluates each patch against
 the new HEAD's slug.
 
-### `databases` *(array of [DatabaseConfig](#databaseconfig))*
+### `databases` *(array of [DatabaseConfig](#databaseconfig))* _[repo]_
 
 One entry per database the project owns. Each entry pairs an
 engine with a dump path, migration source, test-clone fanout,
 and optional namespace template.
 
-### `hooks` *([HooksConfig](#hooksconfig))*
+### `hooks` *([HooksConfig](#hooksconfig))* _[repo]_
 
 Lifecycle hooks fired around worktree create/delete. Two phases:
 `setup` (after create) and `teardown` (before delete). Run
 async by default; `worktrees.async_create` / `async_delete`
 control whether the CLI blocks on completion.
 
-### `debounce_ms` *(integer)*
+### `debounce_ms` *(integer)* _[both]_
 
 DebounceMs is the file-watcher debounce window in
 milliseconds. Coalesces editor save bursts into one re-prep
 dispatch. Default 500.
 
-### `frameworks` *(map of name → [CustomFramework](#customframework))*
+### `frameworks` *(map of name → [CustomFramework](#customframework))* _[both]_
 
 User-defined migration frameworks keyed by name. Use this when
 the built-in framework presets don't cover your tool — declare
 the markers, migration dirs, file pattern, and hash policy
 explicitly.
 
-### `logs` *([LogsConfig](#logsconfig))*
+### `logs` *([LogsConfig](#logsconfig))* _[global]_
 
 Logs retention. Daemon-side prune drops rows older than
 `keep_days` from the events, hook_runs, and hook_log_chunks
 tables on a fixed interval. Set 0 to keep forever (no prune).
 
-### `auto_fetch` *([AutoFetchConfig](#autofetchconfig))*
+### `auto_fetch` *([AutoFetchConfig](#autofetchconfig))* _[both]_
 
 AutoFetch policy. Daemon-side periodic `git fetch --all --prune`
 per registered repo, followed by a `git merge --ff-only @{u}`
 per active worktree. Skips dirty trees, non-ff branches, and
 upstreamless branches. Enabled by default at a 15-minute cadence.
 
-### `main_worktree` *([MainWorktreeConfig](#mainworktreeconfig))*
+### `main_worktree` *([MainWorktreeConfig](#mainworktreeconfig))* _[repo]_
 
 MainWorktree opts the repo's main checkout (repo root) into the
 same watcher-driven prepare/migrate/teardown lifecycle that
@@ -104,7 +344,7 @@ linked `.worktrees/<slug>` checkouts already get. Off by default
 per-branch databases when the user switches branches at the
 repo root.
 
-### `ports` *(map of name → [PortSpec](#portspec))*
+### `ports` *(map of name → [PortSpec](#portspec))* _[both]_
 
 Ports declares per-worktree port slots. Each entry is a named
 slot with a port range; treeman allocates a free port per slot
@@ -117,13 +357,13 @@ Use slot names that match the role they fill in your app (e.g.
 `octane`, `webpack`, `reverb`) — the name shows up in every
 `{port_<name>}` reference and in `wt show` output.
 
-### `status` *([StatusConfig](#statusconfig))*
+### `status` *([StatusConfig](#statusconfig))* _[global]_
 
 Status configures the `treeman status` widget output (icons,
 labels, hover lines, custom bar formats). Lives in the global
 config since the widget aggregates worktrees across every repo.
 
-### `notifications` *([NotificationsConfig](#notificationsconfig))*
+### `notifications` *([NotificationsConfig](#notificationsconfig))* _[global]_
 
 Notifications opts into desktop notifications (notify-send on
 Linux, the native banner via osascript on macOS) when a worktree

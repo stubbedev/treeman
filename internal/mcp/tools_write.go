@@ -68,6 +68,12 @@ func registerWriteTools(srv *mcpsdk.Server) {
 		Annotations: writeAnno("Patch config field", false, true, false),
 	}, configSetTool)
 
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "config_restore",
+		Description: "Restore a stored generation of .treeman.yaml (see config_history) back onto disk. The current content is snapshotted first, so a restore is itself reversible. Use to roll back a bad config_set/config_write.",
+		Annotations: writeAnno("Restore config generation", true, true, false),
+	}, configRestoreTool)
+
 	// In-process registry mutations. No shell-out, no daemon dependency
 	// — agents can reconcile drift the same way `treeman wt
 	// register|unregister` would.
@@ -121,7 +127,7 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "init_repo",
-		Description: "Scaffold a fresh .treeman.yaml — auto-detects migration framework + JS package manager and emits matching databases/hooks. For the full guided flow use the scaffold-from-framework prompt. Pass force=true to overwrite.",
+		Description: "Scaffold a fresh .treeman.yaml — auto-detects migration framework + JS package manager and emits matching databases/hooks. Pass global=true to instead scaffold the user-global ~/.config/treeman/config.yaml (machine-wide defaults: daemon/snapshots/logs/auto_fetch/notifications) and install its scoped schema. For the full guided flow use the scaffold-from-framework prompt. Pass force=true to overwrite.",
 		Annotations: writeAnno("Scaffold config", false, false, false),
 	}, initRepoTool)
 
@@ -286,17 +292,38 @@ func atomicWrite(repoRoot, path string, data []byte) error {
 // ─── init_repo / schema_install ───────────────────────────────────
 
 type initIn struct {
-	Repo  string `json:"repo,omitempty"`
-	Force bool   `json:"force,omitempty"`
+	Repo   string `json:"repo,omitempty"`
+	Force  bool   `json:"force,omitempty"`
+	Global bool   `json:"global,omitempty" jsonschema:"scaffold the user-global ~/.config/treeman/config.yaml (machine-wide defaults) instead of a per-repo .treeman.yaml"`
 }
 type initOut struct {
 	Path     string   `json:"path"`
 	Created  bool     `json:"created"`
 	Bytes    int      `json:"bytes"`
-	Detected []string `json:"detected"`
+	Scope    string   `json:"scope"`
+	Schema   string   `json:"schema,omitempty"`
+	Detected []string `json:"detected,omitempty"`
 }
 
 func initRepoTool(_ context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*mcpsdk.CallToolResult, initOut, error) {
+	if in.Global {
+		target, created, body, err := initgen.WriteGlobalYAML(in.Force)
+		if err != nil {
+			return nil, initOut{}, err
+		}
+		schemaPath, _, schemaErr := schema.Install("", schema.TargetGlobal)
+		if created {
+			writeMCPEvent(context.Background(), "init_repo", "scaffolded "+target, 0, map[string]string{
+				"path":  target,
+				"scope": "global",
+			})
+		}
+		out := initOut{Path: target, Created: created, Bytes: len(body), Scope: "global"}
+		if schemaErr == nil {
+			out.Schema = schemaPath
+		}
+		return nil, out, nil
+	}
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		return nil, initOut{}, fmt.Errorf("resolve repo: %w", err)
@@ -315,6 +342,7 @@ func initRepoTool(_ context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*mcp
 		Path:     target,
 		Created:  created,
 		Bytes:    len(body),
+		Scope:    "repo",
 		Detected: initgen.DetectFrameworkNames(repoRoot),
 	}, nil
 }
@@ -980,6 +1008,45 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 		NewJSON:      string(newJSON),
 		Bytes:        len(body),
 	}, nil
+}
+
+// ─── config_restore ───────────────────────────────────────────────
+
+type configRestoreIn struct {
+	Repo       string `json:"repo,omitempty"`
+	Generation int64  `json:"generation" jsonschema:"the generation number to restore (from config_history)"`
+}
+type configRestoreOut struct {
+	Path     string `json:"path"`
+	Restored int64  `json:"restored"`
+	Bytes    int    `json:"bytes"`
+}
+
+func configRestoreTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configRestoreIn) (*mcpsdk.CallToolResult, configRestoreOut, error) {
+	repoRoot, err := resolveRepo(in.Repo)
+	if err != nil {
+		return nil, configRestoreOut{}, err
+	}
+	p := filepath.Join(repoRoot, ".treeman.yaml")
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, configRestoreOut{}, err
+	}
+	g, err := st.GetConfigGeneration(ctx, repoRoot, p, in.Generation)
+	_ = st.Close()
+	if err != nil {
+		return nil, configRestoreOut{}, fmt.Errorf("generation %d not found for %s", in.Generation, p)
+	}
+	// atomicWrite snapshots the current content first, so the restore is
+	// itself reversible.
+	if err := atomicWrite(repoRoot, p, g.Content); err != nil {
+		return nil, configRestoreOut{}, err
+	}
+	writeMCPEvent(context.Background(), "config_restore", fmt.Sprintf("restored generation %d", in.Generation), 0, map[string]string{
+		"repo":       repoRoot,
+		"generation": strconv.FormatInt(in.Generation, 10),
+	})
+	return nil, configRestoreOut{Path: p, Restored: in.Generation, Bytes: len(g.Content)}, nil
 }
 
 // ─── worktree_repair ──────────────────────────────────────────────
