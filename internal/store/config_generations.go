@@ -56,9 +56,12 @@ func (s *Store) ListConfigGenerations(ctx context.Context, repoRoot, configPath 
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.DB.QueryContext(ctx,
+	rows, err := s.DB.QueryContext(
+		ctx,
 		"SELECT id, repo_id, path, generation, content, created_at FROM config_generations WHERE repo_id = ? AND path = ? ORDER BY generation DESC",
-		repoID, configPath)
+		repoID,
+		configPath,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -82,9 +85,13 @@ func (s *Store) GetConfigGeneration(ctx context.Context, repoRoot, configPath st
 		return ConfigGeneration{}, err
 	}
 	var g ConfigGeneration
-	row := s.DB.QueryRowContext(ctx,
+	row := s.DB.QueryRowContext(
+		ctx,
 		"SELECT id, repo_id, path, generation, content, created_at FROM config_generations WHERE repo_id = ? AND path = ? AND generation = ?",
-		repoID, configPath, generation)
+		repoID,
+		configPath,
+		generation,
+	)
 	if err := row.Scan(&g.ID, &g.RepoID, &g.Path, &g.Generation, &g.Content, &g.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ConfigGeneration{}, err

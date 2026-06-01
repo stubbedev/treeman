@@ -8,6 +8,7 @@
 package initgen
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,7 +47,7 @@ func WriteYAML(cwd string, force bool) (path string, created bool, body string, 
 func WriteGlobalYAML(force bool) (path string, created bool, body string, err error) {
 	target, ok := config.GlobalConfigPath()
 	if !ok {
-		return "", false, "", fmt.Errorf("cannot resolve global config path (no home dir)")
+		return "", false, "", errors.New("cannot resolve global config path (no home dir)")
 	}
 	_, statErr := os.Stat(target)
 	exists := statErr == nil

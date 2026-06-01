@@ -442,7 +442,11 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string, si
 		if err != nil {
 			return nil, func() {}, err
 		}
-		return &branchEngine{drv: redisNS{d: drv, keep: siblingKeep(siblings)}, scope: scope, engine: label}, func() { _ = drv.Close() }, nil
+		return &branchEngine{
+			drv:    redisNS{d: drv, keep: siblingKeep(siblings)},
+			scope:  scope,
+			engine: label,
+		}, func() { _ = drv.Close() }, nil
 	case "elasticsearch":
 		if cfg.Connections.Elasticsearch == nil {
 			return nil, func() {}, errors.New("connections.elasticsearch not configured")

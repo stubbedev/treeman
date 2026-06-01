@@ -264,7 +264,11 @@ func TestDbResetSparesSiblingPrefixElasticsearch(t *testing.T) {
 		t.Fatalf("reset should have dropped the main worktree's own index %q, found %d docs", mainIndex, n)
 	}
 	if n := esCount(t, siblingIndex+"*"); n != 1 {
-		t.Fatalf("reset wiped sibling index %q via a bare-prefix match — sibling-isolation regression (found %d docs, want 1)", siblingIndex, n)
+		t.Fatalf(
+			"reset wiped sibling index %q via a bare-prefix match — sibling-isolation regression (found %d docs, want 1)",
+			siblingIndex,
+			n,
+		)
 	}
 }
 

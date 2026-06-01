@@ -387,55 +387,14 @@ Examples:
 				return err
 			}
 			p := filepath.Join(repoRoot, ".treeman.yaml")
-			raw, err := os.ReadFile(p)
-			if err != nil {
-				return fmt.Errorf("read %s: %w", p, err)
-			}
-			var doc yaml.Node
-			if err := yaml.Unmarshal(raw, &doc); err != nil {
-				return fmt.Errorf("parse %s: %w", p, err)
-			}
-			segs, err := yamlpatch.ParsePath(path)
+			body, prev, value, err := applyConfigSet(p, path, rawValue)
 			if err != nil {
 				return err
-			}
-			if len(segs) > 0 && segs[0].Key != "" {
-				if err := config.CheckKeyInLayer(segs[0].Key, "repo"); err != nil {
-					return err
-				}
-			}
-			var value any
-			if err := json.Unmarshal([]byte(rawValue), &value); err != nil {
-				value = rawValue
-			}
-			newNode, err := yamlpatch.ValueToNode(value)
-			if err != nil {
-				return fmt.Errorf("encode value: %w", err)
-			}
-			prev, err := yamlpatch.Set(&doc, segs, newNode)
-			if err != nil {
-				return err
-			}
-			body, err := yamlpatch.Marshal(&doc)
-			if err != nil {
-				return fmt.Errorf("encode yaml: %w", err)
-			}
-			var validated config.Config
-			if err := yaml.Unmarshal(body, &validated); err != nil {
-				return fmt.Errorf("validation failed — patched file would not parse as config.Config: %w", err)
 			}
 			if err := snapshotAndWrite(ctx, repoRoot, p, body); err != nil {
 				return err
 			}
-			prevJSON := ""
-			if prev != nil {
-				var v any
-				if err := prev.Decode(&v); err == nil {
-					if b, err := json.Marshal(v); err == nil {
-						prevJSON = string(b)
-					}
-				}
-			}
+			prevJSON := decodePrevJSON(prev)
 			newJSON, _ := json.Marshal(value)
 			if c.Bool("json") {
 				return jsonStream(map[string]any{
@@ -453,6 +412,68 @@ Examples:
 			return nil
 		},
 	}
+}
+
+// applyConfigSet reads .treeman.yaml at p, patches the dotted path with
+// rawValue (parsed as JSON when possible, literal string otherwise),
+// and validates the result still parses as config.Config. Returns the
+// new body, the previous node at that path (nil for a new key), and the
+// parsed value.
+func applyConfigSet(p, path, rawValue string) (body []byte, prev *yaml.Node, value any, err error) {
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read %s: %w", p, err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, nil, nil, fmt.Errorf("parse %s: %w", p, err)
+	}
+	segs, err := yamlpatch.ParsePath(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(segs) > 0 && segs[0].Key != "" {
+		if err := config.CheckKeyInLayer(segs[0].Key, "repo"); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	if err := json.Unmarshal([]byte(rawValue), &value); err != nil {
+		value = rawValue
+	}
+	newNode, err := yamlpatch.ValueToNode(value)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("encode value: %w", err)
+	}
+	prev, err = yamlpatch.Set(&doc, segs, newNode)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	body, err = yamlpatch.Marshal(&doc)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("encode yaml: %w", err)
+	}
+	var validated config.Config
+	if err := yaml.Unmarshal(body, &validated); err != nil {
+		return nil, nil, nil, fmt.Errorf("validation failed — patched file would not parse as config.Config: %w", err)
+	}
+	return body, prev, value, nil
+}
+
+// decodePrevJSON renders a patched-over node as compact JSON for the
+// "old → new" diff line. Returns "" for a new key or any decode failure.
+func decodePrevJSON(prev *yaml.Node) string {
+	if prev == nil {
+		return ""
+	}
+	var v any
+	if prev.Decode(&v) != nil {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // openDefaultStore opens the default SQLite event store.

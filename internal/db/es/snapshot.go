@@ -131,7 +131,11 @@ func (d *Driver) SnapshotRestoreFiltered(ctx context.Context, templatePrefix, ta
 // spares the current worktree's siblings exactly as SnapshotRestoreFiltered
 // does. Durable resume passes srcKeep=nil (the durable prefix is
 // hash-derived and never nests).
-func (d *Driver) SnapshotRestoreSrcFiltered(ctx context.Context, templatePrefix, targetPrefix string, srcKeep, tgtKeep func(string) bool) error {
+func (d *Driver) SnapshotRestoreSrcFiltered(
+	ctx context.Context,
+	templatePrefix, targetPrefix string,
+	srcKeep, tgtKeep func(string) bool,
+) error {
 	if templatePrefix == targetPrefix {
 		return errors.New("snapshot restore: template and target prefixes must differ")
 	}

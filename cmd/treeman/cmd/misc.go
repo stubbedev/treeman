@@ -559,7 +559,7 @@ func configHistory() *cli.Command {
 				return nil
 			}
 			for _, g := range gens {
-				fmt.Fprintf(ui.Out, "  %s  %s  %d bytes\n",
+				_, _ = fmt.Fprintf(ui.Out, "  %s  %s  %d bytes\n",
 					ui.Bold(fmt.Sprintf("gen %d", g.Generation)),
 					time.UnixMilli(g.CreatedAt).Local().Format("2006-01-02 15:04:05"),
 					len(g.Content))
@@ -1148,7 +1148,10 @@ func InitCmd() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "force"},
 			&cli.BoolFlag{Name: "json"},
-			&cli.BoolFlag{Name: "global", Usage: "scaffold the user-global ~/.config/treeman/config.yaml (machine-wide defaults) instead of a per-repo .treeman.yaml"},
+			&cli.BoolFlag{
+				Name:  "global",
+				Usage: "scaffold the user-global ~/.config/treeman/config.yaml (machine-wide defaults) instead of a per-repo .treeman.yaml",
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.Bool("global") {

@@ -405,7 +405,11 @@ type configHistoryOut struct {
 	Generations []configGenerationOut `json:"generations"`
 }
 
-func configHistoryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configHistoryIn) (*mcpsdk.CallToolResult, configHistoryOut, error) {
+func configHistoryTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in configHistoryIn,
+) (*mcpsdk.CallToolResult, configHistoryOut, error) {
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		return nil, configHistoryOut{}, err

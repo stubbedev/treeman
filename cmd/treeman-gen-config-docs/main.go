@@ -60,9 +60,15 @@ func main() {
 func writeLayers(b *strings.Builder, root *jsonschema.Schema, scopes map[string]string) {
 	b.WriteString("## Config layers\n\n")
 	b.WriteString("treeman reads config from two files that merge into one effective config:\n\n")
-	b.WriteString("1. **User-global** — `~/.config/treeman/config.yaml` (`$XDG_CONFIG_HOME/treeman/config.yaml`). Machine-wide defaults shared by every repo. Scaffold it with `treeman init --global`.\n")
-	b.WriteString("2. **Per-repo** — `<repo>/.treeman.yaml` (plus an optional git-ignored `.treeman.local.yaml` overlay). Project-specific settings.\n\n")
-	b.WriteString("Later layers override earlier ones. Each top-level key has a **scope** that determines which file it may appear in — a key in the wrong file is a hard error at load time (no flag relaxes it):\n\n")
+	b.WriteString(
+		"1. **User-global** — `~/.config/treeman/config.yaml` (`$XDG_CONFIG_HOME/treeman/config.yaml`). Machine-wide defaults shared by every repo. Scaffold it with `treeman init --global`.\n",
+	)
+	b.WriteString(
+		"2. **Per-repo** — `<repo>/.treeman.yaml` (plus an optional git-ignored `.treeman.local.yaml` overlay). Project-specific settings.\n\n",
+	)
+	b.WriteString(
+		"Later layers override earlier ones. Each top-level key has a **scope** that determines which file it may appear in — a key in the wrong file is a hard error at load time (no flag relaxes it):\n\n",
+	)
 	b.WriteString("- **global** — only valid in the user-global config.\n")
 	b.WriteString("- **repo** — only valid in a repo `.treeman.yaml`.\n")
 	b.WriteString("- **both** — valid in either; the global value is the default, a repo value overrides it.\n\n")
@@ -86,7 +92,9 @@ func writeLayers(b *strings.Builder, root *jsonschema.Schema, scopes map[string]
 // both. Both are walked from the schema so they track the structs.
 func writeExamples(b *strings.Builder, root *jsonschema.Schema, scopes map[string]string) {
 	b.WriteString("## Generated examples\n\n")
-	b.WriteString("Complete examples covering every key valid in each layer, generated from the schema (placeholder values — replace with real ones).\n\n")
+	b.WriteString(
+		"Complete examples covering every key valid in each layer, generated from the schema (placeholder values — replace with real ones).\n\n",
+	)
 
 	b.WriteString("### User-global `~/.config/treeman/config.yaml`\n\n")
 	b.WriteString("```yaml\n")
@@ -197,7 +205,7 @@ func scalar(v string) *yaml.Node { return &yaml.Node{Kind: yaml.ScalarNode, Valu
 // firstLine returns the first non-empty line of a doc comment, trimmed,
 // for use as a one-line YAML comment.
 func firstLine(s string) string {
-	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(s), "\n") {
 		if t := strings.TrimSpace(line); t != "" {
 			return t
 		}

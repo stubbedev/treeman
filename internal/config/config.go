@@ -1821,10 +1821,11 @@ func checkScopeBytes(b []byte, label, layer string) error {
 	if len(bytes.TrimSpace(b)) == 0 {
 		return nil
 	}
+	// Unparseable / non-mapping bodies pass — the merge step surfaces
+	// real parse errors with its own wording. A parse failure leaves
+	// root.Content empty, so the mapping guard below catches it too.
 	var root yaml.Node
-	if err := yaml.Unmarshal(b, &root); err != nil {
-		return nil
-	}
+	_ = yaml.Unmarshal(b, &root)
 	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
 		return nil
 	}
@@ -2091,7 +2092,7 @@ func GlobalConfigPath() (string, bool) { return globalConfigPath() }
 // schema generator to emit global- vs repo-scoped variants and by
 // `config init` to decide which keys to scaffold.
 func FieldScopes() map[string]string {
-	t := reflect.TypeOf(Config{})
+	t := reflect.TypeFor[Config]()
 	out := make(map[string]string, t.NumField())
 	for i := range t.NumField() {
 		f := t.Field(i)

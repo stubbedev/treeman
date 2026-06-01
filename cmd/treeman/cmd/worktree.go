@@ -834,7 +834,10 @@ func wtGo() *cli.Command {
 		ArgsUsage: "<name-or-branch>",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "create", Usage: "create the worktree if nothing matches"},
-			&cli.BoolFlag{Name: "checkout", Usage: "git checkout the branch (auto-routes main vs new worktree) instead of pure path resolution"},
+			&cli.BoolFlag{
+				Name:  "checkout",
+				Usage: "git checkout the branch (auto-routes main vs new worktree) instead of pure path resolution",
+			},
 			&cli.StringFlag{Name: "from", Usage: "base branch (with --create/--checkout)"},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "no-fetch", Usage: "skip the pre-checkout `git fetch origin <base>`"},
@@ -876,7 +879,11 @@ func wtGo() *cli.Command {
 			}
 
 			if !c.Bool("create") {
-				return fmt.Errorf("no worktree matches %q (try `treeman wt go %s --create`, or --checkout to switch branches)", target, target)
+				return fmt.Errorf(
+					"no worktree matches %q (try `treeman wt go %s --create`, or --checkout to switch branches)",
+					target,
+					target,
+				)
 			}
 
 			// --create → spawn the worktree, then print its path.

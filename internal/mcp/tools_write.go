@@ -1024,7 +1024,7 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 
 type configRestoreIn struct {
 	Repo       string `json:"repo,omitempty"`
-	Generation int64  `json:"generation" jsonschema:"the generation number to restore (from config_history)"`
+	Generation int64  `json:"generation"     jsonschema:"the generation number to restore (from config_history)"`
 }
 type configRestoreOut struct {
 	Path     string `json:"path"`
@@ -1032,7 +1032,11 @@ type configRestoreOut struct {
 	Bytes    int    `json:"bytes"`
 }
 
-func configRestoreTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configRestoreIn) (*mcpsdk.CallToolResult, configRestoreOut, error) {
+func configRestoreTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in configRestoreIn,
+) (*mcpsdk.CallToolResult, configRestoreOut, error) {
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		return nil, configRestoreOut{}, err
