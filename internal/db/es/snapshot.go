@@ -62,12 +62,34 @@ func (d *Driver) IndexExists(ctx context.Context, name string) (bool, error) {
 // `index.blocks.write: true` on each source index, clone, then
 // flip back to false so the app keeps working.
 func (d *Driver) SnapshotCreate(ctx context.Context, sourcePrefix, templatePrefix string) error {
+	return d.SnapshotCreateFiltered(ctx, sourcePrefix, templatePrefix, nil)
+}
+
+// SnapshotCreateFiltered is SnapshotCreate with an optional `keep`
+// predicate restricting which SOURCE indices are captured: only indices
+// for which keep(name) returns true are cloned into the template prefix.
+// A nil predicate captures everything under sourcePrefix (classic
+// behaviour). The branch_scoped swap uses this so a bare main-worktree
+// active prefix — which is also a prefix of every sibling worktree's
+// `<prefix>_<slug>_*` — does not pull sibling-owned indices into this
+// branch's durable copy. The template (durable) prefix is hash-derived
+// and never collides, so its stale-cleanup drop stays unfiltered.
+func (d *Driver) SnapshotCreateFiltered(ctx context.Context, sourcePrefix, templatePrefix string, keep func(string) bool) error {
 	if sourcePrefix == templatePrefix {
 		return errors.New("snapshot create: source and template prefixes must differ")
 	}
 	srcIndices, err := d.ListMatching(ctx, sourcePrefix)
 	if err != nil {
 		return fmt.Errorf("list source indices %s*: %w", sourcePrefix, err)
+	}
+	if keep != nil {
+		kept := make([]string, 0, len(srcIndices))
+		for _, n := range srcIndices {
+			if keep(n) {
+				kept = append(kept, n)
+			}
+		}
+		srcIndices = kept
 	}
 	// Drop any pre-existing template indices so the clone has clean ground.
 	if _, err := d.DropMatching(ctx, templatePrefix); err != nil {
@@ -85,6 +107,18 @@ func (d *Driver) SnapshotCreate(ctx context.Context, sourcePrefix, templatePrefi
 // matching index under `targetPrefix`. Used by the parallel fanout
 // to spin up paratest-style worker prefixes.
 func (d *Driver) SnapshotRestore(ctx context.Context, templatePrefix, targetPrefix string) error {
+	return d.SnapshotRestoreFiltered(ctx, templatePrefix, targetPrefix, nil)
+}
+
+// SnapshotRestoreFiltered is SnapshotRestore with an optional `keep`
+// predicate restricting which TARGET indices the stale-target cleanup
+// may drop: only target indices for which keep(name) returns true are
+// dropped before the clone. A nil predicate drops everything under
+// targetPrefix (classic behaviour). The branch_scoped swap uses this so
+// restoring into a bare main-worktree active prefix does not wipe sibling
+// worktrees' `<prefix>_<slug>_*` indices. The template (durable) source
+// is hash-derived and never collides, so its listing stays unfiltered.
+func (d *Driver) SnapshotRestoreFiltered(ctx context.Context, templatePrefix, targetPrefix string, keep func(string) bool) error {
 	if templatePrefix == targetPrefix {
 		return errors.New("snapshot restore: template and target prefixes must differ")
 	}
@@ -92,7 +126,7 @@ func (d *Driver) SnapshotRestore(ctx context.Context, templatePrefix, targetPref
 	if err != nil {
 		return fmt.Errorf("list template indices %s*: %w", templatePrefix, err)
 	}
-	if _, err := d.DropMatching(ctx, targetPrefix); err != nil {
+	if _, err := d.DropMatchingFiltered(ctx, targetPrefix, keep); err != nil {
 		return fmt.Errorf("drop stale target %s*: %w", targetPrefix, err)
 	}
 	if len(tplIndices) == 0 {

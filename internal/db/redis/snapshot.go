@@ -56,10 +56,31 @@ func globEscape(s string) string {
 // `DatabaseExists`. SCAN with COUNT=1 is the cheapest probe — it
 // stops as soon as the first matching key shows up.
 func (d *Driver) PrefixExists(ctx context.Context, prefix string) (bool, error) {
+	return d.PrefixExistsFiltered(ctx, prefix, nil)
+}
+
+// PrefixExistsFiltered is PrefixExists with an optional `keep` predicate:
+// only keys for which keep(key) returns true count toward existence. A
+// nil predicate considers every key under `prefix` (classic behaviour).
+// The branch_scoped swap uses this so a bare main-worktree active prefix
+// — which is also a prefix of every sibling worktree's `<prefix>_<slug>_*`
+// keys — does not report "exists" purely because a sibling has data.
+//
+// With a filter the cheap COUNT=1 early-out no longer applies: a matching
+// key might be sibling-owned, so the scan must continue until it finds a
+// kept key or exhausts the cursor. Use a larger COUNT to keep round-trips
+// down on the common case where the worktree owns most keys.
+func (d *Driver) PrefixExistsFiltered(ctx context.Context, prefix string, keep func(string) bool) (bool, error) {
 	c := d.client()
-	iter := c.Scan(ctx, 0, globEscape(prefix)+"*", 1).Iterator()
-	if iter.Next(ctx) {
-		return true, nil
+	count := int64(1)
+	if keep != nil {
+		count = 100
+	}
+	iter := c.Scan(ctx, 0, globEscape(prefix)+"*", count).Iterator()
+	for iter.Next(ctx) {
+		if keep == nil || keep(iter.Val()) {
+			return true, nil
+		}
 	}
 	return false, iter.Err()
 }
@@ -126,25 +147,49 @@ func (d *Driver) DropPrefixFiltered(ctx context.Context, prefix string, keep fun
 // pre-existing keys under templatePrefix first so the clone has
 // clean ground.
 func (d *Driver) SnapshotCreate(ctx context.Context, sourcePrefix, templatePrefix string) error {
+	return d.SnapshotCreateFiltered(ctx, sourcePrefix, templatePrefix, nil)
+}
+
+// SnapshotCreateFiltered is SnapshotCreate with an optional `keep`
+// predicate restricting which SOURCE keys are captured: only keys for
+// which keep(key) returns true are copied into the template prefix. A nil
+// predicate captures everything under sourcePrefix (classic behaviour).
+// The branch_scoped swap uses this so a bare main-worktree active prefix
+// does not pull sibling-owned keys into this branch's durable copy. The
+// template (durable) prefix is hash-derived and never collides, so its
+// stale-cleanup drop stays unfiltered.
+func (d *Driver) SnapshotCreateFiltered(ctx context.Context, sourcePrefix, templatePrefix string, keep func(string) bool) error {
 	if sourcePrefix == templatePrefix {
 		return errors.New("snapshot create: source and template prefixes must differ")
 	}
 	if _, err := d.DropPrefix(ctx, templatePrefix); err != nil {
 		return fmt.Errorf("drop stale template %s*: %w", templatePrefix, err)
 	}
-	return d.copyByPrefix(ctx, sourcePrefix, templatePrefix)
+	return d.copyByPrefix(ctx, sourcePrefix, templatePrefix, keep)
 }
 
 // SnapshotRestore copies template → target. Used by the fanout path
 // so paratest workers each get an isolated copy.
 func (d *Driver) SnapshotRestore(ctx context.Context, templatePrefix, targetPrefix string) error {
+	return d.SnapshotRestoreFiltered(ctx, templatePrefix, targetPrefix, nil)
+}
+
+// SnapshotRestoreFiltered is SnapshotRestore with an optional `keep`
+// predicate restricting which TARGET keys the stale-target cleanup may
+// drop: only target keys for which keep(key) returns true are dropped
+// before the copy. A nil predicate drops everything under targetPrefix
+// (classic behaviour). The branch_scoped swap uses this so restoring into
+// a bare main-worktree active prefix does not wipe sibling worktrees'
+// `<prefix>_<slug>_*` keys. The template (durable) source is hash-derived
+// and never collides, so the copy itself stays unfiltered.
+func (d *Driver) SnapshotRestoreFiltered(ctx context.Context, templatePrefix, targetPrefix string, keep func(string) bool) error {
 	if templatePrefix == targetPrefix {
 		return errors.New("snapshot restore: template and target prefixes must differ")
 	}
-	if _, err := d.DropPrefix(ctx, targetPrefix); err != nil {
+	if _, err := d.DropPrefixFiltered(ctx, targetPrefix, keep); err != nil {
 		return fmt.Errorf("drop stale target %s*: %w", targetPrefix, err)
 	}
-	return d.copyByPrefix(ctx, templatePrefix, targetPrefix)
+	return d.copyByPrefix(ctx, templatePrefix, targetPrefix, nil)
 }
 
 // DropSnapshot deletes every key under the named template prefix.
@@ -166,14 +211,17 @@ func (d *Driver) DropSnapshot(ctx context.Context, templatePrefix string) error 
 // Version detection is lazy + cached on the Driver via sync.Once.
 // On detection failure we assume legacy + use DUMP+RESTORE so a
 // transient INFO error doesn't surface as "ERR unknown command".
-func (d *Driver) copyByPrefix(ctx context.Context, srcPrefix, dstPrefix string) error {
+// `keep`, when non-nil, restricts the copy to source keys for which
+// keep(key) returns true — used by the branch_scoped capture so a bare
+// main-worktree active prefix does not copy sibling-owned keys.
+func (d *Driver) copyByPrefix(ctx context.Context, srcPrefix, dstPrefix string, keep func(string) bool) error {
 	if srcPrefix == "" {
 		return errors.New("redis: refusing to copy from empty prefix")
 	}
 	if d.supportsCopy(ctx) {
-		return d.copyByPrefixCOPY(ctx, srcPrefix, dstPrefix)
+		return d.copyByPrefixCOPY(ctx, srcPrefix, dstPrefix, keep)
 	}
-	return d.copyByPrefixDumpRestore(ctx, srcPrefix, dstPrefix)
+	return d.copyByPrefixDumpRestore(ctx, srcPrefix, dstPrefix, keep)
 }
 
 // supportsCopy detects (once) whether the connected Redis is 6.2+
@@ -222,7 +270,7 @@ func versionAtLeast(v string, wantMajor, wantMinor int) bool {
 }
 
 // copyByPrefixCOPY is the Redis 6.2+ fast path.
-func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix string) error {
+func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix string, keep func(string) bool) error {
 	c := d.client()
 
 	iter := c.Scan(ctx, 0, globEscape(srcPrefix)+"*", 1000).Iterator()
@@ -240,6 +288,9 @@ func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix stri
 	}
 	for iter.Next(ctx) {
 		src := iter.Val()
+		if keep != nil && !keep(src) {
+			continue
+		}
 		dst := dstPrefix + strings.TrimPrefix(src, srcPrefix)
 		// Plain `COPY src dst REPLACE` — no `DB n` option. treeman only
 		// ever operates in logical DB 0 (DBIndex), so the cross-DB
@@ -275,7 +326,7 @@ func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix stri
 // DEL or TTL expiry) surface as `redis.Nil` from DUMP and are
 // silently skipped — the SCAN cursor only guarantees a snapshot of
 // keys *eventually* visited, not that every visited key still exists.
-func (d *Driver) copyByPrefixDumpRestore(ctx context.Context, srcPrefix, dstPrefix string) error {
+func (d *Driver) copyByPrefixDumpRestore(ctx context.Context, srcPrefix, dstPrefix string, keep func(string) bool) error {
 	c := d.client()
 
 	iter := c.Scan(ctx, 0, globEscape(srcPrefix)+"*", 1000).Iterator()
@@ -329,7 +380,11 @@ func (d *Driver) copyByPrefixDumpRestore(ctx context.Context, srcPrefix, dstPref
 	}
 
 	for iter.Next(ctx) {
-		batch = append(batch, iter.Val())
+		k := iter.Val()
+		if keep != nil && !keep(k) {
+			continue
+		}
+		batch = append(batch, k)
 		if len(batch) >= 100 {
 			if err := flush(); err != nil {
 				return err

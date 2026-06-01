@@ -16,6 +16,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/yamlpatch"
@@ -36,6 +37,87 @@ func WriteYAML(cwd string, force bool) (path string, created bool, body string, 
 		return target, false, "", err
 	}
 	return target, !exists, body, nil
+}
+
+// WriteGlobalYAML scaffolds the user-global `config.yaml` at
+// config.GlobalConfigPath(). Returns the target path, whether a new
+// file was created, and the body. Refuses to clobber an existing file
+// unless force is set. The parent dir is created if missing.
+func WriteGlobalYAML(force bool) (path string, created bool, body string, err error) {
+	target, ok := config.GlobalConfigPath()
+	if !ok {
+		return "", false, "", fmt.Errorf("cannot resolve global config path (no home dir)")
+	}
+	_, statErr := os.Stat(target)
+	exists := statErr == nil
+	if exists && !force {
+		return target, false, "", fmt.Errorf("%s already exists (pass force to overwrite)", target)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return target, false, "", err
+	}
+	body = RenderGlobalTemplate()
+	if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+		return target, false, "", err
+	}
+	return target, !exists, body, nil
+}
+
+// RenderGlobalTemplate returns a commented `~/.config/treeman/config.yaml`
+// scaffold covering only the keys that make sense machine-wide (daemon,
+// snapshots, logs, auto_fetch, notifications). Repo-only blocks
+// (databases, patches, hooks, …) are intentionally omitted — those
+// belong in a per-repo `.treeman.yaml`. Pure function; no disk writes.
+//
+// The modeline points at the global schema file installed alongside it
+// (config.GlobalConfigPath's sibling) so editors validate the file
+// against the global-scoped schema, flagging repo-only keys.
+func RenderGlobalTemplate() string {
+	root := mapNode()
+	root.HeadComment = "yaml-language-server: $schema=" + schema.URL +
+		"\n\ntreeman user-global config — machine-wide defaults shared by every repo.\n" +
+		"Repo-specific blocks (databases, patches, hooks, main_worktree, env_sources)\n" +
+		"belong in each project's .treeman.yaml, not here."
+
+	// daemon: process-level settings (global-only). Plain scalars render
+	// unquoted, so `info`/`30`/`true` parse as the right YAML types.
+	daemon := mapNode("log_level", scalar("info"))
+	mapKeyNode(daemon, "log_level").LineComment = "debug | info | warn | error"
+	mapSet(root, "daemon", daemon)
+
+	// snapshots: machine-wide template cache + retention (global-only).
+	snapshots := mapNode(
+		"max_age_days", scalar("30"),
+		"max_total_gb", scalar("20"),
+	)
+	mapKeyNode(snapshots, "max_age_days").HeadComment = "post-migration template cache eviction policy"
+	mapSet(root, "snapshots", snapshots)
+
+	// logs: daemon prune of the shared event log (global-only).
+	logs := mapNode("keep_days", scalar("14"))
+	mapKeyNode(logs, "keep_days").LineComment = "0 keeps forever"
+	mapSet(root, "logs", logs)
+
+	// auto_fetch: daemon periodic git fetch cadence (default; repos may
+	// opt out with `auto_fetch: {enabled: false}`).
+	af := mapNode(
+		"enabled", scalar("true"),
+		"interval_minutes", scalar("15"),
+	)
+	mapSet(root, "auto_fetch", af)
+
+	// notifications: desktop banners on lifecycle changes (global-only,
+	// off by default).
+	notif := mapNode("enabled", scalar("false"))
+	mapKeyNode(notif, "enabled").HeadComment = "desktop notifications on worktree lifecycle changes"
+	mapSet(root, "notifications", notif)
+
+	doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
+	out, err := yamlpatch.Marshal(doc)
+	if err != nil {
+		return "daemon:\n  log_level: info\n"
+	}
+	return string(out)
 }
 
 // RenderTemplate inspects `cwd` and returns a fully-declarative

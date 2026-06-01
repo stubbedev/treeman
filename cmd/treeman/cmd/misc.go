@@ -671,10 +671,28 @@ func SchemaCmd() *cli.Command {
 		Usage: "JSON schema helpers",
 		Commands: []*cli.Command{
 			{
-				Name:  "dump",
-				Flags: []cli.Flag{&cli.StringFlag{Name: "out"}},
+				Name: "dump",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "out"},
+					&cli.StringFlag{
+						Name:  "scope",
+						Value: "full",
+						Usage: "full (default, every key) | global (~/.config/treeman/config.yaml keys) | repo (.treeman.yaml keys)",
+					},
+				},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					b, err := schema.Render()
+					var sc schema.Scope
+					switch c.String("scope") {
+					case "", "full":
+						sc = schema.ScopeFull
+					case "global":
+						sc = schema.ScopeGlobal
+					case "repo":
+						sc = schema.ScopeRepo
+					default:
+						return fmt.Errorf("invalid --scope %q (want full|global|repo)", c.String("scope"))
+					}
+					b, err := schema.RenderScoped(sc)
 					if err != nil {
 						return err
 					}
@@ -1127,8 +1145,12 @@ func InitCmd() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "force"},
 			&cli.BoolFlag{Name: "json"},
+			&cli.BoolFlag{Name: "global", Usage: "scaffold the user-global ~/.config/treeman/config.yaml (machine-wide defaults) instead of a per-repo .treeman.yaml"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
+			if c.Bool("global") {
+				return initGlobalAction(c)
+			}
 			cwd, _ := os.Getwd()
 			detected := framework.DefaultRegistry().DetectAll(cwd)
 			target, created, body, err := InitTreemanYAML(cwd, c.Bool("force"))
@@ -1174,6 +1196,38 @@ func InitCmd() *cli.Command {
 // should depend on internal/initgen directly.
 func InitTreemanYAML(cwd string, force bool) (path string, created bool, body string, err error) {
 	return initgen.WriteYAML(cwd, force)
+}
+
+// initGlobalAction scaffolds the user-global config.yaml and installs
+// the matching global-scoped JSON Schema beside it so editors validate
+// against the narrower key set (repo-only keys flagged as unknown).
+func initGlobalAction(c *cli.Command) error {
+	target, created, body, err := initgen.WriteGlobalYAML(c.Bool("force"))
+	if err != nil {
+		return err
+	}
+	// Install the global-scoped schema next to the config and point its
+	// modeline at it. Install resolves the modeline file from the target,
+	// so for TargetGlobal it edits the global config we just wrote.
+	schemaPath, _, schemaErr := schema.Install("", schema.TargetGlobal)
+	if c.Bool("json") {
+		out := map[string]any{
+			"path":    target,
+			"created": created,
+			"bytes":   len(body),
+			"scope":   "global",
+		}
+		if schemaErr == nil {
+			out["schema"] = schemaPath
+		}
+		return jsonStream(out)
+	}
+	PrintOK("wrote %s", target)
+	if schemaErr == nil {
+		PrintHint("installed global schema:          %s", schemaPath)
+	}
+	PrintHint("machine-wide defaults only — repo-specific blocks go in each .treeman.yaml")
+	return nil
 }
 
 // detectBranchOfWorktree reads .git/HEAD (handles gitlink files for

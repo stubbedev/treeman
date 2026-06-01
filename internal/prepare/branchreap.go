@@ -53,7 +53,9 @@ func ReapBranchDurables(ctx context.Context, cfg *config.Config, st *store.Store
 		if !ok {
 			continue
 		}
-		eng, closeEng, err := connectBranchEngine(ctx, cfg, d.Engine)
+		// Reap only touches hash-derived durable namespaces, which never
+		// collide with a sibling's prefix — no sibling filter needed.
+		eng, closeEng, err := connectBranchEngine(ctx, cfg, d.Engine, nil)
 		if err != nil {
 			slog.Warn("reap durables: connect engine", "engine", d.Engine, "err", err)
 			closeEng()

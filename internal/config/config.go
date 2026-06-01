@@ -14,8 +14,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/invopop/jsonschema"
 	orderedmap "github.com/pb33f/ordered-map/v2"
@@ -27,20 +29,20 @@ import (
 type Config struct {
 	// Daemon process settings: socket path, log level, log database
 	// location. Typically lives in the user-global config.
-	Daemon DaemonConfig `yaml:"daemon,omitempty"`
+	Daemon DaemonConfig `yaml:"daemon,omitempty" scope:"global"`
 
 	// Connection blocks per supported engine (MySQL, Postgres,
 	// MongoDB, Redis, Elasticsearch). Treeman dials these to create
 	// per-worktree clone databases, run migrations.
-	Connections ConnectionsConfig `yaml:"connections,omitempty"`
+	Connections ConnectionsConfig `yaml:"connections,omitempty" scope:"both"`
 
 	// Snapshot cache settings: where post-migration template
 	// snapshots are cached on disk, plus retention/eviction policy.
-	Snapshots SnapshotsConfig `yaml:"snapshots,omitempty"`
+	Snapshots SnapshotsConfig `yaml:"snapshots,omitempty" scope:"global"`
 
 	// Worktree creation/deletion behaviour: root path, symlink mirrors,
 	// async vs sync semantics for hooks.
-	Worktrees WorktreesConfig `yaml:"worktrees,omitempty"`
+	Worktrees WorktreesConfig `yaml:"worktrees,omitempty" scope:"both"`
 
 	// EnvSources is the ordered list of `.env*` files the credential
 	// resolver consults when looking up DB passwords and other
@@ -49,7 +51,7 @@ type Config struct {
 	//   .env → .env.local → .env.test → .env.testing →
 	//   .env.test.local → .env.testing.local
 	// Per-worktree rewriting of these files lives in `patches:`.
-	EnvSources []string `yaml:"env_sources,omitempty"`
+	EnvSources []string `yaml:"env_sources,omitempty" scope:"repo"`
 
 	// Files to rewrite inside each worktree with per-worktree values
 	// (slug-substituted DB names, cache prefixes, etc.). Supports
@@ -64,40 +66,40 @@ type Config struct {
 	// Re-applied on every `treeman wt finalize` so a branch switch
 	// inside an existing worktree re-evaluates each patch against
 	// the new HEAD's slug.
-	Patches []Patch `yaml:"patches,omitempty"`
+	Patches []Patch `yaml:"patches,omitempty" scope:"repo"`
 
 	// One entry per database the project owns. Each entry pairs an
 	// engine with a dump path, migration source, test-clone fanout,
 	// and optional namespace template.
-	Databases []DatabaseConfig `yaml:"databases,omitempty"`
+	Databases []DatabaseConfig `yaml:"databases,omitempty" scope:"repo"`
 
 	// Lifecycle hooks fired around worktree create/delete. Two phases:
 	// `setup` (after create) and `teardown` (before delete). Run
 	// async by default; `worktrees.async_create` / `async_delete`
 	// control whether the CLI blocks on completion.
-	Hooks HooksConfig `yaml:"hooks,omitempty"`
+	Hooks HooksConfig `yaml:"hooks,omitempty" scope:"repo"`
 
 	// DebounceMs is the file-watcher debounce window in
 	// milliseconds. Coalesces editor save bursts into one re-prep
 	// dispatch. Default 500.
-	DebounceMs uint64 `yaml:"debounce_ms,omitempty"`
+	DebounceMs uint64 `yaml:"debounce_ms,omitempty" scope:"both"`
 
 	// User-defined migration frameworks keyed by name. Use this when
 	// the built-in framework presets don't cover your tool — declare
 	// the markers, migration dirs, file pattern, and hash policy
 	// explicitly.
-	Frameworks map[string]CustomFramework `yaml:"frameworks,omitempty"`
+	Frameworks map[string]CustomFramework `yaml:"frameworks,omitempty" scope:"both"`
 
 	// Logs retention. Daemon-side prune drops rows older than
 	// `keep_days` from the events, hook_runs, and hook_log_chunks
 	// tables on a fixed interval. Set 0 to keep forever (no prune).
-	Logs LogsConfig `yaml:"logs,omitempty"`
+	Logs LogsConfig `yaml:"logs,omitempty" scope:"global"`
 
 	// AutoFetch policy. Daemon-side periodic `git fetch --all --prune`
 	// per registered repo, followed by a `git merge --ff-only @{u}`
 	// per active worktree. Skips dirty trees, non-ff branches, and
 	// upstreamless branches. Enabled by default at a 15-minute cadence.
-	AutoFetch AutoFetchConfig `yaml:"auto_fetch,omitempty"`
+	AutoFetch AutoFetchConfig `yaml:"auto_fetch,omitempty" scope:"both"`
 
 	// MainWorktree opts the repo's main checkout (repo root) into the
 	// same watcher-driven prepare/migrate/teardown lifecycle that
@@ -105,7 +107,7 @@ type Config struct {
 	// — flipping it on for an existing repo will start creating
 	// per-branch databases when the user switches branches at the
 	// repo root.
-	MainWorktree MainWorktreeConfig `yaml:"main_worktree,omitempty"`
+	MainWorktree MainWorktreeConfig `yaml:"main_worktree,omitempty" scope:"repo"`
 
 	// Ports declares per-worktree port slots. Each entry is a named
 	// slot with a port range; treeman allocates a free port per slot
@@ -117,19 +119,19 @@ type Config struct {
 	// Use slot names that match the role they fill in your app (e.g.
 	// `octane`, `webpack`, `reverb`) — the name shows up in every
 	// `{port_<name>}` reference and in `wt show` output.
-	Ports map[string]PortSpec `yaml:"ports,omitempty"`
+	Ports map[string]PortSpec `yaml:"ports,omitempty" scope:"both"`
 
 	// Status configures the `treeman status` widget output (icons,
 	// labels, hover lines, custom bar formats). Lives in the global
 	// config since the widget aggregates worktrees across every repo.
-	Status StatusConfig `yaml:"status,omitempty"`
+	Status StatusConfig `yaml:"status,omitempty" scope:"global"`
 
 	// Notifications opts into desktop notifications (notify-send on
 	// Linux, the native banner via osascript on macOS) when a worktree
 	// changes lifecycle state. Off by default. Lives in the global
 	// config since the daemon that emits them is a single cross-repo
 	// process.
-	Notifications NotificationsConfig `yaml:"notifications,omitempty"`
+	Notifications NotificationsConfig `yaml:"notifications,omitempty" scope:"global"`
 }
 
 // StatusConfig configures `treeman status` — the bar/waybar widget
@@ -1969,4 +1971,34 @@ func globalConfigPath() (string, bool) {
 		xdg = filepath.Join(home, ".config")
 	}
 	return filepath.Join(xdg, "treeman", "config.yaml"), true
+}
+
+// GlobalConfigPath is the exported accessor for the user-global config
+// location (`$XDG_CONFIG_HOME/treeman/config.yaml`). Returns ok=false
+// only when the home dir can't be resolved. Used by `config init
+// --global` to know where to scaffold.
+func GlobalConfigPath() (string, bool) { return globalConfigPath() }
+
+// FieldScopes maps each top-level `Config` yaml key to its declared
+// `scope:` struct tag — "global", "repo", or "both". A field with no
+// scope tag defaults to "both" (it then appears in every scoped schema,
+// so a newly-added field is never silently dropped). Consumed by the
+// schema generator to emit global- vs repo-scoped variants and by
+// `config init` to decide which keys to scaffold.
+func FieldScopes() map[string]string {
+	t := reflect.TypeOf(Config{})
+	out := make(map[string]string, t.NumField())
+	for i := range t.NumField() {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		scope := f.Tag.Get("scope")
+		if scope == "" {
+			scope = "both"
+		}
+		out[name] = scope
+	}
+	return out
 }

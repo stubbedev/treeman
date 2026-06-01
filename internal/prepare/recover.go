@@ -286,7 +286,7 @@ func recoverBranchScoped(
 	if err != nil {
 		return err
 	}
-	eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine)
+	eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine, siblingSlugs(ctx, st, repoID, worktreeID))
 	if cerr != nil {
 		return cerr
 	}

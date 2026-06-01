@@ -199,6 +199,143 @@ func TestWorktreeSwapElasticsearch(t *testing.T) {
 	esAssertVals(t, prefix, map[string]string{"a": "develop", "b": "feature"}) // resumed
 }
 
+// ─── TestDbResetSparesSiblingPrefixElasticsearch ─────────────────────
+//
+// Prefix-engine analogue of TestDbResetDropsActiveExactNotPrefixMySQL.
+// On the main worktree the branch_scoped active prefix is bare
+// (overlay-resolved, slug-free), so it is a prefix of every linked
+// worktree's `<prefix>_<slug>_*` indices. `db reset` must drop only what
+// THIS worktree owns and spare the sibling's. Name-scoped engines solve
+// this with an EXACT drop; ES has no exact drop, so the swap layer
+// excludes any index carrying a sibling slug token. Without that filter
+// DropMatching(bare) wipes the sibling's live data — the ES twin of the
+// mysql exact-drop regression.
+func TestDbResetSparesSiblingPrefixElasticsearch(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitES(t)
+	ctx := context.Background()
+
+	const activePrefix = "bsexactes_"          // bare main-wt active prefix
+	const siblingPrefix = "bsexactes_feature_" // a linked wt's prefix — nests under the bare one
+	const mainIndex = activePrefix + "items"
+	const siblingIndex = siblingPrefix + "items"
+
+	dropESIndex(t, mainIndex)
+	dropESIndex(t, siblingIndex)
+	t.Cleanup(func() { dropESIndex(t, mainIndex); dropESIndex(t, siblingIndex) })
+
+	esIndex(t, activePrefix, "1", "main")     // → mainIndex
+	esIndex(t, siblingPrefix, "1", "feature") // → siblingIndex
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Elasticsearch: &config.EsConn{URL: esURL},
+		},
+		// Bare key_prefix (no {slug}) models the main worktree's
+		// overlay-resolved active prefix.
+		Databases: []config.DatabaseConfig{{
+			Engine:       "elasticsearch",
+			KeyPrefix:    activePrefix,
+			BranchScoped: true,
+		}},
+	}
+
+	st := openStore(t)
+	repoRoot := t.TempDir()
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Main worktree (runs the reset) + a sibling whose slug is "feature";
+	// the sibling slug is what the swap layer uses to spare its indices.
+	mainWtID, err := st.EnsureWorktree(ctx, repoID, repoRoot, "main", "develop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureWorktree(ctx, repoID, filepath.Join(repoRoot, "feature"), "feature", "feature"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := prepare.ResetBranchScoped(ctx, cfg, repoRoot, repoID, mainWtID, st, ""); err != nil {
+		t.Fatalf("ResetBranchScoped: %v", err)
+	}
+
+	if n := esCount(t, mainIndex+"*"); n != 0 {
+		t.Fatalf("reset should have dropped the main worktree's own index %q, found %d docs", mainIndex, n)
+	}
+	if n := esCount(t, siblingIndex+"*"); n != 1 {
+		t.Fatalf("reset wiped sibling index %q via a bare-prefix match — sibling-isolation regression (found %d docs, want 1)", siblingIndex, n)
+	}
+}
+
+// ─── TestDbResetSparesSiblingPrefixRedis ─────────────────────────────
+//
+// Redis twin of TestDbResetSparesSiblingPrefixElasticsearch (and the
+// prefix-engine analogue of TestDbResetDropsActiveExactNotPrefixMySQL).
+// On the main worktree the branch_scoped active prefix is bare, so it is
+// a prefix of every linked worktree's `<prefix>_<slug>_*` keys. `db reset`
+// must drop only the keys THIS worktree owns and spare the sibling's;
+// without the sibling-exclusion filter DropPrefix(bare) wipes the
+// sibling's live data.
+func TestDbResetSparesSiblingPrefixRedis(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitRedis(t)
+	ctx := context.Background()
+
+	// `:`-delimited prefix (idiomatic redis) exercises the delimiter-
+	// agnostic sibling-token boundary — the bare prefix still nests the
+	// sibling's `<prefix>:<slug>:*` keys.
+	const activePrefix = "bsexactrd:"          // bare main-wt active prefix
+	const siblingPrefix = "bsexactrd:feature:" // a linked wt's prefix — nests under the bare one
+	mainKey := activePrefix + "a"
+	siblingKey := siblingPrefix + "a"
+
+	c := redisClient(t)
+	_ = c.Del(ctx, mainKey, siblingKey).Err()
+	t.Cleanup(func() { _ = c.Del(context.Background(), mainKey, siblingKey).Err() })
+
+	rset(t, mainKey, "main")
+	rset(t, siblingKey, "feature")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Redis: &config.RedisConn{URL: "redis://" + redisAddr},
+		},
+		// Bare key_prefix (no {slug}) models the main worktree's
+		// overlay-resolved active prefix.
+		Databases: []config.DatabaseConfig{{
+			Engine:       "redis",
+			KeyPrefix:    activePrefix,
+			BranchScoped: true,
+		}},
+	}
+
+	st := openStore(t)
+	repoRoot := t.TempDir()
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainWtID, err := st.EnsureWorktree(ctx, repoID, repoRoot, "main", "develop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureWorktree(ctx, repoID, filepath.Join(repoRoot, "feature"), "feature", "feature"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := prepare.ResetBranchScoped(ctx, cfg, repoRoot, repoID, mainWtID, st, ""); err != nil {
+		t.Fatalf("ResetBranchScoped: %v", err)
+	}
+
+	if n, _ := c.Exists(ctx, mainKey).Result(); n != 0 {
+		t.Fatalf("reset should have dropped the main worktree's own key %q", mainKey)
+	}
+	if n, _ := c.Exists(ctx, siblingKey).Result(); n != 1 {
+		t.Fatalf("reset wiped sibling key %q via a bare-prefix match — sibling-isolation regression", siblingKey)
+	}
+}
+
 // ─── TestDbResetReseedsFromParentMySQL ───────────────────────────────
 //
 // The HIGH-severity regression, end-to-end against a real engine: after
@@ -824,6 +961,20 @@ func esIndex(t *testing.T, prefix, id, v string) {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("es index %s/%s: %s: %s", index, id, resp.Status, b)
 	}
+}
+
+// dropESIndex deletes one index by EXACT name. 200 (deleted) and 404
+// (already absent) are both fine — used for test pre-clean + cleanup.
+// Exact name avoids the wildcard-DELETE rejection ES enforces when
+// action.destructive_requires_name is on (the cluster default).
+func dropESIndex(t *testing.T, index string) {
+	t.Helper()
+	req, _ := http.NewRequest("DELETE", esURL+"/"+index, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("es delete %s: %v", index, err)
+	}
+	resp.Body.Close()
 }
 
 func esAssertVals(t *testing.T, prefix string, want map[string]string) {

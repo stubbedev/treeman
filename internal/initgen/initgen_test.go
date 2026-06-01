@@ -8,6 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/schema"
 )
 
@@ -19,6 +20,46 @@ func TestRenderTemplateContainsModeline(t *testing.T) {
 	}
 	if !strings.Contains(body, "worktrees:") {
 		t.Errorf("missing worktrees block:\n%s", body)
+	}
+}
+
+func TestRenderGlobalTemplateScopeAndParse(t *testing.T) {
+	body := RenderGlobalTemplate()
+
+	// Parses as a full config.Config (global keys are a valid subset).
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(body), &cfg); err != nil {
+		t.Fatalf("global template does not parse as config.Config: %v\n%s", err, body)
+	}
+
+	// Contains global-scoped blocks.
+	for _, k := range []string{"daemon:", "snapshots:", "logs:", "auto_fetch:", "notifications:"} {
+		if !strings.Contains(body, k) {
+			t.Errorf("global template missing %q:\n%s", k, body)
+		}
+	}
+	// Omits repo-only blocks.
+	for _, k := range []string{"databases:", "patches:", "hooks:", "main_worktree:", "env_sources:"} {
+		if strings.Contains(body, k) {
+			t.Errorf("global template should not contain repo-only %q:\n%s", k, body)
+		}
+	}
+	// Sanity: scalars parsed as their YAML types, not strings.
+	if cfg.Daemon.LogLevel != "info" {
+		t.Errorf("daemon.log_level = %q, want info", cfg.Daemon.LogLevel)
+	}
+	if cfg.AutoFetch.Enabled == nil || !*cfg.AutoFetch.Enabled {
+		t.Errorf("auto_fetch.enabled should parse as bool true")
+	}
+}
+
+func TestWriteGlobalYAMLRefusesOverwriteWithoutForce(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if _, created, _, err := WriteGlobalYAML(false); err != nil || !created {
+		t.Fatalf("first WriteGlobalYAML: created=%v err=%v", created, err)
+	}
+	if _, _, _, err := WriteGlobalYAML(false); err == nil {
+		t.Errorf("expected error overwriting existing global config without force")
 	}
 }
 

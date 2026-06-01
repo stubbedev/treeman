@@ -230,27 +230,37 @@ func (a mongoNS) Watermark(ctx context.Context, ns string) (string, error) {
 	return "", nil
 }
 
-type redisNS struct{ d *dbredis.Driver }
+// redisNS adapts the Redis driver. `keep` plays the same sibling-
+// exclusion role as esNS.keep (see its doc): on the main worktree the
+// bare, slug-free active prefix is a prefix of every linked worktree's
+// `<prefix>_<slug>_*` keys, so every op that enumerates or drops the
+// active prefix must spare sibling-owned keys. nil = keep everything. The
+// durable copy is hash-derived and never collides, so DropDurable stays
+// unfiltered.
+type redisNS struct {
+	d    *dbredis.Driver
+	keep func(string) bool
+}
 
 func (a redisNS) Exists(ctx context.Context, ns string) (bool, error) {
-	return a.d.PrefixExists(ctx, ns)
+	return a.d.PrefixExistsFiltered(ctx, ns, a.keep)
 }
 
 func (a redisNS) Capture(ctx context.Context, active, durable string) error {
-	return a.d.SnapshotCreate(ctx, active, durable)
+	return a.d.SnapshotCreateFiltered(ctx, active, durable, a.keep)
 }
 
 func (a redisNS) Restore(ctx context.Context, durable, active string) error {
-	return a.d.SnapshotRestore(ctx, durable, active)
+	return a.d.SnapshotRestoreFiltered(ctx, durable, active, a.keep)
 }
 
 func (a redisNS) Empty(ctx context.Context, active string) error {
-	_, err := a.d.DropPrefix(ctx, active)
+	_, err := a.d.DropPrefixFiltered(ctx, active, a.keep)
 	return err
 }
 
 func (a redisNS) Drop(ctx context.Context, ns string) error {
-	_, err := a.d.DropPrefix(ctx, ns)
+	_, err := a.d.DropPrefixFiltered(ctx, ns, a.keep)
 	return err
 }
 
@@ -264,28 +274,49 @@ func (a redisNS) Watermark(ctx context.Context, ns string) (string, error) {
 	return "", nil
 }
 
-type esNS struct{ d *dbes.Driver }
+// esNS adapts the Elasticsearch driver. `keep`, when non-nil, excludes
+// indices owned by a sibling worktree's slug from every operation that
+// enumerates or drops the active prefix. It is load-bearing on the main
+// worktree, whose branch_scoped active prefix is bare (slug-free) and so
+// is a prefix of every linked worktree's `<prefix>_<slug>_*` indices —
+// without the filter, an Empty/Drop/Restore at the repo root would wipe
+// sibling worktrees' live data and Exists would bleed into them. This is
+// the prefix-engine analogue of mysql/postgres EXACT-name scoping. The
+// durable copy is hash-derived and never collides, so DropDurable stays
+// unfiltered.
+type esNS struct {
+	d    *dbes.Driver
+	keep func(string) bool
+}
 
 func (a esNS) Exists(ctx context.Context, ns string) (bool, error) {
 	m, err := a.d.ListMatching(ctx, ns)
-	return len(m) > 0, err
+	if err != nil {
+		return false, err
+	}
+	for _, n := range m {
+		if a.keep == nil || a.keep(n) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (a esNS) Capture(ctx context.Context, active, durable string) error {
-	return a.d.SnapshotCreate(ctx, active, durable)
+	return a.d.SnapshotCreateFiltered(ctx, active, durable, a.keep)
 }
 
 func (a esNS) Restore(ctx context.Context, durable, active string) error {
-	return a.d.SnapshotRestore(ctx, durable, active)
+	return a.d.SnapshotRestoreFiltered(ctx, durable, active, a.keep)
 }
 
 func (a esNS) Empty(ctx context.Context, active string) error {
-	_, err := a.d.DropMatching(ctx, active)
+	_, err := a.d.DropMatchingFiltered(ctx, active, a.keep)
 	return err
 }
 
 func (a esNS) Drop(ctx context.Context, ns string) error {
-	_, err := a.d.DropMatching(ctx, ns)
+	_, err := a.d.DropMatchingFiltered(ctx, ns, a.keep)
 	return err
 }
 
@@ -310,17 +341,35 @@ func branchScopeFor(eng string) (bsScope, string, bool) {
 	return scopeName, string(fam), true
 }
 
+// siblingKeep returns a predicate that excludes names owned by another
+// worktree's slug, or nil when there are no siblings (keep everything).
+// Prefix-scoped adapters use it so a bare main-worktree active prefix
+// never enumerates or drops sibling worktrees' `<prefix>_<slug>_*`
+// namespace. Name-scoped engines ignore it (they drop EXACT names).
+func siblingKeep(siblings []string) func(string) bool {
+	if len(siblings) == 0 {
+		return nil
+	}
+	return func(n string) bool { return !nameOwnedByOtherSlug(n, siblings) }
+}
+
 // connectBranchEngine dials `engine` and wraps it in a branchEngine.
 // Used by `treeman db reset`, which connects fresh (the prepare path
 // builds the adapter from its already-connected driver instead). The
 // returned close func releases the connection.
+//
+// `siblings` are the other worktrees' slugs; for prefix-scoped engines
+// they build the sibling-exclusion filter (see esNS.keep) so an op on a
+// bare main-worktree active prefix spares sibling-owned indices/keys.
+// Pass nil when the caller only touches hash-derived durable namespaces
+// (reap, status), which never collide.
 //
 // Unrecognised engines return (nil, no-op, nil) so iteration over a
 // mixed-engine config can skip non-participating entries quietly,
 // BUT log a warning so a typo'd engine name doesn't disappear
 // without a trace. Same observability principle as TeardownDatabases'
 // unknown-engine arm.
-func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*branchEngine, func(), error) {
+func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string, siblings []string) (*branchEngine, func(), error) {
 	scope, label, ok := branchScopeFor(eng)
 	if !ok {
 		slog.Warn("connect branch engine: skipping unrecognised engine",
@@ -363,7 +412,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		if err != nil {
 			return nil, func() {}, err
 		}
-		return &branchEngine{drv: redisNS{drv}, scope: scope, engine: label}, func() { _ = drv.Close() }, nil
+		return &branchEngine{drv: redisNS{d: drv, keep: siblingKeep(siblings)}, scope: scope, engine: label}, func() { _ = drv.Close() }, nil
 	case "elasticsearch":
 		if cfg.Connections.Elasticsearch == nil {
 			return nil, func() {}, errors.New("connections.elasticsearch not configured")
@@ -372,7 +421,7 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string) (*
 		if err != nil {
 			return nil, func() {}, err
 		}
-		return &branchEngine{drv: esNS{drv}, scope: scope, engine: label}, func() {}, nil
+		return &branchEngine{drv: esNS{d: drv, keep: siblingKeep(siblings)}, scope: scope, engine: label}, func() {}, nil
 	default:
 		return nil, func() {}, nil
 	}
@@ -804,7 +853,7 @@ func teardownBranchScoped(
 	if err != nil {
 		return err
 	}
-	eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine)
+	eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine, siblingSlugs(ctx, st, repoID, worktreeID))
 	if cerr != nil {
 		return cerr
 	}
@@ -865,7 +914,7 @@ func ResetBranchScoped(
 		if err != nil {
 			return fmt.Errorf("render active namespace for %s: %w", d.Engine, err)
 		}
-		eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine)
+		eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine, siblingSlugs(ctx, st, repoID, worktreeID))
 		if cerr != nil {
 			return cerr
 		}
@@ -953,7 +1002,10 @@ func BranchScopedStatus(
 		if err != nil {
 			return nil, fmt.Errorf("render active namespace for %s: %w", d.Engine, err)
 		}
-		eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine)
+		// Status only probes hash-derived durable namespaces (and reads the
+		// marker), never enumerates or drops the active prefix — so no
+		// sibling filter is needed.
+		eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine, nil)
 		if cerr != nil {
 			return nil, cerr
 		}

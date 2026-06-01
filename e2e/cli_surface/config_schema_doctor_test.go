@@ -270,6 +270,98 @@ func TestSchemaInstall(t *testing.T) {
 	}
 }
 
+// TestSchemaDumpScoped verifies the --scope flag emits the right
+// top-level key subset: global drops repo-only keys, repo drops
+// global-only keys.
+func TestSchemaDumpScoped(t *testing.T) {
+	e := newEnv(t)
+	repo := newGitRepo(t)
+
+	props := func(scope string) map[string]any {
+		res := e.run(t, repo, "schema", "dump", "--scope", scope)
+		if res.err != nil {
+			t.Fatalf("schema dump --scope %s: %v\nstderr:\n%s", scope, res.err, res.stderr)
+		}
+		var got struct {
+			Properties map[string]any `json:"properties"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(res.stdout)), &got); err != nil {
+			t.Fatalf("decode %s schema: %v", scope, err)
+		}
+		return got.Properties
+	}
+
+	g := props("global")
+	for _, k := range []string{"daemon", "snapshots", "logs"} {
+		if _, ok := g[k]; !ok {
+			t.Errorf("global schema missing %q", k)
+		}
+	}
+	for _, k := range []string{"databases", "patches", "hooks"} {
+		if _, ok := g[k]; ok {
+			t.Errorf("global schema should drop repo-only %q", k)
+		}
+	}
+
+	r := props("repo")
+	for _, k := range []string{"databases", "patches", "hooks"} {
+		if _, ok := r[k]; !ok {
+			t.Errorf("repo schema missing %q", k)
+		}
+	}
+	for _, k := range []string{"daemon", "snapshots", "logs"} {
+		if _, ok := r[k]; ok {
+			t.Errorf("repo schema should drop global-only %q", k)
+		}
+	}
+
+	if res := e.run(t, repo, "schema", "dump", "--scope", "bogus"); res.err == nil {
+		t.Errorf("expected error for invalid --scope, got stdout:\n%s", res.stdout)
+	}
+}
+
+// TestInitGlobal verifies `treeman init --global` scaffolds the
+// user-global config.yaml with only global-scoped keys, installs a
+// global-scoped schema, and refuses to clobber without --force.
+func TestInitGlobal(t *testing.T) {
+	e := newEnv(t)
+	// init --global is repo-independent; run from a throwaway cwd. The
+	// env block isolates XDG_CONFIG_HOME so we write into the temp tree.
+	cwd := newGitRepo(t)
+
+	res := e.run(t, cwd, "init", "--global")
+	if res.err != nil {
+		t.Fatalf("init --global: %v\nstderr:\n%s", res.err, res.stderr)
+	}
+	cfgPath := filepath.Join(e.configDir, "treeman", "config.yaml")
+	body, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("global config not written at %s: %v", cfgPath, err)
+	}
+	bs := string(body)
+	for _, k := range []string{"daemon:", "snapshots:", "logs:"} {
+		if !strings.Contains(bs, k) {
+			t.Errorf("global config missing %q:\n%s", k, bs)
+		}
+	}
+	for _, k := range []string{"databases:", "patches:", "hooks:"} {
+		if strings.Contains(bs, k) {
+			t.Errorf("global config should not contain repo-only %q:\n%s", k, bs)
+		}
+	}
+	if !strings.Contains(bs, "# yaml-language-server: $schema=") {
+		t.Errorf("global config missing schema modeline:\n%s", bs)
+	}
+	// Global-scoped schema installed alongside.
+	if _, err := os.Stat(filepath.Join(e.configDir, "treeman", "treeman.schema.json")); err != nil {
+		t.Errorf("global schema not installed: %v", err)
+	}
+	// Refuses to clobber without --force.
+	if res := e.run(t, cwd, "init", "--global"); res.err == nil {
+		t.Errorf("expected init --global to refuse overwriting existing config")
+	}
+}
+
 // ── treeman doctor ───────────────────────────────────────────────
 
 func TestDoctor(t *testing.T) {

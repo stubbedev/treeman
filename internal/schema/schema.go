@@ -51,6 +51,69 @@ func Render() ([]byte, error) {
 	return json.MarshalIndent(Reflect(), "", "  ")
 }
 
+// Scope selects which subset of the config a generated schema covers.
+// `.treeman.yaml` (repo) and `~/.config/treeman/config.yaml` (global)
+// share one Go struct but accept different key subsets; the scope
+// filters the reflected schema down to the keys valid for one layer.
+type Scope string
+
+const (
+	// ScopeFull keeps every key — the canonical union schema (the
+	// checked-in `schemas/treeman.schema.json` and the upstream URL).
+	ScopeFull Scope = "full"
+	// ScopeGlobal keeps keys tagged `scope:"global"` or `"both"` —
+	// the keys meaningful in the user-global config.
+	ScopeGlobal Scope = "global"
+	// ScopeRepo keeps keys tagged `scope:"repo"` or `"both"` — the
+	// keys meaningful in a per-repo `.treeman.yaml`.
+	ScopeRepo Scope = "repo"
+)
+
+// keepForScope reports whether a field with the given `scope:` tag
+// value belongs in a schema generated for `want`. "both" is always
+// kept; ScopeFull keeps everything.
+func keepForScope(fieldScope string, want Scope) bool {
+	if want == ScopeFull || fieldScope == "both" {
+		return true
+	}
+	return Scope(fieldScope) == want
+}
+
+// ReflectScoped returns the schema for config.Config restricted to the
+// top-level keys valid for `scope`. ScopeFull is identical to Reflect.
+// Filtering happens on the reflected schema's root properties using the
+// `scope:` struct tags exposed by config.FieldScopes — so the global
+// schema drops repo-only keys (databases, patches, …) and the repo
+// schema drops global-only keys (daemon, snapshots, logs, …).
+func ReflectScoped(scope Scope) *jsonschema.Schema {
+	s := Reflect()
+	if scope == ScopeFull || s.Properties == nil {
+		return s
+	}
+	scopes := config.FieldScopes()
+	// Collect first — deleting during KeysFromOldest mutates the
+	// underlying linked list and aborts the iteration early.
+	var drop []string
+	for key := range s.Properties.KeysFromOldest() {
+		fs := scopes[key]
+		if fs == "" {
+			fs = "both"
+		}
+		if !keepForScope(fs, scope) {
+			drop = append(drop, key)
+		}
+	}
+	for _, key := range drop {
+		s.Properties.Delete(key)
+	}
+	return s
+}
+
+// RenderScoped renders ReflectScoped(scope) as pretty-printed bytes.
+func RenderScoped(scope Scope) ([]byte, error) {
+	return json.MarshalIndent(ReflectScoped(scope), "", "  ")
+}
+
 // GlobalPath returns the OS-conventional user-global path
 // (`$XDG_CONFIG_HOME/treeman/treeman.schema.json` on Linux,
 // `~/Library/Application Support/treeman/...` on macOS, …).
@@ -96,7 +159,14 @@ func Install(repoRoot string, t Target) (resolved string, modelineChanged bool, 
 		return "", false, fmt.Errorf("schema: invalid target %d", t)
 	}
 	if t != TargetURL {
-		body, err := Render()
+		// The global config accepts a narrower key set than a repo
+		// `.treeman.yaml`, so the global install gets the scope-filtered
+		// schema. Repo + URL keep the full union schema.
+		render := Render
+		if t == TargetGlobal {
+			render = func() ([]byte, error) { return RenderScoped(ScopeGlobal) }
+		}
+		body, err := render()
 		if err != nil {
 			return "", false, err
 		}
@@ -107,7 +177,20 @@ func Install(repoRoot string, t Target) (resolved string, modelineChanged bool, 
 			return "", false, err
 		}
 	}
-	modelineChanged, err = SetModeline(repoRoot, resolved)
+	// The modeline goes in the file that the installed schema validates:
+	// the global config for TargetGlobal, the repo `.treeman.yaml`
+	// otherwise. Without this split, `schema install --global` would
+	// point the repo file at the (narrower) global schema and break
+	// repo-only key validation.
+	modelineFile := filepath.Join(repoRoot, ".treeman.yaml")
+	if t == TargetGlobal {
+		gp, ok := config.GlobalConfigPath()
+		if !ok {
+			return resolved, false, nil
+		}
+		modelineFile = gp
+	}
+	modelineChanged, err = setModelineAt(modelineFile, resolved)
 	return resolved, modelineChanged, err
 }
 
@@ -185,7 +268,13 @@ func ReadModeline(repoRoot string) string {
 // (changed, err). When `.treeman.yaml` is missing the call is a
 // no-op — `treeman init` is responsible for the initial scaffold.
 func SetModeline(repoRoot, target string) (bool, error) {
-	p := filepath.Join(repoRoot, ".treeman.yaml")
+	return setModelineAt(filepath.Join(repoRoot, ".treeman.yaml"), target)
+}
+
+// setModelineAt is SetModeline against an explicit file path so the
+// global-config install can target `~/.config/treeman/config.yaml`
+// instead of a repo file.
+func setModelineAt(p, target string) (bool, error) {
 	raw, err := os.ReadFile(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

@@ -67,31 +67,51 @@ func siblingSlugs(ctx context.Context, st *store.Store, repoID, selfWtID int64) 
 	return out
 }
 
-// nameOwnedByOtherSlug reports whether `name` contains `_<slug>` as
-// a whole token (followed by `_` or end-of-name) for any slug in
-// `otherSlugs`. The token boundary matters: a slug `a` must not
-// match against a name containing `_abc` — only `_a` or `_a_…`.
+// nameOwnedByOtherSlug reports whether `name` contains one of `otherSlugs`
+// as a whole, delimiter-bounded token, for any slug in `otherSlugs`. A
+// slug is "bounded" when the bytes immediately before and after it are
+// delimiters — any non-alphanumeric byte (`_`, `:`, `-`, `.`, …) — or the
+// string edge. Delimiter-agnostic on purpose: it must work for both
+// `<prefix>_<slug>_*` (ES/SQL naming) and `<prefix>:<slug>:*` (redis key
+// naming). The boundary matters: slug `a` must not match `_abc` (next byte
+// `b` is alphanumeric), and `app_ab_` must not be attributed to slug `a`.
 //
-// Used as the inverse of the "keep" predicate in es.DropMatchingFiltered:
+// Used as the inverse of the "keep" predicate in es.DropMatchingFiltered /
+// redis.DropPrefixFiltered:
 // `keep := func(n string) bool { return !nameOwnedByOtherSlug(n, others) }`.
 func nameOwnedByOtherSlug(name string, otherSlugs []string) bool {
 	for _, s := range otherSlugs {
 		if s == "" {
 			continue
 		}
-		marker := "_" + s
 		idx := 0
 		for {
-			hit := strings.Index(name[idx:], marker)
+			hit := strings.Index(name[idx:], s)
 			if hit < 0 {
 				break
 			}
-			end := idx + hit + len(marker)
-			if end == len(name) || name[end] == '_' {
+			start := idx + hit
+			end := start + len(s)
+			beforeOK := start == 0 || isNameDelimiter(name[start-1])
+			afterOK := end == len(name) || isNameDelimiter(name[end])
+			if beforeOK && afterOK {
 				return true
 			}
-			idx += hit + 1
+			idx = start + 1
 		}
 	}
 	return false
+}
+
+// isNameDelimiter reports whether b marks a namespace token boundary — any
+// byte that is not an ASCII letter or digit. Slugs are alphanumeric (with
+// internal `_`), so a non-alphanumeric byte adjacent to a full-slug match
+// is a delimiter regardless of which separator the name template used.
+func isNameDelimiter(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return false
+	default:
+		return true
+	}
 }

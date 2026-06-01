@@ -26,6 +26,19 @@ func TestNameOwnedByOtherSlug(t *testing.T) {
 		{"kontainer_testing_abc_test_3", false},
 		// Slug `kon_12463` must not match `_kon_12463xy`.
 		{"kontainer_testing_kon_12463xy", false},
+
+		// Delimiter-agnostic: redis `:`-delimited key naming
+		// (`<prefix>:<slug>:*`) must bound the slug too.
+		{"app:kon_12463:items", true},
+		{"app:main_master:queue", true},
+		{"app:a:lock", true},
+		{"app:a", true},
+		// `:`-bounded prefix-collision guards.
+		{"app:abc:items", false}, // slug `a` must not match `:abc:`
+		{"app:kon_12463xy:items", false},
+		// Mixed delimiters around the slug.
+		{"app-kon_12463.items", true},
+		{"app:items", false},
 	}
 	for _, c := range cases {
 		got := nameOwnedByOtherSlug(c.name, others)

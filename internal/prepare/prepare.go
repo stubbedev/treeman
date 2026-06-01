@@ -1955,7 +1955,7 @@ func prepareRedis(
 		return runBranchScoped(ctx, branchScopedArgs{
 			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
 			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
-			eng: &branchEngine{drv: redisNS{drv}, scope: scopePrefix, engine: "redis"},
+			eng: &branchEngine{drv: redisNS{d: drv, keep: siblingKeep(siblingSlugs(ctx, st, repoID, worktreeID))}, scope: scopePrefix, engine: "redis"},
 		})
 	}
 
@@ -2204,7 +2204,7 @@ func prepareES(
 			cfg: cfg, d: d, dbIdx: dbIdx, tplCtx: tplCtx, worktreePath: worktreePath,
 			st: st, repoID: repoID, worktreeID: worktreeID, inheritedEnv: inheritedEnv,
 			migrateFP: computeSnapshotKey(ctx, st, d, worktreePath, version).Fingerprint(),
-			eng:       &branchEngine{drv: esNS{drv}, scope: scopePrefix, engine: "elasticsearch"},
+			eng:       &branchEngine{drv: esNS{d: drv, keep: siblingKeep(siblingSlugs(ctx, st, repoID, worktreeID))}, scope: scopePrefix, engine: "elasticsearch"},
 			loadDump: func(ctx context.Context, active string, dump dumpFile) error {
 				return drv.Restore(ctx, active, dump.Path)
 			},
