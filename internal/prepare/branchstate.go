@@ -43,7 +43,14 @@ type nsDriver interface {
 	Exists(ctx context.Context, ns string) (bool, error)
 	Capture(ctx context.Context, active, durable string) error // active → durable
 	Restore(ctx context.Context, durable, active string) error // durable → active (drops active first)
-	Empty(ctx context.Context, active string) error            // reset active to an empty, present namespace
+	// RestoreParent fills `active` from a parent LIVE namespace, excluding
+	// anything that belongs to a deeper worktree namespace nested under the
+	// parent prefix (`srcKeep`; nil = copy everything). Name-scoped engines
+	// copy an EXACT database and ignore srcKeep; prefix-scoped engines need
+	// it because a bare main-worktree parent prefix nests every sibling
+	// worktree's `<prefix>_<slug>_*` data.
+	RestoreParent(ctx context.Context, parent, active string, srcKeep func(string) bool) error
+	Empty(ctx context.Context, active string) error // reset active to an empty, present namespace
 	Drop(
 		ctx context.Context,
 		ns string,
@@ -137,6 +144,10 @@ func (a mysqlNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
 
+func (a mysqlNS) RestoreParent(ctx context.Context, parent, active string, _ func(string) bool) error {
+	return a.d.SnapshotRestore(ctx, parent, active)
+}
+
 func (a mysqlNS) Empty(ctx context.Context, active string) error {
 	// EXACT drop, not DropMatching: a branch_scoped DB never fans out
 	// into a clone family, and the active name (bare on the main
@@ -175,6 +186,10 @@ func (a postgresNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
 }
 
+func (a postgresNS) RestoreParent(ctx context.Context, parent, active string, _ func(string) bool) error {
+	return a.d.SnapshotRestore(ctx, parent, active)
+}
+
 func (a postgresNS) Empty(ctx context.Context, active string) error {
 	// EXACT drop, not DropMatching — see mysqlNS.Empty.
 	if err := a.d.DropDatabase(ctx, active); err != nil {
@@ -207,6 +222,10 @@ func (a mongoNS) Capture(ctx context.Context, active, durable string) error {
 
 func (a mongoNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestore(ctx, durable, active)
+}
+
+func (a mongoNS) RestoreParent(ctx context.Context, parent, active string, _ func(string) bool) error {
+	return a.d.SnapshotRestore(ctx, parent, active)
 }
 
 func (a mongoNS) Empty(ctx context.Context, active string) error {
@@ -252,6 +271,10 @@ func (a redisNS) Capture(ctx context.Context, active, durable string) error {
 
 func (a redisNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestoreFiltered(ctx, durable, active, a.keep)
+}
+
+func (a redisNS) RestoreParent(ctx context.Context, parent, active string, srcKeep func(string) bool) error {
+	return a.d.SnapshotRestoreSrcFiltered(ctx, parent, active, srcKeep, a.keep)
 }
 
 func (a redisNS) Empty(ctx context.Context, active string) error {
@@ -310,6 +333,10 @@ func (a esNS) Restore(ctx context.Context, durable, active string) error {
 	return a.d.SnapshotRestoreFiltered(ctx, durable, active, a.keep)
 }
 
+func (a esNS) RestoreParent(ctx context.Context, parent, active string, srcKeep func(string) bool) error {
+	return a.d.SnapshotRestoreSrcFiltered(ctx, parent, active, srcKeep, a.keep)
+}
+
 func (a esNS) Empty(ctx context.Context, active string) error {
 	_, err := a.d.DropMatchingFiltered(ctx, active, a.keep)
 	return err
@@ -325,7 +352,10 @@ func (a esNS) DropDurable(ctx context.Context, durable string) error {
 }
 
 func (a esNS) Watermark(ctx context.Context, ns string) (string, error) {
-	return a.d.WriteWatermark(ctx, ns)
+	// Filter to THIS worktree's indices: on a bare main-worktree prefix the
+	// unfiltered sum would include sibling worktrees' writes and falsely
+	// mark the active dirty.
+	return a.d.WriteWatermarkFiltered(ctx, ns, a.keep)
 }
 
 // branchScopeFor reports the scope + canonical engine label for a
@@ -761,7 +791,7 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 	}
 	if ok && parent != "" && parent != active {
 		if pe, _ := a.eng.drv.Exists(ctx, parent); pe {
-			if err := a.eng.drv.Restore(ctx, parent, active); err != nil {
+			if err := a.eng.drv.RestoreParent(ctx, parent, active, a.parentSourceKeep(ctx, parent)); err != nil {
 				return false, "", fmt.Errorf("seed %q from parent branch's live db %q: %w%s",
 					active, parent, err, parentSeedHint(a.eng.engine, err))
 			}
@@ -769,6 +799,51 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 		}
 	}
 	return false, "", nil
+}
+
+// parentSourceKeep returns a predicate excluding keys/indices that belong
+// to a worktree namespace nested STRICTLY under `parent`, so a parent-seed
+// copies only the parent worktree's OWN data. It matters when `parent` is a
+// bare main-worktree prefix (a prefix of every linked worktree's
+// `<prefix>_<slug>_*` data); without it a feature branch would be seeded
+// with every sibling worktree's data too. Returns nil for name-scoped
+// engines (exact-db copy, no nesting) or when nothing nests under `parent`.
+func (a branchScopedArgs) parentSourceKeep(ctx context.Context, parent string) func(string) bool {
+	if a.eng.scope != scopePrefix {
+		return nil
+	}
+	wts, err := a.st.ListWorktreesForRepo(ctx, a.repoID)
+	if err != nil {
+		return nil
+	}
+	mainCfg := *a.cfg
+	config.ApplyMainWorktreeOverlay(&mainCfg)
+	var deeper []string
+	for _, wt := range wts {
+		if wt.Deleted {
+			continue
+		}
+		dbForWt := a.d
+		if wt.IsMain && a.dbIdx < len(mainCfg.Databases) {
+			dbForWt = mainCfg.Databases[a.dbIdx]
+		}
+		p, perr := activeNamespace(dbForWt, a.eng.scope, wt.Path)
+		if perr != nil || p == parent || !strings.HasPrefix(p, parent) {
+			continue
+		}
+		deeper = append(deeper, p)
+	}
+	if len(deeper) == 0 {
+		return nil
+	}
+	return func(name string) bool {
+		for _, p := range deeper {
+			if strings.HasPrefix(name, p) {
+				return false
+			}
+		}
+		return true
+	}
 }
 
 func (a branchScopedArgs) repoPath(ctx context.Context) string {

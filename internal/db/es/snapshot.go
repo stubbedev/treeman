@@ -119,6 +119,19 @@ func (d *Driver) SnapshotRestore(ctx context.Context, templatePrefix, targetPref
 // worktrees' `<prefix>_<slug>_*` indices. The template (durable) source
 // is hash-derived and never collides, so its listing stays unfiltered.
 func (d *Driver) SnapshotRestoreFiltered(ctx context.Context, templatePrefix, targetPrefix string, keep func(string) bool) error {
+	return d.SnapshotRestoreSrcFiltered(ctx, templatePrefix, targetPrefix, nil, keep)
+}
+
+// SnapshotRestoreSrcFiltered is SnapshotRestore with independent filters
+// for the SOURCE (`srcKeep`, which template indices to copy) and the
+// TARGET (`tgtKeep`, which target indices the stale-cleanup may drop).
+// Either nil means "all". The branch_scoped parent-seed uses srcKeep to
+// copy only the parent worktree's OWN indices when the parent prefix is a
+// bare main-worktree prefix that nests sibling worktrees' indices; tgtKeep
+// spares the current worktree's siblings exactly as SnapshotRestoreFiltered
+// does. Durable resume passes srcKeep=nil (the durable prefix is
+// hash-derived and never nests).
+func (d *Driver) SnapshotRestoreSrcFiltered(ctx context.Context, templatePrefix, targetPrefix string, srcKeep, tgtKeep func(string) bool) error {
 	if templatePrefix == targetPrefix {
 		return errors.New("snapshot restore: template and target prefixes must differ")
 	}
@@ -126,7 +139,16 @@ func (d *Driver) SnapshotRestoreFiltered(ctx context.Context, templatePrefix, ta
 	if err != nil {
 		return fmt.Errorf("list template indices %s*: %w", templatePrefix, err)
 	}
-	if _, err := d.DropMatchingFiltered(ctx, targetPrefix, keep); err != nil {
+	if srcKeep != nil {
+		kept := make([]string, 0, len(tplIndices))
+		for _, n := range tplIndices {
+			if srcKeep(n) {
+				kept = append(kept, n)
+			}
+		}
+		tplIndices = kept
+	}
+	if _, err := d.DropMatchingFiltered(ctx, targetPrefix, tgtKeep); err != nil {
 		return fmt.Errorf("drop stale target %s*: %w", targetPrefix, err)
 	}
 	if len(tplIndices) == 0 {

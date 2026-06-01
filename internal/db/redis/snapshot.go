@@ -183,13 +183,25 @@ func (d *Driver) SnapshotRestore(ctx context.Context, templatePrefix, targetPref
 // `<prefix>_<slug>_*` keys. The template (durable) source is hash-derived
 // and never collides, so the copy itself stays unfiltered.
 func (d *Driver) SnapshotRestoreFiltered(ctx context.Context, templatePrefix, targetPrefix string, keep func(string) bool) error {
+	return d.SnapshotRestoreSrcFiltered(ctx, templatePrefix, targetPrefix, nil, keep)
+}
+
+// SnapshotRestoreSrcFiltered is SnapshotRestore with independent filters
+// for the SOURCE (`srcKeep`, which template keys to copy) and the TARGET
+// (`tgtKeep`, which target keys the stale-cleanup may drop). Either nil
+// means "all". The branch_scoped parent-seed uses srcKeep to copy only the
+// parent worktree's OWN keys when the parent prefix is a bare main-worktree
+// prefix nesting sibling worktrees' keys; tgtKeep spares the current
+// worktree's siblings. Durable resume passes srcKeep=nil (durable prefix is
+// hash-derived and never nests).
+func (d *Driver) SnapshotRestoreSrcFiltered(ctx context.Context, templatePrefix, targetPrefix string, srcKeep, tgtKeep func(string) bool) error {
 	if templatePrefix == targetPrefix {
 		return errors.New("snapshot restore: template and target prefixes must differ")
 	}
-	if _, err := d.DropPrefixFiltered(ctx, targetPrefix, keep); err != nil {
+	if _, err := d.DropPrefixFiltered(ctx, targetPrefix, tgtKeep); err != nil {
 		return fmt.Errorf("drop stale target %s*: %w", targetPrefix, err)
 	}
-	return d.copyByPrefix(ctx, templatePrefix, targetPrefix, nil)
+	return d.copyByPrefix(ctx, templatePrefix, targetPrefix, srcKeep)
 }
 
 // DropSnapshot deletes every key under the named template prefix.

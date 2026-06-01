@@ -211,24 +211,42 @@ func (d *Driver) StoreSizeBytes(ctx context.Context, prefix string) (int64, erro
 // Any transport/parse error (including a not-yet-created prefix → HTTP
 // 404) returns "" so the caller declines to skip work.
 func (d *Driver) WriteWatermark(ctx context.Context, prefix string) (string, error) {
-	body, err := d.get(ctx, "/"+escSeg(prefix)+"*/_stats/indexing?format=json")
+	return d.WriteWatermarkFiltered(ctx, prefix, nil)
+}
+
+// WriteWatermarkFiltered is WriteWatermark restricted to the indices for
+// which keep(name) returns true. A nil predicate sums every index under
+// `prefix*` (classic behaviour). The branch_scoped swap passes the
+// adapter's sibling filter so a bare main-worktree active prefix yields a
+// watermark counting only THIS worktree's writes — without it, a sibling
+// worktree's writes would bump the counter and needlessly force a capture.
+// Parses the per-index `level=indices` view so the filter can drop
+// sibling-owned indices before summing.
+func (d *Driver) WriteWatermarkFiltered(ctx context.Context, prefix string, keep func(string) bool) (string, error) {
+	body, err := d.get(ctx, "/"+escSeg(prefix)+"*/_stats/indexing?level=indices&format=json")
 	if err != nil {
 		return "", err
 	}
 	var parsed struct {
-		All struct {
+		Indices map[string]struct {
 			Primaries struct {
 				Indexing struct {
 					IndexTotal  int64 `json:"index_total"`
 					DeleteTotal int64 `json:"delete_total"`
 				} `json:"indexing"`
 			} `json:"primaries"`
-		} `json:"_all"`
+		} `json:"indices"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return "", err
 	}
-	total := parsed.All.Primaries.Indexing.IndexTotal + parsed.All.Primaries.Indexing.DeleteTotal
+	var total int64
+	for name, idx := range parsed.Indices {
+		if keep != nil && !keep(name) {
+			continue
+		}
+		total += idx.Primaries.Indexing.IndexTotal + idx.Primaries.Indexing.DeleteTotal
+	}
 	return "es:" + strconv.FormatInt(total, 10), nil
 }
 

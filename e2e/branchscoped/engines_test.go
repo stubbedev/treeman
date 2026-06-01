@@ -336,6 +336,97 @@ func TestDbResetSparesSiblingPrefixRedis(t *testing.T) {
 	}
 }
 
+// ─── TestParentSeedExcludesSiblingDataElasticsearch ──────────────────
+//
+// Parent-seed isolation for a prefix engine: when a feature branch seeds
+// from a base branch that lives at the repo root, the base namespace is
+// the bare main-worktree prefix — which is a prefix of every linked
+// worktree's `<prefix>_<slug>_*` data. The seed must copy only the base
+// worktree's OWN keys, never a sibling worktree's. Name-scoped engines get
+// this free (exact-db copy); the prefix engines need the source filter.
+// Without it the new branch is seeded with every sibling's data too.
+func TestParentSeedExcludesSiblingDataElasticsearch(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	requireGit(t)
+	waitES(t)
+
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	mustGit(t, "", "init", "-q", "-b", "develop", repoRoot)
+	mustGit(t, repoRoot, "config", "user.email", "t@t")
+	mustGit(t, repoRoot, "config", "user.name", "t")
+	writeFile(t, repoRoot, "README", "hi")
+	mustGit(t, repoRoot, "add", "-A")
+	mustGit(t, repoRoot, "commit", "-q", "-m", "init")
+	mustGit(t, repoRoot, "remote", "add", "origin", repoRoot)
+	mustGit(t, repoRoot, "update-ref", "refs/remotes/origin/develop", "refs/heads/develop")
+
+	wtPath := filepath.Join(repoRoot, ".worktrees", "feature-x")
+	mustGit(t, repoRoot, "worktree", "add", "-q", "-b", "feature/x", wtPath, "origin/develop")
+	mustGit(t, wtPath, "branch", "--set-upstream-to=origin/develop", "feature/x")
+
+	// main_worktree overlay makes the base (develop @ repo root) namespace a
+	// bare, slug-free prefix `pp_`. Linked worktrees use `pp_{slug}_`.
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Elasticsearch: &config.EsConn{URL: esURL},
+		},
+		MainWorktree: config.MainWorktreeConfig{
+			Enabled:   true,
+			Databases: []config.DatabaseOverlay{{KeyPrefix: "pp_"}},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "elasticsearch",
+			KeyPrefix:    "pp_{slug}_",
+			BranchScoped: true,
+		}},
+	}
+
+	// Base worktree's OWN data lives under the bare prefix: `pp_items`.
+	esIndex(t, "pp_", "1", "base")
+	// A sibling linked worktree's branch_scoped data nests under the bare
+	// prefix: `pp_<siblingSlug>_items`. Register the sibling so the swap
+	// layer knows its namespace, and plant junk it must NOT copy.
+	siblingPath := filepath.Join(repoRoot, ".worktrees", "sibling")
+	siblingSlug := slug.For(siblingPath, "").Value
+	siblingPrefix := "pp_" + siblingSlug + "_"
+	esIndex(t, siblingPrefix, "1", "sibling-junk")
+
+	st := openStore(t)
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureWorktree(ctx, repoID, siblingPath, siblingSlug, "feature/sibling"); err != nil {
+		t.Fatal(err)
+	}
+	featSlug := slug.For(wtPath, "")
+	wtID, err := st.EnsureWorktree(ctx, repoID, wtPath, featSlug.Value, "feature/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	featPrefix := "pp_" + featSlug.Value + "_"
+	t.Cleanup(func() {
+		dropESIndex(t, "pp_items")
+		dropESIndex(t, siblingPrefix+"items")
+		dropESIndex(t, featPrefix+"items")
+		dropESIndex(t, featPrefix+siblingSlug+"_items") // the junk a broken seed would create
+	})
+
+	if _, err := prepare.Run(ctx, cfg, wtPath, featSlug, st, repoID, wtID, nil); err != nil {
+		t.Fatalf("prepare feature/x: %v", err)
+	}
+
+	// Seeded from the base worktree's own data only.
+	esAssertVals(t, featPrefix, map[string]string{"1": "base"})
+	// The sibling's nested data must NOT have been dragged in.
+	if n := esCount(t, featPrefix+siblingSlug+"_items*"); n != 0 {
+		t.Fatalf("parent seed dragged in sibling data under %s%s_* (%d docs) — source-filter regression",
+			featPrefix, siblingSlug, n)
+	}
+}
+
 // ─── TestDbResetReseedsFromParentMySQL ───────────────────────────────
 //
 // The HIGH-severity regression, end-to-end against a real engine: after

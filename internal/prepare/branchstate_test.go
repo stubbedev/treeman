@@ -77,6 +77,26 @@ func (f *fakeNS) Restore(_ context.Context, durable, active string) error {
 	return nil
 }
 
+func (f *fakeNS) RestoreParent(_ context.Context, parent, active string, srcKeep func(string) bool) error {
+	f.restoreCalls++
+	if f.restoreErr != nil {
+		return f.restoreErr
+	}
+	src, ok := f.data[parent]
+	if !ok {
+		return fmt.Errorf("restore parent: source %q missing", parent)
+	}
+	dst := map[string]string{}
+	for k, v := range src {
+		if srcKeep == nil || srcKeep(k) {
+			dst[k] = v
+		}
+	}
+	f.data[active] = dst // drops active first, then copies the kept keys
+	f.wm[active]++       // a fill is a write to the active slot
+	return nil
+}
+
 func (f *fakeNS) Empty(_ context.Context, active string) error {
 	f.data[active] = map[string]string{}
 	f.wm[active]++
