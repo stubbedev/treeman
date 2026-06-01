@@ -13,6 +13,7 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/patcher"
+	"github.com/stubbedev/treeman/internal/ports"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
@@ -153,6 +154,21 @@ func FinalizeWorktree(
 	// real `.env` (e.g. point `DB_DATABASE` at a per-branch name when
 	// the main worktree's branch_scoped active DB is the bare,
 	// overlay-resolved name the root `.env` already targets).
+	// Ensure the declared port slots are allocated before patches/hooks
+	// render `{{ port.* }}`. The CLI allocates at `wt create` time; an
+	// external `git worktree add` reaches finalize via the lifecycle
+	// watcher with no ports yet, so without this its patches/hooks would
+	// see empty port values. Allocate is idempotent — a no-op when the
+	// CLI already filled every slot. Skipped for the main worktree
+	// (same rationale as patches: it IS the canonical clone).
+	if len(cfg.Ports) > 0 && !isMain {
+		if _, err := ports.New().Allocate(ctx, st.Store, &cfg, repoID, wtID); err != nil {
+			slog.Warn("finalize: port allocation", "wt", wtRoot, "err", err)
+			_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_port_alloc_error",
+				err.Error(), repoID, wtID, "", 0, nil)
+		}
+	}
+
 	if len(cfg.Patches) > 0 && !isMain {
 		applyFinalizePatches(ctx, st, &cfg, wtRoot, sl, repoID, wtID)
 	}
@@ -511,6 +527,17 @@ func TeardownWorktree(
 	if removeErr != nil && !force {
 		return fmt.Errorf("worktree remove: %w (pass --force to override)", removeErr)
 	}
+
+	// Physically drop the port reservations so the freed ports can be
+	// re-used by the next allocation. Soft-deleting the worktree row is
+	// not enough: ListUsedPorts skips them, but the unique index on
+	// (repo_id, name, port) still rejects the re-insert, so the freed
+	// port silently climbs out of the range. Mirror the CLI inline path.
+	_ = st.Store.ReleaseWorktreePorts(ctx, wtID)
+	// Reap every active-branch marker too, so a worktree later created at
+	// the same path starts clean (also clears markers for databases since
+	// removed from config).
+	_ = st.Store.ClearActiveBranchesForWorktree(ctx, wtID)
 
 	_ = st.Store.MarkWorktreeDeleted(ctx, wtID)
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_done",

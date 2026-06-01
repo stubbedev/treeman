@@ -182,6 +182,53 @@ func TestAllocateReleasesEarlierSlotsOnLaterFailure(t *testing.T) {
 	}
 }
 
+// TestAllocateIsIdempotent pins the contract FinalizeWorktree relies
+// on: re-running Allocate keeps already-held slots untouched and fills
+// only newly-declared ones. Without this the daemon finalize path would
+// fail on every CLI-created worktree (slot already held) or never fill
+// ports for an external `git worktree add`.
+func TestAllocateIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	st, repoID, wtID := openStore(t)
+	a := pickFreePort(t)
+	cfg := &config.Config{
+		Ports: map[string]config.PortSpec{
+			"alpha": {Range: config.PortRange{Min: a, Max: a}},
+		},
+	}
+	first, err := New().Allocate(ctx, st, cfg, repoID, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second call, same config: no error, same port, no extra row.
+	second, err := New().Allocate(ctx, st, cfg, repoID, wtID)
+	if err != nil {
+		t.Fatalf("re-allocate should be a no-op, got %v", err)
+	}
+	if len(second) != 1 || second[0].Port != first[0].Port {
+		t.Fatalf("re-allocate changed alpha: first=%+v second=%+v", first, second)
+	}
+
+	// Now a new slot appears in config — Allocate fills it without
+	// disturbing alpha.
+	b := pickFreePort(t)
+	if b == a {
+		t.Skipf("test prerequisite: distinct free ports (a=%d b=%d)", a, b)
+	}
+	cfg.Ports["beta"] = config.PortSpec{Range: config.PortRange{Min: b, Max: b}}
+	third, err := New().Allocate(ctx, st, cfg, repoID, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]uint16{}
+	for _, al := range third {
+		got[al.Name] = al.Port
+	}
+	if got["alpha"] != a || got["beta"] != b {
+		t.Fatalf("expected alpha=%d beta=%d, got %+v", a, b, got)
+	}
+}
+
 func max16(a, b uint16) uint16 {
 	if a > b {
 		return a

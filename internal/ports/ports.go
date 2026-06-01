@@ -68,6 +68,14 @@ type defaultAllocator struct{}
 
 // Allocate walks every declared port slot in alphabetical order and
 // reserves a free port per slot.
+//
+// Idempotent: a slot the worktree already holds is left untouched and
+// its existing port is returned as-is. This lets the call run on every
+// finalize — the CLI allocates up front, then the daemon's
+// FinalizeWorktree (including the lifecycle-watcher path for an external
+// `git worktree add`) calls Allocate again to fill in any slots that
+// were never assigned, without clobbering or double-allocating the ones
+// that were.
 func (defaultAllocator) Allocate(
 	ctx context.Context,
 	st *store.Store,
@@ -78,16 +86,29 @@ func (defaultAllocator) Allocate(
 	if len(slots) == 0 {
 		return nil, nil
 	}
+	existing, err := st.LoadWorktreePorts(ctx, worktreeID)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]Allocation, 0, len(slots))
+	var allocatedThisCall []string
 	for _, name := range slots {
+		if port, held := existing[name]; held {
+			out = append(out, Allocation{Name: name, Port: port})
+			continue
+		}
 		spec := cfg.Ports[name]
 		port, err := allocateOne(ctx, st, repoID, worktreeID, name, spec)
 		if err != nil {
-			// Best-effort cleanup so a mid-allocation failure doesn't
-			// leak rows.
-			_ = st.ReleaseWorktreePorts(ctx, worktreeID)
+			// Roll back only the slots this call added — ports the
+			// worktree already held must survive a partial-allocation
+			// failure (e.g. a newly-declared slot whose range is full).
+			for _, n := range allocatedThisCall {
+				_ = st.ReleaseWorktreePort(ctx, worktreeID, n)
+			}
 			return nil, fmt.Errorf("allocate port %q: %w", name, err)
 		}
+		allocatedThisCall = append(allocatedThisCall, name)
 		out = append(out, Allocation{Name: name, Port: port})
 	}
 	return out, nil

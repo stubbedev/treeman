@@ -148,6 +148,19 @@ func (s *Store) ReleaseWorktreePorts(ctx context.Context, worktreeID int64) erro
 	return err
 }
 
+// ReleaseWorktreePort drops a single (worktree, slot) row. Used to roll
+// back only the slots allocated in the current pass without disturbing
+// ports the worktree already held — the all-slot ReleaseWorktreePorts
+// would clobber pre-existing assignments on a partial-allocation retry.
+func (s *Store) ReleaseWorktreePort(ctx context.Context, worktreeID int64, name string) error {
+	if worktreeID <= 0 || name == "" {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx,
+		`DELETE FROM worktree_ports WHERE worktree_id = ? AND name = ?`, worktreeID, name)
+	return err
+}
+
 // SortedSlotNames returns the slot names of a port map in stable
 // (alphabetical) order. Used by display layers (`wt show`,
 // `wt create` summary line) so output doesn't shuffle between runs.
