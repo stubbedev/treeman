@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,8 +18,9 @@ import (
 // document on disk.
 func TestPatchMainWorktreeConfigVirginRepo(t *testing.T) {
 	repo := t.TempDir()
+	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "treeman.db"))
 
-	if err := patchMainWorktreeConfig(repo, true); err != nil {
+	if err := patchMainWorktreeConfig(context.Background(), repo, true); err != nil {
 		t.Fatalf("patch: %v", err)
 	}
 	body, err := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))
@@ -43,11 +45,12 @@ func TestPatchMainWorktreeConfigVirginRepo(t *testing.T) {
 // .treeman.yaml.
 func TestPatchMainWorktreeConfigPreservesExistingKeys(t *testing.T) {
 	repo := t.TempDir()
+	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "treeman.db"))
 	original := "auto_fetch:\n  enabled: false\n  interval_minutes: 5\n"
 	if err := os.WriteFile(filepath.Join(repo, ".treeman.yaml"), []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := patchMainWorktreeConfig(repo, true); err != nil {
+	if err := patchMainWorktreeConfig(context.Background(), repo, true); err != nil {
 		t.Fatalf("patch: %v", err)
 	}
 	body, _ := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))

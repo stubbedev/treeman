@@ -419,7 +419,7 @@ Examples:
 			if err := yaml.Unmarshal(body, &validated); err != nil {
 				return fmt.Errorf("validation failed — patched file would not parse as config.Config: %w", err)
 			}
-			if err := atomicWriteFile(p, body); err != nil {
+			if err := snapshotAndWrite(ctx, repoRoot, p, body); err != nil {
 				return err
 			}
 			prevJSON := ""
@@ -459,17 +459,20 @@ func openDefaultStore(ctx context.Context) (*store.Store, error) {
 	return store.Open(ctx, p)
 }
 
-// atomicWriteFile delegates to yamlpatch.AtomicWriteWithBackup so
-// every config-set / config-write path keeps the last 5 backups in
-// case an agent (or human) clobbers something important.
-func atomicWriteFile(path string, data []byte) error {
-	return yamlpatch.AtomicWriteWithBackup(path, data, configBackupKeep)
+// snapshotAndWrite stashes the current on-disk content of path as a new
+// config generation for repoRoot (best-effort — a store failure must
+// not block the edit), then atomically writes the new bytes. Replaces
+// the old `.treeman.yaml.bak.*` files: history now lives per-repo in
+// SQLite, reachable via `treeman config history|restore`.
+func snapshotAndWrite(ctx context.Context, repoRoot, path string, data []byte) error {
+	if prev, err := os.ReadFile(path); err == nil {
+		if st, err := openDefaultStore(ctx); err == nil {
+			_, _ = st.SnapshotConfig(ctx, repoRoot, path, prev)
+			_ = st.Close()
+		}
+	}
+	return yamlpatch.AtomicWrite(path, data)
 }
-
-// configBackupKeep is the rotation depth for `.treeman.yaml.bak.*`
-// snapshots created on every config_set / config_write. Five is
-// arbitrary but covers a typical session of trial-and-error edits.
-const configBackupKeep = 5
 
 // parseOlderThan accepts "24h" / "7d" / RFC3339. For durations the
 // cutoff is interpreted as "older than now-d".

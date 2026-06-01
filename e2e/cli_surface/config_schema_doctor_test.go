@@ -121,6 +121,116 @@ func TestConfigSet(t *testing.T) {
 	})
 }
 
+// TestConfigHistory verifies that overwriting the config stashes the
+// PRIOR content as a per-repo generation in SQLite (newest-first) and
+// that NO `.treeman.yaml.bak.*` files are left in the project root — the
+// backups now live in the DB, not beside the file.
+func TestConfigHistory(t *testing.T) {
+	repo := newGitRepo(t)
+	writeConfig(t, repo, minimalConfig+"\nworker_slots: 1\n")
+	e := newEnv(t)
+
+	// Two overwrites → two stored generations (the pre-write content of
+	// each `config set`).
+	if res := e.run(t, repo, "config", "set", "worker_slots", "2"); res.err != nil {
+		t.Fatalf("set #1: %v\nstderr:\n%s", res.err, res.stderr)
+	}
+	if res := e.run(t, repo, "config", "set", "worker_slots", "3"); res.err != nil {
+		t.Fatalf("set #2: %v\nstderr:\n%s", res.err, res.stderr)
+	}
+
+	t.Run("history lists generations newest-first via JSON", func(t *testing.T) {
+		res := e.run(t, repo, "config", "history", "--json")
+		if res.err != nil {
+			t.Fatalf("config history: %v\nstderr:\n%s", res.err, res.stderr)
+		}
+		var out struct {
+			Generations []struct {
+				Generation int `json:"generation"`
+				Bytes      int `json:"bytes"`
+			} `json:"generations"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(res.stdout)), &out); err != nil {
+			t.Fatalf("decode history JSON %q: %v", res.stdout, err)
+		}
+		if len(out.Generations) != 2 {
+			t.Fatalf("expected 2 generations, got %d: %s", len(out.Generations), res.stdout)
+		}
+		if out.Generations[0].Generation != 2 || out.Generations[1].Generation != 1 {
+			t.Errorf("expected newest-first [2,1], got [%d,%d]",
+				out.Generations[0].Generation, out.Generations[1].Generation)
+		}
+	})
+
+	t.Run("no .bak files written to repo root", func(t *testing.T) {
+		entries, err := os.ReadDir(repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ent := range entries {
+			if strings.Contains(ent.Name(), ".treeman.yaml.bak") {
+				t.Errorf("found stray backup file in repo root: %s", ent.Name())
+			}
+		}
+	})
+}
+
+// TestConfigRestore verifies that `config restore <gen>` writes a stored
+// generation back to .treeman.yaml, and that the restore is itself
+// reversible (it snapshots the pre-restore content as a new generation).
+func TestConfigRestore(t *testing.T) {
+	repo := newGitRepo(t)
+	writeConfig(t, repo, minimalConfig+"\nworker_slots: 10\n")
+	e := newEnv(t)
+
+	// Overwrite once: gen 1 captures the original (worker_slots: 10).
+	if res := e.run(t, repo, "config", "set", "worker_slots", "20"); res.err != nil {
+		t.Fatalf("set: %v\nstderr:\n%s", res.err, res.stderr)
+	}
+
+	t.Run("restores stored generation onto disk", func(t *testing.T) {
+		res := e.run(t, repo, "config", "restore", "1")
+		if res.err != nil {
+			t.Fatalf("config restore 1: %v\nstderr:\n%s", res.err, res.stderr)
+		}
+		body, err := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), "worker_slots: 10") {
+			t.Errorf("expected original worker_slots: 10 after restore:\n%s", body)
+		}
+	})
+
+	t.Run("restore is reversible — pre-restore content stored as new gen", func(t *testing.T) {
+		// After the restore above, the worker_slots:20 body should have
+		// been snapshotted as gen 2, so history now has 2 generations.
+		res := e.run(t, repo, "config", "history", "--json")
+		if res.err != nil {
+			t.Fatalf("config history: %v\nstderr:\n%s", res.err, res.stderr)
+		}
+		var out struct {
+			Generations []struct {
+				Generation int `json:"generation"`
+			} `json:"generations"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(res.stdout)), &out); err != nil {
+			t.Fatalf("decode history JSON %q: %v", res.stdout, err)
+		}
+		if len(out.Generations) != 2 {
+			t.Fatalf("expected 2 generations after reversible restore, got %d: %s",
+				len(out.Generations), res.stdout)
+		}
+	})
+
+	t.Run("missing generation errors", func(t *testing.T) {
+		res := e.run(t, repo, "config", "restore", "99")
+		if res.err == nil {
+			t.Errorf("expected error restoring nonexistent generation, got stdout:\n%s", res.stdout)
+		}
+	})
+}
+
 // ── treeman schema ───────────────────────────────────────────────
 
 func TestSchemaDump(t *testing.T) {

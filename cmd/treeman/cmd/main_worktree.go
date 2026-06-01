@@ -70,7 +70,7 @@ func mainEnableAction(ctx context.Context, c *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	if err := patchMainWorktreeConfig(repoRoot, true); err != nil {
+	if err := patchMainWorktreeConfig(ctx, repoRoot, true); err != nil {
 		return err
 	}
 	if err := requestConfigReload(ctx, repoRoot); err != nil {
@@ -107,7 +107,7 @@ func mainDisableAction(ctx context.Context, c *cli.Command) error {
 		}
 		cfgForPurge = &cfg
 	}
-	if err := patchMainWorktreeConfig(repoRoot, false); err != nil {
+	if err := patchMainWorktreeConfig(ctx, repoRoot, false); err != nil {
 		return err
 	}
 	if err := requestConfigReload(ctx, repoRoot); err != nil {
@@ -241,7 +241,7 @@ func mainStatusAction(ctx context.Context, c *cli.Command) error {
 // back to creating the file with a minimal `main_worktree:` stanza
 // when the repo has no .treeman.yaml yet — a virgin repo wanting to
 // opt-in shouldn't need to scaffold a full config first.
-func patchMainWorktreeConfig(repoRoot string, enabled bool) error {
+func patchMainWorktreeConfig(ctx context.Context, repoRoot string, enabled bool) error {
 	target := filepath.Join(repoRoot, ".treeman.yaml")
 	raw, err := os.ReadFile(target)
 	if err != nil {
@@ -275,7 +275,7 @@ func patchMainWorktreeConfig(repoRoot string, enabled bool) error {
 	if err != nil {
 		return err
 	}
-	return yamlpatch.AtomicWriteWithBackup(target, body, 5)
+	return snapshotAndWrite(ctx, repoRoot, target, body)
 }
 
 // requestWorktreeFinalize dispatches a finalize RPC for wtPath under

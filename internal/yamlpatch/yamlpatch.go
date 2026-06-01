@@ -9,11 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -162,32 +159,11 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// AtomicWriteWithBackup writes `data` to `path` via the standard
-// tmp+rename dance, but first snapshots the existing file content
-// to `<path>.bak.<timestamp>` and prunes older backups so at most
-// `keepN` remain. Used by `config_write` / `config_set` (CLI + MCP)
-// so an agent or human mistake doesn't silently lose the previous
-// `.treeman.yaml`. When the source file doesn't exist yet the
-// backup step is skipped (nothing to preserve).
-//
-// keepN=0 disables backups entirely; keepN<0 keeps every backup.
-func AtomicWriteWithBackup(path string, data []byte, keepN int) error {
-	if keepN != 0 {
-		if _, err := os.Stat(path); err == nil {
-			ts := time.Now().UTC().Format("20060102-150405")
-			bakPath := path + ".bak." + ts
-			src, err := os.ReadFile(path)
-			if err != nil {
-				return fmt.Errorf("read for backup: %w", err)
-			}
-			if err := os.WriteFile(bakPath, src, 0o600); err != nil {
-				return fmt.Errorf("write backup %s: %w", bakPath, err)
-			}
-			if keepN > 0 {
-				pruneBackups(path, keepN)
-			}
-		}
-	}
+// AtomicWrite writes `data` to `path` via the standard tmp+rename
+// dance. History of the previous content is no longer stashed beside
+// the file — callers that want a recoverable trail snapshot the prior
+// bytes into SQLite (store.SnapshotConfig) before calling this.
+func AtomicWrite(path string, data []byte) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
@@ -197,35 +173,6 @@ func AtomicWriteWithBackup(path string, data []byte, keepN int) error {
 		return err
 	}
 	return nil
-}
-
-// pruneBackups deletes oldest backups so at most `keep` remain.
-// Sorts by name (timestamps are zero-padded, so lexical = chrono).
-// Best-effort: prune errors are swallowed — the next call retries.
-func pruneBackups(path string, keep int) {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path) + ".bak."
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	var bakNames []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if strings.HasPrefix(e.Name(), base) {
-			bakNames = append(bakNames, e.Name())
-		}
-	}
-	if len(bakNames) <= keep {
-		return
-	}
-	sort.Strings(bakNames)
-	drop := len(bakNames) - keep
-	for _, name := range bakNames[:drop] {
-		_ = os.Remove(filepath.Join(dir, name))
-	}
 }
 
 // KindName returns a human-readable label for a yaml.Kind.

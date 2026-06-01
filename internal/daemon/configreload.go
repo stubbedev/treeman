@@ -27,7 +27,7 @@ import (
 //     by the `config_reload` RPC.
 //
 // Directories — not individual files — are added to the fsnotify
-// watcher. Most editors (vim's atomic rename, `yamlpatch.AtomicWriteWithBackup`)
+// watcher. Most editors (vim's atomic rename, `yamlpatch.AtomicWrite`)
 // replace `.treeman.yaml` via rename, which breaks file-level watches
 // because the new inode isn't the one being watched. Watching the
 // parent and filtering by basename catches every write pattern.

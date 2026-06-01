@@ -256,7 +256,7 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 		return nil, configWriteOut{}, fmt.Errorf("yaml parse: %w", err)
 	}
 	target := filepath.Join(repoRoot, ".treeman.yaml")
-	if err := atomicWrite(target, []byte(in.Body)); err != nil {
+	if err := atomicWrite(repoRoot, target, []byte(in.Body)); err != nil {
 		return nil, configWriteOut{}, err
 	}
 	writeMCPEvent(context.Background(), "config_write", "replaced .treeman.yaml", 0, map[string]string{
@@ -266,11 +266,21 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 	return nil, configWriteOut{Path: target, Bytes: len(in.Body)}, nil
 }
 
-// atomicWrite delegates to yamlpatch.AtomicWriteWithBackup so MCP
-// mutations (config_write, config_set) leave behind a rotated
-// `.treeman.yaml.bak.*` history. Five-snapshot cap matches the CLI.
-func atomicWrite(path string, data []byte) error {
-	return yamlpatch.AtomicWriteWithBackup(path, data, 5)
+// atomicWrite stashes the current on-disk content of path as a new
+// per-repo config generation in SQLite (best-effort — a store failure
+// must not block the edit), then atomically writes the new bytes. MCP
+// mutations (config_write, config_set) thus leave a recoverable history
+// reachable via `treeman config history|restore`, instead of dropping
+// `.treeman.yaml.bak.*` files in the project root.
+func atomicWrite(repoRoot, path string, data []byte) error {
+	if prev, err := os.ReadFile(path); err == nil {
+		ctx := context.Background()
+		if st, err := openStore(ctx); err == nil {
+			_, _ = st.SnapshotConfig(ctx, repoRoot, path, prev)
+			_ = st.Close()
+		}
+	}
+	return yamlpatch.AtomicWrite(path, data)
 }
 
 // ─── init_repo / schema_install ───────────────────────────────────
@@ -943,7 +953,7 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 	if err := yaml.Unmarshal(body, &validated); err != nil {
 		return nil, configSetOut{}, fmt.Errorf("validation failed — patched file would not parse as config.Config: %w", err)
 	}
-	if err := atomicWrite(p, body); err != nil {
+	if err := atomicWrite(repoRoot, p, body); err != nil {
 		return nil, configSetOut{}, err
 	}
 	prevJSON := ""

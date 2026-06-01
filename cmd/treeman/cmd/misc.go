@@ -511,6 +511,111 @@ func ConfigCmd() *cli.Command {
 				},
 			},
 			configSet(),
+			configHistory(),
+			configRestore(),
+		},
+	}
+}
+
+// configHistory returns `treeman config history` — lists the per-repo
+// generations of `.treeman.yaml` stashed in SQLite each time the file
+// was overwritten by `config set` / `config write` / `main enable`.
+func configHistory() *cli.Command {
+	return &cli.Command{
+		Name:  "history",
+		Usage: "list stored .treeman.yaml generations for this repo",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+			&cli.BoolFlag{Name: "json"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			repoRoot, err := resolveRepo(c.String("repo"))
+			if err != nil {
+				return err
+			}
+			p := filepath.Join(repoRoot, ".treeman.yaml")
+			st, err := openDefaultStore(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = st.Close() }()
+			gens, err := st.ListConfigGenerations(ctx, repoRoot, p)
+			if err != nil {
+				return err
+			}
+			if c.Bool("json") {
+				rows := make([]map[string]any, 0, len(gens))
+				for _, g := range gens {
+					rows = append(rows, map[string]any{
+						"generation": g.Generation,
+						"created_at": time.UnixMilli(g.CreatedAt).UTC().Format(time.RFC3339),
+						"bytes":      len(g.Content),
+					})
+				}
+				return jsonStream(map[string]any{"repo": repoRoot, "generations": rows})
+			}
+			if len(gens) == 0 {
+				ui.Info("no stored generations for %s", p)
+				return nil
+			}
+			for _, g := range gens {
+				fmt.Fprintf(ui.Out, "  %s  %s  %d bytes\n",
+					ui.Bold(fmt.Sprintf("gen %d", g.Generation)),
+					time.UnixMilli(g.CreatedAt).Local().Format("2006-01-02 15:04:05"),
+					len(g.Content))
+			}
+			ui.Hint("restore one with `treeman config restore <generation>`")
+			return nil
+		},
+	}
+}
+
+// configRestore returns `treeman config restore <generation>` — writes
+// a stored generation back to `.treeman.yaml`. The current content is
+// itself snapshotted first, so a restore is reversible.
+func configRestore() *cli.Command {
+	return &cli.Command{
+		Name:      "restore",
+		Usage:     "write a stored generation back to .treeman.yaml",
+		ArgsUsage: "<generation>",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+			&cli.BoolFlag{Name: "json"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			if c.NArg() < 1 {
+				return errors.New("usage: treeman config restore <generation>")
+			}
+			gen, err := strconv.ParseInt(c.Args().Get(0), 10, 64)
+			if err != nil {
+				return fmt.Errorf("generation must be an integer: %w", err)
+			}
+			repoRoot, err := resolveRepo(c.String("repo"))
+			if err != nil {
+				return err
+			}
+			p := filepath.Join(repoRoot, ".treeman.yaml")
+			st, err := openDefaultStore(ctx)
+			if err != nil {
+				return err
+			}
+			g, err := st.GetConfigGeneration(ctx, repoRoot, p, gen)
+			_ = st.Close()
+			if err != nil {
+				return fmt.Errorf("generation %d not found for %s", gen, p)
+			}
+			if err := snapshotAndWrite(ctx, repoRoot, p, g.Content); err != nil {
+				return err
+			}
+			if c.Bool("json") {
+				return jsonStream(map[string]any{
+					"repo":     repoRoot,
+					"restored": gen,
+					"bytes":    len(g.Content),
+				})
+			}
+			PrintOK("restored generation %d → %s (%d bytes)", gen, p, len(g.Content))
+			return nil
 		},
 	}
 }
