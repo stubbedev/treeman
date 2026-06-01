@@ -825,7 +825,7 @@ func (s *Store) LoadInheritedEnvByPath(ctx context.Context, worktreePath string)
 }
 
 // TouchWorktreeVisited stamps `last_visited_at = now` on the worktree
-// row. Called by `wt switch`, `wt go`, and any other path that
+// row. Called by `wt go` and any other path that
 // represents a user-driven move into a worktree. Used by `wt prev`
 // + `wt list --sort=visited` to surface recency.
 func (s *Store) TouchWorktreeVisited(ctx context.Context, id int64) error {

@@ -38,9 +38,7 @@ func WorktreeCmd() *cli.Command {
 			wtLogs(),
 			wtWait(),
 			wtFinalize(),
-			wtSwitch(),
 			wtBack(),
-			wtResolve(),
 			wtPrev(),
 			wtGo(),
 		},
@@ -672,79 +670,6 @@ func resolveRepo(override string) (string, error) {
 	return DiscoverRepoRoot(cwd)
 }
 
-// wtSwitch — `treeman wt switch [name]`. Prints the absolute path
-// of an existing worktree to stdout (so a shell shim can `cd
-// "$(treeman wt switch foo)"`). With `--create`, runs the full
-// create flow first when no match is found.
-//
-// Lookup order:
-//  1. SQLite active worktrees: exact basename match, exact slug
-//     match, then prefix match on either.
-//  2. Filesystem: `<worktrees-root>/<name>` exists.
-//
-// On ambiguous prefix matches, lists candidates on stderr and exits
-// non-zero. Status/warnings go to stderr; only the resolved path
-// goes to stdout — never mix the two streams.
-func wtSwitch() *cli.Command {
-	return &cli.Command{
-		Name:      "switch",
-		Usage:     "print the path of a worktree (for shell `cd $(…)` use)",
-		ArgsUsage: "<name>",
-		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "repo", Usage: "repo root override"},
-			&cli.BoolFlag{Name: "create", Usage: "create the worktree if no match", Value: false},
-			&cli.StringFlag{Name: "from", Usage: "base branch (with --create)"},
-		},
-		Action: func(ctx context.Context, c *cli.Command) error {
-			if c.NArg() < 1 {
-				return errors.New("usage: treeman wt switch <name> [--create]")
-			}
-			name := c.Args().First()
-			repoRoot, err := resolveRepo(c.String("repo"))
-			if err != nil {
-				return err
-			}
-			cfg, err := resolve.LoadResolved(repoRoot)
-			if err != nil {
-				return err
-			}
-
-			if path, ok := wt.LookupWorktree(ctx, repoRoot, name, cliSink{}); ok {
-				touchVisitedByPath(ctx, path)
-				fmt.Println(path)
-				return nil
-			}
-
-			// Filesystem fallback.
-			fsCandidate := filepath.Join(wt.WorktreesRoot(cfg, repoRoot), name)
-			if fi, err := os.Stat(fsCandidate); err == nil && fi.IsDir() {
-				fmt.Println(fsCandidate)
-				return nil
-			}
-
-			if !c.Bool("create") {
-				return fmt.Errorf("no worktree matches %q (try `treeman wt switch %s --create`)", name, name)
-			}
-
-			// Delegate to the create flow, then print the resolved
-			// path. Reuse wtCreate's Action via a synthetic args
-			// vector keeps the codepath single-source.
-			createCmd := wtCreate()
-			argv := []string{"create", name}
-			if v := c.String("from"); v != "" {
-				argv = append(argv, "--from", v)
-			}
-			argv = append(argv, "--repo", repoRoot)
-			if err := createCmd.Run(ctx, argv); err != nil {
-				return err
-			}
-			// After create, wtPath is `<root>/<name>` by default.
-			fmt.Println(filepath.Join(wt.WorktreesRoot(cfg, repoRoot), name))
-			return nil
-		},
-	}
-}
-
 // wtBack — `treeman wt back`. Prints the main repo root for the
 // current cwd. With `--remove`, also deletes the current linked
 // worktree if it is clean (`git status --porcelain` empty) and has
@@ -842,39 +767,6 @@ func gitWorktreeRoot(start string) (string, error) {
 	return out, nil
 }
 
-// wtResolve — `treeman wt resolve <branch>`. Pure registry lookup.
-// Prints the absolute worktree path for the given branch (exact
-// match on `worktrees.branch`) and returns nonzero with a clear
-// stderr message when no live worktree owns that branch. Used by
-// shell shims to replace `_worktree_path_for_branch` (which forks
-// `git worktree list --porcelain` per call).
-func wtResolve() *cli.Command {
-	return &cli.Command{
-		Name:      "resolve",
-		Usage:     "print the worktree path holding <branch> (registry lookup; exit nonzero on miss)",
-		ArgsUsage: "<branch>",
-		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
-		},
-		Action: func(ctx context.Context, c *cli.Command) error {
-			if c.NArg() < 1 {
-				return errors.New("usage: treeman wt resolve <branch>")
-			}
-			branch := c.Args().First()
-			repoRoot, err := resolveRepo(c.String("repo"))
-			if err != nil {
-				return err
-			}
-			path, ok := registryWorktreeForBranch(ctx, repoRoot, branch)
-			if !ok {
-				return fmt.Errorf("no live worktree on branch %q in %s", branch, repoRoot)
-			}
-			fmt.Println(path)
-			return nil
-		},
-	}
-}
-
 // wtPrev — `treeman wt prev`. Prints the path of the previously-
 // visited worktree for the current repo (most recent
 // last_visited_at, excluding cwd). The timestamp lives in SQLite so
@@ -914,102 +806,154 @@ func wtPrev() *cli.Command {
 	}
 }
 
-// wtGo — `treeman wt go <branch> [--create] [--from <base>]`. Full
-// checkout/create-routing: exposes the policy zsh's
-// `_checkout_branch_or_worktree` implements with N git forks.
+// wtGo — `treeman wt go <name-or-branch>`. The single navigation verb;
+// absorbs the former `wt switch` and `wt resolve`.
 //
-// Routing:
+// Default (pure resolve, no git side effects): fuzzy-match an existing
+// worktree (slug/branch/basename), then exact-branch registry lookup,
+// then a filesystem fallback. Prints the resolved path; exits nonzero
+// on miss. With `--create`, spawns the worktree when nothing matches.
+//
+// With `--checkout`: branch checkout auto-routing (exposes the policy
+// zsh's `_checkout_branch_or_worktree` implements with N git forks):
 //  1. Branch already live in another worktree → print that path.
 //  2. cwd is in a linked worktree AND main repo is clean → run
 //     git checkout (or -b) in main, print main.
 //  3. cwd is in a linked worktree AND main is dirty → delegate to
-//     `wt create` so the new branch lands in a fresh worktree,
-//     print the new worktree path.
-//  4. Else (we're in main or a standalone clone) → run git
-//     checkout in cwd's repo root, print that path.
+//     `wt create` so the new branch lands in a fresh worktree.
+//  4. Else (main or standalone clone) → git checkout in cwd's repo
+//     root, print that path.
 //
 // Always prints exactly one line on stdout (the destination
 // directory). Status / warnings go to stderr. Touches
-// last_visited_at on every successful resolution so `wt prev`
-// works.
+// last_visited_at on every successful resolution so `wt prev` works.
 func wtGo() *cli.Command {
 	return &cli.Command{
 		Name:      "go",
-		Usage:     "switch/create branch with auto-routing (use as cd \"$(treeman wt go …)\")",
-		ArgsUsage: "<branch>",
+		Usage:     "resolve/create/checkout a worktree by name or branch (use as cd \"$(treeman wt go …)\")",
+		ArgsUsage: "<name-or-branch>",
 		Flags: []cli.Flag{
-			&cli.BoolFlag{Name: "create", Usage: "treat <branch> as a new branch (falls back to checkout if it already exists)"},
-			&cli.StringFlag{Name: "from", Usage: "base branch (with --create)"},
+			&cli.BoolFlag{Name: "create", Usage: "create the worktree if nothing matches"},
+			&cli.BoolFlag{Name: "checkout", Usage: "git checkout the branch (auto-routes main vs new worktree) instead of pure path resolution"},
+			&cli.StringFlag{Name: "from", Usage: "base branch (with --create/--checkout)"},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "no-fetch", Usage: "skip the pre-checkout `git fetch origin <base>`"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return errors.New("usage: treeman wt go <branch> [--create]")
+				return errors.New("usage: treeman wt go <name-or-branch>")
 			}
-			branch := c.Args().First()
+			target := c.Args().First()
 			repoRoot, err := resolveRepo(c.String("repo"))
 			if err != nil {
 				return err
 			}
 
-			// (1) Already live in some worktree?
-			if path, ok := registryWorktreeForBranch(ctx, repoRoot, branch); ok {
-				cwd, _ := os.Getwd()
-				cwdTop, _ := gitWorktreeRoot(cwd)
-				if path != cwdTop {
-					touchVisitedByPath(ctx, path)
-					fmt.Println(path)
-					return nil
-				}
+			if c.Bool("checkout") {
+				return goCheckout(ctx, repoRoot, target, c.String("from"), c.Bool("create"), c.Bool("no-fetch"))
 			}
 
-			mode, base := resolveGoMode(ctx, repoRoot, branch, c.String("from"), c.Bool("create"), c.Bool("no-fetch"))
-
-			cwd, _ := os.Getwd()
-			cwdTop, _ := gitWorktreeRoot(cwd)
-			inLinked := cwdTop != "" && gitenv.IsLinkedWorktree(cwdTop)
-
-			runCheckoutIn := func(dir string) error {
-				args := []string{"checkout"}
-				if mode == "create" {
-					args = append(args, "-b", branch)
-					if base != "" {
-						args = append(args, base)
-					}
-				} else {
-					args = append(args, branch)
-				}
-				// stdout goes to stderr — `wt go` reserves stdout for
-				// the worktree path (consumed by `cd $(treeman wt go …)`).
-				return gitcmd.RunPiped(ctx, dir, os.Stderr, os.Stderr, args...)
+			// Pure resolve: fuzzy worktree lookup, then exact branch.
+			if path, ok := wt.LookupWorktree(ctx, repoRoot, target, cliSink{}); ok {
+				touchVisitedByPath(ctx, path)
+				fmt.Println(path)
+				return nil
 			}
-
-			// (4) Not in a linked worktree → checkout in cwd's repo root.
-			if !inLinked {
-				if err := runCheckoutIn(repoRoot); err != nil {
-					return err
-				}
-				touchVisitedByPath(ctx, repoRoot)
-				fmt.Println(repoRoot)
+			if path, ok := registryWorktreeForBranch(ctx, repoRoot, target); ok {
+				touchVisitedByPath(ctx, path)
+				fmt.Println(path)
 				return nil
 			}
 
-			// (2) main clean → checkout there.
-			mainClean, _ := gitenv.IsWorktreeClean(ctx, repoRoot)
-			if mainClean {
-				if err := runCheckoutIn(repoRoot); err != nil {
-					return err
-				}
-				touchVisitedByPath(ctx, repoRoot)
-				fmt.Println(repoRoot)
+			cfg, err := resolve.LoadResolved(repoRoot)
+			if err != nil {
+				return err
+			}
+			fsCandidate := filepath.Join(wt.WorktreesRoot(cfg, repoRoot), target)
+			if fi, statErr := os.Stat(fsCandidate); statErr == nil && fi.IsDir() {
+				fmt.Println(fsCandidate)
 				return nil
 			}
 
-			// (3) main dirty → spawn a fresh worktree.
-			return goSpawnWorktree(ctx, repoRoot, branch, c.String("from"))
+			if !c.Bool("create") {
+				return fmt.Errorf("no worktree matches %q (try `treeman wt go %s --create`, or --checkout to switch branches)", target, target)
+			}
+
+			// --create → spawn the worktree, then print its path.
+			createCmd := wtCreate()
+			argv := []string{"create", target}
+			if v := c.String("from"); v != "" {
+				argv = append(argv, "--from", v)
+			}
+			argv = append(argv, "--repo", repoRoot)
+			if err := createCmd.Run(ctx, argv); err != nil {
+				return err
+			}
+			fmt.Println(filepath.Join(wt.WorktreesRoot(cfg, repoRoot), target))
+			return nil
 		},
 	}
+}
+
+// goCheckout runs the branch-checkout auto-routing for `wt go --checkout`.
+// Prints exactly one line (the destination directory) on stdout; status
+// goes to stderr.
+func goCheckout(ctx context.Context, repoRoot, branch, from string, create, noFetch bool) error {
+	// (1) Already live in some worktree (other than cwd)?
+	if path, ok := registryWorktreeForBranch(ctx, repoRoot, branch); ok {
+		cwd, _ := os.Getwd()
+		cwdTop, _ := gitWorktreeRoot(cwd)
+		if path != cwdTop {
+			touchVisitedByPath(ctx, path)
+			fmt.Println(path)
+			return nil
+		}
+	}
+
+	mode, base := resolveGoMode(ctx, repoRoot, branch, from, create, noFetch)
+
+	cwd, _ := os.Getwd()
+	cwdTop, _ := gitWorktreeRoot(cwd)
+	inLinked := cwdTop != "" && gitenv.IsLinkedWorktree(cwdTop)
+
+	runCheckoutIn := func(dir string) error {
+		args := []string{"checkout"}
+		if mode == "create" {
+			args = append(args, "-b", branch)
+			if base != "" {
+				args = append(args, base)
+			}
+		} else {
+			args = append(args, branch)
+		}
+		// stdout goes to stderr — `wt go` reserves stdout for
+		// the worktree path (consumed by `cd $(treeman wt go …)`).
+		return gitcmd.RunPiped(ctx, dir, os.Stderr, os.Stderr, args...)
+	}
+
+	// (4) Not in a linked worktree → checkout in cwd's repo root.
+	if !inLinked {
+		if err := runCheckoutIn(repoRoot); err != nil {
+			return err
+		}
+		touchVisitedByPath(ctx, repoRoot)
+		fmt.Println(repoRoot)
+		return nil
+	}
+
+	// (2) main clean → checkout there.
+	mainClean, _ := gitenv.IsWorktreeClean(ctx, repoRoot)
+	if mainClean {
+		if err := runCheckoutIn(repoRoot); err != nil {
+			return err
+		}
+		touchVisitedByPath(ctx, repoRoot)
+		fmt.Println(repoRoot)
+		return nil
+	}
+
+	// (3) main dirty → spawn a fresh worktree.
+	return goSpawnWorktree(ctx, repoRoot, branch, from)
 }
 
 // resolveGoMode decides whether `wt go` checks out an existing branch or

@@ -144,16 +144,6 @@ rerun setup + prepare for a worktree (default via daemon; --local runs inline)
 | `--repo` |  |
 | `--local` | run setup + prepare in this process instead of dispatching to the daemon |
 
-### `treeman worktree switch`
-
-print the path of a worktree (for shell `cd $(…)` use)
-
-| Flag | Usage |
-|---|---|
-| `--repo` | repo root override |
-| `--create` | create the worktree if no match |
-| `--from` | base branch (with --create) |
-
 ### `treeman worktree back`
 
 print main repo path (with --remove, drop current worktree if clean)
@@ -162,14 +152,6 @@ print main repo path (with --remove, drop current worktree if clean)
 |---|---|
 | `--remove` | delete current worktree if clean + no unpushed commits |
 | `--force` | with --remove: pass --force to delete |
-
-### `treeman worktree resolve`
-
-print the worktree path holding <branch> (registry lookup; exit nonzero on miss)
-
-| Flag | Usage |
-|---|---|
-| `-r`, `--repo` |  |
 
 ### `treeman worktree prev`
 
@@ -181,12 +163,13 @@ print previously-visited worktree (registry-tracked; cross-shell)
 
 ### `treeman worktree go`
 
-switch/create branch with auto-routing (use as cd "$(treeman wt go …)")
+resolve/create/checkout a worktree by name or branch (use as cd "$(treeman wt go …)")
 
 | Flag | Usage |
 |---|---|
-| `--create` | treat <branch> as a new branch (falls back to checkout if it already exists) |
-| `--from` | base branch (with --create) |
+| `--create` | create the worktree if nothing matches |
+| `--checkout` | git checkout the branch (auto-routes main vs new worktree) instead of pure path resolution |
+| `--from` | base branch (with --create/--checkout) |
 | `-r`, `--repo` |  |
 | `--no-fetch` | skip the pre-checkout `git fetch origin <base>` |
 
@@ -497,6 +480,7 @@ JSON schema helpers
 | Flag | Usage |
 |---|---|
 | `--out` |  |
+| `--scope` | full (default, every key) \| global (~/.config/treeman/config.yaml keys) \| repo (.treeman.yaml keys) |
 
 ### `treeman schema install`
 
@@ -535,13 +519,13 @@ ask the daemon to re-read config + restart watchers (no process restart)
 |---|---|
 | `-y`, `--yes` | skip the confirmation prompt |
 
-### `treeman fw`
+### `treeman frameworks`
 
-Aliases: `frameworks`
+Aliases: `fw`
 
 framework detection
 
-### `treeman fw detect`
+### `treeman frameworks detect`
 
 | Flag | Usage |
 |---|---|
@@ -561,6 +545,7 @@ print the slug treeman derives for a worktree
 |---|---|
 | `--force` |  |
 | `--json` |  |
+| `--global` | scaffold the user-global ~/.config/treeman/config.yaml (machine-wide defaults) instead of a per-repo .treeman.yaml |
 
 ### `treeman doctor`
 

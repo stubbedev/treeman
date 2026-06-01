@@ -37,7 +37,7 @@ func Hint(format string, args ...any) {
 }
 
 // Plain prints msg to stdout with no styling. Useful for output that
-// callers may pipe (e.g. `treeman wt switch` prints a path).
+// callers may pipe (e.g. `treeman wt go` prints a path).
 func Plain(format string, args ...any) {
 	fprintln(Out, fmt.Sprintf(format, args...))
 }

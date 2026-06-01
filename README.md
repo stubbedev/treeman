@@ -153,7 +153,7 @@ treeman wt create proj-123
 #   ↳ prepare: ensure_db → load dump → migrate → snapshot → N test clones
 
 # 4. Get the path of an existing worktree for `cd` integration:
-cd "$(treeman wt switch proj-123)"
+cd "$(treeman wt go proj-123)"
 
 # (CI flow: block on the daemon's finalize before running tests.)
 treeman wt wait proj-123                  # exits 0 on success, non-zero on failure
@@ -168,7 +168,7 @@ treeman wt delete proj-123
 cd "$(treeman wt back --remove)"
 ```
 
-A ready-to-source zsh shim that wraps `wt switch` / `wt back` for
+A ready-to-source zsh shim that wraps `wt go` / `wt back` for
 `cd`-into-worktree UX lives at `contrib/tm.zsh` (exposes a `tm`
 shell function):
 

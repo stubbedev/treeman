@@ -1041,8 +1041,8 @@ func mustResolveTreemand() string {
 // frameworks.
 func FwCmd() *cli.Command {
 	return &cli.Command{
-		Name:    "fw",
-		Aliases: []string{"frameworks"},
+		Name:    "frameworks",
+		Aliases: []string{"fw"},
 		Usage:   "framework detection",
 		Commands: []*cli.Command{{
 			Name:  "detect",

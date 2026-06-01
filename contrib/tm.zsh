@@ -1,6 +1,6 @@
 # treeman zsh shim — `tm` shell wrapper around `treeman wt`.
 #
-# `treeman wt switch` + `treeman wt back` print resolved paths on
+# `treeman wt go` + `treeman wt back` print resolved paths on
 # stdout; this function wraps them so `tm foo` and `tm -` change
 # directory in the parent shell.
 #
@@ -18,7 +18,7 @@
 #     tm new FOO           # passthrough; useful when --create needs flags
 #
 # All flags after the target name are forwarded to the underlying
-# `treeman wt switch`/`treeman wt back` invocation.
+# `treeman wt go`/`treeman wt back` invocation.
 
 tm() {
   emulate -L zsh
@@ -44,13 +44,13 @@ tm() {
       ;;
     new|create)
       shift
-      # `tm new BRANCH [...]` → forward to switch --create so the
+      # `tm new BRANCH [...]` → forward to go --create so the
       # cd-after-create UX is the same as the bare `tm BRANCH -c`
       # form.
       local branch="$1"
       shift || true
       local target
-      if ! target=$(treeman wt switch "$branch" --create "$@"); then
+      if ! target=$(treeman wt go "$branch" --create "$@"); then
         return $?
       fi
       [[ -n $target ]] && builtin cd -- "$target"
@@ -87,7 +87,7 @@ USAGE
   fi
 
   local target
-  if ! target=$(treeman wt switch "$name" "${args[@]}"); then
+  if ! target=$(treeman wt go "$name" "${args[@]}"); then
     return $?
   fi
   [[ -n $target ]] && builtin cd -- "$target"
