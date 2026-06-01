@@ -261,6 +261,11 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 	if err := yaml.Unmarshal([]byte(in.Body), &parsed); err != nil {
 		return nil, configWriteOut{}, fmt.Errorf("yaml parse: %w", err)
 	}
+	// Reject global-only keys in a repo file at write time (hard scope
+	// break) — otherwise the body lands and the next load fails.
+	if err := config.CheckBodyScope([]byte(in.Body), "repo"); err != nil {
+		return nil, configWriteOut{}, err
+	}
 	target := filepath.Join(repoRoot, ".treeman.yaml")
 	if err := atomicWrite(repoRoot, target, []byte(in.Body)); err != nil {
 		return nil, configWriteOut{}, err
@@ -965,6 +970,11 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 	if err != nil {
 		return nil, configSetOut{}, err
 	}
+	if len(segs) > 0 && segs[0].Key != "" {
+		if err := config.CheckKeyInLayer(segs[0].Key, "repo"); err != nil {
+			return nil, configSetOut{}, err
+		}
+	}
 	newNode, err := yamlpatch.ValueToNode(in.Value)
 	if err != nil {
 		return nil, configSetOut{}, fmt.Errorf("encode value: %w", err)
@@ -1036,6 +1046,9 @@ func configRestoreTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in config
 	_ = st.Close()
 	if err != nil {
 		return nil, configRestoreOut{}, fmt.Errorf("generation %d not found for %s", in.Generation, p)
+	}
+	if err := config.CheckBodyScope(g.Content, "repo"); err != nil {
+		return nil, configRestoreOut{}, fmt.Errorf("generation %d cannot be restored: %w", in.Generation, err)
 	}
 	// atomicWrite snapshots the current content first, so the restore is
 	// itself reversible.

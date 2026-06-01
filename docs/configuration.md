@@ -2,19 +2,33 @@
 
 [← back to README](../README.md)
 
-treeman reads config in three layers, last-write-wins:
+treeman reads config from two files that merge into one effective
+config, last-write-wins:
 
-1. `~/.config/treeman/config.yaml` — global connection defaults
-2. `.treeman.yaml` — per-repo config (committed)
-3. `.treeman.local.yaml` — per-repo overrides (gitignored)
+1. `~/.config/treeman/config.yaml` — **user-global**, machine-wide defaults shared by every repo. Scaffold with `treeman init --global`.
+2. `<repo>/.treeman.yaml` — **per-repo**, committed. Plus an optional `.treeman.local.yaml` overlay (gitignored).
 
-Sample tree of every top-level block (all optional unless marked):
+Each top-level key has a **scope** that decides which file it may live
+in. **This is a hard rule — a key in the wrong file is an error at load
+time, with no flag to relax it** (the layered merge made a misplaced key
+silently inert, so it's surfaced loudly instead). Editors enforce it too:
+`.treeman.yaml` validates against the repo-scoped schema and the global
+config against the global-scoped one (`treeman schema install` /
+`treeman init --global` wire the right modeline).
+
+| Scope | Keys | Lives in |
+|-------|------|----------|
+| **global** | `daemon`, `snapshots`, `logs`, `status`, `notifications` | `~/.config/treeman/config.yaml` only |
+| **repo** | `databases`, `patches`, `hooks`, `main_worktree`, `env_sources` | `.treeman.yaml` only |
+| **both** | `connections`, `worktrees`, `auto_fetch`, `ports`, `frameworks`, `debounce_ms` | either (global = default, repo overrides) |
+
+For the full per-key reference + auto-generated examples see
+[config-reference.md](config-reference.md).
+
+### Per-repo `.treeman.yaml`
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json
-
-repo:
-  name: my-app                    # required for unambiguous slug derivation
 
 worktrees:
   root: .worktrees                # default
@@ -30,7 +44,8 @@ env_sources:                       # credential-resolver READ list
 # credentials from `.env` / `.env.testing` (Laravel `DB_*`,
 # Spring-Boot `SPRING_DATASOURCE_*`, MySQL/PG/Redis component vars).
 # Declare anything below only when you want to override the auto-
-# detected value.
+# detected value. `connections` is scope "both": set machine-wide
+# defaults in the global config, override per-repo here.
 connections:
   mysql:
     host: 127.0.0.1
@@ -83,19 +98,37 @@ hooks:
     - match: migrations                    # accepts string or list (e.g. [migrations, seeders])
       run: "echo migrations changed"
 
+debounce_ms: 500                         # file-watcher coalesce window (scope "both")
+```
+
+### User-global `~/.config/treeman/config.yaml`
+
+Machine-wide settings. `daemon`, `snapshots`, `logs`, `status`, and
+`notifications` are **only** valid here — putting them in a repo
+`.treeman.yaml` is a hard error.
+
+```yaml
+daemon:
+  socket: $XDG_RUNTIME_DIR/treeman.sock
+  log_level: info                        # debug | info | warn | error
+
 snapshots:
   cache_dir: ~/.cache/treeman/snapshots    # only used by GC reports
   retention:
-    cap_per_repo: 8                        # NEW: hard cap, LRU evicts on new generation
+    cap_per_repo: 8                        # hard cap, LRU evicts on new generation
     max_age_days: 30
     max_total_gb: 50
     gc_interval_minutes: 60                # daemon background sweep
 
-debounce_ms: 500                         # file-watcher coalesce window
+logs:
+  keep_days: 14                            # daemon prunes the shared event log; 0 keeps forever
 
-daemon:
-  socket: $XDG_RUNTIME_DIR/treeman.sock
-  log_level: info
+auto_fetch:                                # scope "both" — global default cadence; a repo may opt out
+  enabled: true
+  interval_minutes: 15
+
+notifications:
+  enabled: false                           # desktop banners on worktree lifecycle changes
 ```
 
 ## Templated names

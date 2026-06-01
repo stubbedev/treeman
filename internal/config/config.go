@@ -1810,12 +1810,19 @@ func checkLayerScope(path, layer string) error {
 		}
 		return fmt.Errorf("read %s: %w", path, err)
 	}
+	return checkScopeBytes(b, path, layer)
+}
+
+// checkScopeBytes is checkLayerScope against an in-memory body, with
+// `label` used in the error message (a path or a generic word like
+// "config"). Empty / non-mapping / unparseable bodies pass — the merge
+// step surfaces any real parse error with its own wording.
+func checkScopeBytes(b []byte, label, layer string) error {
 	if len(bytes.TrimSpace(b)) == 0 {
 		return nil
 	}
 	var root yaml.Node
 	if err := yaml.Unmarshal(b, &root); err != nil {
-		// Let mergeYAMLFile surface the parse error with its own wording.
 		return nil
 	}
 	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
@@ -1823,21 +1830,43 @@ func checkLayerScope(path, layer string) error {
 	}
 	scopes := FieldScopes()
 	mapping := root.Content[0]
-	var other string
-	switch layer {
-	case "global":
-		other = "repo"
-	default:
-		other = "global"
-	}
+	other := otherLayer(layer)
 	for i := 0; i+1 < len(mapping.Content); i += 2 {
 		key := mapping.Content[i].Value
 		if scopes[key] == other {
 			return fmt.Errorf("%s: key %q belongs in the %s config, not the %s config — %s",
-				path, key, other, layer, scopeHint(other))
+				label, key, other, layer, scopeHint(other))
 		}
 	}
 	return nil
+}
+
+// CheckBodyScope validates that every top-level key in a config body
+// belongs in `layer` ("global" or "repo"). Used by config_write /
+// config_restore to reject a misplaced key at WRITE time rather than
+// letting it land on disk and hard-fail at the next load.
+func CheckBodyScope(body []byte, layer string) error {
+	return checkScopeBytes(body, "config", layer)
+}
+
+// CheckKeyInLayer validates a single top-level key against `layer`.
+// Used by config_set (which patches one dotted path) so setting e.g.
+// `daemon.log_level` in a repo file is refused up front. Unknown keys
+// (scope "" or "both") always pass.
+func CheckKeyInLayer(key, layer string) error {
+	if FieldScopes()[key] == otherLayer(layer) {
+		other := otherLayer(layer)
+		return fmt.Errorf("key %q belongs in the %s config, not the %s config — %s",
+			key, other, layer, scopeHint(other))
+	}
+	return nil
+}
+
+func otherLayer(layer string) string {
+	if layer == "global" {
+		return "repo"
+	}
+	return "global"
 }
 
 // scopeHint points the user at the right file for a misplaced key.

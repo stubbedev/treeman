@@ -71,6 +71,37 @@ func TestConfigHistoryAndRestoreTools(t *testing.T) {
 	}
 }
 
+// TestConfigWriteToolsRejectScopeViolations is the write-time guard:
+// config_set and config_write must refuse a global-only key in a repo
+// file BEFORE it lands on disk (hard scope break).
+func TestConfigWriteToolsRejectScopeViolations(t *testing.T) {
+	ctx := context.Background()
+	repo := newTempRepo(t)
+	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "t.db"))
+	cfgPath := filepath.Join(repo, ".treeman.yaml")
+	orig := "worktrees:\n  root: .worktrees\n"
+	if err := os.WriteFile(cfgPath, []byte(orig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// config_set a global-only key → rejected, file untouched.
+	if _, _, err := configSetTool(ctx, nil, configSetIn{Repo: repo, Path: "daemon.log_level", Value: "debug"}); err == nil {
+		t.Errorf("config_set daemon.log_level in repo should be rejected")
+	}
+	// config_write a body with a global-only key → rejected.
+	if _, _, err := configWriteTool(ctx, nil, configWriteIn{Repo: repo, Body: "snapshots:\n  max_age_days: 5\n"}); err == nil {
+		t.Errorf("config_write with snapshots: should be rejected")
+	}
+	body, _ := os.ReadFile(cfgPath)
+	if string(body) != orig {
+		t.Errorf("rejected writes must not modify the file:\n%s", body)
+	}
+	// A repo-valid key still works.
+	if _, _, err := configSetTool(ctx, nil, configSetIn{Repo: repo, Path: "debounce_ms", Value: float64(200)}); err != nil {
+		t.Errorf("config_set of repo-valid key failed: %v", err)
+	}
+}
+
 // TestInitRepoGlobalTool verifies the init_repo global=true path
 // scaffolds the user-global config (global-scoped keys only) and
 // installs a global-scoped schema beside it.

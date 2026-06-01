@@ -119,6 +119,21 @@ func TestConfigSet(t *testing.T) {
 			t.Errorf("expected error when called with no args, got stdout:\n%s", res.stdout)
 		}
 	})
+
+	t.Run("rejects a global-only key in a repo file", func(t *testing.T) {
+		before, _ := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))
+		res := e.run(t, repo, "config", "set", "daemon.log_level", "debug")
+		if res.err == nil {
+			t.Errorf("config set daemon.log_level in a repo should be rejected")
+		}
+		if !strings.Contains(res.stderr+res.stdout, "global config") {
+			t.Errorf("error should explain the scope violation:\n%s%s", res.stdout, res.stderr)
+		}
+		after, _ := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))
+		if string(before) != string(after) {
+			t.Errorf("rejected set must not modify the file")
+		}
+	})
 }
 
 // TestConfigHistory verifies that overwriting the config stashes the

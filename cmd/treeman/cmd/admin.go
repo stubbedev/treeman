@@ -399,6 +399,11 @@ Examples:
 			if err != nil {
 				return err
 			}
+			if len(segs) > 0 && segs[0].Key != "" {
+				if err := config.CheckKeyInLayer(segs[0].Key, "repo"); err != nil {
+					return err
+				}
+			}
 			var value any
 			if err := json.Unmarshal([]byte(rawValue), &value); err != nil {
 				value = rawValue

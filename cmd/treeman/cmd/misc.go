@@ -604,6 +604,9 @@ func configRestore() *cli.Command {
 			if err != nil {
 				return fmt.Errorf("generation %d not found for %s", gen, p)
 			}
+			if err := config.CheckBodyScope(g.Content, "repo"); err != nil {
+				return fmt.Errorf("generation %d cannot be restored: %w", gen, err)
+			}
 			if err := snapshotAndWrite(ctx, repoRoot, p, g.Content); err != nil {
 				return err
 			}
