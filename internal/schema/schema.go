@@ -114,15 +114,18 @@ func RenderScoped(scope Scope) ([]byte, error) {
 	return json.MarshalIndent(ReflectScoped(scope), "", "  ")
 }
 
-// GlobalPath returns the OS-conventional user-global path
-// (`$XDG_CONFIG_HOME/treeman/treeman.schema.json` on Linux,
-// `~/Library/Application Support/treeman/...` on macOS, …).
+// GlobalPath returns the user-global schema path as a sibling of the
+// global config.yaml (`$XDG_CONFIG_HOME/treeman/treeman.schema.json`,
+// falling back to `~/.config/treeman/...`). Derived from
+// config.GlobalConfigPath so the schema always lands beside the config
+// it validates — os.UserConfigDir would diverge on macOS, where it
+// ignores XDG_CONFIG_HOME and returns ~/Library/Application Support.
 func GlobalPath() (string, error) {
-	base, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
+	cfgPath, ok := config.GlobalConfigPath()
+	if !ok {
+		return "", errors.New("cannot resolve user-global config dir")
 	}
-	return filepath.Join(base, "treeman", "treeman.schema.json"), nil
+	return filepath.Join(filepath.Dir(cfgPath), "treeman.schema.json"), nil
 }
 
 // Target enumerates the three install locations.
