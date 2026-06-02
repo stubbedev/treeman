@@ -114,6 +114,38 @@ func TestPruneGoneLocals_DeletesSquashMerged(t *testing.T) {
 	requireDeleted(t, work, pruneGoneLocals(ctx, work))
 }
 
+// Regression for the `git cherry <upstream> <synth> <base>` limit arg: the
+// squash commit must still be detected when origin/main has advanced past it
+// (commits landed after the squash). The <base> limit narrows the patch-id
+// range for CPU, and must not exclude the matching squash commit — which sits
+// between merge-base and tip, inside the limited range.
+func TestPruneGoneLocals_DeletesSquashMergedWithLaterCommits(t *testing.T) {
+	requireGitAutofetch(t)
+	ctx := context.Background()
+	work := makeFeatureGone(t, "squash", false)
+
+	// Advance origin/main with an unrelated commit after the squash, then
+	// fetch so the local feature is compared against a moved-on default.
+	origin := gitOut(t, work, "remote", "get-url", "origin")
+	push := filepath.Join(t.TempDir(), "push")
+	gitRun(t, "", "clone", "-q", origin, push)
+	gitRun(t, push, "config", "user.email", "t@t")
+	gitRun(t, push, "config", "user.name", "t")
+	gitRun(t, push, "checkout", "-q", "main")
+	if err := os.WriteFile(filepath.Join(push, "later.txt"), []byte("later\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, push, "add", "later.txt")
+	gitRun(t, push, "commit", "-q", "-m", "later unrelated work")
+	gitRun(t, push, "push", "-q", "origin", "main")
+	gitRun(t, work, "fetch", "--prune", "-q", "origin")
+
+	if !squashContained(ctx, work, "origin/main", "feature") {
+		t.Fatal("squashContained should still detect the squash after main advanced past it")
+	}
+	requireDeleted(t, work, pruneGoneLocals(ctx, work))
+}
+
 // A branch whose upstream is gone but whose work was NOT integrated is kept —
 // this is the data-safety guarantee.
 func TestPruneGoneLocals_KeepsUnmergedGone(t *testing.T) {

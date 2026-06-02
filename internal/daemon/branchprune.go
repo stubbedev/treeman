@@ -135,7 +135,13 @@ func squashContained(ctx context.Context, repoRoot, defRef, branch string) bool 
 	if err != nil || synth == "" {
 		return false
 	}
-	out, err := gitcmd.Output(ctx, repoRoot, "cherry", defRef, synth)
+	// Pass `base` as the <limit> arg so git cherry only patch-ids commits
+	// after the merge-base, not all of defRef's history. Without it, the
+	// upstream side of the comparison is the entire default branch (tens of
+	// thousands of commits on a mature repo), patch-id'd once per [gone]
+	// branch every auto-fetch tick — a 100% CPU spike. The synthetic patch
+	// is post-base anyway, so limiting the range is correctness-preserving.
+	out, err := gitcmd.Output(ctx, repoRoot, "cherry", defRef, synth, base)
 	if err != nil {
 		return false
 	}
