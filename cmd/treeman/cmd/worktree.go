@@ -733,8 +733,10 @@ func wtBack() *cli.Command {
 				return nil
 			}
 
-			// Print main repo path FIRST so the caller can `cd "$(…)"`
-			// even when the subsequent delete prints to stderr.
+			// Print main repo path FIRST so the caller can `cd "$(…)"`;
+			// stdout must carry only the path. The delete below routes
+			// its status through ui.Out, so redirect ui.Out to stderr
+			// for that call to keep stdout path-only.
 			fmt.Println(repoRoot)
 
 			// Delegate to wt delete to keep teardown logic in one
@@ -749,7 +751,11 @@ func wtBack() *cli.Command {
 			if c.Bool("force") {
 				argv = append(argv, "--force")
 			}
-			if err := wtDelete().Run(ctx, argv); err != nil {
+			prevOut := ui.Out
+			ui.Out = os.Stderr
+			err = wtDelete().Run(ctx, argv)
+			ui.Out = prevOut
+			if err != nil {
 				fmt.Fprintf(os.Stderr, "wt delete failed: %v\n", err)
 			}
 			return nil
