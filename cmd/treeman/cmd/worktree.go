@@ -893,7 +893,13 @@ func wtGo() *cli.Command {
 				argv = append(argv, "--from", v)
 			}
 			argv = append(argv, "--repo", repoRoot)
-			if err := createCmd.Run(ctx, argv); err != nil {
+			// Silence create's status lines on stdout — wt go reserves
+			// stdout for the resolved path (cd "$(treeman wt go …)").
+			prevOut := ui.Out
+			ui.Out = os.Stderr
+			err = createCmd.Run(ctx, argv)
+			ui.Out = prevOut
+			if err != nil {
 				return err
 			}
 			fmt.Println(filepath.Join(wt.WorktreesRoot(cfg, repoRoot), target))
@@ -997,7 +1003,13 @@ func goSpawnWorktree(ctx context.Context, repoRoot, branch, from string) error {
 	if from != "" {
 		argv = append(argv, "--from", from)
 	}
-	if err := wtCreate().Run(ctx, argv); err != nil {
+	// Silence create's status lines on stdout — wt go reserves stdout
+	// for the resolved path (cd "$(treeman wt go …)").
+	prevOut := ui.Out
+	ui.Out = os.Stderr
+	err := wtCreate().Run(ctx, argv)
+	ui.Out = prevOut
+	if err != nil {
 		return err
 	}
 	// Resolve final path from registry (wt create writes the
