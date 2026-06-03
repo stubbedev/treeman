@@ -230,6 +230,12 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 			"pruned merged branch with deleted upstream: "+branch,
 			r.ID, 0, "", 0, map[string]string{"branch": branch})
 	}
+
+	// Catch-all: drop any tracked durable whose branch is gone regardless of
+	// HOW it went away (worktree removed, branch deleted out-of-band, prune
+	// missed it). ReapBranchDurables above only covers branches THIS tick
+	// pruned via a live worktree; this reclaims the rest by recorded name.
+	prepare.ReapOrphanDurables(ctx, cfg, st.Store, r.ID, r.Path)
 	return nil
 }
 

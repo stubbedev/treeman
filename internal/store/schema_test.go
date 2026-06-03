@@ -33,6 +33,7 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 		"_treeman_migrations",
 		"active_branch_db",
 		"branch_db_migrated",
+		"branch_durables",
 		"config_generations",
 		"dir_hashes",
 		"events",
@@ -51,6 +52,8 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 	// filtered out — only user-declared CREATE INDEXes show up here.
 	wantIndexes := []string{
 		"idx_active_branch_db_repo",
+		"idx_branch_durables_branch",
+		"idx_branch_durables_repo",
 		"idx_config_generations_repo",
 		"idx_events_ts",
 		"idx_events_type",
