@@ -161,6 +161,34 @@ func (s *Store) ReleaseWorktreePort(ctx context.Context, worktreeID int64, name 
 	return err
 }
 
+// PurgeDeletedWorktreePorts physically drops every port row whose
+// worktree has been soft-deleted (deleted_at set) or whose worktree
+// row is gone entirely. Returns the number of rows reaped.
+//
+// Per-delete teardown already calls ReleaseWorktreePorts, but rows can
+// still leak when teardown is interrupted (daemon killed mid-teardown)
+// or when a worktree was deleted by an older binary that predates that
+// release. Leaked rows are invisible to ListUsedPorts (it filters on
+// deleted_at IS NULL) yet the unique index on (repo_id, name, port)
+// still rejects the re-insert, so the allocator climbs past every
+// leaked port instead of reusing it. Sweeping on daemon boot keeps the
+// allocation range from drifting upward indefinitely.
+func (s *Store) PurgeDeletedWorktreePorts(ctx context.Context) (int64, error) {
+	res, err := s.DB.ExecContext(ctx, `
+		DELETE FROM worktree_ports
+		WHERE worktree_id IN (
+			SELECT wp.worktree_id
+			FROM worktree_ports wp
+			LEFT JOIN worktrees w ON w.id = wp.worktree_id
+			WHERE w.id IS NULL OR w.deleted_at IS NOT NULL
+		)`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // SortedSlotNames returns the slot names of a port map in stable
 // (alphabetical) order. Used by display layers (`wt show`,
 // `wt create` summary line) so output doesn't shuffle between runs.

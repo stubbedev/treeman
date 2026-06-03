@@ -159,6 +159,52 @@ func SweepTrashDirs(ctx context.Context, st *State, repoPaths []string) {
 	}
 }
 
+// ReapDeadRepos hard-removes (via RemoveRepo's cascade over events,
+// hook_runs, snapshots, worktrees) every registered repo whose root
+// path no longer exists on disk. Called once on daemon boot to reclaim
+// rows left by ephemeral repos — e2e test checkouts under /tmp, scratch
+// clones, etc. — that were never explicitly unregistered.
+//
+// Conservative by design: only a repo whose path is fully gone is
+// reaped, and each removal is logged at WARN with the path. The known
+// false-positive is a repo on a temporarily-unmounted volume; on a dev
+// host that risk is acceptable against unbounded row growth, but the
+// loud log lets an operator notice if a real repo vanished.
+func ReapDeadRepos(ctx context.Context, st *State) {
+	refs, err := st.Store.ListRepoRefs(ctx)
+	if err != nil {
+		slog.Warn("dead-repo reap: list repos", "err", err)
+		return
+	}
+	for _, r := range refs {
+		if _, err := os.Stat(r.Path); err == nil {
+			continue
+		}
+		if err := st.Store.RemoveRepo(ctx, r.ID); err != nil {
+			slog.Warn("dead-repo reap: remove", "repo", r.Path, "id", r.ID, "err", err)
+			continue
+		}
+		slog.Warn("dead-repo reap: removed registry rows for missing repo", "repo", r.Path, "id", r.ID)
+	}
+}
+
+// SweepOrphanWorktreePorts physically drops port reservations left
+// behind by soft-deleted (or vanished) worktrees. Called once on
+// daemon boot so leaked rows from an interrupted teardown — or from a
+// pre-release binary that soft-deleted without releasing — don't pin
+// the allocation range upward forever. Failures are logged + skipped;
+// a sweep error must not abort startup.
+func SweepOrphanWorktreePorts(ctx context.Context, st *State) {
+	n, err := st.Store.PurgeDeletedWorktreePorts(ctx)
+	if err != nil {
+		slog.Warn("port sweep: purge orphan reservations", "err", err)
+		return
+	}
+	if n > 0 {
+		slog.Info("port sweep: reaped orphan reservations", "rows", n)
+	}
+}
+
 // parallelRemoveAll splits the top-level entries of root across up to
 // `workers` concurrent `rm -rf` children, each wrapped in
 // lowPriorityCommand (chrt -i 0 / ionice / nice). After all entries

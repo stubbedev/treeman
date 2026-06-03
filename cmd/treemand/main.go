@@ -150,6 +150,12 @@ func run() error {
 	// both of which dominate boot time on hosts with many registered
 	// repos. 8 concurrent resumes keeps the host responsive while
 	// cutting boot wall-time roughly proportionally.
+	// Reap registry rows for repos whose root has vanished from disk
+	// (ephemeral /tmp e2e checkouts, scratch clones) BEFORE listing
+	// repos for watcher resume, so dead repos neither get watchers nor
+	// drag their events / hook_runs / snapshots rows forever.
+	daemon.ReapDeadRepos(ctx, st)
+
 	repoPaths, _ := s.ListRepoPaths(ctx)
 	resumeRepoWatchers(ctx, st, repoPaths)
 
@@ -159,6 +165,13 @@ func run() error {
 	// host crash mid-reap orphans the trash entries until next boot.
 	// Sweep on startup so they don't accumulate indefinitely.
 	daemon.SweepTrashDirs(ctx, st, repoPaths)
+
+	// Reap port reservations orphaned by an interrupted teardown or a
+	// pre-release binary that soft-deleted a worktree without releasing
+	// its ports. Leaked rows are invisible to ListUsedPorts but still
+	// blocked by the (repo_id, name, port) unique index, so without this
+	// the allocator climbs out of the configured range over time.
+	daemon.SweepOrphanWorktreePorts(ctx, st)
 
 	// Enroll opt-in main worktrees BEFORE listing active worktrees so
 	// the boot resume below spawns watchers against the repo root for

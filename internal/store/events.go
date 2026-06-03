@@ -444,6 +444,37 @@ func (s *Store) PruneOldLogs(ctx context.Context, cutoffMs int64) (int64, error)
 	return total, nil
 }
 
+// PruneStaleHashCaches removes file_hashes / dir_hashes rows whose
+// cached_at is older than cutoffMs. These caches are keyed by on-disk
+// path with no worktree/repo FK, so they can't be cascade-cleaned when
+// a worktree is torn down — and the bulk of rows accumulate under
+// deleted worktree paths that no longer exist on disk.
+//
+// Age is a reliable staleness proxy: a live path's row is touched
+// (cached_at refreshed) on every fingerprint scan, so anything older
+// than the retention window belongs to a path that's gone. The cost of
+// an over-eager prune is a single recompute on the next access — these
+// are pure caches. A cutoff <= 0 is a no-op (retention disabled).
+func (s *Store) PruneStaleHashCaches(ctx context.Context, cutoffMs int64) (int64, error) {
+	if cutoffMs <= 0 {
+		return 0, nil
+	}
+	var total int64
+	for _, stmt := range []string{
+		"DELETE FROM file_hashes WHERE cached_at < ?",
+		"DELETE FROM dir_hashes WHERE cached_at < ?",
+	} {
+		res, err := s.DB.ExecContext(ctx, stmt, cutoffMs)
+		if err != nil {
+			return total, fmt.Errorf("prune hash cache: %w", err)
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			total += n
+		}
+	}
+	return total, nil
+}
+
 // placeholders returns "?, ?, ?" repeated n times.
 // PurgeEvents deletes events matching the filter and returns the row
 // count removed. Only SinceMs / UntilMs / RepoID / WorktreeID /

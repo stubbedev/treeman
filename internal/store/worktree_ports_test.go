@@ -131,6 +131,48 @@ func TestSoftDeleteAloneDoesNotFreePortForReuse(t *testing.T) {
 	}
 }
 
+// TestPurgeDeletedWorktreePorts pins the boot sweep: a port left behind
+// by a soft-deleted worktree (interrupted teardown, or a pre-release
+// binary that never released) is reaped and becomes reusable, while a
+// live worktree's port is untouched.
+func TestPurgeDeletedWorktreePorts(t *testing.T) {
+	ctx := context.Background()
+	st, repoID, wtID := openTestStoreWithWt(t)
+	if err := st.AllocateWorktreePort(ctx, repoID, wtID, "octane", 8042); err != nil {
+		t.Fatal(err)
+	}
+	live, err := st.EnsureWorktree(ctx, repoID, "/repos/test/.worktrees/feature-y", "feature_y", "feature/y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AllocateWorktreePort(ctx, repoID, live, "octane", 8043); err != nil {
+		t.Fatal(err)
+	}
+	// Soft-delete wtID, leaving its 8042 row orphaned (the leak shape).
+	if err := st.MarkWorktreeDeleted(ctx, wtID); err != nil {
+		t.Fatal(err)
+	}
+	n, err := st.PurgeDeletedWorktreePorts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("want 1 row reaped, got %d", n)
+	}
+	// Reaped port is now reusable by a fresh worktree.
+	wt3, err := st.EnsureWorktree(ctx, repoID, "/repos/test/.worktrees/feature-z", "feature_z", "feature/z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AllocateWorktreePort(ctx, repoID, wt3, "octane", 8042); err != nil {
+		t.Fatalf("port should be reusable after purge, got %v", err)
+	}
+	// The live worktree's port survived the sweep.
+	if got, _ := st.LookupWorktreePort(ctx, live, "octane"); got != 8043 {
+		t.Fatalf("live worktree port should survive purge, got %d", got)
+	}
+}
+
 func TestReleaseWorktreePorts(t *testing.T) {
 	ctx := context.Background()
 	st, repoID, wtID := openTestStoreWithWt(t)
