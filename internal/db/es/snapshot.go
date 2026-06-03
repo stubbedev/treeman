@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -180,7 +181,7 @@ func (d *Driver) cloneIndices(ctx context.Context, srcIndices []string, srcPrefi
 		rest := strings.TrimPrefix(src, srcPrefix)
 		dst := dstPrefix + rest
 		g.Go(func() error {
-			return d.cloneOneIndex(gctx, src, dst)
+			return d.cloneOneIndex(gctx, src, dst, srcPrefix, dstPrefix)
 		})
 	}
 	return g.Wait()
@@ -190,7 +191,7 @@ func (d *Driver) cloneIndices(ctx context.Context, srcIndices []string, srcPrefi
 // dance for a single index. Idempotent against pre-existing dst —
 // we don't drop it here (the caller's `DropMatching` already cleared
 // the prefix).
-func (d *Driver) cloneOneIndex(ctx context.Context, src, dst string) error {
+func (d *Driver) cloneOneIndex(ctx context.Context, src, dst, srcPrefix, dstPrefix string) error {
 	// 1. Mark src read-only.
 	if err := d.setIndexBlock(ctx, src, true); err != nil {
 		return fmt.Errorf("set read-only on %s: %w", src, err)
@@ -215,6 +216,86 @@ func (d *Driver) cloneOneIndex(ctx context.Context, src, dst string) error {
 	// from the source, so the dst comes up read-only — flip it.
 	if err := d.setIndexBlock(ctx, dst, false); err != nil {
 		return fmt.Errorf("clear read-only on clone %s: %w", dst, err)
+	}
+
+	// 4. Replicate aliases. `_clone` does NOT carry the source index's
+	// aliases, so an app that reads through `<index>_alias` 404s against
+	// the clone unless we re-create them with the prefix rewritten into
+	// the destination namespace.
+	if err := d.copyAliases(ctx, src, dst, srcPrefix, dstPrefix); err != nil {
+		return fmt.Errorf("copy aliases %s → %s: %w", src, dst, err)
+	}
+	return nil
+}
+
+// copyAliases re-creates every alias on src onto dst, rewriting a leading
+// srcPrefix on the alias name to dstPrefix so the alias lands in the
+// destination namespace (`dev_..._alias` → `kho_<slug>_..._alias`). Alias
+// metadata (filter, routing, is_write_index) is carried through verbatim.
+//
+// ES `_clone` copies index data + settings but not aliases, so this is the
+// missing half of a faithful per-index clone. Aliases whose name does not
+// start with srcPrefix are skipped: a shared/un-prefixed alias replicated
+// onto a branch-scoped clone would resolve across namespaces and break the
+// per-worktree isolation the prefix exists to enforce.
+func (d *Driver) copyAliases(ctx context.Context, src, dst, srcPrefix, dstPrefix string) error {
+	body, err := d.get(ctx, "/"+escSeg(src)+"/_alias")
+	if err != nil {
+		return err
+	}
+	var parsed map[string]struct {
+		Aliases map[string]map[string]json.RawMessage `json:"aliases"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return fmt.Errorf("parse alias response: %w", err)
+	}
+
+	type action struct {
+		Add map[string]json.RawMessage `json:"add"`
+	}
+	var actions []action
+	for _, idx := range parsed {
+		for name, meta := range idx.Aliases {
+			if !strings.HasPrefix(name, srcPrefix) {
+				continue
+			}
+			add := make(map[string]json.RawMessage, len(meta)+2)
+			maps.Copy(add, meta)
+			idxJSON, err := json.Marshal(dst)
+			if err != nil {
+				return fmt.Errorf("marshal index name: %w", err)
+			}
+			aliasJSON, err := json.Marshal(dstPrefix + strings.TrimPrefix(name, srcPrefix))
+			if err != nil {
+				return fmt.Errorf("marshal alias name: %w", err)
+			}
+			add["index"] = idxJSON
+			add["alias"] = aliasJSON
+			actions = append(actions, action{Add: add})
+		}
+	}
+	if len(actions) == 0 {
+		return nil
+	}
+
+	payload, err := json.Marshal(map[string]any{"actions": actions})
+	if err != nil {
+		return err
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, d.Base+"/_aliases",
+		bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := d.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /_aliases: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	rb, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("POST /_aliases: read body: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("POST /_aliases → HTTP %d: %s", resp.StatusCode, rb)
 	}
 	return nil
 }
