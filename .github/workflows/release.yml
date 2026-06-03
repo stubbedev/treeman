@@ -26,6 +26,11 @@ jobs:
         # behind a single docker daemon.
         batch: [engines, fw1, fw2, matrix, watcher, features, cli]
     timeout-minutes: 60
+    # Hoisted to job level so the login step's `if:` can read it —
+    # `secrets.*` isn't usable directly in a step `if`, and a step's
+    # own `env:` isn't in scope when its `if` is evaluated.
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -35,6 +40,21 @@ jobs:
       - uses: extractions/setup-just@v4
       - name: docker preflight
         run: docker version && docker compose version
+      # Authenticate to Docker Hub when credentials are configured.
+      # Raises the anonymous per-IP pull ceiling and gives steadier
+      # routing; skipped automatically on forks / runs without the
+      # secret so the suite still works unauthenticated.
+      - name: Log in to Docker Hub
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Warm the local image cache with retry before the suite runs, so
+      # a transient Docker Hub timeout retries here instead of failing a
+      # test's cold `docker compose up`.
+      - name: Pre-pull e2e images
+        run: just e2e-prepull ${{ matrix.batch }}
       - name: run e2e batch
         run: just test-e2e ${{ matrix.batch }}
 

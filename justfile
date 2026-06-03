@@ -142,6 +142,52 @@ test-e2e batch="all" parallel="4":
         run_batch "$SEL"
     fi
 
+# Pre-pull every docker image an e2e batch needs, with retry, so the
+# suite's own `docker compose up --wait` hits a warm local cache
+# instead of racing a cold pull against a flaky Docker Hub. Transient
+# registry timeouts (context deadline / Client.Timeout) are the #1
+# source of release-e2e flakes; one retried pull up front absorbs them.
+#
+# Non-fatal by design: if a pull still fails after retries the recipe
+# returns 0 and lets the per-test compose up try again — prepull is an
+# optimisation, not a gate. BATCHES mirrors `test-e2e`; keep in sync.
+e2e-prepull batch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    declare -A BATCHES
+    BATCHES[engines]="mysql postgres mongo redis elasticsearch"
+    BATCHES[fw1]="fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
+    BATCHES[fw2]="fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
+    BATCHES[matrix]="matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
+    BATCHES[watcher]="autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
+    BATCHES[features]="clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
+    BATCHES[cli]="cli cli_engine cli_surface mcp mcp_write mongo_dump"
+
+    suites=${BATCHES[{{batch}}]:-}
+    if [ -z "$suites" ]; then
+        echo "unknown batch: {{batch}}" >&2
+        exit 2
+    fi
+
+    pull_retry() {
+        local dir=$1 n=0
+        while [ "$n" -lt 3 ]; do
+            if (cd "$dir" && docker compose pull -q); then return 0; fi
+            n=$((n + 1))
+            echo "  prepull retry $n/3 for $dir after registry error" >&2
+            sleep $((n * 10))
+        done
+        echo "  WARN: prepull failed for $dir after 3 tries; suite will pull on demand" >&2
+        return 0
+    }
+
+    for s in $suites; do
+        [ -f "e2e/$s/docker-compose.yml" ] || continue
+        echo "prepull e2e/$s"
+        pull_retry "e2e/$s"
+    done
+
 # List the e2e batch groupings used by `just test-e2e`.
 test-e2e-list:
     #!/usr/bin/env bash
