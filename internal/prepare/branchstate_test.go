@@ -392,7 +392,7 @@ func TestMigrateGateClearedOnReset(t *testing.T) {
 	if _, ok, _ := f.st.GetBranchMigrated(ctx, f.worktreeID, f.active, "develop"); !ok {
 		t.Fatal("first build should record a migrated fingerprint")
 	}
-	if err := resetActiveNamespace(ctx, f.eng, f.st, f.worktreeID, f.active); err != nil {
+	if err := resetActiveNamespace(ctx, f.eng, f.st, f.repoID, f.worktreeID, f.active); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, _ := f.st.GetBranchMigrated(ctx, f.worktreeID, f.active, "develop"); ok {
@@ -571,7 +571,7 @@ func TestResetReseedsFromParent(t *testing.T) {
 	f.assertMarker("develop")
 
 	// reset: drop durable + active, clear marker.
-	if err := resetActiveNamespace(ctx, f.eng, f.st, f.worktreeID, f.active); err != nil {
+	if err := resetActiveNamespace(ctx, f.eng, f.st, f.repoID, f.worktreeID, f.active); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := f.fake.data[f.active]; ok {

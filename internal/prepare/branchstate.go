@@ -566,7 +566,7 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 		// Active exists but treeman never recorded who owns it — adopt
 		// the current contents as THIS branch's data. Back it up; leave
 		// the data in place. (First-enable on a pre-existing DB.)
-		if err := a.eng.drv.Capture(ctx, active, a.eng.durable(active, branch)); err != nil {
+		if err := a.captureDurable(ctx, active, branch); err != nil {
 			return Outcome{}, fmt.Errorf("adopt-capture %s: %w", active, err)
 		}
 		decision = "adopt"
@@ -674,7 +674,7 @@ func (a branchScopedArgs) swapBranch(ctx context.Context, active, old, branch st
 		a.event(ctx, "capture_skip",
 			fmt.Sprintf("engine=%s active=%s branch=%s capture skipped (no writes since resume)", a.eng.engine, active, old),
 			map[string]string{"old_branch": old})
-	} else if err := a.eng.drv.Capture(ctx, active, a.eng.durable(active, old)); err != nil {
+	} else if err := a.captureDurable(ctx, active, old); err != nil {
 		return "", fmt.Errorf("capture old branch %q: %w", old, err)
 	}
 	// Advance the marker to the NEW branch the instant old's data is
@@ -884,13 +884,34 @@ func (a branchScopedArgs) event(ctx context.Context, typ, msg string, extra map[
 	_ = a.st.WriteEvent(ctx, store.LevelInfo, typ, msg, a.repoID, a.worktreeID, "", 0, fields)
 }
 
+// captureDurable captures `active` into `branch`'s durable copy and records
+// the durable in SQLite so the orphan sweep can later drop it by name. The
+// tracking-row write is best-effort: a failure must not fail the prepare —
+// the durable still exists, and the legacy forward-hash reaper still covers
+// branches deleted while their worktree is live.
+func (a branchScopedArgs) captureDurable(ctx context.Context, active, branch string) error {
+	dur := a.eng.durable(active, branch)
+	if err := a.eng.drv.Capture(ctx, active, dur); err != nil {
+		return err
+	}
+	_ = a.st.RecordBranchDurable(ctx, store.BranchDurableRow{
+		RepoID:      a.repoID,
+		WorktreeID:  a.worktreeID,
+		Engine:      a.eng.engine,
+		DBKey:       active,
+		Branch:      branch,
+		DurableName: dur,
+	})
+	return nil
+}
+
 // captureBranchScopedOnTeardown snapshots a worktree's current active
 // namespace into the current branch's durable copy before the worktree
 // is deleted, so re-creating it (or another worktree that later swaps to
 // the same branch) can resume. Best-effort: a failure must not block
 // teardown. The active namespace itself is dropped by the normal
 // teardown path afterward.
-func captureBranchScopedOnTeardown(ctx context.Context, eng *branchEngine, st *store.Store, worktreeID int64, active string) error {
+func captureBranchScopedOnTeardown(ctx context.Context, eng *branchEngine, st *store.Store, repoID, worktreeID int64, active string) error {
 	branch, ok, err := st.GetActiveBranch(ctx, worktreeID, active)
 	if err != nil || !ok || branch == "" {
 		return err
@@ -899,7 +920,22 @@ func captureBranchScopedOnTeardown(ctx context.Context, eng *branchEngine, st *s
 	if err != nil || !exists {
 		return err
 	}
-	return eng.drv.Capture(ctx, active, eng.durable(active, branch))
+	dur := eng.durable(active, branch)
+	if err := eng.drv.Capture(ctx, active, dur); err != nil {
+		return err
+	}
+	// Record so the orphan sweep can reclaim this durable once `branch` is
+	// gone — the worktree row is about to be soft-deleted, so the durable
+	// must be tracked independently of it.
+	_ = st.RecordBranchDurable(ctx, store.BranchDurableRow{
+		RepoID:      repoID,
+		WorktreeID:  worktreeID,
+		Engine:      eng.engine,
+		DBKey:       active,
+		Branch:      branch,
+		DurableName: dur,
+	})
+	return nil
 }
 
 // teardownBranchScoped handles `wt delete` for one branch_scoped
@@ -941,7 +977,7 @@ func teardownBranchScoped(
 	}
 	defer closeEng()
 
-	if capErr := captureBranchScopedOnTeardown(ctx, eng, st, worktreeID, active); capErr != nil {
+	if capErr := captureBranchScopedOnTeardown(ctx, eng, st, repoID, worktreeID, active); capErr != nil {
 		_ = st.WriteEvent(ctx, store.LevelWarn, "branch_capture_error",
 			capErr.Error(), repoID, worktreeID, "", 0, nil)
 	}
@@ -1000,7 +1036,7 @@ func ResetBranchScoped(
 		if eng == nil {
 			continue
 		}
-		rerr := resetActiveNamespace(ctx, eng, st, worktreeID, active)
+		rerr := resetActiveNamespace(ctx, eng, st, repoID, worktreeID, active)
 		closeEng()
 		if rerr != nil {
 			return rerr
@@ -1024,11 +1060,13 @@ func ResetBranchScoped(
 // (MySQL/Postgres) `Empty` recreates the database, so that adopt-empty
 // outcome was a silent data bug; `Drop` keeps reset reseeding correctly
 // across all engines.
-func resetActiveNamespace(ctx context.Context, eng *branchEngine, st *store.Store, worktreeID int64, active string) error {
+func resetActiveNamespace(ctx context.Context, eng *branchEngine, st *store.Store, repoID, worktreeID int64, active string) error {
 	// Drop the durable copy for whatever branch currently owns the active
 	// slot (so a re-seed can't restore the stale copy).
 	if branch, has, _ := st.GetActiveBranch(ctx, worktreeID, active); has && branch != "" {
-		_ = eng.drv.DropDurable(ctx, eng.durable(active, branch))
+		dur := eng.durable(active, branch)
+		_ = eng.drv.DropDurable(ctx, dur)
+		_ = st.DeleteBranchDurable(ctx, repoID, dur)
 	}
 	if err := eng.drv.Drop(ctx, active); err != nil {
 		return err
