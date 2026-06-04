@@ -97,7 +97,7 @@ func InstallSystemd(ctx context.Context) (string, error) {
 	if err := exec.CommandContext(ctx, "systemctl", "--user", "enable", "--now", "treemand").Run(); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("installed + enabled treemand.service at %s", dst), nil
+	return "installed + enabled treemand.service at " + dst, nil
 }
 
 // UninstallSystemd disables the unit and removes the file.
@@ -145,5 +145,5 @@ func UninstallLaunchd(ctx context.Context) (string, error) {
 	domain := fmt.Sprintf("gui/%d", uid)
 	_ = exec.CommandContext(ctx, "launchctl", "bootout", domain, dst).Run()
 	_ = os.Remove(dst)
-	return fmt.Sprintf("uninstalled %s", LaunchdLabel), nil
+	return "uninstalled " + LaunchdLabel, nil
 }

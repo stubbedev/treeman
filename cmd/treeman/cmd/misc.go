@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -949,13 +948,6 @@ func daemonAutoStartInstalled() bool {
 		}
 	}
 	return false
-}
-
-func mustResolveTreemand() string {
-	if p, err := exec.LookPath("treemand"); err == nil {
-		return p
-	}
-	return "/usr/local/bin/treemand"
 }
 
 // FwCmd — `treeman fw detect` lists detected migration + test

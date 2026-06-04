@@ -533,12 +533,13 @@ func configValidateTool(
 			err = cfg.Validate()
 		}
 		if err != nil {
+			//nolint:nilerr // validation failure is tool output, not a transport error
 			return nil, configValidateOut{
 				OK:    false,
 				Scope: "global",
 				Path:  path,
 				Error: err.Error(),
-			}, nil //nolint:nilerr // validation failure is tool output, not a transport error
+			}, nil
 		}
 		return nil, configValidateOut{OK: true, Scope: "global", Path: path}, nil
 	}
@@ -786,14 +787,54 @@ type logsQueryOut struct {
 	Events []store.Event `json:"events"`
 }
 
-func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryIn) (*mcpsdk.CallToolResult, logsQueryOut, error) {
-	limit := in.Limit
+func clampLogLimit(limit int) int {
 	if limit <= 0 {
-		limit = 50
+		return 50
 	}
 	if limit > 1000 {
-		limit = 1000
+		return 1000
 	}
+	return limit
+}
+
+// applyLogRepoScope resolves in.Repo/in.Worktree into RepoID/WorktreeID on f.
+func applyLogRepoScope(ctx context.Context, st *store.Store, in logsQueryIn, f *store.EventFilter) error {
+	if in.Repo == "" && in.Worktree == "" {
+		return nil
+	}
+	repoRoot, err := resolveRepo(in.Repo)
+	if err == nil && repoRoot != "" {
+		if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
+			f.RepoID = rid
+		}
+	}
+	if in.Worktree != "" {
+		wid, _ := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
+		if wid == 0 {
+			return fmt.Errorf("no worktree matches %q", in.Worktree)
+		}
+		f.WorktreeID = wid
+	}
+	return nil
+}
+
+// filterEventsByRegex keeps events whose message or payload matches re,
+// capping the result at limit.
+func filterEventsByRegex(events []store.Event, re *regexp.Regexp, limit int) []store.Event {
+	filtered := events[:0]
+	for _, e := range events {
+		if re.MatchString(e.Message) || re.MatchString(e.PayloadJSON) {
+			filtered = append(filtered, e)
+			if len(filtered) >= limit {
+				break
+			}
+		}
+	}
+	return filtered
+}
+
+func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryIn) (*mcpsdk.CallToolResult, logsQueryOut, error) {
+	limit := clampLogLimit(in.Limit)
 	var re *regexp.Regexp
 	if in.Regex != "" {
 		var err error
@@ -829,36 +870,15 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 		return nil, logsQueryOut{}, err
 	}
 	defer func() { _ = st.Close() }()
-	if in.Repo != "" || in.Worktree != "" {
-		repoRoot, err := resolveRepo(in.Repo)
-		if err == nil && repoRoot != "" {
-			if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
-				f.RepoID = rid
-			}
-		}
-		if in.Worktree != "" {
-			wid, _ := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
-			if wid == 0 {
-				return nil, logsQueryOut{}, fmt.Errorf("no worktree matches %q", in.Worktree)
-			}
-			f.WorktreeID = wid
-		}
+	if err := applyLogRepoScope(ctx, st, in, &f); err != nil {
+		return nil, logsQueryOut{}, err
 	}
 	events, err := st.QueryEvents(ctx, f)
 	if err != nil {
 		return nil, logsQueryOut{}, err
 	}
 	if re != nil {
-		filtered := events[:0]
-		for _, e := range events {
-			if re.MatchString(e.Message) || re.MatchString(e.PayloadJSON) {
-				filtered = append(filtered, e)
-				if len(filtered) >= limit {
-					break
-				}
-			}
-		}
-		events = filtered
+		events = filterEventsByRegex(events, re, limit)
 	}
 	for i := range events {
 		events[i].Message = redactSecrets(events[i].Message)

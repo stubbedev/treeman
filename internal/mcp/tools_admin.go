@@ -2,9 +2,11 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -174,7 +176,7 @@ func mainWorktreeEnable(ctx context.Context, repoRoot string) (*mcpsdk.CallToolR
 	out := mainWorktreeOut{Action: "enable", Repo: repoRoot, Enabled: true, CurrentBranch: detectBranch(repoRoot)}
 	if err := requestConfigReload(ctx, repoRoot); err != nil {
 		out.Detail = "config written but daemon reload failed (" + err.Error() + ") — restart treemand to apply"
-		return nil, out, nil
+		return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error
 	}
 	// Reload is synchronous; the main row exists by the time it returns,
 	// so finalize routes through the main-wt path and fires on-create-*.
@@ -186,7 +188,7 @@ func mainWorktreeEnable(ctx context.Context, repoRoot string) (*mcpsdk.CallToolR
 	})
 	if err != nil || resp.Kind == rpc.KindError {
 		out.Detail = "enabled + reloaded; finalize dispatch failed — run worktree_finalize at the repo root to retry"
-		return nil, out, nil
+		return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error
 	}
 	out.Detail = "enabled — setup hooks + prepare queued (follow with logs_subscribe)"
 	writeMCPEvent(context.Background(), "main_worktree", "enabled "+repoRoot, 0, map[string]string{"repo": repoRoot})
@@ -210,13 +212,13 @@ func mainWorktreeDisable(ctx context.Context, repoRoot string, purge bool) (*mcp
 	out := mainWorktreeOut{Action: "disable", Repo: repoRoot, Enabled: false, CurrentBranch: detectBranch(repoRoot)}
 	if err := requestConfigReload(ctx, repoRoot); err != nil {
 		out.Detail = "config written but daemon reload failed (" + err.Error() + ") — restart treemand to apply"
-		return nil, out, nil
+		return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error
 	}
 	if cfgForPurge != nil {
 		n, err := purgeMainDatabases(ctx, repoRoot, cfgForPurge)
 		if err != nil {
 			out.Detail = "disabled; purge failed: " + err.Error()
-			return nil, out, nil
+			return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error
 		}
 		out.Purged = n
 	}
@@ -294,14 +296,7 @@ func purgeMainDatabases(ctx context.Context, repoRoot string, cfg *config.Config
 
 	branches := localBranches(ctx, repoRoot)
 	if cur := detectBranch(repoRoot); cur != "" {
-		seen := false
-		for _, b := range branches {
-			if b == cur {
-				seen = true
-				break
-			}
-		}
-		if !seen {
+		if !slices.Contains(branches, cur) {
 			branches = append(branches, cur)
 		}
 	}
@@ -445,7 +440,7 @@ func notifyTestTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in notifyTes
 	if backend == "none" {
 		return nil, notifyTestOut{
 				Backend: "none",
-			}, fmt.Errorf(
+			}, errors.New(
 				"backend is \"none\" — it mutes all notifications; pass backend=auto|notify-send|osascript to probe a real sender",
 			)
 	}

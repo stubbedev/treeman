@@ -86,32 +86,7 @@ func registerWriteTools(srv *mcpsdk.Server) {
 		Annotations: writeAnno("Restore config generation", true, true, false),
 	}, configRestoreTool)
 
-	// In-process registry mutations. No shell-out, no daemon dependency
-	// — agents can reconcile drift the same way `treeman wt
-	// register|unregister` would.
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "registry_register",
-		Description: "Add a WORKTREE row to SQLite without touching git. Use when a worktree exists on disk (e.g. created via raw `git worktree add`) but treeman doesn't know about it. Idempotent. For drift in an unknown direction use registry_repair.",
-		Annotations: writeAnno("Register worktree", false, true, false),
-	}, registryRegisterTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "registry_unregister",
-		Description: "Mark a WORKTREE deleted in SQLite without touching git or external resources (DBs + on-disk path stay). Use when the on-disk worktree was removed externally. Pass dry_run=true to preview which row would be marked, ack=true to skip confirmation. Idempotent.",
-		Annotations: writeAnno("Unregister worktree", true, true, false),
-	}, registryUnregisterTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "registry_repair",
-		Description: "Reconcile the SQLite worktree registry against `git worktree list` — registers what git knows that SQLite doesn't and marks deleted what SQLite knows that git doesn't. Use when drift direction is unknown.",
-		Annotations: writeAnno("Repair registry", true, true, true),
-	}, registryRepairTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "worktree_repair",
-		Description: "Recover one stuck/broken worktree end-to-end: ensure registry row, ensure ports allocated, dispatch finalize via the daemon (or run prepare inline when the daemon is unreachable), and check each snapshot for orphan templates. Returns one result per action. Idempotent — safe to call when nothing is broken.",
-		Annotations: writeAnno("Repair worktree", false, true, true),
-	}, worktreeRepairTool)
+	registerRegistryWriteTools(srv)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "repo_remove",
@@ -163,6 +138,35 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 	registerEngineWriteTools(srv)
 	registerSyncWriteTools(srv)
+}
+
+// registerRegistryWriteTools binds in-process registry mutations. No
+// shell-out, no daemon dependency — agents can reconcile drift the same
+// way `treeman wt register|unregister` would.
+func registerRegistryWriteTools(srv *mcpsdk.Server) {
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "registry_register",
+		Description: "Add a WORKTREE row to SQLite without touching git. Use when a worktree exists on disk (e.g. created via raw `git worktree add`) but treeman doesn't know about it. Idempotent. For drift in an unknown direction use registry_repair.",
+		Annotations: writeAnno("Register worktree", false, true, false),
+	}, registryRegisterTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "registry_unregister",
+		Description: "Mark a WORKTREE deleted in SQLite without touching git or external resources (DBs + on-disk path stay). Use when the on-disk worktree was removed externally. Pass dry_run=true to preview which row would be marked, ack=true to skip confirmation. Idempotent.",
+		Annotations: writeAnno("Unregister worktree", true, true, false),
+	}, registryUnregisterTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "registry_repair",
+		Description: "Reconcile the SQLite worktree registry against `git worktree list` — registers what git knows that SQLite doesn't and marks deleted what SQLite knows that git doesn't. Use when drift direction is unknown.",
+		Annotations: writeAnno("Repair registry", true, true, true),
+	}, registryRepairTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "worktree_repair",
+		Description: "Recover one stuck/broken worktree end-to-end: ensure registry row, ensure ports allocated, dispatch finalize via the daemon (or run prepare inline when the daemon is unreachable), and check each snapshot for orphan templates. Returns one result per action. Idempotent — safe to call when nothing is broken.",
+		Annotations: writeAnno("Repair worktree", false, true, true),
+	}, worktreeRepairTool)
 }
 
 // ─── prepare_run ──────────────────────────────────────────────────
@@ -1001,6 +1005,40 @@ type configSetOut struct {
 	Bytes        int    `json:"bytes"`
 }
 
+// loadConfigDoc reads p and unmarshals it into a yaml.Node. A missing or
+// empty file yields a seeded empty document (a not-yet-created config can
+// take its first key); other read errors surface.
+func loadConfigDoc(p string) (yaml.Node, error) {
+	var doc yaml.Node
+	raw, err := os.ReadFile(p)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return doc, fmt.Errorf("read %s: %w", p, err)
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return doc, fmt.Errorf("parse %s: %w", p, err)
+	}
+	if doc.Kind == 0 {
+		doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode}}}
+	}
+	return doc, nil
+}
+
+// decodePrevJSON renders the pre-patch node as JSON, or "" if absent/unencodable.
+func decodePrevJSON(prev *yaml.Node) string {
+	if prev == nil {
+		return ""
+	}
+	var prevVal any
+	if err := prev.Decode(&prevVal); err != nil {
+		return ""
+	}
+	b, err := json.Marshal(prevVal)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn) (*mcpsdk.CallToolResult, configSetOut, error) {
 	if in.Path == "" {
 		return nil, configSetOut{}, errors.New("path is required")
@@ -1009,21 +1047,9 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 	if err != nil {
 		return nil, configSetOut{}, err
 	}
-	// Missing file is not an error — start from an empty document so a
-	// first key can be set into a not-yet-created config (notably the
-	// user-global file). Other read errors still surface.
-	raw, err := os.ReadFile(p)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, configSetOut{}, fmt.Errorf("read %s: %w", p, err)
-	}
-	var doc yaml.Node
-	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return nil, configSetOut{}, fmt.Errorf("parse %s: %w", p, err)
-	}
-	// An empty/missing file unmarshals to a zero node — seed an empty
-	// document so yamlpatch.Set has a mapping to graft the first key onto.
-	if doc.Kind == 0 {
-		doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode}}}
+	doc, err := loadConfigDoc(p)
+	if err != nil {
+		return nil, configSetOut{}, err
 	}
 	segs, err := yamlpatch.ParsePath(in.Path)
 	if err != nil {
@@ -1057,15 +1083,7 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 	if err := atomicWrite(histRoot, p, body); err != nil {
 		return nil, configSetOut{}, err
 	}
-	prevJSON := ""
-	if prev != nil {
-		var prevVal any
-		if err := prev.Decode(&prevVal); err == nil {
-			if b, err := json.Marshal(prevVal); err == nil {
-				prevJSON = string(b)
-			}
-		}
-	}
+	prevJSON := decodePrevJSON(prev)
 	newJSON, err := json.Marshal(in.Value)
 	if err != nil {
 		return nil, configSetOut{}, fmt.Errorf("marshal value: %w", err)
