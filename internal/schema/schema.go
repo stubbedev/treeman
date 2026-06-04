@@ -25,9 +25,17 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 )
 
-// URL is the canonical upstream URL for the generated schema. Used
-// by `treeman init` (modeline default) and the `--url` install mode.
+// URL is the canonical upstream URL for the REPO-scoped schema that
+// validates a per-repo `.treeman.yaml`. Used by `treeman init`
+// (modeline default) and the `--url` install mode. CI publishes the
+// repo-scoped schema at this path (see .github/workflows/ci.yml).
 const URL = "https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json"
+
+// GlobalURL is the canonical upstream URL for the GLOBAL-scoped schema
+// that validates `~/.config/treeman/config.yaml`. CI publishes it
+// alongside the repo schema so editors can validate the global config
+// without a local `schema install --global`.
+const GlobalURL = "https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.global.schema.json"
 
 // Reflect returns the live *jsonschema.Schema for config.Config,
 // generated via reflection over the Go types + their doc comments.

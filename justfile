@@ -234,11 +234,12 @@ sync-schema:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p schemas
-    go run ./cmd/treeman schema dump --scope repo --out schemas/treeman.schema.json
-    if [ -n "$(git status --porcelain schemas/treeman.schema.json)" ]; then
-        echo "sync-schema: regenerated schemas/treeman.schema.json"
+    go run ./cmd/treeman schema dump --scope repo   --out schemas/treeman.schema.json
+    go run ./cmd/treeman schema dump --scope global --out schemas/treeman.global.schema.json
+    if [ -n "$(git status --porcelain schemas/treeman.schema.json schemas/treeman.global.schema.json)" ]; then
+        echo "sync-schema: regenerated schemas/"
     else
-        echo "sync-schema: schemas/treeman.schema.json already in sync"
+        echo "sync-schema: schemas already in sync"
     fi
 
 clean:

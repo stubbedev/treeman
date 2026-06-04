@@ -144,35 +144,40 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Regenerate `schemas/treeman.schema.json` from the current
-      # config.Config Go types. On master pushes drift is auto-
-      # committed; on PRs we fail so reviewers see the drift.
-      - name: regenerate treeman.schema.json
+      # Regenerate the published JSON schemas from the current
+      # config.Config Go types. Two scoped schemas are published:
+      #   treeman.schema.json        — repo scope, validates .treeman.yaml
+      #   treeman.global.schema.json — global scope, validates the
+      #                                user-global config.yaml
+      # On master pushes drift is auto-committed; on PRs we fail so
+      # reviewers see the drift.
+      - name: regenerate JSON schemas
         run: |
           set -euo pipefail
           mkdir -p schemas
-          go run ./cmd/treeman schema dump --out schemas/treeman.schema.json
+          go run ./cmd/treeman schema dump --scope repo   --out schemas/treeman.schema.json
+          go run ./cmd/treeman schema dump --scope global --out schemas/treeman.global.schema.json
 
-      - name: assert schema in sync (PR)
+      - name: assert schemas in sync (PR)
         if: github.event_name == 'pull_request'
         run: |
-          if [ -n "$(git status --porcelain schemas/treeman.schema.json)" ]; then
-            echo "::error::schemas/treeman.schema.json is stale. Run 'just sync-schema' locally and commit the result."
-            git --no-pager diff schemas/treeman.schema.json
+          if [ -n "$(git status --porcelain schemas/treeman.schema.json schemas/treeman.global.schema.json)" ]; then
+            echo "::error::JSON schemas are stale. Run 'just sync-schema' locally and commit the result."
+            git --no-pager diff schemas/treeman.schema.json schemas/treeman.global.schema.json
             exit 1
           fi
 
       - name: auto-commit schema bump (master)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
-          if [ -z "$(git status --porcelain schemas/treeman.schema.json)" ]; then
-            echo "schemas/treeman.schema.json already in sync; nothing to commit."
+          if [ -z "$(git status --porcelain schemas/treeman.schema.json schemas/treeman.global.schema.json)" ]; then
+            echo "schemas already in sync; nothing to commit."
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add schemas/treeman.schema.json
-          git commit -m 'chore: auto-bump treeman.schema.json [skip ci]'
+          git add schemas/treeman.schema.json schemas/treeman.global.schema.json
+          git commit -m 'chore: auto-bump JSON schemas [skip ci]'
           git push origin HEAD:master
 
   docs:

@@ -75,7 +75,7 @@ func WriteGlobalYAML(force bool) (path string, created bool, body string, err er
 // against the global-scoped schema, flagging repo-only keys.
 func RenderGlobalTemplate() string {
 	root := mapNode()
-	root.HeadComment = "yaml-language-server: $schema=" + schema.URL +
+	root.HeadComment = "yaml-language-server: $schema=" + schema.GlobalURL +
 		"\n\ntreeman user-global config — machine-wide defaults shared by every repo.\n" +
 		"Repo-specific blocks (databases, patches, hooks, main_worktree, env_sources)\n" +
 		"belong in each project's .treeman.yaml, not here."

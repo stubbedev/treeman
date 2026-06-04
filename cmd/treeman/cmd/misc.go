@@ -745,7 +745,16 @@ func schemaInstall(ctx context.Context, c *cli.Command) error {
 		PrintOK("wrote %s", resolved)
 	}
 	if changed {
-		PrintOK("updated modeline in .treeman.yaml → %s", resolved)
+		// The modeline file depends on the target: --global rewrites the
+		// user-global config, every other target rewrites the repo
+		// `.treeman.yaml`. Report the file actually edited.
+		modelineFile := ".treeman.yaml"
+		if target == schema.TargetGlobal {
+			if gp, ok := config.GlobalConfigPath(); ok {
+				modelineFile = gp
+			}
+		}
+		PrintOK("updated modeline in %s → %s", modelineFile, resolved)
 	}
 	return nil
 }
