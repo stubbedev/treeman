@@ -20,6 +20,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -52,9 +53,15 @@ func registerEngineReadTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "db_query",
-		Description: "Run a READ-ONLY query against a configured engine — verifies migration effects or inspects live data. SQL: SELECT/SHOW/EXPLAIN/DESCRIBE/WITH only (mutations refused). Mongo: find-style filter JSON. ES: _search body. Redis: GET/MGET/SMEMBERS/HGETALL/KEYS/SCAN/EXISTS/TYPE/TTL/LRANGE/ZRANGE/HKEYS/HVALS/HGET/HMGET/DBSIZE/INFO/PING.",
-		Annotations: readOnlyAnno("Run read-only query", true),
+		Description: "Read OR write a configured engine directly — no shelling out to mysql/psql/mongosh/redis-cli. Default write=false is READ-ONLY (SQL: SELECT/SHOW/EXPLAIN/DESCRIBE/WITH; Mongo: find-style filter JSON, or a read command_json; Redis: GET/MGET/SCAN/HGETALL/INFO/…; ES: _search body). Set write=true+ack=true to MUTATE: SQL DML/DDL (INSERT/UPDATE/DELETE/CREATE/ALTER/DROP, returns rows_affected), any Redis command, Mongo write commands via command_json ({\"insert\":…},{\"update\":…},{\"delete\":…}). ES writes use es_request. ALWAYS FILTER + PAGINATE reads: add a WHERE/filter to narrow rows, keep limit small (default 100), and when truncated=true is returned re-call with offset += limit (SQL: put your own LIMIT/OFFSET in the query) — never pull a whole table in one shot.",
+		Annotations: writeAnno("Query or mutate engine", true, false, true),
 	}, dbQueryTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "es_request",
+		Description: "Direct Elasticsearch REST passthrough using the configured ES connection (auth handled) — replaces curl for any endpoint db_query doesn't cover: _cat/indices, _cluster/health, _mapping, _settings, _aliases, doc get/index, _bulk, _search. GET/HEAD + POST reads run freely; PUT/DELETE and writing POSTs (_doc/_bulk/_update) need write=true+ack=true. For reads that can return many hits, FILTER + PAGINATE in the body (a real query plus from/size, not match_all) instead of pulling everything; _cat endpoints accept ?format=json&s=… to sort/limit. Returns {status, body|text}.",
+		Annotations: writeAnno("Elasticsearch REST", true, false, true),
+	}, esRequestTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_inspect",
@@ -396,42 +403,55 @@ func dbSchemaRedis(ctx context.Context, cfg *config.Config, db string) (map[stri
 // ─── db_query ───────────────────────────────────────────────────────
 
 type dbQueryIn struct {
-	Repo       string `json:"repo,omitempty"`
-	Engine     string `json:"engine"`
-	DB         string `json:"db"`
-	Query      string `json:"query,omitempty"       jsonschema:"SQL for mysql/postgres; raw command for redis"`
-	Collection string `json:"collection,omitempty"  jsonschema:"required for mongodb"`
-	FilterJSON string `json:"filter_json,omitempty" jsonschema:"mongodb filter document"`
-	Index      string `json:"index,omitempty"       jsonschema:"elasticsearch index name (overrides db field)"`
-	BodyJSON   string `json:"body_json,omitempty"   jsonschema:"elasticsearch _search body"`
-	Limit      int    `json:"limit,omitempty"       jsonschema:"max rows/docs returned (default 100)"`
+	Repo        string `json:"repo,omitempty"`
+	Engine      string `json:"engine"`
+	DB          string `json:"db"`
+	Query       string `json:"query,omitempty"        jsonschema:"SQL for mysql/postgres; raw command for redis"`
+	Collection  string `json:"collection,omitempty"   jsonschema:"mongodb collection name (read/find path)"`
+	FilterJSON  string `json:"filter_json,omitempty"  jsonschema:"mongodb filter document (read/find path)"`
+	CommandJSON string `json:"command_json,omitempty" jsonschema:"mongodb: a raw command document run via RunCommand, e.g. {\"insert\":\"users\",\"documents\":[...]}, {\"aggregate\":\"c\",\"pipeline\":[...],\"cursor\":{}}, {\"count\":\"c\"}. Read commands run with write=false; write commands need write=true+ack."`
+	Index       string `json:"index,omitempty"        jsonschema:"elasticsearch index name (overrides db field)"`
+	BodyJSON    string `json:"body_json,omitempty"    jsonschema:"elasticsearch _search body (carry your own query/from/size for full control)"`
+	Limit       int    `json:"limit,omitempty"        jsonschema:"PAGE SIZE — max rows/docs returned (default 100, hard cap). Keep small; never use this tool to dump a whole table — filter first, then page."`
+	Offset      int    `json:"offset,omitempty"       jsonschema:"pagination offset (mongo skip / ES from). For SQL, put OFFSET in the query itself. Page by re-calling with offset += limit while truncated=true."`
+	Write       bool   `json:"write,omitempty"        jsonschema:"allow MUTATIONS: SQL DML/DDL (INSERT/UPDATE/DELETE/CREATE/ALTER/DROP), any redis command, mongo write commands. Default false = read-only. Requires ack=true. ES writes go through es_request."`
+	Ack         bool   `json:"ack,omitempty"          jsonschema:"required with write=true — confirms intent to mutate live engine data (irreversible)."`
 }
 type dbQueryOut struct {
-	Engine  string   `json:"engine"`
-	Rows    []any    `json:"rows"`
-	Columns []string `json:"columns,omitempty"`
+	Engine    string   `json:"engine"`
+	Wrote     bool     `json:"wrote,omitempty"`
+	Rows      []any    `json:"rows"`
+	Columns   []string `json:"columns,omitempty"`
+	Affected  *int64   `json:"rows_affected,omitempty"`
+	Truncated bool     `json:"truncated,omitempty"     jsonschema:"true when the page filled to limit — more rows likely exist; re-call with offset += limit (or a tighter filter)"`
 }
 
 func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (*mcpsdk.CallToolResult, dbQueryOut, error) {
 	if in.Limit <= 0 {
 		in.Limit = 100
 	}
+	// Mutations are irreversible: write=true must be paired with an
+	// explicit ack so an agent can't drop a table on a stray flag.
+	if in.Write && !in.Ack {
+		return nil, dbQueryOut{}, errors.New("write=true requires ack=true (you are about to mutate live engine data)")
+	}
 	cfg, err := loadCfgForRepo(in.Repo)
 	if err != nil {
 		return nil, dbQueryOut{}, err
 	}
-	out := dbQueryOut{Engine: in.Engine}
+	out := dbQueryOut{Engine: in.Engine, Wrote: in.Write}
 	var rows []any
 	var cols []string
+	var affected *int64
 	fam, ok := engine.Canonical(in.Engine)
 	if !ok {
 		return nil, out, fmt.Errorf("unsupported engine: %s", in.Engine)
 	}
 	switch fam {
 	case engine.FamilyMySQL:
-		rows, cols, err = dbQueryMySQL(ctx, cfg, in)
+		rows, cols, affected, err = dbQueryMySQL(ctx, cfg, in)
 	case engine.FamilyPostgres:
-		rows, cols, err = dbQueryPostgres(ctx, cfg, in)
+		rows, cols, affected, err = dbQueryPostgres(ctx, cfg, in)
 	case engine.FamilyMongo:
 		rows, err = dbQueryMongo(ctx, cfg, in)
 	case engine.FamilyES:
@@ -442,49 +462,95 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 	if err != nil {
 		return nil, out, err
 	}
-	out.Rows, out.Columns = rows, cols
+	out.Rows, out.Columns, out.Affected = rows, cols, affected
+	// A full page signals there's likely more — nudge the agent to
+	// paginate (offset += limit) or tighten the filter rather than
+	// assume it has seen everything.
+	if !in.Write && len(rows) >= in.Limit {
+		out.Truncated = true
+	}
 	return nil, out, nil
 }
 
-func dbQueryMySQL(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, []string, error) {
-	if err := assertReadOnlySQL(in.Query); err != nil {
-		return nil, nil, err
+func dbQueryMySQL(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, []string, *int64, error) {
+	if !in.Write {
+		if err := assertReadOnlySQL(in.Query); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() { _ = drv.Close() }()
 	qdb, err := ident.QuoteMySQL(in.DB)
 	if err != nil {
-		return nil, nil, fmt.Errorf("db %q: %w", in.DB, err)
+		return nil, nil, nil, fmt.Errorf("db %q: %w", in.DB, err)
 	}
 	if _, err := drv.DB.ExecContext(ctx, "USE "+qdb); err != nil {
-		return nil, nil, fmt.Errorf("use %s: %w", in.DB, err)
+		return nil, nil, nil, fmt.Errorf("use %s: %w", in.DB, err)
 	}
-	return runSQLQuery(ctx, drv.DB, in.Query, in.Limit)
+	if in.Write {
+		rows, aff, err := execSQL(ctx, drv.DB, in.Query)
+		return rows, nil, aff, err
+	}
+	rows, cols, err := runSQLQuery(ctx, drv.DB, in.Query, in.Limit)
+	return rows, cols, nil, err
 }
 
-func dbQueryPostgres(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, []string, error) {
-	if err := assertReadOnlySQL(in.Query); err != nil {
-		return nil, nil, err
+func dbQueryPostgres(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, []string, *int64, error) {
+	if !in.Write {
+		if err := assertReadOnlySQL(in.Query); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() { _ = drv.Close() }()
 	scoped, err := drv.OpenScoped(ctx, in.DB)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() { _ = scoped.Close() }()
-	return runSQLQuery(ctx, scoped, in.Query, in.Limit)
+	if in.Write {
+		rows, aff, err := execSQL(ctx, scoped, in.Query)
+		return rows, nil, aff, err
+	}
+	rows, cols, err := runSQLQuery(ctx, scoped, in.Query, in.Limit)
+	return rows, cols, nil, err
+}
+
+// execSQL runs a mutating statement and reports rows-affected (plus the
+// driver's last-insert-id when it exposes a useful one). The write path
+// for db_query's SQL engines.
+func execSQL(ctx context.Context, db *sql.DB, q string) ([]any, *int64, error) {
+	res, err := db.ExecContext(ctx, q)
+	if err != nil {
+		return nil, nil, err
+	}
+	aff, _ := res.RowsAffected()
+	row := map[string]any{"rows_affected": aff}
+	if id, err := res.LastInsertId(); err == nil && id > 0 {
+		row["last_insert_id"] = id
+	}
+	return []any{row}, &aff, nil
 }
 
 func dbQueryMongo(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, error) {
+	// A command document gives full read+write access via RunCommand;
+	// a bare collection+filter is the convenience read/find path.
+	if strings.TrimSpace(in.CommandJSON) != "" {
+		return dbCommandMongo(ctx, cfg, in)
+	}
+	if in.Write {
+		return nil, errors.New(
+			"mongodb write=true requires command_json (e.g. {\"insert\":\"coll\",\"documents\":[...]}); the collection+filter path is read-only find",
+		)
+	}
 	if in.Collection == "" {
-		return nil, errors.New("mongodb query: collection required")
+		return nil, errors.New("mongodb query: collection (or command_json) required")
 	}
 	drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
 	if err != nil {
@@ -498,8 +564,13 @@ func dbQueryMongo(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any,
 		}
 	}
 	col := drv.Client.Database(in.DB).Collection(in.Collection)
-	// Use limit via Find options.
-	cur, err := col.Find(ctx, filter)
+	// Push limit + skip down to the server so pagination doesn't drag
+	// the whole collection over the wire.
+	opt := options.Find().SetLimit(int64(in.Limit))
+	if in.Offset > 0 {
+		opt = opt.SetSkip(int64(in.Offset))
+	}
+	cur, err := col.Find(ctx, filter, opt)
 	if err != nil {
 		return nil, err
 	}
@@ -518,7 +589,48 @@ func dbQueryMongo(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any,
 	return rows, nil
 }
 
+// mongoReadCommands is the set of RunCommand verbs that only read. A
+// command_json whose first key isn't here is treated as a mutation and
+// needs write=true+ack.
+var mongoReadCommands = map[string]bool{
+	"find": true, "aggregate": true, "count": true, "distinct": true,
+	"listcollections": true, "listindexes": true, "dbstats": true,
+	"collstats": true, "ping": true, "buildinfo": true, "serverstatus": true,
+	"explain": true, "geosearch": true, "connectionstatus": true, "hello": true,
+}
+
+// dbCommandMongo runs a raw Mongo command via RunCommand — the unified
+// read+write path. The command's first key decides read vs write: a read
+// verb runs with write=false; anything else needs write=true+ack (already
+// gated in dbQueryTool, re-checked here so write isn't silently downgraded).
+func dbCommandMongo(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, error) {
+	var cmd bson.D
+	if err := bson.UnmarshalExtJSON([]byte(in.CommandJSON), false, &cmd); err != nil {
+		return nil, fmt.Errorf("parse command_json: %w", err)
+	}
+	if len(cmd) == 0 {
+		return nil, errors.New("command_json is empty")
+	}
+	verb := strings.ToLower(cmd[0].Key)
+	if !mongoReadCommands[verb] && !in.Write {
+		return nil, fmt.Errorf("mongo command %q is a write — set write=true and ack=true", cmd[0].Key)
+	}
+	drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = drv.Close(ctx) }()
+	var res bson.M
+	if err := drv.Client.Database(in.DB).RunCommand(ctx, cmd).Decode(&res); err != nil {
+		return nil, fmt.Errorf("run command: %w", err)
+	}
+	return []any{res}, nil
+}
+
 func dbQueryES(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, error) {
+	if in.Write {
+		return nil, errors.New("elasticsearch writes go through the es_request tool (method=PUT/POST/DELETE), not db_query")
+	}
 	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
 	if err != nil {
 		return nil, err
@@ -529,7 +641,7 @@ func dbQueryES(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, er
 	}
 	body := strings.TrimSpace(in.BodyJSON)
 	if body == "" {
-		body = `{"query":{"match_all":{}},"size":` + strconv.Itoa(in.Limit) + `}`
+		body = `{"query":{"match_all":{}},"from":` + strconv.Itoa(in.Offset) + `,"size":` + strconv.Itoa(in.Limit) + `}`
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		drv.Base+"/"+idx+"/_search", strings.NewReader(body))
@@ -565,8 +677,10 @@ func dbQueryES(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, er
 }
 
 func dbQueryRedis(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any, error) {
-	if err := assertReadOnlyRedis(in.Query); err != nil {
-		return nil, err
+	if !in.Write {
+		if err := assertReadOnlyRedis(in.Query); err != nil {
+			return nil, err
+		}
 	}
 	drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
 	if err != nil {
@@ -584,6 +698,127 @@ func dbQueryRedis(ctx context.Context, cfg *config.Config, in dbQueryIn) ([]any,
 		return nil, err
 	}
 	return []any{res}, nil
+}
+
+// ─── es_request ─────────────────────────────────────────────────────
+
+type esRequestIn struct {
+	Repo     string `json:"repo,omitempty"`
+	Method   string `json:"method,omitempty"    jsonschema:"GET|HEAD|POST|PUT|DELETE (default GET)"`
+	Path     string `json:"path"                jsonschema:"ES REST path, e.g. '_cat/indices?v', '_cluster/health', 'myindex/_mapping', 'myindex/_search', 'myindex/_doc/1', 'myindex/_bulk'. Leading slash optional."`
+	BodyJSON string `json:"body_json,omitempty" jsonschema:"request body (JSON, or newline-delimited for _bulk)"`
+	Write    bool   `json:"write,omitempty"     jsonschema:"required for mutating requests (PUT/DELETE, or POST to a write endpoint like _doc/_bulk/_update). GET/HEAD and POST reads (_search/_count) don't need it."`
+	Ack      bool   `json:"ack,omitempty"       jsonschema:"required with write=true — confirms intent to mutate the live cluster (irreversible)."`
+}
+type esRequestOut struct {
+	Status int    `json:"status"`
+	Method string `json:"method"`
+	Path   string `json:"path"`
+	Wrote  bool   `json:"wrote,omitempty"`
+	Body   any    `json:"body,omitempty"`
+	Text   string `json:"text,omitempty"  jsonschema:"raw response when not JSON (e.g. _cat plain-text output)"`
+}
+
+// esRequestTool is the direct Elasticsearch REST passthrough — it removes
+// the need to shell out to curl for any endpoint db_query's _search path
+// doesn't cover (_cat, _cluster, _mapping, _settings, _aliases, doc
+// get/index, _bulk, …). It reuses the configured ES driver's
+// authenticated HTTP client + base URL, so credentials never leave
+// treeman. Reads (GET/HEAD, and POST to read endpoints) run freely;
+// mutations require write=true+ack so an agent can't drop an index by
+// accident.
+func esRequestTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in esRequestIn) (*mcpsdk.CallToolResult, esRequestOut, error) {
+	method := strings.ToUpper(strings.TrimSpace(in.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete:
+	default:
+		return nil, esRequestOut{}, fmt.Errorf("unsupported method %q (want GET|HEAD|POST|PUT|DELETE)", method)
+	}
+	path := strings.TrimPrefix(strings.TrimSpace(in.Path), "/")
+	if path == "" {
+		return nil, esRequestOut{}, errors.New("path is required")
+	}
+	// A non-read request is a mutation — gate it behind write+ack.
+	if !esIsReadRequest(method, path) {
+		if !in.Write {
+			return nil, esRequestOut{}, fmt.Errorf("%s /%s looks like a write — set write=true (and ack=true) to run it", method, path)
+		}
+		if !in.Ack {
+			return nil, esRequestOut{}, errors.New("write=true requires ack=true (you are about to mutate the live cluster)")
+		}
+	}
+	cfg, err := loadCfgForRepo(in.Repo)
+	if err != nil {
+		return nil, esRequestOut{}, err
+	}
+	if cfg.Connections.Elasticsearch == nil {
+		return nil, esRequestOut{}, errors.New("connections.elasticsearch not configured")
+	}
+	drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
+	if err != nil {
+		return nil, esRequestOut{}, err
+	}
+	var bodyReader io.Reader
+	if b := strings.TrimSpace(in.BodyJSON); b != "" {
+		bodyReader = strings.NewReader(in.BodyJSON)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, drv.Base+"/"+path, bodyReader)
+	if err != nil {
+		return nil, esRequestOut{}, err
+	}
+	if bodyReader != nil {
+		// _bulk wants ndjson; everything else is JSON. The header is
+		// advisory for ES, but ndjson endpoints reject application/json.
+		if strings.Contains(path, "_bulk") {
+			req.Header.Set("Content-Type", "application/x-ndjson")
+		} else {
+			req.Header.Set("Content-Type", "application/json")
+		}
+	}
+	resp, err := drv.HTTP.Do(req)
+	if err != nil {
+		return nil, esRequestOut{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	buf, _ := io.ReadAll(resp.Body)
+	out := esRequestOut{Status: resp.StatusCode, Method: method, Path: path, Wrote: in.Write}
+	var parsed any
+	if json.Unmarshal(buf, &parsed) == nil {
+		out.Body = parsed
+	} else {
+		out.Text = string(buf)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, out, fmt.Errorf("es %s /%s: %s", method, path, resp.Status)
+	}
+	if in.Write {
+		writeMCPEvent(context.Background(), "es_request", method+" /"+path, 0, map[string]string{
+			"method": method,
+			"path":   path,
+		})
+	}
+	return nil, out, nil
+}
+
+// esIsReadRequest reports whether an ES REST call is non-mutating: any
+// GET/HEAD, plus POST to the read endpoints (_search/_count/_mget/…) that
+// conventionally use POST to carry a body. Everything else (PUT, DELETE,
+// POST to _doc/_bulk/_update/etc.) is treated as a write.
+func esIsReadRequest(method, path string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead:
+		return true
+	case http.MethodPost:
+		for _, ro := range []string{"_search", "_count", "_msearch", "_mget", "_field_caps", "_explain", "_validate", "_analyze", "_terms_enum", "_rank_eval"} {
+			if strings.Contains(path, ro) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ─── snapshot_inspect ───────────────────────────────────────────────

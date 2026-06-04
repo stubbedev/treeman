@@ -58,19 +58,31 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_write",
-		Description: "Overwrite .treeman.yaml with a full body. Always preview with config_diff first. Parses body before any write — invalid YAML never lands on disk. For surgical one-field edits prefer config_set.",
-		Annotations: writeAnno("Write .treeman.yaml", true, true, false),
+		Description: "Overwrite a config with a full body. scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Always preview with config_diff first. Parses + scope-checks body before any write — invalid YAML or a misplaced-layer key never lands on disk. For surgical one-field edits prefer config_set.",
+		Annotations: writeAnno("Write config", true, true, false),
 	}, configWriteTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_set",
-		Description: "Patch one .treeman.yaml field by dotted path (e.g. 'daemon.gc_interval', 'databases[0].engine'). Preserves comments + key order. Refuses to extend sequences. Validates before the write. Prefer over config_write for any single-field change.",
+		Description: "Patch one config field by dotted path (e.g. 'daemon.gc_interval', 'databases[0].engine'). scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Preserves comments + key order. Refuses to extend sequences. Scope-checks the top-level key + validates before the write. Creates the file if missing. Prefer over config_write for any single-field change.",
 		Annotations: writeAnno("Patch config field", false, true, false),
 	}, configSetTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "config_unset",
+		Description: "Delete one key (or sequence element) from a config by dotted path (e.g. 'daemon.gc_interval', 'databases[0]'). scope=repo (default) | global. Drops the key entirely — config_set with null only nulls it. Preserves comments + order, snapshots prior content to SQLite (recoverable via config_restore), validates before the write.",
+		Annotations: writeAnno("Remove config field", true, true, false),
+	}, configUnsetTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "config_delete",
+		Description: "Delete a whole config FILE from disk. scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). DESTRUCTIVE but recoverable: content is snapshotted to SQLite first (config_restore brings it back). Pass dry_run=true to preview; requires ack=true to actually delete (a bare call only previews).",
+		Annotations: writeAnno("Delete config file", true, true, false),
+	}, configDeleteTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_restore",
-		Description: "Restore a stored generation of .treeman.yaml (see config_history) back onto disk. The current content is snapshotted first, so a restore is itself reversible. Use to roll back a bad config_set/config_write.",
+		Description: "Restore a stored generation of a config (see config_history) back onto disk. scope=repo (default) | global — must match the scope the generation was recorded under. The current content is snapshotted first, so a restore is itself reversible. Use to roll back a bad config_set/config_write/config_unset/config_delete.",
 		Annotations: writeAnno("Restore config generation", true, true, false),
 	}, configRestoreTool)
 
@@ -133,7 +145,7 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_control",
-		Description: "Start/stop treemand. action ∈ {start, stop}. Prefers the installed systemd/launchd unit; otherwise forks treemand (start) or sends shutdown RPC (stop). Use only when daemon_status reports not-running.",
+		Description: "Control treemand. action ∈ {start, stop, reload, install, uninstall}. start/stop prefer the installed systemd/launchd unit (else fork/shutdown-RPC). reload re-reads config + restarts watchers without a process restart (call after a config edit; repo= scopes it). install/uninstall manage the auto-start unit.",
 		Annotations: writeAnno("Daemon control", true, true, true),
 	}, daemonControlTool)
 
@@ -239,11 +251,13 @@ func hookTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in hookIn) (*mcpsd
 // ─── config_write ─────────────────────────────────────────────────
 
 type configWriteIn struct {
-	Repo string `json:"repo,omitempty"`
-	Body string `json:"body"           jsonschema:"the full YAML body to write to .treeman.yaml"`
+	Repo  string `json:"repo,omitempty"`
+	Body  string `json:"body"            jsonschema:"the full YAML body to write"`
+	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Scope is enforced: global-only keys in a repo body (or vice-versa) are rejected before the write."`
 }
 type configWriteOut struct {
 	Path  string `json:"path"`
+	Scope string `json:"scope"`
 	Bytes int    `json:"bytes"`
 }
 
@@ -251,7 +265,7 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 	if in.Body == "" {
 		return nil, configWriteOut{}, errors.New("body is required")
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	target, histRoot, layer, err := resolveConfigTarget(in.Scope, in.Repo)
 	if err != nil {
 		return nil, configWriteOut{}, err
 	}
@@ -261,20 +275,25 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 	if err := yaml.Unmarshal([]byte(in.Body), &parsed); err != nil {
 		return nil, configWriteOut{}, fmt.Errorf("yaml parse: %w", err)
 	}
-	// Reject global-only keys in a repo file at write time (hard scope
+	// Reject keys that belong in the other layer at write time (hard scope
 	// break) — otherwise the body lands and the next load fails.
-	if err := config.CheckBodyScope([]byte(in.Body), "repo"); err != nil {
+	if err := config.CheckBodyScope([]byte(in.Body), layer); err != nil {
 		return nil, configWriteOut{}, err
 	}
-	target := filepath.Join(repoRoot, ".treeman.yaml")
-	if err := atomicWrite(repoRoot, target, []byte(in.Body)); err != nil {
+	// The global config dir may not exist yet (first write). atomicWrite's
+	// tmp+rename needs the parent present; repo dirs always exist.
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return nil, configWriteOut{}, fmt.Errorf("create config dir: %w", err)
+	}
+	if err := atomicWrite(histRoot, target, []byte(in.Body)); err != nil {
 		return nil, configWriteOut{}, err
 	}
-	writeMCPEvent(context.Background(), "config_write", "replaced .treeman.yaml", 0, map[string]string{
-		"repo":  repoRoot,
+	writeMCPEvent(context.Background(), "config_write", "replaced "+target, 0, map[string]string{
+		"scope": layer,
+		"file":  target,
 		"bytes": strconv.Itoa(len(in.Body)),
 	})
-	return nil, configWriteOut{Path: target, Bytes: len(in.Body)}, nil
+	return nil, configWriteOut{Path: target, Scope: layer, Bytes: len(in.Body)}, nil
 }
 
 // atomicWrite stashes the current on-disk content of path as a new
@@ -906,11 +925,13 @@ func worktreeDeleteTool(
 // ─── daemon_control ───────────────────────────────────────────────
 
 type daemonControlIn struct {
-	Action string `json:"action" jsonschema:"start|stop"`
+	Action string `json:"action"         jsonschema:"start|stop|reload|install|uninstall. reload re-reads config + restarts watchers (no process restart) — call after a config edit; repo scopes it, empty reloads all. install/uninstall manage the systemd/launchd auto-start unit."`
+	Repo   string `json:"repo,omitempty" jsonschema:"reload only — scope the reload to one repo (empty = every registered repo)"`
 }
 type daemonControlOut struct {
 	Action string `json:"action"`
 	PID    int    `json:"pid,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 func daemonControlTool(
@@ -930,8 +951,36 @@ func daemonControlTool(
 			return nil, daemonControlOut{}, err
 		}
 		return nil, daemonControlOut{Action: "stop"}, nil
+	case "reload":
+		resp, err := rpc.Call(ctx, rpc.Request{
+			Method:       rpc.MethodConfigReload,
+			ConfigReload: &rpc.ConfigReloadArgs{RepoPath: in.Repo},
+		})
+		if err != nil {
+			return nil, daemonControlOut{}, err
+		}
+		if resp.Kind == rpc.KindError {
+			return nil, daemonControlOut{}, fmt.Errorf("daemon: %s", resp.Message)
+		}
+		detail := "config reloaded for all registered repos"
+		if in.Repo != "" {
+			detail = "config reloaded for " + in.Repo
+		}
+		return nil, daemonControlOut{Action: "reload", Detail: detail}, nil
+	case "install":
+		msg, err := daemonctl.Install(ctx)
+		if err != nil {
+			return nil, daemonControlOut{}, err
+		}
+		return nil, daemonControlOut{Action: "install", Detail: msg}, nil
+	case "uninstall":
+		msg, err := daemonctl.Uninstall(ctx)
+		if err != nil {
+			return nil, daemonControlOut{}, err
+		}
+		return nil, daemonControlOut{Action: "uninstall", Detail: msg}, nil
 	default:
-		return nil, daemonControlOut{}, fmt.Errorf("action must be start or stop, got %q", in.Action)
+		return nil, daemonControlOut{}, fmt.Errorf("action must be start|stop|reload|install|uninstall, got %q", in.Action)
 	}
 }
 
@@ -939,11 +988,14 @@ func daemonControlTool(
 
 type configSetIn struct {
 	Repo  string `json:"repo,omitempty"`
-	Path  string `json:"path"           jsonschema:"dotted path like 'daemon.gc_interval' or 'databases[0].engine'"`
-	Value any    `json:"value"          jsonschema:"the value to set (scalar, array, or object). Pass null to clear."`
+	Path  string `json:"path"            jsonschema:"dotted path like 'daemon.gc_interval' or 'databases[0].engine'"`
+	Value any    `json:"value"           jsonschema:"the value to set (scalar, array, or object). Pass null to clear."`
+	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). The top-level key is scope-checked against the target layer."`
 }
 type configSetOut struct {
 	Path         string `json:"path"`
+	Scope        string `json:"scope"`
+	File         string `json:"file"`
 	PreviousJSON string `json:"previous_json,omitempty"`
 	NewJSON      string `json:"new_json"`
 	Bytes        int    `json:"bytes"`
@@ -953,25 +1005,32 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 	if in.Path == "" {
 		return nil, configSetOut{}, errors.New("path is required")
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	p, histRoot, layer, err := resolveConfigTarget(in.Scope, in.Repo)
 	if err != nil {
 		return nil, configSetOut{}, err
 	}
-	p := filepath.Join(repoRoot, ".treeman.yaml")
+	// Missing file is not an error — start from an empty document so a
+	// first key can be set into a not-yet-created config (notably the
+	// user-global file). Other read errors still surface.
 	raw, err := os.ReadFile(p)
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, configSetOut{}, fmt.Errorf("read %s: %w", p, err)
 	}
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return nil, configSetOut{}, fmt.Errorf("parse %s: %w", p, err)
 	}
+	// An empty/missing file unmarshals to a zero node — seed an empty
+	// document so yamlpatch.Set has a mapping to graft the first key onto.
+	if doc.Kind == 0 {
+		doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode}}}
+	}
 	segs, err := yamlpatch.ParsePath(in.Path)
 	if err != nil {
 		return nil, configSetOut{}, err
 	}
 	if len(segs) > 0 && segs[0].Key != "" {
-		if err := config.CheckKeyInLayer(segs[0].Key, "repo"); err != nil {
+		if err := config.CheckKeyInLayer(segs[0].Key, layer); err != nil {
 			return nil, configSetOut{}, err
 		}
 	}
@@ -991,7 +1050,11 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 	if err := yaml.Unmarshal(body, &validated); err != nil {
 		return nil, configSetOut{}, fmt.Errorf("validation failed — patched file would not parse as config.Config: %w", err)
 	}
-	if err := atomicWrite(repoRoot, p, body); err != nil {
+	// The global config dir may not exist on a first set; repo dirs do.
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return nil, configSetOut{}, fmt.Errorf("create config dir: %w", err)
+	}
+	if err := atomicWrite(histRoot, p, body); err != nil {
 		return nil, configSetOut{}, err
 	}
 	prevJSON := ""
@@ -1008,12 +1071,15 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 		return nil, configSetOut{}, fmt.Errorf("marshal value: %w", err)
 	}
 	writeMCPEvent(context.Background(), "config_set", "patched "+in.Path, 0, map[string]string{
-		"repo":     repoRoot,
+		"scope":    layer,
+		"file":     p,
 		"path":     in.Path,
 		"new_json": string(newJSON),
 	})
 	return nil, configSetOut{
 		Path:         in.Path,
+		Scope:        layer,
+		File:         p,
 		PreviousJSON: prevJSON,
 		NewJSON:      string(newJSON),
 		Bytes:        len(body),
@@ -1024,10 +1090,12 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 
 type configRestoreIn struct {
 	Repo       string `json:"repo,omitempty"`
-	Generation int64  `json:"generation"     jsonschema:"the generation number to restore (from config_history)"`
+	Generation int64  `json:"generation"      jsonschema:"the generation number to restore (from config_history)"`
+	Scope      string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Must match the scope the generation was recorded under."`
 }
 type configRestoreOut struct {
 	Path     string `json:"path"`
+	Scope    string `json:"scope"`
 	Restored int64  `json:"restored"`
 	Bytes    int    `json:"bytes"`
 }
@@ -1037,33 +1105,37 @@ func configRestoreTool(
 	_ *mcpsdk.CallToolRequest,
 	in configRestoreIn,
 ) (*mcpsdk.CallToolResult, configRestoreOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+	p, histRoot, layer, err := resolveConfigTarget(in.Scope, in.Repo)
 	if err != nil {
 		return nil, configRestoreOut{}, err
 	}
-	p := filepath.Join(repoRoot, ".treeman.yaml")
 	st, err := openStore(ctx)
 	if err != nil {
 		return nil, configRestoreOut{}, err
 	}
-	g, err := st.GetConfigGeneration(ctx, repoRoot, p, in.Generation)
+	g, err := st.GetConfigGeneration(ctx, histRoot, p, in.Generation)
 	_ = st.Close()
 	if err != nil {
 		return nil, configRestoreOut{}, fmt.Errorf("generation %d not found for %s", in.Generation, p)
 	}
-	if err := config.CheckBodyScope(g.Content, "repo"); err != nil {
+	if err := config.CheckBodyScope(g.Content, layer); err != nil {
 		return nil, configRestoreOut{}, fmt.Errorf("generation %d cannot be restored: %w", in.Generation, err)
+	}
+	// The global config dir may have been deleted since the snapshot.
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return nil, configRestoreOut{}, fmt.Errorf("create config dir: %w", err)
 	}
 	// atomicWrite snapshots the current content first, so the restore is
 	// itself reversible.
-	if err := atomicWrite(repoRoot, p, g.Content); err != nil {
+	if err := atomicWrite(histRoot, p, g.Content); err != nil {
 		return nil, configRestoreOut{}, err
 	}
 	writeMCPEvent(context.Background(), "config_restore", fmt.Sprintf("restored generation %d", in.Generation), 0, map[string]string{
-		"repo":       repoRoot,
+		"scope":      layer,
+		"file":       p,
 		"generation": strconv.FormatInt(in.Generation, 10),
 	})
-	return nil, configRestoreOut{Path: p, Restored: in.Generation, Bytes: len(g.Content)}, nil
+	return nil, configRestoreOut{Path: p, Scope: layer, Restored: in.Generation, Bytes: len(g.Content)}, nil
 }
 
 // ─── worktree_repair ──────────────────────────────────────────────

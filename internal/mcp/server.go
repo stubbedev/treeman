@@ -47,6 +47,7 @@ func newServer() *mcpsdk.Server {
 	registerReadTools(srv)
 	registerResources(srv)
 	registerWriteTools(srv)
+	registerAdminGapTools(srv)
 	registerPrompts(srv)
 	return srv
 }
@@ -66,19 +67,26 @@ PREFERRED ENTRY POINTS:
 - "set me up a worktree for branch X" → the worktree-setup prompt (drives branches_list → daemon_status → worktree_create → wait).
 - "what's the daemon doing right now" → daemon_state (in-flight prepares + watchers + backoff). For just version/PID use daemon_status.
 - "is my DB up / are engines reachable" → engine_status. For a specific connection string before committing it, connection_probe.
-- "edit .treeman.yaml" → config_get → config_diff → config_set (surgical) or config_write (full body).
+- "edit config" → config_locate (which file?) → config_get → config_diff → config_set (surgical) or config_write (full body). EVERY config tool takes scope=repo (default, .treeman.yaml) | global (~/.config/treeman/config.yaml): daemon/snapshots/logs/status/notifications live in global, databases/patches/hooks/main_worktree/env_sources in repo. Remove a key with config_unset; delete a whole file with config_delete; roll back with config_history → config_restore. Scaffold a fresh file with init_repo (global=true for the user-global one).
 - "why did this prepare cold-build instead of cache-hit" → inputs_fingerprint, then snapshot_inspect on the expected fingerprint.
 - "what would prepare actually run" → prepare_dry_run (renders the plan; no engine I/O).
 - "stream prepare progress" → logs_subscribe with a progressToken (live notifications) — falls back to collect-on-return.
 - "this worktree is stuck / broken" → worktree_repair (reconciles ports + finalize + snapshot templates).
+- "re-run setup/prepare for a worktree" → worktree_finalize (async via daemon; recovery counterpart to worktree_create's tail).
+- "I edited the config, make the daemon pick it up" → daemon_control action=reload.
+- "enroll the repo root for per-branch DBs" → main_worktree action=enable|disable|status.
+- "state of every worktree across all repos" → status_overview (fleet rollup, stable/up/down/failed).
+- "auto-fix what doctor found" → doctor fix=true.
 - "trial this migration without polluting state" → the migration-trial prompt.
 - "scaffold .treeman.yaml" → the scaffold-from-framework prompt.
 
-DESTRUCTIVE TOOLS support dry_run=true for previewing: worktree_delete, snapshots_purge, db_reset, repo_remove. Always preview before committing.
+DESTRUCTIVE TOOLS support dry_run=true for previewing: worktree_delete, snapshots_purge, db_reset, repo_remove, config_delete. Always preview before committing.
 
-DO NOT shell out to ` + "`git worktree`, `psql`, `mysql`, `mongosh`, `redis-cli`" + ` for repo state already covered by these tools — treeman keeps SQLite + engine state in sync, and bypassing it leaves the two out of sync.
+- "read or write engine data directly" → db_query (write=false reads SQL/Mongo/Redis; write=true+ack=true mutates: SQL DML/DDL, any Redis command, Mongo write commands). For Elasticsearch use es_request (any REST endpoint — _cat/_cluster/_mapping/_bulk/doc CRUD; reads free, writes need write=true+ack=true).
 
-Destructive tools (worktree_delete, snapshots_purge, snapshot_drop, db_reset, registry_unregister, repo_remove, logs_purge) carry DestructiveHint=true in their annotations — surface the consequence to the user before invoking.`
+DO NOT shell out to ` + "`git worktree`, `psql`, `mysql`, `mongosh`, `redis-cli`, or `curl`" + ` for repo OR engine state — db_query + es_request reach every engine through treeman's own configured, authenticated drivers (no credentials on the command line), and treeman keeps SQLite + engine state in sync. Bypassing it leaves the two out of sync.
+
+Destructive tools (worktree_delete, snapshots_purge, snapshot_drop, db_reset, registry_unregister, repo_remove, logs_purge, config_delete, config_unset) carry DestructiveHint=true in their annotations — surface the consequence to the user before invoking.`
 
 // Serve boots the MCP server on stdio and blocks until the client
 // disconnects or ctx is cancelled. Returns nil on clean shutdown.
