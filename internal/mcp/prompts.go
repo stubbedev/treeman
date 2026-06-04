@@ -102,6 +102,23 @@ var allPrompts = []promptSpec{
 	},
 	{
 		def: &mcpsdk.Prompt{
+			Name:        "edit-config",
+			Title:       "Edit treeman config (global or repo) safely",
+			Description: "Pick the right config file for a change (user-global ~/.config/treeman/config.yaml vs per-repo .treeman.yaml), preview the edit, apply it scope-checked, and validate. Covers create/update/remove/delete + rollback. Use whenever the user wants to change a treeman setting and it isn't obvious which file it belongs in.",
+			Arguments: []*mcpsdk.PromptArgument{
+				{
+					Name:        "setting",
+					Description: "the setting or key the user wants to change (free text, e.g. 'daemon log level', 'databases[0].engine')",
+					Required:    false,
+				},
+				{Name: "repo", Description: "absolute path to the repo root; defaults to cwd's repo", Required: false},
+			},
+		},
+		handler:   editConfigPrompt,
+		WhenToUse: `user wants to change a treeman setting / "set the daemon log level" / "where does X config go, global or repo?"`,
+	},
+	{
+		def: &mcpsdk.Prompt{
 			Name:        "bootstrap-new-repo",
 			Title:       "Set up treeman in a fresh repo end-to-end",
 			Description: "Walk through first-time enrollment: framework detect → engine connection probe per engine → init_repo → schema_install → daemon ensure → registry_register → first prepare → verify. Use when the user wants treeman wired into a repo that has no .treeman.yaml yet.",
@@ -360,6 +377,57 @@ func ifEmpty(s, dflt string) string {
 		return dflt
 	}
 	return s
+}
+
+func editConfigPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcpsdk.GetPromptResult, error) {
+	setting := req.Params.Arguments["setting"]
+	repo := req.Params.Arguments["repo"]
+	repoArg := ""
+	if repo != "" {
+		repoArg = "repo=\"" + repo + "\""
+	}
+	repoArgComma := ""
+	if repoArg != "" {
+		repoArgComma = repoArg + ", "
+	}
+	settingLine := "the user's requested change"
+	if setting != "" {
+		settingLine = fmt.Sprintf("%q", setting)
+	}
+
+	text := fmt.Sprintf(
+		`Apply a treeman config change for %s. Treeman has TWO config layers; your first job is to put the change in the right one, then edit it safely.
+
+SCOPE RULES (which file?):
+• GLOBAL (~/.config/treeman/config.yaml, scope="global"): daemon, snapshots, logs, status, notifications — machine-wide, shared by every repo.
+• REPO (.treeman.yaml, scope="repo"): databases, patches, hooks, main_worktree, env_sources — project-specific.
+• BOTH (connections, worktrees, ports, frameworks, auto_fetch): allowed in either; prefer repo unless the user wants a machine-wide default.
+A key in the wrong layer is REJECTED at write time — don't guess, use config_schema if unsure.
+
+Execute these tool calls in order:
+
+1. config_locate (%s) — show which config files exist and where. Decide the target scope from the SCOPE RULES above.
+
+2. config_schema (scope=<global|repo>) — confirm the key is valid for that scope and learn its type/shape. If the key only exists in the OTHER scope, switch targets.
+
+3. config_get (scope=<target>%s) — read the current value so you can show a before/after. If the target file doesn't exist yet and you're adding the first key, that's fine — config_set creates it (or run init_repo with global=true / for the repo to scaffold a commented starter).
+
+4. Apply the edit:
+   • single field → config_set (scope=<target>, path="<dotted.path>", value=<new>). Creates the file if missing, preserves comments.
+   • remove a key entirely → config_unset (scope=<target>, path="<dotted.path>").
+   • full rewrite → config_diff (scope=<target>, body=...) to preview, then config_write (scope=<target>, body=...).
+   • delete the whole file → config_delete (scope=<target>, dry_run=true first, then ack=true). DESTRUCTIVE — confirm with the user.
+
+5. config_validate (scope=<target>) — confirm the result still parses + validates. config_set/write/unset validate inline, but run this after any out-of-band edit.
+
+6. If anything looks wrong, config_history (scope=<target>) → config_restore (scope=<target>, generation=N) rolls back — every mutation is snapshotted to SQLite first.
+
+Report: which scope/file you chose and WHY, the before→after value, and the validation result.`,
+		settingLine,
+		repoArg,
+		repoArgComma,
+	)
+	return userMsg(text), nil
 }
 
 func bootstrapNewRepoPrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mcpsdk.GetPromptResult, error) {

@@ -44,6 +44,7 @@ func TestServerRegistersExpectedTools(t *testing.T) {
 	want := []string{
 		// read
 		"doctor", "config_get", "config_validate", "config_schema",
+		"config_locate",
 		"worktree_list", "worktree_show", "branch_scoped_status",
 		"logs_query", "logs_hooks", "fw_detect", "slug_compute",
 		"daemon_status", "daemon_state",
@@ -53,15 +54,16 @@ func TestServerRegistersExpectedTools(t *testing.T) {
 		// engine
 		"engine_status", "db_schema_dump", "db_query", "snapshot_inspect",
 		"hook_log_read", "snapshot_drop", "db_dump", "connection_probe",
-		"engine_logs",
+		"engine_logs", "es_request",
 		// write
 		"prepare_run", "db_reset", "hook_run", "config_write", "config_set",
-		"config_restore",
+		"config_unset", "config_delete", "config_restore",
 		"registry_register", "registry_unregister", "registry_repair",
 		"repo_remove", "worktree_repair",
 		"snapshots_purge", "logs_purge",
 		"schema_install", "init_repo", "daemon_control",
 		"worktree_create", "worktree_delete",
+		"worktree_finalize", "main_worktree", "status_overview", "notify_test",
 		// sync
 		"sync_status", "sync_now",
 	}

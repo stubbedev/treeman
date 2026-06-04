@@ -126,6 +126,62 @@ func Set(root *yaml.Node, segs []Segment, newVal *yaml.Node) (prev *yaml.Node, e
 	return nil, nil
 }
 
+// Unset walks the YAML AST in `root` to `segs` and removes the terminal
+// node: for a mapping it drops the key + value pair, for a sequence it
+// splices out the index (shifting later elements down). Returns the
+// removed value node. A path whose terminal key/index doesn't exist is
+// an error so callers can tell a no-op delete from a real one.
+func Unset(root *yaml.Node, segs []Segment) (removed *yaml.Node, err error) {
+	if len(segs) == 0 {
+		return nil, errors.New("path is empty")
+	}
+	cur := root
+	if cur.Kind == yaml.DocumentNode {
+		if len(cur.Content) == 0 {
+			return nil, errors.New("document is empty — nothing to delete")
+		}
+		cur = cur.Content[0]
+	}
+	for i, seg := range segs {
+		last := i == len(segs)-1
+		if seg.IsIndex {
+			if cur.Kind != yaml.SequenceNode {
+				return nil, fmt.Errorf("segment %d: expected sequence at this position, got %s", i, KindName(cur.Kind))
+			}
+			if seg.Idx < 0 || seg.Idx >= len(cur.Content) {
+				return nil, fmt.Errorf("segment %d: index %d out of range (len=%d)", i, seg.Idx, len(cur.Content))
+			}
+			if last {
+				removed = cur.Content[seg.Idx]
+				cur.Content = append(cur.Content[:seg.Idx], cur.Content[seg.Idx+1:]...)
+				return removed, nil
+			}
+			cur = cur.Content[seg.Idx]
+			continue
+		}
+		if cur.Kind != yaml.MappingNode {
+			return nil, fmt.Errorf("segment %d (%q): expected mapping at this position, got %s", i, seg.Key, KindName(cur.Kind))
+		}
+		idx := -1
+		for k := 0; k < len(cur.Content); k += 2 {
+			if cur.Content[k].Value == seg.Key {
+				idx = k
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("segment %d: key %q not found", i, seg.Key)
+		}
+		if last {
+			removed = cur.Content[idx+1]
+			cur.Content = append(cur.Content[:idx], cur.Content[idx+2:]...)
+			return removed, nil
+		}
+		cur = cur.Content[idx+1]
+	}
+	return nil, errors.New("unreachable: path consumed without reaching terminal")
+}
+
 // ValueToNode round-trips any JSON-decoded value through yaml.Marshal
 // → yaml.Unmarshal so the result is a proper *yaml.Node suitable for
 // splicing into the AST.

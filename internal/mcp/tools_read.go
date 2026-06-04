@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -41,20 +43,26 @@ func registerReadTools(srv *mcpsdk.Server) {
 func registerCoreReadTools(srv *mcpsdk.Server) {
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "doctor",
-		Description: "Run treeman health checks — daemon, .treeman.yaml load, JSON schema install, framework detection, registry/git drift. Call this first whenever something is wrong. Returns ok|warn|fail|skip per check + a remediation hint.",
-		Annotations: readOnlyAnno("Run treeman doctor", true),
+		Description: "Run treeman health checks — daemon, .treeman.yaml load, JSON schema install, framework detection, registry/git drift. Call this first whenever something is wrong. Returns ok|warn|fail|skip per check + a remediation hint. Pass fix=true to auto-remediate the fixable checks (schema reinstall, registry repair) and re-probe.",
+		Annotations: writeAnno("Run treeman doctor", false, true, true),
 	}, doctorTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+		Name:        "config_locate",
+		Description: "List where every config treeman reads lives — the user-global config (~/.config/treeman/config.yaml), the repo .treeman.yaml, and the repo-local .treeman.local.yaml — with exists + bytes per file. Call this first when you need to know WHICH file to edit (global vs repo). The loader merges them global → repo → repo-local.",
+		Annotations: readOnlyAnno("Locate config files", false),
+	}, configLocateTool)
+
+	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_get",
-		Description: "Read the current .treeman.yaml. Always call this before config_set/config_write/config_diff. Pass resolved=true for the post-substitution view (env vars + connection strings rendered) — credentials are redacted.",
-		Annotations: readOnlyAnno("Get .treeman.yaml", false),
+		Description: "Read a config. scope=repo (default — the layered/resolved .treeman.yaml view) | global (~/.config/treeman/config.yaml alone). Always call before config_set/config_write/config_unset/config_diff. Pass resolved=true (repo scope only) for the post-substitution view (env vars + connection strings rendered) — credentials are redacted.",
+		Annotations: readOnlyAnno("Get config", false),
 	}, configGetTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_validate",
-		Description: "Confirm .treeman.yaml still parses + validates. Use after any manual edit (outside MCP) — config_write/config_set already validate inline.",
-		Annotations: readOnlyAnno("Validate .treeman.yaml", false),
+		Description: "Confirm a config still parses + validates. scope=repo (default — layered .treeman.yaml) | global (~/.config/treeman/config.yaml standalone). Use after any manual edit (outside MCP) — config_write/config_set/config_unset already validate inline.",
+		Annotations: readOnlyAnno("Validate config", false),
 	}, configValidateTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -65,13 +73,13 @@ func registerCoreReadTools(srv *mcpsdk.Server) {
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_diff",
-		Description: "Preview the effect of a proposed .treeman.yaml body — returns added/removed/changed dotted paths. Call before config_write. Parse errors short-circuit the diff.",
+		Description: "Preview the effect of a proposed config body — returns added/removed/changed dotted paths. scope=repo (default — diff against .treeman.yaml) | global (diff against ~/.config/treeman/config.yaml). Call before config_write. Parse errors short-circuit the diff.",
 		Annotations: readOnlyAnno("Diff config", false),
 	}, configDiffTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
 		Name:        "config_history",
-		Description: "List stored generations of .treeman.yaml for a repo — every config_set/config_write/main-enable snapshots the prior content into SQLite (per-repo, newest-first). Returns {generation, created_at, bytes}. Pair with config_restore to roll back a bad edit.",
+		Description: "List stored generations of a config — every config_set/config_write/config_unset/config_delete/main-enable snapshots the prior content into SQLite (newest-first). scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Returns {generation, created_at, bytes}. Pair with config_restore to roll back a bad edit.",
 		Annotations: readOnlyAnno("List config history", false),
 	}, configHistoryTool)
 }
@@ -188,9 +196,12 @@ func registerPlanningReadTools(srv *mcpsdk.Server) {
 // ─── doctor ───────────────────────────────────────────────────────
 
 type (
-	doctorIn  struct{}
+	doctorIn struct {
+		Fix bool `json:"fix,omitempty" jsonschema:"auto-apply remediations for the fixable checks (schema → schema_install, registry → registry_repair), then re-probe so the returned status reflects the post-fix state"`
+	}
 	doctorOut struct {
 		Results []doctorResult `json:"results"`
+		Fixed   bool           `json:"fixed,omitempty"`
 	}
 )
 
@@ -201,8 +212,50 @@ type doctorResult struct {
 	Hint   string `json:"hint,omitempty"`
 }
 
-func doctorTool(ctx context.Context, _ *mcpsdk.CallToolRequest, _ doctorIn) (*mcpsdk.CallToolResult, doctorOut, error) {
-	return nil, doctorOut{Results: runDoctorChecks(ctx)}, nil
+func doctorTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in doctorIn) (*mcpsdk.CallToolResult, doctorOut, error) {
+	results := runDoctorChecks(ctx)
+	if in.Fix {
+		results = applyDoctorFixes(ctx, results)
+		return nil, doctorOut{Results: results, Fixed: true}, nil
+	}
+	return nil, doctorOut{Results: results}, nil
+}
+
+// applyDoctorFixes remediates the auto-fixable warn/fail checks (schema
+// → reinstall, registry → repair) and re-probes each so the returned
+// status reflects the post-fix state. Mirrors the CLI's `doctor --fix`.
+func applyDoctorFixes(ctx context.Context, results []doctorResult) []doctorResult {
+	repoRoot, _ := resolveRepo("")
+	if repoRoot == "" {
+		return results
+	}
+	for i, r := range results {
+		if r.Status == "ok" || r.Status == "skip" {
+			continue
+		}
+		switch r.Name {
+		case "schema":
+			if _, _, err := schema.Install(repoRoot, schema.TargetRepo); err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			results[i] = checkSchema(repoRoot)
+		case "registry":
+			st, err := openStore(ctx)
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			_, err = wtreg.Repair(ctx, st, repoRoot, detectBranch)
+			_ = st.Close()
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			results[i] = checkRegistry(ctx, repoRoot)
+		}
+	}
+	return results
 }
 
 func runDoctorChecks(ctx context.Context) []doctorResult {
@@ -346,7 +399,8 @@ func gitWorktreePaths(ctx context.Context, repoRoot string) ([]string, error) {
 
 type configGetIn struct {
 	Repo     string `json:"repo,omitempty"     jsonschema:"repo root override (defaults to cwd)"`
-	Resolved bool   `json:"resolved,omitempty" jsonschema:"include resolved connection strings"`
+	Resolved bool   `json:"resolved,omitempty" jsonschema:"include resolved connection strings (repo scope only)"`
+	Scope    string `json:"scope,omitempty"    jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml)"`
 }
 
 // configGetTool returns the loaded config as a map so the SDK's
@@ -359,6 +413,23 @@ type configGetIn struct {
 // value pairs are scrubbed. LLM clients see structure + which
 // secrets exist, never the literal values.
 func configGetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configGetIn) (*mcpsdk.CallToolResult, map[string]any, error) {
+	// Global scope reads the user-global config alone (no repo/env-file
+	// overlay) — `resolved` and connection-string substitution are
+	// repo-only and silently ignored here.
+	if strings.EqualFold(in.Scope, "global") {
+		path, ok := config.GlobalConfigPath()
+		if !ok {
+			return nil, nil, errors.New("cannot resolve global config path (no home dir)")
+		}
+		cfg, err := config.LoadGlobal()
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, redactMap(map[string]any{"scope": "global", "path": path, "config": cfg}), nil
+	}
+	if in.Scope != "" && !strings.EqualFold(in.Scope, "repo") {
+		return nil, nil, fmt.Errorf("invalid scope %q (want repo|global)", in.Scope)
+	}
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		return nil, nil, err
@@ -367,7 +438,7 @@ func configGetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configGetIn)
 	if err != nil {
 		return nil, nil, err
 	}
-	out := map[string]any{"repo": repoRoot, "config": cfg}
+	out := map[string]any{"scope": "repo", "repo": repoRoot, "config": cfg}
 	if in.Resolved {
 		out["resolved"] = resolve.Resolve(&cfg, repoRoot)
 	}
@@ -392,7 +463,8 @@ func redactMap(m map[string]any) map[string]any {
 }
 
 type configHistoryIn struct {
-	Repo string `json:"repo,omitempty" jsonschema:"repo root override (defaults to cwd)"`
+	Repo  string `json:"repo,omitempty"  jsonschema:"repo root override (defaults to cwd)"`
+	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml)"`
 }
 type configGenerationOut struct {
 	Generation int64  `json:"generation"`
@@ -410,21 +482,20 @@ func configHistoryTool(
 	_ *mcpsdk.CallToolRequest,
 	in configHistoryIn,
 ) (*mcpsdk.CallToolResult, configHistoryOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+	p, histRoot, _, err := resolveConfigTarget(in.Scope, in.Repo)
 	if err != nil {
 		return nil, configHistoryOut{}, err
 	}
-	p := filepath.Join(repoRoot, ".treeman.yaml")
 	st, err := openStore(ctx)
 	if err != nil {
 		return nil, configHistoryOut{}, err
 	}
 	defer func() { _ = st.Close() }()
-	gens, err := st.ListConfigGenerations(ctx, repoRoot, p)
+	gens, err := st.ListConfigGenerations(ctx, histRoot, p)
 	if err != nil {
 		return nil, configHistoryOut{}, err
 	}
-	out := configHistoryOut{Repo: repoRoot, Path: p, Generations: make([]configGenerationOut, 0, len(gens))}
+	out := configHistoryOut{Repo: histRoot, Path: p, Generations: make([]configGenerationOut, 0, len(gens))}
 	for _, g := range gens {
 		out.Generations = append(out.Generations, configGenerationOut{
 			Generation: g.Generation,
@@ -436,11 +507,14 @@ func configHistoryTool(
 }
 
 type configValidateIn struct {
-	Repo string `json:"repo,omitempty"`
+	Repo  string `json:"repo,omitempty"`
+	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml, layered) | global (~/.config/treeman/config.yaml alone)"`
 }
 type configValidateOut struct {
 	OK        bool   `json:"ok"`
+	Scope     string `json:"scope,omitempty"`
 	Repo      string `json:"repo,omitempty"`
+	Path      string `json:"path,omitempty"`
 	Databases int    `json:"databases,omitempty"`
 	Error     string `json:"error,omitempty"`
 }
@@ -450,6 +524,27 @@ func configValidateTool(
 	_ *mcpsdk.CallToolRequest,
 	in configValidateIn,
 ) (*mcpsdk.CallToolResult, configValidateOut, error) {
+	// Global scope validates the user-global file standalone: load it
+	// (scope-checks repo-only keys), then run cross-field Validate.
+	if strings.EqualFold(in.Scope, "global") {
+		path, _ := config.GlobalConfigPath()
+		cfg, err := config.LoadGlobal()
+		if err == nil {
+			err = cfg.Validate()
+		}
+		if err != nil {
+			return nil, configValidateOut{
+				OK:    false,
+				Scope: "global",
+				Path:  path,
+				Error: err.Error(),
+			}, nil //nolint:nilerr // validation failure is tool output, not a transport error
+		}
+		return nil, configValidateOut{OK: true, Scope: "global", Path: path}, nil
+	}
+	if in.Scope != "" && !strings.EqualFold(in.Scope, "repo") {
+		return nil, configValidateOut{OK: false, Error: fmt.Sprintf("invalid scope %q (want repo|global)", in.Scope)}, nil
+	}
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		out := configValidateOut{OK: false, Error: err.Error()}
@@ -457,10 +552,10 @@ func configValidateTool(
 	}
 	cfg, err := resolve.LoadResolved(repoRoot)
 	if err != nil {
-		out := configValidateOut{OK: false, Repo: repoRoot, Error: err.Error()}
+		out := configValidateOut{OK: false, Scope: "repo", Repo: repoRoot, Error: err.Error()}
 		return nil, out, nil //nolint:nilerr // validation failure is tool output, not a transport error
 	}
-	return nil, configValidateOut{OK: true, Repo: repoRoot, Databases: len(cfg.Databases)}, nil
+	return nil, configValidateOut{OK: true, Scope: "repo", Repo: repoRoot, Databases: len(cfg.Databases)}, nil
 }
 
 type configSchemaIn struct {
@@ -682,7 +777,8 @@ type logsQueryIn struct {
 	EventTypes  []string `json:"event_types,omitempty"`
 	Phases      []string `json:"phases,omitempty"`
 	Since       string   `json:"since,omitempty"        jsonschema:"duration (10m, 2h) or RFC3339"`
-	PayloadLike string   `json:"payload_like,omitempty"`
+	PayloadLike string   `json:"payload_like,omitempty" jsonschema:"SQL LIKE substring against the payload JSON (DB-side, fast)"`
+	Regex       string   `json:"regex,omitempty"        jsonschema:"RE2 regex matched (in-process) against each event's message AND payload — use for patterns SQL LIKE can't express. Scans a window of up to 5000 recent matches of the other filters, then caps to limit."`
 	RunID       string   `json:"run_id,omitempty"       jsonschema:"exact correlation id (8-char hex stamped on every event from one prepare/finalize/teardown/watcher flow)"`
 	Limit       int      `json:"limit,omitempty"        jsonschema:"default 50, max 1000"`
 }
@@ -698,6 +794,20 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 	if limit > 1000 {
 		limit = 1000
 	}
+	var re *regexp.Regexp
+	if in.Regex != "" {
+		var err error
+		re, err = regexp.Compile(in.Regex)
+		if err != nil {
+			return nil, logsQueryOut{}, fmt.Errorf("invalid regex: %w", err)
+		}
+	}
+	// With a regex we scan a wider window DB-side (regex can't push down
+	// to SQL), filter in-process, then cap to the requested limit.
+	fetchLimit := limit
+	if re != nil {
+		fetchLimit = 5000
+	}
 	f := store.EventFilter{
 		Levels:      validateLevels(in.Levels),
 		EventTypes:  in.EventTypes,
@@ -705,7 +815,7 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 		PayloadLike: in.PayloadLike,
 		RunID:       in.RunID,
 		HydrateWT:   true,
-		Limit:       limit,
+		Limit:       fetchLimit,
 	}
 	if in.Since != "" {
 		t, err := parseSince(in.Since)
@@ -737,6 +847,18 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 	events, err := st.QueryEvents(ctx, f)
 	if err != nil {
 		return nil, logsQueryOut{}, err
+	}
+	if re != nil {
+		filtered := events[:0]
+		for _, e := range events {
+			if re.MatchString(e.Message) || re.MatchString(e.PayloadJSON) {
+				filtered = append(filtered, e)
+				if len(filtered) >= limit {
+					break
+				}
+			}
+		}
+		events = filtered
 	}
 	for i := range events {
 		events[i].Message = redactSecrets(events[i].Message)

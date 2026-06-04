@@ -594,8 +594,9 @@ func collectRepoBranches(ctx context.Context, repo string, limit int) (branchesL
 // ─── config_diff ────────────────────────────────────────────────────
 
 type configDiffIn struct {
-	Repo string `json:"repo,omitempty"`
-	Body string `json:"body"           jsonschema:"proposed .treeman.yaml body"`
+	Repo  string `json:"repo,omitempty"`
+	Body  string `json:"body"            jsonschema:"proposed config body"`
+	Scope string `json:"scope,omitempty" jsonschema:"repo (default — diff against .treeman.yaml) | global (diff against ~/.config/treeman/config.yaml)"`
 }
 
 type configDiffChange struct {
@@ -620,38 +621,56 @@ func configDiffTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configDif
 	if strings.TrimSpace(in.Body) == "" {
 		return nil, configDiffOut{}, errors.New("body is required")
 	}
-	repoRoot, err := resolveRepo(in.Repo)
-	if err != nil {
-		return nil, configDiffOut{}, err
-	}
 
 	var proposed config.Config
 	if err := yaml.Unmarshal([]byte(in.Body), &proposed); err != nil {
-		return nil, configDiffOut{Repo: repoRoot}, fmt.Errorf("parse proposed config: %w", err)
+		return nil, configDiffOut{}, fmt.Errorf("parse proposed config: %w", err)
 	}
 
-	current, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
-		// Treat missing config as an empty baseline so the diff shows
-		// every proposed field as an add — useful for previewing a
-		// scaffold against a virgin repo.
-		current = config.Config{}
+	// Global scope diffs the proposed body against the user-global config
+	// alone; repo scope diffs against the resolved layered view.
+	var current config.Config
+	var baseLabel string
+	if strings.EqualFold(in.Scope, "global") {
+		baseLabel, _ = config.GlobalConfigPath()
+		c, err := config.LoadGlobal()
+		if err != nil {
+			c = config.Config{}
+		}
+		current = c
+	} else {
+		if in.Scope != "" && !strings.EqualFold(in.Scope, "repo") {
+			return nil, configDiffOut{}, fmt.Errorf("invalid scope %q (want repo|global)", in.Scope)
+		}
+		repoRoot, err := resolveRepo(in.Repo)
+		if err != nil {
+			return nil, configDiffOut{}, err
+		}
+		baseLabel = repoRoot
+		c, err := resolve.LoadResolved(repoRoot)
+		if err != nil {
+			// Treat missing config as an empty baseline so the diff shows
+			// every proposed field as an add — useful for previewing a
+			// scaffold against a virgin repo.
+			c = config.Config{}
+		}
+		current = c
 	}
 
 	curJSON, err := json.Marshal(current)
 	if err != nil {
-		return nil, configDiffOut{Repo: repoRoot}, fmt.Errorf("marshal current config: %w", err)
+		return nil, configDiffOut{Repo: baseLabel}, fmt.Errorf("marshal current config: %w", err)
 	}
 	newJSON, err := json.Marshal(proposed)
 	if err != nil {
-		return nil, configDiffOut{Repo: repoRoot}, fmt.Errorf("marshal proposed config: %w", err)
+		return nil, configDiffOut{Repo: baseLabel}, fmt.Errorf("marshal proposed config: %w", err)
 	}
 	var curMap, newMap map[string]any
 	_ = json.Unmarshal(curJSON, &curMap)
 	_ = json.Unmarshal(newJSON, &newMap)
 
 	changes := diffMaps("", curMap, newMap)
-	out := configDiffOut{Repo: repoRoot, Parsed: true, Changes: changes}
+	out := configDiffOut{Repo: baseLabel, Parsed: true, Changes: changes}
 	out.Summary = summarizeChanges(changes)
 	return nil, out, nil
 }
