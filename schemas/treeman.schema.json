@@ -961,17 +961,9 @@
     }
   },
   "properties": {
-    "daemon": {
-      "$ref": "#/$defs/DaemonConfig",
-      "description": "Daemon process settings: socket path, log level, log database\nlocation. Typically lives in the user-global config."
-    },
     "connections": {
       "$ref": "#/$defs/ConnectionsConfig",
       "description": "Connection blocks per supported engine (MySQL, Postgres,\nMongoDB, Redis, Elasticsearch). Treeman dials these to create\nper-worktree clone databases, run migrations."
-    },
-    "snapshots": {
-      "$ref": "#/$defs/SnapshotsConfig",
-      "description": "Snapshot cache settings: where post-migration template\nsnapshots are cached on disk, plus retention/eviction policy."
     },
     "worktrees": {
       "$ref": "#/$defs/WorktreesConfig",
@@ -1013,10 +1005,6 @@
       "type": "object",
       "description": "User-defined migration frameworks keyed by name. Use this when\nthe built-in framework presets don't cover your tool — declare\nthe markers, migration dirs, file pattern, and hash policy\nexplicitly."
     },
-    "logs": {
-      "$ref": "#/$defs/LogsConfig",
-      "description": "Logs retention. Daemon-side prune drops rows older than\n`keep_days` from the events, hook_runs, and hook_log_chunks\ntables on a fixed interval. Set 0 to keep forever (no prune)."
-    },
     "auto_fetch": {
       "$ref": "#/$defs/AutoFetchConfig",
       "description": "AutoFetch policy. Daemon-side periodic `git fetch --all --prune`\nper registered repo, followed by a `git merge --ff-only @{u}`\nper active worktree. Skips dirty trees, non-ff branches, and\nupstreamless branches. Enabled by default at a 15-minute cadence."
@@ -1031,14 +1019,6 @@
       },
       "type": "object",
       "description": "Ports declares per-worktree port slots. Each entry is a named\nslot with a port range; treeman allocates a free port per slot\nat `wt create` time and exposes it via the `{port_\u003cname\u003e}`\ntemplate token (usable in `patches[].set[*]` values).\nPersisted in SQLite so the assignment survives across daemon\nrestarts; freed on `wt delete`.\n\nUse slot names that match the role they fill in your app (e.g.\n`octane`, `webpack`, `reverb`) — the name shows up in every\n`{port_\u003cname\u003e}` reference and in `wt show` output."
-    },
-    "status": {
-      "$ref": "#/$defs/StatusConfig",
-      "description": "Status configures the `treeman status` widget output (icons,\nlabels, hover lines, custom bar formats). Lives in the global\nconfig since the widget aggregates worktrees across every repo."
-    },
-    "notifications": {
-      "$ref": "#/$defs/NotificationsConfig",
-      "description": "Notifications opts into desktop notifications (notify-send on\nLinux, the native banner via osascript on macOS) when a worktree\nchanges lifecycle state. Off by default. Lives in the global\nconfig since the daemon that emits them is a single cross-repo\nprocess."
     }
   },
   "additionalProperties": false,
