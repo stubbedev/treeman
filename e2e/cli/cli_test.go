@@ -257,9 +257,16 @@ databases:
 		}
 		return nil
 	})
-	if _, err := os.Stat(wtPath); err == nil {
-		t.Errorf("worktree dir still exists after delete: %s", wtPath)
-	}
+	// `wt delete` detaches teardown + DB teardown + git-remove to the daemon;
+	// the git-remove of the worktree dir is a separate async step from the DB
+	// drop above, so poll for it rather than asserting once (else a slow
+	// git-remove races the DB-drop readiness and flakes).
+	harness.WaitForReady(t, "remove-worktree-dir", 30*time.Second, func() error {
+		if _, err := os.Stat(wtPath); err == nil {
+			return fmt.Errorf("worktree dir still exists after delete: %s", wtPath)
+		}
+		return nil
+	})
 }
 
 // TestCLIPrintPathStreamDiscipline verifies the shell-shim contract:
