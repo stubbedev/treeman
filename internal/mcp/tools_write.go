@@ -998,6 +998,7 @@ type configSetIn struct {
 	Value any    `json:"value"           jsonschema:"the value to set (scalar, array, or object). Pass null to clear."`
 	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). The top-level key is scope-checked against the target layer."`
 }
+
 // configSetInputSchema reflects configSetIn, then forces an explicit JSON
 // type union on the `value` property. `Value any` otherwise reflects to a
 // typeless ({}) property, which Claude Code's MCP schema validator rejects —
