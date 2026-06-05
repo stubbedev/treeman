@@ -14,7 +14,7 @@ import (
 // in tools_read / tools_write so the surface stays one-line-per-tool
 // in those files; the implementations and types live here.
 func registerSyncReadTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "sync_status",
 		Description: "Report per-repo + per-worktree git sync state: last-fetch time, fetch failures, next-retry, ahead/behind, dirty flag, last skip reason (dirty|no_upstream|non_ff|detached_head|rebase_conflict). Use to answer \"why isn't my branch up to date?\".",
 		Annotations: readOnlyAnno("Report sync status", true),
@@ -22,7 +22,7 @@ func registerSyncReadTools(srv *mcpsdk.Server) {
 }
 
 func registerSyncWriteTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "sync_now",
 		Description: "Force an immediate `git fetch --all --prune` + advance (ff or rebase per config) without waiting for the auto-fetch tick. Bypasses the offline-mode backoff. path scopes the work: empty → all repos, repo root → that repo + worktrees, worktree path → that wt only. Returns same shape as sync_status.",
 		Annotations: writeAnno("Sync now", false, true, true),

@@ -27,25 +27,25 @@ import (
 // last CLI↔MCP gaps: async finalize, main-worktree enrollment, the
 // cross-repo status rollup, and the desktop-notification self-test.
 func registerAdminGapTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_finalize",
 		Description: "Re-run a worktree's setup hooks + prepare via the daemon (async — returns once queued, follow with logs_subscribe/logs_wait). The recovery/repeat counterpart to worktree_create's tail: use after a failed prepare, a config change, or to (re)materialize DBs without recreating the git worktree. Requires treemand running (daemon_control action=start).",
 		Annotations: writeAnno("Finalize worktree", false, false, true),
 	}, worktreeFinalizeTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "main_worktree",
 		Description: "Manage main-worktree enrollment — opt the repo ROOT into the per-branch DB lifecycle. action=enable (patch main_worktree.enabled=true, reload daemon, queue setup+prepare) | disable (set false, reload; purge=true also drops every main_<branch> DB) | status (enabled flag + enrolled row). Edits .treeman.yaml's main_worktree block.",
 		Annotations: writeAnno("Main-worktree enrollment", true, false, true),
 	}, mainWorktreeTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "status_overview",
 		Description: "Cross-repo fleet rollup: every registered worktree across every repo, bucketed stable/up(preparing)/down(teardown)/failed, derived from the latest lifecycle event per worktree. The fleet-wide answer to \"what's the state of everything?\" — worktree_list is per-repo and has no health bucket.",
 		Annotations: readOnlyAnno("Status overview", false),
 	}, statusOverviewTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "notify_test",
 		Description: "Send a test desktop notification through the configured (or auto-detected) backend to verify notify-send (Linux) / osascript (macOS) works before enabling notifications. Ignores notifications.enabled — it tests the transport. backend overrides the global config's notifications.backend.",
 		Annotations: writeAnno("Test notification", false, true, true),

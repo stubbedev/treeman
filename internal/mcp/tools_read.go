@@ -41,43 +41,43 @@ func registerReadTools(srv *mcpsdk.Server) {
 // registerCoreReadTools binds the four "always-on" tools agents reach for
 // first: doctor + the three .treeman.yaml inspectors.
 func registerCoreReadTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "doctor",
 		Description: "Run treeman health checks — daemon, .treeman.yaml load, JSON schema install, framework detection, registry/git drift. Call this first whenever something is wrong. Returns ok|warn|fail|skip per check + a remediation hint. Pass fix=true to auto-remediate the fixable checks (schema reinstall, registry repair) and re-probe.",
 		Annotations: writeAnno("Run treeman doctor", false, true, true),
 	}, doctorTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_locate",
 		Description: "List where every config treeman reads lives — the user-global config (~/.config/treeman/config.yaml), the repo .treeman.yaml, and the repo-local .treeman.local.yaml — with exists + bytes per file. Call this first when you need to know WHICH file to edit (global vs repo). The loader merges them global → repo → repo-local.",
 		Annotations: readOnlyAnno("Locate config files", false),
 	}, configLocateTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_get",
 		Description: "Read a config. scope=repo (default — the layered/resolved .treeman.yaml view) | global (~/.config/treeman/config.yaml alone). Always call before config_set/config_write/config_unset/config_diff. Pass resolved=true (repo scope only) for the post-substitution view (env vars + connection strings rendered) — credentials are redacted.",
 		Annotations: readOnlyAnno("Get config", false),
 	}, configGetTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_validate",
 		Description: "Confirm a config still parses + validates. scope=repo (default — layered .treeman.yaml) | global (~/.config/treeman/config.yaml standalone). Use after any manual edit (outside MCP) — config_write/config_set/config_unset already validate inline.",
 		Annotations: readOnlyAnno("Validate config", false),
 	}, configValidateTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_schema",
 		Description: "Get the JSON Schema for treeman config (reflected from config.Config). scope=repo (default, .treeman.yaml keys) | global (~/.config/treeman/config.yaml keys) | full. Repo and global accept different key subsets — daemon/snapshots/logs/status/notifications are global-only; databases/patches/hooks/main_worktree/env_sources are repo-only.",
 		Annotations: readOnlyAnno("Get config schema", false),
 	}, configSchemaTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_diff",
 		Description: "Preview the effect of a proposed config body — returns added/removed/changed dotted paths. scope=repo (default — diff against .treeman.yaml) | global (diff against ~/.config/treeman/config.yaml). Call before config_write. Parse errors short-circuit the diff.",
 		Annotations: readOnlyAnno("Diff config", false),
 	}, configDiffTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_history",
 		Description: "List stored generations of a config — every config_set/config_write/config_unset/config_delete/main-enable snapshots the prior content into SQLite (newest-first). scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Returns {generation, created_at, bytes}. Pair with config_restore to roll back a bad edit.",
 		Annotations: readOnlyAnno("List config history", false),
@@ -86,37 +86,37 @@ func registerCoreReadTools(srv *mcpsdk.Server) {
 
 // registerWorktreeReadTools binds the worktree-introspection tools.
 func registerWorktreeReadTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_list",
 		Description: "List active worktrees (slug, branch, path) from the registry. Use to discover slugs before worktree_show / worktree_delete / scoping logs_query. Capped at limit (default 200).",
 		Annotations: readOnlyAnno("List worktrees", false),
 	}, worktreeListTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_show",
 		Description: "Show the full dossier for one worktree: slug, branch, path, ports, branch_scoped active-namespace, recent events. Call before prepare_run/hook_run to confirm the worktree exists + reached finalize.",
 		Annotations: readOnlyAnno("Show worktree", false),
 	}, worktreeShowTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "branch_scoped_status",
 		Description: "Inspect every branch_scoped DB — active namespace, occupying branch, resumable durable copies. Use to answer \"which branches can I resume?\" and \"why did the swap re-seed?\". No-op when no DBs are branch_scoped.",
 		Annotations: readOnlyAnno("Inspect branch-scoped status", true),
 	}, branchScopedStatusTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "branches_list",
 		Description: "List local + origin-only branches, annotated with which already occupy a worktree. Call before worktree_create to pick an unoccupied branch. For the full create flow use the worktree-setup prompt. Capped at limit (default 200).",
 		Annotations: readOnlyAnno("List branches", true),
 	}, branchesListTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "slug_compute",
 		Description: "Preview the slug treeman will derive for a worktree path — which DB / redis prefix / index suffix the new worktree gets. Call before worktree_create.",
 		Annotations: readOnlyAnno("Compute slug", false),
 	}, slugComputeTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "fw_detect",
 		Description: "Detect migration + test frameworks in the repo. Call before init_repo to know which scaffold template will be used.",
 		Annotations: readOnlyAnno("Detect frameworks", true),
@@ -125,25 +125,25 @@ func registerWorktreeReadTools(srv *mcpsdk.Server) {
 
 // registerLogsReadTools binds the event-log tools.
 func registerLogsReadTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "logs_query",
 		Description: "Query the SQLite event log — the PRIMARY diagnostic surface. Every prepare/finalize/teardown/hook/watcher emits events. Filters AND-combine: levels, event_types, phases, since (10m|2h|RFC3339), payload_like, run_id (8-char correlation id). To wait on a live flow use logs_wait; to debug an end-to-end prepare use the diagnose-prepare-failure prompt.",
 		Annotations: readOnlyAnno("Query event log", false),
 	}, logsQueryTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "logs_hooks",
 		Description: "List recent hook_run rows for one worktree — command, exit code, stdout/stderr tails. Pair with hook_log_read for full bodies.",
 		Annotations: readOnlyAnno("List hook runs", false),
 	}, logsHooksTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "logs_wait",
 		Description: "Block until min_count new events match the filter (or timeout). Use instead of polling logs_query when watching a long prepare/finalize — scope with run_id. Returns matched events; on timeout, whatever arrived + timed_out=true. For live streaming via MCP progress notifications, prefer logs_subscribe.",
 		Annotations: readOnlyAnno("Wait for events", false),
 	}, logsWaitTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "logs_subscribe",
 		Description: "Live-stream events as they arrive via MCP progress notifications. Prefers push mode (streaming RPC subscription to the daemon, zero polling); falls back to 500ms SQLite polling when the daemon is unreachable. Each matching event becomes a notifications/progress + notifications/message; the final return carries the collected batch + a mode field (push|poll). Same filter shape as logs_wait.",
 		Annotations: readOnlyAnno("Stream events live", false),
@@ -152,13 +152,13 @@ func registerLogsReadTools(srv *mcpsdk.Server) {
 
 // registerDaemonReadTools binds the daemon-probe tools.
 func registerDaemonReadTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_status",
 		Description: "Check treemand: version, PID, watcher count. Returns status=running|not-running. Call before any daemon-backed action (prepare_run, worktree_create). If not-running, follow with daemon_control(action=\"start\"). For the rich runtime view (in-flight prepares, queued teardowns, backoff timers), use daemon_state.",
 		Annotations: readOnlyAnno("Check daemon status", true),
 	}, daemonStatusTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_state",
 		Description: "Inspect treemand's runtime state — currently-running finalize/teardown goroutines (with age), watcher set (repo + per-worktree + lifecycle), per-repo sync backoff timers, last-skip reasons. Use to answer \"is the daemon already busy with this worktree?\" without scanning logs.",
 		Annotations: readOnlyAnno("Inspect daemon state", true),
@@ -168,25 +168,25 @@ func registerDaemonReadTools(srv *mcpsdk.Server) {
 // registerPlanningReadTools binds the snapshot + fingerprint + prepare-plan
 // tools — the agent's view of "what would prepare do, what's cached".
 func registerPlanningReadTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "snapshots_list",
 		Description: "List cached snapshots (template DBs) for the repo. Call before snapshots_purge to preview what will be wiped, or before snapshot_inspect for drilldown. For orphan-only sweeps use the cache-cleanup prompt. Capped at limit (default 100).",
 		Annotations: readOnlyAnno("List snapshots", false),
 	}, snapshotsListTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "inputs_fingerprint",
 		Description: "Compute the per-database input-hash breakdown + check whether a matching snapshot exists. Use to answer \"why did prepare cold-build instead of cache-hit?\". Pair with snapshot_inspect on the expected fingerprint. Set probe_engine=true for a cache-comparable engine_version (slower).",
 		Annotations: readOnlyAnno("Inspect input hashes", true),
 	}, inputsFingerprintTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "prepare_dry_run",
 		Description: "Render the prepare pipeline plan for a worktree WITHOUT executing — per-database: rendered source-db name, dump files that would be loaded, migrate + seed commands (with env), fanout count, expected fingerprint. No engine I/O. Use to reason about the pipeline before invoking prepare_run, or to debug why a step ran what it did.",
 		Annotations: readOnlyAnno("Plan prepare pipeline", false),
 	}, prepareDryRunTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "prompts_list",
 		Description: "List every MCP prompt treeman registers — name, title, description, arguments, and a when-to-use trigger phrase. Use when the client doesn't surface MCP prompts prominently and you want to discover the canned multi-step workflows (diagnose-prepare-failure, worktree-setup, bootstrap-new-repo, …) without invoking each one.",
 		Annotations: readOnlyAnno("List prompts", false),

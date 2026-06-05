@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"gopkg.in/yaml.v3"
 
@@ -39,50 +38,49 @@ import (
 // treeman's functionality; clients restrict at the agent-policy
 // layer.
 func registerWriteTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "prepare_run",
 		Description: "Run the full prepare pipeline for a worktree (ensure source DB → dump → migrate → seed → snapshot → fanout clones). BLOCKS until every engine returns; long on cold builds — pair with logs_wait to stream progress. The daemon's watcher already re-runs this on input edits; call manually only when an out-of-band schema/seed change must propagate.",
 		Annotations: writeAnno("Run prepare", true, true, true),
 	}, prepareTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "db_reset",
 		Description: "Reset a worktree's branch_scoped DBs to the base branch's data — drops the active namespace + current branch's durable copy, then re-seeds from the parent. DESTRUCTIVE for the current branch's working data (other branches' durable copies kept). Pass dry_run=true to preview which namespaces would be dropped. No-op when no DBs are branch_scoped.",
 		Annotations: writeAnno("Reset branch_scoped DBs", true, true, true),
 	}, dbResetTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "hook_run",
 		Description: "Re-run one configured hook phase synchronously for a worktree. Optional env_overrides lets you tweak a var (e.g. DEBUG=1) for THIS run without editing .treeman.yaml. Returns per-group exit codes + stdout/stderr tails.",
 		Annotations: writeAnno("Run hook phase", true, false, true),
 	}, hookTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_write",
 		Description: "Overwrite a config with a full body. scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Always preview with config_diff first. Parses + scope-checks body before any write — invalid YAML or a misplaced-layer key never lands on disk. For surgical one-field edits prefer config_set.",
 		Annotations: writeAnno("Write config", true, true, false),
 	}, configWriteTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_set",
 		Description: "Patch one config field by dotted path (e.g. 'daemon.gc_interval', 'databases[0].engine'). scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Preserves comments + key order. Refuses to extend sequences. Scope-checks the top-level key + validates before the write. Creates the file if missing. Prefer over config_write for any single-field change.",
 		Annotations: writeAnno("Patch config field", false, true, false),
-		InputSchema: configSetInputSchema(),
 	}, configSetTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_unset",
 		Description: "Delete one key (or sequence element) from a config by dotted path (e.g. 'daemon.gc_interval', 'databases[0]'). scope=repo (default) | global. Drops the key entirely — config_set with null only nulls it. Preserves comments + order, snapshots prior content to SQLite (recoverable via config_restore), validates before the write.",
 		Annotations: writeAnno("Remove config field", true, true, false),
 	}, configUnsetTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_delete",
 		Description: "Delete a whole config FILE from disk. scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). DESTRUCTIVE but recoverable: content is snapshotted to SQLite first (config_restore brings it back). Pass dry_run=true to preview; requires ack=true to actually delete (a bare call only previews).",
 		Annotations: writeAnno("Delete config file", true, true, false),
 	}, configDeleteTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "config_restore",
 		Description: "Restore a stored generation of a config (see config_history) back onto disk. scope=repo (default) | global — must match the scope the generation was recorded under. The current content is snapshotted first, so a restore is itself reversible. Use to roll back a bad config_set/config_write/config_unset/config_delete.",
 		Annotations: writeAnno("Restore config generation", true, true, false),
@@ -90,49 +88,49 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 	registerRegistryWriteTools(srv)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "repo_remove",
 		Description: "Drop a REPO from the registry (cascades to worktrees/events/snapshots/hook_runs). External resources — DBs, on-disk worktrees, dumps — are NOT touched. Pass dry_run=true to count cascaded rows first. Refuses by default if active worktrees exist; pass force=true to override.",
 		Annotations: writeAnno("Remove repo", true, true, false),
 	}, repoRemoveTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "snapshots_purge",
 		Description: "DELETE every cached snapshot for a repo — forces every prepare to cold-build. Pass dry_run=true to preview (or call snapshots_list). For evicting only stale/orphan entries use the cache-cleanup prompt (much safer).",
 		Annotations: writeAnno("Purge snapshots", true, true, true),
 	}, snapshotsPurgeTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "logs_purge",
 		Description: "Delete event-log rows. Filters AND-combine; pass older_than=24h to drop anything older. At least one filter is REQUIRED to prevent a full wipe. Pass dry_run=true to preview the matched-row count; ack=true to skip confirmation.",
 		Annotations: writeAnno("Purge events", true, false, false),
 	}, logsPurgeTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "schema_install",
 		Description: "Generate the .treeman.yaml JSON Schema and wire the yaml-language-server modeline so editors get autocomplete + inline validation. target=repo (default) | global | url.",
 		Annotations: writeAnno("Install schema", false, true, false),
 	}, schemaInstallTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "init_repo",
 		Description: "Scaffold a fresh .treeman.yaml — auto-detects migration framework + JS package manager and emits matching databases/hooks. Pass global=true to instead scaffold the user-global ~/.config/treeman/config.yaml (machine-wide defaults: daemon/snapshots/logs/auto_fetch/notifications) and install its scoped schema. For the full guided flow use the scaffold-from-framework prompt. Pass force=true to overwrite.",
 		Annotations: writeAnno("Scaffold config", false, false, false),
 	}, initRepoTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "daemon_control",
 		Description: "Control treemand. action ∈ {start, stop, reload, install, uninstall}. start/stop prefer the installed systemd/launchd unit (else fork/shutdown-RPC). reload re-reads config + restarts watchers without a process restart (call after a config edit; repo= scopes it). install/uninstall manage the auto-start unit.",
 		Annotations: writeAnno("Daemon control", true, true, true),
 	}, daemonControlTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_create",
 		Description: "Create a new git worktree under .worktrees/<branch> + dispatch setup hooks + prepare via the daemon. For the full guided flow (branches_list → daemon_status → create → wait) use the worktree-setup prompt. For one-off migration validation use the migration-trial prompt instead. Non-blocking — tail via logs_wait.",
 		Annotations: writeAnno("Create worktree", false, false, true),
 	}, worktreeCreateTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_delete",
 		Description: "Tear down a worktree end-to-end: teardown hooks → drop DBs/redis prefixes/ES indices → remove the git worktree dir. Pass dry_run=true to preview the per-engine namespaces that would be dropped. Non-blocking — runs in the daemon.",
 		Annotations: writeAnno("Delete worktree", true, true, true),
@@ -146,25 +144,25 @@ func registerWriteTools(srv *mcpsdk.Server) {
 // shell-out, no daemon dependency — agents can reconcile drift the same
 // way `treeman wt register|unregister` would.
 func registerRegistryWriteTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "registry_register",
 		Description: "Add a WORKTREE row to SQLite without touching git. Use when a worktree exists on disk (e.g. created via raw `git worktree add`) but treeman doesn't know about it. Idempotent. For drift in an unknown direction use registry_repair.",
 		Annotations: writeAnno("Register worktree", false, true, false),
 	}, registryRegisterTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "registry_unregister",
 		Description: "Mark a WORKTREE deleted in SQLite without touching git or external resources (DBs + on-disk path stay). Use when the on-disk worktree was removed externally. Pass dry_run=true to preview which row would be marked, ack=true to skip confirmation. Idempotent.",
 		Annotations: writeAnno("Unregister worktree", true, true, false),
 	}, registryUnregisterTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "registry_repair",
 		Description: "Reconcile the SQLite worktree registry against `git worktree list` — registers what git knows that SQLite doesn't and marks deleted what SQLite knows that git doesn't. Use when drift direction is unknown.",
 		Annotations: writeAnno("Repair registry", true, true, true),
 	}, registryRepairTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_repair",
 		Description: "Recover one stuck/broken worktree end-to-end: ensure registry row, ensure ports allocated, dispatch finalize via the daemon (or run prepare inline when the daemon is unreachable), and check each snapshot for orphan templates. Returns one result per action. Idempotent — safe to call when nothing is broken.",
 		Annotations: writeAnno("Repair worktree", false, true, true),
@@ -997,23 +995,6 @@ type configSetIn struct {
 	Path  string `json:"path"            jsonschema:"dotted path like 'daemon.gc_interval' or 'databases[0].engine'"`
 	Value any    `json:"value"           jsonschema:"the value to set (scalar, array, or object). Pass null to clear."`
 	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). The top-level key is scope-checked against the target layer."`
-}
-
-// configSetInputSchema reflects configSetIn, then forces an explicit JSON
-// type union on the `value` property. `Value any` otherwise reflects to a
-// typeless ({}) property, which Claude Code's MCP schema validator rejects —
-// and one bad property fails the whole tools/list, so the entire treeman
-// server shows "tool fetch failed" with no tools registered. The union keeps
-// the "accept any scalar/array/object, or null to clear" semantics intact.
-func configSetInputSchema() *jsonschema.Schema {
-	s, err := jsonschema.For[configSetIn](nil)
-	if err != nil {
-		panic(fmt.Sprintf("config_set input schema: %v", err))
-	}
-	if v := s.Properties["value"]; v != nil {
-		v.Types = []string{"null", "boolean", "number", "string", "array", "object"}
-	}
-	return s
 }
 
 type configSetOut struct {

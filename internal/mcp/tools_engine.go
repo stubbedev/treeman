@@ -39,49 +39,49 @@ import (
 // inspection tools. Called from registerReadTools (read-only ones)
 // and registerWriteTools (mutating ones).
 func registerEngineReadTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "engine_status",
 		Description: "Probe every engine in .treeman.yaml — reachable? version? per-DB summary. Use to answer \"are my databases up?\". Call before prepare_run/worktree_create against a fresh env, and as the second step in diagnose-prepare-failure.",
 		Annotations: readOnlyAnno("Probe engine status", true),
 	}, engineStatusTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "db_schema_dump",
 		Description: "Dump the live schema for ONE database — mysql/postgres: CREATE TABLEs, mongo: collection list + samples, ES: index mapping, redis: SCAN-driven key summary. Use to reason about live shape vs. what migrations expect. db = the rendered per-worktree name (find via worktree_show or snapshot_inspect). Capped at max_tables (default 200).",
 		Annotations: readOnlyAnno("Dump live schema", true),
 	}, dbSchemaDumpTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "db_query",
 		Description: "Read OR write a configured engine directly — no shelling out to mysql/psql/mongosh/redis-cli. Default write=false is READ-ONLY (SQL: SELECT/SHOW/EXPLAIN/DESCRIBE/WITH; Mongo: find-style filter JSON, or a read command_json; Redis: GET/MGET/SCAN/HGETALL/INFO/…; ES: _search body). Set write=true+ack=true to MUTATE: SQL DML/DDL (INSERT/UPDATE/DELETE/CREATE/ALTER/DROP, returns rows_affected), any Redis command, Mongo write commands via command_json ({\"insert\":…},{\"update\":…},{\"delete\":…}). ES writes use es_request. ALWAYS FILTER + PAGINATE reads: add a WHERE/filter to narrow rows, keep limit small (default 100), and when truncated=true is returned re-call with offset += limit (SQL: put your own LIMIT/OFFSET in the query) — never pull a whole table in one shot.",
 		Annotations: writeAnno("Query or mutate engine", true, false, true),
 	}, dbQueryTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "es_request",
 		Description: "Direct Elasticsearch REST passthrough using the configured ES connection (auth handled) — replaces curl for any endpoint db_query doesn't cover: _cat/indices, _cluster/health, _mapping, _settings, _aliases, doc get/index, _bulk, _search. GET/HEAD + POST reads run freely; PUT/DELETE and writing POSTs (_doc/_bulk/_update) need write=true+ack=true. For reads that can return many hits, FILTER + PAGINATE in the body (a real query plus from/size, not match_all) instead of pulling everything; _cat endpoints accept ?format=json&s=… to sort/limit. Returns {status, body|text}.",
 		Annotations: writeAnno("Elasticsearch REST", true, false, true),
 	}, esRequestTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_inspect",
 		Description: "Inspect ONE snapshot (by fingerprint, or engine+source_db) — SQLite row + does the engine-side template still exist + size + engine version. Call before snapshot_drop. Diagnoses \"cache hit but prepare failed\": template_exists=false → orphan row, next prepare will (correctly) cold-build. For sweeps use the cache-cleanup prompt.",
 		Annotations: readOnlyAnno("Inspect snapshot", true),
 	}, snapshotInspectTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "hook_log_read",
 		Description: "Read the FULL hook log file for one (worktree, phase, group_idx). logs_hooks only keeps 16KB tails — use this when you need more. max_bytes=N returns just the trailing N bytes.",
 		Annotations: readOnlyAnno("Read hook log", false),
 	}, hookLogReadTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "connection_probe",
 		Description: "Dry-test a connection string against an engine without writing it to .treeman.yaml. Tightens the setup loop — iterate on credentials, observe reachable/version/latency, then commit via config_set. dsn forms: mysql://user:pw@host:port, postgres://…, mongodb://…, redis://…, http(s)://…(ES). Omit dsn to probe the repo's currently-configured connection.",
 		Annotations: readOnlyAnno("Probe connection", true),
 	}, connectionProbeTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "engine_logs",
 		Description: "Tail the container logs for one configured engine — `docker logs --tail N --since S` (or podman/nerdctl/finch per the connection block's container_engine). Closes the \"why is MySQL refusing connections?\" gap so the agent doesn't have to leave MCP for the diagnosis. Errors with a clear message when the engine's connection block has no container/compose ref (raw host engines need host-side log access).",
 		Annotations: readOnlyAnno("Tail engine logs", true),
@@ -89,13 +89,13 @@ func registerEngineReadTools(srv *mcpsdk.Server) {
 }
 
 func registerEngineWriteTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "snapshot_drop",
 		Description: "Evict ONE snapshot by fingerprint (engine-side template + SQLite row). Next prepare cold-rebuilds. Call snapshot_inspect first to confirm. Engine-drop failures abort before the SQLite row is touched, so partial failures leave a recoverable state. Pass dry_run=true to preview, ack=true to skip confirmation. For orphan sweeps the cache-cleanup prompt is safer than calling this directly.",
 		Annotations: writeAnno("Drop snapshot", true, true, true),
 	}, snapshotDropTool)
 
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "db_dump",
 		Description: "Refresh the seed dump used for cold builds — runs mysqldump / pg_dump / mongodump / ES scroll-bulk. Commit the new file then trigger prepare_run. Redis intentionally not implemented (uses a seed step, not a dump). output_dir defaults to <repo>/storage/dumps.",
 		Annotations: writeAnno("Dump database", false, false, true),
