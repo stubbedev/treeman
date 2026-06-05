@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"gopkg.in/yaml.v3"
 
@@ -66,6 +67,7 @@ func registerWriteTools(srv *mcpsdk.Server) {
 		Name:        "config_set",
 		Description: "Patch one config field by dotted path (e.g. 'daemon.gc_interval', 'databases[0].engine'). scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Preserves comments + key order. Refuses to extend sequences. Scope-checks the top-level key + validates before the write. Creates the file if missing. Prefer over config_write for any single-field change.",
 		Annotations: writeAnno("Patch config field", false, true, false),
+		InputSchema: configSetInputSchema(),
 	}, configSetTool)
 
 	mcpsdk.AddTool(srv, &mcpsdk.Tool{
@@ -996,6 +998,23 @@ type configSetIn struct {
 	Value any    `json:"value"           jsonschema:"the value to set (scalar, array, or object). Pass null to clear."`
 	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). The top-level key is scope-checked against the target layer."`
 }
+// configSetInputSchema reflects configSetIn, then forces an explicit JSON
+// type union on the `value` property. `Value any` otherwise reflects to a
+// typeless ({}) property, which Claude Code's MCP schema validator rejects —
+// and one bad property fails the whole tools/list, so the entire treeman
+// server shows "tool fetch failed" with no tools registered. The union keeps
+// the "accept any scalar/array/object, or null to clear" semantics intact.
+func configSetInputSchema() *jsonschema.Schema {
+	s, err := jsonschema.For[configSetIn](nil)
+	if err != nil {
+		panic(fmt.Sprintf("config_set input schema: %v", err))
+	}
+	if v := s.Properties["value"]; v != nil {
+		v.Types = []string{"null", "boolean", "number", "string", "array", "object"}
+	}
+	return s
+}
+
 type configSetOut struct {
 	Path         string `json:"path"`
 	Scope        string `json:"scope"`
