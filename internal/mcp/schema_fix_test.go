@@ -61,6 +61,7 @@ func TestToolSchemasAreClaudeCompatible(t *testing.T) {
 // any that is the boolean `true` or a typeless object. `additionalProperties:
 // false` (boolean false) is explicitly allowed — Claude Code accepts it.
 func walkSchemaPositions(t *testing.T, path string, node any) {
+	t.Helper()
 	switch v := node.(type) {
 	case bool:
 		if v {
