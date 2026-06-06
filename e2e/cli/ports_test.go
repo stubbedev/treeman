@@ -36,6 +36,7 @@ func setupPortsRepo(t *testing.T) (binDir, repoRoot string) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "treeman.db"))
+	t.Setenv("TREEMAN_SOCKET", filepath.Join(t.TempDir(), "tm.sock"))
 
 	repoRoot = filepath.Join(t.TempDir(), "main")
 	if err := os.MkdirAll(repoRoot, 0o755); err != nil {

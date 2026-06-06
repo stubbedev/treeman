@@ -59,6 +59,7 @@ func TestSIGHUPReloadsConfig(t *testing.T) {
 		"XDG_RUNTIME_DIR="+runtimeDir,
 		"XDG_CONFIG_HOME="+configHome,
 		"TREEMAN_DB_PATH="+dbPath,
+		"TREEMAN_SOCKET="+filepath.Join(filepath.Dir(dbPath), "tm.sock"),
 	)
 	daemonCmd.Stderr = os.Stderr
 	if err := daemonCmd.Start(); err != nil {

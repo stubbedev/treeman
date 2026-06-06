@@ -239,6 +239,7 @@ func runCLI(t *testing.T, fx *fixture, cwd string, args ...string) cliResult {
 	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(),
 		"TREEMAN_DB_PATH="+fx.dbPath,
+		"TREEMAN_SOCKET="+filepath.Join(filepath.Dir(fx.dbPath), "tm.sock"),
 		"HOME="+fx.homeDir,
 		"XDG_DATA_HOME="+fx.homeDir,
 		"XDG_STATE_HOME="+fx.homeDir,
@@ -638,6 +639,7 @@ func TestLogsTailFollow(t *testing.T) {
 	cmd.Dir = t.TempDir()
 	cmd.Env = append(os.Environ(),
 		"TREEMAN_DB_PATH="+fx.dbPath,
+		"TREEMAN_SOCKET="+filepath.Join(filepath.Dir(fx.dbPath), "tm.sock"),
 		"HOME="+fx.homeDir,
 		"XDG_DATA_HOME="+fx.homeDir,
 		"XDG_STATE_HOME="+fx.homeDir,

@@ -48,6 +48,7 @@ func TestCleanFilterKeepsGitStatusClean(t *testing.T) {
 	// Isolate the store the filter opens for its template context, and
 	// the global config, away from the developer's real ones.
 	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "treeman.db"))
+	t.Setenv("TREEMAN_SOCKET", filepath.Join(t.TempDir(), "tm.sock"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	// One repo, six committed files (each in its HEAD/placeholder form),

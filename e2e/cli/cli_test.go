@@ -93,6 +93,7 @@ func TestCLIEndToEnd(t *testing.T) {
 		"XDG_RUNTIME_DIR="+runtimeDir,
 		"XDG_STATE_HOME="+stateDir,
 		"TREEMAN_DB_PATH="+dbPath,
+		"TREEMAN_SOCKET="+filepath.Join(filepath.Dir(dbPath), "tm.sock"),
 	)
 	daemonStderr := &lineBuf{}
 	daemonCmd.Stderr = daemonStderr

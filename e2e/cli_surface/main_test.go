@@ -126,6 +126,7 @@ func (e *env) block() []string {
 		"XDG_CONFIG_HOME=" + e.configDir,
 		"XDG_RUNTIME_DIR=" + e.runtimeDir,
 		"TREEMAN_DB_PATH=" + e.dbPath,
+		"TREEMAN_SOCKET=" + filepath.Join(filepath.Dir(e.dbPath), "tm.sock"),
 		"TREEMAN_NO_PAGER=1",
 		"NO_COLOR=1",
 	}

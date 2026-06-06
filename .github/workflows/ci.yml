@@ -28,6 +28,30 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
+  # Container-free e2e on every push/PR. The full e2e matrix (engines,
+  # frameworks, …) needs Docker and only runs on release tags; the `lite`
+  # batch (cli_surface, logs, notifications) exercises the CLI / daemon /
+  # event surface with no engine, so it catches event/hook/status-name
+  # drift here instead of at release. Engine tests gate on
+  # harness.SkipIfNoDocker, so even if a docker test sneaks into the batch
+  # it skips rather than fails.
+  e2e-lite:
+    name: e2e (container-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: install just
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+            | bash -s -- --to "$(go env GOPATH)/bin"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: run container-free e2e batch
+        run: just test-e2e lite
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest

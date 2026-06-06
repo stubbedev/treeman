@@ -87,6 +87,7 @@ func runTreeman(t *testing.T, repo string, args ...string) (string, string, erro
 		"XDG_DATA_HOME="+t.TempDir(),
 		"XDG_CONFIG_HOME="+t.TempDir(),
 		"TREEMAN_DB_PATH="+filepath.Join(t.TempDir(), "treeman.db"),
+		"TREEMAN_SOCKET="+filepath.Join(t.TempDir(), "tm.sock"),
 		"TREEMAN_NO_PAGER=1", "NO_COLOR=1",
 	)
 	var sout, serr strings.Builder

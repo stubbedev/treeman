@@ -24,6 +24,7 @@ func TestWorktreesRootOverride(t *testing.T) {
 	// Isolate the store + global config so Create doesn't touch the
 	// developer's real DB (it resolves store.DefaultDBPath()).
 	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "tm.db"))
+	t.Setenv("TREEMAN_SOCKET", filepath.Join(t.TempDir(), "tm.sock"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 
 	repo := t.TempDir()
