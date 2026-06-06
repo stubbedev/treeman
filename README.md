@@ -45,9 +45,10 @@ protocol).
 - **Hook lifecycle** — declarative create / delete / checkout /
   file-change trigger lists; actions in a list run in parallel, the
   `run:` steps within an action chain sequentially.
-- **Parallel test runner support** — `clones: auto` detects worker
-  counts from 19+ runners (paratest, pytest-xdist, jest / vitest,
-  cargo-nextest, …) by inspecting the repo's config files.
+- **Parallel test runner support** — `clones: auto` detects the test
+  framework (paratest, pytest-xdist, jest / vitest, cargo-nextest, …)
+  and pre-warms one clone per CPU when that runner parallelizes
+  per-worker, else one.
 - **File watcher** — fsnotify re-fingerprints affected databases on
   input edits and picks `auto | delta | rebuild`.
 - **MCP server** — `treeman mcp` exposes config authoring/validation,
@@ -76,7 +77,7 @@ schema, AI integration, internals.
   instances; it does not run them. Local server, remote server,
   or container-hosted server (auto-discovered via `docker
   inspect` / `compose ps`) all work.
-- **Go 1.23+** — only if building from source.
+- **Go 1.25+** — only if building from source.
 
 That's the whole dependency list. No Python, no Node, no
 language-specific tooling required.
@@ -105,7 +106,7 @@ install /tmp/treeman-*-linux-amd64/treeman  ~/.local/bin/
 install /tmp/treeman-*-linux-amd64/treemand ~/.local/bin/
 ```
 
-From source (Go 1.23+):
+From source (Go 1.25+):
 
 ```sh
 git clone https://github.com/stubbedev/treeman
@@ -146,10 +147,10 @@ treeman doctor              # probes daemon, config, schema, git ↔ registry dr
 # 3. Spin up a worktree end-to-end.
 treeman wt create proj-123
 #   ↳ git worktree add .worktrees/proj-123 -b proj-123 origin/HEAD
-#   ↳ symlinks .env (and any worktrees.links targets)
-#   ↳ patches env_scoping.files entries (.env.testing, settings.py,
+#   ↳ brings in worktrees.copies (e.g. .env) + worktrees.links (e.g. node_modules)
+#   ↳ patches `patches:` entries (.env.testing, settings.py,
 #     phpunit.xml, etc.) to point at per-worktree DB names
-#   ↳ runs postcreate hooks (parallel groups, detached)
+#   ↳ runs create hooks (parallel groups, detached)
 #   ↳ prepare: ensure_db → load dump → migrate → snapshot → N test clones
 
 # 4. Get the path of an existing worktree for `cd` integration:
@@ -192,11 +193,14 @@ tm list              # passthrough to `treeman wt list`
 | Page | What you'll find |
 |---|---|
 | [docs/cli.md](docs/cli.md) | Full command reference, log filters, completion, output/color/paging, env vars |
-| [docs/configuration.md](docs/configuration.md) | `.treeman.yaml` reference — every block, per-stack examples, templated names, hooks, credential resolution, container DBs + hooks |
+| [docs/configuration.md](docs/configuration.md) | `.treeman.yaml` guide — every block, per-stack examples, templated names, hooks, credential resolution, container DBs |
+| [docs/config-reference.md](docs/config-reference.md) | Generated field-by-field `.treeman.yaml` reference (from the Go types) |
 | [docs/advanced.md](docs/advanced.md) | Snapshot cache + GC, framework presets |
-| [docs/mcp-tools.md](docs/mcp-tools.md) | Generated MCP tool + prompt reference (auto-generated from the registry) |
-| [docs/events.md](docs/events.md) | Generated event-type reference (auto-generated from the `store.Evt*` constants) |
 | [docs/mcp.md](docs/mcp.md) | MCP / AI integration — Claude Code, Claude Desktop, Cursor, security model |
+| [docs/mcp-tools.md](docs/mcp-tools.md) | Generated MCP tool + prompt reference (from the registry) |
+| [docs/events.md](docs/events.md) | Generated event-type reference (from the `store.Evt*` constants) |
+| [docs/frameworks.md](docs/frameworks.md) | Generated migration-framework preset table (from the detector registry) |
+| [docs/rpc-reference.md](docs/rpc-reference.md) | Generated RPC method / task / kind reference (from `internal/rpc`) |
 | [docs/internals.md](docs/internals.md) | Storage layout, daemon model, init parity, RPC envelope, development |
 
 ---

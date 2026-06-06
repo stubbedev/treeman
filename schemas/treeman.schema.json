@@ -206,7 +206,7 @@
             "$ref": "#/$defs/Input"
           },
           "type": "array",
-          "description": "Inputs declare every file that determines this database's\ntemplate state. Each entry:\n  1. Contributes a hash to the snapshot fingerprint (so any\n     change auto-invalidates the cached template).\n  2. Subscribes fsnotify so changes trigger a re-prep.\n  3. Carries an optional `label:` that `hooks.file-change`\n     actions can match against.\n\nGlob patterns are repo-root-relative. Hash mode is per-entry:\n`filename` for append-only files (Laravel migrations, …),\n`checksum` for files edited in place (seeders, lockfiles).\nDefault is checksum.\n\nCache-hit vs cold-build is derived purely from the input\nhashes — there's no separate `on: rebuild` knob. If you want\nto force a rebuild, change an input."
+          "description": "Inputs declare every file that determines this database's\ntemplate state. Each entry:\n  1. Contributes a hash to the snapshot fingerprint (so any\n     change auto-invalidates the cached template).\n  2. Subscribes fsnotify so changes trigger a re-prep.\n  3. Carries an optional `label:` that `hooks.file-change`\n     actions can match against.\n\nGlob patterns are repo-root-relative. Every matched file is\ncontent-hashed (BLAKE3); a content, add, or remove moves the\nfingerprint.\n\nCache-hit vs cold-build is derived purely from the input\nhashes — there's no separate `on: rebuild` knob. If you want\nto force a rebuild, change an input."
         },
         "test_clones": {
           "$ref": "#/$defs/TestClonesSpec",

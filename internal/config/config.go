@@ -1280,10 +1280,9 @@ type DatabaseConfig struct {
 	//   3. Carries an optional `label:` that `hooks.file-change`
 	//      actions can match against.
 	//
-	// Glob patterns are repo-root-relative. Hash mode is per-entry:
-	// `filename` for append-only files (Laravel migrations, …),
-	// `checksum` for files edited in place (seeders, lockfiles).
-	// Default is checksum.
+	// Glob patterns are repo-root-relative. Every matched file is
+	// content-hashed (BLAKE3); a content, add, or remove moves the
+	// fingerprint.
 	//
 	// Cache-hit vs cold-build is derived purely from the input
 	// hashes — there's no separate `on: rebuild` knob. If you want

@@ -215,7 +215,9 @@ sync-docs:
     go run ./cmd/treeman-gen-config-docs docs/config-reference.md
     go run ./cmd/treeman-gen-mcp-docs docs/mcp-tools.md
     go run ./cmd/treeman-gen-events-docs docs/events.md
-    if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md)" ]; then
+    go run ./cmd/treeman-gen-frameworks-docs docs/frameworks.md
+    go run ./cmd/treeman-gen-rpc-docs docs/rpc-reference.md
+    if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md)" ]; then
         echo "sync-docs: regenerated generated docs"
     else
         echo "sync-docs: generated docs already in sync"

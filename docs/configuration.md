@@ -32,9 +32,8 @@ For the full per-key reference + auto-generated examples see
 
 worktrees:
   root: .worktrees                # default
-  links: [".env"]                 # symlink from main repo into the worktree
-  async_create: true              # default — postcreate + prepare detach to daemon
-  async_delete: true              # default
+  copies: [".env"]                # copied into each worktree (patched per-branch; never shared)
+  links: ["node_modules"]         # symlinked from main (shared read-only cache)
 
 env_sources:                       # credential-resolver READ list
   - .env
@@ -73,8 +72,8 @@ databases:
         DB_DATABASE: "{target_db}"
         DB_TEST_DATABASE: "{target_db}"
     inputs:                                # files folded into the snapshot key; also watched for changes
-      - { glob: "database/migrations/**/*.php", label: migrations, hash: filename }
-      - composer.lock                      # bare string = checksum hash, no label
+      - { glob: "database/migrations/**/*.php", label: migrations }
+      - composer.lock                      # bare string = glob with no label
     test_clones:                           # parallel-test-runner fan-out
       clones: auto                         # auto = one clone per CPU when the detected framework parallelizes per-worker
       name_template: "myapp_testing_{slug}_test_{n}"
@@ -140,9 +139,11 @@ worktree's slug:
 |---|---|
 | `{slug}` | `proj_123` |
 | `{slug_dash}` | `proj-123` |
-| `{slug_upper}` | `PROJ_123` |
-| `{slug_redis_index}` | `7` (deterministic 0–15 hash of slug) |
-| `{n}` | test-clone index (1-based) |
+| `{slug_redis_queue}` | `9` — checksum-derived Redis DB index (6–15) |
+| `{slug_redis_cache}` | `12` — checksum-derived Redis DB index (6–15), distinct from queue |
+| `{port_<name>}` | allocated port for the `ports:` slot `<name>` (e.g. `{port_octane}`) |
+| `{target_db}` | the rendered per-run DB name (only in `migrate.env` / `seed.env`) |
+| `{n}` | test-clone index, 1-based (only in `test_clones.name_template`) |
 
 ## Fully declarative — no hidden defaults
 
@@ -307,7 +308,7 @@ framework. Copy + paste into the `databases:` array of an existing
     run: "bin/rails db:migrate"
     env: { DB_NAME: "{target_db}" }
   inputs:
-    - { glob: "db/migrate/**/*.rb", label: migrations, hash: filename }
+    - { glob: "db/migrate/**/*.rb", label: migrations }
     - Gemfile.lock
   test_clones:
     clones: auto          # auto = one clone per CPU (framework detected, not worker-config parsed)
@@ -323,7 +324,7 @@ framework. Copy + paste into the `databases:` array of an existing
     run: "python manage.py migrate --noinput"
     env: { DB_NAME: "{target_db}" }
   inputs:
-    - { glob: "**/migrations/[0-9]*_*.py", label: migrations, hash: filename }
+    - { glob: "**/migrations/[0-9]*_*.py", label: migrations }
     - poetry.lock
     - Pipfile.lock
     - requirements.txt
@@ -345,15 +346,15 @@ framework. Copy + paste into the `databases:` array of an existing
     env:
       DATABASE_URL: "postgres://user:password@127.0.0.1:5432/{target_db}?sslmode=disable"
   inputs:
-    - { glob: "migrations/**/*.up.sql", label: migrations, hash: filename }
-    - { glob: "services/*/migrations/**/*.up.sql", label: migrations, hash: filename }
+    - { glob: "migrations/**/*.up.sql", label: migrations }
+    - { glob: "services/*/migrations/**/*.up.sql", label: migrations }
     - go.sum
   test_clones:
     clones: 4             # explicit count; Go's `-parallel` is per-package
     name_template: "svc_test_{slug}_w{n}"
 ```
 
-**sqlx-cli + Postgres** (migrations are mutable — checksum hash via default):
+**sqlx-cli + Postgres** (sqlx allows in-place migration edits — content hashing catches them):
 
 ```yaml
 - engine: postgres
@@ -364,8 +365,8 @@ framework. Copy + paste into the `databases:` array of an existing
       # sqlx-cli reads DATABASE_URL natively.
       DATABASE_URL: "postgres://user:password@127.0.0.1:5432/{target_db}?sslmode=disable"
   inputs:
-    # bare-string default = checksum hash, so edits to a migration
-    # rebuild the snapshot (sqlx allows mutable migrations).
+    # every matched file is content-hashed, so an in-place edit
+    # moves the fingerprint and rebuilds the snapshot.
     - "migrations/**/*.sql"
     - "crates/*/migrations/**/*.sql"
     - Cargo.lock
