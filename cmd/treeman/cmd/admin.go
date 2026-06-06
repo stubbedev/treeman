@@ -7,15 +7,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/urfave/cli/v3"
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
-	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
-	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/ui"
 	"github.com/stubbedev/treeman/internal/wtreg"
@@ -43,18 +43,16 @@ func RegistryCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
-					st, err := openDefaultStore(ctx)
-					if err != nil {
-						return err
-					}
-					defer func() { _ = st.Close() }()
-					res, err := wtreg.Repair(ctx, st, repoRoot, detectBranchOfWorktree)
-					if err != nil {
-						return err
-					}
+					task := rpc.Task{Type: rpc.TaskRegistryRepair, RepoPath: repoRoot}
 					if c.Bool("json") {
-						return jsonStream(res)
+						return runResultJSON(ctx, task)
 					}
+					payload, err := resultPayload(ctx, task)
+					if err != nil {
+						return err
+					}
+					var res wtreg.RepairResult
+					_ = json.Unmarshal(payload, &res)
 					for _, p := range res.Registered {
 						PrintOK("registered %s", p)
 					}
@@ -238,38 +236,25 @@ func SnapshotsCmd() *cli.Command {
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 					&cli.BoolFlag{Name: "json"},
+					&cli.BoolFlag{
+						Name:    "foreground",
+						Aliases: []string{"wait", "f"},
+						Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+					},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					repoRoot, err := resolveRepo(c.String("repo"))
 					if err != nil {
 						return err
 					}
-					cfg, err := resolve.LoadResolved(repoRoot)
-					if err != nil {
-						return fmt.Errorf("load config: %w", err)
+					task := rpc.Task{
+						Type: rpc.TaskSnapshotsPurge, RepoPath: repoRoot,
+						InheritedEnv: CaptureInheritedEnv(),
 					}
-					st, err := openDefaultStore(ctx)
-					if err != nil {
-						return err
-					}
-					defer func() { _ = st.Close() }()
-					repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-					if err != nil {
-						return fmt.Errorf("ensure repo: %w", err)
-					}
-					dropped, errs := snapshot.PurgeRepo(ctx, &cfg, st, repoID)
 					if c.Bool("json") {
-						msgs := make([]string, 0, len(errs))
-						for _, e := range errs {
-							msgs = append(msgs, e.Error())
-						}
-						return jsonStream(map[string]any{"repo": repoRoot, "dropped": dropped, "errors": msgs})
+						return runResultJSON(ctx, task)
 					}
-					PrintOK("purged %d snapshot(s) for %s", dropped, repoRoot)
-					for _, e := range errs {
-						PrintWarn("%s", e)
-					}
-					return nil
+					return dispatchTask(ctx, task, c.Bool("foreground"), "snapshots purge")
 				},
 			},
 		},
@@ -301,61 +286,49 @@ never wipe the whole table.
 				len(c.StringSlice("level")) == 0 && len(c.StringSlice("event-type")) == 0 {
 				return errors.New("at least one filter (--repo, --worktree, --older-than, --level, --event-type) is required")
 			}
-			f := store.EventFilter{
-				Levels:     validateLevels(c.StringSlice("level")),
-				EventTypes: c.StringSlice("event-type"),
+			// Build the purge filter as task params; the daemon owns the
+			// DELETE (single SQLite writer). Scope paths are resolved to
+			// absolute here — the daemon's cwd is not the user's.
+			params := map[string]string{}
+			if lv := validateLevels(c.StringSlice("level")); len(lv) > 0 {
+				params["levels"] = strings.Join(lv, ",")
+			}
+			if et := c.StringSlice("event-type"); len(et) > 0 {
+				params["event_types"] = strings.Join(et, ",")
 			}
 			if v := c.String("older-than"); v != "" {
 				t, err := parseOlderThan(v)
 				if err != nil {
 					return err
 				}
-				f.UntilMs = t.UnixMilli()
+				params["until_ms"] = strconv.FormatInt(t.UnixMilli(), 10)
 			}
-			st, err := openDefaultStore(ctx)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = st.Close() }()
-			if c.String("repo") != "" || c.String("worktree") != "" {
-				if err := applyPurgeScope(ctx, st, c.String("repo"), c.String("worktree"), &f); err != nil {
+			if r := c.String("repo"); r != "" {
+				repoAbs, err := resolveRepo(r)
+				if err != nil {
 					return err
 				}
+				params["repo"] = repoAbs
 			}
-			n, err := st.PurgeEvents(ctx, f)
+			if w := c.String("worktree"); w != "" {
+				params["worktree"] = w
+			}
+			task := rpc.Task{Type: rpc.TaskLogsPurge, Params: params}
+			if c.Bool("json") {
+				return runResultJSON(ctx, task)
+			}
+			payload, err := resultPayload(ctx, task)
 			if err != nil {
 				return err
 			}
-			if c.Bool("json") {
-				return jsonStream(map[string]any{"rows_removed": n})
+			var r struct {
+				RowsRemoved int64 `json:"rows_removed"`
 			}
-			PrintOK("removed %d event row(s)", n)
+			_ = json.Unmarshal(payload, &r)
+			PrintOK("removed %d event row(s)", r.RowsRemoved)
 			return nil
 		},
 	}
-}
-
-// applyPurgeScope resolves the optional --repo / --worktree filters into
-// the EventFilter. A repo that can't be resolved is silently left unset
-// (best-effort scope); a named worktree that doesn't exist is an error.
-func applyPurgeScope(ctx context.Context, st *store.Store, repoArg, wtArg string, f *store.EventFilter) error {
-	repoRoot, err := resolveRepo(repoArg)
-	if err == nil && repoRoot != "" {
-		if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
-			f.RepoID = rid
-		}
-	}
-	if wtArg != "" {
-		wid, err := st.LookupWorktreeID(ctx, f.RepoID, wtArg)
-		if err != nil {
-			return err
-		}
-		if wid == 0 {
-			return fmt.Errorf("no worktree matches %q", wtArg)
-		}
-		f.WorktreeID = wid
-	}
-	return nil
 }
 
 // configSet returns the `treeman config set` subcommand. Wired into
@@ -391,7 +364,7 @@ Examples:
 			if err != nil {
 				return err
 			}
-			if err := snapshotAndWrite(ctx, repoRoot, p, body); err != nil {
+			if err := writeConfig(ctx, repoRoot, p, body); err != nil {
 				return err
 			}
 			prevJSON := decodePrevJSON(prev)
@@ -483,21 +456,6 @@ func openDefaultStore(ctx context.Context) (*store.Store, error) {
 		return nil, err
 	}
 	return store.Open(ctx, p)
-}
-
-// snapshotAndWrite stashes the current on-disk content of path as a new
-// config generation for repoRoot (best-effort — a store failure must
-// not block the edit), then atomically writes the new bytes. Replaces
-// the old `.treeman.yaml.bak.*` files: history now lives per-repo in
-// SQLite, reachable via `treeman config history|restore`.
-func snapshotAndWrite(ctx context.Context, repoRoot, path string, data []byte) error {
-	if prev, err := os.ReadFile(path); err == nil {
-		if st, err := openDefaultStore(ctx); err == nil {
-			_, _ = st.SnapshotConfig(ctx, repoRoot, path, prev)
-			_ = st.Close()
-		}
-	}
-	return yamlpatch.AtomicWrite(path, data)
 }
 
 // parseOlderThan accepts "24h" / "7d" / RFC3339. For durations the

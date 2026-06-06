@@ -1,14 +1,13 @@
 // Package rpc — wire types shared between `treemand` and `treeman`.
-// Wire format is newline-delimited JSON over a unix domain socket
-// with an SO_PEERCRED uid check. Requests and responses use a
-// tagged-union shape: every payload carries a discriminator field
-// (`method` on requests, `kind` on responses) as the first key.
+// Wire format is newline-delimited JSON over a unix domain socket with
+// an SO_PEERCRED uid check. Requests and responses are tagged unions: a
+// discriminator (`method` on requests, `kind` on responses) plus the
+// matching args/payload object, (un)marshaled by encoding/json directly.
 package rpc
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -17,7 +16,9 @@ import (
 )
 
 // ProtocolVersion is bumped when an incompatible RPC change ships.
-const ProtocolVersion uint32 = 1
+// v2: nested-args envelope ({"method":m,"<m>":{...}}) replacing the old
+// flat tagged union; worktree finalize/teardown folded into run_plan.
+const ProtocolVersion uint32 = 2
 
 // Default socket-path lookup order: $TREEMAN_SOCKET → $XDG_RUNTIME_DIR
 // /treeman.sock → $XDG_DATA_HOME/treeman/treeman.sock.
@@ -47,225 +48,81 @@ func SocketPath() (string, error) {
 
 // ─────────────────────────── Request ───────────────────────────
 //
-// Wire shape: {"method": "status", ...}. `method` is the tagged-
-// union discriminator and is always emitted as the first field on
-// every payload.
+// Wire shape: {"method":"<m>","<m>":{...args...}}. `method` is the
+// discriminator; the args object is nested under the method-named key.
 
 // RequestMethod values.
 const (
-	MethodStatus           = "status"
-	MethodPing             = "ping"
-	MethodRepoRegister     = "repo_register"
-	MethodWatcherStart     = "watcher_start"
-	MethodWatcherStop      = "watcher_stop"
-	MethodWatcherList      = "watcher_list"
-	MethodWorktreeList     = "worktree_list"
-	MethodWorktreeFinalize = "worktree_finalize"
-	MethodWorktreeTeardown = "worktree_teardown"
-	MethodConfigReload     = "config_reload"
-	MethodRepoRemove       = "repo_remove"
-	MethodShutdown         = "shutdown"
-	MethodSyncNow          = "sync_now"
-	MethodSyncStatus       = "sync_status"
-	MethodDaemonState      = "daemon_state"
+	MethodStatus       = "status"
+	MethodPing         = "ping"
+	MethodRepoRegister = "repo_register"
+	MethodWatcherStart = "watcher_start"
+	MethodWatcherStop  = "watcher_stop"
+	MethodWatcherList  = "watcher_list"
+	MethodWorktreeList = "worktree_list"
+	MethodConfigReload = "config_reload"
+	MethodRepoRemove   = "repo_remove"
+	MethodShutdown     = "shutdown"
+	MethodSyncNow      = "sync_now"
+	MethodSyncStatus   = "sync_status"
+	MethodDaemonState  = "daemon_state"
+	// MethodRunPlan offloads a plan to the daemon, the sole mutator of
+	// repo/worktree state. A plan is a set of groups: groups run in
+	// PARALLEL with each other, tasks within a group run SEQUENTIALLY
+	// (a group is one ordered lane; a lane stops at its first failure).
+	// The daemon either queues the plan and returns immediately
+	// (RunPlanArgs.Wait false) or runs it to completion and returns
+	// per-task results (Wait true). Foreground progress is observed by
+	// subscribing to the plan's RunID via MethodEventSubscribe before
+	// dispatch.
+	MethodRunPlan = "run_plan"
 	// MethodEventSubscribe opens a STREAMING subscription: one request
 	// → many responses (one per matching event) over the same socket
 	// connection, until ctx cancels or client closes.
 	MethodEventSubscribe = "event_subscribe"
 )
 
-// Request is the envelope every CLI message uses. Exactly one of the
-// `*Args` pointers is non-nil for any given Method.
+// Request is the envelope every CLI message sends. The wire shape is the
+// method discriminator plus the matching args object, e.g.
+// {"method":"run_plan","run_plan":{...}}. encoding/json (un)marshals it
+// directly — omitempty drops the nil pointers, so exactly the one set for
+// r.Method survives, and decode populates the matching pointer by key.
+// No hand-rolled (un)marshal: add a method = add a Method* const, a
+// tagged pointer field here, and an args struct.
 type Request struct {
-	Method           string                `json:"method"`
-	RepoRegister     *RepoRegisterArgs     `json:",omitempty"`
-	WatcherStart     *WatcherStartArgs     `json:",omitempty"`
-	WatcherStop      *WatcherStopArgs      `json:",omitempty"`
-	WorktreeList     *WorktreeListArgs     `json:",omitempty"`
-	WorktreeFinalize *WorktreeFinalizeArgs `json:",omitempty"`
-	WorktreeTeardown *WorktreeTeardownArgs `json:",omitempty"`
-	ConfigReload     *ConfigReloadArgs     `json:",omitempty"`
-	RepoRemove       *RepoRemoveArgs       `json:",omitempty"`
-	SyncNow          *SyncNowArgs          `json:",omitempty"`
-	SyncStatus       *SyncStatusArgs       `json:",omitempty"`
-	EventSubscribe   *EventSubscribeArgs   `json:",omitempty"`
+	Method         string              `json:"method"`
+	RepoRegister   *RepoRegisterArgs   `json:"repo_register,omitempty"`
+	WatcherStart   *WatcherStartArgs   `json:"watcher_start,omitempty"`
+	WatcherStop    *WatcherStopArgs    `json:"watcher_stop,omitempty"`
+	WorktreeList   *WorktreeListArgs   `json:"worktree_list,omitempty"`
+	ConfigReload   *ConfigReloadArgs   `json:"config_reload,omitempty"`
+	RepoRemove     *RepoRemoveArgs     `json:"repo_remove,omitempty"`
+	SyncNow        *SyncNowArgs        `json:"sync_now,omitempty"`
+	SyncStatus     *SyncStatusArgs     `json:"sync_status,omitempty"`
+	RunPlan        *RunPlanArgs        `json:"run_plan,omitempty"`
+	EventSubscribe *EventSubscribeArgs `json:"event_subscribe,omitempty"`
 }
 
-// MarshalJSON flattens the discriminator + the matching args struct
-// onto a single object so the wire format is a flat tagged union
-// keyed by `method`.
-func (r Request) MarshalJSON() ([]byte, error) {
-	wrapper := map[string]any{"method": r.Method}
-	if !populateWrapperA(r, wrapper) {
-		populateWrapperB(r, wrapper)
-	}
-	return json.Marshal(wrapper)
-}
-
-// populateWrapperA flattens the args struct for the first half of the
-// method discriminator. Returns true when r.Method was handled here so
-// the caller can skip the second half. Split out of MarshalJSON to keep
-// each discriminator switch under the complexity budget.
-func populateWrapperA(r Request, wrapper map[string]any) bool {
-	switch r.Method {
-	case MethodRepoRegister:
-		if r.RepoRegister != nil {
-			wrapper["path"] = r.RepoRegister.Path
-			wrapper["name"] = r.RepoRegister.Name
-		}
-	case MethodWatcherStart:
-		if r.WatcherStart != nil {
-			wrapper["repo_path"] = r.WatcherStart.RepoPath
-		}
-	case MethodWatcherStop:
-		if r.WatcherStop != nil {
-			wrapper["repo_path"] = r.WatcherStop.RepoPath
-		}
-	case MethodWorktreeList:
-		if r.WorktreeList != nil {
-			wrapper["repo_path"] = r.WorktreeList.RepoPath
-		}
-	case MethodWorktreeFinalize:
-		if r.WorktreeFinalize != nil {
-			wrapper["repo_path"] = r.WorktreeFinalize.RepoPath
-			wrapper["worktree_path"] = r.WorktreeFinalize.WorktreePath
-			wrapper["inherited_env"] = r.WorktreeFinalize.InheritedEnv
-		}
-	default:
-		return false
-	}
-	return true
-}
-
-// populateWrapperB handles the remaining methods not matched by
-// populateWrapperA.
-func populateWrapperB(r Request, wrapper map[string]any) {
-	switch r.Method {
-	case MethodWorktreeTeardown:
-		if r.WorktreeTeardown != nil {
-			wrapper["repo_path"] = r.WorktreeTeardown.RepoPath
-			wrapper["worktree_path"] = r.WorktreeTeardown.WorktreePath
-			wrapper["force"] = r.WorktreeTeardown.Force
-			wrapper["inherited_env"] = r.WorktreeTeardown.InheritedEnv
-		}
-	case MethodConfigReload:
-		if r.ConfigReload != nil {
-			wrapper["repo_path"] = r.ConfigReload.RepoPath
-		}
-	case MethodRepoRemove:
-		if r.RepoRemove != nil {
-			wrapper["repo_path"] = r.RepoRemove.RepoPath
-			wrapper["force"] = r.RepoRemove.Force
-		}
-	case MethodSyncNow:
-		if r.SyncNow != nil {
-			wrapper["path"] = r.SyncNow.Path
-		}
-	case MethodSyncStatus:
-		if r.SyncStatus != nil {
-			wrapper["repo_path"] = r.SyncStatus.RepoPath
-		}
-	case MethodEventSubscribe:
-		if r.EventSubscribe != nil {
-			wrapper["repo_path"] = r.EventSubscribe.RepoPath
-			wrapper["worktree_path"] = r.EventSubscribe.WorktreePath
-			wrapper["levels"] = r.EventSubscribe.Levels
-			wrapper["event_types"] = r.EventSubscribe.EventTypes
-			wrapper["phases"] = r.EventSubscribe.Phases
-			wrapper["payload_like"] = r.EventSubscribe.PayloadLike
-			wrapper["run_id"] = r.EventSubscribe.RunID
-		}
-	}
-}
-
-// UnmarshalJSON parses the flat tagged shape back into Request +
-// the matching args struct.
-func (r *Request) UnmarshalJSON(data []byte) error {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	m, ok := raw["method"]
-	if !ok {
-		return errors.New("rpc: missing `method`")
-	}
-	if err := json.Unmarshal(m, &r.Method); err != nil {
-		return err
-	}
-	switch r.Method {
-	case MethodStatus, MethodPing, MethodWatcherList, MethodShutdown, MethodDaemonState:
-		return nil
-	case MethodRepoRegister:
-		r.RepoRegister = &RepoRegisterArgs{}
-		return decodeFields(raw, map[string]any{
-			"path": &r.RepoRegister.Path,
-			"name": &r.RepoRegister.Name,
-		})
-	case MethodWatcherStart:
-		r.WatcherStart = &WatcherStartArgs{}
-		return decodeFields(raw, map[string]any{"repo_path": &r.WatcherStart.RepoPath})
-	case MethodWatcherStop:
-		r.WatcherStop = &WatcherStopArgs{}
-		return decodeFields(raw, map[string]any{"repo_path": &r.WatcherStop.RepoPath})
-	case MethodWorktreeList:
-		r.WorktreeList = &WorktreeListArgs{}
-		return decodeFields(raw, map[string]any{"repo_path": &r.WorktreeList.RepoPath})
-	case MethodWorktreeFinalize:
-		r.WorktreeFinalize = &WorktreeFinalizeArgs{}
-		return decodeFields(raw, map[string]any{
-			"repo_path":     &r.WorktreeFinalize.RepoPath,
-			"worktree_path": &r.WorktreeFinalize.WorktreePath,
-			"inherited_env": &r.WorktreeFinalize.InheritedEnv,
-		})
-	case MethodWorktreeTeardown:
-		r.WorktreeTeardown = &WorktreeTeardownArgs{}
-		return decodeFields(raw, map[string]any{
-			"repo_path":     &r.WorktreeTeardown.RepoPath,
-			"worktree_path": &r.WorktreeTeardown.WorktreePath,
-			"force":         &r.WorktreeTeardown.Force,
-			"inherited_env": &r.WorktreeTeardown.InheritedEnv,
-		})
-	case MethodConfigReload:
-		r.ConfigReload = &ConfigReloadArgs{}
-		return decodeFields(raw, map[string]any{"repo_path": &r.ConfigReload.RepoPath})
-	case MethodRepoRemove:
-		r.RepoRemove = &RepoRemoveArgs{}
-		return decodeFields(raw, map[string]any{
-			"repo_path": &r.RepoRemove.RepoPath,
-			"force":     &r.RepoRemove.Force,
-		})
-	case MethodSyncNow:
-		r.SyncNow = &SyncNowArgs{}
-		return decodeFields(raw, map[string]any{"path": &r.SyncNow.Path})
-	case MethodSyncStatus:
-		r.SyncStatus = &SyncStatusArgs{}
-		return decodeFields(raw, map[string]any{"repo_path": &r.SyncStatus.RepoPath})
-	case MethodEventSubscribe:
-		r.EventSubscribe = &EventSubscribeArgs{}
-		return decodeFields(raw, map[string]any{
-			"repo_path":     &r.EventSubscribe.RepoPath,
-			"worktree_path": &r.EventSubscribe.WorktreePath,
-			"levels":        &r.EventSubscribe.Levels,
-			"event_types":   &r.EventSubscribe.EventTypes,
-			"phases":        &r.EventSubscribe.Phases,
-			"payload_like":  &r.EventSubscribe.PayloadLike,
-			"run_id":        &r.EventSubscribe.RunID,
-		})
-	default:
-		return fmt.Errorf("rpc: unknown method %q", r.Method)
-	}
-}
-
-func decodeFields(raw map[string]json.RawMessage, into map[string]any) error {
-	for k, dst := range into {
-		if v, ok := raw[k]; ok {
-			if err := json.Unmarshal(v, dst); err != nil {
-				return fmt.Errorf("field %s: %w", k, err)
-			}
-		}
-	}
-	return nil
-}
+// Task type values — the concrete operation a Task performs. The daemon
+// is the sole executor; every state mutation is one of these.
+const (
+	TaskPrepare        = "prepare"         // prepare.Run
+	TaskDBReset        = "db_reset"        // drop branch-scoped + re-prepare
+	TaskHookRun        = "hook_run"        // run one hook phase
+	TaskSnapshotsPurge = "snapshots_purge" // drop every cached template DB
+	TaskMainPurgeDBs   = "main_purge_dbs"  // drop main_<branch> DBs across branches
+	TaskWtRegister     = "wt_register"     // EnsureRepo + EnsureWorktree row
+	TaskWtUnregister   = "wt_unregister"   // mark a worktree row deleted
+	TaskLogsPurge      = "logs_purge"      // delete event-log rows by filter
+	TaskRegistryRepair = "registry_repair" // reconcile SQLite vs git worktree list
+	TaskConfigWrite    = "config_write"    // snapshot + atomic-write .treeman.yaml + reload
+	// Worktree lifecycle, folded into the plan model. Booleans ride in
+	// Params ("force"/"no_fetch"/"skip_hooks"/"skip_prepare" == "1");
+	// create's from/path overrides ride in Params["from"]/["path"].
+	TaskWorktreeCreate   = "worktree_create"   // git add + register + ports (+ async finalize)
+	TaskWorktreeFinalize = "worktree_finalize" // setup hooks + prepare tail
+	TaskWorktreeTeardown = "worktree_teardown" // teardown hooks + DB drop + git remove
+)
 
 // RepoRegisterArgs — Register or update a repo.
 type RepoRegisterArgs struct {
@@ -275,34 +132,23 @@ type RepoRegisterArgs struct {
 
 // WatcherStartArgs / WatcherStopArgs — control the per-repo watcher.
 type (
-	WatcherStartArgs struct{ RepoPath string }
-	WatcherStopArgs  struct{ RepoPath string }
+	WatcherStartArgs struct {
+		RepoPath string `json:"repo_path"`
+	}
+	WatcherStopArgs struct {
+		RepoPath string `json:"repo_path"`
+	}
 )
 
 // WorktreeListArgs — list the watched linked-worktrees for a repo.
-type WorktreeListArgs struct{ RepoPath string }
-
-// WorktreeFinalizeArgs — daemon runs postcreate hooks + prepare in
-// its tokio-equivalent so the CLI can return immediately.
-type WorktreeFinalizeArgs struct {
-	RepoPath     string
-	WorktreePath string
-	InheritedEnv map[string]string
-}
-
-// WorktreeTeardownArgs — daemon runs predelete hooks + DB teardown
-// + git worktree remove asynchronously.
-type WorktreeTeardownArgs struct {
-	RepoPath     string
-	WorktreePath string
-	Force        bool
-	InheritedEnv map[string]string
+type WorktreeListArgs struct {
+	RepoPath string `json:"repo_path"`
 }
 
 // ConfigReloadArgs — tells the daemon to invalidate its config cache
 // and restart watchers. Empty RepoPath reloads every registered repo.
 type ConfigReloadArgs struct {
-	RepoPath string
+	RepoPath string `json:"repo_path,omitempty"`
 }
 
 // SyncNowArgs — on-demand fetch + advance. Path scopes the work:
@@ -388,27 +234,76 @@ type EventEnvelope struct {
 // touched — callers wanting a destructive purge run `treeman wt delete`
 // first.
 type RepoRemoveArgs struct {
-	RepoPath string
-	Force    bool
+	RepoPath string `json:"repo_path"`
+	Force    bool   `json:"force,omitempty"`
+}
+
+// Task is one unit of work the daemon executes. Convention: Type +
+// RepoPath/WorktreePath (the routing fields) + InheritedEnv are the only
+// explicit fields; every task-specific argument rides in Params (e.g.
+// branch, phase, engine_filter, force/no_fetch/skip_hooks=="1", the
+// logs-purge filter, the config-write body). WorktreePath is empty for
+// repo-scoped tasks (snapshots_purge / main_purge_dbs). The CLI resolves
+// all paths to absolute before dispatch — the daemon's cwd is not the
+// user's.
+type Task struct {
+	Type         string            `json:"type"`
+	RepoPath     string            `json:"repo_path,omitempty"`
+	WorktreePath string            `json:"worktree_path,omitempty"`
+	Params       map[string]string `json:"params,omitempty"`
+	InheritedEnv map[string]string `json:"inherited_env,omitempty"`
+}
+
+// One wraps a single task as a one-task group — the common plan shape.
+func One(t Task) []Task { return []Task{t} }
+
+// Plan builds a run_plan Request. Groups run in parallel; tasks within a
+// group run sequentially. wait=false queues the plan (KindPlanQueued);
+// wait=true runs it to completion and returns results (KindPlanResult).
+func Plan(wait bool, groups ...[]Task) Request {
+	return Request{Method: MethodRunPlan, RunPlan: &RunPlanArgs{Groups: groups, Wait: wait}}
+}
+
+// RunPlanArgs — submit a plan to the daemon. Groups run in parallel; the
+// tasks inside a group run sequentially (one ordered lane, stopping at
+// its first failure). RunID, when set, becomes the executor's run-id so
+// a foreground caller can subscribe to the plan's events before dispatch
+// (no missed-event race); empty → daemon mints one. Wait=false queues
+// the plan and returns immediately (KindPlanQueued); Wait=true runs it to
+// completion and returns per-task results (KindPlanResult).
+type RunPlanArgs struct {
+	Groups [][]Task `json:"groups"`
+	RunID  string   `json:"run_id,omitempty"`
+	Wait   bool     `json:"wait,omitempty"`
+}
+
+// TaskResult is one task's outcome, returned for a Wait=true plan.
+// PayloadJSON carries the task-specific structured result (e.g. prepare
+// outcomes) for callers that asked for --json.
+type TaskResult struct {
+	Type        string `json:"type"`
+	OK          bool   `json:"ok"`
+	Message     string `json:"message,omitempty"`
+	PayloadJSON string `json:"payload_json,omitempty"`
 }
 
 // ─────────────────────────── Response ───────────────────────────
 
 // Response kinds. Wire shape: {"kind": "ok", ...}.
 const (
-	KindOk                     = "ok"
-	KindPong                   = "pong"
-	KindStatus                 = "status"
-	KindRepoRegistered         = "repo_registered"
-	KindWatcherStarted         = "watcher_started"
-	KindWatcherStopped         = "watcher_stopped"
-	KindWatcherList            = "watcher_list"
-	KindWorktreeList           = "worktree_list"
-	KindWorktreeFinalizeQueued = "worktree_finalize_queued"
-	KindWorktreeTeardownQueued = "worktree_teardown_queued"
-	KindSyncResult             = "sync_result"
-	KindSyncStatus             = "sync_status"
-	KindDaemonState            = "daemon_state"
+	KindOk             = "ok"
+	KindPong           = "pong"
+	KindStatus         = "status"
+	KindRepoRegistered = "repo_registered"
+	KindWatcherStarted = "watcher_started"
+	KindWatcherStopped = "watcher_stopped"
+	KindWatcherList    = "watcher_list"
+	KindWorktreeList   = "worktree_list"
+	KindPlanQueued     = "plan_queued"
+	KindPlanResult     = "plan_result"
+	KindSyncResult     = "sync_result"
+	KindSyncStatus     = "sync_status"
+	KindDaemonState    = "daemon_state"
 	// KindEvent is the per-event envelope emitted on a streaming
 	// MethodEventSubscribe response. One emitted per matching event;
 	// the subscription has no terminal "done" envelope — it ends when
@@ -433,8 +328,10 @@ type Response struct {
 	RepoPath  string           `json:"repo_path,omitempty"`
 	Repos     []WatcherSummary `json:"repos,omitempty"`
 	Worktrees []string         `json:"worktrees,omitempty"`
-	// Finalize / Teardown queued
+	// Finalize / Teardown / Plan queued
 	WorktreePath string `json:"worktree_path,omitempty"`
+	// PlanResult (Wait=true)
+	TaskResults []TaskResult `json:"task_results,omitempty"`
 	// SyncResult / SyncStatus
 	SyncedRepos []SyncRepoStatus `json:"synced_repos,omitempty"`
 	SyncErrors  []string         `json:"sync_errors,omitempty"`

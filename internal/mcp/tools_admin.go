@@ -65,6 +65,18 @@ func inheritedEnv() map[string]string {
 	return out
 }
 
+// finalizePlan wraps the worktree-finalize tail as a fire-and-forget
+// run_plan request — the generic channel the daemon uses for every
+// offloaded mutation.
+func finalizePlan(repoRoot, wtPath string) rpc.Request {
+	return rpc.Plan(false, rpc.One(rpc.Task{
+		Type:         rpc.TaskWorktreeFinalize,
+		RepoPath:     repoRoot,
+		WorktreePath: wtPath,
+		InheritedEnv: inheritedEnv(),
+	}))
+}
+
 // ─── worktree_finalize ─────────────────────────────────────────────
 
 type worktreeFinalizeIn struct {
@@ -90,14 +102,7 @@ func worktreeFinalizeTool(
 	if wtPath == "" {
 		wtPath = repoRoot
 	}
-	resp, err := rpc.Call(ctx, rpc.Request{
-		Method: rpc.MethodWorktreeFinalize,
-		WorktreeFinalize: &rpc.WorktreeFinalizeArgs{
-			RepoPath:     repoRoot,
-			WorktreePath: wtPath,
-			InheritedEnv: inheritedEnv(),
-		},
-	})
+	resp, err := rpc.Call(ctx, finalizePlan(repoRoot, wtPath))
 	if err != nil {
 		return nil, worktreeFinalizeOut{}, fmt.Errorf("dispatch finalize (is treemand running?): %w", err)
 	}
@@ -180,12 +185,7 @@ func mainWorktreeEnable(ctx context.Context, repoRoot string) (*mcpsdk.CallToolR
 	}
 	// Reload is synchronous; the main row exists by the time it returns,
 	// so finalize routes through the main-wt path and fires on-create-*.
-	resp, err := rpc.Call(ctx, rpc.Request{
-		Method: rpc.MethodWorktreeFinalize,
-		WorktreeFinalize: &rpc.WorktreeFinalizeArgs{
-			RepoPath: repoRoot, WorktreePath: repoRoot, InheritedEnv: inheritedEnv(),
-		},
-	})
+	resp, err := rpc.Call(ctx, finalizePlan(repoRoot, repoRoot))
 	if err != nil || resp.Kind == rpc.KindError {
 		out.Detail = "enabled + reloaded; finalize dispatch failed — run worktree_finalize at the repo root to retry"
 		return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error

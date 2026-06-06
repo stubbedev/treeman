@@ -9,6 +9,7 @@ import (
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/template"
 )
 
 // RunLocalFinalize executes the setup + prepare tail in the calling
@@ -45,6 +46,24 @@ func RunLocalFinalize(
 		sink.Info("%s: %d action(s) complete (logs in %s/.treeman-hooks/)",
 			trigger, len(actions), wtPath)
 		return nil
+	}
+	// Materialize links/copies + render patches before hooks fire (a
+	// before-engines hook may read the copied/patched `.env`). The daemon
+	// path does this in FinalizeWorktree; this mirror covers the detached
+	// child / `wt finalize --local` fallback. Skipped for the main
+	// worktree (src == dst), matching the daemon.
+	if !isMain {
+		if err := BringInFiles(repoRoot, wtPath, cfg.Worktrees.Links, "link", sink); err != nil {
+			return err
+		}
+		if err := BringInFiles(repoRoot, wtPath, cfg.Worktrees.Copies, "copy", sink); err != nil {
+			return err
+		}
+		portMap, _ := st.LoadWorktreePorts(ctx, wtID)
+		tplCtx := template.FromSlug(sl).WithPorts(portMap)
+		if err := applyPatches(ctx, cfg.Patches, wtPath, tplCtx, sink); err != nil {
+			return err
+		}
 	}
 	if err := runTrigger("on-create-before-engines", cfg.Hooks.OnCreateBeforeEngines); err != nil {
 		return err

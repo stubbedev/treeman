@@ -23,13 +23,28 @@ func TestRequestRoundtripStatus(t *testing.T) {
 	}
 }
 
-func TestRequestRoundtripWorktreeFinalize(t *testing.T) {
+func TestRequestRoundtripRunPlan(t *testing.T) {
 	req := Request{
-		Method: MethodWorktreeFinalize,
-		WorktreeFinalize: &WorktreeFinalizeArgs{
-			RepoPath:     "/repos/foo",
-			WorktreePath: "/repos/foo/.worktrees/x",
-			InheritedEnv: map[string]string{"PATH": "/usr/bin:/bin"},
+		Method: MethodRunPlan,
+		RunPlan: &RunPlanArgs{
+			RunID: "abcd1234",
+			Wait:  true,
+			Groups: [][]Task{
+				{{
+					Type:         TaskWorktreeFinalize,
+					RepoPath:     "/repos/foo",
+					WorktreePath: "/repos/foo/.worktrees/x",
+					InheritedEnv: map[string]string{"PATH": "/usr/bin:/bin"},
+				}},
+				{
+					{Type: TaskPrepare, WorktreePath: "/repos/foo/.worktrees/x"},
+					{
+						Type:         TaskWorktreeTeardown,
+						WorktreePath: "/repos/foo/.worktrees/y",
+						Params:       map[string]string{"force": "1"},
+					},
+				},
+			},
 		},
 	}
 	b, err := json.Marshal(&req)
@@ -40,47 +55,37 @@ func TestRequestRoundtripWorktreeFinalize(t *testing.T) {
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Method != MethodWorktreeFinalize {
-		t.Errorf("method: %s", got.Method)
+	if got.Method != MethodRunPlan || got.RunPlan == nil {
+		t.Fatalf("method/args: %s %+v", got.Method, got.RunPlan)
 	}
-	if got.WorktreeFinalize == nil {
-		t.Fatal("args nil")
+	if !got.RunPlan.Wait || got.RunPlan.RunID != "abcd1234" {
+		t.Errorf("wait/run_id: %v %s", got.RunPlan.Wait, got.RunPlan.RunID)
 	}
-	if got.WorktreeFinalize.WorktreePath != req.WorktreeFinalize.WorktreePath {
-		t.Errorf("worktree_path: %s", got.WorktreeFinalize.WorktreePath)
+	if len(got.RunPlan.Groups) != 2 || len(got.RunPlan.Groups[1]) != 2 {
+		t.Fatalf("groups shape: %+v", got.RunPlan.Groups)
 	}
-	if got.WorktreeFinalize.InheritedEnv["PATH"] != "/usr/bin:/bin" {
-		t.Errorf("env: %v", got.WorktreeFinalize.InheritedEnv)
+	g0 := got.RunPlan.Groups[0][0]
+	if g0.Type != TaskWorktreeFinalize || g0.InheritedEnv["PATH"] != "/usr/bin:/bin" {
+		t.Errorf("group0 task: %+v", g0)
 	}
-}
-
-func TestRequestRoundtripWorktreeTeardown(t *testing.T) {
-	req := Request{
-		Method: MethodWorktreeTeardown,
-		WorktreeTeardown: &WorktreeTeardownArgs{
-			RepoPath:     "/repos/foo",
-			WorktreePath: "/repos/foo/.worktrees/x",
-			Force:        true,
-			InheritedEnv: map[string]string{},
-		},
-	}
-	b, err := json.Marshal(&req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got Request
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatal(err)
-	}
-	if !got.WorktreeTeardown.Force {
-		t.Error("force should be true")
+	if got.RunPlan.Groups[1][1].Params["force"] != "1" {
+		t.Errorf("force param lost: %+v", got.RunPlan.Groups[1][1])
 	}
 }
 
-func TestUnknownMethodErrors(t *testing.T) {
+// TestUnknownMethodDecodes confirms decode no longer rejects unknown
+// methods — that validation moved to the daemon's Dispatch switch (which
+// returns an "unknown method" error response). Decode just sets Method
+// and leaves every args pointer nil.
+func TestUnknownMethodDecodes(t *testing.T) {
 	var got Request
-	err := json.Unmarshal([]byte(`{"method":"nope"}`), &got)
-	if err == nil {
-		t.Fatal("want error for unknown method")
+	if err := json.Unmarshal([]byte(`{"method":"nope"}`), &got); err != nil {
+		t.Fatalf("decode should not error on unknown method: %v", err)
+	}
+	if got.Method != "nope" {
+		t.Errorf("method: %q", got.Method)
+	}
+	if got.RunPlan != nil || got.RepoRegister != nil {
+		t.Errorf("no args pointer should be set for an unknown method")
 	}
 }

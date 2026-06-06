@@ -139,6 +139,22 @@ func FinalizeWorktree(
 		return err
 	}
 
+	// Bring in worktrees.links / worktrees.copies. Offloaded from the CLI
+	// (`wt create`) to here so the CLI returns immediately instead of
+	// blocking on a recursive copy of e.g. a vendor/ tree. Idempotent —
+	// existing destinations are skipped. Done before port alloc + patches
+	// so the copied `.env` exists for the patch render below. Skipped for
+	// the main worktree, which is the source the links/copies originate
+	// from (src == dst), same rationale as patches.
+	if !isMain {
+		if err := wt.BringInFiles(repoRoot, wtRoot, cfg.Worktrees.Links, "link", nil); err != nil {
+			return err
+		}
+		if err := wt.BringInFiles(repoRoot, wtRoot, cfg.Worktrees.Copies, "copy", nil); err != nil {
+			return err
+		}
+	}
+
 	// Re-apply top-level patches: every finalize evaluates them
 	// against the current HEAD's slug. Idempotent — Unchanged is a
 	// no-op write, and EnsureFilter re-asserts the git clean/smudge

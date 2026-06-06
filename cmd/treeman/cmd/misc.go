@@ -17,14 +17,13 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemonctl"
-	"github.com/stubbedev/treeman/internal/engine"
-	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/initgen"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -41,62 +40,203 @@ func PrepareCmd() *cli.Command {
 			&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "json"},
+			&cli.BoolFlag{
+				Name:    "foreground",
+				Aliases: []string{"wait", "f"},
+				Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			outs, err := RunPrepareOnWorktree(ctx, c.String("worktree"), c.String("repo"))
+			wtPath, repoRoot, err := resolveWtRepo(c.String("worktree"), c.String("repo"))
 			if err != nil {
 				return err
 			}
+			task := rpc.Task{
+				Type: rpc.TaskPrepare, RepoPath: repoRoot, WorktreePath: wtPath,
+				InheritedEnv: CaptureInheritedEnv(),
+			}
 			if c.Bool("json") {
-				return jsonStream(map[string]any{"outcomes": outs})
+				return runResultJSON(ctx, task)
 			}
-			for _, o := range outs {
-				fmt.Printf("[%s] %s template=%s clones=%d\n", o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
-			}
-			return nil
+			return dispatchTask(ctx, task, c.Bool("foreground"), "prepare")
 		},
 	}
 }
 
-// RunPrepareOnWorktree is the shared core for `treeman prepare` and
-// the MCP `prepare_run` tool. Discovers the worktree + repo root,
-// loads resolved config, opens the SQLite store, and dispatches
-// prepare.Run. Returns the per-engine outcomes so callers can render
-// them however they like.
-func RunPrepareOnWorktree(ctx context.Context, worktree, repoOverride string) ([]prepare.Outcome, error) {
-	wt := worktree
-	if wt == "" {
-		cwd, _ := os.Getwd()
-		wt = cwd
+// The daemon is the sole mutator of repo/worktree state. The CLI builds
+// a plan (parallel groups; tasks within a group run sequentially on the
+// daemon) and submits it through one of three modes below.
+
+// dispatchTask submits a single-task plan. When foreground is false it
+// queues the task and returns as soon as the daemon accepts it. When
+// true it subscribes to the task's events FIRST (client-minted run-id, so
+// no event is missed), dispatches, then streams the live event tail until
+// the terminal event — returning the task's error so the exit code
+// reflects success/failure. label is the human noun for messages.
+func dispatchTask(ctx context.Context, task rpc.Task, foreground bool, label string) error {
+	if !foreground {
+		resp, ok := submitPlan(ctx, rpc.Plan(false, rpc.One(task)))
+		if ok && resp.Kind == rpc.KindPlanQueued {
+			PrintOK("queued: %s detached to daemon — follow with `treeman logs tail --follow` (or re-run with --foreground)", label)
+			return nil
+		}
+		return planDispatchErr(resp, ok, label)
 	}
-	wt = MustAbs(wt)
-	repoRoot, err := resolveRepo(repoOverride)
+
+	runID := runid.New()
+	ch, cancel, err := subscribeRun(ctx, runID)
 	if err != nil {
-		repoRoot, err = DiscoverRepoRoot(wt)
-		if err != nil {
-			return nil, err
+		return fmt.Errorf("subscribe to %s events: %w", label, err)
+	}
+	defer cancel()
+	req := rpc.Plan(false, rpc.One(task))
+	req.RunPlan.RunID = runID
+	resp, ok := submitPlan(ctx, req)
+	if !ok || resp.Kind != rpc.KindPlanQueued {
+		return planDispatchErr(resp, ok, label)
+	}
+	return streamPlanEvents(ch, label)
+}
+
+// resultTask runs a single-task plan to completion and returns the
+// per-task results (for --json / result-oriented callers). A failed task
+// surfaces as an error.
+func resultTask(ctx context.Context, task rpc.Task) ([]rpc.TaskResult, error) {
+	resp, ok := submitPlan(ctx, rpc.Plan(true, rpc.One(task)))
+	if !ok {
+		return nil, errors.New("daemon unreachable")
+	}
+	if resp.Kind == rpc.KindError {
+		return nil, fmt.Errorf("daemon: %s", resp.Message)
+	}
+	if resp.Kind != rpc.KindPlanResult {
+		return nil, fmt.Errorf("unexpected daemon response %q", resp.Kind)
+	}
+	for _, r := range resp.TaskResults {
+		if !r.OK {
+			return resp.TaskResults, fmt.Errorf("%s: %s", r.Type, r.Message)
 		}
 	}
-	cfg, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
+	return resp.TaskResults, nil
+}
+
+// resultPayload runs a single-task result plan and returns the task's
+// JSON payload bytes, for callers that render a human summary from the
+// structured result.
+func resultPayload(ctx context.Context, task rpc.Task) ([]byte, error) {
+	results, err := resultTask(ctx, task)
+	if err != nil || len(results) == 0 {
 		return nil, err
 	}
-	branch := detectBranchOfWorktree(wt)
-	dbPath, _ := store.DefaultDBPath()
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return nil, err
+	return []byte(results[0].PayloadJSON), nil
+}
+
+// runResultJSON runs a single-task result plan and prints the task's
+// structured JSON payload to stdout (the --json surface).
+func runResultJSON(ctx context.Context, task rpc.Task) error {
+	payload, err := resultPayload(ctx, task)
+	if err != nil || payload == nil {
+		return err
 	}
-	defer func() { _ = st.Close() }()
-	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	// Route through ResolveIdentity so this manual path matches the daemon:
-	// the main-worktree overlay is applied (bare active DB name) and a linked
-	// worktree's slug is its branch-independent path slug.
-	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
-	if err != nil {
-		return nil, err
+	_, werr := fmt.Fprintln(ui.Out, string(payload))
+	return werr
+}
+
+// finalizeRequest builds a fire-and-forget run_plan for the worktree-
+// finalize tail (setup hooks + prepare) — used by `wt finalize` and
+// `main enable`.
+func finalizeRequest(repoRoot, wtPath string) rpc.Request {
+	return rpc.Plan(false, rpc.One(rpc.Task{
+		Type:         rpc.TaskWorktreeFinalize,
+		RepoPath:     repoRoot,
+		WorktreePath: wtPath,
+		InheritedEnv: CaptureInheritedEnv(),
+	}))
+}
+
+// writeConfig persists a CLI-rendered config body through the daemon —
+// the sole writer of .treeman.yaml. The daemon snapshots the previous
+// content, atomic-writes the new body, and reloads the repo.
+func writeConfig(ctx context.Context, repoRoot, path string, body []byte) error {
+	_, err := resultTask(ctx, rpc.Task{
+		Type: rpc.TaskConfigWrite, RepoPath: repoRoot,
+		Params: map[string]string{"path": path, "body": string(body)},
+	})
+	return err
+}
+
+// submitPlan submits a run_plan request, autostarting the daemon once on
+// connection failure. Returns the response + whether it landed.
+func submitPlan(ctx context.Context, req rpc.Request) (rpc.Response, bool) {
+	resp, err := wt2.CallWithStart(ctx, req)
+	return resp, err == nil
+}
+
+func planDispatchErr(resp rpc.Response, ok bool, label string) error {
+	if ok && resp.Kind == rpc.KindError {
+		return fmt.Errorf("daemon: %s", resp.Message)
 	}
-	return prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, CaptureInheritedEnv())
+	return fmt.Errorf("daemon unreachable: could not dispatch %s", label)
+}
+
+// subscribeRun opens a run-id-scoped event subscription, starting the
+// daemon first if it isn't reachable.
+func subscribeRun(ctx context.Context, runID string) (<-chan rpc.EventEnvelope, func(), error) {
+	ch, cancel, err := rpc.SubscribeEvents(ctx, rpc.EventSubscribeArgs{RunID: runID})
+	if err != nil {
+		if startErr := wt2.EnsureDaemon(ctx); startErr != nil {
+			return nil, nil, err
+		}
+		ch, cancel, err = rpc.SubscribeEvents(ctx, rpc.EventSubscribeArgs{RunID: runID})
+	}
+	return ch, cancel, err
+}
+
+// streamPlanEvents prints the live event tail for a foreground plan and
+// returns when the daemon emits the terminal event: nil on run_plan_done,
+// an error on a run_plan error event. A closed channel (daemon gone)
+// returns a best-effort error.
+func streamPlanEvents(ch <-chan rpc.EventEnvelope, label string) error {
+	for ev := range ch {
+		switch ev.EventType {
+		case "run_plan_done":
+			return nil
+		case "run_plan":
+			if ev.Level == store.LevelError {
+				return fmt.Errorf("%s failed: %s", label, ev.Message)
+			}
+		}
+		printTaskEvent(ev)
+	}
+	return fmt.Errorf("%s: daemon closed the event stream before completion", label)
+}
+
+// printTaskEvent renders one streamed event line for a foreground plan.
+func printTaskEvent(ev rpc.EventEnvelope) {
+	switch ev.Level {
+	case store.LevelError, store.LevelWarn:
+		PrintWarn("%s: %s", ev.EventType, ev.Message)
+	default:
+		PrintInfo("%s: %s", ev.EventType, ev.Message)
+	}
+}
+
+// resolveWtRepo resolves a worktree arg (empty → cwd) to an absolute
+// path + its repo root, for dispatch args the daemon can act on (the
+// daemon's cwd is not the user's). Mirrors the resolution the prepare /
+// db-reset cores do inline.
+func resolveWtRepo(worktree, repoOverride string) (wtPath, repoRoot string, err error) {
+	wtPath = worktree
+	if wtPath == "" {
+		cwd, _ := os.Getwd()
+		wtPath = cwd
+	}
+	wtPath = MustAbs(wtPath)
+	repoRoot, err = resolveRepo(repoOverride)
+	if err != nil {
+		repoRoot, err = DiscoverRepoRoot(wtPath)
+	}
+	return wtPath, repoRoot, err
 }
 
 // DbCmd — `treeman db reset` re-syncs a worktree's branch_scoped
@@ -119,23 +259,26 @@ func DbCmd() *cli.Command {
 						Usage: "restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql/valkey/dragonfly accepted)",
 					},
 					&cli.BoolFlag{Name: "json"},
+					&cli.BoolFlag{
+						Name:    "foreground",
+						Aliases: []string{"wait", "f"},
+						Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+					},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					wt := c.Args().First()
-					outs, err := RunDbResetOnWorktree(ctx, wt, c.String("repo"), strings.ToLower(c.String("engine")))
+					wtPath, repoRoot, err := resolveWtRepo(c.Args().First(), c.String("repo"))
 					if err != nil {
 						return err
 					}
+					task := rpc.Task{
+						Type: rpc.TaskDBReset, RepoPath: repoRoot, WorktreePath: wtPath,
+						Params:       map[string]string{"engine_filter": strings.ToLower(c.String("engine"))},
+						InheritedEnv: CaptureInheritedEnv(),
+					}
 					if c.Bool("json") {
-						return jsonStream(map[string]any{"outcomes": outs})
+						return runResultJSON(ctx, task)
 					}
-					for _, o := range outs {
-						fmt.Printf("[%s] %s re-seeded from base\n", o.Engine, o.SourceDB)
-					}
-					if len(outs) == 0 {
-						PrintInfo("no branch_scoped databases configured")
-					}
-					return nil
+					return dispatchTask(ctx, task, c.Bool("foreground"), "db reset")
 				},
 			},
 			{
@@ -209,83 +352,6 @@ func RunDbStatusOnWorktree(ctx context.Context, worktree, repoOverride string) (
 	return prepare.BranchScopedStatus(ctx, &cfg, repoRoot, wt, id.WtID, st)
 }
 
-// RunDbResetOnWorktree resolves the worktree + repo, drops every
-// branch_scoped database's active namespace + current durable copy,
-// then re-runs prepare so each is repopulated from the live base branch.
-func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.Outcome, error) {
-	wt := worktree
-	if wt == "" {
-		cwd, _ := os.Getwd()
-		wt = cwd
-	}
-	wt = MustAbs(wt)
-	repoRoot, err := resolveRepo(repoOverride)
-	if err != nil {
-		repoRoot, err = DiscoverRepoRoot(wt)
-		if err != nil {
-			return nil, err
-		}
-	}
-	cfg, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
-		return nil, err
-	}
-	branch := detectBranchOfWorktree(wt)
-	dbPath, _ := store.DefaultDBPath()
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = st.Close() }()
-	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	// Route through ResolveIdentity so the main-worktree overlay is applied
-	// (bare active DB name) and the slug matches the daemon's branch-
-	// independent value — reset operates on the same active namespace the
-	// swap lifecycle created.
-	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
-	if err != nil {
-		return nil, err
-	}
-	if err := prepare.ResetBranchScoped(ctx, &cfg, wt, repoID, id.WtID, st, engineFilter); err != nil {
-		return nil, err
-	}
-	outs, err := prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, CaptureInheritedEnv())
-	if err != nil {
-		return outs, err
-	}
-	// Surface only the seeded databases the reset actually touched.
-	// Match on the canonical engine family so an alias (mariadb, tidb,
-	// postgresql, opensearch) lines up with the canonical Outcome.Engine
-	// and an `--engine` filter written as the family name still hits.
-	filterLabel := engineFilter
-	if engineFilter != "" {
-		if fam, ok := engine.Canonical(engineFilter); ok {
-			filterLabel = string(fam)
-		}
-	}
-	var seeded []prepare.Outcome
-	for _, o := range outs {
-		for _, d := range cfg.Databases {
-			if !d.BranchScoped {
-				continue
-			}
-			fam, ok := engine.Canonical(d.Engine)
-			if !ok {
-				continue
-			}
-			label := string(fam)
-			if filterLabel != "" && label != filterLabel {
-				continue
-			}
-			if label == o.Engine {
-				seeded = append(seeded, o)
-				break
-			}
-		}
-	}
-	return seeded, nil
-}
-
 // HookCmd — `treeman hook run <phase>` runs the configured hooks
 // for that phase against the cwd's repo + worktree.
 func HookCmd() *cli.Command {
@@ -298,106 +364,33 @@ func HookCmd() *cli.Command {
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}},
 				&cli.BoolFlag{Name: "json"},
+				&cli.BoolFlag{
+					Name:    "foreground",
+					Aliases: []string{"wait", "f"},
+					Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+				},
 			},
 			Action: func(ctx context.Context, c *cli.Command) error {
 				if c.NArg() < 1 {
-					return errors.New("usage: treeman hook run <setup|teardown>")
+					return errors.New("usage: treeman hook run <phase>")
 				}
 				phase := c.Args().First()
-				out, err := RunHookPhase(ctx, phase, c.String("worktree"))
+				wtPath, repoRoot, err := resolveWtRepo(c.String("worktree"), "")
 				if err != nil {
 					return err
 				}
-				if c.Bool("json") {
-					return jsonStream(map[string]any{
-						"phase":   phase,
-						"outcome": out,
-					})
+				task := rpc.Task{
+					Type: rpc.TaskHookRun, RepoPath: repoRoot, WorktreePath: wtPath,
+					Params:       map[string]string{"phase": phase},
+					InheritedEnv: CaptureInheritedEnv(),
 				}
-				fmt.Printf("%s: %d action(s) complete\n", phase, len(out.Groups))
-				return nil
+				if c.Bool("json") {
+					return runResultJSON(ctx, task)
+				}
+				return dispatchTask(ctx, task, c.Bool("foreground"), "hook "+phase)
 			},
 		}},
 	}
-}
-
-// RunHookPhase is the shared core for `treeman hook run <phase>`
-// and the MCP `hook_run` tool. Resolves cfg, runs the phase
-// synchronously, and returns the hooks.RunOutcome so callers can
-// inspect group exit codes / tails. Each run also persists a
-// hook_runs row + emits hook_start/hook_done events so the operation
-// is later searchable from `treeman logs`.
-func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome, error) {
-	wt := worktree
-	if wt == "" {
-		cwd, _ := os.Getwd()
-		wt = cwd
-	}
-	wt = MustAbs(wt)
-	repoRoot, err := DiscoverRepoRoot(wt)
-	if err != nil {
-		return hooks.RunOutcome{}, err
-	}
-	cfg, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
-		return hooks.RunOutcome{}, err
-	}
-	branch := detectBranchOfWorktree(wt)
-	env := CaptureInheritedEnv()
-
-	var (
-		st           *store.Store
-		repoID, wtID int64
-		sl           slug.Slug
-		isMain       bool
-		entries      int
-		startedMs    int64
-		out          hooks.RunOutcome
-		runErr       error
-	)
-	dbPath, _ := store.DefaultDBPath()
-	if dbPath != "" {
-		if s, oerr := store.Open(ctx, dbPath); oerr == nil {
-			st = s
-			defer func() { _ = st.Close() }()
-			repoID, _ = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			id, idErr := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
-			if idErr != nil {
-				return hooks.RunOutcome{}, idErr
-			}
-			sl, wtID, isMain = id.Slug, id.WtID, id.IsMain
-		}
-	}
-	if sl.Value == "" {
-		// Store unreachable — fall back to a path-hash slug so the hook
-		// env still has something. $TREEMAN_IS_MAIN reads "0".
-		sl = slug.For(wt, branch)
-	}
-
-	var hookEntries []config.Action
-	switch phase {
-	case "on-create-before-engines":
-		hookEntries = cfg.Hooks.OnCreateBeforeEngines
-	case "on-create-after-engines":
-		hookEntries = cfg.Hooks.OnCreateAfterEngines
-	case "on-delete-before-engines":
-		hookEntries = cfg.Hooks.OnDeleteBeforeEngines
-	case "on-delete-after-engines":
-		hookEntries = cfg.Hooks.OnDeleteAfterEngines
-	case "on-checkout":
-		hookEntries = cfg.Hooks.OnCheckout
-	default:
-		return hooks.RunOutcome{}, fmt.Errorf(
-			"unknown phase: %s (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)",
-			phase,
-		)
-	}
-	entries = len(hookEntries)
-
-	startedMs = hooks.EmitHookStart(ctx, st, repoID, wtID, phase, entries)
-	out, runErr = hooks.RunHooks(ctx, phase, hookEntries, repoRoot, wt, sl.Value, isMain, env, true)
-	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, startedMs, time.Now().UnixMilli(), out)
-	return out, runErr
 }
 
 // padRight pads a possibly-ANSI-colored cell with trailing spaces.
@@ -606,7 +599,7 @@ func configRestore() *cli.Command {
 			if err := config.CheckBodyScope(g.Content, "repo"); err != nil {
 				return fmt.Errorf("generation %d cannot be restored: %w", gen, err)
 			}
-			if err := snapshotAndWrite(ctx, repoRoot, p, g.Content); err != nil {
+			if err := writeConfig(ctx, repoRoot, p, g.Content); err != nil {
 				return err
 			}
 			if c.Bool("json") {

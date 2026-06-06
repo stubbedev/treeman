@@ -57,12 +57,6 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 	case rpc.MethodWatcherList:
 		return handleWatcherList(st)
 
-	case rpc.MethodWorktreeFinalize:
-		return handleWorktreeFinalize(st, req)
-
-	case rpc.MethodWorktreeTeardown:
-		return handleWorktreeTeardown(st, req)
-
 	case rpc.MethodWatcherStart:
 		return handleWatcherStart(ctx, st, req)
 
@@ -86,6 +80,9 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 
 	case rpc.MethodDaemonState:
 		return handleDaemonState(st)
+
+	case rpc.MethodRunPlan:
+		return handleRunPlan(ctx, st, req)
 
 	default:
 		return errResp("unknown method: " + req.Method)
@@ -460,48 +457,6 @@ func handleSyncStatus(ctx context.Context, st *State, req rpc.Request) rpc.Respo
 		Kind:        rpc.KindSyncStatus,
 		SyncedRepos: statuses,
 	}
-}
-
-// handleWorktreeFinalize validates the finalize args and dispatches a
-// detached FinalizeWorktree goroutine. Extracted from Dispatch to keep
-// that switch's cognitive complexity under the gate.
-func handleWorktreeFinalize(st *State, req rpc.Request) rpc.Response {
-	if req.WorktreeFinalize == nil {
-		return errResp("worktree_finalize: missing args")
-	}
-	args := *req.WorktreeFinalize
-	safeGo("wt_finalize", func() {
-		bg := runid.With(st.BgCtx, runid.New())
-		err := FinalizeWorktree(bg, st, args.RepoPath, args.WorktreePath, args.InheritedEnv)
-		if err != nil {
-			_ = st.Store.WriteEvent(bg, "error", "wt_finalize", err.Error(),
-				0, 0, "", 0, map[string]string{
-					"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
-				})
-		}
-	})
-	return rpc.Response{Kind: rpc.KindWorktreeFinalizeQueued, WorktreePath: args.WorktreePath}
-}
-
-// handleWorktreeTeardown validates the teardown args and dispatches a
-// detached TeardownWorktree goroutine. Extracted from Dispatch to keep
-// that switch's cognitive complexity under the gate.
-func handleWorktreeTeardown(st *State, req rpc.Request) rpc.Response {
-	if req.WorktreeTeardown == nil {
-		return errResp("worktree_teardown: missing args")
-	}
-	args := *req.WorktreeTeardown
-	safeGo("wt_teardown", func() {
-		bg := runid.With(st.BgCtx, runid.New())
-		err := TeardownWorktree(bg, st, args.RepoPath, args.WorktreePath, args.Force, args.InheritedEnv)
-		if err != nil {
-			_ = st.Store.WriteEvent(bg, "error", "wt_teardown", err.Error(),
-				0, 0, "", 0, map[string]string{
-					"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
-				})
-		}
-	})
-	return rpc.Response{Kind: rpc.KindWorktreeTeardownQueued, WorktreePath: args.WorktreePath}
 }
 
 func errResp(msg string) rpc.Response {

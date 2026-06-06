@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,21 +17,17 @@ import (
 // document on disk.
 func TestPatchMainWorktreeConfigVirginRepo(t *testing.T) {
 	repo := t.TempDir()
-	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "treeman.db"))
 
-	if err := patchMainWorktreeConfig(context.Background(), repo, true); err != nil {
-		t.Fatalf("patch: %v", err)
-	}
-	body, err := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))
+	_, body, err := renderMainWorktreeConfig(repo, true)
 	if err != nil {
-		t.Fatalf("read written file: %v", err)
+		t.Fatalf("render: %v", err)
 	}
 	if len(body) == 0 {
-		t.Fatalf("written file is empty")
+		t.Fatalf("rendered body is empty")
 	}
 	var cfg config.Config
 	if err := yaml.Unmarshal(body, &cfg); err != nil {
-		t.Fatalf("written body does not parse as config.Config: %v\nbody=%q", err, body)
+		t.Fatalf("rendered body does not parse as config.Config: %v\nbody=%q", err, body)
 	}
 	if !cfg.MainWorktree.Enabled {
 		t.Errorf("expected main_worktree.enabled=true, got %+v\nbody=%q",
@@ -45,15 +40,14 @@ func TestPatchMainWorktreeConfigVirginRepo(t *testing.T) {
 // .treeman.yaml.
 func TestPatchMainWorktreeConfigPreservesExistingKeys(t *testing.T) {
 	repo := t.TempDir()
-	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "treeman.db"))
 	original := "auto_fetch:\n  enabled: false\n  interval_minutes: 5\n"
 	if err := os.WriteFile(filepath.Join(repo, ".treeman.yaml"), []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := patchMainWorktreeConfig(context.Background(), repo, true); err != nil {
-		t.Fatalf("patch: %v", err)
+	_, body, err := renderMainWorktreeConfig(repo, true)
+	if err != nil {
+		t.Fatalf("render: %v", err)
 	}
-	body, _ := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))
 	var cfg config.Config
 	if err := yaml.Unmarshal(body, &cfg); err != nil {
 		t.Fatalf("parse: %v\n%s", err, body)

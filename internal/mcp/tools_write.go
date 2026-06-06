@@ -849,14 +849,47 @@ func worktreeCreateTool(
 	if err != nil {
 		return nil, wt.CreateResult{}, fmt.Errorf("resolve repo: %w", err)
 	}
-	res, err := wt.Create(ctx, wt.CreateRequest{
-		RepoRoot: repoRoot,
-		Branch:   in.Branch,
-		From:     in.From,
-		Path:     in.Path,
-		NoFetch:  in.NoFetch,
-	}, wt.NoopSink{})
+	task := rpc.Task{
+		Type:         rpc.TaskWorktreeCreate,
+		RepoPath:     repoRoot,
+		Params:       map[string]string{"branch": in.Branch},
+		InheritedEnv: inheritedEnv(),
+	}
+	if in.From != "" {
+		task.Params["from"] = in.From
+	}
+	if in.Path != "" {
+		task.Params["path"] = in.Path
+	}
+	if in.NoFetch {
+		task.Params["no_fetch"] = "1"
+	}
+	res, err := dispatchCreatePlan(ctx, task)
 	return nil, res, err
+}
+
+// dispatchCreatePlan submits a worktree_create plan (result mode) to the
+// daemon — the sole mutator — starting it once on connection failure,
+// and parses the returned CreateResult.
+func dispatchCreatePlan(ctx context.Context, task rpc.Task) (wt.CreateResult, error) {
+	resp, err := wt.CallWithStart(ctx, rpc.Plan(true, rpc.One(task)))
+	if err != nil {
+		return wt.CreateResult{}, fmt.Errorf("dispatch create (is treemand running?): %w", err)
+	}
+	if resp.Kind == rpc.KindError {
+		return wt.CreateResult{}, fmt.Errorf("daemon: %s", resp.Message)
+	}
+	if len(resp.TaskResults) == 0 {
+		return wt.CreateResult{}, errors.New("daemon returned no task result")
+	}
+	if r := resp.TaskResults[0]; !r.OK {
+		return wt.CreateResult{}, errors.New(r.Message)
+	}
+	var res wt.CreateResult
+	if err := json.Unmarshal([]byte(resp.TaskResults[0].PayloadJSON), &res); err != nil {
+		return wt.CreateResult{}, err
+	}
+	return res, nil
 }
 
 type worktreeDeleteIn struct {

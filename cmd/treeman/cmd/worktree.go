@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,7 +17,6 @@ import (
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
-	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/ui"
 	"github.com/stubbedev/treeman/internal/wt"
@@ -97,24 +97,72 @@ Examples:
 			if err != nil {
 				return err
 			}
-			res, err := wt.Create(ctx, wt.CreateRequest{
-				RepoRoot:    repoRoot,
-				Branch:      branch,
-				From:        c.String("from"),
-				Path:        c.String("path"),
-				NoFetch:     c.Bool("no-fetch"),
-				SkipHooks:   c.Bool("skip-hooks"),
-				SkipPrepare: c.Bool("skip-prepare"),
-				Env:         CaptureInheritedEnv(),
-			}, cliSink{})
+			task := rpc.Task{
+				Type:         rpc.TaskWorktreeCreate,
+				RepoPath:     repoRoot,
+				Params:       map[string]string{"branch": branch},
+				InheritedEnv: CaptureInheritedEnv(),
+			}
+			if v := c.String("from"); v != "" {
+				task.Params["from"] = v
+			}
+			if v := c.String("path"); v != "" {
+				task.Params["path"] = v
+			}
+			if c.Bool("no-fetch") {
+				task.Params["no_fetch"] = "1"
+			}
+			if c.Bool("skip-hooks") {
+				task.Params["skip_hooks"] = "1"
+			}
+			if c.Bool("skip-prepare") {
+				task.Params["skip_prepare"] = "1"
+			}
+			payload, err := resultPayload(ctx, task)
 			if err != nil {
 				return err
 			}
+			var res wt.CreateResult
+			if err := json.Unmarshal(payload, &res); err != nil {
+				return err
+			}
+			printCreateResult(res)
 			if printPathOnly {
 				_, _ = fmt.Fprintln(os.Stdout, res.WtPath)
 			}
 			return nil
 		},
+	}
+}
+
+// printCreateResult renders the structured worktree_create outcome to
+// the status stream (stderr under --print-path). The daemon performed
+// the work; this is the CLI's human echo of it.
+func printCreateResult(res wt.CreateResult) {
+	switch res.Status {
+	case wt.CreatedNoop:
+		PrintInfo("worktree already exists at %s — no-op", res.WtPath)
+		return
+	case wt.CreatedNoFinalize:
+		PrintOK("created worktree #%d slug=%s path=%s", res.WorktreeID, res.Slug, res.WtPath)
+	default:
+		PrintOK("created worktree #%d slug=%s path=%s", res.WorktreeID, res.Slug, res.WtPath)
+		PrintOK("queued: setup + prepare on daemon — follow with `treeman logs tail --follow`")
+	}
+	if len(res.Ports) > 0 {
+		names := make([]string, 0, len(res.Ports))
+		for n := range res.Ports {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		summary := ""
+		for _, n := range names {
+			if summary != "" {
+				summary += " "
+			}
+			summary += fmt.Sprintf("%s=%d", n, res.Ports[n])
+		}
+		PrintInfo("ports: %s", summary)
 	}
 }
 
@@ -212,22 +260,20 @@ func wtRegister() *cli.Command {
 				}
 			}
 			branch := c.String("branch")
-			sl := slug.For(path, branch)
-			dbPath, _ := store.DefaultDBPath()
-			st, err := store.Open(ctx, dbPath)
+			payload, err := resultPayload(ctx, rpc.Task{
+				Type: rpc.TaskWtRegister, RepoPath: repoRoot, WorktreePath: path,
+				Params: map[string]string{"branch": branch},
+			})
 			if err != nil {
 				return err
 			}
-			defer func() { _ = st.Close() }()
-			repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			if err != nil {
-				return err
+			var r struct {
+				WorktreeID int64  `json:"worktree_id"`
+				RepoID     int64  `json:"repo_id"`
+				Slug       string `json:"slug"`
 			}
-			wtID, err := st.EnsureWorktree(ctx, repoID, path, sl.Value, branch)
-			if err != nil {
-				return err
-			}
-			fmt.Printf("worktree #%d slug=%s repo=#%d (%s)\n", wtID, sl.Value, repoID, repoRoot)
+			_ = json.Unmarshal(payload, &r)
+			fmt.Printf("worktree #%d slug=%s repo=#%d (%s)\n", r.WorktreeID, r.Slug, r.RepoID, repoRoot)
 			return nil
 		},
 	}
@@ -243,18 +289,8 @@ func wtUnregister() *cli.Command {
 				path = c.Args().First()
 			}
 			path = MustAbs(path)
-			dbPath, _ := store.DefaultDBPath()
-			st, err := store.Open(ctx, dbPath)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = st.Close() }()
-			row := st.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
-			var id int64
-			if err := row.Scan(&id); err != nil {
-				return fmt.Errorf("worktree not found: %s", path)
-			}
-			return st.MarkWorktreeDeleted(ctx, id)
+			_, err := resultPayload(ctx, rpc.Task{Type: rpc.TaskWtUnregister, WorktreePath: path})
+			return err
 		},
 	}
 }
@@ -550,14 +586,7 @@ func wtFinalize() *cli.Command {
 				return runLocalFinalizeFlow(ctx, repoRoot, wtPath)
 			}
 
-			resp, err := rpc.Call(ctx, rpc.Request{
-				Method: rpc.MethodWorktreeFinalize,
-				WorktreeFinalize: &rpc.WorktreeFinalizeArgs{
-					RepoPath:     repoRoot,
-					WorktreePath: wtPath,
-					InheritedEnv: CaptureInheritedEnv(),
-				},
-			})
+			resp, err := rpc.Call(ctx, finalizeRequest(repoRoot, wtPath))
 			if err != nil {
 				return err
 			}
