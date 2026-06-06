@@ -618,11 +618,11 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		// Fire user-defined on-checkout actions in parallel with
 		// the regular finalize re-run (no ordering — both react to
 		// the same event independently).
-		safeGo("head_actions:"+wtPath, func() {
+		safeGo(lblHeadActions, wtPath, func() {
 			fireTriggerActions(runid.With(st.BgCtx, rid), st, repoPath, wtPath, "on-checkout", env,
 				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnCheckout })
 		})
-		safeGo("head_finalize:"+wtPath, func() {
+		safeGo(lblHeadFinalize, wtPath, func() {
 			if err := FinalizeWorktree(runid.With(st.BgCtx, rid), st, repoPath, wtPath, env); err != nil {
 				slog.Warn("head-triggered finalize", "wt", wtPath, "err", err)
 			}
@@ -631,7 +631,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		// stale branch otherwise leaves it stale until the next
 		// auto-fetch tick (up to 15 min). Respects per-repo opt-out
 		// the same way the periodic sweep does.
-		safeGo("head_sync:"+wtPath, func() {
+		safeGo(lblHeadSync, wtPath, func() {
 			cfg, err := resolve.LoadResolved(repoPath)
 			if err != nil || !cfg.AutoFetch.IsEnabled() {
 				return
@@ -643,7 +643,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		slog.Warn("head watcher init failed", "wt", wtPath, "err", err)
 	} else {
 		stoppers = append(stoppers, hw.Stop)
-		safeGo("wt_head_watcher:"+wtPath, func() {
+		safeGo(lblWatcherHead, wtPath, func() {
 			if err := hw.Start(wctx); err != nil {
 				slog.Warn("head watcher exit", "wt", wtPath, "err", err)
 			}
@@ -663,7 +663,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 			return fmt.Errorf("fsnotify watcher init: %w", err)
 		}
 		stoppers = append(stoppers, w.Stop)
-		safeGo("wt_fs_watcher:"+wtPath, func() {
+		safeGo(lblWatcherFS, wtPath, func() {
 			if err := w.Start(wctx); err != nil {
 				slog.Warn("fsnotify watcher exit", "wt", wtPath, "err", err)
 			}
@@ -740,10 +740,10 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 		env, _ := st.Store.LoadInheritedEnvByPath(st.BgCtx, wtPath)
 		// Fire the on-file-change actions in parallel with the
 		// re-prep — both react to the same event independently.
-		safeGo("watch_actions:"+wtPath, func() {
+		safeGo(lblWatchActions, wtPath, func() {
 			fireOnFileChange(runid.With(st.BgCtx, rid), st, repoPath, wtPath, dbIdx, path, label, env)
 		})
-		safeGo("watcher_finalize:"+wtPath, func() {
+		safeGo(lblWatchFinalize, wtPath, func() {
 			if err := FinalizeWorktreeForWatch(runid.With(st.BgCtx, rid), st, repoPath, wtPath, dbIdx, env); err != nil {
 				slog.Warn("watcher-triggered finalize", "wt", wtPath, "err", err)
 			}

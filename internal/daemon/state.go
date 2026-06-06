@@ -365,15 +365,41 @@ func (st *State) WaitFinalizeCleared(ctx context.Context, wtPath string, timeout
 	}
 }
 
+// Goroutine labels for safeGo's panic logs. Same colon-hierarchy style
+// as the event types in store/eventtypes.go — one constant per
+// goroutine role, so the labels stay consistent and greppable instead
+// of being scattered string literals. The dynamic disambiguator (a
+// worktree/repo path) is passed to safeGo as `detail`, never glued
+// into the label.
+const (
+	lblLifecycle         = "lifecycle"
+	lblConfigReload      = "config:reload"
+	lblPlanRun           = "plan:run"
+	lblWorktreeFinalize  = "worktree:finalize"
+	lblWorktreeReap      = "worktree:reap"
+	lblWorktreeReapDrain = "worktree:reap:drain"
+	lblHeadActions       = "head:actions"
+	lblHeadFinalize      = "head:finalize"
+	lblHeadSync          = "head:sync"
+	lblWatcherHead       = "watcher:head"
+	lblWatcherFS         = "watcher:fs"
+	lblWatchActions      = "watch:actions"
+	lblWatchFinalize     = "watch:finalize"
+	lblDBDropOverflow    = "db:drop:overflow"
+	lblDBDropDrain       = "db:drop:drain"
+)
+
 // safeGo runs fn in a new goroutine, recovering any panic so a
-// runtime error in one async task can't kill the whole daemon.
-// The panic is logged with the caller-supplied label.
-func safeGo(label string, fn func()) {
+// runtime error in one async task can't kill the whole daemon. The
+// panic is logged with the caller-supplied label (an lbl* constant)
+// and an optional detail (the worktree/repo path it acts on; "" when
+// the goroutine is process-wide).
+func safeGo(label, detail string, fn func()) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("daemon goroutine panic",
-					"label", label, "panic", fmt.Sprint(r))
+					"label", label, "detail", detail, "panic", fmt.Sprint(r))
 			}
 		}()
 		fn()

@@ -86,7 +86,7 @@ func NewConfigReloader(st *State) (*ConfigReloader, error) {
 // Start spawns the fsnotify drain loop. The loop exits when ctx is
 // cancelled — that closes the underlying watcher.
 func (cr *ConfigReloader) Start(ctx context.Context) {
-	safeGo("config_reloader", func() { cr.loop(ctx) })
+	safeGo(lblConfigReload, "", func() { cr.loop(ctx) })
 }
 
 // AddRepo begins watching `repoPath` for changes to `.treeman.yaml`

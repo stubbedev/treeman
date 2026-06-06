@@ -52,7 +52,7 @@ func handleRunPlan(ctx context.Context, st *State, req rpc.Request) rpc.Response
 		return rpc.Response{Kind: rpc.KindPlanResult, TaskResults: results}
 	}
 
-	safeGo("run_plan", func() {
+	safeGo(lblPlanRun, "", func() {
 		bg := runid.With(st.BgCtx, id)
 		_ = st.Store.WriteEvent(bg, store.LevelInfo, store.EvtPlanStart, "plan beginning", 0, 0, "", 0, nil)
 		results := ExecutePlan(bg, st, args.Groups)
@@ -474,7 +474,7 @@ func runTaskWorktreeCreate(ctx context.Context, st *State, task rpc.Task) (json.
 			// No daemon to outlive the call — run the tail before returning.
 			runFinalize(runid.With(ctx, runid.New()))
 		} else {
-			safeGo("worktree_finalize", func() { runFinalize(runid.With(st.BgCtx, runid.New())) })
+			safeGo(lblWorktreeFinalize, "", func() { runFinalize(runid.With(st.BgCtx, runid.New())) })
 		}
 		res.Status = wt.CreatedQueued
 	}

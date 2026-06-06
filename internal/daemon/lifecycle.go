@@ -94,7 +94,7 @@ func StartLifecycleWatcher(ctx context.Context, st *State, repoID int64, repoPat
 		},
 	}
 	st.RegisterLifecycleWatcher(repoPath, entry)
-	safeGo("lifecycle:"+repoPath, func() { lw.loop(wctx) })
+	safeGo(lblLifecycle, repoPath, func() { lw.loop(wctx) })
 	slog.Info("lifecycle watcher started", "repo", repoPath, "admin_root", adminRoot)
 	return lw, nil
 }
