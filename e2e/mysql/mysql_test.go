@@ -307,7 +307,7 @@ func TestPhysicalClonePreconditionsFailSkipsToLogical(t *testing.T) {
 
 	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
 		WorktreeID: env.WTID,
-		EventTypes: []string{"snapshot_clone_strategy"},
+		EventTypes: []string{"snapshots:strategy"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +367,7 @@ func TestPhysicalCloneViaContainerExec(t *testing.T) {
 	// Assert at least one snapshot_clone_strategy event with strategy=physical.
 	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
 		WorktreeID: env.WTID,
-		EventTypes: []string{"snapshot_clone_strategy"},
+		EventTypes: []string{"snapshots:strategy"},
 	})
 	if err != nil {
 		t.Fatalf("query events: %v", err)
@@ -592,7 +592,7 @@ func assertSawPhysicalStrategy(t *testing.T, env *harness.Env) {
 	t.Helper()
 	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
 		WorktreeID: env.WTID,
-		EventTypes: []string{"snapshot_clone_strategy"},
+		EventTypes: []string{"snapshots:strategy"},
 	})
 	if err != nil {
 		t.Fatalf("query strategy events: %v", err)
@@ -700,7 +700,7 @@ func TestAutoStrategyPicksLogicalForSmall(t *testing.T) {
 
 	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
 		WorktreeID: env.WTID,
-		EventTypes: []string{"snapshot_clone_strategy"},
+		EventTypes: []string{"snapshots:strategy"},
 	})
 	if err != nil {
 		t.Fatalf("query strategy events: %v", err)
