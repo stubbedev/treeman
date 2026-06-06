@@ -137,18 +137,18 @@ func setup(t *testing.T) *fixture {
 		durMs     int64
 	}
 	events := []seedEv{
-		{mins(120), "debug", repo1ID, wt1aID, "prepare_start", "precreate", "wt1a old debug", `{"engine":"mysql"}`, 0},
-		{mins(90), "info", repo1ID, wt1aID, "prepare_done", "postcreate", "wt1a info hit alpha", `{"engine":"mysql","cache":"hit"}`, 1200},
-		{mins(45), "warn", repo1ID, wt1aID, "fanout_done", "postcreate", "wt1a warn fanout slow", `{"slowest_ms":7000}`, 7000},
-		{mins(5), "error", repo1ID, wt1aID, "wt_finalize_done", "postcreate", "wt1a recent error needle", `{"err":"boom"}`, 0},
+		{mins(120), "debug", repo1ID, wt1aID, "prepare:start", "precreate", "wt1a old debug", `{"engine":"mysql"}`, 0},
+		{mins(90), "info", repo1ID, wt1aID, "prepare:end", "postcreate", "wt1a info hit alpha", `{"engine":"mysql","cache":"hit"}`, 1200},
+		{mins(45), "warn", repo1ID, wt1aID, "clones:end", "postcreate", "wt1a warn fanout slow", `{"slowest_ms":7000}`, 7000},
+		{mins(5), "error", repo1ID, wt1aID, "worktree:create:end", "postcreate", "wt1a recent error needle", `{"err":"boom"}`, 0},
 
-		{mins(80), "info", repo1ID, wt1bID, "prepare_start", "precreate", "wt1b info bravo", `{"engine":"postgres"}`, 0},
+		{mins(80), "info", repo1ID, wt1bID, "prepare:start", "precreate", "wt1b info bravo", `{"engine":"postgres"}`, 0},
 		{
 			mins(20),
 			"info",
 			repo1ID,
 			wt1bID,
-			"prepare_done",
+			"prepare:end",
 			"postcreate",
 			"wt1b info bravo done",
 			`{"engine":"postgres","cache":"miss"}`,
@@ -156,7 +156,7 @@ func setup(t *testing.T) *fixture {
 		},
 
 		{mins(70), "warn", repo2ID, wt2aID, "snapshot_create", "precreate", "wt2a snapshot warn", `{"size":12345}`, 4500},
-		{mins(15), "info", repo2ID, wt2aID, "wt_finalize_done", "postcreate", "wt2a finalize done", `{"final":true}`, 0},
+		{mins(15), "info", repo2ID, wt2aID, "worktree:create:end", "postcreate", "wt2a finalize done", `{"final":true}`, 0},
 	}
 	for _, e := range events {
 		var dur any
@@ -364,7 +364,7 @@ func TestLogsCLI(t *testing.T) {
 				"--event-type",
 				"snapshot_create",
 				"--event-type",
-				"wt_finalize_done",
+				"worktree:create:end",
 			},
 			wantStdout: []string{"wt1a recent error needle", "wt2a snapshot warn", "wt2a finalize done"},
 			notStdout:  []string{"wt1a info hit alpha", "wt1b info bravo"},

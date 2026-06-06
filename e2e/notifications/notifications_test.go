@@ -37,7 +37,7 @@ type fakeSender struct {
 func newFakeSender() *fakeSender { return &fakeSender{ch: make(chan notify.Notification, 16)} }
 
 func (f *fakeSender) Available() bool { return true }
-func (f *fakeSender) Send(n notify.Notification) error {
+func (f *fakeSender) Send(_ context.Context, n notify.Notification) error {
 	f.ch <- n
 	return nil
 }
@@ -110,8 +110,8 @@ func TestDefaultEventsNotifyReadyAndFailedOnly(t *testing.T) {
 	st.Store.RegisterEventHook("test-notify", daemon.NotifyHook(st, cfg.Notifications, fake))
 
 	// up → muted; stable → fires.
-	write(t, st, store.LevelInfo, "wt_finalize_start", repoID, wtID)
-	write(t, st, store.LevelInfo, "wt_finalize_done", repoID, wtID)
+	write(t, st, store.LevelInfo, "worktree:create:start", repoID, wtID)
+	write(t, st, store.LevelInfo, "worktree:create:end", repoID, wtID)
 
 	n := fake.recv(t)
 	if n.Title != "treeman: ready" {
@@ -122,7 +122,7 @@ func TestDefaultEventsNotifyReadyAndFailedOnly(t *testing.T) {
 	}
 
 	// failed → fires, critical urgency.
-	write(t, st, store.LevelError, "wt_finalize", repoID, wtID)
+	write(t, st, store.LevelError, "worktree:create:error", repoID, wtID)
 	f := fake.recv(t)
 	if f.Title != "treeman: failed" {
 		t.Errorf("failed title = %q", f.Title)
@@ -147,17 +147,17 @@ func TestCustomEventsListFlipsBuckets(t *testing.T) {
 	st.Store.RegisterEventHook("test-notify", daemon.NotifyHook(st, cfg, fake))
 
 	// up → fires.
-	write(t, st, store.LevelInfo, "wt_finalize_start", repoID, wtID)
+	write(t, st, store.LevelInfo, "worktree:create:start", repoID, wtID)
 	if got := fake.recv(t).Title; got != "treeman: preparing" {
 		t.Errorf("up title = %q, want 'treeman: preparing'", got)
 	}
 
 	// stable → muted (not in the list).
-	write(t, st, store.LevelInfo, "wt_finalize_done", repoID, wtID)
+	write(t, st, store.LevelInfo, "worktree:create:end", repoID, wtID)
 	fake.expectSilence(t)
 
 	// down → fires.
-	write(t, st, store.LevelInfo, "wt_teardown_start", repoID, wtID)
+	write(t, st, store.LevelInfo, "worktree:delete:start", repoID, wtID)
 	if got := fake.recv(t).Title; got != "treeman: tearing down" {
 		t.Errorf("down title = %q, want 'treeman: tearing down'", got)
 	}
@@ -173,7 +173,7 @@ func TestDisabledNeverFires(t *testing.T) {
 	fake := newFakeSender()
 	st.Store.RegisterEventHook("test-notify", daemon.NotifyHook(st, cfg, fake))
 
-	write(t, st, store.LevelInfo, "wt_finalize_done", repoID, wtID)
-	write(t, st, store.LevelError, "wt_finalize", repoID, wtID)
+	write(t, st, store.LevelInfo, "worktree:create:end", repoID, wtID)
+	write(t, st, store.LevelError, "worktree:create:error", repoID, wtID)
 	fake.expectSilence(t)
 }

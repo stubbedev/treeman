@@ -49,22 +49,22 @@ func seedStatusFixture(t *testing.T, e *env) (apiRepo, webRepo string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev(mID, "info", "wt_finalize_done")
+	ev(mID, "info", "worktree:create:end")
 
 	// api: preparing → up.
 	upID, err := st.EnsureWorktree(ctx, apiID, filepath.Join(apiRepo, ".worktrees", "feat"), "api_feat", "feature/login")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev(upID, "info", "wt_finalize_start")
+	ev(upID, "info", "worktree:create:start")
 
 	// api: errored → failed.
 	badID, err := st.EnsureWorktree(ctx, apiID, filepath.Join(apiRepo, ".worktrees", "bug"), "api_bug", "bugfix/crash")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev(badID, "info", "wt_finalize_start")
-	ev(badID, "error", "wt_finalize")
+	ev(badID, "info", "worktree:create:start")
+	ev(badID, "error", "worktree:create:error")
 
 	// web: no events → stable.
 	if _, err := st.EnsureWorktree(ctx, webID, filepath.Join(webRepo, ".worktrees", "x"), "web_x", "feature/x"); err != nil {
@@ -76,8 +76,8 @@ func seedStatusFixture(t *testing.T, e *env) (apiRepo, webRepo string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ev(dnID, "info", "wt_finalize_done")
-	ev(dnID, "info", "wt_teardown_start")
+	ev(dnID, "info", "worktree:create:end")
+	ev(dnID, "info", "worktree:delete:start")
 
 	return apiRepo, webRepo
 }

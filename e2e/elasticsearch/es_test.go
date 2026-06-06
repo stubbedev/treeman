@@ -221,7 +221,7 @@ func TestDumpLoadViaDockerExec(t *testing.T) {
 
 	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
 		WorktreeID: env.WTID,
-		EventTypes: []string{"prepare_phase"},
+		EventTypes: []string{"prepare:phase"},
 		Phases:     []string{"dump-load"},
 	})
 	if err != nil {

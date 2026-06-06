@@ -227,7 +227,7 @@ func TestPostgresFanoutConcurrency(t *testing.T) {
 	// in DurationMs.
 	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
 		WorktreeID: env.WTID,
-		EventTypes: []string{"clone_restore_done"},
+		EventTypes: []string{"clones:restore:end"},
 		SinceMs:    probeStartMs,
 	})
 	if err != nil {
@@ -287,7 +287,7 @@ func TestDumpLoadViaDockerExec(t *testing.T) {
 
 	evs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
 		WorktreeID: env.WTID,
-		EventTypes: []string{"prepare_phase"},
+		EventTypes: []string{"prepare:phase"},
 		Phases:     []string{"dump-load"},
 	})
 	if err != nil {

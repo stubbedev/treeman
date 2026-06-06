@@ -103,7 +103,7 @@ func TestMigrateGateMySQL(t *testing.T) {
 	if got := countLines(t, counter); got != 1 {
 		t.Fatalf("fresh build must migrate once, ran %d times", got)
 	}
-	if got := countEvents(t, st, wtID, "migrate_skip"); got != 0 {
+	if got := countEvents(t, st, wtID, "migrate:skip"); got != 0 {
 		t.Fatalf("fresh build must not skip, got %d skips", got)
 	}
 
@@ -112,7 +112,7 @@ func TestMigrateGateMySQL(t *testing.T) {
 	if got := countLines(t, counter); got != 1 {
 		t.Fatalf("unchanged resume must skip migrate, ran %d times total", got)
 	}
-	if got := countEvents(t, st, wtID, "migrate_skip"); got != 1 {
+	if got := countEvents(t, st, wtID, "migrate:skip"); got != 1 {
 		t.Fatalf("unchanged resume must emit one migrate_skip, got %d", got)
 	}
 
@@ -124,7 +124,7 @@ func TestMigrateGateMySQL(t *testing.T) {
 	if got := countLines(t, counter); got != 2 {
 		t.Fatalf("changed inputs must re-migrate, ran %d times total", got)
 	}
-	if got := countEvents(t, st, wtID, "migrate_skip"); got != 1 {
+	if got := countEvents(t, st, wtID, "migrate:skip"); got != 1 {
 		t.Fatalf("changed inputs must not add a skip, got %d", got)
 	}
 }
