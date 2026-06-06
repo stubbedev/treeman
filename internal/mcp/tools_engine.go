@@ -33,6 +33,7 @@ import (
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 // registerEngineTools binds the engine-introspection + snapshot
@@ -795,7 +796,7 @@ func esRequestTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in esRequestI
 		return nil, out, fmt.Errorf("es %s /%s: %s", method, path, resp.Status)
 	}
 	if in.Write {
-		writeMCPEvent(context.Background(), "es_request", method+" /"+path, 0, map[string]string{
+		writeMCPEvent(context.Background(), store.EvtMCPEsRequest, method+" /"+path, 0, map[string]string{
 			"method": method,
 			"path":   path,
 		})

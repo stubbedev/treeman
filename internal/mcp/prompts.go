@@ -237,12 +237,12 @@ Execute these tool calls in order. Stop as soon as you can identify the failing 
 
 1. logs_query — fetch recent errors.
    • levels=["error"]
-   • event_types=["prepare_done","wt_finalize","clone_restore_fail","fanout_done","prepare_unsupported_engine"]
+   • event_types=["prepare:end","worktree:create:error","clones:restore:error","clones:end","prepare:unsupported"]
    %s
    • limit=20
    Identify the most-recent failure row's repo, worktree, engine, and event_type.
 
-2. If a run_id is visible in the failure payload but wasn't supplied as an argument, RE-RUN logs_query with that run_id and event_types=["prepare_start","prepare_phase","prepare_done","fanout_start","fanout_done","clone_restore_fail","snapshot_cache_hit"] to reconstruct the full timeline of that prepare invocation.
+2. If a run_id is visible in the failure payload but wasn't supplied as an argument, RE-RUN logs_query with that run_id and event_types=["prepare:start","prepare:phase","prepare:end","clones:start","clones:end","clones:restore:error","snapshots:cache:hit"] to reconstruct the full timeline of that prepare invocation.
 
 3. engine_status — confirm the affected engine is reachable and responsive. If unreachable, surface that as the root cause and stop.
 

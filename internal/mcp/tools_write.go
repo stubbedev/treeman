@@ -292,7 +292,7 @@ func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWrit
 	if err := atomicWrite(histRoot, target, []byte(in.Body)); err != nil {
 		return nil, configWriteOut{}, err
 	}
-	writeMCPEvent(context.Background(), "config_write", "replaced "+target, 0, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPConfigWrite, "replaced "+target, 0, map[string]string{
 		"scope": layer,
 		"file":  target,
 		"bytes": strconv.Itoa(len(in.Body)),
@@ -341,7 +341,7 @@ func initRepoTool(_ context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*mcp
 		}
 		schemaPath, _, schemaErr := schema.Install("", schema.TargetGlobal)
 		if created {
-			writeMCPEvent(context.Background(), "init_repo", "scaffolded "+target, 0, map[string]string{
+			writeMCPEvent(context.Background(), store.EvtMCPInitRepo, "scaffolded "+target, 0, map[string]string{
 				"path":  target,
 				"scope": "global",
 			})
@@ -361,7 +361,7 @@ func initRepoTool(_ context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*mcp
 		return nil, initOut{}, err
 	}
 	if created {
-		writeMCPEvent(context.Background(), "init_repo", "scaffolded "+target, 0, map[string]string{
+		writeMCPEvent(context.Background(), store.EvtMCPInitRepo, "scaffolded "+target, 0, map[string]string{
 			"repo": repoRoot,
 			"path": target,
 		})
@@ -406,7 +406,7 @@ func schemaInstallTool(_ context.Context, _ *mcpsdk.CallToolRequest, in schemaIn
 	if err != nil {
 		return nil, schemaInstallOut{}, err
 	}
-	writeMCPEvent(context.Background(), "schema_install", "installed "+resolved, 0, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPSchemaInstall, "installed "+resolved, 0, map[string]string{
 		"repo":     repoRoot,
 		"target":   strings.ToLower(in.Target),
 		"resolved": resolved,
@@ -468,7 +468,7 @@ func registryRegisterTool(
 	if err != nil {
 		return nil, registryRegisterOut{}, fmt.Errorf("ensure worktree: %w", err)
 	}
-	writeMCPEvent(context.Background(), "registry_register", "registered "+wt, repoID, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPRegistryRegister, "registered "+wt, repoID, map[string]string{
 		"path":   wt,
 		"slug":   sl.Value,
 		"branch": branch,
@@ -545,7 +545,7 @@ func registryUnregisterTool(
 	if err := st.MarkWorktreeDeleted(ctx, wtID); err != nil {
 		return nil, registryUnregisterOut{}, err
 	}
-	writeMCPEvent(context.Background(), "registry_unregister", "unregistered "+path, repoID, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPRegistryUnregister, "unregistered "+path, repoID, map[string]string{
 		"path": path,
 		"name": in.Name,
 	})
@@ -603,7 +603,7 @@ func repoRemoveTool(
 				if resp.Kind == rpc.KindError {
 					return nil, repoRemoveOut{}, fmt.Errorf("daemon: %s", resp.Message)
 				}
-				writeMCPEvent(context.Background(), "registry_remove", "removed "+repoRoot, 0, map[string]string{
+				writeMCPEvent(context.Background(), store.EvtMCPRegistryRemove, "removed "+repoRoot, 0, map[string]string{
 					"repo": repoRoot,
 					"via":  "daemon",
 				})
@@ -636,7 +636,7 @@ func repoRemoveTool(
 	if err := st.RemoveRepo(ctx, repoID); err != nil {
 		return nil, repoRemoveOut{}, err
 	}
-	writeMCPEvent(context.Background(), "registry_remove", "removed "+repoRoot, 0, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPRegistryRemove, "removed "+repoRoot, 0, map[string]string{
 		"repo": repoRoot,
 		"via":  "sqlite",
 	})
@@ -663,7 +663,7 @@ func registryRepairTool(
 	defer func() { _ = st.Close() }()
 	res, err := wtreg.Repair(ctx, st, repoRoot, detectBranch)
 	if err == nil && (len(res.Registered) > 0 || len(res.Unregistered) > 0) {
-		writeMCPEvent(context.Background(), "registry_repair",
+		writeMCPEvent(context.Background(), store.EvtMCPRegistryRepair,
 			fmt.Sprintf("repaired %d registered, %d unregistered", len(res.Registered), len(res.Unregistered)),
 			0, map[string]string{"repo": repoRoot})
 	}
@@ -728,7 +728,7 @@ func snapshotsPurgeTool(
 		return nil, snapshotsPurgeOut{}, fmt.Errorf("ensure repo: %w", err)
 	}
 	dropped, errs := snapshot.PurgeRepo(ctx, &cfg, st, repoID)
-	writeMCPEvent(context.Background(), "snapshots_purge",
+	writeMCPEvent(context.Background(), store.EvtMCPSnapshotsPurge,
 		fmt.Sprintf("purged %d snapshot(s)", dropped), repoID,
 		map[string]string{"repo": repoRoot, "dropped": strconv.Itoa(dropped)})
 	out := snapshotsPurgeOut{Repo: repoRoot, Dropped: dropped}
@@ -799,7 +799,7 @@ func logsPurgeTool(ctx context.Context, req *mcpsdk.CallToolRequest, in logsPurg
 	if err != nil {
 		return nil, logsPurgeOut{}, err
 	}
-	writeMCPEvent(context.Background(), "logs_purge",
+	writeMCPEvent(context.Background(), store.EvtMCPLogsPurge,
 		fmt.Sprintf("purged %d event row(s)", n), f.RepoID,
 		map[string]string{"rows_removed": strconv.FormatInt(n, 10)})
 	return nil, logsPurgeOut{RowsRemoved: n}, nil
@@ -1116,7 +1116,7 @@ func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn)
 	if err != nil {
 		return nil, configSetOut{}, fmt.Errorf("marshal value: %w", err)
 	}
-	writeMCPEvent(context.Background(), "config_set", "patched "+in.Path, 0, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPConfigSet, "patched "+in.Path, 0, map[string]string{
 		"scope":    layer,
 		"file":     p,
 		"path":     in.Path,
@@ -1176,11 +1176,17 @@ func configRestoreTool(
 	if err := atomicWrite(histRoot, p, g.Content); err != nil {
 		return nil, configRestoreOut{}, err
 	}
-	writeMCPEvent(context.Background(), "config_restore", fmt.Sprintf("restored generation %d", in.Generation), 0, map[string]string{
-		"scope":      layer,
-		"file":       p,
-		"generation": strconv.FormatInt(in.Generation, 10),
-	})
+	writeMCPEvent(
+		context.Background(),
+		store.EvtMCPConfigRestore,
+		fmt.Sprintf("restored generation %d", in.Generation),
+		0,
+		map[string]string{
+			"scope":      layer,
+			"file":       p,
+			"generation": strconv.FormatInt(in.Generation, 10),
+		},
+	)
 	return nil, configRestoreOut{Path: p, Scope: layer, Restored: in.Generation, Bytes: len(g.Content)}, nil
 }
 
@@ -1257,7 +1263,7 @@ func worktreeRepairTool(
 	// Phase 4: snapshot templates.
 	out.Actions = append(out.Actions, repairSnapshots(ctx, st, &cfg, repoID))
 
-	writeMCPEvent(context.Background(), "worktree_repair", "repaired "+wtPath, repoID, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPWorktreeRepair, "repaired "+wtPath, repoID, map[string]string{
 		"worktree_path": wtPath,
 	})
 	return nil, out, nil

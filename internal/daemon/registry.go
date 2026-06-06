@@ -68,7 +68,7 @@ func removeRepoFromRegistry(ctx context.Context, st *State, repoPath string, for
 		return fmt.Errorf("remove repo: %w", err)
 	}
 	slog.Info("repo removed from registry", "repo", repoPath, "id", repoID, "force", force)
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "registry_remove",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtRegistryRemove,
 		"repo removed from registry", 0, 0, "", 0,
 		map[string]string{"repo": repoPath, "force": strconv.FormatBool(force)})
 	return nil

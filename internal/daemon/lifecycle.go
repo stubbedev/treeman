@@ -381,7 +381,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 		return nil
 	}
 
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_lifecycle_teardown_start",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeReapStart,
 		"lifecycle watcher: teardown hooks + db teardown beginning",
 		repoID, row.ID, "", 0, nil)
 
@@ -421,7 +421,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 	if err := st.Store.MarkWorktreeDeleted(ctx, row.ID); err != nil {
 		return err
 	}
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_lifecycle_teardown_done",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeReapEnd,
 		"lifecycle watcher: teardown + db teardown complete",
 		repoID, row.ID, "", 0, nil)
 	return nil

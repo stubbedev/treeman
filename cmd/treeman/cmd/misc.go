@@ -218,15 +218,15 @@ func subscribeRun(ctx context.Context, runID string) (<-chan rpc.EventEnvelope, 
 }
 
 // streamPlanEvents prints the live event tail for a foreground plan and
-// returns when the daemon emits the terminal event: nil on run_plan_done,
+// returns when the daemon emits the terminal event: nil on plan:end,
 // an error on a run_plan error event. A closed channel (daemon gone)
 // returns a best-effort error.
 func streamPlanEvents(ch <-chan rpc.EventEnvelope, label string) error {
 	for ev := range ch {
 		switch ev.EventType {
-		case "run_plan_done":
+		case store.EvtPlanEnd:
 			return nil
-		case "run_plan":
+		case store.EvtPlanError:
 			if ev.Level == store.LevelError {
 				return fmt.Errorf("%s failed: %s", label, ev.Message)
 			}

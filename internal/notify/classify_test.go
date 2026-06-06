@@ -11,19 +11,19 @@ func TestBucketMapsLifecycleEvents(t *testing.T) {
 		level     string
 		want      string
 	}{
-		{"wt_finalize_start", "info", BucketUp},
-		{"wt_finalize_done", "info", BucketStable},
-		{"wt_finalize", "error", BucketFailed},
+		{"worktree:create:start", "info", BucketUp},
+		{"worktree:create:end", "info", BucketStable},
+		{"worktree:create:error", "error", BucketFailed},
 		// wt_finalize at a non-error level is not a failure transition.
-		{"wt_finalize", "info", ""},
-		{"wt_teardown_start", "info", BucketDown},
-		{"wt_lifecycle_teardown_start", "info", BucketDown},
+		{"worktree:create:error", "info", ""},
+		{"worktree:delete:start", "info", BucketDown},
+		{"worktree:reap:start", "info", BucketDown},
 		// Terminal teardown completion is intentionally unmapped.
-		{"wt_teardown_done", "info", ""},
-		{"wt_lifecycle_teardown_done", "info", ""},
+		{"worktree:delete:end", "info", ""},
+		{"worktree:reap:end", "info", ""},
 		// Unrelated events never notify.
 		{"auto_fetch_done", "info", ""},
-		{"config_reloaded", "info", ""},
+		{"config:reload", "info", ""},
 		{"", "", ""},
 	}
 	for _, c := range cases {

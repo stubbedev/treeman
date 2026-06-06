@@ -138,7 +138,7 @@ func TestRemoveRepoCascadesChildren(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.WriteEvent(ctx, LevelInfo, "wt_finalize_start", "hi",
+	if err := s.WriteEvent(ctx, LevelInfo, "worktree:create:start", "hi",
 		repoID, wtID, "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestWriteEvent(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := s.WriteEvent(ctx, LevelInfo, "wt_finalize_start", "hi",
+	if err := s.WriteEvent(ctx, LevelInfo, "worktree:create:start", "hi",
 		0, 0, "", 0, map[string]string{"engine": "mysql"}); err != nil {
 		t.Fatal(err)
 	}

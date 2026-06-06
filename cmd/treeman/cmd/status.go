@@ -190,9 +190,9 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 	rows, _ := st.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
 		EventTypes: []string{
-			"wt_finalize_start", "wt_finalize_done", "wt_finalize",
-			"wt_teardown_start", "wt_teardown_done",
-			"wt_lifecycle_teardown_start", "wt_lifecycle_teardown_done",
+			store.EvtWorktreeCreateStart, store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError,
+			store.EvtWorktreeDeleteStart, store.EvtWorktreeDeleteEnd,
+			store.EvtWorktreeReapStart, store.EvtWorktreeReapEnd,
 		},
 		Limit: 1,
 	})
@@ -200,17 +200,17 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 		return "ready", bucketStable
 	}
 	switch last := rows[0]; last.EventType {
-	case "wt_finalize_start":
+	case store.EvtWorktreeCreateStart:
 		return "preparing", bucketUp
-	case "wt_finalize":
+	case store.EvtWorktreeCreateError:
 		if last.Level == "error" {
 			return "error", bucketFailed
 		}
 		return "ready", bucketStable
-	case "wt_teardown_start", "wt_lifecycle_teardown_start":
+	case store.EvtWorktreeDeleteStart, store.EvtWorktreeReapStart:
 		return "teardown", bucketDown
 	default:
-		// wt_finalize_done / wt_teardown_done / wt_lifecycle_teardown_done.
+		// worktree:create:end / worktree:delete:end / worktree:reap:end.
 		return "ready", bucketStable
 	}
 }

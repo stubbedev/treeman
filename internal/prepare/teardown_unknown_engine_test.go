@@ -44,7 +44,7 @@ func TestTeardownDatabasesEmitsEventForUnknownEngine(t *testing.T) {
 	}
 
 	events, err := st.QueryEvents(ctx, store.EventFilter{
-		EventTypes: []string{"db_teardown_skipped"},
+		EventTypes: []string{"db:teardown:skip"},
 		WorktreeID: wtID,
 		Limit:      10,
 	})

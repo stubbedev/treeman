@@ -550,7 +550,7 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 		return Outcome{}, err
 	}
 
-	a.event(ctx, "prepare_start", fmt.Sprintf("engine=%s active=%s branch=%s branch_scoped", a.eng.engine, active, branch), nil)
+	a.event(ctx, store.EvtPrepareStart, fmt.Sprintf("engine=%s active=%s branch=%s branch_scoped", a.eng.engine, active, branch), nil)
 
 	builtEmpty := false
 	var decision string
@@ -603,7 +603,7 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 				_ = a.st.SetBranchMigrated(ctx, a.worktreeID, active, branch, a.migrateFP)
 			}
 		} else {
-			a.event(ctx, "migrate_skip",
+			a.event(ctx, store.EvtMigrateSkip,
 				fmt.Sprintf("engine=%s active=%s branch=%s migrate skipped (inputs unchanged)", a.eng.engine, active, branch),
 				map[string]string{"fingerprint": a.migrateFP})
 		}
@@ -621,7 +621,7 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 	a.recordClean(ctx, active, branch, decision, migrated, seeded)
 
 	ms := time.Since(started).Milliseconds()
-	a.event(ctx, "prepare_done",
+	a.event(ctx, store.EvtPrepareEnd,
 		fmt.Sprintf("branch_scoped decision=%s active=%s branch=%s duration=%dms", decision, active, branch, ms),
 		map[string]string{"duration_ms": strconv.FormatInt(ms, 10), "decision": decision})
 
@@ -671,7 +671,7 @@ func (a branchScopedArgs) swapBranch(ctx context.Context, active, old, branch st
 	// still mirrors that durable copy. Sound because the watermark is a
 	// monotonic write counter — an unchanged value cannot hide a write.
 	if a.captureRedundant(ctx, active, old) {
-		a.event(ctx, "capture_skip",
+		a.event(ctx, store.EvtBranchCaptureSkip,
 			fmt.Sprintf("engine=%s active=%s branch=%s capture skipped (no writes since resume)", a.eng.engine, active, old),
 			map[string]string{"old_branch": old})
 	} else if err := a.captureDurable(ctx, active, old); err != nil {
@@ -978,7 +978,7 @@ func teardownBranchScoped(
 	defer closeEng()
 
 	if capErr := captureBranchScopedOnTeardown(ctx, eng, st, repoID, worktreeID, active); capErr != nil {
-		_ = st.WriteEvent(ctx, store.LevelWarn, "branch_capture_error",
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtBranchCaptureError,
 			capErr.Error(), repoID, worktreeID, "", 0, nil)
 	}
 	if err := eng.drv.Drop(ctx, active); err != nil {
@@ -986,7 +986,7 @@ func teardownBranchScoped(
 	}
 	_ = st.ClearActiveBranch(ctx, worktreeID, active)
 	_ = st.ClearBranchMigratedForKey(ctx, worktreeID, active)
-	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtDBDrop,
 		fmt.Sprintf("%s: dropped active %s (branch_scoped; durable copies kept)", d.Engine, active),
 		repoID, worktreeID, "", 0, map[string]any{"engine": d.Engine, "active": active})
 	return nil
@@ -1041,7 +1041,7 @@ func ResetBranchScoped(
 		if rerr != nil {
 			return rerr
 		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "db_reset",
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtDBReset,
 			fmt.Sprintf("%s: cleared active %s + durable copy", d.Engine, active),
 			repoID, worktreeID, "", 0, map[string]string{"engine": d.Engine, "active": active})
 	}

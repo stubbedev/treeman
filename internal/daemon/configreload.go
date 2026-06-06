@@ -229,7 +229,7 @@ func (cr *ConfigReloader) ReloadAll(ctx context.Context) {
 	// daemon restart. Lives here (not reloadOne) because notifications
 	// are global-only and ReloadAll is the global-config seam.
 	RegisterNotifier(cr.st)
-	_ = cr.st.Store.WriteEvent(ctx, store.LevelInfo, "config_reloaded",
+	_ = cr.st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtConfigReload,
 		"config reload restarted watchers (all repos)", 0, 0, "", 0,
 		map[string]string{"scope": "all"})
 }
@@ -239,7 +239,7 @@ func (cr *ConfigReloader) ReloadAll(ctx context.Context) {
 func (cr *ConfigReloader) ReloadRepo(ctx context.Context, repoPath string) {
 	resolve.InvalidateConfigCache()
 	cr.reloadOne(ctx, repoPath)
-	_ = cr.st.Store.WriteEvent(ctx, store.LevelInfo, "config_reloaded",
+	_ = cr.st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtConfigReload,
 		"config reload restarted watchers", 0, 0, "", 0,
 		map[string]string{"repo": repoPath})
 }

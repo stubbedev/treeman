@@ -105,10 +105,10 @@ func run() error {
 
 	st := daemon.NewState(ctx, s)
 	slog.Info("treemand listening",
-		"event_type", "daemon_started",
+		"event_type", store.EvtDaemonStart,
 		"socket", sockPath,
 		"pid", os.Getpid())
-	_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_started", "treemand listening",
+	_ = s.WriteEvent(ctx, store.LevelInfo, store.EvtDaemonStart, "treemand listening",
 		0, 0, "", 0, map[string]string{"socket": sockPath})
 
 	// Desktop notifications (opt-in via the global `notifications:`
@@ -134,7 +134,7 @@ func run() error {
 	// Reconcile any finalize that was in flight when the previous
 	// daemon died — the goroutine is gone, so the row would otherwise
 	// stay at derived state=preparing forever. SweepStalePreparing
-	// emits a synthetic wt_finalize error so the user sees the wedge
+	// emits a synthetic worktree:create:error error so the user sees the wedge
 	// and can rerun `treeman wt finalize`. Runs BEFORE watchers come
 	// up so the stale event is visible regardless of whether a fresh
 	// finalize is about to fire.
@@ -226,10 +226,10 @@ func run() error {
 	select {
 	case <-ctx.Done():
 		slog.Info("daemon_stopped — signal received")
-		_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_stopped", "SIGTERM/SIGINT received", 0, 0, "", 0, nil)
+		_ = s.WriteEvent(ctx, store.LevelInfo, store.EvtDaemonStop, "SIGTERM/SIGINT received", 0, 0, "", 0, nil)
 	case <-shutdown:
 		slog.Info("daemon_stopped — shutdown rpc")
-		_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_stopped", "shutdown requested", 0, 0, "", 0, nil)
+		_ = s.WriteEvent(ctx, store.LevelInfo, store.EvtDaemonStop, "shutdown requested", 0, 0, "", 0, nil)
 	}
 	_ = ln.Close()
 	_ = os.Remove(sockPath)

@@ -134,7 +134,7 @@ func worktreeFinalizeTool(
 	if err := mcpPlanErr(submitMCPPlan(ctx, finalizePlan(repoRoot, wtPath))); err != nil {
 		return nil, worktreeFinalizeOut{}, fmt.Errorf("finalize: %w", err)
 	}
-	writeMCPEvent(context.Background(), "worktree_finalize", "queued finalize for "+wtPath, 0, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPWorktreeFinalize, "queued finalize for "+wtPath, 0, map[string]string{
 		"repo":     repoRoot,
 		"worktree": wtPath,
 	})
@@ -215,7 +215,7 @@ func mainWorktreeEnable(ctx context.Context, repoRoot string) (*mcpsdk.CallToolR
 		return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error
 	}
 	out.Detail = "enabled — setup hooks + prepare queued (follow with logs_subscribe)"
-	writeMCPEvent(context.Background(), "main_worktree", "enabled "+repoRoot, 0, map[string]string{"repo": repoRoot})
+	writeMCPEvent(context.Background(), store.EvtMCPMainWorktree, "enabled "+repoRoot, 0, map[string]string{"repo": repoRoot})
 	return nil, out, nil
 }
 
@@ -247,7 +247,7 @@ func mainWorktreeDisable(ctx context.Context, repoRoot string, purge bool) (*mcp
 		out.Purged = n
 	}
 	out.Detail = "main worktree disabled"
-	writeMCPEvent(context.Background(), "main_worktree", "disabled "+repoRoot, 0, map[string]string{"repo": repoRoot})
+	writeMCPEvent(context.Background(), store.EvtMCPMainWorktree, "disabled "+repoRoot, 0, map[string]string{"repo": repoRoot})
 	return nil, out, nil
 }
 
@@ -420,9 +420,9 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 	rows, _ := st.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
 		EventTypes: []string{
-			"wt_finalize_start", "wt_finalize_done", "wt_finalize",
-			"wt_teardown_start", "wt_teardown_done",
-			"wt_lifecycle_teardown_start", "wt_lifecycle_teardown_done",
+			store.EvtWorktreeCreateStart, store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError,
+			store.EvtWorktreeDeleteStart, store.EvtWorktreeDeleteEnd,
+			store.EvtWorktreeReapStart, store.EvtWorktreeReapEnd,
 		},
 		Limit: 1,
 	})
@@ -430,14 +430,14 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 		return "ready", "stable"
 	}
 	switch last := rows[0]; last.EventType {
-	case "wt_finalize_start":
+	case store.EvtWorktreeCreateStart:
 		return "preparing", "up"
-	case "wt_finalize":
+	case store.EvtWorktreeCreateError:
 		if last.Level == "error" {
 			return "error", "failed"
 		}
 		return "ready", "stable"
-	case "wt_teardown_start", "wt_lifecycle_teardown_start":
+	case store.EvtWorktreeDeleteStart, store.EvtWorktreeReapStart:
 		return "teardown", "down"
 	default:
 		return "ready", "stable"

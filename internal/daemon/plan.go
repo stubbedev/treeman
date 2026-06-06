@@ -35,8 +35,8 @@ import (
 // them here. Wait=true runs the plan inline and returns per-task results
 // (for --json / result-oriented callers); Wait=false queues it in a
 // background goroutine and returns immediately, emitting a terminal
-// run_plan_done / run_plan-error event under the plan's run-id so a
-// foreground subscriber knows when it finished.
+// plan:end / plan:error event under the plan's run-id so a foreground
+// subscriber knows when it finished.
 func handleRunPlan(ctx context.Context, st *State, req rpc.Request) rpc.Response {
 	if req.RunPlan == nil {
 		return errResp("run_plan: missing args")
@@ -54,12 +54,13 @@ func handleRunPlan(ctx context.Context, st *State, req rpc.Request) rpc.Response
 
 	safeGo("run_plan", func() {
 		bg := runid.With(st.BgCtx, id)
+		_ = st.Store.WriteEvent(bg, store.LevelInfo, store.EvtPlanStart, "plan beginning", 0, 0, "", 0, nil)
 		results := ExecutePlan(bg, st, args.Groups)
 		if msg := firstFailure(results); msg != "" {
-			_ = st.Store.WriteEvent(bg, store.LevelError, "run_plan", msg, 0, 0, "", 0, nil)
+			_ = st.Store.WriteEvent(bg, store.LevelError, store.EvtPlanError, msg, 0, 0, "", 0, nil)
 			return
 		}
-		_ = st.Store.WriteEvent(bg, store.LevelInfo, "run_plan_done", "plan complete", 0, 0, "", 0, nil)
+		_ = st.Store.WriteEvent(bg, store.LevelInfo, store.EvtPlanEnd, "plan complete", 0, 0, "", 0, nil)
 	})
 	return rpc.Response{Kind: rpc.KindPlanQueued}
 }
@@ -305,7 +306,7 @@ func runTaskSnapshotsPurge(ctx context.Context, st *State, task rpc.Task) (json.
 		return nil, err
 	}
 	dropped, errs := snapshot.PurgeRepo(ctx, &cfg, st.Store, repoID)
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "snapshots_purged",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsPurgeEnd,
 		fmt.Sprintf("dropped %d snapshot(s)", dropped), repoID, 0, "", 0, nil)
 	msgs := make([]string, 0, len(errs))
 	for _, e := range errs {
@@ -344,7 +345,7 @@ func runTaskMainPurgeDBs(ctx context.Context, st *State, task rpc.Task) (json.Ra
 		}
 		purged++
 	}
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "main_dbs_purged",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtMainPurge,
 		fmt.Sprintf("tore down DBs for %d branch(es)", purged), repoID, 0, "", 0, nil)
 	return json.Marshal(map[string]any{"purged": purged})
 }
@@ -465,7 +466,7 @@ func runTaskWorktreeCreate(ctx context.Context, st *State, task rpc.Task) (json.
 		repoRoot, wtPath, env := req.RepoRoot, res.WtPath, req.Env
 		runFinalize := func(bg context.Context) {
 			if ferr := FinalizeWorktree(bg, st, repoRoot, wtPath, env); ferr != nil {
-				_ = st.Store.WriteEvent(bg, store.LevelError, "wt_finalize", ferr.Error(),
+				_ = st.Store.WriteEvent(bg, store.LevelError, store.EvtWorktreeCreateError, ferr.Error(),
 					0, 0, "", 0, map[string]string{"repo_path": repoRoot, "worktree_path": wtPath})
 			}
 		}
@@ -473,7 +474,7 @@ func runTaskWorktreeCreate(ctx context.Context, st *State, task rpc.Task) (json.
 			// No daemon to outlive the call — run the tail before returning.
 			runFinalize(runid.With(ctx, runid.New()))
 		} else {
-			safeGo("wt_finalize", func() { runFinalize(runid.With(st.BgCtx, runid.New())) })
+			safeGo(store.EvtWorktreeCreateError, func() { runFinalize(runid.With(st.BgCtx, runid.New())) })
 		}
 		res.Status = wt.CreatedQueued
 	}

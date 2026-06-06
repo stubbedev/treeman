@@ -168,7 +168,7 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 	if err := prepare.TeardownDatabases(ctx, &cfg, id.Slug.Value, repoID, id.WtID, st); err != nil {
 		slog.Warn("wt delete: teardown databases",
 			"slug", id.Slug.Value, "repo", repoRoot, "wt", wtPath, "err", err)
-		_ = st.WriteEvent(ctx, store.LevelWarn, "wt_teardown_db_error",
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeDeleteError,
 			fmt.Sprintf("teardown databases: %v", err),
 			repoID, id.WtID, "", 0, map[string]any{
 				"slug": id.Slug.Value, "err": err.Error(),

@@ -74,7 +74,7 @@ func EnrollMainWorktree(ctx context.Context, st *State, repoPath string) (int64,
 		// alive would tail HEAD against a path that no longer routes
 		// to a row.
 		st.UnregisterWtWatcher(repoPath)
-		_ = st.Store.WriteEvent(ctx, store.LevelInfo, "main_worktree_disabled",
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtMainDisable,
 			"main_worktree.enabled flipped off; row marked deleted",
 			repoID, existing.ID, "", 0, map[string]string{"repo": repoPath})
 		return 0, nil
@@ -86,7 +86,7 @@ func EnrollMainWorktree(ctx context.Context, st *State, repoPath string) (int64,
 	if err != nil {
 		return 0, fmt.Errorf("ensure main wt: %w", err)
 	}
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "main_worktree_enrolled",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtMainEnroll,
 		"main worktree row upserted",
 		repoID, id, "", 0, map[string]string{
 			"repo":   repoPath,

@@ -92,7 +92,7 @@ func TestNotifierLiveReload(t *testing.T) {
 	// Start disabled: boot registration installs no hook.
 	writeGlobalConfig(t, cfgDir, "notifications:\n  enabled: false\n")
 	RegisterNotifier(st)
-	if err := st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done", "", repoID, wtID, "", 0, nil); err != nil {
+	if err := st.Store.WriteEvent(ctx, store.LevelInfo, "worktree:create:end", "", repoID, wtID, "", 0, nil); err != nil {
 		t.Fatalf("write event: %v", err)
 	}
 	fake.expectSilence(t)
@@ -106,7 +106,7 @@ func TestNotifierLiveReload(t *testing.T) {
 	}
 	cr.ReloadAll(ctx)
 
-	if err := st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done", "", repoID, wtID, "", 0, nil); err != nil {
+	if err := st.Store.WriteEvent(ctx, store.LevelInfo, "worktree:create:end", "", repoID, wtID, "", 0, nil); err != nil {
 		t.Fatalf("write event: %v", err)
 	}
 	n := fake.recv(t)
@@ -117,7 +117,7 @@ func TestNotifierLiveReload(t *testing.T) {
 	// Edit again to disable, reload, and confirm the hook is gone.
 	writeGlobalConfig(t, cfgDir, "notifications:\n  enabled: false\n")
 	cr.ReloadAll(ctx)
-	if err := st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done", "", repoID, wtID, "", 0, nil); err != nil {
+	if err := st.Store.WriteEvent(ctx, store.LevelInfo, "worktree:create:end", "", repoID, wtID, "", 0, nil); err != nil {
 		t.Fatalf("write event: %v", err)
 	}
 	fake.expectSilence(t)
@@ -148,7 +148,7 @@ func TestNotifierBackendNoneMutes(t *testing.T) {
 	}
 
 	RegisterNotifier(st)
-	if err := st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done", "", repoID, wtID, "", 0, nil); err != nil {
+	if err := st.Store.WriteEvent(ctx, store.LevelInfo, "worktree:create:end", "", repoID, wtID, "", 0, nil); err != nil {
 		t.Fatalf("write event: %v", err)
 	}
 	fake.expectSilence(t)
