@@ -76,7 +76,7 @@ databases:
       - { glob: "database/migrations/**/*.php", label: migrations, hash: filename }
       - composer.lock                      # bare string = checksum hash, no label
     test_clones:                           # parallel-test-runner fan-out
-      clones: auto                         # auto = detect from phpunit.xml / pyproject / Jest config
+      clones: auto                         # auto = one clone per CPU when the detected framework parallelizes per-worker
       name_template: "myapp_testing_{slug}_test_{n}"
 
 hooks:
@@ -310,7 +310,7 @@ framework. Copy + paste into the `databases:` array of an existing
     - { glob: "db/migrate/**/*.rb", label: migrations, hash: filename }
     - Gemfile.lock
   test_clones:
-    clones: auto          # reads parallel_workers from config/test.rb / spec_helper
+    clones: auto          # auto = one clone per CPU (framework detected, not worker-config parsed)
     name_template: "myapp_test_{slug}_w{n}"
 ```
 
@@ -328,7 +328,7 @@ framework. Copy + paste into the `databases:` array of an existing
     - Pipfile.lock
     - requirements.txt
   test_clones:
-    clones: auto          # reads pytest -n / pytest-xdist config
+    clones: auto          # auto = one clone per CPU (framework detected, not worker-config parsed)
     name_template: "myapp_test_{slug}_w{n}"
 ```
 
@@ -370,7 +370,7 @@ framework. Copy + paste into the `databases:` array of an existing
     - "crates/*/migrations/**/*.sql"
     - Cargo.lock
   test_clones:
-    clones: auto          # reads cargo nextest config
+    clones: auto          # auto = one clone per CPU (framework detected, not worker-config parsed)
     name_template: "app_test_{slug}_w{n}"
 ```
 

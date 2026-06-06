@@ -31,7 +31,7 @@ logs:
   `logs_hooks` (hook run summaries) + `hook_log_read` (full
   per-hook stdout/stderr) give the agent everything the daemon
   recorded. `worktree_show` is the per-worktree dossier.
-  `doctor` runs the health-check matrix. `snapshot_inspect`
+  `doctor` runs the health-check matrix. `snapshots_inspect`
   resolves a fingerprint to "is this row an orphan or live?" —
   the canonical answer for "cache hit but prepare still failed".
 
@@ -44,7 +44,7 @@ logs:
   reason about live shape vs. what the config says.
 
 - **Snapshot-cache maintenance.** `snapshots_list` shows what's
-  cached for the current repo; `snapshot_drop` evicts a single
+  cached for the current repo; `snapshots_drop` evicts a single
   fingerprint when a template went stale; `snapshots_purge`
   wipes the whole cache.
 
@@ -144,7 +144,7 @@ flow. Invoke from your MCP client to get a tailored briefing.
 | `bootstrap-new-repo` | First-time enrollment: detect → probe engines → init → schema_install → daemon ensure → register → first prepare. |
 | `scaffold-from-framework` | Detect → scaffold `.treeman.yaml` → validate → review. Stops short of running prepare. |
 | `worktree-setup` | Pick branch → daemon ensure → create → wait → verify. |
-| `diagnose-prepare-failure` | Drives `logs_query` → `engine_status` → `snapshot_inspect` → root-cause report. |
+| `diagnose-prepare-failure` | Drives `logs_query` → `engine_status` → `snapshots_inspect` → root-cause report. |
 | `cache-cleanup` | Hunt orphan snapshots (template gone, SQLite row remains) and drop only those. |
 | `migration-trial` | Throw-away worktree → run migration → schema diff → tear down. |
 
