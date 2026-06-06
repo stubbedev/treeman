@@ -157,3 +157,53 @@ func TestBringInFilesCopiesDirectoryRecursively(t *testing.T) {
 		t.Errorf("missing seeds/fixtures/b.sql in copy: %q", got)
 	}
 }
+
+// TestBringInFilesReportCountsAndSkips guards the per-entry observability
+// report: files + bytes are tallied on first copy, and a second
+// idempotent pass reports the entry as skipped with zero files copied.
+func TestBringInFilesReportCountsAndSkips(t *testing.T) {
+	main := t.TempDir()
+	wtDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(main, "seeds", "fixtures"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(main, "seeds", "a.sql"), []byte("aaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(main, "seeds", "fixtures", "b.sql"), []byte("bb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := BringInFilesReport(main, wtDir, []string{"seeds"}, "copy", NoopSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("want 1 result, got %d", len(res))
+	}
+	if res[0].Files != 2 || res[0].Bytes != 5 {
+		t.Errorf("first pass: files/bytes = %d/%d, want 2/5", res[0].Files, res[0].Bytes)
+	}
+	if res[0].Brought != 1 || res[0].Skipped != 0 {
+		t.Errorf("first pass: brought/skipped = %d/%d, want 1/0", res[0].Brought, res[0].Skipped)
+	}
+
+	// Idempotent second pass: dst exists → skipped, nothing copied.
+	res2, err := BringInFilesReport(main, wtDir, []string{"seeds"}, "copy", NoopSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2[0].Brought != 0 || res2[0].Skipped != 1 || res2[0].Files != 0 {
+		t.Errorf("second pass: brought/skipped/files = %d/%d/%d, want 0/1/0",
+			res2[0].Brought, res2[0].Skipped, res2[0].Files)
+	}
+
+	// Missing non-glob source is tallied, not fatal.
+	res3, err := BringInFilesReport(main, wtDir, []string{"nope"}, "copy", NoopSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res3[0].Missing != 1 || res3[0].Brought != 0 {
+		t.Errorf("missing source: missing/brought = %d/%d, want 1/0", res3[0].Missing, res3[0].Brought)
+	}
+}
