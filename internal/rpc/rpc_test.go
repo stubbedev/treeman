@@ -77,6 +77,29 @@ func TestRequestRoundtripRunPlan(t *testing.T) {
 // methods — that validation moved to the daemon's Dispatch switch (which
 // returns an "unknown method" error response). Decode just sets Method
 // and leaves every args pointer nil.
+// TestPlanConstructors checks rpc.Plan/One build the expected request and
+// that it survives the nested-envelope round-trip.
+func TestPlanConstructors(t *testing.T) {
+	req := Plan(true, One(Task{Type: TaskPrepare, WorktreePath: "/wt"}))
+	if req.Method != MethodRunPlan || req.RunPlan == nil {
+		t.Fatalf("method/args: %s %+v", req.Method, req.RunPlan)
+	}
+	if !req.RunPlan.Wait || len(req.RunPlan.Groups) != 1 || len(req.RunPlan.Groups[0]) != 1 {
+		t.Fatalf("shape: %+v", req.RunPlan)
+	}
+	b, err := json.Marshal(&req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Request
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.RunPlan == nil || got.RunPlan.Groups[0][0].Type != TaskPrepare {
+		t.Fatalf("round-trip lost the task: %s", b)
+	}
+}
+
 func TestUnknownMethodDecodes(t *testing.T) {
 	var got Request
 	if err := json.Unmarshal([]byte(`{"method":"nope"}`), &got); err != nil {
