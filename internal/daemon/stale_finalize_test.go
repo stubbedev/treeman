@@ -23,7 +23,7 @@ func TestSweepStalePreparingEmitsErrorEvent(t *testing.T) {
 	}
 	// A finalize_start with no matching done — the "stuck in preparing"
 	// state described by issue #9.
-	if err := st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_start",
+	if err := st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateStart,
 		"prepare beginning", repoID, wtID, "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestSweepStalePreparingEmitsErrorEvent(t *testing.T) {
 
 	evs, err := st.Store.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{"wt_finalize"},
+		EventTypes: []string{store.EvtWorktreeCreateError},
 		Limit:      1,
 	})
 	if err != nil {
@@ -71,7 +71,7 @@ func TestSweepExpiredFinalizesCancelsAndEmitsError(t *testing.T) {
 	}
 	evs, _ := st.Store.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{"wt_finalize"},
+		EventTypes: []string{store.EvtWorktreeCreateError},
 		Limit:      1,
 	})
 	if len(evs) != 1 {
@@ -105,7 +105,7 @@ func TestSweepExpiredFinalizesSkipsFreshFinalize(t *testing.T) {
 	}
 	evs, _ := st.Store.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{"wt_finalize"},
+		EventTypes: []string{store.EvtWorktreeCreateError},
 		Limit:      5,
 	})
 	if len(evs) != 0 {
@@ -120,16 +120,16 @@ func TestSweepStalePreparingSkipsCompleted(t *testing.T) {
 
 	repoID, _ := st.Store.EnsureRepo(ctx, "/repo", "repo")
 	wtID, _ := st.Store.EnsureWorktree(ctx, repoID, "/repo/wt", "slug", "feature")
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_start",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateStart,
 		"prepare beginning", repoID, wtID, "", 0, nil)
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateEnd,
 		"prepare complete", repoID, wtID, "", 0, nil)
 
 	SweepStalePreparing(ctx, st)
 
 	evs, _ := st.Store.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{"wt_finalize"},
+		EventTypes: []string{store.EvtWorktreeCreateError},
 		Limit:      5,
 	})
 	if len(evs) != 0 {

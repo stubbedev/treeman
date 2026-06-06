@@ -57,7 +57,7 @@ func RecoverStaleWorktree(
 	for _, d := range cfg.Databases {
 		if d.BranchScoped {
 			if err := recoverBranchScoped(ctx, cfg, d, worktreePath, repoID, worktreeID, st); err != nil {
-				_ = st.WriteEvent(ctx, store.LevelWarn, "wt_recovery_error",
+				_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
 					fmt.Sprintf("engine=%s branch_scoped: %v", d.Engine, err),
 					repoID, worktreeID, "", 0, map[string]string{
 						"engine": d.Engine,
@@ -68,7 +68,7 @@ func RecoverStaleWorktree(
 			continue
 		}
 		if err := recoverTestClone(ctx, cfg, d, tplCtx, repoID, worktreeID, st); err != nil {
-			_ = st.WriteEvent(ctx, store.LevelWarn, "wt_recovery_error",
+			_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
 				fmt.Sprintf("engine=%s: %v", d.Engine, err),
 				repoID, worktreeID, "", 0, map[string]string{
 					"engine": d.Engine,
@@ -306,7 +306,7 @@ func recoverBranchScoped(
 		return err
 	}
 	_ = st.ClearActiveBranch(ctx, worktreeID, active)
-	_ = st.WriteEvent(ctx, store.LevelInfo, "wt_recovery_drop",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeRecoverDrop,
 		fmt.Sprintf("%s: dropped active %s (branch_scoped; durable kept)", d.Engine, active),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine": d.Engine,
@@ -320,7 +320,7 @@ func emitRecoveryDrop(ctx context.Context, st *store.Store, repoID, worktreeID i
 	if st == nil {
 		return
 	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "wt_recovery_drop",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeRecoverDrop,
 		fmt.Sprintf("%s: dropped %s* (%d)", eng, target, count),
 		repoID, worktreeID, "", 0, map[string]any{
 			"engine": eng,

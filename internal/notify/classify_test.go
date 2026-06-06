@@ -3,6 +3,8 @@ package notify
 import (
 	"context"
 	"testing"
+
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 func TestBucketMapsLifecycleEvents(t *testing.T) {
@@ -11,19 +13,19 @@ func TestBucketMapsLifecycleEvents(t *testing.T) {
 		level     string
 		want      string
 	}{
-		{"wt_finalize_start", "info", BucketUp},
-		{"wt_finalize_done", "info", BucketStable},
-		{"wt_finalize", "error", BucketFailed},
+		{store.EvtWorktreeCreateStart, "info", BucketUp},
+		{store.EvtWorktreeCreateEnd, "info", BucketStable},
+		{store.EvtWorktreeCreateError, "error", BucketFailed},
 		// wt_finalize at a non-error level is not a failure transition.
-		{"wt_finalize", "info", ""},
-		{"wt_teardown_start", "info", BucketDown},
-		{"wt_lifecycle_teardown_start", "info", BucketDown},
+		{store.EvtWorktreeCreateError, "info", ""},
+		{store.EvtWorktreeDeleteStart, "info", BucketDown},
+		{store.EvtWorktreeReapStart, "info", BucketDown},
 		// Terminal teardown completion is intentionally unmapped.
-		{"wt_teardown_done", "info", ""},
-		{"wt_lifecycle_teardown_done", "info", ""},
+		{store.EvtWorktreeDeleteEnd, "info", ""},
+		{store.EvtWorktreeReapEnd, "info", ""},
 		// Unrelated events never notify.
 		{"auto_fetch_done", "info", ""},
-		{"config_reloaded", "info", ""},
+		{store.EvtConfigReload, "info", ""},
 		{"", "", ""},
 	}
 	for _, c := range cases {

@@ -206,7 +206,7 @@
             "$ref": "#/$defs/Input"
           },
           "type": "array",
-          "description": "Inputs declare every file that determines this database's\ntemplate state. Each entry:\n  1. Contributes a hash to the snapshot fingerprint (so any\n     change auto-invalidates the cached template).\n  2. Subscribes fsnotify so changes trigger a re-prep.\n  3. Carries an optional `label:` that `hooks.on-file-change`\n     actions can match against.\n\nGlob patterns are repo-root-relative. Hash mode is per-entry:\n`filename` for append-only files (Laravel migrations, …),\n`checksum` for files edited in place (seeders, lockfiles).\nDefault is checksum.\n\nCache-hit vs cold-build is derived purely from the input\nhashes — there's no separate `on: rebuild` knob. If you want\nto force a rebuild, change an input."
+          "description": "Inputs declare every file that determines this database's\ntemplate state. Each entry:\n  1. Contributes a hash to the snapshot fingerprint (so any\n     change auto-invalidates the cached template).\n  2. Subscribes fsnotify so changes trigger a re-prep.\n  3. Carries an optional `label:` that `hooks.file-change`\n     actions can match against.\n\nGlob patterns are repo-root-relative. Hash mode is per-entry:\n`filename` for append-only files (Laravel migrations, …),\n`checksum` for files edited in place (seeders, lockfiles).\nDefault is checksum.\n\nCache-hit vs cold-build is derived purely from the input\nhashes — there's no separate `on: rebuild` knob. If you want\nto force a rebuild, change an input."
         },
         "test_clones": {
           "$ref": "#/$defs/TestClonesSpec",
@@ -424,42 +424,42 @@
     },
     "HooksConfig": {
       "properties": {
-        "on-create-before-engines": {
+        "create-before-engines": {
           "items": {
             "$ref": "#/$defs/Action"
           },
           "type": "array",
           "description": "OnCreateBeforeEngines — actions fire after worktree create +\npatches + bring-in, before engine prepare."
         },
-        "on-create-after-engines": {
+        "create-after-engines": {
           "items": {
             "$ref": "#/$defs/Action"
           },
           "type": "array",
           "description": "OnCreateAfterEngines — actions fire after engine prepare completes."
         },
-        "on-delete-before-engines": {
+        "delete-before-engines": {
           "items": {
             "$ref": "#/$defs/Action"
           },
           "type": "array",
           "description": "OnDeleteBeforeEngines — actions fire before DB drop on delete."
         },
-        "on-delete-after-engines": {
+        "delete-after-engines": {
           "items": {
             "$ref": "#/$defs/Action"
           },
           "type": "array",
           "description": "OnDeleteAfterEngines — actions fire after DB drop + worktree\nremove on delete."
         },
-        "on-checkout": {
+        "checkout": {
           "items": {
             "$ref": "#/$defs/Action"
           },
           "type": "array",
           "description": "OnCheckout — actions fire when the HEAD watcher detects a\nbranch switch inside an existing worktree."
         },
-        "on-file-change": {
+        "file-change": {
           "items": {
             "$ref": "#/$defs/FilteredAction"
           },
@@ -469,7 +469,7 @@
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "HooksConfig — `hooks:` block. A flat set of trigger-keyed action\nlists. Each key's value is a list of Actions that fire when that\ntrigger happens. Actions in the same list run in parallel; the\ntrigger key itself encodes BOTH the lifecycle phase AND the timing\npoint, so there's no separate `when:` field anywhere.\n\nTriggers (all optional — omit any you don't need):\n\n  - on-create-before-engines — during `wt create`, after patches +\n    bring-in (copies/links), BEFORE engine prepare. Standard\n    home of dependency installs (composer/yarn/pip) so migrate\n    can find vendor/.\n  - on-create-after-engines — during `wt create`, after engine\n    prepare. Use when actions need a populated database\n    (cache warming, seed verification).\n  - on-delete-before-engines — during `wt delete`, BEFORE DB\n    drop. Graceful shutdown: drain queues, docker compose stop.\n  - on-delete-after-engines — during `wt delete`, AFTER DB drop +\n    git worktree remove. External notifications (Slack, CDN\n    purge) that should announce only once the data is gone.\n  - on-checkout — fires when the HEAD watcher sees a branch\n    switch inside an existing worktree. Re-runs in addition to\n    the regular finalize-on-HEAD-change behaviour.\n  - on-file-change — fires when any `databases[].inputs[]` glob\n    matches a filesystem event. Each action can optionally\n    `match: \u003clabel\u003e` to filter by the input entry's label.\n\nDaemon execution is always non-blocking from the CLI's\nperspective — each list of actions dispatches in parallel."
+      "description": "HooksConfig — `hooks:` block. A flat set of trigger-keyed action\nlists. Each key's value is a list of Actions that fire when that\ntrigger happens. Actions in the same list run in parallel; the\ntrigger key itself encodes BOTH the lifecycle phase AND the timing\npoint, so there's no separate `when:` field anywhere.\n\nTriggers (all optional — omit any you don't need):\n\n  - create-before-engines — during `wt create`, after patches +\n    bring-in (copies/links), BEFORE engine prepare. Standard\n    home of dependency installs (composer/yarn/pip) so migrate\n    can find vendor/.\n  - create-after-engines — during `wt create`, after engine\n    prepare. Use when actions need a populated database\n    (cache warming, seed verification).\n  - delete-before-engines — during `wt delete`, BEFORE DB\n    drop. Graceful shutdown: drain queues, docker compose stop.\n  - delete-after-engines — during `wt delete`, AFTER DB drop +\n    git worktree remove. External notifications (Slack, CDN\n    purge) that should announce only once the data is gone.\n  - checkout — fires when the HEAD watcher sees a branch\n    switch inside an existing worktree. Re-runs in addition to\n    the regular finalize-on-HEAD-change behaviour.\n  - file-change — fires when any `databases[].inputs[]` glob\n    matches a filesystem event. Each action can optionally\n    `match: \u003clabel\u003e` to filter by the input entry's label.\n\nDaemon execution is always non-blocking from the CLI's\nperspective — each list of actions dispatches in parallel."
     },
     "Input": {
       "oneOf": [
@@ -485,7 +485,7 @@
             },
             "label": {
               "type": "string",
-              "description": "Optional label for `hooks.on-file-change` matchers."
+              "description": "Optional label for `hooks.file-change` matchers."
             }
           },
           "additionalProperties": false,

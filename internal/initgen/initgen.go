@@ -210,7 +210,7 @@ func RenderTemplate(cwd string) string {
 		mapSet(root, "databases", seqNode(db))
 	}
 
-	// hooks: on-create-before-engines:
+	// hooks: create-before-engines:
 	actions := seqNode()
 	if hasComposer {
 		actions.Content = append(actions.Content, hookGroup("composer install --no-interaction --prefer-dist"))
@@ -228,7 +228,7 @@ func RenderTemplate(cwd string) string {
 		actions.Style = yaml.FlowStyle
 		actions.HeadComment = "add install commands here — each action is one parallel group;\nuse run: [step1, step2] for sequenced commands inside one group."
 	}
-	hooks := mapNode("on-create-before-engines", actions)
+	hooks := mapNode("create-before-engines", actions)
 	mapSet(root, "hooks", hooks)
 	if len(detected) == 0 {
 		// Attach the "no databases yet" hint as a HeadComment on the

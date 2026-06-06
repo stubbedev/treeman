@@ -42,6 +42,7 @@ import (
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/runid"
+	"github.com/stubbedev/treeman/internal/safego"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
@@ -74,7 +75,7 @@ func emitRunnerError(ctx context.Context, st *store.Store, repoID, worktreeID in
 	if st == nil {
 		return
 	}
-	_ = st.WriteEvent(ctx, store.LevelError, "prepare_error",
+	_ = st.WriteEvent(ctx, store.LevelError, store.EvtPrepareError,
 		fmt.Sprintf("%s/%s phase=%s exit=%d", engine, sourceDB, label, out.ExitCode),
 		repoID, worktreeID, label, 0, map[string]string{
 			"engine":      engine,
@@ -99,7 +100,7 @@ func emitPhaseDone(ctx context.Context, st *store.Store, repoID, worktreeID int6
 		return
 	}
 	durMs := time.Since(stepStart).Milliseconds()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_phase",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPreparePhase,
 		fmt.Sprintf("%s/%s phase=%s duration=%dms", engine, sourceDB, phase, durMs),
 		repoID, worktreeID, phase, durMs, map[string]string{
 			"engine":      engine,
@@ -161,7 +162,7 @@ func emitCloneStrategy(ctx context.Context, st *store.Store, repoID, worktreeID 
 	if st == nil || strategy == "" {
 		return
 	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_clone_strategy",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsStrategy,
 		fmt.Sprintf("engine=%s strategy=%s template=%s", engine, strategy, templateName),
 		repoID, worktreeID, "snapshot-create", 0, map[string]string{
 			"engine":    engine,
@@ -183,7 +184,7 @@ func emitCacheMiss(ctx context.Context, st *store.Store, repoID, worktreeID int6
 	if st == nil {
 		return
 	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_miss",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsCacheMiss,
 		fmt.Sprintf("engine=%s source=%s reason=%s fingerprint=%s",
 			engine, sourceDB, reason, fingerprint),
 		repoID, worktreeID, "", 0, map[string]string{
@@ -208,7 +209,7 @@ func emitDumpLoadPhase(ctx context.Context, st *store.Store, repoID, worktreeID 
 	}
 	durMs := time.Since(stepStart).Milliseconds()
 	base := filepath.Base(path)
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_phase",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPreparePhase,
 		fmt.Sprintf("%s/%s phase=dump-load dump=%s (%d/%d) strategy=%s duration=%dms",
 			engine, sourceDB, base, index+1, total, strategy, durMs),
 		repoID, worktreeID, "dump-load", durMs, map[string]string{
@@ -238,7 +239,7 @@ type Outcome struct {
 	// Skipped is true when the engine's connection block is absent
 	// from the resolved config — declaring `databases: [{engine:
 	// mysql, ...}]` without `connections.mysql` is now a no-op
-	// (logged via `prepare_skipped`) instead of a wt_finalize error.
+	// (logged via `prepare:skip`) instead of a worktree:create:error error.
 	// Lets repos like treeman's own checkout declare a sample
 	// `.treeman.yaml` for schema-validation purposes without spawning
 	// stale errors on every finalize.
@@ -252,13 +253,13 @@ type Outcome struct {
 	IncrementalBase string
 }
 
-// emitPrepareSkipped writes the `prepare_skipped` info event used by
+// emitPrepareSkipped writes the `prepare:skip` info event used by
 // the unconfigured-engine short-circuit and returns the matching
 // Outcome. Single point so the event payload stays consistent across
 // every engine.
 func emitPrepareSkipped(ctx context.Context, st *store.Store, repoID, worktreeID int64, eng, sourceDB, reason string) Outcome {
 	if st != nil {
-		_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_skipped",
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareSkip,
 			fmt.Sprintf("engine=%s reason=%s", eng, reason),
 			repoID, worktreeID, "", 0, map[string]string{
 				"engine":    eng,
@@ -354,9 +355,9 @@ func autoTuneOuter(fam engine.Family, maxConns int) int {
 // max_connections (or who run a beefier PG that doesn't contend on
 // pg_database) can opt into higher concurrency without recompiling.
 //
-// Events emitted: `fanout_start` (info) at entry, per-clone
-// `clone_restore_done` (debug) / `clone_restore_fail` (warn) inside
-// each restore, and `fanout_done` (info / error on failure) at exit
+// Events emitted: `clones:start` (info) at entry, per-clone
+// `clones:restore:end` (debug) / `clones:restore:error` (warn) inside
+// each restore, and `clones:end` (info / error on failure) at exit
 // with the slowest-clone duration so the user can spot stragglers
 // without trawling the per-clone debug stream.
 //
@@ -381,7 +382,7 @@ func fanOutClones(
 
 	startedMs := time.Now().UnixMilli()
 	if st != nil {
-		_ = st.WriteEvent(ctx, store.LevelInfo, "fanout_start",
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtClonesStart,
 			fmt.Sprintf("engine=%s template=%s clones=%d limit=%d", engine, template, len(clones), limit),
 			repoID, worktreeID, "", 0, map[string]any{
 				"engine":     engine,
@@ -411,7 +412,7 @@ func fanOutClones(
 			if err != nil {
 				failCount.Add(1)
 				if st != nil {
-					_ = st.WriteEvent(gctx, store.LevelWarn, "clone_restore_fail",
+					_ = st.WriteEvent(gctx, store.LevelWarn, store.EvtClonesRestoreError,
 						fmt.Sprintf("engine=%s db=%s err=%v", engine, c, err),
 						repoID, worktreeID, "", dur, map[string]any{
 							"engine":   engine,
@@ -424,7 +425,7 @@ func fanOutClones(
 			}
 			okCount.Add(1)
 			if st != nil {
-				_ = st.WriteEvent(gctx, store.LevelDebug, "clone_restore_done",
+				_ = st.WriteEvent(gctx, store.LevelDebug, store.EvtClonesRestoreEnd,
 					fmt.Sprintf("engine=%s db=%s", engine, c),
 					repoID, worktreeID, "", dur, map[string]any{
 						"engine":   engine,
@@ -454,7 +455,7 @@ func fanOutClones(
 		slowestMu.Lock()
 		slowDB := slowestDB
 		slowestMu.Unlock()
-		_ = st.WriteEvent(ctx, level, "fanout_done",
+		_ = st.WriteEvent(ctx, level, store.EvtClonesEnd,
 			fmt.Sprintf("engine=%s ok=%d fail=%d slowest=%dms",
 				engine, okCount.Load(), failCount.Load(), slowestMs.Load()),
 			repoID, worktreeID, "", totalMs, map[string]any{
@@ -473,7 +474,7 @@ func fanOutClones(
 // override wins; otherwise auto-tune from the pool's max connections;
 // otherwise a per-engine default (falling back to GOMAXPROCS). The
 // result is clamped to [2, numClones]. autoTuned reports whether the
-// max-connections heuristic was used (surfaced in the fanout_start
+// max-connections heuristic was used (surfaced in the clones:start
 // event payload).
 func fanOutLimit(override uint32, maxConns, numClones int, eng string) (limit int, autoTuned bool) {
 	fam, _ := engine.Canonical(eng)
@@ -534,7 +535,7 @@ func cacheHitRestoreAndFanout(
 	}
 	if err := fanOutClones(ctx, st, repoID, worktreeID, restore, template, targets, d.Engine, d.Fanout, maxConns); err != nil {
 		if st != nil {
-			_ = st.WriteEvent(ctx, store.LevelWarn, "snapshot_cache_fallback",
+			_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtSnapshotsCacheFallback,
 				fmt.Sprintf("restore/fanout failed, falling back to cold build: %v", err),
 				repoID, worktreeID, "", 0, map[string]string{
 					"engine":      d.Engine,
@@ -622,7 +623,7 @@ func RunFiltered(
 			if !ok {
 				// Engine not recognised. Surface via event so the
 				// user notices, but don't fail the whole prepare run.
-				_ = st.WriteEvent(gctx, store.LevelWarn, "prepare_unsupported_engine",
+				_ = st.WriteEvent(gctx, store.LevelWarn, store.EvtPrepareUnsupported,
 					fmt.Sprintf("engine=%s not recognised", d.Engine),
 					repoID, worktreeID, "", 0, nil)
 				return nil
@@ -781,7 +782,7 @@ func prepareMySQL(
 		return out, err
 	}
 
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareStart,
 		fmt.Sprintf("engine=mysql source=%s template=%s", sourceDB, templateName),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      "mysql",
@@ -843,7 +844,7 @@ func prepareMySQL(
 	}
 
 	ms := time.Since(started).Milliseconds()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
 		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
 			"source_db":   sourceDB,
@@ -909,7 +910,7 @@ func cacheHitGeneric(
 		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 		return Outcome{}, false, nil
 	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_cache_hit",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsCacheHit,
 		"template="+rec.TemplateName,
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      d.Engine,
@@ -930,13 +931,13 @@ func cacheHitGeneric(
 	//
 	// If the template disappears mid-flight (race with EvictExcess
 	// between the existence probe and the restore/fanout), fall through
-	// to cold build instead of failing wt_finalize.
+	// to cold build instead of failing worktree:create:error.
 	if err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, restore,
 		d, rec.TemplateName, sourceDB, clones, maxConns, key.Fingerprint()); err != nil {
 		return Outcome{}, false, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
 	}
 	ms := time.Since(started).Milliseconds()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
 		fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      d.Engine,
@@ -1154,7 +1155,7 @@ func mysqlMergedColdFanout(
 
 	limit, autoTuned := fanOutLimit(d.Fanout, maxConns, len(targets), d.Engine)
 	started := time.Now()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "fanout_start",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtClonesStart,
 		fmt.Sprintf("engine=%s source=%s targets=%d (template+%d clones) limit=%d", d.Engine, sourceDB, len(targets), len(clones), limit),
 		repoID, worktreeID, "", 0, map[string]any{
 			"engine":     d.Engine,
@@ -1183,7 +1184,7 @@ func mysqlMergedColdFanout(
 			dur := time.Since(cloneStart).Milliseconds()
 			if err != nil {
 				failCount.Add(1)
-				_ = st.WriteEvent(gctx, store.LevelWarn, "clone_restore_fail",
+				_ = st.WriteEvent(gctx, store.LevelWarn, store.EvtClonesRestoreError,
 					fmt.Sprintf("engine=%s source=%s db=%s err=%v", d.Engine, sourceDB, tgt, err),
 					repoID, worktreeID, "", dur, map[string]any{
 						"engine": d.Engine,
@@ -1194,7 +1195,7 @@ func mysqlMergedColdFanout(
 				return fmt.Errorf("snapshot create %s → %s: %w", sourceDB, tgt, err)
 			}
 			okCount.Add(1)
-			_ = st.WriteEvent(gctx, store.LevelDebug, "clone_restore_done",
+			_ = st.WriteEvent(gctx, store.LevelDebug, store.EvtClonesRestoreEnd,
 				fmt.Sprintf("engine=%s db=%s", d.Engine, tgt),
 				repoID, worktreeID, "", dur, map[string]any{
 					"engine": d.Engine,
@@ -1222,7 +1223,7 @@ func mysqlMergedColdFanout(
 	slowestMu.Lock()
 	slowDB := slowestDB
 	slowestMu.Unlock()
-	_ = st.WriteEvent(ctx, level, "fanout_done",
+	_ = st.WriteEvent(ctx, level, store.EvtClonesEnd,
 		fmt.Sprintf("engine=%s ok=%d fail=%d slowest=%dms (merged)", d.Engine, okCount.Load(), failCount.Load(), slowestMs.Load()),
 		repoID, worktreeID, "", totalMs, map[string]any{
 			"engine":     d.Engine,
@@ -1254,11 +1255,11 @@ func mysqlMergedColdFanout(
 // leak the goroutine forever, and so the eviction outlives the prepare
 // request's own context. Errors are logged inside EvictExcess.
 func spawnEvict(cfg *config.Config, st *store.Store, repoID int64) {
-	go func() {
+	safego.Go("snapshot:evict", "", func() {
 		evictCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		snapshot.EvictExcess(evictCtx, cfg, st, repoID)
-	}()
+	})
 }
 
 // incrementalOps bundles the engine-specific primitives the generic
@@ -1347,7 +1348,7 @@ func tryIncrementalBuild(
 	}
 
 	delta := vectorDelta(anc.Inputs, inputs)
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_incremental_start",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareIncrementalStart,
 		fmt.Sprintf("engine=%s ancestor=%s files_added=%d", d.Engine, anc.TemplateName, delta),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":               d.Engine,
@@ -1363,7 +1364,7 @@ func tryIncrementalBuild(
 	// target first, so any stale source contents are cleared.
 	restoreStart := time.Now()
 	if err := ops.snapshotRestore(ctx, anc.TemplateName, source); err != nil {
-		_ = st.WriteEvent(ctx, store.LevelWarn, "prepare_incremental_fallback",
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtPrepareIncrementalFallback,
 			fmt.Sprintf("ancestor restore failed: %v", err),
 			repoID, worktreeID, "", 0, map[string]string{
 				"engine":               d.Engine,
@@ -1411,7 +1412,7 @@ func tryIncrementalBuild(
 	}
 
 	ms := time.Since(started).Milliseconds()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
 		fmt.Sprintf("incremental clones=%d duration=%dms ancestor=%s files_added=%d",
 			len(clones), ms, anc.TemplateName, delta),
 		repoID, worktreeID, "", 0, map[string]string{
@@ -1515,7 +1516,7 @@ func preparePostgres(
 	unpinTemplate := snapshot.Pin(key.Fingerprint())
 	defer unpinTemplate()
 
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareStart,
 		fmt.Sprintf("engine=postgres source=%s template=%s", sourceDB, templateName),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      "postgres",
@@ -1590,7 +1591,7 @@ func preparePostgres(
 		return Outcome{}, err
 	}
 	ms := time.Since(started).Milliseconds()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
 		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      "postgres",
@@ -1750,7 +1751,7 @@ func prepareMongo(
 	unpinTemplate := snapshot.Pin(key.Fingerprint())
 	defer unpinTemplate()
 
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareStart,
 		fmt.Sprintf("engine=mongodb source=%s template=%s", sourceDB, templateName),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      "mongodb",
@@ -1812,7 +1813,7 @@ func prepareMongo(
 	}
 
 	ms := time.Since(started).Milliseconds()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
 		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      "mongodb",
@@ -1999,7 +2000,7 @@ func prepareRedisPrefix(
 	unpinTemplate := snapshot.Pin(key.Fingerprint())
 	defer unpinTemplate()
 
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareStart,
 		fmt.Sprintf("engine=redis source=%s template=%s", sourcePrefix, templatePrefix),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      "redis",
@@ -2077,7 +2078,7 @@ func prepareRedisPrefix(
 	}
 
 	ms := time.Since(started).Milliseconds()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
 		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      "redis",
@@ -2271,7 +2272,7 @@ func prepareES(
 	unpinTemplate := snapshot.Pin(key.Fingerprint())
 	defer unpinTemplate()
 
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_start",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareStart,
 		fmt.Sprintf("engine=elasticsearch source=%s template=%s", sourcePrefix, templatePrefix),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      "elasticsearch",
@@ -2344,7 +2345,7 @@ func prepareES(
 	}
 
 	ms := time.Since(started).Milliseconds()
-	_ = st.WriteEvent(ctx, store.LevelInfo, "prepare_done",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
 		fmt.Sprintf("cold_build clones=%d duration=%dms", len(clones), ms),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":      "elasticsearch",
@@ -2755,7 +2756,7 @@ func TeardownDatabases(
 	for _, d := range cfg.Databases {
 		g.Go(func() error {
 			if err := teardownOne(gctx, cfg, d, tplCtx, sl, repoID, worktreeID, st); err != nil {
-				_ = st.WriteEvent(gctx, store.LevelWarn, "db_teardown_error",
+				_ = st.WriteEvent(gctx, store.LevelWarn, store.EvtDBTeardownError,
 					err.Error(), repoID, worktreeID, "", 0, nil)
 			}
 			return nil
@@ -2785,7 +2786,7 @@ func teardownOne(
 		// doesn't turn worktree teardown into a silent no-op (same
 		// shape as the cold-build sibling-wipe that originally hid in
 		// the event log).
-		_ = st.WriteEvent(ctx, store.LevelWarn, "db_teardown_skipped",
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtDBTeardownSkip,
 			fmt.Sprintf("teardown skipped: unknown engine %q (allowed: %s)", d.Engine, engine.KnownList()),
 			repoID, worktreeID, "", 0, map[string]any{
 				"engine": d.Engine, "slug": sl,
@@ -2834,7 +2835,7 @@ func teardownGeneric(
 	if err != nil {
 		return err
 	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtDBDrop,
 		fmt.Sprintf("%s: %s (%d)", engineLabel, target, count),
 		repoID, worktreeID, "", 0, map[string]any{
 			"engine": engineLabel, "slug": sl, "target": target, "count": count,

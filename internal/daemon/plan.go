@@ -35,8 +35,8 @@ import (
 // them here. Wait=true runs the plan inline and returns per-task results
 // (for --json / result-oriented callers); Wait=false queues it in a
 // background goroutine and returns immediately, emitting a terminal
-// run_plan_done / run_plan-error event under the plan's run-id so a
-// foreground subscriber knows when it finished.
+// plan:end / plan:error event under the plan's run-id so a foreground
+// subscriber knows when it finished.
 func handleRunPlan(ctx context.Context, st *State, req rpc.Request) rpc.Response {
 	if req.RunPlan == nil {
 		return errResp("run_plan: missing args")
@@ -52,14 +52,15 @@ func handleRunPlan(ctx context.Context, st *State, req rpc.Request) rpc.Response
 		return rpc.Response{Kind: rpc.KindPlanResult, TaskResults: results}
 	}
 
-	safeGo("run_plan", func() {
+	safeGo(lblPlanRun, "", func() {
 		bg := runid.With(st.BgCtx, id)
+		_ = st.Store.WriteEvent(bg, store.LevelInfo, store.EvtPlanStart, "plan beginning", 0, 0, "", 0, nil)
 		results := ExecutePlan(bg, st, args.Groups)
 		if msg := firstFailure(results); msg != "" {
-			_ = st.Store.WriteEvent(bg, store.LevelError, "run_plan", msg, 0, 0, "", 0, nil)
+			_ = st.Store.WriteEvent(bg, store.LevelError, store.EvtPlanError, msg, 0, 0, "", 0, nil)
 			return
 		}
-		_ = st.Store.WriteEvent(bg, store.LevelInfo, "run_plan_done", "plan complete", 0, 0, "", 0, nil)
+		_ = st.Store.WriteEvent(bg, store.LevelInfo, store.EvtPlanEnd, "plan complete", 0, 0, "", 0, nil)
 	})
 	return rpc.Response{Kind: rpc.KindPlanQueued}
 }
@@ -95,7 +96,8 @@ func ExecutePlan(ctx context.Context, st *State, groups [][]rpc.Task) []rpc.Task
 	var wg sync.WaitGroup
 	for i := range groups {
 		wg.Add(1)
-		go func(i int, lane []rpc.Task) {
+		lane := groups[i]
+		safeGo(lblPlanLane, "", func() {
 			defer wg.Done()
 			for _, task := range lane {
 				payload, err := runOneTask(ctx, st, task)
@@ -108,7 +110,7 @@ func ExecutePlan(ctx context.Context, st *State, groups [][]rpc.Task) []rpc.Task
 					break // stop this lane; later tasks depend on this one
 				}
 			}
-		}(i, groups[i])
+		})
 	}
 	wg.Wait()
 	var results []rpc.TaskResult
@@ -137,19 +139,19 @@ type taskRunner func(context.Context, *State, rpc.Task) (json.RawMessage, error)
 // extension point of the plan model. Adding a task = add a Task* const
 // (rpc), a runner, and one entry here.
 var taskRunners = map[string]taskRunner{
-	rpc.TaskPrepare:          runTaskPrepare,
-	rpc.TaskDBReset:          runTaskDBReset,
-	rpc.TaskHookRun:          runTaskHookRun,
-	rpc.TaskSnapshotsPurge:   runTaskSnapshotsPurge,
-	rpc.TaskMainPurgeDBs:     runTaskMainPurgeDBs,
-	rpc.TaskWtRegister:       runTaskWtRegister,
-	rpc.TaskWtUnregister:     runTaskWtUnregister,
-	rpc.TaskLogsPurge:        runTaskLogsPurge,
-	rpc.TaskRegistryRepair:   runTaskRegistryRepair,
-	rpc.TaskConfigWrite:      runTaskConfigWrite,
-	rpc.TaskWorktreeCreate:   runTaskWorktreeCreate,
-	rpc.TaskWorktreeFinalize: runTaskWorktreeFinalize,
-	rpc.TaskWorktreeTeardown: runTaskWorktreeTeardown,
+	rpc.TaskPrepare:            runTaskPrepare,
+	rpc.TaskDBReset:            runTaskDBReset,
+	rpc.TaskHookRun:            runTaskHookRun,
+	rpc.TaskSnapshotsPurge:     runTaskSnapshotsPurge,
+	rpc.TaskMainPurgeDBs:       runTaskMainPurgeDBs,
+	rpc.TaskWorktreeRegister:   runTaskWorktreeRegister,
+	rpc.TaskWorktreeUnregister: runTaskWorktreeUnregister,
+	rpc.TaskLogsPurge:          runTaskLogsPurge,
+	rpc.TaskRegistryRepair:     runTaskRegistryRepair,
+	rpc.TaskConfigWrite:        runTaskConfigWrite,
+	rpc.TaskWorktreeCreate:     runTaskWorktreeCreate,
+	rpc.TaskWorktreeFinalize:   runTaskWorktreeFinalize,
+	rpc.TaskWorktreeTeardown:   runTaskWorktreeTeardown,
 }
 
 // runOneTask dispatches a single task to its registered runner.
@@ -166,7 +168,7 @@ func runTaskWorktreeFinalize(ctx context.Context, st *State, task rpc.Task) (jso
 }
 
 func runTaskWorktreeTeardown(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
-	return nil, TeardownWorktree(ctx, st, task.RepoPath, task.WorktreePath, task.Params["force"] == "1", task.InheritedEnv)
+	return nil, TeardownWorktree(ctx, st, task.RepoPath, task.WorktreePath, task.Params[rpc.ParamForce] == "1", task.InheritedEnv)
 }
 
 // taskIdentity bundles the resolved config + row identity a worktree-
@@ -212,7 +214,7 @@ func runTaskDBReset(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	if err != nil {
 		return nil, err
 	}
-	engineFilter := task.Params["engine_filter"]
+	engineFilter := task.Params[rpc.ParamEngineFilter]
 	if err := prepare.ResetBranchScoped(ctx, &id.cfg, task.WorktreePath, id.repoID, id.wtID, st.Store, engineFilter); err != nil {
 		return nil, err
 	}
@@ -261,18 +263,18 @@ func runTaskHookRun(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	if err != nil {
 		return nil, err
 	}
-	phase := task.Params["phase"]
+	phase := task.Params[rpc.ParamPhase]
 	var entries []config.Action
 	switch phase {
-	case "on-create-before-engines":
+	case "create-before-engines":
 		entries = id.cfg.Hooks.OnCreateBeforeEngines
-	case "on-create-after-engines":
+	case "create-after-engines":
 		entries = id.cfg.Hooks.OnCreateAfterEngines
-	case "on-delete-before-engines":
+	case "delete-before-engines":
 		entries = id.cfg.Hooks.OnDeleteBeforeEngines
-	case "on-delete-after-engines":
+	case "delete-after-engines":
 		entries = id.cfg.Hooks.OnDeleteAfterEngines
-	case "on-checkout":
+	case "checkout":
 		entries = id.cfg.Hooks.OnCheckout
 	default:
 		return nil, fmt.Errorf("run_plan hook_run: unknown phase %q", phase)
@@ -305,7 +307,7 @@ func runTaskSnapshotsPurge(ctx context.Context, st *State, task rpc.Task) (json.
 		return nil, err
 	}
 	dropped, errs := snapshot.PurgeRepo(ctx, &cfg, st.Store, repoID)
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "snapshots_purged",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsPurgeEnd,
 		fmt.Sprintf("dropped %d snapshot(s)", dropped), repoID, 0, "", 0, nil)
 	msgs := make([]string, 0, len(errs))
 	for _, e := range errs {
@@ -344,17 +346,17 @@ func runTaskMainPurgeDBs(ctx context.Context, st *State, task rpc.Task) (json.Ra
 		}
 		purged++
 	}
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "main_dbs_purged",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtMainPurge,
 		fmt.Sprintf("tore down DBs for %d branch(es)", purged), repoID, 0, "", 0, nil)
 	return json.Marshal(map[string]any{"purged": purged})
 }
 
-func runTaskWtRegister(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
+func runTaskWorktreeRegister(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
 	repoID, err := st.Store.EnsureRepo(ctx, task.RepoPath, filepath.Base(task.RepoPath))
 	if err != nil {
 		return nil, err
 	}
-	branch := task.Params["branch"]
+	branch := task.Params[rpc.ParamBranch]
 	sl := slug.For(task.WorktreePath, branch)
 	wtID, err := st.Store.EnsureWorktree(ctx, repoID, task.WorktreePath, sl.Value, branch)
 	if err != nil {
@@ -363,7 +365,7 @@ func runTaskWtRegister(ctx context.Context, st *State, task rpc.Task) (json.RawM
 	return json.Marshal(map[string]any{"worktree_id": wtID, "slug": sl.Value, "repo_id": repoID})
 }
 
-func runTaskWtUnregister(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
+func runTaskWorktreeUnregister(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
 	row := st.Store.DB.QueryRowContext(ctx,
 		"SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", task.WorktreePath)
 	var id int64
@@ -378,23 +380,23 @@ func runTaskWtUnregister(ctx context.Context, st *State, task rpc.Task) (json.Ra
 
 func runTaskLogsPurge(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
 	f := store.EventFilter{}
-	if v := task.Params["levels"]; v != "" {
+	if v := task.Params[rpc.ParamLevels]; v != "" {
 		f.Levels = strings.Split(v, ",")
 	}
-	if v := task.Params["event_types"]; v != "" {
+	if v := task.Params[rpc.ParamEventTypes]; v != "" {
 		f.EventTypes = strings.Split(v, ",")
 	}
-	if v := task.Params["until_ms"]; v != "" {
+	if v := task.Params[rpc.ParamUntilMs]; v != "" {
 		f.UntilMs, _ = strconv.ParseInt(v, 10, 64)
 	}
 	// Scope to a repo / worktree by resolving the (CLI-absolutized) paths
 	// to row ids — mirrors the CLI's applyPurgeScope.
-	if repo := task.Params["repo"]; repo != "" {
+	if repo := task.Params[rpc.ParamRepo]; repo != "" {
 		if rid, err := st.Store.LookupRepoID(ctx, repo); err == nil {
 			f.RepoID = rid
 		}
 	}
-	if wtArg := task.Params["worktree"]; wtArg != "" {
+	if wtArg := task.Params[rpc.ParamWorktree]; wtArg != "" {
 		wid, err := st.Store.LookupWorktreeID(ctx, f.RepoID, wtArg)
 		if err != nil {
 			return nil, err
@@ -425,11 +427,11 @@ func runTaskRegistryRepair(ctx context.Context, st *State, task rpc.Task) (json.
 // keeps the write coherent with the daemon's own config watcher (the
 // watcher's later REMOVE/CREATE fire is a harmless idempotent re-reload).
 func runTaskConfigWrite(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
-	path := task.Params["path"]
+	path := task.Params[rpc.ParamPath]
 	if path == "" {
 		return nil, errors.New("config_write: missing path")
 	}
-	body := []byte(task.Params["body"])
+	body := []byte(task.Params[rpc.ParamBody])
 	if prev, err := os.ReadFile(path); err == nil {
 		_, _ = st.Store.SnapshotConfig(ctx, task.RepoPath, path, prev)
 	}
@@ -449,12 +451,12 @@ func runTaskConfigWrite(ctx context.Context, st *State, task rpc.Task) (json.Raw
 func runTaskWorktreeCreate(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
 	req := wt.CreateRequest{
 		RepoRoot:    task.RepoPath,
-		Branch:      task.Params["branch"],
-		From:        task.Params["from"],
-		Path:        task.Params["path"],
-		NoFetch:     task.Params["no_fetch"] == "1",
-		SkipHooks:   task.Params["skip_hooks"] == "1",
-		SkipPrepare: task.Params["skip_prepare"] == "1",
+		Branch:      task.Params[rpc.ParamBranch],
+		From:        task.Params[rpc.ParamFrom],
+		Path:        task.Params[rpc.ParamPath],
+		NoFetch:     task.Params[rpc.ParamNoFetch] == "1",
+		SkipHooks:   task.Params[rpc.ParamSkipHooks] == "1",
+		SkipPrepare: task.Params[rpc.ParamSkipPrepare] == "1",
 		Env:         task.InheritedEnv,
 	}
 	res, needsFinalize, err := wt.CreateInStore(ctx, req, st.Store, nil)
@@ -465,7 +467,7 @@ func runTaskWorktreeCreate(ctx context.Context, st *State, task rpc.Task) (json.
 		repoRoot, wtPath, env := req.RepoRoot, res.WtPath, req.Env
 		runFinalize := func(bg context.Context) {
 			if ferr := FinalizeWorktree(bg, st, repoRoot, wtPath, env); ferr != nil {
-				_ = st.Store.WriteEvent(bg, store.LevelError, "wt_finalize", ferr.Error(),
+				_ = st.Store.WriteEvent(bg, store.LevelError, store.EvtWorktreeCreateError, ferr.Error(),
 					0, 0, "", 0, map[string]string{"repo_path": repoRoot, "worktree_path": wtPath})
 			}
 		}
@@ -473,7 +475,7 @@ func runTaskWorktreeCreate(ctx context.Context, st *State, task rpc.Task) (json.
 			// No daemon to outlive the call — run the tail before returning.
 			runFinalize(runid.With(ctx, runid.New()))
 		} else {
-			safeGo("wt_finalize", func() { runFinalize(runid.With(st.BgCtx, runid.New())) })
+			safeGo(lblWorktreeFinalize, "", func() { runFinalize(runid.With(st.BgCtx, runid.New())) })
 		}
 		res.Status = wt.CreatedQueued
 	}

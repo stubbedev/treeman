@@ -170,13 +170,13 @@ func registerDaemonReadTools(srv *mcpsdk.Server) {
 func registerPlanningReadTools(srv *mcpsdk.Server) {
 	addTool(srv, &mcpsdk.Tool{
 		Name:        "snapshots_list",
-		Description: "List cached snapshots (template DBs) for the repo. Call before snapshots_purge to preview what will be wiped, or before snapshot_inspect for drilldown. For orphan-only sweeps use the cache-cleanup prompt. Capped at limit (default 100).",
+		Description: "List cached snapshots (template DBs) for the repo. Call before snapshots_purge to preview what will be wiped, or before snapshots_inspect for drilldown. For orphan-only sweeps use the cache-cleanup prompt. Capped at limit (default 100).",
 		Annotations: readOnlyAnno("List snapshots", false),
 	}, snapshotsListTool)
 
 	addTool(srv, &mcpsdk.Tool{
 		Name:        "inputs_fingerprint",
-		Description: "Compute the per-database input-hash breakdown + check whether a matching snapshot exists. Use to answer \"why did prepare cold-build instead of cache-hit?\". Pair with snapshot_inspect on the expected fingerprint. Set probe_engine=true for a cache-comparable engine_version (slower).",
+		Description: "Compute the per-database input-hash breakdown + check whether a matching snapshot exists. Use to answer \"why did prepare cold-build instead of cache-hit?\". Pair with snapshots_inspect on the expected fingerprint. Set probe_engine=true for a cache-comparable engine_version (slower).",
 		Annotations: readOnlyAnno("Inspect input hashes", true),
 	}, inputsFingerprintTool)
 

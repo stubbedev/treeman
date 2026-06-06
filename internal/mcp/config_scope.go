@@ -14,6 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
 
@@ -173,7 +174,7 @@ func configUnsetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configUnse
 	if scopeLabel == "" {
 		scopeLabel = "repo"
 	}
-	writeMCPEvent(context.Background(), "config_unset", "removed "+in.Path, 0, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPConfigUnset, "removed "+in.Path, 0, map[string]string{
 		"path":  in.Path,
 		"scope": scopeLabel,
 		"file":  target,
@@ -243,7 +244,7 @@ func configDeleteTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configD
 	if err := os.Remove(target); err != nil {
 		return nil, configDeleteOut{}, fmt.Errorf("delete %s: %w", target, err)
 	}
-	writeMCPEvent(context.Background(), "config_delete", "deleted "+target, 0, map[string]string{
+	writeMCPEvent(context.Background(), store.EvtMCPConfigDelete, "deleted "+target, 0, map[string]string{
 		"scope": scopeLabel,
 		"file":  target,
 		"bytes": strconv.Itoa(len(prev)),

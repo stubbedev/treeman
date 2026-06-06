@@ -33,7 +33,7 @@ func emitColdBuildDrop(
 	repoID, worktreeID int64,
 	engine, target string,
 ) {
-	_ = st.WriteEvent(ctx, store.LevelInfo, "db_drop",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtDBDrop,
 		fmt.Sprintf("%s: cold-build pre-drop %s", engine, target),
 		repoID, worktreeID, "", 0, map[string]any{
 			"engine": engine,

@@ -62,7 +62,7 @@ func logsTail() *cli.Command {
   treeman logs tail --follow
   treeman logs tail --worktree PROJ-1234 --level warn --level error
   treeman logs tail --since 5m --json | jq .
-  treeman logs tail --event-type wt_finalize_done --event-type wt_finalize_start
+  treeman logs tail --event-type worktree:create:end --event-type worktree:create:start
 
 When stdout is a terminal and --follow / --json are not used,
 output is paged through $PAGER (default: less -FRX). Set

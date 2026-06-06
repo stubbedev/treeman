@@ -25,6 +25,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
+	"github.com/stubbedev/treeman/internal/safego"
 )
 
 // RunOutcome bundles every group's status.
@@ -345,7 +346,7 @@ func spawnDetached(
 		// asynchronously so zombies don't pile up against this
 		// daemon process. Log non-zero exits at WARN so a background
 		// hook that's silently failing on every fire has a trail.
-		go func() {
+		safego.Go("hook:reap", "", func() {
 			err := c.Wait()
 			if err == nil {
 				return
@@ -358,7 +359,7 @@ func spawnDetached(
 			}
 			slog.Warn("background hook wait failed",
 				"cmd", cmdStr, "err", err)
-		}()
+		})
 	}
 	return c, nil
 }
@@ -383,7 +384,7 @@ func spawnDetached(
 //     _SLUG, _IS_MAIN) so user scripts can address them. These always
 //     win. _IS_MAIN is "1" when this hook is firing for the repo
 //     root's main-wt enrollment, "0" for any linked worktree — lets a
-//     shared on-create-* hook branch behaviour (e.g. skip the dev .env
+//     shared create-* hook branch behaviour (e.g. skip the dev .env
 //     copy on linked wts).
 //
 // Layering order means the lifecycle watcher's empty `inheritedEnv`

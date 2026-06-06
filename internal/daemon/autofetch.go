@@ -19,7 +19,7 @@ import (
 	"github.com/stubbedev/treeman/internal/wtreg"
 )
 
-// Skip-reason codes emitted as `auto_fetch_skipped` events and stamped
+// Skip-reason codes emitted as `fetch:skip` events and stamped
 // onto `State.syncLastSkip` so the sync_status RPC can answer "why
 // didn't this branch advance on the last sweep?".
 const (
@@ -194,7 +194,7 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 		slog.Warn("auto_fetch fetch failed",
 			"repo", r.Path, "err", err,
 			"consecutive_failures", failures)
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "auto_fetch_fetch_failed",
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtFetchError,
 			err.Error(), r.ID, 0, "", 0, map[string]string{
 				"consecutive_failures": strconv.Itoa(failures),
 				"next_retry_at":        st.SyncBackoffUntil(r.Path).UTC().Format(time.RFC3339),
@@ -226,7 +226,7 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 	// branch_scoped durable databases those deleted branches left behind.
 	for _, branch := range pruneGoneLocals(ctx, r.Path) {
 		prepare.ReapBranchDurables(ctx, cfg, st.Store, r.ID, branch)
-		_ = st.Store.WriteEvent(ctx, store.LevelInfo, "branch_pruned",
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtBranchPrune,
 			"pruned merged branch with deleted upstream: "+branch,
 			r.ID, 0, "", 0, map[string]string{"branch": branch})
 	}
@@ -322,7 +322,7 @@ func advanceRebase(ctx context.Context, st *State, repoID int64, wtPath, branch 
 		if abortErr := gitcmd.Run(ctx, wtPath, "rebase", "--abort"); abortErr != nil {
 			slog.Error("auto_fetch rebase --abort failed; worktree may be half-rebased",
 				"wt", wtPath, "branch", branch, "abort_err", abortErr, "rebase_err", err)
-			_ = st.Store.WriteEvent(ctx, store.LevelError, "auto_fetch_rebase_abort_failed",
+			_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtFetchRebaseError,
 				abortErr.Error(), repoID, lookupWorktreeID(ctx, st, wtPath), "", 0,
 				map[string]string{"wt": wtPath, "branch": branch})
 		}
@@ -333,13 +333,13 @@ func advanceRebase(ctx context.Context, st *State, repoID int64, wtPath, branch 
 	return nil
 }
 
-// emitSkip writes an `auto_fetch_skipped` event and stamps the
+// emitSkip writes an `fetch:skip` event and stamps the
 // worktree's last-skip-reason on State so sync_status can surface it
 // without scanning the event log.
 func emitSkip(ctx context.Context, st *State, repoID int64, wtPath, branch, reason, detail string) {
 	slog.Debug("auto_fetch skip", "wt", wtPath, "branch", branch, "reason", reason)
 	st.RecordSyncSkip(wtPath, reason)
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "auto_fetch_skipped",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtFetchSkip,
 		detail, repoID, lookupWorktreeID(ctx, st, wtPath), "", 0, map[string]string{
 			"wt":     wtPath,
 			"branch": branch,
@@ -347,12 +347,12 @@ func emitSkip(ctx context.Context, st *State, repoID int64, wtPath, branch, reas
 		})
 }
 
-// emitAdvance writes an `auto_fetch_pulled` event and clears any
+// emitAdvance writes an `fetch:pull` event and clears any
 // previous skip marker for the worktree (the branch did advance).
 func emitAdvance(ctx context.Context, st *State, repoID int64, wtPath, branch, mode, detail string) {
 	slog.Info(detail, "wt", wtPath, "branch", branch, "mode", mode)
 	st.RecordSyncSkip(wtPath, "")
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "auto_fetch_pulled",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtFetchPull,
 		detail+" "+branch, repoID, lookupWorktreeID(ctx, st, wtPath), "", 0, map[string]string{
 			"wt":     wtPath,
 			"branch": branch,

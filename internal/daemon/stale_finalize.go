@@ -12,7 +12,7 @@ import (
 
 // finalizeTimeout caps how long any single FinalizeWorktree run is
 // allowed to occupy its slot before the watchdog cancels it and
-// emits a wt_finalize error event. 30 minutes is comfortably above
+// emits a worktree:create:error error event. 30 minutes is comfortably above
 // every realistic cold-build we've measured (largest production
 // schema with seed data: ~12 min) while still catching the silent-
 // stall class from issue #9 within the same workday. Not yet
@@ -26,14 +26,14 @@ const finalizeTimeout = 30 * time.Minute
 const watchdogInterval = 2 * time.Minute
 
 // SweepStalePreparing fails-out any worktree row whose most recent
-// finalize event is `wt_finalize_start` — by definition, no goroutine
+// finalize event is `worktree:create:start` — by definition, no goroutine
 // owns that work anymore once the daemon has restarted. Without this
 // sweep, `treeman worktree list` keeps reporting `state=preparing`
 // indefinitely (the state is derived from the latest finalize event
 // per worktree). See issue #9.
 //
 // The fix is intentionally conservative: emit a synthetic
-// `wt_finalize` error event so the derived state flips to `error`
+// `worktree:create:error` error event so the derived state flips to `error`
 // with a clear message. We don't auto-requeue — silently re-running
 // setup hooks + cold builds on a fresh daemon would be surprising,
 // and the user already has `treeman wt finalize` to retry. They get a
@@ -41,9 +41,9 @@ const watchdogInterval = 2 * time.Minute
 //
 // Idempotent: the sweep emits at most one stale event per row per
 // daemon start. A second start without intervening activity still
-// sees `wt_finalize_start` as the latest finalize event (the error
+// sees `worktree:create:start` as the latest finalize event (the error
 // event we wrote uses a different event_type) — that's deliberate;
-// the message includes the wt_finalize_start timestamp so consecutive
+// the message includes the worktree:create:start timestamp so consecutive
 // stale entries don't lose information.
 func SweepStalePreparing(ctx context.Context, st *State) {
 	wts, err := st.Store.ListActiveWorktrees(ctx)
@@ -58,17 +58,22 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 		}
 		evs, err := st.Store.QueryEvents(ctx, store.EventFilter{
 			WorktreeID: row.ID,
-			EventTypes: []string{"wt_finalize_start", "wt_finalize_done", "wt_finalize", "wt_finalize_cancelled"},
-			Limit:      1,
+			EventTypes: []string{
+				store.EvtWorktreeCreateStart,
+				store.EvtWorktreeCreateEnd,
+				store.EvtWorktreeCreateError,
+				store.EvtWorktreeCreateCancel,
+			},
+			Limit: 1,
 		})
 		if err != nil || len(evs) == 0 {
 			continue
 		}
 		last := evs[0]
-		if last.EventType != "wt_finalize_start" {
+		if last.EventType != store.EvtWorktreeCreateStart {
 			continue
 		}
-		_ = st.Store.WriteEvent(ctx, store.LevelError, "wt_finalize",
+		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError,
 			"stale finalize: daemon restarted while prepare was in flight — rerun `treeman wt finalize` to retry",
 			row.RepoID, row.ID, "", 0, map[string]any{
 				"reason":         "daemon_restart",
@@ -89,7 +94,7 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 		// don't stop the sweep.
 		cfg, err := resolve.LoadResolvedForWorktree(w.RepoPath, w.WorktreePath)
 		if err != nil {
-			_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_recovery_error",
+			_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
 				"load config for recovery: "+err.Error(),
 				row.RepoID, row.ID, "", 0, map[string]string{"error": err.Error()})
 			continue
@@ -111,7 +116,7 @@ func errString(err error) string {
 // FinalizeWatchdogLoop is the live-daemon counterpart to
 // SweepStalePreparing: it cancels in-flight finalizes that have
 // exceeded finalizeTimeout (a child wedged on a network read, a
-// blocked DB connection, etc.) and emits a synthetic wt_finalize
+// blocked DB connection, etc.) and emits a synthetic worktree:create:error
 // error so the row's derived state flips out of "preparing".
 //
 // Runs until ctx cancels. Designed to be launched once at boot off
@@ -156,7 +161,7 @@ func sweepExpiredFinalizes(ctx context.Context, st *State) {
 			continue
 		}
 		age := time.Since(startedAt).Round(time.Second)
-		_ = st.Store.WriteEvent(ctx, store.LevelError, "wt_finalize",
+		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError,
 			"prepare timed out after "+age.String()+" — child wedged; rerun `treeman wt finalize` once unstuck",
 			row.RepoID, row.ID, "", 0, map[string]any{
 				"reason":     "prepare_timeout",
@@ -172,14 +177,14 @@ func sweepExpiredFinalizes(ctx context.Context, st *State) {
 		// the user's rerun starts clean.
 		repoPath, repoErr := st.Store.RepoPath(ctx, row.RepoID)
 		if repoErr != nil || repoPath == "" {
-			_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_recovery_error",
+			_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
 				"lookup repo path for recovery: "+errString(repoErr),
 				row.RepoID, row.ID, "", 0, map[string]string{"error": errString(repoErr)})
 			continue
 		}
 		cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
 		if err != nil {
-			_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_recovery_error",
+			_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
 				"load config for recovery: "+err.Error(),
 				row.RepoID, row.ID, "", 0, map[string]string{"error": err.Error()})
 			continue

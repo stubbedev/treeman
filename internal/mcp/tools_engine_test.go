@@ -10,7 +10,7 @@ import (
 )
 
 // TestDropTemplateRejectsNonReservedNames is the trust-boundary
-// guard on snapshot_drop. The MCP tool feeds rec.TemplateName into
+// guard on snapshots_drop. The MCP tool feeds rec.TemplateName into
 // the prefix-LIKE / prefix-scan DropMatching / DropPrefix calls, so a
 // hand-crafted SQLite row (or any client that synthesises a name)
 // could otherwise reap real app databases. dropTemplate must refuse

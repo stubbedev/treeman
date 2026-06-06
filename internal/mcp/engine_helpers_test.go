@@ -13,7 +13,7 @@ import (
 // TestSnapshotLookupByEngineSource_PrefersMostRecentlyUsed seeds two
 // snapshots for the same (engine, source_db) pair with different
 // last_used_at timestamps and asserts the lookup helper returns the
-// most-recent row. This is the slow path the MCP snapshot_inspect
+// most-recent row. This is the slow path the MCP snapshots_inspect
 // tool falls back to when the caller doesn't have a fingerprint.
 func TestSnapshotLookupByEngineSource_PrefersMostRecentlyUsed(t *testing.T) {
 	ctx := context.Background()

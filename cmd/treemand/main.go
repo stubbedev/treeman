@@ -19,8 +19,24 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/safego"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/version"
+)
+
+// Goroutine labels for the daemon's process-lifetime loops + RPC
+// plumbing, in the same colon-hierarchy convention as event types and
+// the internal daemon labels. Passed to safego.Go for panic recovery.
+const (
+	lblWatchdog      = "loop:watchdog"
+	lblSnapshotGC    = "loop:snapshot-gc"
+	lblWALCheckpoint = "loop:wal-checkpoint"
+	lblLogPrune      = "loop:log-prune"
+	lblAutoFetch     = "loop:auto-fetch"
+	lblHUPReload     = "loop:hup-reload"
+	lblAccept        = "rpc:accept"
+	lblConn          = "rpc:conn"
+	lblBoot          = "boot"
 )
 
 // slogLevel parses a daemon.log_level YAML value into a slog.Level.
@@ -105,10 +121,10 @@ func run() error {
 
 	st := daemon.NewState(ctx, s)
 	slog.Info("treemand listening",
-		"event_type", "daemon_started",
+		"event_type", store.EvtDaemonStart,
 		"socket", sockPath,
 		"pid", os.Getpid())
-	_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_started", "treemand listening",
+	_ = s.WriteEvent(ctx, store.LevelInfo, store.EvtDaemonStart, "treemand listening",
 		0, 0, "", 0, map[string]string{"socket": sockPath})
 
 	// Desktop notifications (opt-in via the global `notifications:`
@@ -134,7 +150,7 @@ func run() error {
 	// Reconcile any finalize that was in flight when the previous
 	// daemon died — the goroutine is gone, so the row would otherwise
 	// stay at derived state=preparing forever. SweepStalePreparing
-	// emits a synthetic wt_finalize error so the user sees the wedge
+	// emits a synthetic worktree:create:error error so the user sees the wedge
 	// and can rerun `treeman wt finalize`. Runs BEFORE watchers come
 	// up so the stale event is visible regardless of whether a fresh
 	// finalize is about to fire.
@@ -195,41 +211,41 @@ func run() error {
 	// flags any that exceed the prepare timeout. Catches the
 	// daemon-alive-but-child-wedged variant of issue #9 that
 	// SweepStalePreparing (boot-only) can't cover.
-	go daemon.FinalizeWatchdogLoop(st.BgCtx, st)
+	safego.Go(lblWatchdog, "", func() { daemon.FinalizeWatchdogLoop(st.BgCtx, st) })
 
 	// Periodic snapshot GC sweep. Runs at the cadence declared by
 	// `snapshots.retention.gc_interval_minutes` (default 60); each
 	// tick walks every registered repo and evicts cached templates
 	// above `cap_per_repo`. Bare-bones for now — age/size sweeps
 	// (MaxAgeDays, MaxTotalGb) land here later.
-	go daemon.SnapshotGCLoop(ctx, st)
-	go daemon.WALCheckpointLoop(ctx, st)
+	safego.Go(lblSnapshotGC, "", func() { daemon.SnapshotGCLoop(ctx, st) })
+	safego.Go(lblWALCheckpoint, "", func() { daemon.WALCheckpointLoop(ctx, st) })
 	// Daemon-side retention sweep — drops events / hook_runs (and
 	// cascaded hook_log_chunks) older than `logs.keep_days`.
-	go daemon.LogPruneLoop(ctx, st)
+	safego.Go(lblLogPrune, "", func() { daemon.LogPruneLoop(ctx, st) })
 	// Periodic `git fetch --all --prune` + best-effort
 	// `git merge --ff-only @{u}` per registered repo's worktrees.
 	// Returns immediately when `auto_fetch.enabled: false` in the
 	// global config.
-	go daemon.AutoFetchLoop(ctx, st)
+	safego.Go(lblAutoFetch, "", func() { daemon.AutoFetchLoop(ctx, st) })
 
 	// SIGHUP → full reload. Independent of the shutdown signal set so
 	// `kill -HUP $(pgrep treemand)` is a deterministic operator knob
 	// and matches Unix daemon convention.
 	if cr != nil {
-		go hupReloadLoop(ctx, st, cr, hupCh)
+		safego.Go(lblHUPReload, "", func() { hupReloadLoop(ctx, st, cr, hupCh) })
 	}
 
 	shutdown := make(chan struct{}, 1)
-	go acceptLoop(ctx, ln, st, shutdown)
+	safego.Go(lblAccept, "", func() { acceptLoop(ctx, ln, st, shutdown) })
 
 	select {
 	case <-ctx.Done():
 		slog.Info("daemon_stopped — signal received")
-		_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_stopped", "SIGTERM/SIGINT received", 0, 0, "", 0, nil)
+		_ = s.WriteEvent(ctx, store.LevelInfo, store.EvtDaemonStop, "SIGTERM/SIGINT received", 0, 0, "", 0, nil)
 	case <-shutdown:
 		slog.Info("daemon_stopped — shutdown rpc")
-		_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_stopped", "shutdown requested", 0, 0, "", 0, nil)
+		_ = s.WriteEvent(ctx, store.LevelInfo, store.EvtDaemonStop, "shutdown requested", 0, 0, "", 0, nil)
 	}
 	_ = ln.Close()
 	_ = os.Remove(sockPath)
@@ -344,7 +360,7 @@ func acceptLoop(ctx context.Context, ln net.Listener, st *daemon.State, shutdown
 			_ = conn.Close()
 			continue
 		}
-		go handleConn(ctx, conn, st, shutdown)
+		safego.Go(lblConn, "", func() { handleConn(ctx, conn, st, shutdown) })
 	}
 }
 
@@ -390,11 +406,12 @@ func parallelFor[T any](items []T, workers int, fn func(T)) {
 	for _, it := range items {
 		sem <- struct{}{}
 		wg.Add(1)
-		go func(v T) {
+		v := it
+		safego.Go(lblBoot, "", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			fn(v)
-		}(it)
+		})
 	}
 	wg.Wait()
 }

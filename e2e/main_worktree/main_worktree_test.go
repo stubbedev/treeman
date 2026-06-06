@@ -2,7 +2,7 @@
 
 // Package mainworktree_e2e drives the main-worktree feature
 // end-to-end: opt the repo root into the branch-aware lifecycle, fire
-// real HEAD + FS events, and assert the on-checkout / on-file-change
+// real HEAD + FS events, and assert the checkout / file-change
 // hooks fire with the right env vars under three overlay variants
 // (none / partial / full). Catches the dispatcher-slug + missing-
 // overlay-in-rendering bugs that the pre-existing unit tests for the
@@ -30,7 +30,7 @@ import (
 
 // TestMainWorktreeOnCheckout opts the repo root into main-wt, starts
 // the daemon's HEAD watcher, switches branches, and asserts the
-// on-checkout hook fires with TREEMAN_SLUG=main_<branch>. The pre-
+// checkout hook fires with TREEMAN_SLUG=main_<branch>. The pre-
 // fix dispatcher passed slug.For(repoRoot, branch) (a path-hash slug)
 // which would write a wrong value to the witness AND overwrite the
 // main row's slug column.
@@ -51,7 +51,7 @@ func TestMainWorktreeOnCheckout(t *testing.T) {
 main_worktree:
   enabled: true
 hooks:
-  on-checkout:
+  checkout:
     - run: echo "$TREEMAN_SLUG|$TREEMAN_IS_MAIN" > ` + witnessDir + `/slug
 `
 	writeFile(t, repoRoot, ".treeman.yaml", yaml)
@@ -78,7 +78,7 @@ hooks:
 	body := waitForFile(t, witness, 15*time.Second)
 	got := strings.TrimSpace(body)
 	if got != "main_feature_x|1" {
-		t.Fatalf("on-checkout witness = %q, want \"main_feature_x|1\" (dispatcher slug or $TREEMAN_IS_MAIN regressed)", got)
+		t.Fatalf("checkout witness = %q, want \"main_feature_x|1\" (dispatcher slug or $TREEMAN_IS_MAIN regressed)", got)
 	}
 
 	// Row's slug column must reflect the post-checkout branch — and
@@ -87,7 +87,7 @@ hooks:
 	assertMainRow(t, st, repoRoot, "main_feature_x", "feature/x")
 }
 
-// TestMainWorktreeOnFileChange runs the on-file-change variant matrix
+// TestMainWorktreeOnFileChange runs the file-change variant matrix
 // (no overlay / partial overlay / full overlay) and asserts the hook
 // fires with TREEMAN_WATCH_DB_NAME rendered from the right template.
 // The pre-fix fireOnFileChange read cfg.Databases[i].NameTemplate
@@ -167,7 +167,7 @@ databases:
     inputs:
       - { glob: "db/migrations/*.sql", label: migrations }
 hooks:
-  on-file-change:
+  file-change:
     - match: migrations
       run: 'echo "$TREEMAN_SLUG|$TREEMAN_WATCH_DB_NAME|$TREEMAN_WATCH_LABEL|$TREEMAN_WATCH_ENGINE|$TREEMAN_IS_MAIN" > ` + witnessDir + `/event'
 `
@@ -209,7 +209,7 @@ hooks:
 				t.Errorf("TREEMAN_WATCH_ENGINE = %q, want mysql", gotEngine)
 			}
 			if gotIsMain != "1" {
-				t.Errorf("TREEMAN_IS_MAIN = %q, want 1 for main-wt-driven on-file-change", gotIsMain)
+				t.Errorf("TREEMAN_IS_MAIN = %q, want 1 for main-wt-driven file-change", gotIsMain)
 			}
 
 			assertMainRow(t, st, repoRoot, tc.wantSlugInDB, tc.branch)
@@ -219,7 +219,7 @@ hooks:
 
 // TestMainWorktreeKeyPrefixOverlay covers the prefix-scoped overlay
 // field: a redis database whose main-worktree overlay replaces the
-// key_prefix. Asserts the on-file-change hook receives
+// key_prefix. Asserts the file-change hook receives
 // TREEMAN_WATCH_DB_NAME rendered from the OVERLAY key_prefix (not the
 // base one) — which also pins the fix for prefix engines reporting an
 // empty TREEMAN_WATCH_DB_NAME (dispatch rendered name_template only, but
@@ -253,7 +253,7 @@ databases:
     inputs:
       - { glob: "db/migrations/*.sql", label: migrations }
 hooks:
-  on-file-change:
+  file-change:
     - match: migrations
       run: 'echo "$TREEMAN_WATCH_DB_NAME|$TREEMAN_WATCH_ENGINE" > ` + witnessDir + `/event'
 `
@@ -296,8 +296,8 @@ hooks:
 
 // TestMainWorktreeEnableFiresOnCreateHooks mimics what
 // `treeman main enable` does end-to-end: enroll the main row, then
-// dispatch FinalizeWorktree against the repo root. Both on-create-
-// before-engines and on-create-after-engines must fire with
+// dispatch FinalizeWorktree against the repo root. Both create-
+// before-engines and create-after-engines must fire with
 // $TREEMAN_IS_MAIN=1 — pre-change, neither fired because EnrollMain
 // Worktree only wrote a row and the user had to manually run
 // `treeman wt finalize .` to get setup hooks.
@@ -322,9 +322,9 @@ func TestMainWorktreeEnableFiresOnCreateHooks(t *testing.T) {
 main_worktree:
   enabled: true
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: 'echo "$TREEMAN_SLUG|$TREEMAN_IS_MAIN" > ` + witnessDir + `/before'
-  on-create-after-engines:
+  create-after-engines:
     - run: 'echo "$TREEMAN_SLUG|$TREEMAN_IS_MAIN" > ` + witnessDir + `/after'
 `
 	writeFile(t, repoRoot, ".treeman.yaml", yaml)
@@ -352,7 +352,7 @@ hooks:
 		path := filepath.Join(witnessDir, name)
 		body := strings.TrimSpace(waitForFile(t, path, 15*time.Second))
 		if body != "main_develop|1" {
-			t.Errorf("on-create-%s-engines witness = %q, want \"main_develop|1\"", name, body)
+			t.Errorf("create-%s-engines witness = %q, want \"main_develop|1\"", name, body)
 		}
 	}
 }

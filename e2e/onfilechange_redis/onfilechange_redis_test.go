@@ -3,7 +3,7 @@
 // Package onfilechange_redis_e2e is the prefix-engine twin of the
 // (relational) onfilechange suite: it proves the daemon-managed
 // `inputs` watcher fires for a NON-SQL engine too, and — critically —
-// that on-file-change hooks for a key_prefix engine receive a
+// that file-change hooks for a key_prefix engine receive a
 // populated TREEMAN_WATCH_DB_NAME. Prefix engines have no
 // name_template, so dispatch falls back to the rendered key_prefix;
 // this test is the regression guard for that fallback.
@@ -61,7 +61,7 @@ databases:
     inputs:
       - { glob: "seeds/*.txt", label: seeds }
 hooks:
-  on-file-change:
+  file-change:
     - match: seeds
       run: 'echo "$TREEMAN_WATCH_PATH|$TREEMAN_WATCH_LABEL|$TREEMAN_WATCH_ENGINE|$TREEMAN_WATCH_DB_NAME" > ` + touch + `/event'
 `
@@ -112,7 +112,7 @@ hooks:
 		time.Sleep(200 * time.Millisecond)
 	}
 	if body == "" {
-		t.Fatal("redis on-file-change hook never wrote touch/event")
+		t.Fatal("redis file-change hook never wrote touch/event")
 	}
 	t.Logf("event body: %s", strings.TrimSpace(body))
 	// engine=redis proves the watcher fired for a prefix engine;

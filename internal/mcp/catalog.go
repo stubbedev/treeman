@@ -139,13 +139,13 @@ const toolGuide = `Entry points (enable the named tool first if it isn't loaded)
 - "what's the daemon doing" → daemon_state; version/PID only → daemon_status.
 - "are engines reachable" → engine_status; probe one connection string → connection_probe.
 - "edit config" → config_locate → config_get → config_diff → config_set (surgical) or config_write (full); config_unset/config_delete/config_restore for the rest. scope=repo (.treeman.yaml) | global (~/.config/treeman/config.yaml).
-- "why cold-build not cache-hit" → inputs_fingerprint, then snapshot_inspect.
+- "why cold-build not cache-hit" → inputs_fingerprint, then snapshots_inspect.
 - "what would prepare run" → prepare_dry_run. "stream progress" → logs_subscribe.
 - "worktree stuck" → worktree_repair. "re-run setup/prepare" → worktree_finalize.
 - "enroll repo root for per-branch DBs" → main_worktree action=enable|disable|status.
 - "read/write engine data" → db_query (SQL/Mongo/Redis) or es_request (Elasticsearch); reads free, writes need write=true+ack=true.
 - prompts (guided multi-step flows): diagnose-prepare-failure, scaffold-from-framework, cache-cleanup, worktree-setup, migration-trial, edit-config, bootstrap-new-repo — list them with prompts_list.
-Destructive tools (worktree_delete, snapshots_purge, snapshot_drop, db_reset, repo_remove, registry_unregister, logs_purge, config_delete, config_unset) take dry_run=true — preview before committing.`
+Destructive tools (worktree_delete, snapshots_purge, snapshots_drop, db_reset, repo_remove, registry_unregister, logs_purge, config_delete, config_unset) take dry_run=true — preview before committing.`
 
 // registerToolGateway installs the always-on `tools` tool that discovers
 // and loads the deferred tools. It closes over the build catalog.

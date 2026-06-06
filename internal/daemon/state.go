@@ -3,12 +3,12 @@ package daemon
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"maps"
 	"sync"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/safego"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -365,19 +365,37 @@ func (st *State) WaitFinalizeCleared(ctx context.Context, wtPath string, timeout
 	}
 }
 
-// safeGo runs fn in a new goroutine, recovering any panic so a
-// runtime error in one async task can't kill the whole daemon.
-// The panic is logged with the caller-supplied label.
-func safeGo(label string, fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("daemon goroutine panic",
-					"label", label, "panic", fmt.Sprint(r))
-			}
-		}()
-		fn()
-	}()
+// Goroutine labels for safeGo's panic logs. Same colon-hierarchy style
+// as the event types in store/eventtypes.go — one constant per
+// goroutine role, so the labels stay consistent and greppable instead
+// of being scattered string literals. The dynamic disambiguator (a
+// worktree/repo path) is passed to safeGo as `detail`, never glued
+// into the label.
+const (
+	lblLifecycle         = "lifecycle"
+	lblConfigReload      = "config:reload"
+	lblPlanRun           = "plan:run"
+	lblWorktreeFinalize  = "worktree:finalize"
+	lblWorktreeReap      = "worktree:reap"
+	lblWorktreeReapDrain = "worktree:reap:drain"
+	lblHeadActions       = "head:actions"
+	lblHeadFinalize      = "head:finalize"
+	lblHeadSync          = "head:sync"
+	lblWatcherHead       = "watcher:head"
+	lblWatcherFS         = "watcher:fs"
+	lblWatchActions      = "watch:actions"
+	lblWatchFinalize     = "watch:finalize"
+	lblDBDropOverflow    = "db:drop:overflow"
+	lblDBDropDrain       = "db:drop:drain"
+	lblNotify            = "notify:dispatch"
+	lblPlanLane          = "plan:lane"
+)
+
+// safeGo runs fn in a daemon goroutine with panic recovery (delegates
+// to safego.Go). label is an lbl* constant; detail is the worktree/repo
+// path the goroutine acts on ("" when process-wide).
+func safeGo(label, detail string, fn func()) {
+	safego.Go(label, detail, fn)
 }
 
 // LockRepoTeardown returns the per-repo teardown mutex, creating it

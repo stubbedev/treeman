@@ -209,7 +209,7 @@ func wtLogs() *cli.Command {
 
 // wtWait — `treeman wt wait <name>` blocks until the most-recent
 // daemon-detached finalize for that worktree has either succeeded
-// (`wt_finalize_done`) or failed (level=error, event_type=wt_finalize).
+// (`worktree:create:end`) or failed (level=error, event_type=worktree:create:error).
 // Exit code reflects the outcome — 0 on success, non-zero on failure
 // or timeout — so CI scripts can `treeman wt create FOO && treeman
 // wt wait FOO`.
@@ -239,7 +239,7 @@ func wtWait() *cli.Command {
 				return err
 			}
 
-			// Anchor the wait at the newest wt_finalize_start we can
+			// Anchor the wait at the newest worktree:create:start we can
 			// see. If none exists yet, fall back to the wt's creation
 			// time so we don't terminate prematurely against a
 			// historical "done" row.
@@ -282,7 +282,7 @@ func pollFinalize(
 		}
 		rows, err := st.QueryEvents(ctx, store.EventFilter{
 			WorktreeID:  wt.ID,
-			EventTypes:  []string{"wt_finalize_done", "wt_finalize"},
+			EventTypes:  []string{store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError},
 			SinceMs:     anchor,
 			OldestFirst: true,
 			Limit:       50,
@@ -291,13 +291,13 @@ func pollFinalize(
 			return err
 		}
 		for _, e := range rows {
-			if e.EventType == "wt_finalize_done" {
+			if e.EventType == store.EvtWorktreeCreateEnd {
 				if !quiet {
 					ui.Success("finalize complete for %s", wt.Slug)
 				}
 				return nil
 			}
-			if e.EventType == "wt_finalize" && e.Level == "error" {
+			if e.EventType == store.EvtWorktreeCreateError && e.Level == store.LevelError {
 				return fmt.Errorf("finalize failed: %s", e.Message)
 			}
 		}
@@ -397,7 +397,7 @@ func finalizeStateShort(ctx context.Context, st *store.Store, wtID int64) string
 func finalizeState(ctx context.Context, st *store.Store, wtID int64) (state, detail string) {
 	rows, _ := st.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{"wt_finalize_start", "wt_finalize_done", "wt_finalize"},
+		EventTypes: []string{store.EvtWorktreeCreateStart, store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError},
 		Limit:      1,
 	})
 	if len(rows) == 0 {
@@ -405,12 +405,12 @@ func finalizeState(ctx context.Context, st *store.Store, wtID int64) (state, det
 	}
 	last := rows[0]
 	switch last.EventType {
-	case "wt_finalize_done":
+	case store.EvtWorktreeCreateEnd:
 		return ui.Status("ready"), "(last finalize " + formatTs(last.Ts) + ")"
-	case "wt_finalize_start":
+	case store.EvtWorktreeCreateStart:
 		return ui.Status("preparing"), "(started " + formatTs(last.Ts) + ")"
-	case "wt_finalize":
-		if last.Level == "error" {
+	case store.EvtWorktreeCreateError:
+		if last.Level == store.LevelError {
 			return ui.Status("error"), "— " + last.Message
 		}
 	}
@@ -420,7 +420,7 @@ func finalizeState(ctx context.Context, st *store.Store, wtID int64) (state, det
 func newestStartTs(ctx context.Context, st *store.Store, wtID int64) int64 {
 	rows, _ := st.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{"wt_finalize_start"},
+		EventTypes: []string{store.EvtWorktreeCreateStart},
 		Limit:      1,
 	})
 	if len(rows) == 0 {

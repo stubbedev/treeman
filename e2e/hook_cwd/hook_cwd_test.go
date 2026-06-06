@@ -40,7 +40,7 @@ func TestHookActionCwd(t *testing.T) {
 main_worktree:
   enabled: true
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - cwd: backend/app
       run: pwd > ` + filepath.Join(witnessDir, "pwd") + `
 `

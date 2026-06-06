@@ -100,23 +100,23 @@ Examples:
 			task := rpc.Task{
 				Type:         rpc.TaskWorktreeCreate,
 				RepoPath:     repoRoot,
-				Params:       map[string]string{"branch": branch},
+				Params:       map[string]string{rpc.ParamBranch: branch},
 				InheritedEnv: CaptureInheritedEnv(),
 			}
 			if v := c.String("from"); v != "" {
-				task.Params["from"] = v
+				task.Params[rpc.ParamFrom] = v
 			}
 			if v := c.String("path"); v != "" {
-				task.Params["path"] = v
+				task.Params[rpc.ParamPath] = v
 			}
 			if c.Bool("no-fetch") {
-				task.Params["no_fetch"] = "1"
+				task.Params[rpc.ParamNoFetch] = "1"
 			}
 			if c.Bool("skip-hooks") {
-				task.Params["skip_hooks"] = "1"
+				task.Params[rpc.ParamSkipHooks] = "1"
 			}
 			if c.Bool("skip-prepare") {
-				task.Params["skip_prepare"] = "1"
+				task.Params[rpc.ParamSkipPrepare] = "1"
 			}
 			payload, err := resultPayload(ctx, task)
 			if err != nil {
@@ -261,8 +261,8 @@ func wtRegister() *cli.Command {
 			}
 			branch := c.String("branch")
 			payload, err := resultPayload(ctx, rpc.Task{
-				Type: rpc.TaskWtRegister, RepoPath: repoRoot, WorktreePath: path,
-				Params: map[string]string{"branch": branch},
+				Type: rpc.TaskWorktreeRegister, RepoPath: repoRoot, WorktreePath: path,
+				Params: map[string]string{rpc.ParamBranch: branch},
 			})
 			if err != nil {
 				return err
@@ -289,7 +289,7 @@ func wtUnregister() *cli.Command {
 				path = c.Args().First()
 			}
 			path = MustAbs(path)
-			_, err := resultPayload(ctx, rpc.Task{Type: rpc.TaskWtUnregister, WorktreePath: path})
+			_, err := resultPayload(ctx, rpc.Task{Type: rpc.TaskWorktreeUnregister, WorktreePath: path})
 			return err
 		},
 	}

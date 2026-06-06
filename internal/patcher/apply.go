@@ -45,17 +45,17 @@ func Apply(p config.Patch, worktreePath string, tplCtx template.Context) (ApplyR
 	abs := filepath.Join(worktreePath, p.File)
 	var outcome Outcome
 	switch driver {
-	case "dotenv":
+	case DriverDotenv:
 		outcome, err = PatchEnvFile(abs, pairsFrom(rendered))
-	case "phpunit", "phpunit_env":
+	case DriverPhpunit, DriverPhpunitEnv:
 		outcome, err = PatchPhpunitFile(abs, pairsFrom(rendered))
-	case "yaml":
+	case DriverYAML:
 		outcome, err = PatchYAMLFile(abs, rendered)
-	case "json":
+	case DriverJSON:
 		outcome, err = PatchJSONFile(abs, rendered)
-	case "toml":
+	case DriverTOML:
 		outcome, err = PatchTOMLFile(abs, rendered)
-	case "ini":
+	case DriverINI:
 		outcome, err = PatchINIFile(abs, rendered)
 	default:
 		return ApplyResult{}, fmt.Errorf("patch %s: unknown format %q (want dotenv|phpunit|yaml|json|toml|ini)", p.File, driver)
@@ -73,7 +73,7 @@ func detectFormat(file string) string {
 	// `.env`, `.env.local`, `.env.testing.local` — all dotenv. Match
 	// on prefix so `.env-flavour` variants line up.
 	if base == ".env" || strings.HasPrefix(base, ".env.") || strings.HasSuffix(base, ".env") {
-		return "dotenv"
+		return DriverDotenv
 	}
 	ext := filepath.Ext(base)
 	// Strip `.dist` from e.g. `phpunit.xml.dist` so the real format
@@ -83,19 +83,19 @@ func detectFormat(file string) string {
 	}
 	switch ext {
 	case ".yaml", ".yml":
-		return "yaml"
+		return DriverYAML
 	case ".json":
-		return "json"
+		return DriverJSON
 	case ".toml":
-		return "toml"
+		return DriverTOML
 	case ".ini", ".cfg":
-		return "ini"
+		return DriverINI
 	case ".xml":
 		// Default XML driver is phpunit since that's the only XML
 		// shape we know how to edit. Users with other XML files
 		// should set `format:` explicitly (and we'll error since
 		// we don't have a generic XML driver).
-		return "phpunit"
+		return DriverPhpunit
 	}
 	return ""
 }

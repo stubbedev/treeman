@@ -1,5 +1,7 @@
 package notify
 
+import "github.com/stubbedev/treeman/internal/store"
+
 // The four `treeman status` buckets a worktree can fall into. Kept in
 // sync with the constants in cmd/treeman/cmd/status.go — these are the
 // user-facing names the `notifications.events:` config lists.
@@ -18,31 +20,31 @@ const (
 // per-event (the moment of transition) rather than by replaying the
 // newest event for a worktree:
 //
-//   - wt_finalize_start                 → up     (preparing began)
-//   - wt_finalize_done                  → stable (ready)
-//   - wt_finalize (level=error)         → failed (finalize errored)
-//   - wt_teardown_start                 → down   (teardown began)
-//   - wt_lifecycle_teardown_start       → down
+//   - worktree:create:start             → up     (preparing began)
+//   - worktree:create:end               → stable (ready)
+//   - worktree:create:error (lvl=error) → failed (finalize errored)
+//   - worktree:delete:start             → down   (teardown began)
+//   - worktree:reap:start               → down
 //
-// The terminal teardown events (wt_teardown_done /
-// wt_lifecycle_teardown_done) are intentionally unmapped: the worktree
-// is gone, so "down" already fired at teardown start and a second
-// banner for the completion would just be noise.
+// The terminal teardown events (worktree:delete:end /
+// worktree:reap:end) are intentionally unmapped: the worktree is gone,
+// so "down" already fired at teardown start and a second banner for
+// the completion would just be noise.
 func Bucket(eventType, level string) string {
 	switch eventType {
-	case "wt_finalize_start":
+	case store.EvtWorktreeCreateStart:
 		return BucketUp
-	case "wt_finalize_done":
+	case store.EvtWorktreeCreateEnd:
 		return BucketStable
-	case "wt_finalize":
-		// `wt_finalize` is only ever written as the terminal error event
-		// (see finalize.go / stale_finalize.go); gate on level so a
-		// future non-error use can't masquerade as a failure.
-		if level == "error" {
+	case store.EvtWorktreeCreateError:
+		// Only ever written as the terminal error event (see
+		// finalize.go / stale_finalize.go); gate on level so a future
+		// non-error use can't masquerade as a failure.
+		if level == store.LevelError {
 			return BucketFailed
 		}
 		return ""
-	case "wt_teardown_start", "wt_lifecycle_teardown_start":
+	case store.EvtWorktreeDeleteStart, store.EvtWorktreeReapStart:
 		return BucketDown
 	default:
 		return ""

@@ -9,7 +9,7 @@ import (
 )
 
 // PersistOutcome writes one hook_runs row per group and emits paired
-// hook_start / hook_done events for the phase as a whole. Safe to call
+// hooks:start / hooks:end events for the phase as a whole. Safe to call
 // with st == nil or wtID == 0 — both result in a no-op so non-daemon /
 // orphan call sites (where store wiring is awkward) can opt in
 // gradually.
@@ -80,18 +80,18 @@ func PersistOutcome(
 	}
 
 	msg := fmt.Sprintf("groups=%d failed=%d", len(out.Groups), failed)
-	_ = st.WriteEvent(ctx, level, "hook_done", msg, repoID, wtID, phase, dur, payload)
+	_ = st.WriteEvent(ctx, level, store.EvtHooksEnd, msg, repoID, wtID, phase, dur, payload)
 }
 
-// EmitHookStart writes a hook_start event so `treeman logs tail` shows
+// EmitHookStart writes a hooks:start event so `treeman logs tail` shows
 // the phase began even when every group succeeds and the only signal
-// would otherwise be a single hook_done. Safe to call with st == nil.
+// would otherwise be a single hooks:end. Safe to call with st == nil.
 func EmitHookStart(ctx context.Context, st *store.Store, repoID, wtID int64, phase string, entryCount int) int64 {
 	now := time.Now().UnixMilli()
 	if st == nil || wtID == 0 {
 		return now
 	}
-	_ = st.WriteEvent(ctx, store.LevelInfo, "hook_start",
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtHooksStart,
 		fmt.Sprintf("groups=%d", entryCount),
 		repoID, wtID, phase, 0,
 		map[string]any{"groups": entryCount})

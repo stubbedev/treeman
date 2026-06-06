@@ -21,6 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/stubbedev/treeman/internal/runid"
+	"github.com/stubbedev/treeman/internal/safego"
 )
 
 //go:embed migrations/*.sql
@@ -243,7 +244,7 @@ func (s *Store) StartEventBatcher(ctx context.Context) {
 	s.batchDone = make(chan struct{})
 	s.batchActive = true
 	s.batchMu.Unlock()
-	go s.eventBatchLoop() //nolint:gosec // long-lived background loop; intentionally detached from any request ctx
+	safego.Go("store:event-batch", "", s.eventBatchLoop)
 }
 
 // StopEventBatcher cancels the flusher and synchronously drains any

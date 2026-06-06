@@ -25,7 +25,7 @@ import (
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
-// goroutine) tail of `treeman wt create`: it runs the on-create
+// goroutine) tail of `treeman wt create`: it runs the create
 // hook pipeline + engine prepare against the main repo root,
 // detached from the CLI invocation.
 func FinalizeWorktree(
@@ -38,7 +38,7 @@ func FinalizeWorktree(
 	wtRoot := worktreePath
 	// Captured by the terminal-event defer below. Populated once the
 	// row identity is known so a hook/prepare error after that point
-	// always produces a wt_finalize event scoped to the right row.
+	// always produces a worktree:create:error event scoped to the right row.
 	var (
 		termRepoID int64
 		termWtID   int64
@@ -51,15 +51,15 @@ func FinalizeWorktree(
 			// Pre-identity error (LoadResolved, EnsureRepo,
 			// ResolveIdentity): we don't have a row to attach a
 			// terminal event to. Let the dispatch-level safety net at
-			// dispatch.go log a global wt_finalize error instead.
+			// dispatch.go log a global worktree:create:error error instead.
 			return
 		}
 		// Terminal event for `finalizeState` — without this, a
 		// prepare/hook failure leaves the row derived as preparing
 		// forever (see #11). Swallow the returned error afterwards so
 		// dispatch doesn't double-log the same failure as a second
-		// (row-less) wt_finalize event.
-		_ = st.Store.WriteEvent(ctx, store.LevelError, "wt_finalize", err.Error(),
+		// (row-less) worktree:create:error event.
+		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError, err.Error(),
 			termRepoID, termWtID, "", 0, map[string]string{
 				"repo_path":     repoRoot,
 				"worktree_path": wtRoot,
@@ -122,7 +122,7 @@ func FinalizeWorktree(
 		_ = st.Store.SaveInheritedEnv(ctx, wtID, inheritedEnv)
 	}
 
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_start",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateStart,
 		"daemon-detached setup + prepare beginning",
 		repoID, wtID, "", 0, nil)
 
@@ -130,7 +130,7 @@ func FinalizeWorktree(
 	// before firing hooks. Watcher-triggered finalize can race: the
 	// new worktree dir + .git file land first, the daemon's filesystem
 	// watcher sees them and dispatches finalize, but git is still
-	// writing subdirs. A user `on-create-before-engines` hook with a
+	// writing subdirs. A user `create-before-engines` hook with a
 	// `cwd: frontend` then fails with `cd: can't cd to frontend`. CLI-
 	// triggered finalize is already past the git wait so this is a
 	// near-zero-cost no-op there. Bounded so a wedged checkout still
@@ -182,8 +182,8 @@ func FinalizeWorktree(
 		applyFinalizePatches(ctx, st, &cfg, wtRoot, sl, repoID, wtID)
 	}
 
-	// Three-step setup pipeline: on-create-before-engines actions →
-	// engine prepare → on-create-after-engines actions. Each step waits
+	// Three-step setup pipeline: create-before-engines actions →
+	// engine prepare → create-after-engines actions. Each step waits
 	// for the previous on the daemon side; the CLI never sees this
 	// (it already returned).
 	//
@@ -203,24 +203,25 @@ func FinalizeWorktree(
 	if err := startWorktreeWatcher(ctx, st, repoRoot, wtRoot); err != nil {
 		slog.Warn("start worktree watcher", "wt", wtRoot, "err", err)
 	} else {
-		_ = st.Store.WriteEvent(ctx, store.LevelDebug, "worktree_watcher_started",
+		_ = st.Store.WriteEvent(ctx, store.LevelDebug, store.EvtWatchStart,
 			"per-worktree fsnotify watcher active",
 			repoID, wtID, "", 0, nil)
 	}
 
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateEnd,
 		"daemon-detached setup + prepare complete",
 		repoID, wtID, "", 0, nil)
 	return nil
 }
 
 // bringInWithEvents runs the link + copy bring-in passes for a non-main
-// worktree, emitting bring_in_start / bring_in_path (debug) / bring_in_done
-// events. Bring-in is the single biggest silent cost on create (a
-// recursive copy of e.g. vendor/ or node_modules/ can run for tens of
-// seconds); the per-entry line carries files + bytes + duration so a slow
-// copy is attributable to a specific configured path. Extracted from
-// FinalizeWorktree to keep that function under the complexity gate.
+// worktree, emitting <domain>:start / <domain>:path (debug) / <domain>:end
+// per pass where <domain> is `copies` or `links`. Bring-in is the single
+// biggest silent cost on create (a recursive copy of e.g. vendor/ or
+// node_modules/ can run for tens of seconds); the per-entry line carries
+// files + bytes + duration so a slow copy is attributable to a specific
+// configured path. Extracted from FinalizeWorktree to keep that function
+// under the complexity gate.
 func bringInWithEvents(
 	ctx context.Context,
 	st *State,
@@ -228,13 +229,15 @@ func bringInWithEvents(
 	cfg *config.Config,
 	repoID, wtID int64,
 ) error {
-	emit := func(mode string, paths []string) error {
+	// startEvt/pathEvt/endEvt are the copies:* or links:* event types;
+	// mode is the wt.BringInFilesReport verb (copy|link).
+	emit := func(startEvt, pathEvt, endEvt, mode string, paths []string) error {
 		if len(paths) == 0 {
 			return nil
 		}
-		_ = st.Store.WriteEvent(ctx, store.LevelInfo, "bring_in_start",
-			fmt.Sprintf("%s entries=%d", mode, len(paths)),
-			repoID, wtID, "", 0, map[string]any{"mode": mode, "entries": len(paths)})
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, startEvt,
+			fmt.Sprintf("entries=%d", len(paths)),
+			repoID, wtID, "", 0, map[string]any{"entries": len(paths)})
 		results, brErr := wt.BringInFilesReport(repoRoot, wtRoot, paths, mode, nil)
 		var files, brought, skipped int
 		var bytes, totalMs int64
@@ -244,26 +247,26 @@ func bringInWithEvents(
 			skipped += r.Skipped
 			bytes += r.Bytes
 			totalMs += r.DurationMs
-			_ = st.Store.WriteEvent(ctx, store.LevelDebug, "bring_in_path",
-				fmt.Sprintf("%s %s files=%d bytes=%d duration=%dms", mode, r.Rel, r.Files, r.Bytes, r.DurationMs),
+			_ = st.Store.WriteEvent(ctx, store.LevelDebug, pathEvt,
+				fmt.Sprintf("%s files=%d bytes=%d duration=%dms", r.Rel, r.Files, r.Bytes, r.DurationMs),
 				repoID, wtID, "", r.DurationMs, map[string]any{
-					"mode": mode, "path": r.Rel, "matches": r.Matches,
+					"path": r.Rel, "matches": r.Matches,
 					"brought": r.Brought, "skipped": r.Skipped, "missing": r.Missing,
 					"files": r.Files, "bytes": r.Bytes,
 				})
 		}
-		_ = st.Store.WriteEvent(ctx, store.LevelInfo, "bring_in_done",
-			fmt.Sprintf("%s entries=%d brought=%d skipped=%d files=%d bytes=%d", mode, len(results), brought, skipped, files, bytes),
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, endEvt,
+			fmt.Sprintf("entries=%d brought=%d skipped=%d files=%d bytes=%d", len(results), brought, skipped, files, bytes),
 			repoID, wtID, "", totalMs, map[string]any{
-				"mode": mode, "entries": len(results), "brought": brought,
+				"entries": len(results), "brought": brought,
 				"skipped": skipped, "files": files, "bytes": bytes,
 			})
 		return brErr
 	}
-	if err := emit("link", cfg.Worktrees.Links); err != nil {
+	if err := emit(store.EvtLinksStart, store.EvtLinksPath, store.EvtLinksEnd, "link", cfg.Worktrees.Links); err != nil {
 		return err
 	}
-	return emit("copy", cfg.Worktrees.Copies)
+	return emit(store.EvtCopiesStart, store.EvtCopiesPath, store.EvtCopiesEnd, "copy", cfg.Worktrees.Copies)
 }
 
 // allocatePortsWithEvents allocates the configured port slots for a
@@ -282,14 +285,14 @@ func allocatePortsWithEvents(
 	switch {
 	case err != nil:
 		slog.Warn("finalize: port allocation", "wt", wtRoot, "err", err)
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_port_alloc_error",
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtPortsError,
 			err.Error(), repoID, wtID, "", 0, nil)
 	case len(allocs) > 0:
 		slots := make(map[string]any, len(allocs))
 		for _, a := range allocs {
 			slots[a.Name] = a.Port
 		}
-		_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_port_alloc",
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtPortsAllocate,
 			fmt.Sprintf("allocated %d port slot(s)", len(allocs)),
 			repoID, wtID, "", 0, map[string]any{"slots": slots})
 	}
@@ -318,7 +321,7 @@ func applyFinalizePatches(
 			continue
 		}
 		if res.Outcome == patcher.Updated {
-			_ = st.Store.WriteEvent(ctx, store.LevelInfo, "patch_applied",
+			_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtPatchesApply,
 				fmt.Sprintf("driver=%s file=%s", res.Driver, res.File),
 				repoID, wtID, "", 0, map[string]string{
 					"driver": res.Driver,
@@ -332,10 +335,10 @@ func applyFinalizePatches(
 }
 
 // runFinalizeSetupPipeline runs the three-step setup pipeline:
-// on-create-before-engines actions → engine prepare →
-// on-create-after-engines actions. Each phase boundary is a
+// create-before-engines actions → engine prepare →
+// create-after-engines actions. Each phase boundary is a
 // cancellation checkpoint: when a concurrent TeardownWorktree fires
-// `cancel`, the next check writes a wt_finalize_cancelled event and
+// `cancel`, the next check writes a worktree:create:cancel event and
 // returns (done=true, nil) so the caller stops short of starting the
 // watcher / emitting the done event. A non-nil error aborts the
 // pipeline. Extracted from FinalizeWorktree to keep that function
@@ -353,7 +356,7 @@ func runFinalizeSetupPipeline(
 	if cancelledBefore(ctx, st, "pre-hooks", repoID, wtID) {
 		return true, nil
 	}
-	if err := runTriggerActions(ctx, st, "on-create-before-engines",
+	if err := runTriggerActions(ctx, st, "create-before-engines",
 		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
 		isMain, repoID, wtID, inheritedEnv); err != nil {
 		return false, err
@@ -378,7 +381,7 @@ func runFinalizeSetupPipeline(
 	if cancelledBefore(ctx, st, "post-hooks", repoID, wtID) {
 		return true, nil
 	}
-	if err := runTriggerActions(ctx, st, "on-create-after-engines",
+	if err := runTriggerActions(ctx, st, "create-after-engines",
 		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
 		isMain, repoID, wtID, inheritedEnv); err != nil {
 		return false, err
@@ -388,7 +391,7 @@ func runFinalizeSetupPipeline(
 
 // cancelledBefore is a phase-boundary cancellation checkpoint: when a
 // concurrent TeardownWorktree has fired `cancel`, it records a
-// wt_finalize_cancelled event naming the phase about to be skipped and
+// worktree:create:cancel event naming the phase about to be skipped and
 // reports true so the pipeline bails. Isolating the ctx.Err() check
 // here keeps the "cancelled, not an error" return out of the call
 // site's error-handling flow.
@@ -396,7 +399,7 @@ func cancelledBefore(ctx context.Context, st *State, phase string, repoID, wtID 
 	if ctx.Err() == nil {
 		return false
 	}
-	_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
+	_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeCreateCancel,
 		"finalize aborted before "+phase, repoID, wtID, "", 0, nil)
 	return true
 }
@@ -589,15 +592,15 @@ func TeardownWorktree(
 	slugVal := row.Slug
 	worktreesRoot := worktreesRootOf(cfg.Worktrees.Root, repoRoot)
 
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_start",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteStart,
 		"daemon-detached teardown hooks + db teardown + git remove beginning",
 		repoID, wtID, "", 0, nil)
 
-	// Three-step teardown: on-delete-before-engines actions →
+	// Three-step teardown: delete-before-engines actions →
 	// engine drop (inline + synchronous so post-engine actions can
-	// observe the drop) → on-delete-after-engines actions. Drop
+	// observe the drop) → delete-after-engines actions. Drop
 	// failures are logged but don't abort the rest.
-	_ = runTriggerActions(ctx, st, "on-delete-before-engines",
+	_ = runTriggerActions(ctx, st, "delete-before-engines",
 		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, slugVal,
 		row.IsMain, repoID, wtID, inheritedEnv)
 	if len(cfg.Databases) > 0 {
@@ -605,7 +608,7 @@ func TeardownWorktree(
 			slog.Warn("teardown DB drop", "wt", wtRoot, "err", err)
 		}
 	}
-	_ = runTriggerActions(ctx, st, "on-delete-after-engines",
+	_ = runTriggerActions(ctx, st, "delete-after-engines",
 		cfg.Hooks.OnDeleteAfterEngines, repoRoot, wtRoot, slugVal,
 		row.IsMain, repoID, wtID, inheritedEnv)
 
@@ -634,7 +637,7 @@ func TeardownWorktree(
 	_ = st.Store.ClearActiveBranchesForWorktree(ctx, wtID)
 
 	_ = st.Store.MarkWorktreeDeleted(ctx, wtID)
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_done",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteEnd,
 		"daemon-detached teardown complete",
 		repoID, wtID, "", 0, nil)
 
@@ -779,7 +782,7 @@ func detectBranch(worktree string) string {
 // before this point, so the first probe succeeds instantly; the wait
 // only kicks in on the watcher-triggered path.
 //
-// Always emits a `checkout_wait` event so the stage is never invisible:
+// Always emits a `worktree:create:checkout` event so the stage is never invisible:
 // at info level when the wait was non-trivial (>50ms) so a slow checkout
 // stands out, at debug otherwise (the instant CLI-triggered path).
 func waitForCheckoutSettled(ctx context.Context, st *State, wtRoot string, repoID, wtID int64, timeout time.Duration) error {
@@ -792,7 +795,7 @@ func waitForCheckoutSettled(ctx context.Context, st *State, wtRoot string, repoI
 			if waited > 50*time.Millisecond {
 				level = store.LevelInfo
 			}
-			_ = st.Store.WriteEvent(ctx, level, "checkout_wait",
+			_ = st.Store.WriteEvent(ctx, level, store.EvtWorktreeCreateCheckout,
 				fmt.Sprintf("git worktree add settled after %dms", waited.Milliseconds()),
 				repoID, wtID, "", waited.Milliseconds(), map[string]any{
 					"waited_ms": waited.Milliseconds(),

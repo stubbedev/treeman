@@ -75,9 +75,9 @@ type Config struct {
 
 	// Lifecycle hooks fired around worktree create/delete/checkout and
 	// on watched-file changes. A flat block of trigger-keyed action
-	// lists (on-create-before-engines, on-create-after-engines,
-	// on-delete-before-engines, on-delete-after-engines, on-checkout,
-	// on-file-change); see HooksConfig. Dispatched non-blocking via
+	// lists (create-before-engines, create-after-engines,
+	// delete-before-engines, delete-after-engines, checkout,
+	// file-change); see HooksConfig. Dispatched non-blocking via
 	// the daemon; when the daemon is unreachable they run inline
 	// (blocking) in the CLI.
 	Hooks HooksConfig `yaml:"hooks,omitempty" scope:"repo"`
@@ -1012,22 +1012,22 @@ type Patch struct {
 //
 // Triggers (all optional — omit any you don't need):
 //
-//   - on-create-before-engines — during `wt create`, after patches +
+//   - create-before-engines — during `wt create`, after patches +
 //     bring-in (copies/links), BEFORE engine prepare. Standard
 //     home of dependency installs (composer/yarn/pip) so migrate
 //     can find vendor/.
-//   - on-create-after-engines — during `wt create`, after engine
+//   - create-after-engines — during `wt create`, after engine
 //     prepare. Use when actions need a populated database
 //     (cache warming, seed verification).
-//   - on-delete-before-engines — during `wt delete`, BEFORE DB
+//   - delete-before-engines — during `wt delete`, BEFORE DB
 //     drop. Graceful shutdown: drain queues, docker compose stop.
-//   - on-delete-after-engines — during `wt delete`, AFTER DB drop +
+//   - delete-after-engines — during `wt delete`, AFTER DB drop +
 //     git worktree remove. External notifications (Slack, CDN
 //     purge) that should announce only once the data is gone.
-//   - on-checkout — fires when the HEAD watcher sees a branch
+//   - checkout — fires when the HEAD watcher sees a branch
 //     switch inside an existing worktree. Re-runs in addition to
 //     the regular finalize-on-HEAD-change behaviour.
-//   - on-file-change — fires when any `databases[].inputs[]` glob
+//   - file-change — fires when any `databases[].inputs[]` glob
 //     matches a filesystem event. Each action can optionally
 //     `match: <label>` to filter by the input entry's label.
 //
@@ -1036,21 +1036,21 @@ type Patch struct {
 type HooksConfig struct {
 	// OnCreateBeforeEngines — actions fire after worktree create +
 	// patches + bring-in, before engine prepare.
-	OnCreateBeforeEngines []Action `yaml:"on-create-before-engines,omitempty"`
+	OnCreateBeforeEngines []Action `yaml:"create-before-engines,omitempty"`
 
 	// OnCreateAfterEngines — actions fire after engine prepare completes.
-	OnCreateAfterEngines []Action `yaml:"on-create-after-engines,omitempty"`
+	OnCreateAfterEngines []Action `yaml:"create-after-engines,omitempty"`
 
 	// OnDeleteBeforeEngines — actions fire before DB drop on delete.
-	OnDeleteBeforeEngines []Action `yaml:"on-delete-before-engines,omitempty"`
+	OnDeleteBeforeEngines []Action `yaml:"delete-before-engines,omitempty"`
 
 	// OnDeleteAfterEngines — actions fire after DB drop + worktree
 	// remove on delete.
-	OnDeleteAfterEngines []Action `yaml:"on-delete-after-engines,omitempty"`
+	OnDeleteAfterEngines []Action `yaml:"delete-after-engines,omitempty"`
 
 	// OnCheckout — actions fire when the HEAD watcher detects a
 	// branch switch inside an existing worktree.
-	OnCheckout []Action `yaml:"on-checkout,omitempty"`
+	OnCheckout []Action `yaml:"checkout,omitempty"`
 
 	// OnFileChange — actions fire when any `databases[].inputs[]`
 	// glob matches a filesystem event. Each action can optionally
@@ -1063,11 +1063,11 @@ type HooksConfig struct {
 	//   TREEMAN_WATCH_LABEL  — the label on the matched watch entry (or "")
 	//   TREEMAN_WATCH_ENGINE — engine of the owning database (mysql, postgres, …)
 	//   TREEMAN_WATCH_DB_NAME — rendered name_template of the owning database
-	OnFileChange []FilteredAction `yaml:"on-file-change,omitempty"`
+	OnFileChange []FilteredAction `yaml:"file-change,omitempty"`
 }
 
 // Action — one entry in a `hooks.<trigger>` list (e.g.
-// `hooks.on-create-before-engines`). Every action is a mapping;
+// `hooks.create-before-engines`). Every action is a mapping;
 // there are no shorthand forms.
 //
 //   - `run` is the work, as either a single shell string (one
@@ -1277,7 +1277,7 @@ type DatabaseConfig struct {
 	//   1. Contributes a hash to the snapshot fingerprint (so any
 	//      change auto-invalidates the cached template).
 	//   2. Subscribes fsnotify so changes trigger a re-prep.
-	//   3. Carries an optional `label:` that `hooks.on-file-change`
+	//   3. Carries an optional `label:` that `hooks.file-change`
 	//      actions can match against.
 	//
 	// Glob patterns are repo-root-relative. Hash mode is per-entry:
@@ -1378,7 +1378,7 @@ type Input struct {
 	// Required.
 	Glob string `yaml:"glob"`
 
-	// Optional label that `hooks.on-file-change` actions can match
+	// Optional label that `hooks.file-change` actions can match
 	// against via their `match:` field. Multiple entries can share a
 	// label so one action handles a logical group of file types.
 	Label string `yaml:"label,omitempty"`
@@ -1392,7 +1392,7 @@ type Input struct {
 func (Input) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
 	props.Set("glob", &jsonschema.Schema{Type: "string", Description: "Glob pattern (repo-root-relative). Required."})
-	props.Set("label", &jsonschema.Schema{Type: "string", Description: "Optional label for `hooks.on-file-change` matchers."})
+	props.Set("label", &jsonschema.Schema{Type: "string", Description: "Optional label for `hooks.file-change` matchers."})
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
 			{Type: "string", Description: "Bare glob string. Equivalent to `{glob: <this string>}`."},
@@ -1424,7 +1424,7 @@ func (i *Input) UnmarshalYAML(node *yaml.Node) error {
 
 // FilteredAction is an Action with an optional `match:` that
 // filters which watch labels can trigger it. Used by
-// `hooks.on-file-change`.
+// `hooks.file-change`.
 type FilteredAction struct {
 	// Match restricts the action to a set of watch labels. Accepts
 	// either a single string (`match: migrations`) or a list of
@@ -1464,7 +1464,7 @@ func (FilteredAction) JSONSchema() *jsonschema.Schema {
 // Action's UnmarshalYAML.
 func (f *FilteredAction) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("on-file-change action (line %d): want a mapping", node.Line)
+		return fmt.Errorf("file-change action (line %d): want a mapping", node.Line)
 	}
 	// Pull the `match:` value out separately so we can accept both
 	// scalar + sequence forms. Other keys are decoded by Action.
@@ -1482,12 +1482,12 @@ func (f *FilteredAction) UnmarshalYAML(node *yaml.Node) error {
 			f.Match = make([]string, 0, len(v.Content))
 			for _, child := range v.Content {
 				if child.Kind != yaml.ScalarNode {
-					return fmt.Errorf("on-file-change (line %d): every `match` entry must be a string label", child.Line)
+					return fmt.Errorf("file-change (line %d): every `match` entry must be a string label", child.Line)
 				}
 				f.Match = append(f.Match, child.Value)
 			}
 		default:
-			return fmt.Errorf("on-file-change (line %d): `match` must be a string or list of strings", v.Line)
+			return fmt.Errorf("file-change (line %d): `match` must be a string or list of strings", v.Line)
 		}
 		break
 	}
@@ -1692,6 +1692,10 @@ type TestClonesSpec struct {
 	NameTemplate string `yaml:"name_template"`
 }
 
+// clonesAuto is the sentinel `clones:` value selecting CPU-based
+// auto-sizing (vs an explicit integer).
+const clonesAuto = "auto"
+
 // ClonesSetting — `clones: auto | <integer>`.
 type ClonesSetting struct {
 	Auto  bool
@@ -1710,7 +1714,7 @@ func (ClonesSetting) JSONSchema() *jsonschema.Schema {
 		OneOf: []*jsonschema.Schema{
 			{
 				Type:        "string",
-				Enum:        []any{"auto"},
+				Enum:        []any{clonesAuto},
 				Description: "Detect the test framework and pre-warm one clone per CPU when it parallelizes per-worker (else 1).",
 			},
 			{
@@ -1725,7 +1729,7 @@ func (ClonesSetting) JSONSchema() *jsonschema.Schema {
 // UnmarshalYAML parses `auto` or a non-negative integer.
 func (c *ClonesSetting) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind == yaml.ScalarNode {
-		if node.Value == "auto" || node.Value == "" {
+		if node.Value == clonesAuto || node.Value == "" {
 			c.Auto = true
 			return nil
 		}

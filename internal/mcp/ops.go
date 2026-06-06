@@ -132,13 +132,13 @@ func captureEnv() map[string]string {
 	return out
 }
 
-// writeMCPEvent records that an MCP tool performed `action` against
-// `repoID` (optional). Best-effort: failures are swallowed so an
-// audit-log glitch doesn't fail the underlying operation. All
-// MCP-originated events share the `mcp_` event_type prefix and a
-// `mcp=true` payload key so `logs grep mcp_` produces a clean
-// audit trail.
-func writeMCPEvent(ctx context.Context, action, message string, repoID int64, payload map[string]string) {
+// writeMCPEvent records that an MCP tool emitted `eventType` (a
+// store.EvtMCP* constant) against `repoID` (optional). Best-effort:
+// failures are swallowed so an audit-log glitch doesn't fail the
+// underlying operation. All MCP-originated events share the `mcp:`
+// prefix and a `mcp=true` payload key so `logs grep mcp:` produces a
+// clean audit trail.
+func writeMCPEvent(ctx context.Context, eventType, message string, repoID int64, payload map[string]string) {
 	st, err := openStore(ctx)
 	if err != nil {
 		return
@@ -148,7 +148,7 @@ func writeMCPEvent(ctx context.Context, action, message string, repoID int64, pa
 		payload = map[string]string{}
 	}
 	payload["mcp"] = "true"
-	_ = st.WriteEvent(ctx, store.LevelInfo, "mcp_"+action, message, repoID, 0, "", 0, payload)
+	_ = st.WriteEvent(ctx, store.LevelInfo, eventType, message, repoID, 0, "", 0, payload)
 }
 
 // openStore opens the default SQLite event store. Caller closes.
@@ -376,19 +376,19 @@ func runHookPhase(ctx context.Context, phase, worktree string, envOverrides map[
 
 	var entries []config.Action
 	switch phase {
-	case "on-create-before-engines":
+	case "create-before-engines":
 		entries = cfg.Hooks.OnCreateBeforeEngines
-	case "on-create-after-engines":
+	case "create-after-engines":
 		entries = cfg.Hooks.OnCreateAfterEngines
-	case "on-delete-before-engines":
+	case "delete-before-engines":
 		entries = cfg.Hooks.OnDeleteBeforeEngines
-	case "on-delete-after-engines":
+	case "delete-after-engines":
 		entries = cfg.Hooks.OnDeleteAfterEngines
-	case "on-checkout":
+	case "checkout":
 		entries = cfg.Hooks.OnCheckout
 	default:
 		return hooks.RunOutcome{}, fmt.Errorf(
-			"unknown phase %q (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)",
+			"unknown phase %q (want create-before-engines|create-after-engines|delete-before-engines|delete-after-engines|checkout)",
 			phase,
 		)
 	}

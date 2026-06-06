@@ -170,42 +170,42 @@ databases:
       branch_scoped: false
 # Lifecycle hooks fired around worktree create/delete/checkout and
 hooks:
-    on-create-before-engines:
+    create-before-engines:
         - run: '...'
           cwd: '...'
           container: '...'
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
-    on-create-after-engines:
+    create-after-engines:
         - run: '...'
           cwd: '...'
           container: '...'
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
-    on-delete-before-engines:
+    delete-before-engines:
         - run: '...'
           cwd: '...'
           container: '...'
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
-    on-delete-after-engines:
+    delete-after-engines:
         - run: '...'
           cwd: '...'
           container: '...'
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
-    on-checkout:
+    checkout:
         - run: '...'
           cwd: '...'
           container: '...'
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
-    on-file-change:
+    file-change:
         - run: '...'
           cwd: '...'
           container: '...'
@@ -306,9 +306,9 @@ and optional namespace template.
 
 Lifecycle hooks fired around worktree create/delete/checkout and
 on watched-file changes. A flat block of trigger-keyed action
-lists (on-create-before-engines, on-create-after-engines,
-on-delete-before-engines, on-delete-after-engines, on-checkout,
-on-file-change); see HooksConfig. Dispatched non-blocking via
+lists (create-before-engines, create-after-engines,
+delete-before-engines, delete-after-engines, checkout,
+file-change); see HooksConfig. Dispatched non-blocking via
 the daemon; when the daemon is unreachable they run inline
 (blocking) in the CLI.
 
@@ -602,7 +602,7 @@ template state. Each entry:
   1. Contributes a hash to the snapshot fingerprint (so any
      change auto-invalidates the cached template).
   2. Subscribes fsnotify so changes trigger a re-prep.
-  3. Carries an optional `label:` that `hooks.on-file-change`
+  3. Carries an optional `label:` that `hooks.file-change`
      actions can match against.
 
 Glob patterns are repo-root-relative. Hash mode is per-entry:
@@ -771,52 +771,52 @@ point, so there's no separate `when:` field anywhere.
 
 Triggers (all optional — omit any you don't need):
 
-  - on-create-before-engines — during `wt create`, after patches +
+  - create-before-engines — during `wt create`, after patches +
     bring-in (copies/links), BEFORE engine prepare. Standard
     home of dependency installs (composer/yarn/pip) so migrate
     can find vendor/.
-  - on-create-after-engines — during `wt create`, after engine
+  - create-after-engines — during `wt create`, after engine
     prepare. Use when actions need a populated database
     (cache warming, seed verification).
-  - on-delete-before-engines — during `wt delete`, BEFORE DB
+  - delete-before-engines — during `wt delete`, BEFORE DB
     drop. Graceful shutdown: drain queues, docker compose stop.
-  - on-delete-after-engines — during `wt delete`, AFTER DB drop +
+  - delete-after-engines — during `wt delete`, AFTER DB drop +
     git worktree remove. External notifications (Slack, CDN
     purge) that should announce only once the data is gone.
-  - on-checkout — fires when the HEAD watcher sees a branch
+  - checkout — fires when the HEAD watcher sees a branch
     switch inside an existing worktree. Re-runs in addition to
     the regular finalize-on-HEAD-change behaviour.
-  - on-file-change — fires when any `databases[].inputs[]` glob
+  - file-change — fires when any `databases[].inputs[]` glob
     matches a filesystem event. Each action can optionally
     `match: <label>` to filter by the input entry's label.
 
 Daemon execution is always non-blocking from the CLI's
 perspective — each list of actions dispatches in parallel.
 
-#### `on-create-before-engines` *(array of [Action](#action))*
+#### `create-before-engines` *(array of [Action](#action))*
 
 OnCreateBeforeEngines — actions fire after worktree create +
 patches + bring-in, before engine prepare.
 
-#### `on-create-after-engines` *(array of [Action](#action))*
+#### `create-after-engines` *(array of [Action](#action))*
 
 OnCreateAfterEngines — actions fire after engine prepare completes.
 
-#### `on-delete-before-engines` *(array of [Action](#action))*
+#### `delete-before-engines` *(array of [Action](#action))*
 
 OnDeleteBeforeEngines — actions fire before DB drop on delete.
 
-#### `on-delete-after-engines` *(array of [Action](#action))*
+#### `delete-after-engines` *(array of [Action](#action))*
 
 OnDeleteAfterEngines — actions fire after DB drop + worktree
 remove on delete.
 
-#### `on-checkout` *(array of [Action](#action))*
+#### `checkout` *(array of [Action](#action))*
 
 OnCheckout — actions fire when the HEAD watcher detects a
 branch switch inside an existing worktree.
 
-#### `on-file-change` *(array of [FilteredAction](#filteredaction))*
+#### `file-change` *(array of [FilteredAction](#filteredaction))*
 
 OnFileChange — actions fire when any `databases[].inputs[]`
 glob matches a filesystem event. Each action can optionally

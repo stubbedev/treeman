@@ -60,7 +60,7 @@ func RegisterNotifier(st *State) {
 // block event ingestion.
 func NotifyHook(st *State, nc config.NotificationsConfig, sender notify.Sender) store.EventHook {
 	return func(ev store.Event) {
-		go dispatchNotification(st.BgCtx, st, nc, sender, ev)
+		safeGo(lblNotify, "", func() { dispatchNotification(st.BgCtx, st, nc, sender, ev) })
 	}
 }
 

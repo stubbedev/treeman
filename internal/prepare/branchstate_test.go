@@ -364,18 +364,18 @@ func TestMigrateSkippedOnUnchangedResume(t *testing.T) {
 	f.migrateFP = "fp-A"
 
 	f.run("develop") // fresh → builtEmpty → migrate runs, records fp-A
-	if n := f.eventCount("migrate_skip"); n != 0 {
+	if n := f.eventCount(store.EvtMigrateSkip); n != 0 {
 		t.Fatalf("first build must migrate, got %d skips", n)
 	}
 
 	f.run("develop") // noop, fp unchanged → skip
-	if n := f.eventCount("migrate_skip"); n != 1 {
+	if n := f.eventCount(store.EvtMigrateSkip); n != 1 {
 		t.Fatalf("unchanged resume must skip migrate, got %d skips", n)
 	}
 
 	f.migrateFP = "fp-B" // a migration landed
 	f.run("develop")     // noop but fp changed → migrate runs again
-	if n := f.eventCount("migrate_skip"); n != 1 {
+	if n := f.eventCount(store.EvtMigrateSkip); n != 1 {
 		t.Fatalf("changed fingerprint must re-migrate (no new skip), got %d skips", n)
 	}
 }
@@ -448,8 +448,8 @@ func TestCaptureSkippedOnCleanBounce(t *testing.T) {
 	if f.fake.captureCalls != c0 {
 		t.Fatalf("clean bounce must skip capture: captureCalls %d → %d", c0, f.fake.captureCalls)
 	}
-	if f.eventCount("capture_skip") != 1 {
-		t.Fatalf("expected one capture_skip event, got %d", f.eventCount("capture_skip"))
+	if f.eventCount(store.EvtBranchCaptureSkip) != 1 {
+		t.Fatalf("expected one capture_skip event, got %d", f.eventCount(store.EvtBranchCaptureSkip))
 	}
 	// durable(develop) still holds develop's data — the skip was safe.
 	if dd := f.fake.data[f.durable("develop")]; dd["d"] != "1" {
@@ -487,8 +487,8 @@ func TestCaptureNeverSkippedWithoutWatermark(t *testing.T) {
 	if f.fake.captureCalls != c0+1 {
 		t.Fatalf("no-watermark engine must always capture: captureCalls %d → %d (want +1)", c0, f.fake.captureCalls)
 	}
-	if f.eventCount("capture_skip") != 0 {
-		t.Fatalf("no-watermark engine must never emit capture_skip, got %d", f.eventCount("capture_skip"))
+	if f.eventCount(store.EvtBranchCaptureSkip) != 0 {
+		t.Fatalf("no-watermark engine must never emit capture_skip, got %d", f.eventCount(store.EvtBranchCaptureSkip))
 	}
 }
 

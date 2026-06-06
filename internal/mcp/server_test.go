@@ -20,8 +20,8 @@ var allTools = []string{
 	"config_diff", "config_history", "inputs_fingerprint", "prepare_dry_run",
 	"prompts_list",
 	// engine
-	"engine_status", "db_schema_dump", "db_query", "snapshot_inspect",
-	"hook_log_read", "snapshot_drop", "db_dump", "connection_probe",
+	"engine_status", "db_schema_dump", "db_query", "snapshots_inspect",
+	"hook_log_read", "snapshots_drop", "db_dump", "connection_probe",
 	"engine_logs", "es_request",
 	// write
 	"prepare_run", "db_reset", "hook_run", "config_write", "config_set",

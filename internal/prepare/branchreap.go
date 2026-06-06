@@ -91,7 +91,7 @@ func ReapBranchDurables(ctx context.Context, cfg *config.Config, st *store.Store
 				continue
 			}
 			_ = st.DeleteBranchDurable(ctx, repoID, dur)
-			_ = st.WriteEvent(ctx, store.LevelInfo, "branch_durable_reaped",
+			_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtBranchReap,
 				fmt.Sprintf("%s: dropped durable for deleted branch %q (active=%s)", eng.engine, branch, active),
 				repoID, wt.ID, "", 0, map[string]string{
 					"engine":  eng.engine,
@@ -161,7 +161,7 @@ func ReapOrphanDurables(ctx context.Context, cfg *config.Config, st *store.Store
 				continue
 			}
 			_ = st.DeleteBranchDurable(ctx, repoID, d.DurableName)
-			_ = st.WriteEvent(ctx, store.LevelInfo, "branch_durable_reaped",
+			_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtBranchReap,
 				fmt.Sprintf("%s: dropped orphan durable for absent branch %q (active=%s)", eng, d.Branch, d.DBKey),
 				repoID, d.WorktreeID, "", 0, map[string]string{
 					"engine":  eng,

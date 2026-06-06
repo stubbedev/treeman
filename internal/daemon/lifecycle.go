@@ -94,7 +94,7 @@ func StartLifecycleWatcher(ctx context.Context, st *State, repoID int64, repoPat
 		},
 	}
 	st.RegisterLifecycleWatcher(repoPath, entry)
-	safeGo("lifecycle:"+repoPath, func() { lw.loop(wctx) })
+	safeGo(lblLifecycle, repoPath, func() { lw.loop(wctx) })
 	slog.Info("lifecycle watcher started", "repo", repoPath, "admin_root", adminRoot)
 	return lw, nil
 }
@@ -313,11 +313,11 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 			admin := admin
 			wg.Add(1)
 			sem <- struct{}{}
-			go func() {
+			safeGo(lblLifecycle, admin, func() {
 				defer wg.Done()
 				defer func() { <-sem }()
 				lw.onCreate(ctx, admin)
-			}()
+			})
 			continue
 		}
 		// Row exists and active — make sure admin_dir is stamped
@@ -338,11 +338,11 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 
 		wg.Add(1)
 		sem <- struct{}{}
-		go func() {
+		safeGo(lblLifecycle, admin, func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			lw.onRemove(ctx, admin)
-		}()
+		})
 	}
 	wg.Wait()
 	return nil
@@ -381,7 +381,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 		return nil
 	}
 
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_lifecycle_teardown_start",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeReapStart,
 		"lifecycle watcher: teardown hooks + db teardown beginning",
 		repoID, row.ID, "", 0, nil)
 
@@ -398,10 +398,10 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 			repoPath, wtPath, row.Slug, logDir, row.IsMain, map[string]string{}, true)
 		hooks.PersistOutcome(ctx, st.Store, repoID, row.ID, trigger, started, nowMillis(), out)
 	}
-	runOrphan("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
+	runOrphan("delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
 
 	if len(cfg.Databases) > 0 {
-		// Inline drop so on-delete-after-engines actions observe a
+		// Inline drop so delete-after-engines actions observe a
 		// fully-dropped state. The lifecycle goroutine already runs
 		// detached from the originating fsnotify event, so the cost
 		// stays off the user's CLI hot path.
@@ -409,7 +409,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 			slog.Warn("lifecycle teardown DB drop", "wt", wtPath, "err", err)
 		}
 	}
-	runOrphan("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
+	runOrphan("delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
 
 	// Physically release the port reservations and active-branch markers,
 	// same as the CLI delete path. A bare MarkWorktreeDeleted leaves the
@@ -421,7 +421,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 	if err := st.Store.MarkWorktreeDeleted(ctx, row.ID); err != nil {
 		return err
 	}
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_lifecycle_teardown_done",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeReapEnd,
 		"lifecycle watcher: teardown + db teardown complete",
 		repoID, row.ID, "", 0, nil)
 	return nil

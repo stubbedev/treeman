@@ -32,7 +32,7 @@ func TestEmitPhaseDone_WritesEventWithPhaseAndDuration(t *testing.T) {
 
 	evs, err := s.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{"prepare_phase"},
+		EventTypes: []string{store.EvtPreparePhase},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestEmitPhaseDone_RunIDInjectedFromCtx(t *testing.T) {
 
 	evs, _ := s.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{"prepare_phase"},
+		EventTypes: []string{store.EvtPreparePhase},
 	})
 	if len(evs) != 1 {
 		t.Fatalf("want 1 event, got %d", len(evs))

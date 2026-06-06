@@ -35,7 +35,7 @@ func EvictExcess(ctx context.Context, cfg *config.Config, st *store.Store, repoI
 		slog.Warn("snapshot eviction lookup", "repo_id", repoID, "err", err)
 		return
 	}
-	evictCandidates(ctx, cfg, st, candidates, repoID, "snapshot_evict", "snapshot eviction",
+	evictCandidates(ctx, cfg, st, candidates, repoID, store.EvtSnapshotsEvictCap, "snapshot eviction",
 		func(c store.SnapshotEvictionCandidate) string {
 			return fmt.Sprintf("evicted %s (%s)", c.TemplateName, c.Engine)
 		})
@@ -104,7 +104,7 @@ func PurgeRepo(ctx context.Context, cfg *config.Config, st *store.Store, repoID 
 			continue
 		}
 		dropped++
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_purge",
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsPurge,
 			fmt.Sprintf("purged %s (%s)", c.TemplateName, c.Engine),
 			repoID, 0, "", 0, map[string]string{
 				"engine":      c.Engine,
@@ -133,7 +133,7 @@ func SweepBySource(ctx context.Context, cfg *config.Config, st *store.Store) {
 		slog.Warn("snapshot source sweep query", "err", err)
 		return
 	}
-	evictCandidates(ctx, cfg, st, cands, 0, "snapshot_source_evict", "snapshot source sweep",
+	evictCandidates(ctx, cfg, st, cands, 0, store.EvtSnapshotsEvictSource, "snapshot source sweep",
 		func(c store.SnapshotEvictionCandidate) string {
 			return fmt.Sprintf("evicted %s (over keep_per_source=%d)", c.TemplateName, keep)
 		})
@@ -171,7 +171,7 @@ func SweepByAge(ctx context.Context, cfg *config.Config, st *store.Store) {
 		slog.Warn("snapshot age sweep query", "err", err)
 		return
 	}
-	evictCandidates(ctx, cfg, st, cands, 0, "snapshot_age_evict", "snapshot age sweep",
+	evictCandidates(ctx, cfg, st, cands, 0, store.EvtSnapshotsEvictAge, "snapshot age sweep",
 		func(c store.SnapshotEvictionCandidate) string {
 			return fmt.Sprintf("evicted %s (older than %dd)", c.TemplateName, days)
 		})
@@ -217,7 +217,7 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
 		}
 		total -= sizes[i]
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_size_evict",
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsEvictSize,
 			fmt.Sprintf("evicted %s (size=%d)", c.TemplateName, sizes[i]),
 			0, 0, "", 0, map[string]string{
 				"engine":      c.Engine,

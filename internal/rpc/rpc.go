@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/stubbedev/treeman/internal/safego"
 )
 
 // ProtocolVersion is bumped when an incompatible RPC change ships.
@@ -106,22 +108,44 @@ type Request struct {
 // Task type values — the concrete operation a Task performs. The daemon
 // is the sole executor; every state mutation is one of these.
 const (
-	TaskPrepare        = "prepare"         // prepare.Run
-	TaskDBReset        = "db_reset"        // drop branch-scoped + re-prepare
-	TaskHookRun        = "hook_run"        // run one hook phase
-	TaskSnapshotsPurge = "snapshots_purge" // drop every cached template DB
-	TaskMainPurgeDBs   = "main_purge_dbs"  // drop main_<branch> DBs across branches
-	TaskWtRegister     = "wt_register"     // EnsureRepo + EnsureWorktree row
-	TaskWtUnregister   = "wt_unregister"   // mark a worktree row deleted
-	TaskLogsPurge      = "logs_purge"      // delete event-log rows by filter
-	TaskRegistryRepair = "registry_repair" // reconcile SQLite vs git worktree list
-	TaskConfigWrite    = "config_write"    // snapshot + atomic-write .treeman.yaml + reload
+	TaskPrepare            = "prepare"             // prepare.Run
+	TaskDBReset            = "db_reset"            // drop branch-scoped + re-prepare
+	TaskHookRun            = "hook_run"            // run one hook phase
+	TaskSnapshotsPurge     = "snapshots_purge"     // drop every cached template DB
+	TaskMainPurgeDBs       = "main_purge_dbs"      // drop main_<branch> DBs across branches
+	TaskWorktreeRegister   = "worktree_register"   // EnsureRepo + EnsureWorktree row
+	TaskWorktreeUnregister = "worktree_unregister" // mark a worktree row deleted
+	TaskLogsPurge          = "logs_purge"          // delete event-log rows by filter
+	TaskRegistryRepair     = "registry_repair"     // reconcile SQLite vs git worktree list
+	TaskConfigWrite        = "config_write"        // snapshot + atomic-write .treeman.yaml + reload
 	// Worktree lifecycle, folded into the plan model. Booleans ride in
 	// Params ("force"/"no_fetch"/"skip_hooks"/"skip_prepare" == "1");
 	// create's from/path overrides ride in Params["from"]/["path"].
 	TaskWorktreeCreate   = "worktree_create"   // git add + register + ports (+ async finalize)
 	TaskWorktreeFinalize = "worktree_finalize" // setup hooks + prepare tail
 	TaskWorktreeTeardown = "worktree_teardown" // teardown hooks + DB drop + git remove
+)
+
+// Task.Params keys — the string-keyed side-channel a Task carries
+// (booleans encoded as "1"). Single source of truth for this wire
+// contract so the CLI producers and daemon consumers can't drift on a
+// typo. snake_case, matching the RPC method/task convention.
+const (
+	ParamBranch       = "branch"
+	ParamFrom         = "from"
+	ParamPath         = "path"
+	ParamPhase        = "phase"
+	ParamForce        = "force"
+	ParamBody         = "body"
+	ParamEngineFilter = "engine_filter"
+	ParamNoFetch      = "no_fetch"
+	ParamSkipHooks    = "skip_hooks"
+	ParamSkipPrepare  = "skip_prepare"
+	ParamLevels       = "levels"
+	ParamEventTypes   = "event_types"
+	ParamUntilMs      = "until_ms"
+	ParamRepo         = "repo"
+	ParamWorktree     = "worktree"
 )
 
 // RepoRegisterArgs — Register or update a repo.
@@ -425,12 +449,12 @@ func SubscribeEvents(ctx context.Context, args EventSubscribeArgs) (<-chan Event
 		_ = conn.Close()
 	}
 
-	go func() {
+	safego.Go("rpc:subscribe:closer", "", func() {
 		<-subCtx.Done()
 		_ = conn.Close()
-	}()
+	})
 
-	go func() {
+	safego.Go("rpc:subscribe:read", "", func() {
 		defer close(out)
 		defer cancel()
 		dec := json.NewDecoder(conn)
@@ -450,7 +474,7 @@ func SubscribeEvents(ctx context.Context, args EventSubscribeArgs) (<-chan Event
 				}
 			}
 		}
-	}()
+	})
 
 	return out, stop, nil
 }

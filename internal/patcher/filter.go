@@ -163,17 +163,17 @@ func Clean(p config.Patch, content, headContent string) (string, error) {
 // that exist in HEAD (i.e. need restore, not strip).
 func restoreContent(driver, content, headContent string, headVals map[string]string, present []string) (string, error) {
 	switch driver {
-	case "phpunit":
+	case DriverPhpunit:
 		return restorePhpunitFromHead(content, headContent, present), nil
-	case "dotenv":
+	case DriverDotenv:
 		return restoreDotenvFromHead(content, headContent, present), nil
-	case "ini":
+	case DriverINI:
 		return restoreINIFromHead(content, headContent, present), nil
-	case "toml":
+	case DriverTOML:
 		return restoreTOMLFromHead(content, headContent, present), nil
-	case "yaml":
+	case DriverYAML:
 		return restoreYAMLFromHead(content, headContent, headVals, present)
-	case "json":
+	case DriverJSON:
 		return restoreJSONFromHead(content, headContent, headVals, present)
 	}
 	subset := make(map[string]string, len(present))
@@ -399,7 +399,7 @@ func restoreYAMLFromHead(content, headContent string, headVals map[string]string
 				subset[k] = v
 			}
 		}
-		out, err := applyContent("yaml", content, subset)
+		out, err := applyContent(DriverYAML, content, subset)
 		if err != nil {
 			return "", err
 		}
@@ -530,7 +530,7 @@ func restoreJSONFromHead(content, headContent string, headVals map[string]string
 				subset[k] = v
 			}
 		}
-		out, err := applyContent("json", content, subset)
+		out, err := applyContent(DriverJSON, content, subset)
 		if err != nil {
 			return "", err
 		}
@@ -683,8 +683,8 @@ func patchDriver(p config.Patch) (string, error) {
 		return "", fmt.Errorf("patch %s: cannot infer format from extension; set `format:` explicitly", p.File)
 	}
 	// phpunit_env is a legacy alias for phpunit.
-	if d == "phpunit_env" {
-		d = "phpunit"
+	if d == DriverPhpunitEnv {
+		d = DriverPhpunit
 	}
 	return d, nil
 }
@@ -707,17 +707,17 @@ func applyContent(driver, content string, pairs map[string]string) (string, erro
 		return content, nil
 	}
 	switch driver {
-	case "dotenv":
+	case DriverDotenv:
 		return applyDotenvContent(content, pairs), nil
-	case "phpunit":
+	case DriverPhpunit:
 		return applyPhpunitContent(content, pairs), nil
-	case "yaml":
+	case DriverYAML:
 		return applyYAMLContent(content, pairs)
-	case "json":
+	case DriverJSON:
 		return applyJSONContent(content, pairs)
-	case "toml":
+	case DriverTOML:
 		return applyTOMLContent(content, pairs)
-	case "ini":
+	case DriverINI:
 		return applyINIContent(content, pairs)
 	}
 	return "", fmt.Errorf("unknown driver %q", driver)
@@ -732,17 +732,17 @@ func extractContent(driver, content string, keys []string) (map[string]string, e
 		return nil, nil
 	}
 	switch driver {
-	case "dotenv":
+	case DriverDotenv:
 		return extractDotenv(content, keys), nil
-	case "phpunit":
+	case DriverPhpunit:
 		return extractPhpunit(content, keys), nil
-	case "yaml":
+	case DriverYAML:
 		return extractYAML(content, keys)
-	case "json":
+	case DriverJSON:
 		return extractJSON(content, keys)
-	case "toml":
+	case DriverTOML:
 		return extractTOML(content, keys)
-	case "ini":
+	case DriverINI:
 		return extractINI(content, keys)
 	}
 	return nil, fmt.Errorf("unknown driver %q", driver)
@@ -763,17 +763,17 @@ func removeContent(driver, content string, keys []string) (string, error) {
 		return content, nil
 	}
 	switch driver {
-	case "dotenv":
+	case DriverDotenv:
 		return removeDotenvContent(content, keys), nil
-	case "phpunit":
+	case DriverPhpunit:
 		return removePhpunitContent(content, keys), nil
-	case "yaml":
+	case DriverYAML:
 		return removeYAMLContent(content, keys)
-	case "json":
+	case DriverJSON:
 		return removeJSONContent(content, keys)
-	case "toml":
+	case DriverTOML:
 		return removeTOMLContent(content, keys)
-	case "ini":
+	case DriverINI:
 		return removeINIContent(content, keys)
 	}
 	return "", fmt.Errorf("unknown driver %q", driver)

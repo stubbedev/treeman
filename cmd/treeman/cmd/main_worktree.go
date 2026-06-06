@@ -73,7 +73,7 @@ func mainEnableAction(ctx context.Context, c *cli.Command) error {
 	// The reload above is synchronous: by the time it returns, Enroll
 	// MainWorktree has run and the row exists, so FinalizeWorktree
 	// routes through the main-wt path (slug.ForMain + overlay) and
-	// fires on-create-* hooks with $TREEMAN_IS_MAIN=1.
+	// fires create-* hooks with $TREEMAN_IS_MAIN=1.
 	if err := requestWorktreeFinalize(ctx, repoRoot, repoRoot); err != nil {
 		ui.Warn("daemon finalize dispatch failed: %v", err)
 		ui.Hint("run `treeman wt finalize .` at the repo root to retry")
@@ -199,7 +199,7 @@ func renderMainWorktreeConfig(repoRoot string, enabled bool) (string, []byte, er
 }
 
 // requestWorktreeFinalize dispatches a finalize RPC for wtPath under
-// repoRoot. Used by `main enable` to kick off on-create-* hooks +
+// repoRoot. Used by `main enable` to kick off create-* hooks +
 // prepare against the freshly-enrolled main row without making the
 // user manually run `treeman wt finalize .`. The CLI captures the
 // user's env here because the daemon goroutine wouldn't otherwise

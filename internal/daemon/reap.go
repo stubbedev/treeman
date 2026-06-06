@@ -91,7 +91,7 @@ func scheduleBackgroundReap(st *State, repoPath, trashPath string) {
 	default:
 		// Queue full (highly unlikely with a 64-slot buffer): fall
 		// back to a one-shot reaper so we never lose the trash entry.
-		safeGo("wt_reap:"+trashPath, func() {
+		safeGo(lblWorktreeReap, trashPath, func() {
 			if err := parallelRemoveAll(st.BgCtx, trashPath, 4); err != nil {
 				slog.Warn("background reap", "trash", trashPath, "err", err)
 			}
@@ -110,7 +110,7 @@ func (st *State) reapQueueFor(repoPath string) chan string {
 	}
 	q := make(chan string, 64)
 	st.reapQueues[repoPath] = q
-	safeGo("wt_reap_drain:"+repoPath, func() {
+	safeGo(lblWorktreeReapDrain, repoPath, func() {
 		for {
 			select {
 			case <-st.BgCtx.Done():
@@ -236,13 +236,13 @@ func parallelRemoveAll(ctx context.Context, root string, workers int) error {
 			target := filepath.Join(root, e.Name())
 			sem <- struct{}{}
 			wg.Add(1)
-			go func(t string) {
+			safeGo(lblWorktreeReap, target, func() {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if runErr := lowPriorityCommand(ctx, "rm", []string{"-rf", t}).Run(); runErr != nil {
-					slog.Debug("reap rm", "path", t, "err", runErr)
+				if runErr := lowPriorityCommand(ctx, "rm", []string{"-rf", target}).Run(); runErr != nil {
+					slog.Debug("reap rm", "path", target, "err", runErr)
 				}
-			}(target)
+			})
 		}
 		wg.Wait()
 	}

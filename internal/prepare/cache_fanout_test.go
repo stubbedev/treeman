@@ -32,7 +32,7 @@ func TestEmitCacheMissWritesEvent(t *testing.T) {
 
 	evs, err := s.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{"snapshot_cache_miss"},
+		EventTypes: []string{store.EvtSnapshotsCacheMiss},
 	})
 	if err != nil {
 		t.Fatal(err)
