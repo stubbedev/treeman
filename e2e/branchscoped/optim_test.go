@@ -171,10 +171,10 @@ func TestCaptureGateMySQL(t *testing.T) {
 
 	// Clean bounce: switch away with NO write since the resume → the
 	// capture of develop is redundant and must be skipped.
-	skips := countEvents(t, st, wtID, "capture_skip")
+	skips := countEvents(t, st, wtID, "branch:capture:skip")
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
 	assertItems(t, active, "develop", "feature") // feature resumed intact
-	if got := countEvents(t, st, wtID, "capture_skip"); got != skips+1 {
+	if got := countEvents(t, st, wtID, "branch:capture:skip"); got != skips+1 {
 		t.Fatalf("clean bounce must skip a capture: capture_skip %d → %d (want +1)", skips, got)
 	}
 
@@ -183,9 +183,9 @@ func TestCaptureGateMySQL(t *testing.T) {
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop")
 	assertItems(t, active, "develop")
 	mustExec(t, active, "INSERT INTO items(v) VALUES('extra')")
-	skips = countEvents(t, st, wtID, "capture_skip")
+	skips = countEvents(t, st, wtID, "branch:capture:skip")
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
-	if got := countEvents(t, st, wtID, "capture_skip"); got != skips {
+	if got := countEvents(t, st, wtID, "branch:capture:skip"); got != skips {
 		t.Fatalf("a write before switch must force a capture: capture_skip %d → %d (want +0)", skips, got)
 	}
 
@@ -229,19 +229,19 @@ func TestCaptureGatePostgres(t *testing.T) {
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop") // resume → clean watermark
 	pgAssertItems(t, active, "develop")
 
-	skips := countEvents(t, st, wtID, "capture_skip")
+	skips := countEvents(t, st, wtID, "branch:capture:skip")
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature") // clean bounce → skip
 	pgAssertItems(t, active, "develop", "feature")
-	if got := countEvents(t, st, wtID, "capture_skip"); got != skips+1 {
+	if got := countEvents(t, st, wtID, "branch:capture:skip"); got != skips+1 {
 		t.Fatalf("clean bounce must skip a capture: capture_skip %d → %d (want +1)", skips, got)
 	}
 
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop")
 	pgAssertItems(t, active, "develop")
 	pgExec(t, active, "INSERT INTO items(v) VALUES('extra')") // dirties watermark
-	skips = countEvents(t, st, wtID, "capture_skip")
+	skips = countEvents(t, st, wtID, "branch:capture:skip")
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
-	if got := countEvents(t, st, wtID, "capture_skip"); got != skips {
+	if got := countEvents(t, st, wtID, "branch:capture:skip"); got != skips {
 		t.Fatalf("a write before switch must force a capture: capture_skip %d → %d (want +0)", skips, got)
 	}
 
@@ -289,19 +289,19 @@ func TestCaptureGateElasticsearch(t *testing.T) {
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop") // resume → clean watermark
 	esAssertVals(t, prefix, map[string]string{"a": "develop"})
 
-	skips := countEvents(t, st, wtID, "capture_skip")
+	skips := countEvents(t, st, wtID, "branch:capture:skip")
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature") // clean bounce → skip
 	esAssertVals(t, prefix, map[string]string{"a": "develop", "b": "feature"})
-	if got := countEvents(t, st, wtID, "capture_skip"); got != skips+1 {
+	if got := countEvents(t, st, wtID, "branch:capture:skip"); got != skips+1 {
 		t.Fatalf("clean bounce must skip a capture: capture_skip %d → %d (want +1)", skips, got)
 	}
 
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop")
 	esAssertVals(t, prefix, map[string]string{"a": "develop"})
 	esIndex(t, prefix, "c", "extra") // dirties the indexing watermark
-	skips = countEvents(t, st, wtID, "capture_skip")
+	skips = countEvents(t, st, wtID, "branch:capture:skip")
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
-	if got := countEvents(t, st, wtID, "capture_skip"); got != skips {
+	if got := countEvents(t, st, wtID, "branch:capture:skip"); got != skips {
 		t.Fatalf("a write before switch must force a capture: capture_skip %d → %d (want +0)", skips, got)
 	}
 
@@ -340,7 +340,7 @@ func TestCaptureNeverSkippedMongo(t *testing.T) {
 	// Clean bounce — but no watermark, so capture must still run.
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
 	mongoAssert(t, active, "develop", "feature")
-	if got := countEvents(t, st, wtID, "capture_skip"); got != 0 {
+	if got := countEvents(t, st, wtID, "branch:capture:skip"); got != 0 {
 		t.Fatalf("mongo has no watermark; capture must never be skipped, got %d capture_skip", got)
 	}
 }
@@ -408,7 +408,7 @@ func TestMultiWorktreeCaptureGatePostgres(t *testing.T) {
 		t.Fatalf("sibling worktrees must get distinct active databases, both = %s", activeA)
 	}
 
-	skipsA := countEvents(t, st, wtIDA, "capture_skip")
+	skipsA := countEvents(t, st, wtIDA, "branch:capture:skip")
 
 	// Write into B's active DB. B's per-database watermark advances; A's
 	// must NOT — so A's next switch can still skip.
@@ -416,7 +416,7 @@ func TestMultiWorktreeCaptureGatePostgres(t *testing.T) {
 
 	// A clean bounce: must still skip despite the concurrent write in B.
 	drivePrepare(t, st, cfg, wtA, repoID, wtIDA, "feature")
-	if got := countEvents(t, st, wtIDA, "capture_skip"); got != skipsA+1 {
+	if got := countEvents(t, st, wtIDA, "branch:capture:skip"); got != skipsA+1 {
 		t.Fatalf("worktree A's gate must be isolated from B's writes: capture_skip %d → %d (want +1)", skipsA, got)
 	}
 
@@ -488,14 +488,14 @@ func TestMultiWorktreeCaptureGateMySQL(t *testing.T) {
 		t.Fatalf("sibling worktrees must get distinct active databases, both = %s", activeA)
 	}
 
-	skipsA := countEvents(t, st, wtIDA, "capture_skip")
+	skipsA := countEvents(t, st, wtIDA, "branch:capture:skip")
 
 	// Write into B's active DB. With a per-database watermark, A's gate
 	// must be unaffected — so A's next switch still skips.
 	mustExec(t, activeB, "INSERT INTO items(v) VALUES('bnoise')")
 
 	drivePrepare(t, st, cfg, wtA, repoID, wtIDA, "feature")
-	if got := countEvents(t, st, wtIDA, "capture_skip"); got != skipsA+1 {
+	if got := countEvents(t, st, wtIDA, "branch:capture:skip"); got != skipsA+1 {
 		t.Fatalf("per-db watermark must isolate A from B's write: capture_skip %d → %d (want +1)", skipsA, got)
 	}
 
@@ -585,7 +585,7 @@ func TestCaptureNeverSkippedRedis(t *testing.T) {
 	assertRedisVals(t, prefix, map[string]string{"a": "develop"})
 	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
 	assertRedisVals(t, prefix, map[string]string{"a": "develop", "b": "feature"})
-	if got := countEvents(t, st, wtID, "capture_skip"); got != 0 {
+	if got := countEvents(t, st, wtID, "branch:capture:skip"); got != 0 {
 		t.Fatalf("redis has no watermark; capture must never be skipped, got %d capture_skip", got)
 	}
 }

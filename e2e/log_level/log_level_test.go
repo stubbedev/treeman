@@ -64,7 +64,6 @@ func daemonStderr(t *testing.T, bin, logLevel string) string {
 		"XDG_DATA_HOME="+t.TempDir(),
 		"XDG_RUNTIME_DIR="+t.TempDir(),
 		"TREEMAN_DB_PATH="+filepath.Join(t.TempDir(), "treeman.db"),
-		"TREEMAN_SOCKET="+filepath.Join(t.TempDir(), "tm.sock"),
 	)
 	var serr strings.Builder
 	cmd.Stderr = &serr
