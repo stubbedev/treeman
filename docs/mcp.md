@@ -8,7 +8,7 @@ speaks MCP — get a structured tool surface onto treeman's state.
 Transport is stdio; no extra processes, no network surface.
 
 ```sh
-treeman mcp                                    # all tools exposed
+treeman mcp                                    # core tools + `tools` gateway (lazy disclosure)
 ```
 
 ## What is this actually for
@@ -51,11 +51,9 @@ logs:
 ## Tool discovery (lazy disclosure)
 
 To keep the model's context lean, `treeman mcp` advertises only a
-curated **core** set of tools up front (`doctor`, `worktree_*`,
-`prepare_run`, `logs_query`, `config_get`/`config_set`,
-`daemon_status`/`daemon_state`, `status_overview`, `branches_list`,
-`sync_status`, `prompts_list`) plus one **`tools`** gateway. The rest
-are deferred:
+curated **core** set of six tools up front — `doctor`,
+`status_overview`, `worktree_create`, `worktree_list`, `prepare_run`,
+`logs_query` — plus one **`tools`** gateway. The rest are deferred:
 
 - `tools` with `action=list` returns every available tool grouped by
   category with a one-line summary (no schemas).
@@ -78,9 +76,11 @@ allow-list, Cursor's MCP allow rules, etc.), not here.
 
 ### Destructive-action confirmation (elicitation)
 
-`worktree_delete`, `snapshots_purge`, `db_reset`, and `repo_remove`
-gate their mutation behind an MCP `notifications/elicitation`
-confirmation when invoked with `dry_run=false`. Clients that support
+`worktree_delete`, `snapshots_purge`, `db_reset`, `repo_remove`,
+`logs_purge`, `registry_unregister`, and the write-mode engine tools
+(`db_query` / `es_request` with `write=true`) gate their mutation
+behind an MCP `notifications/elicitation` confirmation when invoked
+with `dry_run=false`. Clients that support
 elicitation (Claude Desktop, etc.) get a confirmation pop-up before
 the action runs; clients that don't support it (or that error out)
 fall through to proceed so non-interactive agents aren't blocked.
@@ -131,6 +131,7 @@ flow. Invoke from your MCP client to get a tailored briefing.
 | `diagnose-prepare-failure` | Drives `logs_query` → `engine_status` → `snapshots_inspect` → root-cause report. |
 | `cache-cleanup` | Hunt orphan snapshots (template gone, SQLite row remains) and drop only those. |
 | `migration-trial` | Throw-away worktree → run migration → schema diff → tear down. |
+| `edit-config` | Pick the right config file (global vs repo), preview, apply scope-checked, validate. |
 
 ## Claude Code
 
@@ -203,11 +204,11 @@ wrap the command in anything that mixes the two.
   Restrict the exposed surface at the **agent-policy layer**
   (Claude Code's per-tool allow rules, Cursor's MCP allow list,
   etc.) for any agent you don't fully trust.
-- `worktree_delete` from MCP runs `wt.Delete` in-process. The
-  TTY confirmation prompt is a CLI-only concern (it lives in
-  the `wt delete` action closure, not the orchestrator), so MCP
-  callers get **no confirmation** — every `worktree_delete`
-  invocation runs the teardown.
+- `worktree_delete` and the other destructive tools run their
+  mutation in-process but gate it behind MCP elicitation (see
+  [Destructive-action confirmation](#destructive-action-confirmation-elicitation))
+  — clients without elicitation support fall through to proceed,
+  so enforce policy at the agent layer for untrusted agents.
 - Hook stdout/stderr and event payloads pass through
   `redactSecrets` (see `internal/mcp/ops.go`) before being
   returned to the client. False positives just hide a token;

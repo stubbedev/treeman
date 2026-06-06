@@ -6,17 +6,17 @@
 
 | Path | What |
 |---|---|
-| `~/.local/share/treeman/treeman.db` | SQLite event log + worktree registry + snapshots table |
+| `~/.local/share/treeman/treeman.db` | SQLite event log + worktree registry + snapshots table (override with `$TREEMAN_DB_PATH`) |
 | `~/.local/share/treeman/treemand.log` | Daemon stderr |
-| `$XDG_RUNTIME_DIR/treeman.sock` | JSON-line RPC socket (SO_PEERCRED on Linux, stat-based owner check elsewhere) |
+| `$XDG_RUNTIME_DIR/treeman.sock` | JSON-line RPC socket — overridable via `$TREEMAN_SOCKET`, falls back to `$XDG_DATA_HOME/treeman/treeman.sock` (SO_PEERCRED on Linux, stat-based owner check elsewhere) |
 | `~/.config/systemd/user/treemand.service` | systemd-user unit (Linux) |
 | `~/Library/LaunchAgents/dev.stubbe.treemand.plist` | launchd LaunchAgent (macOS) |
 | `<worktree>/.treeman-hooks/<phase>-<n>.log` | Per-hook driver stdout/stderr |
 | `<repo>/schemas/treeman.schema.json` | JSON Schema (only present after `treeman schema install`) |
 
-The store schema lives at `internal/store/migrations/0001_init.sql`
-and is shipped embedded into the binary, so a fresh `treeman.db`
-self-migrates on first daemon start.
+The store schema lives in `internal/store/migrations/` (`0001_init.sql`
+… and onward) and ships embedded into the binary, so a fresh
+`treeman.db` self-migrates on first daemon start.
 
 ## Daemon model
 
@@ -25,9 +25,9 @@ client that round-trips JSON over the unix socket. Why a daemon:
 
 1. **Watcher lifecycles** survive shell exits. `watcher start` from
    one shell keeps watching even after the shell closes.
-2. **Hook drivers** are detached and parented to PID 1 (`setsid`),
-   so `wt create` returns in <2s regardless of how slow the hooks
-   themselves are.
+2. **Hook drivers** are detached into their own session (`setsid`),
+   so they survive the CLI exit and `wt create` returns promptly
+   regardless of how slow the hooks themselves are.
 3. **Snapshot cache** is shared across shells; two terminals
    creating two worktrees on the same branch share the cached
    template DB.
@@ -51,31 +51,31 @@ install also works.
 
 ## RPC envelope
 
-The line-JSON protocol is documented in `internal/rpc/rpc.go`.
-Methods:
+`treeman` talks to `treemand` over the unix socket with a line-JSON
+protocol (protocol version 2): a request is `{"method": <m>, "<m>":
+{…args}}` and every response carries a `kind` field. State mutations
+(create/finalize/teardown/prepare/…) don't have their own methods —
+they're submitted as a **plan** of tasks through the `run_plan` method
+and the daemon executes them, returning `plan_queued` (async) or
+`plan_result` (with `wait`).
 
-| Method | Args | Response |
-|---|---|---|
-| `ping` | — | `{ kind: "pong" }` |
-| `status` | — | `{ kind: "status", daemon_version, pid, watcher_count }` |
-| `repo_register` | `{ path, name }` | `{ kind: "repo_registered", repo_id }` |
-| `repo_remove` | `{ repo_path, force }` | `{ kind: "repo_removed" }` |
-| `worktree_list` | `{ repo_path }` | `{ kind: "worktree_list", worktrees: [...] }` |
-| `worktree_finalize` | `{ repo_path, worktree_path, inherited_env }` | `{ kind: "worktree_finalize_queued" }` |
-| `worktree_teardown` | `{ repo_path, worktree_path, force, inherited_env }` | `{ kind: "worktree_teardown_queued" }` |
-| `watcher_start` / `watcher_stop` / `watcher_list` | `{ repo_path }` | `{ kind: "watcher_*" }` |
-| `config_reload` | `{ repo_path }` (empty = reload all) | `{ kind: "config_reloaded" }` |
-| `shutdown` | — | `{ kind: "shutdown_acked" }` |
+The full method / response-kind / task / param surface is generated
+from the constants in `internal/rpc/rpc.go`:
+**[rpc-reference.md](rpc-reference.md)**.
 
-The `inherited_env` field carries the calling shell's environment
-to the daemon so hook subprocesses see the user's `$PATH`,
+The calling shell's environment rides along on the relevant tasks (via
+their params) so hook subprocesses see the user's `$PATH`,
 nvm/asdf/rbenv shims, etc.
+
+Every daemon goroutine — accept loop, per-connection handler, watcher
+loops, plan lanes, background reapers — runs through `internal/safego`,
+which recovers panics so one bad async task can't take down the daemon.
 
 ## Development
 
 ```sh
 just build    # ./bin/treeman + ./bin/treemand with version baked in
-just check    # gofmt + go vet + go test
+just check    # lint (golangci-lint fmt+vet+run) + test + sync-{schema,docs,flake}
 just nix-check
 just sync-flake [VERSION]
 just release-{patch,minor,major}   # tag + push, GH Actions builds + publishes

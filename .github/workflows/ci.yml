@@ -210,25 +210,27 @@ jobs:
           go run ./cmd/treeman-gen-config-docs docs/config-reference.md
           go run ./cmd/treeman-gen-mcp-docs docs/mcp-tools.md
           go run ./cmd/treeman-gen-events-docs docs/events.md
+          go run ./cmd/treeman-gen-frameworks-docs docs/frameworks.md
+          go run ./cmd/treeman-gen-rpc-docs docs/rpc-reference.md
 
       - name: assert docs in sync (PR)
         if: github.event_name == 'pull_request'
         run: |
-          if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md)" ]; then
+          if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md)" ]; then
             echo "::error::generated docs are stale. Run 'just sync-docs' locally and commit the result."
-            git --no-pager diff docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md
+            git --no-pager diff docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md
             exit 1
           fi
 
       - name: auto-commit docs bump (master)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
-          if [ -z "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md)" ]; then
+          if [ -z "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md)" ]; then
             echo "generated docs already in sync; nothing to commit."
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md
+          git add docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md
           git commit -m 'chore: auto-bump generated docs [skip ci]'
           git push origin HEAD:master
