@@ -28,6 +28,14 @@ type State struct {
 	// orphans the work on shutdown.
 	BgCtx context.Context
 
+	// SyncFinalize forces worktree-create's hooks+prepare tail to run
+	// synchronously instead of in a detached goroutine. The real daemon
+	// leaves this false (fast return; the tail outlives the RPC). The
+	// in-process executor (RunPlanInProcess, used by the CLI/MCP when no
+	// daemon is reachable) sets it true so the tail completes before the
+	// ephemeral State + store are torn down.
+	SyncFinalize bool
+
 	mu                sync.Mutex
 	watchers          map[string]*WatcherEntry
 	wtWatchers        map[string]*WatcherEntry

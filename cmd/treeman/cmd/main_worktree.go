@@ -205,12 +205,10 @@ func renderMainWorktreeConfig(repoRoot string, enabled bool) (string, []byte, er
 // user's env here because the daemon goroutine wouldn't otherwise
 // see PATH / nvm shims / etc.
 func requestWorktreeFinalize(ctx context.Context, repoRoot, wtPath string) error {
-	resp, err := rpc.Call(ctx, finalizeRequest(repoRoot, wtPath))
-	if err != nil {
-		return err
-	}
-	if resp.Kind == rpc.KindError {
-		return fmt.Errorf("daemon: %s", resp.Message)
+	// submitPlan dispatches to the daemon when reachable, else runs the
+	// finalize tail in-process — so `main enable` works daemon-less.
+	if resp := submitPlan(ctx, finalizeRequest(repoRoot, wtPath)); resp.Kind == rpc.KindError {
+		return fmt.Errorf("finalize: %s", resp.Message)
 	}
 	return nil
 }

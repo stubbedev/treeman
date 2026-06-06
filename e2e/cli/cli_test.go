@@ -181,6 +181,12 @@ databases:
 		t.Fatalf("worktree dir not created: %v", err)
 	}
 
+	// `wt create` dispatches the tail — links, copies, patches, prepare —
+	// to the daemon and returns immediately. Block on the daemon finishing
+	// before asserting on the materialized files (this is the real
+	// dispatch + async-finalize path end-to-end).
+	runTreeman(t, binDir, mainRepo, "wt", "wait", wtBranch)
+
 	// ── Links ──: vendor should be a symlink to main repo's vendor.
 	vendor := filepath.Join(wtPath, "vendor")
 	li, err := os.Lstat(vendor)

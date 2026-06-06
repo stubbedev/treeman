@@ -872,18 +872,12 @@ func worktreeCreateTool(
 // daemon — the sole mutator — starting it once on connection failure,
 // and parses the returned CreateResult.
 func dispatchCreatePlan(ctx context.Context, task rpc.Task) (wt.CreateResult, error) {
-	resp, err := wt.CallWithStart(ctx, rpc.Plan(true, rpc.One(task)))
-	if err != nil {
-		return wt.CreateResult{}, fmt.Errorf("dispatch create (is treemand running?): %w", err)
-	}
-	if resp.Kind == rpc.KindError {
-		return wt.CreateResult{}, fmt.Errorf("daemon: %s", resp.Message)
+	resp := submitMCPPlan(ctx, rpc.Plan(true, rpc.One(task)))
+	if err := mcpPlanErr(resp); err != nil {
+		return wt.CreateResult{}, fmt.Errorf("create: %w", err)
 	}
 	if len(resp.TaskResults) == 0 {
-		return wt.CreateResult{}, errors.New("daemon returned no task result")
-	}
-	if r := resp.TaskResults[0]; !r.OK {
-		return wt.CreateResult{}, errors.New(r.Message)
+		return wt.CreateResult{}, errors.New("no task result")
 	}
 	var res wt.CreateResult
 	if err := json.Unmarshal([]byte(resp.TaskResults[0].PayloadJSON), &res); err != nil {

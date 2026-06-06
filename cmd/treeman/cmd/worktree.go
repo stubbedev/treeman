@@ -586,14 +586,16 @@ func wtFinalize() *cli.Command {
 				return runLocalFinalizeFlow(ctx, repoRoot, wtPath)
 			}
 
-			resp, err := rpc.Call(ctx, finalizeRequest(repoRoot, wtPath))
-			if err != nil {
-				return err
+			// Dispatch to the daemon when reachable, else run the tail
+			// in-process — `wt finalize` works daemon-less.
+			switch resp := submitPlan(ctx, finalizeRequest(repoRoot, wtPath)); resp.Kind {
+			case rpc.KindPlanQueued:
+				PrintOK("queued: setup + prepare detached to daemon — follow with `treeman logs tail --follow`")
+			case rpc.KindError:
+				return fmt.Errorf("finalize: %s", resp.Message)
+			default:
+				PrintOK("finalize complete")
 			}
-			if resp.Kind == rpc.KindError {
-				return fmt.Errorf("daemon: %s", resp.Message)
-			}
-			PrintOK("queued: setup + prepare detached to daemon — follow with `treeman logs tail --follow`")
 			return nil
 		},
 	}

@@ -16,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/daemonctl"
 	"github.com/stubbedev/treeman/internal/initgen"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
@@ -63,54 +64,76 @@ func PrepareCmd() *cli.Command {
 	}
 }
 
-// The daemon is the sole mutator of repo/worktree state. The CLI builds
-// a plan (parallel groups; tasks within a group run sequentially on the
-// daemon) and submits it through one of three modes below.
+// The daemon is the preferred mutator of repo/worktree state: the CLI
+// builds a plan (parallel groups; tasks within a group run sequentially)
+// and dispatches it. When no daemon is reachable the same plan runs
+// in-process (submitPlan), so every command works daemon-less.
 
 // dispatchTask submits a single-task plan. When foreground is false it
-// queues the task and returns as soon as the daemon accepts it. When
-// true it subscribes to the task's events FIRST (client-minted run-id, so
-// no event is missed), dispatches, then streams the live event tail until
-// the terminal event — returning the task's error so the exit code
-// reflects success/failure. label is the human noun for messages.
+// queues the task on the daemon and returns at once; when no daemon is
+// reachable it runs the task in-process and reports the outcome. When
+// foreground is true it streams the daemon's live event tail (subscribing
+// before dispatch so no event is missed), or runs in-process when there's
+// no daemon. label is the human noun for messages.
 func dispatchTask(ctx context.Context, task rpc.Task, foreground bool, label string) error {
-	if !foreground {
-		resp, ok := submitPlan(ctx, rpc.Plan(false, rpc.One(task)))
-		if ok && resp.Kind == rpc.KindPlanQueued {
-			PrintOK("queued: %s detached to daemon — follow with `treeman logs tail --follow` (or re-run with --foreground)", label)
-			return nil
-		}
-		return planDispatchErr(resp, ok, label)
+	if foreground {
+		return foregroundTask(ctx, task, label)
 	}
+	resp := submitPlan(ctx, rpc.Plan(false, rpc.One(task)))
+	switch resp.Kind {
+	case rpc.KindPlanQueued:
+		PrintOK("queued: %s detached to daemon — follow with `treeman logs tail --follow` (or re-run with --foreground)", label)
+		return nil
+	case rpc.KindPlanResult:
+		return reportInlineResult(resp, label) // ran in-process (no daemon)
+	default:
+		return fmt.Errorf("%s: %s", label, resp.Message)
+	}
+}
 
+// foregroundTask streams the daemon's live events to completion, or — when
+// no daemon is reachable — runs the plan in-process and reports the outcome.
+func foregroundTask(ctx context.Context, task rpc.Task, label string) error {
 	runID := runid.New()
 	ch, cancel, err := subscribeRun(ctx, runID)
 	if err != nil {
-		return fmt.Errorf("subscribe to %s events: %w", label, err)
+		return reportInlineResult(submitPlan(ctx, rpc.Plan(true, rpc.One(task))), label)
 	}
 	defer cancel()
 	req := rpc.Plan(false, rpc.One(task))
 	req.RunPlan.RunID = runID
-	resp, ok := submitPlan(ctx, req)
-	if !ok || resp.Kind != rpc.KindPlanQueued {
-		return planDispatchErr(resp, ok, label)
+	if resp, callErr := rpc.Call(ctx, req); callErr != nil || resp.Kind != rpc.KindPlanQueued {
+		return reportInlineResult(submitPlan(ctx, rpc.Plan(true, rpc.One(task))), label)
 	}
 	return streamPlanEvents(ch, label)
 }
 
+// reportInlineResult prints the outcome of an in-process plan run and
+// surfaces the first failed task as an error.
+func reportInlineResult(resp rpc.Response, label string) error {
+	if resp.Kind == rpc.KindError {
+		return fmt.Errorf("%s: %s", label, resp.Message)
+	}
+	for _, r := range resp.TaskResults {
+		if !r.OK {
+			return fmt.Errorf("%s: %s", label, r.Message)
+		}
+	}
+	PrintOK("%s complete", label)
+	return nil
+}
+
 // resultTask runs a single-task plan to completion and returns the
-// per-task results (for --json / result-oriented callers). A failed task
+// per-task results (for --json / result-oriented callers). Dispatched to
+// the daemon when reachable, otherwise run in-process. A failed task
 // surfaces as an error.
 func resultTask(ctx context.Context, task rpc.Task) ([]rpc.TaskResult, error) {
-	resp, ok := submitPlan(ctx, rpc.Plan(true, rpc.One(task)))
-	if !ok {
-		return nil, errors.New("daemon unreachable")
-	}
+	resp := submitPlan(ctx, rpc.Plan(true, rpc.One(task)))
 	if resp.Kind == rpc.KindError {
-		return nil, fmt.Errorf("daemon: %s", resp.Message)
+		return nil, errors.New(resp.Message)
 	}
 	if resp.Kind != rpc.KindPlanResult {
-		return nil, fmt.Errorf("unexpected daemon response %q", resp.Kind)
+		return nil, fmt.Errorf("unexpected response %q", resp.Kind)
 	}
 	for _, r := range resp.TaskResults {
 		if !r.OK {
@@ -165,18 +188,20 @@ func writeConfig(ctx context.Context, repoRoot, path string, body []byte) error 
 	return err
 }
 
-// submitPlan submits a run_plan request, autostarting the daemon once on
-// connection failure. Returns the response + whether it landed.
-func submitPlan(ctx context.Context, req rpc.Request) (rpc.Response, bool) {
-	resp, err := wt2.CallWithStart(ctx, req)
-	return resp, err == nil
-}
-
-func planDispatchErr(resp rpc.Response, ok bool, label string) error {
-	if ok && resp.Kind == rpc.KindError {
-		return fmt.Errorf("daemon: %s", resp.Message)
+// submitPlan runs a plan: dispatch to the daemon when reachable, else
+// execute it in-process. treeman works daemon-less — the daemon is the
+// preferred mutator (fast async return, single writer), not a hard
+// requirement. Always yields a response: KindPlanQueued from a live
+// daemon, KindPlanResult from in-process, or KindError.
+func submitPlan(ctx context.Context, req rpc.Request) rpc.Response {
+	if resp, err := rpc.Call(ctx, req); err == nil {
+		return resp
 	}
-	return fmt.Errorf("daemon unreachable: could not dispatch %s", label)
+	resp, err := daemon.RunPlanInProcess(ctx, *req.RunPlan)
+	if err != nil {
+		return rpc.Response{Kind: rpc.KindError, Message: err.Error()}
+	}
+	return resp
 }
 
 // subscribeRun opens a run-id-scoped event subscription, starting the

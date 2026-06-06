@@ -69,6 +69,9 @@ func TestMCPWriteTools(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	t.Setenv("XDG_STATE_HOME", stateDir)
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	// Advertise every tool — these tests exercise tool behavior, not the
+	// lazy-disclosure gateway (which is unit-tested in internal/mcp).
+	t.Setenv("TREEMAN_MCP_ALL_TOOLS", "1")
 
 	// Build a git repo with a .treeman.yaml so the orchestrator's
 	// engine prepare path lights up.

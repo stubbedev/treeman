@@ -64,6 +64,28 @@ func handleRunPlan(ctx context.Context, st *State, req rpc.Request) rpc.Response
 	return rpc.Response{Kind: rpc.KindPlanQueued}
 }
 
+// RunPlanInProcess runs a plan locally — opening the store, building an
+// ephemeral State, and executing — for callers (the CLI, the MCP server)
+// that found no daemon reachable. The daemon is the *preferred* mutator,
+// but treeman commands must still work daemon-less; this is that path,
+// reusing the exact same task runners so behavior is identical. The
+// create tail runs synchronously (SyncFinalize) since no daemon outlives
+// the call. Always returns a KindPlanResult response.
+func RunPlanInProcess(ctx context.Context, args rpc.RunPlanArgs) (rpc.Response, error) {
+	dbPath, err := store.DefaultDBPath()
+	if err != nil {
+		return rpc.Response{}, err
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return rpc.Response{}, err
+	}
+	defer func() { _ = st.Close() }()
+	state := NewState(ctx, st)
+	state.SyncFinalize = true
+	return rpc.Response{Kind: rpc.KindPlanResult, TaskResults: ExecutePlan(ctx, state, args.Groups)}, nil
+}
+
 // ExecutePlan runs the plan: groups run in parallel; the tasks within a
 // group run sequentially as one ordered lane, stopping that lane at its
 // first failure (the remaining tasks in the lane depend on it). Results
@@ -441,13 +463,18 @@ func runTaskWorktreeCreate(ctx context.Context, st *State, task rpc.Task) (json.
 	}
 	if needsFinalize {
 		repoRoot, wtPath, env := req.RepoRoot, res.WtPath, req.Env
-		safeGo("wt_finalize", func() {
-			bg := runid.With(st.BgCtx, runid.New())
+		runFinalize := func(bg context.Context) {
 			if ferr := FinalizeWorktree(bg, st, repoRoot, wtPath, env); ferr != nil {
 				_ = st.Store.WriteEvent(bg, store.LevelError, "wt_finalize", ferr.Error(),
 					0, 0, "", 0, map[string]string{"repo_path": repoRoot, "worktree_path": wtPath})
 			}
-		})
+		}
+		if st.SyncFinalize {
+			// No daemon to outlive the call — run the tail before returning.
+			runFinalize(runid.With(ctx, runid.New()))
+		} else {
+			safeGo("wt_finalize", func() { runFinalize(runid.With(st.BgCtx, runid.New())) })
+		}
 		res.Status = wt.CreatedQueued
 	}
 	return json.Marshal(res)

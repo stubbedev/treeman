@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/notify"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -77,6 +78,34 @@ func finalizePlan(repoRoot, wtPath string) rpc.Request {
 	}))
 }
 
+// submitMCPPlan dispatches a plan to the daemon, falling back to running
+// it in-process when no daemon is reachable — mirroring the CLI so MCP
+// tools work daemon-less too.
+func submitMCPPlan(ctx context.Context, req rpc.Request) rpc.Response {
+	if resp, err := rpc.Call(ctx, req); err == nil {
+		return resp
+	}
+	resp, err := daemon.RunPlanInProcess(ctx, *req.RunPlan)
+	if err != nil {
+		return rpc.Response{Kind: rpc.KindError, Message: err.Error()}
+	}
+	return resp
+}
+
+// mcpPlanErr collapses a plan response to an error — KindError, or the
+// first failed task — or nil on success.
+func mcpPlanErr(resp rpc.Response) error {
+	if resp.Kind == rpc.KindError {
+		return errors.New(resp.Message)
+	}
+	for _, r := range resp.TaskResults {
+		if !r.OK {
+			return errors.New(r.Message)
+		}
+	}
+	return nil
+}
+
 // ─── worktree_finalize ─────────────────────────────────────────────
 
 type worktreeFinalizeIn struct {
@@ -102,12 +131,8 @@ func worktreeFinalizeTool(
 	if wtPath == "" {
 		wtPath = repoRoot
 	}
-	resp, err := rpc.Call(ctx, finalizePlan(repoRoot, wtPath))
-	if err != nil {
-		return nil, worktreeFinalizeOut{}, fmt.Errorf("dispatch finalize (is treemand running?): %w", err)
-	}
-	if resp.Kind == rpc.KindError {
-		return nil, worktreeFinalizeOut{}, fmt.Errorf("daemon: %s", resp.Message)
+	if err := mcpPlanErr(submitMCPPlan(ctx, finalizePlan(repoRoot, wtPath))); err != nil {
+		return nil, worktreeFinalizeOut{}, fmt.Errorf("finalize: %w", err)
 	}
 	writeMCPEvent(context.Background(), "worktree_finalize", "queued finalize for "+wtPath, 0, map[string]string{
 		"repo":     repoRoot,
@@ -185,9 +210,8 @@ func mainWorktreeEnable(ctx context.Context, repoRoot string) (*mcpsdk.CallToolR
 	}
 	// Reload is synchronous; the main row exists by the time it returns,
 	// so finalize routes through the main-wt path and fires on-create-*.
-	resp, err := rpc.Call(ctx, finalizePlan(repoRoot, repoRoot))
-	if err != nil || resp.Kind == rpc.KindError {
-		out.Detail = "enabled + reloaded; finalize dispatch failed — run worktree_finalize at the repo root to retry"
+	if err := mcpPlanErr(submitMCPPlan(ctx, finalizePlan(repoRoot, repoRoot))); err != nil {
+		out.Detail = "enabled + reloaded; finalize failed (" + err.Error() + ") — run worktree_finalize at the repo root to retry"
 		return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error
 	}
 	out.Detail = "enabled — setup hooks + prepare queued (follow with logs_subscribe)"
