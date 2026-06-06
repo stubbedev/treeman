@@ -248,6 +248,7 @@ ensure → dump → migrate → snapshot → replicate (foreground)
 | `-w`, `--worktree` |  |
 | `-r`, `--repo` |  |
 | `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman db`
 
@@ -262,6 +263,7 @@ re-sync branch_scoped databases from the live base branch (defaults to the cwd's
 | `-r`, `--repo` |  |
 | `--engine` | restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql/valkey/dragonfly accepted) |
 | `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman db status`
 
@@ -294,6 +296,7 @@ run a hook phase using the cwd's repo config
 |---|---|
 | `-w`, `--worktree` |  |
 | `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman logs`
 
@@ -616,6 +619,7 @@ drop every cached snapshot for this repo and force the next prepare to rebuild
 |---|---|
 | `-r`, `--repo` |  |
 | `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman mcp`
 
