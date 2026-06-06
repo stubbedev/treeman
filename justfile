@@ -213,7 +213,9 @@ sync-docs:
     mkdir -p docs
     go run ./cmd/treeman-gen-docs docs/cli.md
     go run ./cmd/treeman-gen-config-docs docs/config-reference.md
-    if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md)" ]; then
+    go run ./cmd/treeman-gen-mcp-docs docs/mcp-tools.md
+    go run ./cmd/treeman-gen-events-docs docs/events.md
+    if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md)" ]; then
         echo "sync-docs: regenerated generated docs"
     else
         echo "sync-docs: generated docs already in sync"

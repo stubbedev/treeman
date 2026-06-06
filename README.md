@@ -194,6 +194,8 @@ tm list              # passthrough to `treeman wt list`
 | [docs/cli.md](docs/cli.md) | Full command reference, log filters, completion, output/color/paging, env vars |
 | [docs/configuration.md](docs/configuration.md) | `.treeman.yaml` reference — every block, per-stack examples, templated names, hooks, credential resolution, container DBs + hooks |
 | [docs/advanced.md](docs/advanced.md) | Snapshot cache + GC, framework presets |
+| [docs/mcp-tools.md](docs/mcp-tools.md) | Generated MCP tool + prompt reference (auto-generated from the registry) |
+| [docs/events.md](docs/events.md) | Generated event-type reference (auto-generated from the `store.Evt*` constants) |
 | [docs/mcp.md](docs/mcp.md) | MCP / AI integration — Claude Code, Claude Desktop, Cursor, security model |
 | [docs/internals.md](docs/internals.md) | Storage layout, daemon model, init parity, RPC envelope, development |
 
