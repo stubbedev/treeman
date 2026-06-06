@@ -48,14 +48,33 @@ logs:
   fingerprint when a template went stale; `snapshots_purge`
   wipes the whole cache.
 
+## Tool discovery (lazy disclosure)
+
+To keep the model's context lean, `treeman mcp` advertises only a
+curated **core** set of tools up front (`doctor`, `worktree_*`,
+`prepare_run`, `logs_query`, `config_get`/`config_set`,
+`daemon_status`/`daemon_state`, `status_overview`, `branches_list`,
+`sync_status`, `prompts_list`) plus one **`tools`** gateway. The rest
+are deferred:
+
+- `tools` with `action=list` returns every available tool grouped by
+  category with a one-line summary (no schemas).
+- `tools` with `action=enable` + `names=[…]` (or `category=…`) loads
+  the chosen tools' full schemas so they become callable; the client is
+  notified via `tools/list_changed`.
+
+Set `TREEMAN_MCP_ALL_TOOLS=1` to advertise every tool at startup
+instead (the pre-disclosure behavior). The full surface is always
+*reachable* — lazy mode only controls what's loaded into context first.
+
 ## Permission model
 
 `treeman mcp` takes no permission flags — every tool (read, write,
-engine introspection, worktree lifecycle) is exposed unconditionally.
-The MCP surface is designed as the fully-qualified link to treeman;
-clients that want a restricted surface should enforce that at the
-agent-policy layer (Claude Code's tool allow-list, Cursor's MCP
-allow rules, etc.), not here.
+engine introspection, worktree lifecycle) is reachable (loaded up front
+or via the `tools` gateway above). The MCP surface is designed as the
+fully-qualified link to treeman; clients that want a restricted surface
+should enforce that at the agent-policy layer (Claude Code's tool
+allow-list, Cursor's MCP allow rules, etc.), not here.
 
 ### Destructive-action confirmation (elicitation)
 
@@ -194,8 +213,9 @@ wrap the command in anything that mixes the two.
 ## Security notes
 
 - The MCP server runs **as the invoking user** with full access
-  to the repo, the daemon socket, and any `.env` files. Every
-  tool is exposed unconditionally — there is no in-binary gate.
+  to the repo, the daemon socket, and any `.env` files. Lazy
+  disclosure (see *Tool discovery*) controls what loads into context
+  first, but every tool stays reachable — it is not a security gate.
   Restrict the exposed surface at the **agent-policy layer**
   (Claude Code's per-tool allow rules, Cursor's MCP allow list,
   etc.) for any agent you don't fully trust.

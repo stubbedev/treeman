@@ -23,13 +23,22 @@ import (
 // alone.
 var jsonAnyTypes = []string{"null", "boolean", "number", "string", "array", "object"}
 
-// addTool is a drop-in replacement for mcpsdk.AddTool that pre-builds the
-// input/output schemas and pins an explicit type union on every typeless
-// ("any") subschema before registering. Pre-setting the schemas makes the SDK
-// skip its own reflection (which would emit the rejected boolean nodes). Use
-// it for EVERY tool so no future `any`/`map[string]any` field can silently
-// take down the whole server.
+// addTool is the registration entry point for EVERY tool. It does not
+// register immediately — it records the tool into the build catalog so
+// newServer can decide whether to advertise it up front (core) or defer
+// it behind the `tools` gateway (see catalog.go). The actual pinned
+// registration happens via registerTool when the tool is activated.
 func addTool[In, Out any](s *mcpsdk.Server, t *mcpsdk.Tool, h mcpsdk.ToolHandlerFor[In, Out]) {
+	recordTool(t, func() { registerTool(s, t, h) })
+}
+
+// registerTool pre-builds the input/output schemas, pins an explicit type
+// union on every typeless ("any") subschema, then registers with the SDK.
+// Pre-setting the schemas makes the SDK skip its own reflection (which
+// would emit the boolean nodes Claude Code rejects). The single chokepoint
+// where a tool actually enters the server — used both for activating core
+// tools and for the gateway revealing deferred ones.
+func registerTool[In, Out any](s *mcpsdk.Server, t *mcpsdk.Tool, h mcpsdk.ToolHandlerFor[In, Out]) {
 	if t.InputSchema == nil {
 		// Mirror the SDK: a bare `any` input is an empty object, not "any value".
 		if reflect.TypeFor[In]() == reflect.TypeFor[any]() {

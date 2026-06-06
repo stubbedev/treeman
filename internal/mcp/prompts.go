@@ -141,9 +141,23 @@ var allPrompts = []promptSpec{
 // model on the goal, lists which tools to call in which order, and
 // names the artifacts to inspect. The agent then drives the tool
 // calls; treeman does not pre-execute them.
+// registerPrompts records each prompt into the build catalog as a
+// deferred entry (category "prompt") rather than registering it
+// immediately — so prompts, like non-core tools, stay out of the
+// up-front context and are revealed on demand through the `tools`
+// gateway (action=list shows them, action=enable / category=prompt
+// loads them). Under TREEMAN_MCP_ALL_TOOLS=1 activateTools registers
+// them all eagerly, matching the pre-disclosure behavior. The summary
+// is the WhenToUse trigger phrase so the catalog listing is actionable.
 func registerPrompts(srv *mcpsdk.Server) {
 	for _, p := range allPrompts {
-		srv.AddPrompt(p.def, p.handler)
+		def, handler := p.def, p.handler
+		pendingTools = append(pendingTools, &toolEntry{
+			name:     def.Name,
+			category: "prompt",
+			summary:  p.WhenToUse,
+			register: func() { srv.AddPrompt(def, handler) },
+		})
 	}
 }
 

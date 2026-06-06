@@ -18,6 +18,9 @@ import (
 func TestToolSchemasAreClaudeCompatible(t *testing.T) {
 	ctx := context.Background()
 
+	// Advertise every tool so the schema check covers the deferred ones,
+	// not just the core set the lazy gateway loads up front.
+	t.Setenv("TREEMAN_MCP_ALL_TOOLS", "1")
 	srv := newServer()
 	ct, st := mcpsdk.NewInMemoryTransports()
 	serverSession, err := srv.Connect(ctx, st, nil)

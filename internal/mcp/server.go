@@ -9,12 +9,10 @@
 // packages (resolve, prepare, hooks, store, slug, rpc) that the
 // CLI uses.
 //
-// Every tool — read, write, engine-introspection, shell-spawning —
-// is registered unconditionally. The MCP server is designed as a
-// fully-qualified link to all of treeman's observability,
-// configuration, and execution capabilities. Clients that want to
-// restrict the surface should do so at the agent-policy layer, not
-// here.
+// To keep the model's context lean, only a curated CORE set of tools is
+// advertised up front; the rest are deferred behind the `tools` gateway,
+// which lists them by category and loads them on demand (see catalog.go).
+// Set TREEMAN_MCP_ALL_TOOLS=1 to advertise every tool at startup instead.
 package mcp
 
 import (
@@ -26,10 +24,17 @@ import (
 	"github.com/stubbedev/treeman/internal/version"
 )
 
-// newServer builds the fully-registered MCP server without starting a
-// transport. Extracted from Serve so tests can introspect the tool +
-// resource surface over an in-memory transport.
+// newServer builds the MCP server without starting a transport.
 func newServer() *mcpsdk.Server {
+	srv, _ := buildServer()
+	return srv
+}
+
+// buildServer constructs the server and returns it alongside the full
+// tool catalog (every registerable tool, whether advertised up front or
+// deferred behind the gateway). Tests use the catalog to assert the
+// complete surface; Serve/newServer ignore it.
+func buildServer() (*mcpsdk.Server, []*toolEntry) {
 	srv := mcpsdk.NewServer(&mcpsdk.Implementation{
 		Name:    "treeman",
 		Version: version.Version,
@@ -44,12 +49,22 @@ func newServer() *mcpsdk.Server {
 		CompletionHandler: completionHandler,
 	})
 
+	// The register* calls funnel through addTool, which RECORDS each tool
+	// into the build catalog rather than registering it. activateTools then
+	// advertises the core set + the `tools` gateway (or everything, under
+	// TREEMAN_MCP_ALL_TOOLS=1). buildMu serialises the package-level build
+	// catalog across concurrent builds (tests).
+	buildMu.Lock()
+	defer buildMu.Unlock()
+	pendingTools = nil
+
 	registerReadTools(srv)
 	registerResources(srv)
 	registerWriteTools(srv)
 	registerAdminGapTools(srv)
 	registerPrompts(srv)
-	return srv
+
+	return srv, activateTools(srv)
 }
 
 // serverInstructions is the one-shot briefing every MCP client gets
@@ -57,36 +72,13 @@ func newServer() *mcpsdk.Server {
 // into the conversation and the highest-leverage entry points, so an
 // agent doesn't fall back to raw `git`/`psql` when treeman owns the
 // flow. Keep it short — clients prepend it to the model's context.
-const serverInstructions = `Treeman manages per-git-worktree database snapshots: every branch gets its own ephemeral MySQL/Postgres/Mongo/Redis/ES instance, cold-built from a dump + migrations and cached as a template for fast reuse.
+const serverInstructions = `Treeman gives every git worktree its own ephemeral MySQL/Postgres/Mongo/Redis/ES instance, cold-built from a dump + migrations and cached as a template for fast reuse.
 
-REACH FOR TREEMAN when the user mentions: worktree, branch-scoped DB, snapshot/template, prepare, dump+migrate+seed, ` + "`.treeman.yaml`" + `, treemand, finalize, fingerprint, fanout/clone target, slug.
+REACH FOR TREEMAN when the user mentions: worktree, branch-scoped DB, snapshot/template, prepare, dump+migrate+seed, ` + "`.treeman.yaml`" + `, treemand, finalize, fingerprint, slug.
 
-PREFERRED ENTRY POINTS:
-- "what's wrong / why did this fail" → doctor first, then logs_query (or the diagnose-prepare-failure prompt for the full chain).
-- "set up treeman in this repo from scratch" → the bootstrap-new-repo prompt.
-- "set me up a worktree for branch X" → the worktree-setup prompt (drives branches_list → daemon_status → worktree_create → wait).
-- "what's the daemon doing right now" → daemon_state (in-flight prepares + watchers + backoff). For just version/PID use daemon_status.
-- "is my DB up / are engines reachable" → engine_status. For a specific connection string before committing it, connection_probe.
-- "edit config" → config_locate (which file?) → config_get → config_diff → config_set (surgical) or config_write (full body). EVERY config tool takes scope=repo (default, .treeman.yaml) | global (~/.config/treeman/config.yaml): daemon/snapshots/logs/status/notifications live in global, databases/patches/hooks/main_worktree/env_sources in repo. Remove a key with config_unset; delete a whole file with config_delete; roll back with config_history → config_restore. Scaffold a fresh file with init_repo (global=true for the user-global one).
-- "why did this prepare cold-build instead of cache-hit" → inputs_fingerprint, then snapshot_inspect on the expected fingerprint.
-- "what would prepare actually run" → prepare_dry_run (renders the plan; no engine I/O).
-- "stream prepare progress" → logs_subscribe with a progressToken (live notifications) — falls back to collect-on-return.
-- "this worktree is stuck / broken" → worktree_repair (reconciles ports + finalize + snapshot templates).
-- "re-run setup/prepare for a worktree" → worktree_finalize (async via daemon; recovery counterpart to worktree_create's tail).
-- "I edited the config, make the daemon pick it up" → daemon_control action=reload.
-- "enroll the repo root for per-branch DBs" → main_worktree action=enable|disable|status.
-- "state of every worktree across all repos" → status_overview (fleet rollup, stable/up/down/failed).
-- "auto-fix what doctor found" → doctor fix=true.
-- "trial this migration without polluting state" → the migration-trial prompt.
-- "scaffold .treeman.yaml" → the scaffold-from-framework prompt.
+Only a few core tools load up front (doctor, status_overview, worktree_create, worktree_list, prepare_run, logs_query). For everything else — config, engine access, snapshots, registry, daemon control, init, the rest of the worktree/logs surface, and the guided multi-step prompts — call the ` + "`tools`" + ` tool: action=list catalogs every capability by category (with a routing guide), action=enable loads the ones the task needs.
 
-DESTRUCTIVE TOOLS support dry_run=true for previewing: worktree_delete, snapshots_purge, db_reset, repo_remove, config_delete. Always preview before committing.
-
-- "read or write engine data directly" → db_query (write=false reads SQL/Mongo/Redis; write=true+ack=true mutates: SQL DML/DDL, any Redis command, Mongo write commands). For Elasticsearch use es_request (any REST endpoint — _cat/_cluster/_mapping/_bulk/doc CRUD; reads free, writes need write=true+ack=true).
-
-DO NOT shell out to ` + "`git worktree`, `psql`, `mysql`, `mongosh`, `redis-cli`, or `curl`" + ` for repo OR engine state — db_query + es_request reach every engine through treeman's own configured, authenticated drivers (no credentials on the command line), and treeman keeps SQLite + engine state in sync. Bypassing it leaves the two out of sync.
-
-Destructive tools (worktree_delete, snapshots_purge, snapshot_drop, db_reset, registry_unregister, repo_remove, logs_purge, config_delete, config_unset) carry DestructiveHint=true in their annotations — surface the consequence to the user before invoking.`
+Prefer treeman over raw ` + "`git worktree`, `psql`, `mysql`, `mongosh`, `redis-cli`, `curl`" + `: it reaches every engine through its own configured, authenticated drivers and keeps SQLite + engine state in sync — bypassing it desyncs them. Destructive tools take dry_run=true to preview.`
 
 // Serve boots the MCP server on stdio and blocks until the client
 // disconnects or ctx is cancelled. Returns nil on clean shutdown.
