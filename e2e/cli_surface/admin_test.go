@@ -127,7 +127,7 @@ func TestDaemonStatus(t *testing.T) {
 const hookConfig = `worktrees:
   root: .worktrees
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: echo "hello from hook"
 `
 
@@ -157,12 +157,12 @@ func TestHookRun(t *testing.T) {
 	})
 
 	t.Run("runs the configured phase", func(t *testing.T) {
-		res := e.run(t, wtPath, "hook", "run", "on-create-before-engines")
+		res := e.run(t, wtPath, "hook", "run", "create-before-engines")
 		if res.err != nil {
 			t.Fatalf("hook run: %v\nstderr:\n%s\nstdout:\n%s",
 				res.err, res.stderr, res.stdout)
 		}
-		if !strings.Contains(res.stdout, "on-create-before-engines") &&
+		if !strings.Contains(res.stdout, "create-before-engines") &&
 			!strings.Contains(res.stdout, "action") {
 			t.Errorf("expected hook run summary line, got:\n%s", res.stdout)
 		}
@@ -179,7 +179,7 @@ func TestHookRun(t *testing.T) {
 	})
 
 	t.Run("--json reports phase + outcome", func(t *testing.T) {
-		res := e.run(t, wtPath, "hook", "run", "on-create-before-engines", "--json")
+		res := e.run(t, wtPath, "hook", "run", "create-before-engines", "--json")
 		if res.err != nil {
 			t.Fatalf("hook run --json: %v\nstderr:\n%s\nstdout:\n%s",
 				res.err, res.stderr, res.stdout)
@@ -188,15 +188,15 @@ func TestHookRun(t *testing.T) {
 		if err := json.Unmarshal([]byte(strings.TrimSpace(res.stdout)), &got); err != nil {
 			t.Fatalf("decode hook JSON %q: %v", res.stdout, err)
 		}
-		if got["phase"] != "on-create-before-engines" {
-			t.Errorf("expected phase=on-create-before-engines, got %v", got["phase"])
+		if got["phase"] != "create-before-engines" {
+			t.Errorf("expected phase=create-before-engines, got %v", got["phase"])
 		}
 	})
 
 	t.Run("captured stdout survives in DB and renders via --show", func(t *testing.T) {
 		// Re-run so we get a fresh hook_runs row; the row id varies by
 		// run order so we discover it via `logs hooks --json`.
-		_ = e.run(t, wtPath, "hook", "run", "on-create-before-engines")
+		_ = e.run(t, wtPath, "hook", "run", "create-before-engines")
 
 		listing := e.run(t, wtPath, "logs", "hooks", "--all", "--json")
 		if listing.err != nil {

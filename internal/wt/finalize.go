@@ -65,11 +65,11 @@ func RunLocalFinalize(
 			return err
 		}
 	}
-	if err := runTrigger("on-create-before-engines", cfg.Hooks.OnCreateBeforeEngines); err != nil {
+	if err := runTrigger("create-before-engines", cfg.Hooks.OnCreateBeforeEngines); err != nil {
 		return err
 	}
 	if skipPrepare || len(cfg.Databases) == 0 {
-		return runTrigger("on-create-after-engines", cfg.Hooks.OnCreateAfterEngines)
+		return runTrigger("create-after-engines", cfg.Hooks.OnCreateAfterEngines)
 	}
 	outs, err := prepare.Run(ctx, cfg, wtPath, sl, st, repoID, wtID, env)
 	if err != nil {
@@ -79,5 +79,5 @@ func RunLocalFinalize(
 		sink.Info("prepare[%s] %s template=%s clones=%d",
 			o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
 	}
-	return runTrigger("on-create-after-engines", cfg.Hooks.OnCreateAfterEngines)
+	return runTrigger("create-after-engines", cfg.Hooks.OnCreateAfterEngines)
 }

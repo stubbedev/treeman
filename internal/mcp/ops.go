@@ -376,19 +376,19 @@ func runHookPhase(ctx context.Context, phase, worktree string, envOverrides map[
 
 	var entries []config.Action
 	switch phase {
-	case "on-create-before-engines":
+	case "create-before-engines":
 		entries = cfg.Hooks.OnCreateBeforeEngines
-	case "on-create-after-engines":
+	case "create-after-engines":
 		entries = cfg.Hooks.OnCreateAfterEngines
-	case "on-delete-before-engines":
+	case "delete-before-engines":
 		entries = cfg.Hooks.OnDeleteBeforeEngines
-	case "on-delete-after-engines":
+	case "delete-after-engines":
 		entries = cfg.Hooks.OnDeleteAfterEngines
-	case "on-checkout":
+	case "checkout":
 		entries = cfg.Hooks.OnCheckout
 	default:
 		return hooks.RunOutcome{}, fmt.Errorf(
-			"unknown phase %q (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)",
+			"unknown phase %q (want create-before-engines|create-after-engines|delete-before-engines|delete-after-engines|checkout)",
 			phase,
 		)
 	}

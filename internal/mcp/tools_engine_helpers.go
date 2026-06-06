@@ -91,7 +91,7 @@ func probeTemplate(ctx context.Context, cfg *config.Config, eng, template string
 // reservedTemplatePrefixes are the namespace markers treeman owns:
 // cache templates (`_tm_<hex>` / `tm_<hex>` for ES) and branch-scoped
 // durable copies (`_tmbs_<hex>` / `tmbs_<hex>` for ES). MCP
-// snapshot_drop must refuse anything else so a hand-crafted or
+// snapshots_drop must refuse anything else so a hand-crafted or
 // typo'd template arg can't reach DropMatching's prefix LIKE and
 // reap unrelated app databases.
 var reservedTemplatePrefixes = []string{"_tm_", "_tmbs_", "tm_", "tmbs_"}

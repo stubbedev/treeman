@@ -42,6 +42,7 @@ import (
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/runid"
+	"github.com/stubbedev/treeman/internal/safego"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
@@ -1254,11 +1255,11 @@ func mysqlMergedColdFanout(
 // leak the goroutine forever, and so the eviction outlives the prepare
 // request's own context. Errors are logged inside EvictExcess.
 func spawnEvict(cfg *config.Config, st *store.Store, repoID int64) {
-	go func() {
+	safego.Go("snapshot:evict", "", func() {
 		evictCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		snapshot.EvictExcess(evictCtx, cfg, st, repoID)
-	}()
+	})
 }
 
 // incrementalOps bundles the engine-specific primitives the generic

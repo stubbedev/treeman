@@ -183,7 +183,7 @@ func finalizeRequest(repoRoot, wtPath string) rpc.Request {
 func writeConfig(ctx context.Context, repoRoot, path string, body []byte) error {
 	_, err := resultTask(ctx, rpc.Task{
 		Type: rpc.TaskConfigWrite, RepoPath: repoRoot,
-		Params: map[string]string{"path": path, "body": string(body)},
+		Params: map[string]string{rpc.ParamPath: path, rpc.ParamBody: string(body)},
 	})
 	return err
 }
@@ -297,7 +297,7 @@ func DbCmd() *cli.Command {
 					}
 					task := rpc.Task{
 						Type: rpc.TaskDBReset, RepoPath: repoRoot, WorktreePath: wtPath,
-						Params:       map[string]string{"engine_filter": strings.ToLower(c.String("engine"))},
+						Params:       map[string]string{rpc.ParamEngineFilter: strings.ToLower(c.String("engine"))},
 						InheritedEnv: CaptureInheritedEnv(),
 					}
 					if c.Bool("json") {
@@ -406,7 +406,7 @@ func HookCmd() *cli.Command {
 				}
 				task := rpc.Task{
 					Type: rpc.TaskHookRun, RepoPath: repoRoot, WorktreePath: wtPath,
-					Params:       map[string]string{"phase": phase},
+					Params:       map[string]string{rpc.ParamPhase: phase},
 					InheritedEnv: CaptureInheritedEnv(),
 				}
 				if c.Bool("json") {

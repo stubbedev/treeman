@@ -209,7 +209,7 @@ func mainWorktreeEnable(ctx context.Context, repoRoot string) (*mcpsdk.CallToolR
 		return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error
 	}
 	// Reload is synchronous; the main row exists by the time it returns,
-	// so finalize routes through the main-wt path and fires on-create-*.
+	// so finalize routes through the main-wt path and fires create-*.
 	if err := mcpPlanErr(submitMCPPlan(ctx, finalizePlan(repoRoot, repoRoot))); err != nil {
 		out.Detail = "enabled + reloaded; finalize failed (" + err.Error() + ") — run worktree_finalize at the repo root to retry"
 		return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error

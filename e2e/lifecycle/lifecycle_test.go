@@ -3,10 +3,10 @@
 // Package lifecycle_e2e tests the full worktree create/delete pipeline
 // through internal/daemon:
 //
-//	FinalizeWorktree → on-create-before-engines → engine prepare →
-//	  on-create-after-engines
-//	TeardownWorktree → on-delete-before-engines → engine drop →
-//	  on-delete-after-engines
+//	FinalizeWorktree → create-before-engines → engine prepare →
+//	  create-after-engines
+//	TeardownWorktree → delete-before-engines → engine drop →
+//	  delete-after-engines
 //
 // Hooks write touchstone files we can stat to confirm each phase
 // actually fired in the documented order.
@@ -75,13 +75,13 @@ databases:
     name_template: tm_lc_{slug}
 
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: "touch %s/01_before_engines"
-  on-create-after-engines:
+  create-after-engines:
     - run: "touch %s/02_after_engines"
-  on-delete-before-engines:
+  delete-before-engines:
     - run: "touch %s/03_before_delete"
-  on-delete-after-engines:
+  delete-after-engines:
     - run: "touch %s/04_after_delete"
 `, touchstones, touchstones, touchstones, touchstones)
 	if err := os.WriteFile(filepath.Join(repoRoot, ".treeman.yaml"),

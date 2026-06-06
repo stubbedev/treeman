@@ -1,9 +1,9 @@
 //go:build e2e
 
 // Package onfilechange_e2e drives the full daemon-managed watcher
-// against a real engine + on-file-change hook. Each file edit must:
+// against a real engine + file-change hook. Each file edit must:
 //
-//  1. Fire the matching on-file-change action with env vars
+//  1. Fire the matching file-change action with env vars
 //     describing the event (TREEMAN_WATCH_PATH, _LABEL, _ENGINE,
 //     _DB_NAME).
 //  2. Trigger FinalizeWorktreeForWatch → new fingerprint in store.
@@ -73,7 +73,7 @@ databases:
     inputs:
       - { glob: "db/migrations/*.sql", label: migrations }
 hooks:
-  on-file-change:
+  file-change:
     - match: migrations
       run: 'echo "$TREEMAN_WATCH_PATH|$TREEMAN_WATCH_LABEL|$TREEMAN_WATCH_ENGINE|$TREEMAN_WATCH_DB_NAME" > ` + touch + `/event'
 `
@@ -116,7 +116,7 @@ hooks:
 	time.Sleep(500 * time.Millisecond) // let fsnotify subscribe
 
 	// Add a new migration → expect:
-	//   • on-file-change hook fires (writes touch/event)
+	//   • file-change hook fires (writes touch/event)
 	//   • FinalizeWorktreeForWatch updates fingerprint
 	if err := os.WriteFile(filepath.Join(repoRoot, "db/migrations/001_new.sql"),
 		[]byte("ALTER TABLE x ADD COLUMN n INT;"), 0o644); err != nil {
@@ -135,7 +135,7 @@ hooks:
 		time.Sleep(200 * time.Millisecond)
 	}
 	if body == "" {
-		t.Fatal("on-file-change hook never wrote touch/event")
+		t.Fatal("file-change hook never wrote touch/event")
 	}
 	t.Logf("event body: %s", strings.TrimSpace(body))
 	for _, want := range []string{"db/migrations/001_new.sql", "migrations", "mysql", "tm_ofc_"} {

@@ -3,12 +3,12 @@ package daemon
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"maps"
 	"sync"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/safego"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -387,23 +387,15 @@ const (
 	lblWatchFinalize     = "watch:finalize"
 	lblDBDropOverflow    = "db:drop:overflow"
 	lblDBDropDrain       = "db:drop:drain"
+	lblNotify            = "notify:dispatch"
+	lblPlanLane          = "plan:lane"
 )
 
-// safeGo runs fn in a new goroutine, recovering any panic so a
-// runtime error in one async task can't kill the whole daemon. The
-// panic is logged with the caller-supplied label (an lbl* constant)
-// and an optional detail (the worktree/repo path it acts on; "" when
-// the goroutine is process-wide).
+// safeGo runs fn in a daemon goroutine with panic recovery (delegates
+// to safego.Go). label is an lbl* constant; detail is the worktree/repo
+// path the goroutine acts on ("" when process-wide).
 func safeGo(label, detail string, fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("daemon goroutine panic",
-					"label", label, "detail", detail, "panic", fmt.Sprint(r))
-			}
-		}()
-		fn()
-	}()
+	safego.Go(label, detail, fn)
 }
 
 // LockRepoTeardown returns the per-repo teardown mutex, creating it

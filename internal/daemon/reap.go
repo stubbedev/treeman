@@ -236,13 +236,13 @@ func parallelRemoveAll(ctx context.Context, root string, workers int) error {
 			target := filepath.Join(root, e.Name())
 			sem <- struct{}{}
 			wg.Add(1)
-			go func(t string) {
+			safeGo(lblWorktreeReap, target, func() {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if runErr := lowPriorityCommand(ctx, "rm", []string{"-rf", t}).Run(); runErr != nil {
-					slog.Debug("reap rm", "path", t, "err", runErr)
+				if runErr := lowPriorityCommand(ctx, "rm", []string{"-rf", target}).Run(); runErr != nil {
+					slog.Debug("reap rm", "path", target, "err", runErr)
 				}
-			}(target)
+			})
 		}
 		wg.Wait()
 	}

@@ -235,7 +235,7 @@ func dbResetTool(ctx context.Context, req *mcpsdk.CallToolRequest, in dbResetIn)
 // ─── hook_run ─────────────────────────────────────────────────────
 
 type hookIn struct {
-	Phase        string            `json:"phase"                   jsonschema:"on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout"`
+	Phase        string            `json:"phase"                   jsonschema:"create-before-engines|create-after-engines|delete-before-engines|delete-after-engines|checkout"`
 	Worktree     string            `json:"worktree,omitempty"`
 	EnvOverrides map[string]string `json:"env_overrides,omitempty" jsonschema:"extra env vars merged on top of the captured os.Environ() for this one invocation. Use to retry a flaky hook with a tweaked value without editing .treeman.yaml."`
 }
@@ -851,17 +851,17 @@ func worktreeCreateTool(
 	task := rpc.Task{
 		Type:         rpc.TaskWorktreeCreate,
 		RepoPath:     repoRoot,
-		Params:       map[string]string{"branch": in.Branch},
+		Params:       map[string]string{rpc.ParamBranch: in.Branch},
 		InheritedEnv: inheritedEnv(),
 	}
 	if in.From != "" {
-		task.Params["from"] = in.From
+		task.Params[rpc.ParamFrom] = in.From
 	}
 	if in.Path != "" {
-		task.Params["path"] = in.Path
+		task.Params[rpc.ParamPath] = in.Path
 	}
 	if in.NoFetch {
-		task.Params["no_fetch"] = "1"
+		task.Params[rpc.ParamNoFetch] = "1"
 	}
 	res, err := dispatchCreatePlan(ctx, task)
 	return nil, res, err
@@ -1318,7 +1318,7 @@ func repairFinalize(ctx context.Context, repoRoot, wtPath string) repairAction {
 // repairSnapshots probes each snapshot row owned by repoID to confirm
 // the engine-side template still exists. Orphans (template missing)
 // are reported but NOT auto-dropped — the agent should confirm before
-// calling snapshot_drop. Returns ok when every row is healthy.
+// calling snapshots_drop. Returns ok when every row is healthy.
 func repairSnapshots(ctx context.Context, st *store.Store, cfg *config.Config, repoID int64) repairAction {
 	rows, err := st.ListSnapshotsForRepo(ctx, repoID)
 	if err != nil {
@@ -1340,7 +1340,7 @@ func repairSnapshots(ctx context.Context, st *store.Store, cfg *config.Config, r
 	return repairAction{
 		Action: "snapshots",
 		Status: "fixed",
-		Detail: fmt.Sprintf("%d orphan(s) out of %d — call snapshot_drop on each, or the cache-cleanup prompt", orphans, len(rows)),
+		Detail: fmt.Sprintf("%d orphan(s) out of %d — call snapshots_drop on each, or the cache-cleanup prompt", orphans, len(rows)),
 	}
 }
 

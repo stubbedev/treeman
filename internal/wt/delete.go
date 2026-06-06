@@ -164,7 +164,7 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 		out, _ := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, id.Slug.Value, id.IsMain, env, true)
 		hooks.PersistOutcome(ctx, st, repoID, id.WtID, trigger, started, time.Now().UnixMilli(), out)
 	}
-	runTrigger("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
+	runTrigger("delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
 	if err := prepare.TeardownDatabases(ctx, &cfg, id.Slug.Value, repoID, id.WtID, st); err != nil {
 		slog.Warn("wt delete: teardown databases",
 			"slug", id.Slug.Value, "repo", repoRoot, "wt", wtPath, "err", err)
@@ -174,7 +174,7 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 				"slug": id.Slug.Value, "err": err.Error(),
 			})
 	}
-	runTrigger("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
+	runTrigger("delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
 	// Release the per-worktree port reservations back into the pool
 	// so a future `wt create` can re-use them.
 	_ = st.ReleaseWorktreePorts(ctx, id.WtID)

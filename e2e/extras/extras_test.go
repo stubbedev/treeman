@@ -10,9 +10,9 @@
 //     must produce a clear "dump … no such file" error.
 //   - TestFanoutCapIsHonored — explicit databases[].fanout caps
 //     concurrent clone restore.
-//   - TestActionContainerWrap — hooks.on-create-after-engines with a
+//   - TestActionContainerWrap — hooks.create-after-engines with a
 //     container: ref runs the action inside that container.
-//   - TestOnFileChangeMatchList — hooks.on-file-change match: [a,b]
+//   - TestOnFileChangeMatchList — hooks.file-change match: [a,b]
 //     fires for both labels and not for non-listed labels.
 package extras_e2e
 
@@ -193,7 +193,7 @@ func TestActionContainerWrap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The on-create-after-engines hook runs INSIDE the engine
+	// The create-after-engines hook runs INSIDE the engine
 	// container (Action.Container wrap). The mysql client there
 	// inserts the container's hostname into the marker table.
 	yaml := `
@@ -210,7 +210,7 @@ databases:
     name_template: tm_xtr_ctr_{slug}
     dump: seed.sql
 hooks:
-  on-create-after-engines:
+  create-after-engines:
     # Sanity: this hook runs on the HOST (no container wrap). The
     # witness file proves any hook fired.
     - run: echo "fired" > /tmp/treeman-e2e-extras-hook
@@ -300,7 +300,7 @@ databases:
       - { glob: "b/*", label: beta }
       - { glob: "c/*", label: gamma }
 hooks:
-  on-file-change:
+  file-change:
     - match: [alpha, beta]   # NOT gamma
       run: 'echo "$TREEMAN_WATCH_LABEL" >> ` + touch + `/events'
 `

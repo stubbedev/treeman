@@ -22,7 +22,7 @@ func TestActionSingleStringRun(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: "composer install"
 `)
 	cfg, err := LoadLayered(d)
@@ -42,7 +42,7 @@ func TestActionListRun(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run:
         - "npm install"
         - "npm run build"
@@ -61,7 +61,7 @@ func TestActionGroupLevelCwd(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run:
         - "yarn install"
         - "yarn build"
@@ -80,20 +80,20 @@ hooks:
 func TestAllTriggersParseAndCarryActions(t *testing.T) {
 	// Asserts every top-level trigger key in the schema accepts an
 	// actions list and lands on the matching struct field. The
-	// `on-file-change` trigger now lives per-database (covered by
+	// `file-change` trigger now lives per-database (covered by
 	// TestPerDBOnFileChange below).
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: "composer install"
-  on-create-after-engines:
+  create-after-engines:
     - run: "warm-cache.sh"
-  on-delete-before-engines:
+  delete-before-engines:
     - run: "drain-queues"
-  on-delete-after-engines:
+  delete-after-engines:
     - run: "notify-slack"
-  on-checkout:
+  checkout:
     - run: "refresh-test-data"
 `)
 	cfg, err := LoadLayered(d)
@@ -105,11 +105,11 @@ hooks:
 		actual []Action
 		want   string
 	}{
-		{"on-create-before-engines", cfg.Hooks.OnCreateBeforeEngines, "composer install"},
-		{"on-create-after-engines", cfg.Hooks.OnCreateAfterEngines, "warm-cache.sh"},
-		{"on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines, "drain-queues"},
-		{"on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines, "notify-slack"},
-		{"on-checkout", cfg.Hooks.OnCheckout, "refresh-test-data"},
+		{"create-before-engines", cfg.Hooks.OnCreateBeforeEngines, "composer install"},
+		{"create-after-engines", cfg.Hooks.OnCreateAfterEngines, "warm-cache.sh"},
+		{"delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines, "drain-queues"},
+		{"delete-after-engines", cfg.Hooks.OnDeleteAfterEngines, "notify-slack"},
+		{"checkout", cfg.Hooks.OnCheckout, "refresh-test-data"},
 	}
 	for _, c := range cases {
 		if len(c.actual) != 1 {
@@ -123,7 +123,7 @@ hooks:
 }
 
 // TestOnFileChangeGlobalWithLabels asserts the global
-// hooks.on-file-change block parses with the three valid `match:`
+// hooks.file-change block parses with the three valid `match:`
 // shapes: omitted (wildcard), single string, and list.
 func TestOnFileChangeGlobalWithLabels(t *testing.T) {
 	d := writeTmp(t, `
@@ -139,7 +139,7 @@ databases:
     inputs:
       - { glob: "es/mappings/**/*.json", label: es-mappings }
 hooks:
-  on-file-change:
+  file-change:
     - run: "echo any change anywhere"               # wildcard
     - match: migrations                              # single label
       run: "echo mysql migration changed"
@@ -153,7 +153,7 @@ hooks:
 		t.Fatal(err)
 	}
 	if len(cfg.Hooks.OnFileChange) != 4 {
-		t.Fatalf("on-file-change: want 4 actions, got %d", len(cfg.Hooks.OnFileChange))
+		t.Fatalf("file-change: want 4 actions, got %d", len(cfg.Hooks.OnFileChange))
 	}
 	a := cfg.Hooks.OnFileChange
 	if len(a[0].Match) != 0 {
@@ -183,7 +183,7 @@ func TestActionContainerSingleStep(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: "composer install"
       container: app
 `)
@@ -203,7 +203,7 @@ func TestActionInContainerAliasRejected(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: "composer install"
       in_container: app
 `)
@@ -217,7 +217,7 @@ func TestActionComposeService(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - compose_service: app
       compose_project: myproj
       container_engine: podman
@@ -242,7 +242,7 @@ func TestActionContainerAndComposeServiceMutuallyExclusive(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - container: app
       compose_service: also-app
       run: "boom"
@@ -256,7 +256,7 @@ func TestLegacyBackgroundFieldRejected(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: "yarn install"
       background: true
 `)
@@ -273,7 +273,7 @@ func TestLegacyStepsKeywordRejected(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - steps:
         - "a"
         - "b"
@@ -291,7 +291,7 @@ func TestActionRejectsBareString(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - "composer install"
 `)
 	_, err := LoadLayered(d)
@@ -325,16 +325,16 @@ databases:
       clones: auto
       name_template: "myapp_testing_{slug}_test_{n}"
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: "composer install --no-interaction"
     - run: "yarn install --frozen-lockfile"
     - run:
         - "yarn install"
         - "yarn build"
       cwd: frontend
-  on-create-after-engines:
+  create-after-engines:
     - run: "warm-cache.sh"
-  on-delete-before-engines:
+  delete-before-engines:
     - run: "drain-queues"
 `)
 	cfg, err := LoadLayered(d)
@@ -342,13 +342,13 @@ hooks:
 		t.Fatal(err)
 	}
 	if len(cfg.Hooks.OnCreateBeforeEngines) != 3 {
-		t.Errorf("want 3 on-create-before-engines actions, got %d", len(cfg.Hooks.OnCreateBeforeEngines))
+		t.Errorf("want 3 create-before-engines actions, got %d", len(cfg.Hooks.OnCreateBeforeEngines))
 	}
 	if len(cfg.Hooks.OnCreateAfterEngines) != 1 {
-		t.Errorf("want 1 on-create-after-engines action, got %d", len(cfg.Hooks.OnCreateAfterEngines))
+		t.Errorf("want 1 create-after-engines action, got %d", len(cfg.Hooks.OnCreateAfterEngines))
 	}
 	if len(cfg.Hooks.OnDeleteBeforeEngines) != 1 {
-		t.Errorf("want 1 on-delete-before-engines action, got %d", len(cfg.Hooks.OnDeleteBeforeEngines))
+		t.Errorf("want 1 delete-before-engines action, got %d", len(cfg.Hooks.OnDeleteBeforeEngines))
 	}
 	if len(cfg.Databases) != 1 || cfg.Databases[0].Engine != "mysql" {
 		t.Errorf("databases: %#v", cfg.Databases)
@@ -359,7 +359,7 @@ hooks:
 	if len(cfg.Patches) != 1 || cfg.Patches[0].File != ".env.testing" {
 		t.Errorf("patches: %#v", cfg.Patches)
 	}
-	// Spot-check that the 3rd on-create-before-engines action is the grouped one with cwd.
+	// Spot-check that the 3rd create-before-engines action is the grouped one with cwd.
 	a := cfg.Hooks.OnCreateBeforeEngines[2]
 	if a.Cwd != "frontend" || len(a.Run) != 2 {
 		t.Errorf("3rd action: %#v", a)

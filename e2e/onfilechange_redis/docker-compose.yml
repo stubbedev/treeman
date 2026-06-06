@@ -1,4 +1,4 @@
-# Redis for the prefix-engine on-file-change watcher e2e. Distinct port
+# Redis for the prefix-engine file-change watcher e2e. Distinct port
 # so it runs alongside the other redis suites.
 services:
   redis:

@@ -259,7 +259,7 @@ Execute these tool calls in order. Stop as soon as you can identify the failing 
 
 3. engine_status — confirm the affected engine is reachable and responsive. If unreachable, surface that as the root cause and stop.
 
-4. snapshot_inspect — when the failure involved a snapshot template (look for "snapshot" in the message or fingerprint in the payload). Verify the engine-side template_exists matches the SQLite row. A row whose template_exists=false is an orphan — recommend snapshot_drop or cache-cleanup.
+4. snapshots_inspect — when the failure involved a snapshot template (look for "snapshot" in the message or fingerprint in the payload). Verify the engine-side template_exists matches the SQLite row. A row whose template_exists=false is an orphan — recommend snapshots_drop or cache-cleanup.
 
 5. If the failure was inside the user's migrate/seed command, fetch the run_id and call logs_hooks for the worktree, plus hook_log_read for the specific phase/group_idx referenced in the failing hook_run.
 
@@ -530,13 +530,13 @@ Execute these tool calls in order:
 
 1. snapshots_list (%s) — list every cached snapshot. Record each fingerprint.
 
-2. For EACH fingerprint, call snapshot_inspect with that fingerprint. Collect the ones where template_exists=false. Those are the orphans.
+2. For EACH fingerprint, call snapshots_inspect with that fingerprint. Collect the ones where template_exists=false. Those are the orphans.
 
 3. If no orphans, report "0 orphans found" and stop.
 
 4. Show the user the orphan list (fingerprint, engine, template_name, source_db, created_at) and ASK FOR CONFIRMATION before dropping anything.
 
-5. After confirmation, for each orphan call snapshot_drop with that fingerprint. Report per-engine success/failure counts.
+5. After confirmation, for each orphan call snapshots_drop with that fingerprint. Report per-engine success/failure counts.
 
 NEVER call snapshots_purge from this flow — that nukes valid templates too.`,
 		repoArg,

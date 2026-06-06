@@ -48,7 +48,7 @@ func registerEngineReadTools(srv *mcpsdk.Server) {
 
 	addTool(srv, &mcpsdk.Tool{
 		Name:        "db_schema_dump",
-		Description: "Dump the live schema for ONE database — mysql/postgres: CREATE TABLEs, mongo: collection list + samples, ES: index mapping, redis: SCAN-driven key summary. Use to reason about live shape vs. what migrations expect. db = the rendered per-worktree name (find via worktree_show or snapshot_inspect). Capped at max_tables (default 200).",
+		Description: "Dump the live schema for ONE database — mysql/postgres: CREATE TABLEs, mongo: collection list + samples, ES: index mapping, redis: SCAN-driven key summary. Use to reason about live shape vs. what migrations expect. db = the rendered per-worktree name (find via worktree_show or snapshots_inspect). Capped at max_tables (default 200).",
 		Annotations: readOnlyAnno("Dump live schema", true),
 	}, dbSchemaDumpTool)
 
@@ -65,8 +65,8 @@ func registerEngineReadTools(srv *mcpsdk.Server) {
 	}, esRequestTool)
 
 	addTool(srv, &mcpsdk.Tool{
-		Name:        "snapshot_inspect",
-		Description: "Inspect ONE snapshot (by fingerprint, or engine+source_db) — SQLite row + does the engine-side template still exist + size + engine version. Call before snapshot_drop. Diagnoses \"cache hit but prepare failed\": template_exists=false → orphan row, next prepare will (correctly) cold-build. For sweeps use the cache-cleanup prompt.",
+		Name:        "snapshots_inspect",
+		Description: "Inspect ONE snapshot (by fingerprint, or engine+source_db) — SQLite row + does the engine-side template still exist + size + engine version. Call before snapshots_drop. Diagnoses \"cache hit but prepare failed\": template_exists=false → orphan row, next prepare will (correctly) cold-build. For sweeps use the cache-cleanup prompt.",
 		Annotations: readOnlyAnno("Inspect snapshot", true),
 	}, snapshotInspectTool)
 
@@ -91,8 +91,8 @@ func registerEngineReadTools(srv *mcpsdk.Server) {
 
 func registerEngineWriteTools(srv *mcpsdk.Server) {
 	addTool(srv, &mcpsdk.Tool{
-		Name:        "snapshot_drop",
-		Description: "Evict ONE snapshot by fingerprint (engine-side template + SQLite row). Next prepare cold-rebuilds. Call snapshot_inspect first to confirm. Engine-drop failures abort before the SQLite row is touched, so partial failures leave a recoverable state. Pass dry_run=true to preview, ack=true to skip confirmation. For orphan sweeps the cache-cleanup prompt is safer than calling this directly.",
+		Name:        "snapshots_drop",
+		Description: "Evict ONE snapshot by fingerprint (engine-side template + SQLite row). Next prepare cold-rebuilds. Call snapshots_inspect first to confirm. Engine-drop failures abort before the SQLite row is touched, so partial failures leave a recoverable state. Pass dry_run=true to preview, ack=true to skip confirmation. For orphan sweeps the cache-cleanup prompt is safer than calling this directly.",
 		Annotations: writeAnno("Drop snapshot", true, true, true),
 	}, snapshotDropTool)
 
@@ -822,7 +822,7 @@ func esIsReadRequest(method, path string) bool {
 	return false
 }
 
-// ─── snapshot_inspect ───────────────────────────────────────────────
+// ─── snapshots_inspect ───────────────────────────────────────────────
 
 type snapshotInspectIn struct {
 	Fingerprint string `json:"fingerprint,omitempty"`
@@ -871,7 +871,7 @@ func snapshotInspectTool(
 	return nil, out, nil
 }
 
-// ─── snapshot_drop ──────────────────────────────────────────────────
+// ─── snapshots_drop ──────────────────────────────────────────────────
 
 type snapshotDropIn struct {
 	Fingerprint string `json:"fingerprint"`
@@ -941,7 +941,7 @@ func snapshotDropTool(
 	}
 	if dropErr := dropTemplate(ctx, cfg, rec.Engine, rec.TemplateName); dropErr != nil {
 		// Don't proceed to the SQLite delete: leaving the row in
-		// place AND the orphan template means the next snapshot_inspect
+		// place AND the orphan template means the next snapshots_inspect
 		// will surface the orphan correctly. Deleting the row here
 		// would silently lose the link.
 		out.EngineDropped = false

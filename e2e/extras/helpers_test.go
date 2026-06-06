@@ -104,7 +104,7 @@ func runFinalize(t *testing.T, repoRoot string) {
 }
 
 // startWatcher launches the per-worktree watchers (HEAD + FS) so
-// on-file-change hooks fire. Must be called after runFinalize.
+// file-change hooks fire. Must be called after runFinalize.
 func startWatcher(t *testing.T, repoRoot string) {
 	t.Helper()
 	state := tStates[t.Name()]

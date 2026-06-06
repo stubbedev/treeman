@@ -36,7 +36,7 @@ type Event struct {
 	// DBIndex is the index into cfg.Databases for the owning DB.
 	DBIndex int
 	// Label is the optional label on the matched Input, referenced
-	// by `hooks.on-file-change[].match:` for filtered dispatch.
+	// by `hooks.file-change[].match:` for filtered dispatch.
 	Label string
 }
 

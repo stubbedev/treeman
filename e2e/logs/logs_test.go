@@ -181,10 +181,10 @@ func setup(t *testing.T) *fixture {
 		exit     int
 	}
 	hooks := []seedHook{
-		{wt1aID, "on-create-before-engines", 0, "echo a", mins(100), mins(100) + 250, 0},
-		{wt1aID, "on-create-after-engines", 1, "echo b", mins(60), mins(60) + 500, 0},
-		{wt1bID, "on-create-before-engines", 0, "echo c", mins(40), mins(40) + 100, 0},
-		{wt2aID, "on-create-before-engines", 0, "echo d", mins(10), mins(10) + 80, 1},
+		{wt1aID, "create-before-engines", 0, "echo a", mins(100), mins(100) + 250, 0},
+		{wt1aID, "create-after-engines", 1, "echo b", mins(60), mins(60) + 500, 0},
+		{wt1bID, "create-before-engines", 0, "echo c", mins(40), mins(40) + 100, 0},
+		{wt2aID, "create-before-engines", 0, "echo d", mins(10), mins(10) + 80, 1},
 	}
 	var hookRunIDs []int64
 	for _, h := range hooks {
@@ -471,7 +471,7 @@ func TestLogsCLI(t *testing.T) {
 			name:       "hooks/cwd auto-resolves to enclosing worktree",
 			cwd:        fx.wt1aPath,
 			args:       []string{"logs", "hooks", "-n", "10"},
-			wantStdout: []string{"on-create-before-engines", "on-create-after-engines"},
+			wantStdout: []string{"create-before-engines", "create-after-engines"},
 			notStdout:  []string{"echo c", "echo d"},
 			wantStderr: []string{"# scope: worktree=wt1a"},
 		},

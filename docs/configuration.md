@@ -83,18 +83,18 @@ hooks:
   # Every entry under a trigger key is an action; actions in one
   # list run in PARALLEL. `run:` itself takes a string (one step) or
   # a list (steps chain sequentially with `&&` — failure short-circuits).
-  on-create-before-engines:                # fires after patches + bring-in, BEFORE engine prepare
+  create-before-engines:                # fires after patches + bring-in, BEFORE engine prepare
     - run: "git pull --ff-only"
-  on-create-after-engines:                 # fires after engine prepare
+  create-after-engines:                 # fires after engine prepare
     - run: composer install --no-interaction --prefer-dist
     - run: yarn install --frozen-lockfile
     - cwd: frontend                        # multi-step action — cd + build chain sequentially
       run:
         - yarn install
         - yarn build:dev
-  on-delete-before-engines:                # fires BEFORE engine drop + git remove
+  delete-before-engines:                # fires BEFORE engine drop + git remove
     - run: "echo dropping caches"
-  on-file-change:                          # filtered by `match:` against input labels
+  file-change:                          # filtered by `match:` against input labels
     - match: migrations                    # accepts string or list (e.g. [migrations, seeders])
       run: "echo migrations changed"
 
@@ -161,7 +161,7 @@ custom layouts.
 
 ## Hooks
 
-Each entry under a trigger key (e.g. `on-create-after-engines`) is
+Each entry under a trigger key (e.g. `create-after-engines`) is
 one **action**. Actions in the same list run in **parallel**. The
 `run:` field inside one action is the action's step list — steps
 chain sequentially with `&&` so the first non-zero exit aborts the
@@ -173,7 +173,7 @@ Every action must be a mapping with at minimum a `run:` field
 
 ```yaml
 hooks:
-  on-create-after-engines:
+  create-after-engines:
     # single-step action — `run:` is a string
     - run: "composer install"
 
@@ -188,9 +188,9 @@ hooks:
         - "yarn build:dev"
 ```
 
-Available triggers: `on-create-before-engines`,
-`on-create-after-engines`, `on-delete-before-engines`,
-`on-delete-after-engines`, `on-checkout`, `on-file-change`. The
+Available triggers: `create-before-engines`,
+`create-after-engines`, `delete-before-engines`,
+`delete-after-engines`, `checkout`, `file-change`. The
 `*-before-engines` variants run before treeman touches its managed
 engines, the `*-after-engines` variants after. Every hook trigger is
 async-dispatched — the CLI returns immediately after spawning
@@ -211,7 +211,7 @@ the named container rather than on the host. Useful for
 
 ```yaml
 hooks:
-  on-create-after-engines:
+  create-after-engines:
     # Single-step action, in a named container.
     - { run: "composer install", container: myapp-php }
 
@@ -240,13 +240,13 @@ unconditionally:
 | `TREEMAN_SLUG`     | The slug used to name resources for this run (e.g. `feature_x`, `main_develop`). |
 | `TREEMAN_IS_MAIN`  | `"1"` when the firing worktree is the repo root with main-wt enabled, else `"0"`. Branch on this to skip dev-only setup on linked worktrees, or vice versa. |
 
-`on-file-change` hooks additionally receive `TREEMAN_WATCH_PATH`,
+`file-change` hooks additionally receive `TREEMAN_WATCH_PATH`,
 `TREEMAN_WATCH_LABEL`, `TREEMAN_WATCH_ENGINE`, `TREEMAN_WATCH_DB_NAME`
 so the script can branch on the trigger details.
 
 ```yaml
 hooks:
-  on-create-after-engines:
+  create-after-engines:
     - run: |
         if [ "$TREEMAN_IS_MAIN" = "1" ]; then
           composer install --no-dev
@@ -265,8 +265,8 @@ checkout doesn't get its own per-branch databases.
 `main_worktree:` opts the repo root into the same lifecycle. Once
 enabled, flipping a branch at the repo root produces per-branch
 databases keyed by `main_<branch>` (instead of every non-ticket
-branch collapsing to one path-hash slug), and the on-checkout /
-on-file-change / on-create-* hooks fire against the repo root the
+branch collapsing to one path-hash slug), and the checkout /
+file-change / create-* hooks fire against the repo root the
 same way they do for linked worktrees.
 
 ```yaml
@@ -284,7 +284,7 @@ main_worktree:
 
 Flip on with `treeman main enable` — this patches `.treeman.yaml`,
 asks the daemon to reload, then dispatches a finalize against the
-repo root so `on-create-*` hooks run immediately. Reverse with
+repo root so `create-*` hooks run immediately. Reverse with
 `treeman main disable` (config flag flips, watcher stops, databases
 remain). Add `--purge` to drop every per-branch DB the
 `main_<branch>` slug owns across all local branches.

@@ -615,11 +615,11 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		// `wt finalize` so PATH-sensitive scripts work in this
 		// daemon-driven re-run.
 		env, _ := st.Store.LoadInheritedEnvByPath(st.BgCtx, wtPath)
-		// Fire user-defined on-checkout actions in parallel with
+		// Fire user-defined checkout actions in parallel with
 		// the regular finalize re-run (no ordering — both react to
 		// the same event independently).
 		safeGo(lblHeadActions, wtPath, func() {
-			fireTriggerActions(runid.With(st.BgCtx, rid), st, repoPath, wtPath, "on-checkout", env,
+			fireTriggerActions(runid.With(st.BgCtx, rid), st, repoPath, wtPath, "checkout", env,
 				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnCheckout })
 		})
 		safeGo(lblHeadFinalize, wtPath, func() {
@@ -738,7 +738,7 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 			})
 		dbIdx, path, label := ev.DBIndex, ev.Path, ev.Label
 		env, _ := st.Store.LoadInheritedEnvByPath(st.BgCtx, wtPath)
-		// Fire the on-file-change actions in parallel with the
+		// Fire the file-change actions in parallel with the
 		// re-prep — both react to the same event independently.
 		safeGo(lblWatchActions, wtPath, func() {
 			fireOnFileChange(runid.With(st.BgCtx, rid), st, repoPath, wtPath, dbIdx, path, label, env)
@@ -752,7 +752,7 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 	}
 }
 
-// fireOnFileChange runs the global `hooks.on-file-change` actions,
+// fireOnFileChange runs the global `hooks.file-change` actions,
 // filtered by the watch event's label. Actions with an empty
 // `match:` fire for any watch event (any engine, any label);
 // actions with `match: <label>` only fire when the event's label
@@ -779,7 +779,7 @@ func fireOnFileChange(
 ) {
 	cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
 	if err != nil {
-		slog.Warn("on-file-change: load config", "wt", wtPath, "err", err)
+		slog.Warn("file-change: load config", "wt", wtPath, "err", err)
 		return
 	}
 	all := cfg.Hooks.OnFileChange
@@ -833,7 +833,7 @@ func fireOnFileChange(
 	env["TREEMAN_WATCH_LABEL"] = label
 	env["TREEMAN_WATCH_ENGINE"] = engine
 	env["TREEMAN_WATCH_DB_NAME"] = dbName
-	_ = runTriggerActions(ctx, st, "on-file-change", matched, repoPath, wtPath, sl.Value, isMain, repoID, wtID, env)
+	_ = runTriggerActions(ctx, st, "file-change", matched, repoPath, wtPath, sl.Value, isMain, repoID, wtID, env)
 }
 
 // fireTriggerActions loads the resolved config for a worktree and

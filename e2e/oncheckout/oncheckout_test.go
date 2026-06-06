@@ -1,7 +1,7 @@
 //go:build e2e
 
 // Package oncheckout_e2e drives a real branch switch inside a real
-// worktree and asserts the `hooks.on-checkout:` action fires with
+// worktree and asserts the `hooks.checkout:` action fires with
 // the new ref. The headwatcher e2e suite only proves the watcher
 // detects HEAD changes — this test goes one step further and
 // confirms the configured action runs.
@@ -61,7 +61,7 @@ databases:
   - engine: mysql
     name_template: tm_oc_{slug}
 hooks:
-  on-checkout:
+  checkout:
     - run: echo "$TREEMAN_SLUG" > ` + touch + `/checkout-fired
 `
 	must(".treeman.yaml", yaml)
@@ -94,11 +94,11 @@ hooks:
 	}
 	time.Sleep(500 * time.Millisecond) // let HEAD watcher seed
 
-	// Trigger HEAD change → on-checkout should fire.
+	// Trigger HEAD change → checkout should fire.
 	mustGit(t, repoRoot, "checkout", "-q", "feature")
 
 	witness := filepath.Join(touch, "checkout-fired")
-	harness.WaitForReady(t, "on-checkout-fired", 15*time.Second, func() error {
+	harness.WaitForReady(t, "checkout-fired", 15*time.Second, func() error {
 		body, err := os.ReadFile(witness)
 		if err != nil {
 			return fmt.Errorf("witness missing: %v", err)
@@ -109,7 +109,7 @@ hooks:
 		return nil
 	})
 	body, _ := os.ReadFile(witness)
-	t.Logf("on-checkout fired; slug=%s", string(body))
+	t.Logf("checkout fired; slug=%s", string(body))
 }
 
 func mustGit(t *testing.T, dir string, args ...string) {

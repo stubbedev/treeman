@@ -25,7 +25,7 @@ import (
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
-// goroutine) tail of `treeman wt create`: it runs the on-create
+// goroutine) tail of `treeman wt create`: it runs the create
 // hook pipeline + engine prepare against the main repo root,
 // detached from the CLI invocation.
 func FinalizeWorktree(
@@ -130,7 +130,7 @@ func FinalizeWorktree(
 	// before firing hooks. Watcher-triggered finalize can race: the
 	// new worktree dir + .git file land first, the daemon's filesystem
 	// watcher sees them and dispatches finalize, but git is still
-	// writing subdirs. A user `on-create-before-engines` hook with a
+	// writing subdirs. A user `create-before-engines` hook with a
 	// `cwd: frontend` then fails with `cd: can't cd to frontend`. CLI-
 	// triggered finalize is already past the git wait so this is a
 	// near-zero-cost no-op there. Bounded so a wedged checkout still
@@ -182,8 +182,8 @@ func FinalizeWorktree(
 		applyFinalizePatches(ctx, st, &cfg, wtRoot, sl, repoID, wtID)
 	}
 
-	// Three-step setup pipeline: on-create-before-engines actions →
-	// engine prepare → on-create-after-engines actions. Each step waits
+	// Three-step setup pipeline: create-before-engines actions →
+	// engine prepare → create-after-engines actions. Each step waits
 	// for the previous on the daemon side; the CLI never sees this
 	// (it already returned).
 	//
@@ -335,8 +335,8 @@ func applyFinalizePatches(
 }
 
 // runFinalizeSetupPipeline runs the three-step setup pipeline:
-// on-create-before-engines actions → engine prepare →
-// on-create-after-engines actions. Each phase boundary is a
+// create-before-engines actions → engine prepare →
+// create-after-engines actions. Each phase boundary is a
 // cancellation checkpoint: when a concurrent TeardownWorktree fires
 // `cancel`, the next check writes a worktree:create:cancel event and
 // returns (done=true, nil) so the caller stops short of starting the
@@ -356,7 +356,7 @@ func runFinalizeSetupPipeline(
 	if cancelledBefore(ctx, st, "pre-hooks", repoID, wtID) {
 		return true, nil
 	}
-	if err := runTriggerActions(ctx, st, "on-create-before-engines",
+	if err := runTriggerActions(ctx, st, "create-before-engines",
 		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
 		isMain, repoID, wtID, inheritedEnv); err != nil {
 		return false, err
@@ -381,7 +381,7 @@ func runFinalizeSetupPipeline(
 	if cancelledBefore(ctx, st, "post-hooks", repoID, wtID) {
 		return true, nil
 	}
-	if err := runTriggerActions(ctx, st, "on-create-after-engines",
+	if err := runTriggerActions(ctx, st, "create-after-engines",
 		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
 		isMain, repoID, wtID, inheritedEnv); err != nil {
 		return false, err
@@ -596,11 +596,11 @@ func TeardownWorktree(
 		"daemon-detached teardown hooks + db teardown + git remove beginning",
 		repoID, wtID, "", 0, nil)
 
-	// Three-step teardown: on-delete-before-engines actions →
+	// Three-step teardown: delete-before-engines actions →
 	// engine drop (inline + synchronous so post-engine actions can
-	// observe the drop) → on-delete-after-engines actions. Drop
+	// observe the drop) → delete-after-engines actions. Drop
 	// failures are logged but don't abort the rest.
-	_ = runTriggerActions(ctx, st, "on-delete-before-engines",
+	_ = runTriggerActions(ctx, st, "delete-before-engines",
 		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, slugVal,
 		row.IsMain, repoID, wtID, inheritedEnv)
 	if len(cfg.Databases) > 0 {
@@ -608,7 +608,7 @@ func TeardownWorktree(
 			slog.Warn("teardown DB drop", "wt", wtRoot, "err", err)
 		}
 	}
-	_ = runTriggerActions(ctx, st, "on-delete-after-engines",
+	_ = runTriggerActions(ctx, st, "delete-after-engines",
 		cfg.Hooks.OnDeleteAfterEngines, repoRoot, wtRoot, slugVal,
 		row.IsMain, repoID, wtID, inheritedEnv)
 
