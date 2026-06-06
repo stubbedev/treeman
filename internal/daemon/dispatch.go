@@ -605,7 +605,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 	hw, err := NewHeadWatcher(wtPath, 100*time.Millisecond, func(_ context.Context, newRef string) {
 		rid := runid.New()
 		evCtx := runid.With(st.BgCtx, rid)
-		_ = st.Store.WriteEvent(evCtx, "info", store.EvtWatchHead,
+		_ = st.Store.WriteEvent(evCtx, store.LevelInfo, store.EvtWatchHead,
 			"HEAD → "+newRef,
 			repoID, 0, "", 0, map[string]string{
 				"wt":  wtPath,
@@ -728,7 +728,7 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 		// re-attach the id there too.
 		rid := runid.New()
 		evCtx := runid.With(ctx, rid)
-		_ = st.Store.WriteEvent(evCtx, "info", store.EvtWatchInput,
+		_ = st.Store.WriteEvent(evCtx, store.LevelInfo, store.EvtWatchInput,
 			fmt.Sprintf("%s (db_idx=%d label=%s)", ev.Path, ev.DBIndex, ev.Label),
 			repoID, 0, "", 0, map[string]string{
 				"path":   ev.Path,

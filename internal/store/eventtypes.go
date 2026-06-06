@@ -11,10 +11,6 @@ package store
 // auto_fetch→fetch, …) or a subsystem (worktree, daemon, mcp).
 // Stage vocabulary is closed: start / end / error / skip / cancel for
 // bracketed operations; a bare present-tense verb for one-shots.
-//
-// Dynamic families that are NOT plain constants:
-//   - MCP audit events: EvtMCPPrefix + the action with `_`→`:`
-//     (e.g. config_set → "mcp:config:set"). See internal/mcp/ops.go.
 const (
 	// worktrees.copies / worktrees.links — bring-in passes.
 	EvtCopiesStart = "copies:start"

@@ -474,7 +474,7 @@ func runTaskWorktreeCreate(ctx context.Context, st *State, task rpc.Task) (json.
 			// No daemon to outlive the call — run the tail before returning.
 			runFinalize(runid.With(ctx, runid.New()))
 		} else {
-			safeGo(store.EvtWorktreeCreateError, func() { runFinalize(runid.With(st.BgCtx, runid.New())) })
+			safeGo("worktree_finalize", func() { runFinalize(runid.With(st.BgCtx, runid.New())) })
 		}
 		res.Status = wt.CreatedQueued
 	}

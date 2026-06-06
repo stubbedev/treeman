@@ -433,7 +433,7 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 	case store.EvtWorktreeCreateStart:
 		return "preparing", "up"
 	case store.EvtWorktreeCreateError:
-		if last.Level == "error" {
+		if last.Level == store.LevelError {
 			return "error", "failed"
 		}
 		return "ready", "stable"

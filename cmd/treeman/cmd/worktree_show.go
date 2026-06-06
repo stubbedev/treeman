@@ -297,7 +297,7 @@ func pollFinalize(
 				}
 				return nil
 			}
-			if e.EventType == store.EvtWorktreeCreateError && e.Level == "error" {
+			if e.EventType == store.EvtWorktreeCreateError && e.Level == store.LevelError {
 				return fmt.Errorf("finalize failed: %s", e.Message)
 			}
 		}
@@ -410,7 +410,7 @@ func finalizeState(ctx context.Context, st *store.Store, wtID int64) (state, det
 	case store.EvtWorktreeCreateStart:
 		return ui.Status("preparing"), "(started " + formatTs(last.Ts) + ")"
 	case store.EvtWorktreeCreateError:
-		if last.Level == "error" {
+		if last.Level == store.LevelError {
 			return ui.Status("error"), "— " + last.Message
 		}
 	}

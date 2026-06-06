@@ -568,9 +568,8 @@ type repoRemoveOut struct {
 
 // repoRemoveTool drops a repo from the registry. Tool surface was
 // renamed from registry_remove → repo_remove (the only registry_*
-// tool that acts on a REPO rather than a worktree); the emitted
-// event_type is still "registry_remove" so historical log_query
-// filters keep working.
+// tool that acts on a REPO rather than a worktree); the emitted audit
+// event is store.EvtMCPRegistryRemove.
 func repoRemoveTool(
 	ctx context.Context,
 	req *mcpsdk.CallToolRequest,

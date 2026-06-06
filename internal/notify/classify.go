@@ -40,7 +40,7 @@ func Bucket(eventType, level string) string {
 		// Only ever written as the terminal error event (see
 		// finalize.go / stale_finalize.go); gate on level so a future
 		// non-error use can't masquerade as a failure.
-		if level == "error" {
+		if level == store.LevelError {
 			return BucketFailed
 		}
 		return ""
