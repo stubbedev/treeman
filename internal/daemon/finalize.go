@@ -147,47 +147,7 @@ func FinalizeWorktree(
 	// the main worktree, which is the source the links/copies originate
 	// from (src == dst), same rationale as patches.
 	if !isMain {
-		// Bring-in is the single biggest silent cost on create (a
-		// recursive copy of e.g. vendor/ or node_modules/ can run for
-		// tens of seconds). Bracket it with start/done events and emit a
-		// per-entry debug line carrying files + bytes + duration so a
-		// slow copy is attributable to a specific configured path.
-		bringIn := func(mode string, paths []string) error {
-			if len(paths) == 0 {
-				return nil
-			}
-			_ = st.Store.WriteEvent(ctx, store.LevelInfo, "bring_in_start",
-				fmt.Sprintf("%s entries=%d", mode, len(paths)),
-				repoID, wtID, "", 0, map[string]any{"mode": mode, "entries": len(paths)})
-			results, brErr := wt.BringInFilesReport(repoRoot, wtRoot, paths, mode, nil)
-			var files, brought, skipped int
-			var bytes, totalMs int64
-			for _, r := range results {
-				files += r.Files
-				brought += r.Brought
-				skipped += r.Skipped
-				bytes += r.Bytes
-				totalMs += r.DurationMs
-				_ = st.Store.WriteEvent(ctx, store.LevelDebug, "bring_in_path",
-					fmt.Sprintf("%s %s files=%d bytes=%d duration=%dms", mode, r.Rel, r.Files, r.Bytes, r.DurationMs),
-					repoID, wtID, "", r.DurationMs, map[string]any{
-						"mode": mode, "path": r.Rel, "matches": r.Matches,
-						"brought": r.Brought, "skipped": r.Skipped, "missing": r.Missing,
-						"files": r.Files, "bytes": r.Bytes,
-					})
-			}
-			_ = st.Store.WriteEvent(ctx, store.LevelInfo, "bring_in_done",
-				fmt.Sprintf("%s entries=%d brought=%d skipped=%d files=%d bytes=%d", mode, len(results), brought, skipped, files, bytes),
-				repoID, wtID, "", totalMs, map[string]any{
-					"mode": mode, "entries": len(results), "brought": brought,
-					"skipped": skipped, "files": files, "bytes": bytes,
-				})
-			return brErr
-		}
-		if err := bringIn("link", cfg.Worktrees.Links); err != nil {
-			return err
-		}
-		if err := bringIn("copy", cfg.Worktrees.Copies); err != nil {
+		if err := bringInWithEvents(ctx, st, repoRoot, wtRoot, &cfg, repoID, wtID); err != nil {
 			return err
 		}
 	}
@@ -215,21 +175,7 @@ func FinalizeWorktree(
 	// CLI already filled every slot. Skipped for the main worktree
 	// (same rationale as patches: it IS the canonical clone).
 	if len(cfg.Ports) > 0 && !isMain {
-		allocs, err := ports.New().Allocate(ctx, st.Store, &cfg, repoID, wtID)
-		switch {
-		case err != nil:
-			slog.Warn("finalize: port allocation", "wt", wtRoot, "err", err)
-			_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_port_alloc_error",
-				err.Error(), repoID, wtID, "", 0, nil)
-		case len(allocs) > 0:
-			slots := make(map[string]any, len(allocs))
-			for _, a := range allocs {
-				slots[a.Name] = a.Port
-			}
-			_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_port_alloc",
-				fmt.Sprintf("allocated %d port slot(s)", len(allocs)),
-				repoID, wtID, "", 0, map[string]any{"slots": slots})
-		}
+		allocatePortsWithEvents(ctx, st, &cfg, wtRoot, repoID, wtID)
 	}
 
 	if len(cfg.Patches) > 0 && !isMain {
@@ -266,6 +212,87 @@ func FinalizeWorktree(
 		"daemon-detached setup + prepare complete",
 		repoID, wtID, "", 0, nil)
 	return nil
+}
+
+// bringInWithEvents runs the link + copy bring-in passes for a non-main
+// worktree, emitting bring_in_start / bring_in_path (debug) / bring_in_done
+// events. Bring-in is the single biggest silent cost on create (a
+// recursive copy of e.g. vendor/ or node_modules/ can run for tens of
+// seconds); the per-entry line carries files + bytes + duration so a slow
+// copy is attributable to a specific configured path. Extracted from
+// FinalizeWorktree to keep that function under the complexity gate.
+func bringInWithEvents(
+	ctx context.Context,
+	st *State,
+	repoRoot, wtRoot string,
+	cfg *config.Config,
+	repoID, wtID int64,
+) error {
+	emit := func(mode string, paths []string) error {
+		if len(paths) == 0 {
+			return nil
+		}
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, "bring_in_start",
+			fmt.Sprintf("%s entries=%d", mode, len(paths)),
+			repoID, wtID, "", 0, map[string]any{"mode": mode, "entries": len(paths)})
+		results, brErr := wt.BringInFilesReport(repoRoot, wtRoot, paths, mode, nil)
+		var files, brought, skipped int
+		var bytes, totalMs int64
+		for _, r := range results {
+			files += r.Files
+			brought += r.Brought
+			skipped += r.Skipped
+			bytes += r.Bytes
+			totalMs += r.DurationMs
+			_ = st.Store.WriteEvent(ctx, store.LevelDebug, "bring_in_path",
+				fmt.Sprintf("%s %s files=%d bytes=%d duration=%dms", mode, r.Rel, r.Files, r.Bytes, r.DurationMs),
+				repoID, wtID, "", r.DurationMs, map[string]any{
+					"mode": mode, "path": r.Rel, "matches": r.Matches,
+					"brought": r.Brought, "skipped": r.Skipped, "missing": r.Missing,
+					"files": r.Files, "bytes": r.Bytes,
+				})
+		}
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, "bring_in_done",
+			fmt.Sprintf("%s entries=%d brought=%d skipped=%d files=%d bytes=%d", mode, len(results), brought, skipped, files, bytes),
+			repoID, wtID, "", totalMs, map[string]any{
+				"mode": mode, "entries": len(results), "brought": brought,
+				"skipped": skipped, "files": files, "bytes": bytes,
+			})
+		return brErr
+	}
+	if err := emit("link", cfg.Worktrees.Links); err != nil {
+		return err
+	}
+	return emit("copy", cfg.Worktrees.Copies)
+}
+
+// allocatePortsWithEvents allocates the configured port slots for a
+// non-main worktree, emitting wt_port_alloc on success (with the
+// slot→port map) or wt_port_alloc_error on failure. Idempotent — a
+// no-op when the CLI already filled every slot. Extracted from
+// FinalizeWorktree to keep that function under the complexity gate.
+func allocatePortsWithEvents(
+	ctx context.Context,
+	st *State,
+	cfg *config.Config,
+	wtRoot string,
+	repoID, wtID int64,
+) {
+	allocs, err := ports.New().Allocate(ctx, st.Store, cfg, repoID, wtID)
+	switch {
+	case err != nil:
+		slog.Warn("finalize: port allocation", "wt", wtRoot, "err", err)
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_port_alloc_error",
+			err.Error(), repoID, wtID, "", 0, nil)
+	case len(allocs) > 0:
+		slots := make(map[string]any, len(allocs))
+		for _, a := range allocs {
+			slots[a.Name] = a.Port
+		}
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_port_alloc",
+			fmt.Sprintf("allocated %d port slot(s)", len(allocs)),
+			repoID, wtID, "", 0, map[string]any{"slots": slots})
+	}
 }
 
 // applyFinalizePatches re-applies the top-level `patches:` against the
