@@ -25,9 +25,9 @@ import (
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
-// goroutine) tail of `treeman wt create` when
-// `worktrees.async_create` is true. Runs setup hooks + prepare
-// against the main repo root.
+// goroutine) tail of `treeman wt create`: it runs the on-create
+// hook pipeline + engine prepare against the main repo root,
+// detached from the CLI invocation.
 func FinalizeWorktree(
 	ctx context.Context,
 	st *State,
