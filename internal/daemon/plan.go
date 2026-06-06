@@ -106,40 +106,45 @@ func firstFailure(results []rpc.TaskResult) string {
 	return ""
 }
 
-// runOneTask dispatches a single task to its runner. Each runner mutates
-// state via the daemon's warm store and returns a task-specific JSON
-// payload (nil when there's nothing structured to return).
+// taskRunner mutates state via the daemon's warm store and returns a
+// task-specific JSON payload (nil when there's nothing structured to
+// return).
+type taskRunner func(context.Context, *State, rpc.Task) (json.RawMessage, error)
+
+// taskRunners is the full set of mutations the daemon performs — the one
+// extension point of the plan model. Adding a task = add a Task* const
+// (rpc), a runner, and one entry here.
+var taskRunners = map[string]taskRunner{
+	rpc.TaskPrepare:          runTaskPrepare,
+	rpc.TaskDBReset:          runTaskDBReset,
+	rpc.TaskHookRun:          runTaskHookRun,
+	rpc.TaskSnapshotsPurge:   runTaskSnapshotsPurge,
+	rpc.TaskMainPurgeDBs:     runTaskMainPurgeDBs,
+	rpc.TaskWtRegister:       runTaskWtRegister,
+	rpc.TaskWtUnregister:     runTaskWtUnregister,
+	rpc.TaskLogsPurge:        runTaskLogsPurge,
+	rpc.TaskRegistryRepair:   runTaskRegistryRepair,
+	rpc.TaskConfigWrite:      runTaskConfigWrite,
+	rpc.TaskWorktreeCreate:   runTaskWorktreeCreate,
+	rpc.TaskWorktreeFinalize: runTaskWorktreeFinalize,
+	rpc.TaskWorktreeTeardown: runTaskWorktreeTeardown,
+}
+
+// runOneTask dispatches a single task to its registered runner.
 func runOneTask(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
-	switch task.Type {
-	case rpc.TaskPrepare:
-		return runTaskPrepare(ctx, st, task)
-	case rpc.TaskDBReset:
-		return runTaskDBReset(ctx, st, task)
-	case rpc.TaskHookRun:
-		return runTaskHookRun(ctx, st, task)
-	case rpc.TaskSnapshotsPurge:
-		return runTaskSnapshotsPurge(ctx, st, task)
-	case rpc.TaskMainPurgeDBs:
-		return runTaskMainPurgeDBs(ctx, st, task)
-	case rpc.TaskWtRegister:
-		return runTaskWtRegister(ctx, st, task)
-	case rpc.TaskWtUnregister:
-		return runTaskWtUnregister(ctx, st, task)
-	case rpc.TaskLogsPurge:
-		return runTaskLogsPurge(ctx, st, task)
-	case rpc.TaskRegistryRepair:
-		return runTaskRegistryRepair(ctx, st, task)
-	case rpc.TaskConfigWrite:
-		return runTaskConfigWrite(ctx, st, task)
-	case rpc.TaskWorktreeCreate:
-		return runTaskWorktreeCreate(ctx, st, task)
-	case rpc.TaskWorktreeFinalize:
-		return nil, FinalizeWorktree(ctx, st, task.RepoPath, task.WorktreePath, task.InheritedEnv)
-	case rpc.TaskWorktreeTeardown:
-		return nil, TeardownWorktree(ctx, st, task.RepoPath, task.WorktreePath, task.Params["force"] == "1", task.InheritedEnv)
-	default:
+	run, ok := taskRunners[task.Type]
+	if !ok {
 		return nil, fmt.Errorf("run_plan: unknown task %q", task.Type)
 	}
+	return run(ctx, st, task)
+}
+
+func runTaskWorktreeFinalize(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
+	return nil, FinalizeWorktree(ctx, st, task.RepoPath, task.WorktreePath, task.InheritedEnv)
+}
+
+func runTaskWorktreeTeardown(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
+	return nil, TeardownWorktree(ctx, st, task.RepoPath, task.WorktreePath, task.Params["force"] == "1", task.InheritedEnv)
 }
 
 // taskIdentity bundles the resolved config + row identity a worktree-
