@@ -96,26 +96,10 @@ tool result with no mutation performed.
 
 ## Tools exposed
 
-| Tool | What it does |
-|---|---|
-| `doctor`, `daemon_status`, `daemon_state` | Health checks. `daemon_state` adds a rich runtime view: in-flight finalize/teardown work, watcher set, per-repo sync backoff timers. |
-| `config_get`, `config_validate`, `config_schema`, `config_diff` | Read/validate the YAML config. `config_get` output is redacted (passwords in resolved connection strings). |
-| `worktree_list`, `worktree_show`, `snapshots_list` | Registry + snapshot-cache queries. `worktree_show` also reports allocated ports and branch_scoped active-namespace state. |
-| `branch_scoped_status` | Per branch_scoped database: active namespace, which branch's data occupies it now, and which local branches have a resumable durable copy. |
-| `logs_query`, `logs_hooks`, `logs_wait`, `logs_subscribe` | Event log + hook run history. `logs_wait` blocks until N matches via SQLite polling; **`logs_subscribe` prefers push mode** — opens a streaming RPC subscription to the daemon so events arrive without polling, falling back to 500ms polling only when the daemon is unreachable. The result's `mode` field reports which path was used. Output runs through a secret-redaction pass. |
-| `fw_detect`, `slug_compute`, `inputs_fingerprint` | Detection + fingerprint helpers. `inputs_fingerprint` answers "why did prepare cold-build instead of cache-hit?". |
-| `prepare_dry_run` | Render the prepare pipeline plan WITHOUT executing — per-DB rendered name, dump files, migrate/seed commands, fanout count, expected fingerprint. |
-| `connection_probe` | Dry-test a connection string (or the repo's configured connection) — reachable, version, latency. Use to iterate on credentials before committing them. |
-| `engine_logs` | Tail container logs for one configured engine (`docker logs --tail N --since S` or `podman`/`nerdctl`/`finch` per the connection block). Closes the "why is MySQL refusing connections?" gap. Errors with a clear message when the engine has no container ref. |
-| `prompts_list` | List every registered MCP prompt with its when-to-use trigger. Discovery backup for clients with weak prompt UI. |
-| `config_write`, `config_set`, `hook_run`, `prepare_run` | Replace the whole YAML body, patch a single field by dotted path, run a hook phase (`env_overrides` lets you tweak one var for the run), run the prepare pipeline. |
-| `db_reset` | Re-sync a worktree's `branch_scoped` databases from the live base branch. Destructive for the current branch's working data; `dry_run=true` previews, `ack=true` skips elicitation. |
-| `init_repo`, `schema_install` | Scaffold `.treeman.yaml`; install the JSON Schema and wire its modeline. |
-| `registry_register`, `registry_unregister`, `registry_repair`, `worktree_repair` | Mutate the SQLite worktree registry directly. `registry_repair` diffs git vs SQLite. `worktree_repair` reconciles ports / finalize state / snapshot templates for one worktree. |
-| `repo_remove` | Drop a whole REPO from the SQLite registry (cascades to its worktrees/events/snapshots/hook_runs). `dry_run=true` counts cascaded rows first. External resources are not touched; refuses by default if active worktrees exist. |
-| `snapshots_purge`, `logs_purge` | Wipe the snapshot cache (`dry_run=true` previews) / delete event-log rows by filter (at least one filter required). |
-| `daemon_control` | Start / stop treemand. Prefers the installed systemd/launchd unit; otherwise forks the `treemand` binary (start) or sends the shutdown RPC (stop). |
-| `worktree_create`, `worktree_delete` | Run the full git + hooks + prepare lifecycle in-process via `internal/wt`. `worktree_delete` accepts `dry_run=true` to preview the per-engine namespaces that would be dropped. The heavy tail is dispatched to the daemon; on daemon-unreachable the orchestrator spawns a detached child and returns immediately. |
+The complete tool list — grouped by category, flagged **core** (loaded
+up front) vs revealed on demand — is generated from the live registry:
+**[mcp-tools.md](mcp-tools.md)**. It refreshes via `just sync-docs`, so it
+never drifts from the code (CI fails a PR that forgets to regenerate).
 
 ## Resources
 

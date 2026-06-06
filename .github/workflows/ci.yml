@@ -197,35 +197,38 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Regenerate the generated docs from the live binary: `docs/cli.md`
-      # from the cli.Command tree and `docs/config-reference.md` from the
-      # config.Config types. On master pushes drift is auto-committed; on
-      # PRs we fail so reviewers see the drift. Mirrors the schema job.
+      # Regenerate the generated docs from the live binary + registries:
+      # cli.md (cli.Command tree), config-reference.md (config.Config),
+      # mcp-tools.md (mcp.Catalog), events.md (store.Evt* consts). On
+      # master pushes drift is auto-committed; on PRs we fail so reviewers
+      # see the drift. Mirrors the schema job.
       - name: regenerate generated docs
         run: |
           set -euo pipefail
           mkdir -p docs
           go run ./cmd/treeman-gen-docs docs/cli.md
           go run ./cmd/treeman-gen-config-docs docs/config-reference.md
+          go run ./cmd/treeman-gen-mcp-docs docs/mcp-tools.md
+          go run ./cmd/treeman-gen-events-docs docs/events.md
 
       - name: assert docs in sync (PR)
         if: github.event_name == 'pull_request'
         run: |
-          if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md)" ]; then
+          if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md)" ]; then
             echo "::error::generated docs are stale. Run 'just sync-docs' locally and commit the result."
-            git --no-pager diff docs/cli.md docs/config-reference.md
+            git --no-pager diff docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md
             exit 1
           fi
 
       - name: auto-commit docs bump (master)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
-          if [ -z "$(git status --porcelain docs/cli.md docs/config-reference.md)" ]; then
+          if [ -z "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md)" ]; then
             echo "generated docs already in sync; nothing to commit."
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add docs/cli.md docs/config-reference.md
+          git add docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md
           git commit -m 'chore: auto-bump generated docs [skip ci]'
           git push origin HEAD:master
