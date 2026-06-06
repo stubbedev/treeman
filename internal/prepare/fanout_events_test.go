@@ -38,19 +38,19 @@ func TestFanOutClonesEmitsLifecycleEvents(t *testing.T) {
 	for _, e := range all {
 		counts[e.EventType]++
 	}
-	if counts["clones:start"] != 1 {
-		t.Errorf("fanout_start count = %d, want 1", counts["clones:start"])
+	if counts[store.EvtClonesStart] != 1 {
+		t.Errorf("fanout_start count = %d, want 1", counts[store.EvtClonesStart])
 	}
-	if counts["clones:end"] != 1 {
-		t.Errorf("fanout_done count = %d, want 1", counts["clones:end"])
+	if counts[store.EvtClonesEnd] != 1 {
+		t.Errorf("fanout_done count = %d, want 1", counts[store.EvtClonesEnd])
 	}
-	if counts["clones:restore:end"] != len(clones) {
-		t.Errorf("clone_restore_done = %d, want %d", counts["clones:restore:end"], len(clones))
+	if counts[store.EvtClonesRestoreEnd] != len(clones) {
+		t.Errorf("clone_restore_done = %d, want %d", counts[store.EvtClonesRestoreEnd], len(clones))
 	}
 	// Sanity: the per-clone events should sit at debug level so they
 	// don't pollute the default info-only tail stream.
 	for _, e := range all {
-		if e.EventType == "clones:restore:end" && e.Level != store.LevelDebug {
+		if e.EventType == store.EvtClonesRestoreEnd && e.Level != store.LevelDebug {
 			t.Errorf("clone_restore_done emitted at level %q, want debug", e.Level)
 		}
 	}
@@ -90,10 +90,10 @@ func TestFanOutClonesEmitsErrorEventOnFailure(t *testing.T) {
 	var done store.Event
 	var sawFailEvent bool
 	for _, e := range all {
-		if e.EventType == "clones:end" {
+		if e.EventType == store.EvtClonesEnd {
 			done = e
 		}
-		if e.EventType == "clones:restore:error" {
+		if e.EventType == store.EvtClonesRestoreError {
 			sawFailEvent = true
 		}
 	}

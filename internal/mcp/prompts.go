@@ -3,8 +3,11 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 // promptSpec pairs a prompt definition with its handler. Defined as
@@ -231,18 +234,28 @@ func diagnosePreparePrompt(_ context.Context, req *mcpsdk.GetPromptRequest) (*mc
 		scope = "scope: worktree=" + wt
 	}
 
+	errTypes := quoteEvents(
+		store.EvtPrepareEnd, store.EvtWorktreeCreateError,
+		store.EvtClonesRestoreError, store.EvtClonesEnd, store.EvtPrepareUnsupported,
+	)
+	timelineTypes := quoteEvents(
+		store.EvtPrepareStart, store.EvtPreparePhase, store.EvtPrepareEnd,
+		store.EvtClonesStart, store.EvtClonesEnd, store.EvtClonesRestoreError,
+		store.EvtSnapshotsCacheHit,
+	)
+
 	text := fmt.Sprintf(`Diagnose the most recent failed prepare. %s
 
 Execute these tool calls in order. Stop as soon as you can identify the failing step + root cause.
 
 1. logs_query — fetch recent errors.
    • levels=["error"]
-   • event_types=["prepare:end","worktree:create:error","clones:restore:error","clones:end","prepare:unsupported"]
+   • event_types=[%s]
    %s
    • limit=20
    Identify the most-recent failure row's repo, worktree, engine, and event_type.
 
-2. If a run_id is visible in the failure payload but wasn't supplied as an argument, RE-RUN logs_query with that run_id and event_types=["prepare:start","prepare:phase","prepare:end","clones:start","clones:end","clones:restore:error","snapshots:cache:hit"] to reconstruct the full timeline of that prepare invocation.
+2. If a run_id is visible in the failure payload but wasn't supplied as an argument, RE-RUN logs_query with that run_id and event_types=[%s] to reconstruct the full timeline of that prepare invocation.
 
 3. engine_status — confirm the affected engine is reachable and responsive. If unreachable, surface that as the root cause and stop.
 
@@ -250,9 +263,21 @@ Execute these tool calls in order. Stop as soon as you can identify the failing 
 
 5. If the failure was inside the user's migrate/seed command, fetch the run_id and call logs_hooks for the worktree, plus hook_log_read for the specific phase/group_idx referenced in the failing hook_run.
 
-Report: failing step (phase), engine, the actual error line, and one concrete next-action.`, scope, runIDOrWorktreeLine(runID, wt))
+Report: failing step (phase), engine, the actual error line, and one concrete next-action.`, scope, errTypes, runIDOrWorktreeLine(runID, wt), timelineTypes)
 
 	return userMsg(text), nil
+}
+
+// quoteEvents renders store.Evt* constants as a comma-separated list of
+// double-quoted strings for embedding in a prompt's event_types=[…]
+// argument — so event names in prompts derive from the constants, never
+// raw string literals.
+func quoteEvents(types ...string) string {
+	q := make([]string, len(types))
+	for i, t := range types {
+		q[i] = `"` + t + `"`
+	}
+	return strings.Join(q, ",")
 }
 
 // runIDOrWorktreeLine emits the right logs_query argument depending

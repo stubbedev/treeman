@@ -155,7 +155,7 @@ func TestHandleRunPlanQueuedMode(t *testing.T) {
 	}
 	// Wait for the terminal event so the safeGo goroutine's final
 	// WriteEvent completes before t.Cleanup closes the store.
-	waitForEvent(t, st, "plan:end")
+	waitForEvent(t, st, store.EvtPlanEnd)
 }
 
 // waitForEvent polls the event log until an event of the given type
