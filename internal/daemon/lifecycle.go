@@ -310,7 +310,6 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 		lw.mu.Unlock()
 		row, ok := dbByAdmin[admin]
 		if !ok || row.Deleted {
-			admin := admin
 			wg.Add(1)
 			sem <- struct{}{}
 			safeGo(lblLifecycle, admin, func() {

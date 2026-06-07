@@ -141,13 +141,15 @@ func branchCompletions(ctx context.Context) []string {
 	var out []string
 	for rows.Next() {
 		var b string
-		_ = rows.Scan(&b)
+		if err := rows.Scan(&b); err != nil {
+			break
+		}
 		if b != "" {
 			out = append(out, b)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return out
+		return nil
 	}
 	return out
 }
@@ -176,7 +178,9 @@ func recentRunIDCompletions(ctx context.Context) []string {
 	var out []string
 	for rows.Next() {
 		var p string
-		_ = rows.Scan(&p)
+		if err := rows.Scan(&p); err != nil {
+			break
+		}
 		if id := extractRunID(p); id != "" {
 			if _, dup := seen[id]; dup {
 				continue
@@ -189,7 +193,7 @@ func recentRunIDCompletions(ctx context.Context) []string {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return out
+		return nil
 	}
 	return out
 }
@@ -226,13 +230,15 @@ func snapshotFingerprintCompletions(ctx context.Context) []string {
 	var out []string
 	for rows.Next() {
 		var f string
-		_ = rows.Scan(&f)
+		if err := rows.Scan(&f); err != nil {
+			break
+		}
 		if f != "" {
 			out = append(out, f)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return out
+		return nil
 	}
 	return out
 }

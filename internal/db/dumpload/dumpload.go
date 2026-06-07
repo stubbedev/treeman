@@ -181,8 +181,11 @@ func loadPostgresViaWire(ctx context.Context, db *sql.DB, dumpPath string) error
 // that reference implementation byte-for-byte.
 func streamStatements(ctx context.Context, r io.Reader, onStmt func(stmt string) error) (uint64, error) {
 	chunk := make([]byte, 1<<20)
-	s := &stmtScanner{ctx: ctx, onStmt: onStmt}
+	s := &stmtScanner{onStmt: onStmt}
 	for {
+		if err := ctx.Err(); err != nil {
+			return s.applied, err
+		}
 		n, rerr := r.Read(chunk)
 		for i := range n {
 			if err := s.feed(chunk[i]); err != nil {
@@ -216,7 +219,6 @@ func streamStatements(ctx context.Context, r io.Reader, onStmt func(stmt string)
 // read chunks so the two-character `--` / `/*` / `*/` lookaheads and
 // quote/comment context survive chunk boundaries.
 type stmtScanner struct {
-	ctx    context.Context
 	onStmt func(stmt string) error
 	buf    bytes.Buffer
 
@@ -231,9 +233,6 @@ func (s *stmtScanner) flush() error {
 	s.buf.Reset()
 	if isBlank(stmt) {
 		return nil
-	}
-	if err := s.ctx.Err(); err != nil {
-		return err
 	}
 	if err := s.onStmt(stmt); err != nil {
 		return fmt.Errorf("apply dump stmt #%d: %w", s.applied, err)
