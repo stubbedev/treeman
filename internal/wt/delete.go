@@ -194,7 +194,11 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 	if err := gitcmd.RunPiped(ctx, repoRoot, os.Stderr, os.Stderr, args...); err != nil && !force {
 		return fmt.Errorf("git worktree remove: %w", err)
 	}
-	PruneEmptyParents(wtPath, WorktreesRoot(cfg, repoRoot))
+	// git worktree remove leaves untracked copies/links bring-in behind
+	// (node_modules, vendored dirs, nested git repos). Nuke it plus the
+	// now-empty parent dirs so a future create at this path doesn't trip
+	// "destination path already exists".
+	RemoveWorktreeTree(wtPath, WorktreesRoot(cfg, repoRoot))
 	_ = sink
 	return nil
 }

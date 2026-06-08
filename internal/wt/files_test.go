@@ -207,3 +207,47 @@ func TestBringInFilesReportCountsAndSkips(t *testing.T) {
 		t.Errorf("missing source: missing/brought = %d/%d, want 1/0", res3[0].Missing, res3[0].Brought)
 	}
 }
+
+func TestRemoveWorktreeTree(t *testing.T) {
+	wtRoot := t.TempDir()
+
+	// Leftover under wtRoot (the post-`git worktree remove` node_modules
+	// case): the worktree dir and its now-empty feature/ parent both go.
+	wtPath := filepath.Join(wtRoot, "feature", "KON-1")
+	if err := os.MkdirAll(filepath.Join(wtPath, "frontend", "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	RemoveWorktreeTree(wtPath, wtRoot)
+	if _, err := os.Stat(filepath.Join(wtRoot, "feature")); !os.IsNotExist(err) {
+		t.Errorf("leftover/empty parent not removed: stat err = %v", err)
+	}
+	if _, err := os.Stat(wtRoot); err != nil {
+		t.Errorf("wtRoot wrongly removed by parent walk: %v", err)
+	}
+
+	// A non-empty parent stops the walk (sibling worktree must survive).
+	keep := filepath.Join(wtRoot, "feature", "KON-2")
+	gone := filepath.Join(wtRoot, "feature", "KON-3")
+	if err := os.MkdirAll(keep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(gone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	RemoveWorktreeTree(gone, wtRoot)
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("sibling worktree removed: %v", err)
+	}
+
+	// Guard: wtRoot itself, outside paths, and empty args are no-ops.
+	outside := t.TempDir()
+	RemoveWorktreeTree(wtRoot, wtRoot)
+	RemoveWorktreeTree(outside, wtRoot)
+	RemoveWorktreeTree("", wtRoot)
+	RemoveWorktreeTree(wtRoot, "")
+	for _, p := range []string{wtRoot, outside} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("guarded path %q wrongly removed: %v", p, err)
+		}
+	}
+}

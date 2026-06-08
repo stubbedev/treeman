@@ -198,22 +198,37 @@ func copyRegularFile(src, dst string, perm os.FileMode) (int64, error) {
 	return n, nil
 }
 
-// PruneEmptyParents walks up from `start` removing now-empty
-// directories until we leave `wtRoot` (the configured worktrees
-// root). Best-effort: any rmdir error stops the walk.
-func PruneEmptyParents(start, wtRoot string) {
-	if start == "" || wtRoot == "" {
+// underRoot reports whether path sits strictly under root — not root
+// itself, not an escape via "..", and neither side empty.
+func underRoot(path, root string) bool {
+	if path == "" || root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..")
+}
+
+// RemoveWorktreeTree deletes the worktree directory at wtPath plus any
+// now-empty parent directories up to (but not including) wtRoot.
+//
+// `git worktree remove` drops the tracked tree and admin files, but
+// untracked copies/links bring-in (node_modules, vendored dirs, nested
+// git repos) survives even with --force — a non-empty leftover then
+// blocks the next create at the same path with "destination path
+// already exists". RemoveAll clears it; the parent walk reaps the empty
+// feature/ scaffolding dirs git leaves behind.
+//
+// Guarded to paths strictly under wtRoot, so a bad wtPath (repo root,
+// "", or anything outside the worktrees root) is a no-op. Best-effort:
+// any rmdir error stops the parent walk.
+func RemoveWorktreeTree(wtPath, wtRoot string) {
+	if !underRoot(wtPath, wtRoot) {
 		return
 	}
-	parent := filepath.Dir(start)
-	for {
-		rel, err := filepath.Rel(wtRoot, parent)
-		if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-			return
-		}
+	_ = os.RemoveAll(wtPath)
+	for parent := filepath.Dir(wtPath); underRoot(parent, wtRoot); parent = filepath.Dir(parent) {
 		if err := os.Remove(parent); err != nil {
 			return
 		}
-		parent = filepath.Dir(parent)
 	}
 }
