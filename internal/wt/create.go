@@ -1,11 +1,14 @@
 package wt
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
@@ -236,6 +239,14 @@ func bringInAndPatch(
 // Mutates *wtPath in place. Extracted from Create as a mechanical lift
 // of the git-creation phase.
 func addGitWorktree(ctx context.Context, req CreateRequest, wtPath *string) error {
+	// Clear stale worktree admin entries whose working dir was removed
+	// out-of-band — e.g. a prior create whose finalize failed and got
+	// reaped, leaving `.git/worktrees/<name>` behind. Without this,
+	// `git worktree add` aborts with "fatal: '<branch>' is already
+	// checked out at '<gone path>'" (exit 128) even though the dir no
+	// longer exists. Best-effort: a prune failure must not block create.
+	_ = gitcmd.RunPiped(ctx, req.RepoRoot, nil, nil, "worktree", "prune")
+
 	// Decide base ref + optional pre-fetch.
 	base := req.From
 	if base == "" {
@@ -257,8 +268,16 @@ func addGitWorktree(ctx context.Context, req CreateRequest, wtPath *string) erro
 	// Route git's output to stderr (not stdout) so the --print-path
 	// shell idiom — `cd "$(treeman wt create x --print-path)"` —
 	// doesn't ingest "Preparing worktree …" / "HEAD is now at …"
-	// lines that git emits on its stdout.
-	if err := gitcmd.RunPiped(ctx, req.RepoRoot, os.Stderr, os.Stderr, gitArgs...); err != nil {
+	// lines that git emits on its stdout. Tee stderr through a buffer
+	// too: RunPiped streams stderr to the writer and drops it from the
+	// returned error, so without this MCP / non-TTY callers see only a
+	// bare "exit status 128" instead of git's actual complaint (e.g.
+	// "'<branch>' is already checked out at '<path>'").
+	var errBuf bytes.Buffer
+	if err := gitcmd.RunPiped(ctx, req.RepoRoot, os.Stderr, io.MultiWriter(os.Stderr, &errBuf), gitArgs...); err != nil {
+		if tail := strings.TrimSpace(errBuf.String()); tail != "" {
+			return fmt.Errorf("git worktree add: %w: %s", err, tail)
+		}
 		return fmt.Errorf("git worktree add: %w", err)
 	}
 	if abs, err := filepath.Abs(*wtPath); err == nil {

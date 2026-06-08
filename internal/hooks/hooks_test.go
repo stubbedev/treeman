@@ -307,6 +307,44 @@ func TestBuildEnvFallsBackToDaemonPath(t *testing.T) {
 	}
 }
 
+func TestFirstFailureErrorNilWhenAllZero(t *testing.T) {
+	out := RunOutcome{Groups: []GroupOutcome{
+		{Command: "composer install", ExitCode: 0},
+		{Command: "yarn install", ExitCode: 0},
+	}}
+	if err := FirstFailureError("create-before-engines", out, []int64{1, 2}); err != nil {
+		t.Fatalf("want nil, got %v", err)
+	}
+}
+
+func TestFirstFailureErrorReportsFirstFailureWithIDAndTail(t *testing.T) {
+	out := RunOutcome{Groups: []GroupOutcome{
+		{Command: "composer install", ExitCode: 0},
+		{Command: "yarn install", ExitCode: 1, StderrTail: "ENOENT: clean-css missing"},
+	}}
+	err := FirstFailureError("create-before-engines", out, []int64{10, 11})
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{"exited 1", "yarn install", "ENOENT: clean-css missing", "--show 11"} {
+		if indexOf(msg, want) < 0 {
+			t.Errorf("error missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+func TestFirstFailureErrorFallsBackWhenIDUnknown(t *testing.T) {
+	out := RunOutcome{Groups: []GroupOutcome{{Command: "composer install", ExitCode: 2}}}
+	err := FirstFailureError("create-before-engines", out, nil)
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if indexOf(err.Error(), "logs hooks --all") < 0 {
+		t.Errorf("want generic pointer, got:\n%s", err.Error())
+	}
+}
+
 func TestShellSingleQuoteEscapesApostrophes(t *testing.T) {
 	if shellSingleQuote("plain") != "'plain'" {
 		t.Errorf("plain: %s", shellSingleQuote("plain"))

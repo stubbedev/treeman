@@ -207,6 +207,39 @@ func RunHooks(
 	return out, nil
 }
 
+// FirstFailureError returns a descriptive error for the first group in
+// out that exited non-zero, or nil when every group exited zero. The
+// message carries the failed group's command + the captured stderr
+// tail, plus a `treeman logs hooks --show <id>` pointer (when the id is
+// known via runIDs, index-aligned to out.Groups from PersistOutcome).
+//
+// Callers use this at a pipeline barrier — after a hook phase whose
+// success a later phase depends on — so the abort surfaces the true
+// cause (e.g. `composer install` exit 1) instead of a downstream
+// symptom (a `migrate` that fails only because vendor/ is half-written).
+func FirstFailureError(trigger string, out RunOutcome, runIDs []int64) error {
+	for i, g := range out.Groups {
+		if g.ExitCode == 0 {
+			continue
+		}
+		tail := strings.TrimSpace(g.StderrTail)
+		if len(tail) > 600 {
+			tail = "…" + tail[len(tail)-600:]
+		}
+		hint := "`treeman logs hooks --all`"
+		if i < len(runIDs) && runIDs[i] > 0 {
+			hint = fmt.Sprintf("`treeman logs hooks --all --show %d`", runIDs[i])
+		}
+		msg := fmt.Sprintf("%s: hook exited %d: %s", trigger, g.ExitCode, g.Command)
+		if tail != "" {
+			msg += "\n" + tail
+		}
+		msg += "\nfull output: " + hint
+		return errors.New(msg)
+	}
+	return nil
+}
+
 // readFileBytes returns the full body of path, or nil on any I/O
 // error. Used to copy the on-disk hook log into the DB chunk row.
 func readFileBytes(path string) []byte {

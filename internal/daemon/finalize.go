@@ -743,9 +743,18 @@ func runTriggerActions(
 	}
 	started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, trigger, len(actions))
 	out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtRoot, slugVal, isMain, inheritedEnv, true)
-	hooks.PersistOutcome(ctx, st.Store, repoID, wtID, trigger, started, nowMillis(), out)
+	runIDs := hooks.PersistOutcome(ctx, st.Store, repoID, wtID, trigger, started, nowMillis(), out)
 	if err != nil {
 		return fmt.Errorf("%s: %w", trigger, err)
+	}
+	// RunHooks records non-zero child exits on the outcome but does not
+	// itself error (it leaves the decision to the caller). For the
+	// create pipeline a failed phase must abort: the next phase
+	// (engine prepare / migrate) depends on this one having populated
+	// vendor/ etc., so letting it proceed only produces a confusing
+	// downstream failure. Abort here with the real cause.
+	if failErr := hooks.FirstFailureError(trigger, out, runIDs); failErr != nil {
+		return failErr
 	}
 	return nil
 }
