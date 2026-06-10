@@ -59,6 +59,7 @@ func BringInFilesReport(repoRoot, wtPath string, paths []string, mode string, si
 		sink = NoopSink{}
 	}
 	results := make([]BringInResult, 0, len(paths))
+	var broughtRels []string
 	for _, rel := range paths {
 		res := BringInResult{Rel: rel, Mode: mode}
 		start := time.Now()
@@ -86,6 +87,9 @@ func BringInFilesReport(repoRoot, wtPath string, paths []string, mode string, si
 			if err != nil {
 				relToRepo = filepath.Base(src)
 			}
+			// Keep it out of git status whether we create it now or it
+			// already exists from a prior run — both would show as untracked.
+			broughtRels = append(broughtRels, relToRepo)
 			dst := filepath.Join(wtPath, relToRepo)
 			if _, err := os.Stat(dst); err == nil {
 				res.Skipped++
@@ -120,6 +124,13 @@ func BringInFilesReport(repoRoot, wtPath string, paths []string, mode string, si
 		res.DurationMs = time.Since(start).Milliseconds()
 		results = append(results, res)
 	}
+
+	// Best-effort: hide the brought-in paths from git so the worktree never
+	// reads as dirty. A failure here must not fail the bring-in.
+	if err := ensureRepoExcludes(repoRoot, broughtRels); err != nil {
+		sink.Warn("could not update git exclude for brought-in files: %v", err)
+	}
+
 	return results, nil
 }
 

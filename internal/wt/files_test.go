@@ -3,6 +3,7 @@ package wt
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -248,6 +249,59 @@ func TestRemoveWorktreeTree(t *testing.T) {
 	for _, p := range []string{wtRoot, outside} {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("guarded path %q wrongly removed: %v", p, err)
+		}
+	}
+}
+
+// TestBringInFilesWritesGitExclude verifies brought-in paths are anchored
+// into the repo's shared exclude so the worktree never reads as dirty, and
+// that re-running neither duplicates a pattern nor re-adds the header.
+func TestBringInFilesWritesGitExclude(t *testing.T) {
+	main := t.TempDir()
+	wtDir := t.TempDir()
+	// gitCommonDir only needs <main>/.git to be a directory.
+	if err := os.MkdirAll(filepath.Join(main, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(main, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := BringInFiles(main, wtDir, []string{".claude"}, "link", NoopSink{}); err != nil {
+		t.Fatalf("BringInFiles: %v", err)
+	}
+
+	excludePath := filepath.Join(main, ".git", "info", "exclude")
+	body, err := os.ReadFile(excludePath)
+	if err != nil {
+		t.Fatalf("read exclude: %v", err)
+	}
+	if !strings.Contains(string(body), "\n/.claude\n") && !strings.HasSuffix(string(body), "/.claude\n") {
+		t.Errorf("exclude missing anchored /.claude pattern:\n%s", body)
+	}
+
+	// Re-run: idempotent — no duplicate pattern, single header.
+	if err := BringInFiles(main, wtDir, []string{".claude"}, "link", NoopSink{}); err != nil {
+		t.Fatalf("BringInFiles re-run: %v", err)
+	}
+	body2, _ := os.ReadFile(excludePath)
+	if got := strings.Count(string(body2), "/.claude\n"); got != 1 {
+		t.Errorf("pattern count = %d, want 1:\n%s", got, body2)
+	}
+	if got := strings.Count(string(body2), excludeHeader); got != 1 {
+		t.Errorf("header count = %d, want 1", got)
+	}
+}
+
+func TestAnchoredPatterns(t *testing.T) {
+	got := anchoredPatterns([]string{"./.claude", ".claude", "justfile", "", ".", "../escape", "a/b"})
+	want := []string{"/.claude", "/justfile", "/a/b"}
+	if len(got) != len(want) {
+		t.Fatalf("anchoredPatterns = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("anchoredPatterns[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
 }
