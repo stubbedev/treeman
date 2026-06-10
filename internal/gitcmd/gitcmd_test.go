@@ -18,7 +18,7 @@ func TestCommandPathOverride(t *testing.T) {
 
 	t.Run("no override pins self dir onto inherited PATH", func(t *testing.T) {
 		cmd := command(context.Background(), "", false, "status")
-		got := envValue(cmd.Env, "PATH")
+		got := pathValue(cmd.Env)
 		if !strings.HasPrefix(got, selfDir+sep) && got != selfDir {
 			t.Fatalf("PATH %q does not start with self dir %q", got, selfDir)
 		}
@@ -27,7 +27,7 @@ func TestCommandPathOverride(t *testing.T) {
 	t.Run("WithPath replaces PATH then self dir is prepended", func(t *testing.T) {
 		ctx := WithPath(context.Background(), "/shell/bin"+sep+"/usr/bin")
 		cmd := command(ctx, "", false, "status")
-		got := envValue(cmd.Env, "PATH")
+		got := pathValue(cmd.Env)
 		want := selfDir + sep + "/shell/bin" + sep + "/usr/bin"
 		if got != want {
 			t.Fatalf("PATH = %q, want %q", got, want)
@@ -44,7 +44,7 @@ func TestCommandPathOverride(t *testing.T) {
 	t.Run("self dir already first is not duplicated", func(t *testing.T) {
 		ctx := WithPath(context.Background(), selfDir+sep+"/usr/bin")
 		cmd := command(ctx, "", false, "status")
-		got := envValue(cmd.Env, "PATH")
+		got := pathValue(cmd.Env)
 		if got != selfDir+sep+"/usr/bin" {
 			t.Fatalf("PATH = %q, want no duplicate self dir", got)
 		}
@@ -55,7 +55,7 @@ func TestSetEnvKey(t *testing.T) {
 	t.Run("replaces existing", func(t *testing.T) {
 		env := []string{"A=1", "PATH=old", "B=2"}
 		env = setEnvKey(env, "PATH", "new")
-		if got := envValue(env, "PATH"); got != "new" {
+		if got := pathValue(env); got != "new" {
 			t.Fatalf("PATH = %q, want new", got)
 		}
 		if len(env) != 3 {
@@ -64,17 +64,16 @@ func TestSetEnvKey(t *testing.T) {
 	})
 	t.Run("appends when absent", func(t *testing.T) {
 		env := setEnvKey([]string{"A=1"}, "PATH", "p")
-		if got := envValue(env, "PATH"); got != "p" {
+		if got := pathValue(env); got != "p" {
 			t.Fatalf("PATH = %q, want p", got)
 		}
 	})
 }
 
-// envValue returns the value for key in a name=value env slice, or "".
-func envValue(env []string, key string) string {
-	prefix := key + "="
+// pathValue returns the PATH= value in a name=value env slice, or "".
+func pathValue(env []string) string {
 	for _, kv := range env {
-		if v, ok := strings.CutPrefix(kv, prefix); ok {
+		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
 			return v
 		}
 	}
