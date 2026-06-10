@@ -125,7 +125,20 @@ func ensureFilterConfig(ctx context.Context, worktreePath string) error {
 	pairs := [][2]string{
 		{"filter." + FilterName + ".clean", "treeman patch-filter clean %f"},
 		{"filter." + FilterName + ".smudge", "treeman patch-filter smudge %f"},
-		{"filter." + FilterName + ".required", "true"},
+		// required=false: when the filter program can't be resolved
+		// (treeman not on PATH for the spawning process — common for
+		// `git worktree add` invoked outside the user's interactive
+		// shell), git falls back to identity content rather than
+		// aborting. required=true made any such hiccup a fatal
+		// `git worktree add: exit status 128`, killing worktree
+		// creation over a missing binary. Matches filter.go's
+		// passthrough-on-error contract: a degraded filter must
+		// no-op, not corrupt or block. Cost when treeman is truly
+		// absent: the clean direction no longer projects patched keys
+		// back to HEAD, so patched files may show as modified in
+		// `git status` until the next finalize — cosmetic and
+		// recoverable, unlike a blocked worktree.
+		{"filter." + FilterName + ".required", "false"},
 	}
 	for _, kv := range pairs {
 		if _, err := gitcmd.OutputRW(ctx, worktreePath, false, "config", "--local", kv[0], kv[1]); err != nil {

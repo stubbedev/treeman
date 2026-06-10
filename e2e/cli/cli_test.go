@@ -63,11 +63,12 @@ func TestCLIEndToEnd(t *testing.T) {
 
 	// Put the freshly-built `treeman` on PATH. The patches clean/smudge
 	// filter is wired as the bare program `treeman patch-filter` (a
-	// documented contract — see internal/patcher/install.go), and it's
-	// `required=true`, so every git op in a patched worktree must be able
-	// to resolve it. Both the daemon (spawned below, inherits os.Environ)
-	// and this test's own `git` invocations rely on this. Without it git
-	// can't run the clean filter and patched files show as modified.
+	// documented contract — see internal/patcher/install.go). It's
+	// `required=false` (a missing binary degrades to identity rather
+	// than aborting git), but the clean filter must still resolve for
+	// patched files to compare equal to HEAD — without it git shows
+	// them as modified. Both the daemon (spawned below, inherits
+	// os.Environ) and this test's own `git` invocations rely on this.
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	// Per-test sockets + state so we don't collide with the

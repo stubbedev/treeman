@@ -155,11 +155,20 @@ var taskRunners = map[string]taskRunner{
 }
 
 // runOneTask dispatches a single task to its registered runner.
+//
+// The caller's shell PATH (shipped as task.InheritedEnv["PATH"]) is
+// pinned onto ctx so every git subprocess the runner spawns resolves
+// programs the way the user's shell would — most importantly the
+// clean/smudge filter git shells out as the bare `treeman patch-filter`
+// during `git worktree add` checkout. Without this the daemon's stock
+// systemd PATH can't find `treeman` and the filter fails (exit 127),
+// which with filter.required aborts the whole worktree add.
 func runOneTask(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
 	run, ok := taskRunners[task.Type]
 	if !ok {
 		return nil, fmt.Errorf("run_plan: unknown task %q", task.Type)
 	}
+	ctx = gitcmd.WithPath(ctx, task.InheritedEnv["PATH"])
 	return run(ctx, st, task)
 }
 

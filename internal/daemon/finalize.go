@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/ports"
@@ -73,6 +74,15 @@ func FinalizeWorktree(
 	// creates databases the cleanup would then have to chase.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Pin the caller's shell PATH onto ctx for every git subprocess
+	// this finalize spawns — notably EnsureFilter's `git add
+	// --renormalize`, which runs the clean filter (`treeman
+	// patch-filter`). The async create tail and the file/HEAD watchers
+	// reach here on st.BgCtx, which does NOT carry runOneTask's
+	// override, so re-pin from inheritedEnv (the CLI-captured env,
+	// rehydrated from the store on watcher-driven runs).
+	ctx = gitcmd.WithPath(ctx, inheritedEnv["PATH"])
 
 	// Dedup against concurrent finalize attempts on the same wtPath
 	// — both the CLI's wt-create dispatch AND the lifecycle watcher
@@ -430,6 +440,10 @@ func FinalizeWorktreeForWatch(
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Same PATH pin as FinalizeWorktree — this watcher path re-applies
+	// patches (EnsureFilter → `git add --renormalize` → clean filter)
+	// and runs on st.BgCtx with no inherited override.
+	ctx = gitcmd.WithPath(ctx, inheritedEnv["PATH"])
 	if !st.MarkFinalizeInFlight(wtRoot, cancel) {
 		return nil
 	}
