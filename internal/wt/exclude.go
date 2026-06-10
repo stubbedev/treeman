@@ -64,7 +64,7 @@ func ensureRepoExcludes(repoRoot string, rels []string) error {
 
 	present := map[string]bool{}
 	hasHeader := false
-	for _, line := range strings.Split(string(body), "\n") {
+	for line := range strings.SplitSeq(string(body), "\n") {
 		trimmed := strings.TrimSpace(line)
 		present[trimmed] = true
 		if trimmed == excludeHeader {
