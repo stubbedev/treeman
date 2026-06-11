@@ -197,6 +197,10 @@
           "$ref": "#/$defs/Step",
           "description": "Migrate is the shell command that brings a freshly-loaded\nsource DB up to the current schema. Required when any input\nglob matches migration files; optional otherwise (e.g. a DB\nthat's purely seed-driven)."
         },
+        "rollback": {
+          "$ref": "#/$defs/Step",
+          "description": "Rollback is the OPTIONAL shell command that unwinds the most\nrecently applied migrations, used to keep templates correct when\nan *already-applied* migration's content is edited. Treeman runs\nit against a clone of the prior template, then re-runs Migrate\nforward — the only path that re-applies an edit to a migration\nwhose ledger row is baked into the source dump.\n\nTreeman injects the number of migrations to unwind as the env var\nTREEMAN_ROLLBACK_STEPS; reference it in Run, e.g.\n  rollback: { run: \"php artisan migrate:rollback --step=$TREEMAN_ROLLBACK_STEPS\" }\n(Run is passed verbatim to `sh -c`; only Env values are\n`{placeholder}`-rendered, so use the shell env var, not a brace\nplaceholder.)\n\nWARNING: rollback runs the migration's CURRENT down() — the edited\nfile on disk — not the original down() that matched the applied\nschema. For edits that change down(), or for lossy/irreversible\ndown()s, this can produce a wrong or failing schema. Treeman\nhard-falls-back to a full cold rebuild on ANY rollback or migrate\nerror, so a broken down() degrades to \"slow but correct\", never\n\"fast but wrong\"-at-the-engine — but a down() that *succeeds* while\nnot faithfully inverting up() is the user's responsibility. Leave\nthis unset to disable the rollback path entirely (cold rebuild\nonly)."
+        },
         "seed": {
           "$ref": "#/$defs/Step",
           "description": "Seed is the shell command that populates non-migration data\n(fixtures, ES mappings, Redis warm-cache keys, etc.). Runs\nAFTER dump-load + migrate as the final cold-build step,\nbefore treeman snapshots the populated state into the\ntemplate DB."

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -36,6 +37,12 @@ type Spec struct {
 	Env     map[string]string
 	Label   string // e.g. "migrations.migrate" or "seed"
 	LogPath string
+	// ExtraEnv holds already-resolved literal env vars (NOT template-
+	// rendered, unlike Env) layered onto the subprocess after the
+	// inherited base and rendered Env. Used to pass runtime values the
+	// command needs but the user can't template — e.g.
+	// TREEMAN_ROLLBACK_STEPS for the rollback path.
+	ExtraEnv map[string]string
 }
 
 // FromMigrate converts a `databases[].migrate` block to a Spec.
@@ -46,6 +53,19 @@ func FromMigrate(s config.Step) Spec {
 // FromSeed converts a `databases[].seed` block to a Spec.
 func FromSeed(s config.Step) Spec {
 	return Spec{Run: s.Run, Env: s.Env, Label: "seed"}
+}
+
+// FromRollback converts a `databases[].rollback` block to a Spec.
+// `steps` is the number of migrations to unwind; it's exposed to the
+// command as the TREEMAN_ROLLBACK_STEPS env var (Run is not template-
+// rendered, so a brace placeholder wouldn't be substituted).
+func FromRollback(s config.Step, steps int) Spec {
+	return Spec{
+		Run:      s.Run,
+		Env:      s.Env,
+		Label:    "rollback",
+		ExtraEnv: map[string]string{"TREEMAN_ROLLBACK_STEPS": strconv.Itoa(steps)},
+	}
 }
 
 // WithLogPath returns a copy of the Spec with LogPath set. Lets call
@@ -146,6 +166,9 @@ func Run(
 	merged := shellenv.BaseEnv(inheritedEnv)
 	merged["TREEMAN_TARGET_DB"] = targetDB
 	maps.Copy(merged, renderedEnv)
+	// ExtraEnv carries already-resolved literals (e.g.
+	// TREEMAN_ROLLBACK_STEPS); layer last so it wins.
+	maps.Copy(merged, spec.ExtraEnv)
 	env := make([]string, 0, len(merged))
 	for k, v := range merged {
 		env = append(env, k+"="+v)

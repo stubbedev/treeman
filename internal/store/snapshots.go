@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/stubbedev/treeman/internal/engine"
 )
@@ -147,6 +148,15 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 // distinguish "real input glob" entries from this synthetic one.
 const CommandsHashKey = "__commands__"
 
+// DumpOnlyMarkerKey tags a snapshot whose template holds the post-dump,
+// pre-migrate, pre-seed state — the intermediate "dump-only" template
+// the dump-only fast path clones from. Stored in LockfileHashes with
+// value "1". These rows are intentionally excluded from ancestor
+// lookups (they have empty Inputs, which would otherwise read as a
+// prefix of every run and let an incremental build skip seed); only the
+// exact-fingerprint LookupSnapshot path resolves them.
+const DumpOnlyMarkerKey = "__dump_only__"
+
 // FindAncestorSnapshot returns the cached snapshot that is the LONGEST
 // content-prefix ancestor of the current run, or (nil, nil) when none
 // qualifies. An ancestor is a row in the same repo with identical
@@ -170,46 +180,15 @@ func (s *Store) FindAncestorSnapshot(
 	eng, engineVersion, dumpHash, currentCommandsHash string,
 	currentInputs map[string]InputVector,
 ) (*SnapshotRecord, error) {
-	if fam, ok := engine.Canonical(eng); ok {
-		eng = string(fam)
-	}
-	dumpArg := sql.NullString{String: dumpHash, Valid: dumpHash != ""}
-	rows, err := s.DB.QueryContext(ctx, `
-		SELECT fingerprint, engine, engine_version, source_db, template_name,
-		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
-		       COALESCE(inputs_json,'{}'),
-		       COALESCE(size_bytes,0), created_at, last_used_at, use_count
-		FROM snapshots
-		WHERE repo_id = ?
-		  AND engine = ?
-		  AND engine_version = ?
-		  AND COALESCE(dump_hash,'') = COALESCE(?,'')`, repoID, eng, engineVersion, dumpArg)
+	cands, err := s.candidateSnapshots(ctx, repoID, eng, engineVersion, dumpHash)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-
 	currentTotal := vectorTotalLen(currentInputs)
 	var best *SnapshotRecord
 	bestLen := -1
-	for rows.Next() {
-		var r SnapshotRecord
-		var lockJSON, inputsJSON string
-		if err := rows.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
-			&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
-			&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount); err != nil {
-			return nil, err
-		}
-		if lockJSON != "" {
-			if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
-				continue
-			}
-		}
-		if inputsJSON != "" && inputsJSON != "{}" {
-			if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
-				continue
-			}
-		}
+	for i := range cands {
+		r := cands[i]
 		// Commands must match exactly. A different migrate/seed run-
 		// string or env would change which migrations get applied, so
 		// the ancestor isn't a safe clone target.
@@ -231,10 +210,169 @@ func (s *Store) FindAncestorSnapshot(
 			bestLen = total
 		}
 	}
+	return best, nil
+}
+
+// FindRollbackAncestor finds the prior snapshot best suited to a
+// "rollback + re-migrate" rebuild after an EXISTING migration was
+// edited (or removed) mid-sequence. Unlike FindAncestorSnapshot — which
+// requires a strict content-prefix (pure append) — this looks for a
+// candidate that DIVERGES from the current inputs: it shares the longest
+// common prefix and then differs.
+//
+// Both the candidate's and the current run's per-glob vectors are merged
+// into one global list ordered by file basename (timestamp-prefixed
+// migration filenames sort in ledger order for Laravel/Rails/Django/…),
+// because single-ledger frameworks roll back by a single global step
+// count, not per-glob. `steps` is the number of the candidate's
+// migrations at or after the first divergent position — i.e. how many
+// ledger entries `migrate:rollback` must unwind to reach the last-good
+// common state before re-running `migrate` forward.
+//
+// Pure-append and exact-match candidates are skipped (those are
+// FindAncestorSnapshot's / LookupSnapshot's job). Returns (nil, 0, nil)
+// when no diverging candidate exists. The chosen candidate maximises the
+// common-prefix length (minimises steps).
+func (s *Store) FindRollbackAncestor(
+	ctx context.Context,
+	repoID int64,
+	eng, engineVersion, dumpHash, currentCommandsHash string,
+	currentInputs map[string]InputVector,
+) (*SnapshotRecord, int, error) {
+	cands, err := s.candidateSnapshots(ctx, repoID, eng, engineVersion, dumpHash)
+	if err != nil {
+		return nil, 0, err
+	}
+	curMerged := mergeVectorsByBasename(currentInputs)
+	var best *SnapshotRecord
+	bestSteps := 0
+	bestPrefix := -1
+	for i := range cands {
+		r := cands[i]
+		if r.LockfileHashes[CommandsHashKey] != currentCommandsHash {
+			continue
+		}
+		candMerged := mergeVectorsByBasename(r.Inputs)
+		prefix := commonPrefixLen(candMerged, curMerged)
+		if prefix == len(candMerged) {
+			// Candidate fully consumed as a prefix of current → pure
+			// append or exact match, not a rollback target.
+			continue
+		}
+		steps := len(candMerged) - prefix
+		// Prefer the longest common prefix (fewest migrations to unwind).
+		if prefix > bestPrefix {
+			bestCopy := r
+			best = &bestCopy
+			bestPrefix = prefix
+			bestSteps = steps
+		}
+	}
+	return best, bestSteps, nil
+}
+
+// candidateSnapshots runs the shared (repo, engine, version, dump)
+// filter query and returns every matching snapshot row with its
+// lockfile/inputs JSON decoded. Rows whose JSON fails to decode are
+// skipped (mirrors the lenient behaviour of the prior inline loop).
+func (s *Store) candidateSnapshots(
+	ctx context.Context,
+	repoID int64,
+	eng, engineVersion, dumpHash string,
+) ([]SnapshotRecord, error) {
+	if fam, ok := engine.Canonical(eng); ok {
+		eng = string(fam)
+	}
+	dumpArg := sql.NullString{String: dumpHash, Valid: dumpHash != ""}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT fingerprint, engine, engine_version, source_db, template_name,
+		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
+		       COALESCE(inputs_json,'{}'),
+		       COALESCE(size_bytes,0), created_at, last_used_at, use_count
+		FROM snapshots
+		WHERE repo_id = ?
+		  AND engine = ?
+		  AND engine_version = ?
+		  AND COALESCE(dump_hash,'') = COALESCE(?,'')`, repoID, eng, engineVersion, dumpArg)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []SnapshotRecord
+	for rows.Next() {
+		var r SnapshotRecord
+		var lockJSON, inputsJSON string
+		if err := rows.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
+			&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
+			&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount); err != nil {
+			return nil, err
+		}
+		if lockJSON != "" {
+			if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
+				continue
+			}
+		}
+		if inputsJSON != "" && inputsJSON != "{}" {
+			if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
+				continue
+			}
+		}
+		// Never offer a dump-only template as an ancestor: its empty
+		// Inputs would read as a prefix of every run and an incremental
+		// build off it would skip seed.
+		if r.LockfileHashes[DumpOnlyMarkerKey] == "1" {
+			continue
+		}
+		out = append(out, r)
+	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return best, nil
+	return out, nil
+}
+
+// mergeVectorsByBasename flattens every per-glob InputVector into one
+// list ordered by file basename. Migration filenames are timestamp- or
+// sequence-prefixed, so basename order approximates the framework's
+// single global ledger order across multiple migration dirs/globs. Ties
+// on basename (rare — same filename under two globs) break by full path
+// for determinism.
+func mergeVectorsByBasename(m map[string]InputVector) []FileHash {
+	var all []FileHash
+	for _, v := range m {
+		all = append(all, v...)
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		bi, bj := pathBase(all[i].Path), pathBase(all[j].Path)
+		if bi != bj {
+			return bi < bj
+		}
+		return all[i].Path < all[j].Path
+	})
+	return all
+}
+
+// commonPrefixLen returns the number of leading entries that are
+// identical (path AND hash) in both merged vectors.
+func commonPrefixLen(a, b []FileHash) int {
+	n := 0
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
+	}
+	return n
+}
+
+// pathBase returns the basename of a slash- or OS-separated relpath
+// without importing path/filepath semantics that differ across OSes —
+// InputVector paths are stored slash-normalised, but tolerate either.
+func pathBase(p string) string {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' || p[i] == '\\' {
+			return p[i+1:]
+		}
+	}
+	return p
 }
 
 // vectorTotalLen sums the lengths of every input vector — the metric

@@ -1265,6 +1265,32 @@ type DatabaseConfig struct {
 	// that's purely seed-driven).
 	Migrate *Step `yaml:"migrate,omitempty"`
 
+	// Rollback is the OPTIONAL shell command that unwinds the most
+	// recently applied migrations, used to keep templates correct when
+	// an *already-applied* migration's content is edited. Treeman runs
+	// it against a clone of the prior template, then re-runs Migrate
+	// forward — the only path that re-applies an edit to a migration
+	// whose ledger row is baked into the source dump.
+	//
+	// Treeman injects the number of migrations to unwind as the env var
+	// TREEMAN_ROLLBACK_STEPS; reference it in Run, e.g.
+	//   rollback: { run: "php artisan migrate:rollback --step=$TREEMAN_ROLLBACK_STEPS" }
+	// (Run is passed verbatim to `sh -c`; only Env values are
+	// `{placeholder}`-rendered, so use the shell env var, not a brace
+	// placeholder.)
+	//
+	// WARNING: rollback runs the migration's CURRENT down() — the edited
+	// file on disk — not the original down() that matched the applied
+	// schema. For edits that change down(), or for lossy/irreversible
+	// down()s, this can produce a wrong or failing schema. Treeman
+	// hard-falls-back to a full cold rebuild on ANY rollback or migrate
+	// error, so a broken down() degrades to "slow but correct", never
+	// "fast but wrong"-at-the-engine — but a down() that *succeeds* while
+	// not faithfully inverting up() is the user's responsibility. Leave
+	// this unset to disable the rollback path entirely (cold rebuild
+	// only).
+	Rollback *Step `yaml:"rollback,omitempty"`
+
 	// Seed is the shell command that populates non-migration data
 	// (fixtures, ES mappings, Redis warm-cache keys, etc.). Runs
 	// AFTER dump-load + migrate as the final cold-build step,

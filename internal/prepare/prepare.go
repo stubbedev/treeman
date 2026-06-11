@@ -758,6 +758,21 @@ func prepareMySQL(
 	// off this one.
 	inputs := computeInputVectors(ctx, st, d, worktreePath)
 
+	ops := incrementalOps{
+		exists:                drv.DatabaseExists,
+		snapshotRestore:       drv.SnapshotRestore,
+		snapshotRestoreFanout: drv.SnapshotRestoreStaged,
+		snapshotCreate: func(ctx context.Context, src, tmpl string) error {
+			if cerr := drv.SnapshotCreate(ctx, src, tmpl); cerr != nil {
+				return cerr
+			}
+			emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, src, tmpl,
+				string(drv.LastCloneStrategy()))
+			return nil
+		},
+	}
+	dumpKey := dumpOnlySnapshotKey(d.Engine, version, key.DumpHashHex)
+
 	// Incremental path: try to find a content-PREFIX ancestor template
 	// (same engine/version/dump/commands; every input vector a prefix
 	// of this run's) and clone + migrate from there instead of a full
@@ -765,19 +780,30 @@ func prepareMySQL(
 	// already-applied files so only the new ones run.
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
-		inheritedEnv, started, incrementalOps{
-			exists:                drv.DatabaseExists,
-			snapshotRestore:       drv.SnapshotRestore,
-			snapshotRestoreFanout: drv.SnapshotRestoreStaged,
-			snapshotCreate: func(ctx context.Context, src, tmpl string) error {
-				if cerr := drv.SnapshotCreate(ctx, src, tmpl); cerr != nil {
-					return cerr
-				}
-				emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, src, tmpl,
-					string(drv.LastCloneStrategy()))
-				return nil
-			},
-		})
+		inheritedEnv, started, ops)
+	if done || err != nil {
+		return out, err
+	}
+
+	// Rollback path (opt-in): an EXISTING migration's content changed
+	// mid-sequence, so no prefix ancestor matched. If a `rollback:`
+	// command is configured, clone the diverging ancestor, unwind the
+	// changed tail, and re-migrate forward. Hard-falls-back to cold on
+	// any error.
+	out, done, err = tryRollbackIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
+		inheritedEnv, started, ops)
+	if done || err != nil {
+		return out, err
+	}
+
+	// Dump-only fast path: clone the post-dump intermediate template and
+	// run the full forward migrate+seed — same result as a cold build
+	// but skips reloading the dump. No dump-only template yet → falls
+	// through to the cold build below (which seeds it).
+	out, done, err = tryDumpOnlyBuild(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, dumpKey,
+		inputs, inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
 	}
@@ -800,7 +826,21 @@ func prepareMySQL(
 	// prefix drop would wipe sibling worktrees. Stale per-test
 	// clones from a prior cold-build get overwritten by exact name
 	// in SnapshotRestore during fanout below.
-	if err := mysqlColdBuildSteps(ctx, drv, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
+	if err := mysqlColdBuildSteps(
+		ctx,
+		drv,
+		cfg,
+		d,
+		tplCtx,
+		worktreePath,
+		st,
+		repoID,
+		worktreeID,
+		sourceDB,
+		version,
+		dumpKey,
+		inheritedEnv,
+	); err != nil {
 		return Outcome{}, err
 	}
 
@@ -1006,7 +1046,8 @@ func mysqlColdBuildSteps(
 	worktreePath string,
 	st *store.Store,
 	repoID, worktreeID int64,
-	sourceDB string,
+	sourceDB, version string,
+	dumpKey snapshot.Key,
 	inheritedEnv map[string]string,
 ) error {
 	// mysqlColdBuild: cold-build pre-drop site (see coldbuild_invariant_test).
@@ -1029,6 +1070,11 @@ func mysqlColdBuildSteps(
 		}
 		emitDumpLoadPhase(ctx, st, repoID, worktreeID, d.Engine, sourceDB, dr.Path, i, len(dumps), stepStart, string(strategy))
 	}
+	// Seed the dump-only intermediate template (post-dump, pre-migrate)
+	// so a later migration edit can rebuild from it without reloading
+	// the dump. Best-effort: failure here only forfeits the fast path.
+	seedDumpOnlyTemplate(ctx, st, d, repoID, worktreeID, sourceDB, version, dumpKey, len(dumps),
+		func(ctx context.Context, src, tmpl string) error { return drv.SnapshotCreate(ctx, src, tmpl) })
 	if d.Migrate != nil {
 		if err := runPhase(
 			ctx,
@@ -1454,6 +1500,316 @@ func vectorDelta(ancestor, current map[string]store.InputVector) int {
 	return n
 }
 
+// dumpOnlySnapshotKey builds the cache key for the post-dump, pre-
+// migrate intermediate template. Keyed ONLY on (engine, version,
+// dumpHash) plus a marker so it never collides with a real template
+// and is excluded from ancestor lookups (see store.DumpOnlyMarkerKey).
+func dumpOnlySnapshotKey(engineName, version, dumpHash string) snapshot.Key {
+	return snapshot.New(engineName, version, "", "", dumpHash,
+		map[string]string{store.DumpOnlyMarkerKey: "1"})
+}
+
+// seedDumpOnlyTemplate snapshots the freshly dump-loaded source into the
+// dump-only template so a future migration edit can rebuild from it
+// without reloading the dump. Best-effort and a no-op unless there's a
+// dump AND a migrate step (without migrate the dump-only template would
+// equal the real template). Failures are logged, never fatal — the cold
+// build proceeds and the fast path is simply unavailable next time.
+func seedDumpOnlyTemplate(
+	ctx context.Context,
+	st *store.Store,
+	d config.DatabaseConfig,
+	repoID, worktreeID int64,
+	sourceDB, version string,
+	dumpKey snapshot.Key,
+	dumpCount int,
+	snapshotCreate func(ctx context.Context, src, tmpl string) error,
+) {
+	if dumpCount == 0 || d.Migrate == nil {
+		return
+	}
+	dumpTpl := dumpKey.TemplateName()
+	start := time.Now()
+	if err := snapshotCreate(ctx, sourceDB, dumpTpl); err != nil {
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtPrepareDumpOnlyFallback,
+			fmt.Sprintf("seed dump-only template failed: %v", err),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine": d.Engine, "source_db": sourceDB, "template": dumpTpl,
+				"error": err.Error(),
+			})
+		return
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dumponly-snapshot", start)
+	recordSnapshot(ctx, st, dumpKey, d.Engine, version, sourceDB, dumpTpl, nil, repoID)
+}
+
+// snapshotRecordFanout is the shared tail of the incremental build
+// paths: create the template from the populated source, record its
+// snapshot row, fire LRU eviction, then fan out the test clones.
+func snapshotRecordFanout(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	source, templateName, version string,
+	maxConns int,
+	key snapshot.Key,
+	inputs map[string]store.InputVector,
+	ops incrementalOps,
+) ([]string, error) {
+	snapStart := time.Now()
+	if err := ops.snapshotCreate(ctx, source, templateName); err != nil {
+		return nil, fmt.Errorf("snapshot create %s → %s: %w", source, templateName, err)
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "snapshot-create", snapStart)
+	recordSnapshot(ctx, st, key, d.Engine, version, source, templateName, inputs, repoID)
+	spawnEvict(cfg, st, repoID)
+
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	if err != nil {
+		return nil, err
+	}
+	fanoutRestore := ops.snapshotRestore
+	if ops.snapshotRestoreFanout != nil {
+		fanoutRestore = ops.snapshotRestoreFanout
+	}
+	if err := fanOutClones(ctx, st, repoID, worktreeID, fanoutRestore, templateName,
+		clones, d.Engine, d.Fanout, maxConns); err != nil {
+		return nil, err
+	}
+	return clones, nil
+}
+
+// tryDumpOnlyBuild rebuilds from the post-dump intermediate template
+// (see dumpOnlySnapshotKey): clone it into the source, then run the FULL
+// forward migrate + seed. This is correctness-identical to a cold build
+// (it never runs down()), it just skips reloading the dump — the usual
+// dominant cost. Returns (out, true, nil) on success; (Outcome{}, false,
+// nil) when no dump-only template exists yet (caller cold-builds, which
+// seeds it). A migrate/seed failure is propagated as a real error: a
+// cold build would re-run the same forward commands and fail identically.
+func tryDumpOnlyBuild(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	source, templateName, version string,
+	maxConns int,
+	key, dumpKey snapshot.Key,
+	inputs map[string]store.InputVector,
+	inheritedEnv map[string]string,
+	started time.Time,
+	ops incrementalOps,
+) (Outcome, bool, error) {
+	if len(d.Dump) == 0 || d.Migrate == nil {
+		return Outcome{}, false, nil
+	}
+	anc, _ := st.LookupSnapshot(ctx, dumpKey.Fingerprint())
+	if anc == nil {
+		return Outcome{}, false, nil
+	}
+	unpin := snapshot.Pin(anc.Fingerprint)
+	defer unpin()
+
+	exists, _ := ops.exists(ctx, anc.TemplateName)
+	if !exists {
+		// Ghost row: SQLite remembers the dump-only template but the
+		// engine doesn't. Clear it and cold-build (which re-seeds it).
+		_ = st.DeleteSnapshot(ctx, anc.Fingerprint)
+		return Outcome{}, false, nil
+	}
+
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareDumpOnlyStart,
+		fmt.Sprintf("engine=%s dump_template=%s", d.Engine, anc.TemplateName),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine": d.Engine, "source_db": source, "template": templateName,
+			"fingerprint": key.Fingerprint(), "dump_template": anc.TemplateName,
+		})
+
+	restoreStart := time.Now()
+	if err := ops.snapshotRestore(ctx, anc.TemplateName, source); err != nil {
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtPrepareDumpOnlyFallback,
+			fmt.Sprintf("dump-only restore failed: %v", err),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine": d.Engine, "dump_template": anc.TemplateName, "error": err.Error(),
+			})
+		return Outcome{}, false, nil
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "dumponly-restore", restoreStart)
+
+	if err := runPhase(ctx, st, repoID, worktreeID, d, tplCtx, worktreePath, source,
+		"migrate", runner.FromMigrate(*d.Migrate), inheritedEnv); err != nil {
+		return Outcome{}, false, err
+	}
+	if d.Seed != nil {
+		if err := runPhase(ctx, st, repoID, worktreeID, d, tplCtx, worktreePath, source,
+			"seed", runner.FromSeed(*d.Seed), inheritedEnv); err != nil {
+			return Outcome{}, false, err
+		}
+	}
+
+	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, source, templateName, version, maxConns, key, inputs, ops)
+	if err != nil {
+		return Outcome{}, false, err
+	}
+
+	ms := time.Since(started).Milliseconds()
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
+		fmt.Sprintf("dump_only clones=%d duration=%dms", len(clones), ms),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine": d.Engine, "source_db": source, "template": templateName,
+			"clones": strconv.Itoa(len(clones)), "cache_hit": "false",
+			"dump_only": "true", "duration_ms": strconv.FormatInt(ms, 10),
+		})
+
+	return Outcome{
+		Engine: d.Engine, SourceDB: source, TemplateName: templateName,
+		Fingerprint: key.Fingerprint(), CacheHit: false, Clones: clones,
+		IncrementalBase: anc.Fingerprint,
+	}, true, nil
+}
+
+// tryRollbackIncrementalBuild handles an edit to an ALREADY-APPLIED
+// migration (its content changed mid-sequence, so no prefix ancestor
+// matched). Opt-in via `databases[].rollback`. It clones the diverging
+// ancestor template, runs the rollback command to unwind the changed
+// tail (TREEMAN_ROLLBACK_STEPS migrations), then re-runs migrate forward
+// — the only path that re-applies an edit whose ledger row is baked into
+// the dump. ANY rollback/migrate/seed error hard-falls-back to a full
+// cold build (returns (Outcome{}, false, nil); the cold build drops the
+// dirty source first).
+//
+// WARNING: rollback runs the migration's CURRENT down(), not the one
+// that matched the applied schema — see the config doc on Rollback.
+func tryRollbackIncrementalBuild(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	source, templateName, version string,
+	maxConns int,
+	key snapshot.Key,
+	inputs map[string]store.InputVector,
+	inheritedEnv map[string]string,
+	started time.Time,
+	ops incrementalOps,
+) (Outcome, bool, error) {
+	if d.Rollback == nil || d.Migrate == nil {
+		return Outcome{}, false, nil
+	}
+	commandsHash := key.LockfileHashes[store.CommandsHashKey]
+	anc, steps, _ := st.FindRollbackAncestor(ctx, repoID, d.Engine, version,
+		key.DumpHashHex, commandsHash, inputs)
+	if anc == nil || steps <= 0 {
+		return Outcome{}, false, nil
+	}
+	unpin := snapshot.Pin(anc.Fingerprint)
+	defer unpin()
+
+	exists, _ := ops.exists(ctx, anc.TemplateName)
+	if !exists {
+		_ = st.DeleteSnapshot(ctx, anc.Fingerprint)
+		return Outcome{}, false, nil
+	}
+
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareRollbackStart,
+		fmt.Sprintf("engine=%s ancestor=%s rollback_steps=%d", d.Engine, anc.TemplateName, steps),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine": d.Engine, "source_db": source, "template": templateName,
+			"fingerprint": key.Fingerprint(), "ancestor_template": anc.TemplateName,
+			"ancestor_fingerprint": anc.Fingerprint, "rollback_steps": strconv.Itoa(steps),
+		})
+
+	rollbackFallback := func(reason string) {
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtPrepareRollbackFallback, reason,
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine": d.Engine, "ancestor_fingerprint": anc.Fingerprint, "reason": reason,
+			})
+	}
+
+	if err := ops.snapshotRestore(ctx, anc.TemplateName, source); err != nil {
+		rollbackFallback(fmt.Sprintf("ancestor restore failed: %v", err))
+		return Outcome{}, false, nil
+	}
+
+	// Rollback then re-migrate. Both run via runner.Run directly (not
+	// runPhase) so a failure becomes a cold-build fall-through, not a
+	// propagated error.
+	rbSpec := runner.FromRollback(*d.Rollback, steps).
+		WithLogPath(runnerLogPath(worktreePath, d.Engine, "rollback", source))
+	rbStart := time.Now()
+	out, err := runner.Run(ctx, rbSpec, worktreePath, source, tplCtx, inheritedEnv)
+	if err != nil || out.ExitCode != 0 {
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, d.Engine, source, "rollback", out)
+		}
+		rollbackFallback(fmt.Sprintf("rollback exit=%d err=%v", out.ExitCode, err))
+		return Outcome{}, false, nil
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "rollback", rbStart)
+
+	mgSpec := runner.FromMigrate(*d.Migrate).
+		WithLogPath(runnerLogPath(worktreePath, d.Engine, "migrate", source))
+	mgStart := time.Now()
+	out, err = runner.Run(ctx, mgSpec, worktreePath, source, tplCtx, inheritedEnv)
+	if err != nil || out.ExitCode != 0 {
+		if out.ExitCode != 0 {
+			emitRunnerError(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", out)
+		}
+		rollbackFallback(fmt.Sprintf("re-migrate exit=%d err=%v", out.ExitCode, err))
+		return Outcome{}, false, nil
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", mgStart)
+
+	if d.Seed != nil {
+		sdSpec := runner.FromSeed(*d.Seed).
+			WithLogPath(runnerLogPath(worktreePath, d.Engine, "seed", source))
+		sdStart := time.Now()
+		out, err = runner.Run(ctx, sdSpec, worktreePath, source, tplCtx, inheritedEnv)
+		if err != nil || out.ExitCode != 0 {
+			if out.ExitCode != 0 {
+				emitRunnerError(ctx, st, repoID, worktreeID, d.Engine, source, "seed", out)
+			}
+			rollbackFallback(fmt.Sprintf("seed exit=%d err=%v", out.ExitCode, err))
+			return Outcome{}, false, nil
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "seed", sdStart)
+	}
+
+	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, source, templateName, version, maxConns, key, inputs, ops)
+	if err != nil {
+		return Outcome{}, false, err
+	}
+
+	ms := time.Since(started).Milliseconds()
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
+		fmt.Sprintf("rollback clones=%d duration=%dms ancestor=%s steps=%d",
+			len(clones), ms, anc.TemplateName, steps),
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine": d.Engine, "source_db": source, "template": templateName,
+			"clones": strconv.Itoa(len(clones)), "cache_hit": "false",
+			"rollback": "true", "ancestor_fingerprint": anc.Fingerprint,
+			"rollback_steps": strconv.Itoa(steps), "duration_ms": strconv.FormatInt(ms, 10),
+		})
+
+	return Outcome{
+		Engine: d.Engine, SourceDB: source, TemplateName: templateName,
+		Fingerprint: key.Fingerprint(), CacheHit: false, Clones: clones,
+		IncrementalBase: anc.Fingerprint,
+	}, true, nil
+}
+
 // preparePostgres mirrors prepareMySQL for the PostgreSQL engine.
 // Uses `CREATE DATABASE … TEMPLATE` as the snapshot-and-fan-out
 // primitive — fast because pg copies on-disk files instead of
@@ -1550,18 +1906,49 @@ func preparePostgres(
 	// off this one. Mirrors prepareMySQL.
 	inputs := computeInputVectors(ctx, st, d, worktreePath)
 
+	ops := incrementalOps{
+		exists:          drv.DatabaseExists,
+		snapshotRestore: drv.SnapshotRestore,
+		snapshotCreate:  drv.SnapshotCreate,
+	}
+	dumpKey := dumpOnlySnapshotKey(d.Engine, version, key.DumpHashHex)
+
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
-		inheritedEnv, started, incrementalOps{
-			exists:          drv.DatabaseExists,
-			snapshotRestore: drv.SnapshotRestore,
-			snapshotCreate:  drv.SnapshotCreate,
-		})
+		inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
 	}
 
-	if err := postgresColdBuildSteps(ctx, drv, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceDB, inheritedEnv); err != nil {
+	out, done, err = tryRollbackIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
+		inheritedEnv, started, ops)
+	if done || err != nil {
+		return out, err
+	}
+
+	out, done, err = tryDumpOnlyBuild(ctx, cfg, d, tplCtx, worktreePath, st,
+		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, dumpKey,
+		inputs, inheritedEnv, started, ops)
+	if done || err != nil {
+		return out, err
+	}
+
+	if err := postgresColdBuildSteps(
+		ctx,
+		drv,
+		cfg,
+		d,
+		tplCtx,
+		worktreePath,
+		st,
+		repoID,
+		worktreeID,
+		sourceDB,
+		version,
+		dumpKey,
+		inheritedEnv,
+	); err != nil {
 		return Outcome{}, err
 	}
 	snapStart := time.Now()
@@ -1620,7 +2007,8 @@ func postgresColdBuildSteps(
 	worktreePath string,
 	st *store.Store,
 	repoID, worktreeID int64,
-	sourceDB string,
+	sourceDB, version string,
+	dumpKey snapshot.Key,
 	inheritedEnv map[string]string,
 ) error {
 	// pgColdBuild: cold-build pre-drop site (see coldbuild_invariant_test).
@@ -1657,6 +2045,9 @@ func postgresColdBuildSteps(
 		}
 		_ = scoped.Close()
 	}
+	// Seed the dump-only intermediate template (post-dump, pre-migrate).
+	// Best-effort; see the mysql cold-build site for rationale.
+	seedDumpOnlyTemplate(ctx, st, d, repoID, worktreeID, sourceDB, version, dumpKey, len(dumps), drv.SnapshotCreate)
 	if d.Migrate != nil {
 		if err := runPhase(
 			ctx,
@@ -2644,6 +3035,14 @@ func commandsHash(d config.DatabaseConfig) string {
 			parts = append(parts, "seed.env."+k+"="+d.Seed.Env[k])
 		}
 	}
+	// Rollback is deliberately NOT folded in: it affects only the build
+	// *transformation* (how an edited template is rebuilt), never the
+	// template's content or which migrations `migrate` applies. Folding
+	// it would force needless rebuilds on a rollback-config change and,
+	// worse, break rollback-ancestor matching the first time a user adds
+	// a `rollback:` block (every prior template would carry a different
+	// commands hash). Templates built with the same migrate+seed are
+	// valid rollback ancestors regardless of rollback config.
 	if len(parts) == 0 {
 		return ""
 	}

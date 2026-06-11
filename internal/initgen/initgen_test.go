@@ -182,6 +182,36 @@ func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 		t.Errorf("migrate.env.DB_TEST_DATABASE = %v, want {target_db}", got)
 	}
 
+	// Laravel has a step-based rollback CLI, so a rollback block must be
+	// scaffolded referencing the injected step-count env var.
+	rollback, ok := db["rollback"].(map[string]any)
+	if !ok {
+		t.Fatalf("databases[0].rollback: missing or wrong type\n%s", body)
+	}
+	if got := rollback["run"]; got != "php artisan migrate:rollback --force --step=$TREEMAN_ROLLBACK_STEPS" {
+		t.Errorf("rollback.run = %v, want laravel rollback default", got)
+	}
+	rbEnv, ok := rollback["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("rollback.env: missing or wrong type\n%s", body)
+	}
+	if got := rbEnv["DB_DATABASE"]; got != "{target_db}" {
+		t.Errorf("rollback.env.DB_DATABASE = %v, want {target_db}", got)
+	}
+
+	// Round-trip through the real config loader: the scaffolded rollback
+	// block must bind to DatabaseConfig.Rollback, not just be loose YAML.
+	var cfg config.Config
+	if err := yaml.Unmarshal([]byte(body), &cfg); err != nil {
+		t.Fatalf("scaffolded yaml fails to load as config: %v\n%s", err, body)
+	}
+	if len(cfg.Databases) == 0 || cfg.Databases[0].Rollback == nil {
+		t.Fatalf("DatabaseConfig.Rollback not populated from scaffold\n%s", body)
+	}
+	if cfg.Databases[0].Rollback.Run != "php artisan migrate:rollback --force --step=$TREEMAN_ROLLBACK_STEPS" {
+		t.Errorf("bound Rollback.Run = %q", cfg.Databases[0].Rollback.Run)
+	}
+
 	inputs, ok := db["inputs"].([]any)
 	if !ok || len(inputs) == 0 {
 		t.Fatalf("databases[0].inputs: missing or empty\n%s", body)
@@ -217,6 +247,41 @@ func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 		if got != want {
 			t.Errorf("inputs[%q] = %+v, want %+v", g, got, want)
 		}
+	}
+}
+
+// TestRenderTemplateNoRollbackForFrameworkWithoutStepDown verifies that
+// a framework lacking a clean step-based rollback CLI (Prisma — forward-
+// only `migrate deploy`, no relative down) scaffolds NO rollback block,
+// so those projects fall back to cold rebuild on an edited migration.
+func TestRenderTemplateNoRollbackForFrameworkWithoutStepDown(t *testing.T) {
+	dir := t.TempDir()
+	must := func(p, body string) {
+		t.Helper()
+		full := filepath.Join(dir, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must("prisma/schema.prisma", "generator client {}\n")
+	must("package-lock.json", `{"name":"acme"}`)
+	must("prisma/migrations/20240101000000_init/migration.sql", "CREATE TABLE t (id INT);\n")
+
+	body := RenderTemplate(dir)
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("rendered template is not valid YAML: %v\n%s", err, body)
+	}
+	dbs, ok := doc["databases"].([]any)
+	if !ok || len(dbs) == 0 {
+		t.Fatalf("databases: missing\n%s", body)
+	}
+	db, _ := dbs[0].(map[string]any)
+	if _, has := db["rollback"]; has {
+		t.Errorf("prisma must NOT scaffold a rollback block; got %v", db["rollback"])
 	}
 }
 

@@ -52,6 +52,17 @@ type Spec struct {
 	// per-run template DB name. Empty for frameworks that read the
 	// target DB from their own config rather than env.
 	MigrateEnv map[string]string
+	// RollbackRun is the shell command `treeman init` writes into the
+	// optional `databases[].rollback.run` field — the framework's
+	// step-based "undo last N migrations" CLI. Treeman injects the step
+	// count via the TREEMAN_ROLLBACK_STEPS env var (Run is not template-
+	// rendered), so the command references it directly. Empty for
+	// frameworks without a clean relative-step rollback (those scaffold
+	// no rollback block and use cold rebuild on an edited migration).
+	RollbackRun string
+	// RollbackEnv is the env-var override map for the rollback command —
+	// the same DB-targeting env as MigrateEnv. Empty when RollbackRun is.
+	RollbackEnv map[string]string
 	// Validate, when non-nil, runs after the marker check and must
 	// also pass for Detect to return true. Used to disambiguate
 	// frameworks whose Markers are too coarse on their own (e.g.
@@ -342,6 +353,11 @@ func builtinsClassic() []Spec {
 				"DB_DATABASE":      "{target_db}",
 				"DB_TEST_DATABASE": "{target_db}",
 			},
+			RollbackRun: "php artisan migrate:rollback --force --step=$TREEMAN_ROLLBACK_STEPS",
+			RollbackEnv: map[string]string{
+				"DB_DATABASE":      "{target_db}",
+				"DB_TEST_DATABASE": "{target_db}",
+			},
 		},
 		{
 			Name:          "rails",
@@ -352,6 +368,8 @@ func builtinsClassic() []Spec {
 			OnModify:      OnRebuild,
 			MigrateRun:    "bin/rails db:migrate",
 			MigrateEnv:    dbNameEnv(),
+			RollbackRun:   "bin/rails db:rollback STEP=$TREEMAN_ROLLBACK_STEPS",
+			RollbackEnv:   dbNameEnv(),
 		},
 		{
 			Name:          "django",
@@ -374,8 +392,10 @@ func builtinsClassic() []Spec {
 			// -path/-source and -database flags or env. Scaffold a
 			// working form that picks up DATABASE_URL from the env
 			// treeman injects via MigrateEnv.
-			MigrateRun: `migrate -path migrations -database "$DATABASE_URL" up`,
-			MigrateEnv: dbURLEnv(),
+			MigrateRun:  `migrate -path migrations -database "$DATABASE_URL" up`,
+			MigrateEnv:  dbURLEnv(),
+			RollbackRun: `migrate -path migrations -database "$DATABASE_URL" down $TREEMAN_ROLLBACK_STEPS`,
+			RollbackEnv: dbURLEnv(),
 			// go.mod alone matches every Go repo, so require a second
 			// signal: either the golang-migrate module is imported, or
 			// the repo contains at least one *.up.sql file (the
@@ -440,6 +460,8 @@ func builtinsJSAndOther() []Spec {
 			OnModify:      OnRebuild,
 			MigrateRun:    "alembic upgrade head",
 			MigrateEnv:    dbNameEnv(),
+			RollbackRun:   "alembic downgrade -$TREEMAN_ROLLBACK_STEPS",
+			RollbackEnv:   dbNameEnv(),
 		},
 		{
 			Name:          "flyway",
@@ -580,6 +602,8 @@ func builtinsExtra() []Spec {
 			OnModify:      OnRebuild,
 			MigrateRun:    "mix ecto.migrate",
 			MigrateEnv:    dbNameEnv(),
+			RollbackRun:   "mix ecto.rollback -n $TREEMAN_ROLLBACK_STEPS",
+			RollbackEnv:   dbNameEnv(),
 			Validate:      hasEctoEvidence,
 		},
 		{

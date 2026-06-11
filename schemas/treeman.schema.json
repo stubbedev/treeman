@@ -197,6 +197,10 @@
           "$ref": "#/$defs/Step",
           "description": "Migrate is the shell command that brings a freshly-loaded\nsource DB up to the current schema. Required when any input\nglob matches migration files; optional otherwise (e.g. a DB\nthat's purely seed-driven)."
         },
+        "rollback": {
+          "$ref": "#/$defs/Step",
+          "description": "Rollback is the OPTIONAL shell command that unwinds the most\nrecently applied migrations, used to keep templates correct when\nan *already-applied* migration's content is edited. Treeman runs\nit against a clone of the prior template, then re-runs Migrate\nforward — the only path that re-applies an edit to a migration\nwhose ledger row is baked into the source dump.\n\nTreeman injects the number of migrations to unwind as the env var\nTREEMAN_ROLLBACK_STEPS; reference it in Run, e.g.\n  rollback: { run: \"php artisan migrate:rollback --step=$TREEMAN_ROLLBACK_STEPS\" }\n(Run is passed verbatim to `sh -c`; only Env values are\n`{placeholder}`-rendered, so use the shell env var, not a brace\nplaceholder.)\n\nWARNING: rollback runs the migration's CURRENT down() — the edited\nfile on disk — not the original down() that matched the applied\nschema. For edits that change down(), or for lossy/irreversible\ndown()s, this can produce a wrong or failing schema. Treeman\nhard-falls-back to a full cold rebuild on ANY rollback or migrate\nerror, so a broken down() degrades to \"slow but correct\", never\n\"fast but wrong\"-at-the-engine — but a down() that *succeeds* while\nnot faithfully inverting up() is the user's responsibility. Leave\nthis unset to disable the rollback path entirely (cold rebuild\nonly)."
+        },
         "seed": {
           "$ref": "#/$defs/Step",
           "description": "Seed is the shell command that populates non-migration data\n(fixtures, ES mappings, Redis warm-cache keys, etc.). Runs\nAFTER dump-load + migrate as the final cold-build step,\nbefore treeman snapshots the populated state into the\ntemplate DB."
@@ -961,9 +965,17 @@
     }
   },
   "properties": {
+    "daemon": {
+      "$ref": "#/$defs/DaemonConfig",
+      "description": "Daemon process settings: stderr log level. Typically lives in\nthe user-global config."
+    },
     "connections": {
       "$ref": "#/$defs/ConnectionsConfig",
       "description": "Connection blocks per supported engine (MySQL, Postgres,\nMongoDB, Redis, Elasticsearch). Treeman dials these to create\nper-worktree clone databases, run migrations."
+    },
+    "snapshots": {
+      "$ref": "#/$defs/SnapshotsConfig",
+      "description": "Snapshot retention/eviction policy for cached post-migration\ntemplate snapshots: per-repo cap, per-source keep, max age,\nmax total size, GC cadence."
     },
     "worktrees": {
       "$ref": "#/$defs/WorktreesConfig",
@@ -1005,6 +1017,10 @@
       "type": "object",
       "description": "User-defined migration frameworks keyed by name. Use this when\nthe built-in framework presets don't cover your tool — declare\nthe markers, migration dirs, file pattern, lockfiles, and\nengine hint explicitly."
     },
+    "logs": {
+      "$ref": "#/$defs/LogsConfig",
+      "description": "Logs retention. Daemon-side prune drops rows older than\n`keep_days` from the events, hook_runs, and hook_log_chunks\ntables on a fixed interval. Set 0 to keep forever (no prune)."
+    },
     "auto_fetch": {
       "$ref": "#/$defs/AutoFetchConfig",
       "description": "AutoFetch policy. Daemon-side periodic `git fetch --all --prune`\nper registered repo, followed by a fast-forward (`merge\n--ff-only @{u}`) or rebase per active worktree, per\n`auto_fetch.mode`. Skips dirty trees, non-ff branches, and\nupstreamless branches. Enabled by default at a 15-minute cadence."
@@ -1019,6 +1035,14 @@
       },
       "type": "object",
       "description": "Ports declares per-worktree port slots. Each entry is a named\nslot with a port range; treeman allocates a free port per slot\nat `wt create` time and exposes it via the `{port_\u003cname\u003e}`\ntemplate token (usable in `patches[].set[*]` values).\nPersisted in SQLite so the assignment survives across daemon\nrestarts; freed on `wt delete`.\n\nUse slot names that match the role they fill in your app (e.g.\n`octane`, `webpack`, `reverb`) — the name shows up in every\n`{port_\u003cname\u003e}` reference and in `wt show` output."
+    },
+    "status": {
+      "$ref": "#/$defs/StatusConfig",
+      "description": "Status configures the `treeman status` widget output (icons,\nlabels, hover lines, custom bar formats). Lives in the global\nconfig since the widget aggregates worktrees across every repo."
+    },
+    "notifications": {
+      "$ref": "#/$defs/NotificationsConfig",
+      "description": "Notifications opts into desktop notifications (notify-send on\nLinux, the native banner via osascript on macOS) when a worktree\nchanges lifecycle state. Off by default. Lives in the global\nconfig since the daemon that emits them is a single cross-repo\nprocess."
     }
   },
   "additionalProperties": false,

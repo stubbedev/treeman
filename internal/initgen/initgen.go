@@ -201,12 +201,19 @@ func RenderTemplate(cwd string) string {
 			"engine", scalar(engine),
 			"name_template", scalar(name+"_testing_{slug}"),
 			"migrate", migrateBlock(spec),
-			"inputs", inputNodes(spec),
-			"test_clones", mapNode(
-				"clones", scalar("auto"),
-				"name_template", scalar(name+"_testing_{slug}_test_{n}"),
-			),
 		)
+		// Optional rollback block: only for frameworks with a clean
+		// step-based "undo last N migrations" CLI. Lets treeman re-apply
+		// an edited already-applied migration via rollback + re-migrate
+		// instead of a full cold rebuild. See DatabaseConfig.Rollback.
+		if spec.RollbackRun != "" {
+			mapSet(db, "rollback", rollbackBlock(spec))
+		}
+		mapSet(db, "inputs", inputNodes(spec))
+		mapSet(db, "test_clones", mapNode(
+			"clones", scalar("auto"),
+			"name_template", scalar(name+"_testing_{slug}_test_{n}"),
+		))
 		mapSet(root, "databases", seqNode(db))
 	}
 
@@ -253,16 +260,29 @@ func RenderTemplate(cwd string) string {
 // that point the framework's migrate CLI at the per-run template DB.
 // Env keys are sorted so the emitted YAML is deterministic.
 func migrateBlock(spec framework.Spec) *yaml.Node {
-	out := mapNode("run", scalar(spec.MigrateRun))
-	if len(spec.MigrateEnv) > 0 {
-		envKeys := make([]string, 0, len(spec.MigrateEnv))
-		for k := range spec.MigrateEnv {
+	return stepBlock(spec.MigrateRun, spec.MigrateEnv)
+}
+
+// rollbackBlock renders the optional `databases[].rollback:` mapping —
+// the framework's step-based rollback CLI plus the same DB-targeting
+// env as migrate. Only emitted for frameworks that declare RollbackRun.
+func rollbackBlock(spec framework.Spec) *yaml.Node {
+	return stepBlock(spec.RollbackRun, spec.RollbackEnv)
+}
+
+// stepBlock renders a `{run, env}` step mapping. Env keys are sorted so
+// the emitted YAML is deterministic.
+func stepBlock(run string, envMap map[string]string) *yaml.Node {
+	out := mapNode("run", scalar(run))
+	if len(envMap) > 0 {
+		envKeys := make([]string, 0, len(envMap))
+		for k := range envMap {
 			envKeys = append(envKeys, k)
 		}
 		sort.Strings(envKeys)
 		env := mapNode()
 		for _, k := range envKeys {
-			mapSet(env, k, scalar(spec.MigrateEnv[k]))
+			mapSet(env, k, scalar(envMap[k]))
 		}
 		mapSet(out, "env", env)
 	}

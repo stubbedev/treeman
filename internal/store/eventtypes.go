@@ -39,6 +39,10 @@ const (
 	EvtPrepareSkip                = "prepare:skip"
 	EvtPrepareIncrementalStart    = "prepare:incremental:start"
 	EvtPrepareIncrementalFallback = "prepare:incremental:fallback"
+	EvtPrepareDumpOnlyStart       = "prepare:dumponly:start"
+	EvtPrepareDumpOnlyFallback    = "prepare:dumponly:fallback"
+	EvtPrepareRollbackStart       = "prepare:rollback:start"
+	EvtPrepareRollbackFallback    = "prepare:rollback:fallback"
 	EvtPrepareUnsupported         = "prepare:unsupported"
 
 	// databases — db operations

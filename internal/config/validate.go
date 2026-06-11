@@ -263,6 +263,13 @@ func (d DatabaseConfig) validate(path string) error {
 				template.Scope{AllowTargetDB: true}))
 		}
 	}
+	if d.Rollback != nil {
+		for k, v := range d.Rollback.Env {
+			errs = appendIfErr(errs, validateTemplate(
+				fmt.Sprintf("%s.rollback.env[%s]", path, k), v,
+				template.Scope{AllowTargetDB: true}))
+		}
+	}
 	if d.TestClones != nil && d.TestClones.NameTemplate != "" {
 		errs = appendIfErr(errs, validateTemplate(
 			path+".test_clones.name_template", d.TestClones.NameTemplate,
