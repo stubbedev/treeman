@@ -213,7 +213,7 @@ func esDurablePrefix(index string) (string, bool) {
 	}
 	for i := range 16 {
 		c := rest[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return "", false
 		}
 	}
