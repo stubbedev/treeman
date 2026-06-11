@@ -38,3 +38,28 @@ func TestRollbackStepsVisibleToCommand(t *testing.T) {
 		t.Errorf("rollback command did not see step count; stdout=%q", out.StdoutTail)
 	}
 }
+
+// TestRollbackSharesMigratePathInjection proves the rollback command
+// runs with the exact same PATH as migrate — both flow through
+// runner.Run → shellenv.BaseEnv, which merges the daemon's login-shell
+// PATH. Equal, non-empty PATH for both specs guards against rollback
+// ever bypassing that shared env injection.
+func TestRollbackSharesMigratePathInjection(t *testing.T) {
+	const echoPath = `printf 'PATH=%s\n' "$PATH"`
+	mg, err := Run(context.Background(), FromMigrate(config.Step{Run: echoPath}),
+		t.TempDir(), "anydb", template.Context{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb, err := Run(context.Background(), FromRollback(config.Step{Run: echoPath}, 1),
+		t.TempDir(), "anydb", template.Context{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mg.StdoutTail == "" || !strings.HasPrefix(mg.StdoutTail, "PATH=") {
+		t.Fatalf("migrate PATH not captured: %q", mg.StdoutTail)
+	}
+	if mg.StdoutTail != rb.StdoutTail {
+		t.Errorf("rollback PATH differs from migrate:\n migrate=%q\n rollback=%q", mg.StdoutTail, rb.StdoutTail)
+	}
+}
