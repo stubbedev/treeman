@@ -146,6 +146,78 @@ func TestPruneGoneLocals_DeletesSquashMergedWithLaterCommits(t *testing.T) {
 	requireDeleted(t, work, pruneGoneLocals(ctx, work))
 }
 
+// Several squash-merged-gone branches with DIFFERENT merge-bases plus one
+// unmerged-gone branch are resolved in a single sweep: the batched path scans
+// defRef's patch-ids once (bounded by the oldest base) and matches every
+// suspect, deleting the squashed ones while keeping the unmerged one. Guards
+// the multi-suspect efficiency path that replaced the per-branch `git cherry`.
+func TestPruneGoneLocals_BatchedMultiSuspect(t *testing.T) {
+	requireGitAutofetch(t)
+	ctx := context.Background()
+	work, origin := makeClone(t)
+
+	squashMergeGone := func(branch, file string) {
+		gitRun(t, work, "checkout", "-q", "main")
+		gitRun(t, work, "checkout", "-q", "-b", branch)
+		if err := os.WriteFile(filepath.Join(work, file), []byte(file+" work\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(t, work, "add", file)
+		gitRun(t, work, "commit", "-q", "-m", branch)
+		gitRun(t, work, "push", "-q", "-u", "origin", branch)
+
+		push := filepath.Join(t.TempDir(), "push")
+		gitRun(t, "", "clone", "-q", origin, push)
+		gitRun(t, push, "config", "user.email", "t@t")
+		gitRun(t, push, "config", "user.name", "t")
+		gitRun(t, push, "checkout", "-q", "main")
+		gitRun(t, push, "merge", "-q", "--squash", "origin/"+branch)
+		gitRun(t, push, "commit", "-q", "-m", "squash "+branch)
+		gitRun(t, push, "push", "-q", "origin", "main")
+		gitRun(t, origin, "branch", "-D", branch)
+	}
+
+	// feature1 forks from the seed commit; feature2 forks after feature1's
+	// squash landed — so the two have distinct merge-bases and the shared
+	// scan must span back to the oldest of them.
+	gitRun(t, work, "fetch", "-q", "origin")
+	squashMergeGone("feature1", "f1.txt")
+	gitRun(t, work, "fetch", "-q", "origin")
+	gitRun(t, work, "checkout", "-q", "main")
+	gitRun(t, work, "merge", "-q", "--ff-only", "origin/main")
+	squashMergeGone("feature2", "f2.txt")
+
+	// feature3: gone upstream but never integrated — must be kept.
+	gitRun(t, work, "checkout", "-q", "main")
+	gitRun(t, work, "checkout", "-q", "-b", "feature3")
+	if err := os.WriteFile(filepath.Join(work, "f3.txt"), []byte("f3 work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, work, "add", "f3.txt")
+	gitRun(t, work, "commit", "-q", "-m", "feature3")
+	gitRun(t, work, "push", "-q", "-u", "origin", "feature3")
+	gitRun(t, origin, "branch", "-D", "feature3")
+
+	gitRun(t, work, "checkout", "-q", "main")
+	gitRun(t, work, "fetch", "--prune", "-q", "origin")
+
+	got := pruneGoneLocals(ctx, work)
+	for _, b := range []string{"feature1", "feature2"} {
+		if !listed(got, b) {
+			t.Errorf("pruneGoneLocals returned %v, want it to delete %q", got, b)
+		}
+		if gitcmd.Exists(ctx, work, "refs/heads/"+b) {
+			t.Errorf("%s ref still exists; expected it deleted", b)
+		}
+	}
+	if listed(got, "feature3") {
+		t.Errorf("pruneGoneLocals deleted unmerged \"feature3\" (returned %v)", got)
+	}
+	if !gitcmd.Exists(ctx, work, "refs/heads/feature3") {
+		t.Error("feature3 ref was deleted; expected it kept")
+	}
+}
+
 // A branch whose upstream is gone but whose work was NOT integrated is kept —
 // this is the data-safety guarantee.
 func TestPruneGoneLocals_KeepsUnmergedGone(t *testing.T) {

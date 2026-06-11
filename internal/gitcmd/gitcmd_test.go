@@ -3,6 +3,7 @@ package gitcmd
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -78,4 +79,49 @@ func pathValue(env []string) string {
 		}
 	}
 	return ""
+}
+
+// TestPipeOutput pipes `git log -p | git patch-id` against a one-commit repo
+// and asserts the patch-id summary streams through. Also covers the error
+// path: a bogus src ref must surface as an error, not silent empty output.
+func TestPipeOutput(t *testing.T) {
+	if _, err := os.Stat("/dev/null"); err != nil {
+		t.Skip("needs a unix-y environment")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		full := append([]string{"-C", dir}, args...)
+		if out, err := exec.Command("git", full...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", full, err, out)
+		}
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "a.txt")
+	run("commit", "-q", "-m", "init")
+
+	ctx := context.Background()
+	out, err := PipeOutput(ctx, dir,
+		[]string{"log", "-p", "--format=commit %H", "HEAD"},
+		[]string{"patch-id", "--stable"})
+	if err != nil {
+		t.Fatalf("PipeOutput: %v", err)
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		t.Fatal("PipeOutput returned empty; expected a patch-id line")
+	}
+
+	if _, err := PipeOutput(ctx, dir,
+		[]string{"log", "-p", "no-such-ref"},
+		[]string{"patch-id", "--stable"}); err == nil {
+		t.Fatal("PipeOutput with a bogus src ref should error")
+	}
 }

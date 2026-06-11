@@ -179,6 +179,57 @@ func Exists(ctx context.Context, dir, ref string) bool {
 	return RunOptional(ctx, dir, "rev-parse", "--verify", "--quiet", ref) == nil
 }
 
+// PipeOutput runs `git src...` and streams its stdout into the stdin of
+// `git dst...`, returning dst's accumulated stdout. Both run read-only.
+//
+// The OS pipe between the two children means src's output is never buffered
+// whole in this process — required for `git log -p <huge-range> | git patch-id`,
+// where the `-p` diff of tens of thousands of commits would otherwise be held
+// in memory all at once. dst's stdout (patch-id's one-line-per-commit summary)
+// is small, so collecting it in a buffer is safe and can't deadlock the pipe.
+func PipeOutput(ctx context.Context, dir string, src, dst []string) ([]byte, error) {
+	srcCmd := command(ctx, dir, true, src...)
+	dstCmd := command(ctx, dir, true, dst...)
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("git pipe: %w", err)
+	}
+	srcCmd.Stdout = pw
+	dstCmd.Stdin = pr
+
+	var out, srcErr, dstErr bytes.Buffer
+	srcCmd.Stderr = &srcErr
+	dstCmd.Stdout = &out
+	dstCmd.Stderr = &dstErr
+
+	if err := dstCmd.Start(); err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
+		return nil, wrap(dst, err, dstErr.String())
+	}
+	if err := srcCmd.Start(); err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
+		_ = dstCmd.Wait()
+		return nil, wrap(src, err, srcErr.String())
+	}
+	// Both children hold their own dup of the pipe ends now; drop this
+	// process's copies so dst sees EOF once src exits and closes its write end.
+	_ = pw.Close()
+	_ = pr.Close()
+
+	srcWait := srcCmd.Wait()
+	dstWait := dstCmd.Wait()
+	if srcWait != nil {
+		return nil, wrap(src, srcWait, srcErr.String())
+	}
+	if dstWait != nil {
+		return nil, wrap(dst, dstWait, dstErr.String())
+	}
+	return out.Bytes(), nil
+}
+
 // command builds the exec.Cmd with the standard env scrubbing applied.
 func command(ctx context.Context, dir string, readOnly bool, args ...string) *exec.Cmd {
 	full := args

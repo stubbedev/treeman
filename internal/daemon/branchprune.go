@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/gitcmd"
@@ -17,9 +18,17 @@ import (
 //
 // "Provably integrated" means either the branch tip is an ancestor of the
 // default branch (fast-forward / merge-commit) or its cumulative diff is
-// already present there (squash-merge, see squashContained). A branch that
-// can't be proven merged keeps both its ref and its durable — genuinely
+// already present there (squash-merge, see squashMergedSuspects). A branch
+// that can't be proven merged keeps both its ref and its durable — genuinely
 // unmerged work is never force-deleted.
+//
+// The work splits in two so the cost scales with what's actually needed:
+//   - Ancestor check (`merge-base --is-ancestor`) is cheap and resolves the
+//     common case (ff / merge-commit merges) with no diff work — done inline.
+//   - Squash detection needs patch-ids, the expensive part. Every remaining
+//     suspect is batched into ONE shared defRef patch-id pass instead of a
+//     per-branch `git cherry` that re-walked defRef's history once per branch
+//     (the O(suspects × defRef-history) blowup that pinned a core every tick).
 //
 // Guards: never deletes the default branch itself, never a branch checked out
 // in any worktree (git refuses that anyway), and never a branch that never had
@@ -41,7 +50,7 @@ func pruneGoneLocals(ctx context.Context, repoRoot string) []string {
 	}
 	checkedOut := checkedOutBranches(ctx, repoRoot)
 
-	var deleted []string
+	var deleted, suspects []string
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
@@ -53,19 +62,34 @@ func pruneGoneLocals(ctx context.Context, repoRoot string) []string {
 		if _, busy := checkedOut[name]; busy {
 			continue
 		}
-		if !safeToDelete(ctx, repoRoot, defRef, name) {
-			continue // genuinely unmerged — keep the branch and its durable
-		}
-		// Containment is proven above, so -D (not -d, whose merged-check is
-		// against HEAD — which may not be the default branch).
-		if err := gitcmd.RunOptional(ctx, repoRoot, "branch", "-D", name); err != nil {
-			slog.Warn("branch_prune delete", "repo", repoRoot, "branch", name, "err", err)
+		// Fast path: tip already reachable from the default branch
+		// (fast-forward / merge-commit). No patch-id work needed.
+		if gitcmd.RunOptional(ctx, repoRoot, "merge-base", "--is-ancestor", name, defRef) == nil {
+			deleteGoneLocal(ctx, repoRoot, name, &deleted)
 			continue
 		}
-		slog.Info("branch_prune deleted merged gone-upstream branch", "repo", repoRoot, "branch", name)
-		deleted = append(deleted, name)
+		suspects = append(suspects, name)
+	}
+
+	// Squash-merge detection for whatever the ancestor check didn't resolve.
+	// One shared defRef scan covers every suspect; genuinely unmerged
+	// suspects fall through and are kept.
+	for _, name := range squashMergedSuspects(ctx, repoRoot, defRef, suspects) {
+		deleteGoneLocal(ctx, repoRoot, name, &deleted)
 	}
 	return deleted
+}
+
+// deleteGoneLocal force-deletes a provably-integrated branch and records it.
+// -D (not -d) because containment is already proven against the default
+// branch — -d's merged-check is against HEAD, which may not be the default.
+func deleteGoneLocal(ctx context.Context, repoRoot, name string, deleted *[]string) {
+	if err := gitcmd.RunOptional(ctx, repoRoot, "branch", "-D", name); err != nil {
+		slog.Warn("branch_prune delete", "repo", repoRoot, "branch", name, "err", err)
+		return
+	}
+	slog.Info("branch_prune deleted merged gone-upstream branch", "repo", repoRoot, "branch", name)
+	*deleted = append(*deleted, name)
 }
 
 // defaultRemoteRef returns the remote-tracking ref of the repo's default
@@ -104,47 +128,143 @@ func checkedOutBranches(ctx context.Context, repoRoot string) map[string]struct{
 	return set
 }
 
-// safeToDelete reports whether `branch` is provably already integrated into
-// `defRef` (the default branch's remote-tracking ref).
-func safeToDelete(ctx context.Context, repoRoot, defRef, branch string) bool {
-	// Fast-forward / merge-commit: tip already reachable from the default.
-	if gitcmd.RunOptional(ctx, repoRoot, "merge-base", "--is-ancestor", branch, defRef) == nil {
-		return true
+// squashMergedSuspects returns the subset of `suspects` that were squash-merged
+// into defRef. A squash rewrites history, so the branch's individual commits
+// never enter defRef and the ancestor check misses — the only local signal is
+// that the branch's cumulative diff (merge-base..branch) is already present in
+// defRef as a single commit with the same patch-id.
+//
+// The expensive half — patch-id'ing defRef's commits — is done ONCE for the
+// whole suspect set, over the range since the oldest suspect merge-base, then
+// each suspect's cumulative-diff patch-id is a map lookup. This replaces the
+// previous per-suspect `git cherry`, each of which independently patch-id'd
+// defRef's history from its own merge-base: O(suspects × defRef-since-base)
+// CPU every auto-fetch tick, the source of the 100% spike on a many-branch
+// repo. Now it's O(defRef-since-oldest-base + suspects), and zero when there
+// are no suspects at all.
+//
+// Suspects whose merge-base or diff patch-id can't be computed are omitted
+// (kept) — same conservative "never force-delete unproven work" stance.
+// Read-only: no refs or objects are written.
+func squashMergedSuspects(ctx context.Context, repoRoot, defRef string, suspects []string) []string {
+	if len(suspects) == 0 {
+		return nil
 	}
-	return squashContained(ctx, repoRoot, defRef, branch)
+
+	type candidate struct {
+		name    string
+		patchID string
+	}
+	var cands []candidate
+	var bases []string
+	for _, name := range suspects {
+		base, err := gitcmd.String(ctx, repoRoot, "merge-base", defRef, name)
+		if err != nil || base == "" {
+			continue
+		}
+		pid := cumulativeDiffPatchID(ctx, repoRoot, base, name)
+		if pid == "" {
+			continue
+		}
+		cands = append(cands, candidate{name: name, patchID: pid})
+		bases = append(bases, base)
+	}
+	if len(cands) == 0 {
+		return nil
+	}
+
+	present := defRefPatchIDIndex(ctx, repoRoot, defRef, bases)
+	if present == nil {
+		return nil
+	}
+
+	var merged []string
+	for _, c := range cands {
+		if _, ok := present[c.patchID]; ok {
+			merged = append(merged, c.name)
+		}
+	}
+	return merged
 }
 
-// squashContained detects a squash-merged branch. It collapses the branch's
-// cumulative diff into a single synthetic commit atop the merge-base, then asks
-// `git cherry` whether that patch is already present in `defRef`. This is the
-// only reliable local signal that a squash-merged-then-deleted branch's work
-// actually landed: the squash rewrites history, so the individual commits never
-// appear in the default branch and ancestor / `branch -d` checks all miss it.
-// Read-only in effect — the synthetic commit is a dangling object git will
-// garbage-collect.
+// squashContained reports whether a single branch was squash-merged into
+// defRef. Thin wrapper over squashMergedSuspects so the batched path is the
+// one source of truth; retained as the unit-test entry point and for callers
+// that check one branch.
 func squashContained(ctx context.Context, repoRoot, defRef, branch string) bool {
-	base, err := gitcmd.String(ctx, repoRoot, "merge-base", defRef, branch)
-	if err != nil || base == "" {
-		return false
-	}
-	tree, err := gitcmd.String(ctx, repoRoot, "rev-parse", branch+"^{tree}")
-	if err != nil || tree == "" {
-		return false
-	}
-	synth, err := gitcmd.String(ctx, repoRoot, "commit-tree", tree, "-p", base, "-m", "treeman-squash-probe")
-	if err != nil || synth == "" {
-		return false
-	}
-	// Pass `base` as the <limit> arg so git cherry only patch-ids commits
-	// after the merge-base, not all of defRef's history. Without it, the
-	// upstream side of the comparison is the entire default branch (tens of
-	// thousands of commits on a mature repo), patch-id'd once per [gone]
-	// branch every auto-fetch tick — a 100% CPU spike. The synthetic patch
-	// is post-base anyway, so limiting the range is correctness-preserving.
-	out, err := gitcmd.Output(ctx, repoRoot, "cherry", defRef, synth, base)
+	return slices.Contains(squashMergedSuspects(ctx, repoRoot, defRef, []string{branch}), branch)
+}
+
+// cumulativeDiffPatchID returns the patch-id of the whole-branch diff
+// base..branch — the same fingerprint `git cherry` compares, computed directly
+// so it can be matched against a precomputed defRef index. patch-id normalises
+// line offsets, so a squash applied atop a moved-on defRef still matches the
+// original cumulative diff. Empty string on any failure (caller keeps the
+// branch). Both sides of the comparison use `patch-id --stable`, so the match
+// is self-consistent regardless of git's default patch-id algorithm.
+func cumulativeDiffPatchID(ctx context.Context, repoRoot, base, branch string) string {
+	out, err := gitcmd.PipeOutput(ctx, repoRoot,
+		[]string{"diff", base, branch},
+		[]string{"patch-id", "--stable"})
 	if err != nil {
-		return false
+		return ""
 	}
-	// A leading "-" marks the synthetic patch as already present in defRef.
-	return strings.HasPrefix(strings.TrimSpace(string(out)), "-")
+	return firstField(out)
+}
+
+// defRefPatchIDIndex builds the set of patch-ids of every non-merge commit in
+// defRef newer than the oldest of `bases` — one streamed `git log -p | git
+// patch-id` pass that covers every suspect's post-base range. Merge commits
+// are excluded: they carry no single cumulative diff and the ancestor
+// fast-path already handles merge-commit merges. Returns nil on failure.
+func defRefPatchIDIndex(ctx context.Context, repoRoot, defRef string, bases []string) map[string]struct{} {
+	logArgs := []string{"log", "-p", "--no-merges", "--format=commit %H", defRef}
+	if oldest := oldestCommonAncestor(ctx, repoRoot, bases); oldest != "" {
+		// Limit defRef to commits after the oldest fork point — every
+		// suspect's squash sits between its own (newer-or-equal) base and
+		// defRef's tip, so it stays inside this range.
+		logArgs = append(logArgs, "^"+oldest)
+	}
+	out, err := gitcmd.PipeOutput(ctx, repoRoot, logArgs, []string{"patch-id", "--stable"})
+	if err != nil {
+		slog.Warn("branch_prune patch-id index", "repo", repoRoot, "err", err)
+		return nil
+	}
+	ids := map[string]struct{}{}
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if id := firstField([]byte(line)); id != "" {
+			ids[id] = struct{}{}
+		}
+	}
+	return ids
+}
+
+// oldestCommonAncestor returns the merge-base of all `commits` — their common
+// ancestor, which (since every base is itself an ancestor of defRef) is the
+// oldest fork point and thus a safe lower bound for the shared defRef scan.
+// Empty string when it can't be resolved, which makes the caller scan all of
+// defRef rather than risk excluding a suspect's squash commit.
+func oldestCommonAncestor(ctx context.Context, repoRoot string, commits []string) string {
+	switch len(commits) {
+	case 0:
+		return ""
+	case 1:
+		return commits[0]
+	}
+	s, err := gitcmd.String(ctx, repoRoot, append([]string{"merge-base"}, commits...)...)
+	if err != nil {
+		return ""
+	}
+	return s
+}
+
+// firstField returns the first whitespace-delimited token of b — the patch-id
+// in `git patch-id` output lines (`<patch-id> <commit-id>`). Empty when b is
+// blank.
+func firstField(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if before, _, found := strings.Cut(s, " "); found {
+		return before
+	}
+	return s
 }
