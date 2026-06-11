@@ -41,7 +41,13 @@ protocol).
 
 - **Snapshot cache** — repeated `wt create` on the same migrations +
   dump hits a cached template DB; LRU eviction with a per-repo cap
-  (default 8) bounds disk use.
+  (default 8), per-source retention, age + size sweeps bound disk use;
+  `treeman doctor` flags (and `--fix` reclaims) orphaned templates
+  left behind by crashes.
+- **Spare-clone pre-warming** — `databases[].prewarm: N` (Postgres)
+  keeps N clones pre-restored from the cached template; a cache-hit
+  `wt create` claims one via `ALTER DATABASE … RENAME` in milliseconds
+  regardless of database size, and the pool refills in the background.
 - **Hook lifecycle** — declarative create / delete / checkout /
   file-change trigger lists; actions in a list run in parallel, the
   `run:` steps within an action chain sequentially.

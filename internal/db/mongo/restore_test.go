@@ -53,7 +53,7 @@ func TestArchiveReader_BasicStream(t *testing.T) {
 	}
 
 	r := &archiveReader{r: &buf}
-	if err := r.readHeader(); err != nil {
+	if _, err := r.readHeader(); err != nil {
 		t.Fatalf("readHeader: %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestArchiveReader_MultipleNamespaces(t *testing.T) {
 	mustWriteUint32(t, &buf, archiveTerminator)
 
 	r := &archiveReader{r: &buf}
-	if err := r.readHeader(); err != nil {
+	if _, err := r.readHeader(); err != nil {
 		t.Fatalf("readHeader: %v", err)
 	}
 
@@ -184,4 +184,92 @@ func mustMarshalInto(t *testing.T, w *bytes.Buffer, v any) {
 		t.Fatal(err)
 	}
 	w.Write(raw)
+}
+
+// TestParseIndexSpecs pins the metadata→createIndexes translation:
+// `_id_` and the legacy `ns` field are stripped, everything else
+// (unique, sparse, compound keys) passes through.
+func TestParseIndexSpecs(t *testing.T) {
+	meta := `{"indexes":[` +
+		`{"v":2,"key":{"_id":1},"name":"_id_"},` +
+		`{"v":2,"key":{"email":1},"name":"email_1","unique":true,"ns":"old.users"},` +
+		`{"v":2,"key":{"a":1,"b":-1},"name":"a_1_b_-1"}` +
+		`],"uuid":"abc","collectionName":"users","type":"collection"}`
+	specs, err := parseIndexSpecs(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 2 {
+		t.Fatalf("got %d specs, want 2 (skip _id_): %+v", len(specs), specs)
+	}
+	for _, spec := range specs {
+		for _, e := range spec {
+			if e.Key == "ns" {
+				t.Errorf("legacy ns field not stripped: %+v", spec)
+			}
+		}
+	}
+	if specs, err := parseIndexSpecs(""); err != nil || specs != nil {
+		t.Errorf("empty metadata: got %v, %v", specs, err)
+	}
+	if _, err := parseIndexSpecs("{not json"); err == nil {
+		t.Error("malformed metadata: want error")
+	}
+}
+
+// TestCollMetaSkip: views/timeseries are skipped, plain + untyped +
+// unparseable-metadata collections restore.
+func TestCollMetaSkip(t *testing.T) {
+	cases := []struct {
+		m    collMeta
+		want bool
+	}{
+		{collMeta{DB: "d", Collection: "c", Metadata: `{"type":"collection"}`}, false},
+		{collMeta{DB: "d", Collection: "c", Metadata: `{}`}, false},
+		{collMeta{DB: "d", Collection: "c", Metadata: ""}, false},
+		{collMeta{DB: "d", Collection: "c", Metadata: `{"type":"view"}`}, true},
+		{collMeta{DB: "d", Collection: "c", Metadata: `{"type":"timeseries"}`}, true},
+		{collMeta{DB: "d", Collection: "c", Metadata: `{broken`}, false},
+		{collMeta{DB: "", Collection: "c"}, true},
+	}
+	for i, tc := range cases {
+		if got := tc.m.skip(); got != tc.want {
+			t.Errorf("case %d (%+v): skip = %v, want %v", i, tc.m, got, tc.want)
+		}
+	}
+}
+
+// TestReadHeaderParsesCollectionMetadata: the prelude's metadata docs
+// come back parsed (they feed index replay), and the body stream still
+// reads from the right offset.
+func TestReadHeaderParsesCollectionMetadata(t *testing.T) {
+	var buf bytes.Buffer
+	mustWriteUint32(t, &buf, archiveMagic)
+	mustMarshalInto(t, &buf, bson.M{"concurrent_collections": int32(1)})
+	mustMarshalInto(t, &buf, bson.M{
+		"db": "srcdb", "collection": "users",
+		"metadata": `{"indexes":[{"v":2,"key":{"email":1},"name":"email_1"}],"type":"collection"}`,
+	})
+	mustWriteUint32(t, &buf, archiveTerminator) // end of prelude
+	mustMarshalInto(t, &buf, bson.M{"db": "srcdb", "collection": "users"})
+	mustMarshalInto(t, &buf, bson.M{"_id": int32(1)})
+	mustWriteUint32(t, &buf, archiveTerminator)
+	mustWriteUint32(t, &buf, archiveTerminator)
+
+	r := &archiveReader{r: &buf}
+	metas, err := r.readHeader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metas) != 1 || metas[0].DB != "srcdb" || metas[0].Collection != "users" {
+		t.Fatalf("metas = %+v", metas)
+	}
+	specs, err := parseIndexSpecs(metas[0].Metadata)
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("index specs from metadata: %v, %v", specs, err)
+	}
+	ns, _, terminate, err := r.next()
+	if err != nil || terminate || ns != "srcdb.users" {
+		t.Fatalf("body misaligned after metadata parse: ns=%q terminate=%v err=%v", ns, terminate, err)
+	}
 }

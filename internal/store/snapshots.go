@@ -494,6 +494,28 @@ func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, keep uint32)
 	return out, rows.Err()
 }
 
+// ListAllTemplateNames returns the template_name of every snapshot row
+// across ALL repos. The orphan probe compares engine-side `_tm_*`
+// namespaces against this set — a template the engine carries but no
+// row references can never be cache-hit, restored from, or GC'd, so
+// it's reclaimable junk.
+func (s *Store) ListAllTemplateNames(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT template_name FROM snapshots`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out[n] = true
+	}
+	return out, rows.Err()
+}
+
 // TouchSnapshot bumps `last_used_at` + `use_count` on a cache hit.
 // Used by GC to keep an LRU ordering.
 func (s *Store) TouchSnapshot(ctx context.Context, fingerprint string) error {

@@ -66,6 +66,11 @@ databases:
     dump: { path: storage/dumps/seed.sql.gz }
     fanout: 0                              # 0 = safe per-engine default (mysql 4, pg GOMAXPROCS, mongo 6, es 8).
                                            # raise only if the server is provisioned (max_connections bumped, etc.).
+    prewarm: 0                             # Postgres only: keep N spare clones pre-restored from the cached
+                                           # template; a cache-hit create claims one via ALTER DATABASE … RENAME
+                                           # (milliseconds, size-independent) instead of a full template copy.
+                                           # The pool replenishes in the background and is dropped with its
+                                           # template on eviction. See `treeman snapshots list` (SPARES column).
     migrate:                               # shell command + env-var redirects (point the CLI at the per-run template DB)
       run: "php artisan migrate --force"
       env:
@@ -108,16 +113,15 @@ Machine-wide settings. `daemon`, `snapshots`, `logs`, `status`, and
 
 ```yaml
 daemon:
-  socket: $XDG_RUNTIME_DIR/treeman.sock
-  log_level: info                        # debug | info | warn | error
+  log_level: info                          # debug | info | warn | error
+                                           # (socket path is derived from $XDG_RUNTIME_DIR — not configurable)
 
 snapshots:
-  cache_dir: ~/.cache/treeman/snapshots    # only used by GC reports
-  retention:
-    cap_per_repo: 8                        # hard cap, LRU evicts on new generation
-    max_age_days: 30
-    max_total_gb: 50
-    gc_interval_minutes: 60                # daemon background sweep
+  cap_per_repo: 8                          # hard cap per repo, LRU evicts on new generation
+  keep_per_source: 500                     # max templates kept per migration-content source
+  max_age_days: 30                         # drop templates unused this long (0 = off)
+  max_total_gb: 50                         # evict largest-first above this total (0 = off)
+  gc_interval_minutes: 60                  # daemon background sweep cadence
 
 logs:
   keep_days: 14                            # daemon prunes the shared event log; 0 keeps forever

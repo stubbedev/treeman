@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -141,21 +142,37 @@ func tryNativeCLIMongoRestore(ctx context.Context, conn *config.MongoConn, targe
 	return true, nil
 }
 
+// restoreStagePrefix names the staging collection a namespace loads
+// into before being promoted onto its final name. Loading into a
+// staging collection + renameCollection(dropTarget) at the end gives
+// the wire fallback the same per-collection all-or-nothing semantics
+// `mongorestore --drop` has: a mid-stream failure leaves the existing
+// target collections untouched instead of half-dropped/half-loaded.
+const restoreStagePrefix = "_tmload_"
+
+// restoreBatchSize bounds one InsertMany call. 500 docs per round-trip
+// replaces the old per-doc InsertOne without buffering whole dumps.
+const restoreBatchSize = 500
+
 // restoreViaDriver is the pure-Go wire-protocol fallback. It parses
-// the `mongodump --archive` stream itself and inserts every doc via
-// the official mongo Go driver, which speaks the same BSON wire
-// protocol the CLI does. Compression is auto-detected via
-// dumpload.OpenDump.
+// the `mongodump --archive` stream itself and loads every doc via the
+// official mongo Go driver, which speaks the same BSON wire protocol
+// the CLI does. Compression is auto-detected via dumpload.OpenDump.
 //
-// Limitations of this fallback (documented + tolerated, NOT silent):
-//   - Indexes encoded in the prelude's collection metadata are NOT
-//     replayed. Most dev workflows rebuild them via the migrate step
-//     after the dump applies, so this rarely surfaces. We log a
-//     `wire fallback used: indexes not replayed` warning so the
-//     operator can decide whether to install mongorestore.
-//   - Per-doc inserts (not bulk-write batching). Adequate for the
-//     small seed dumps treeman typically handles; could be batched
-//     later if measurement shows it's worth the complexity.
+// Semantics (mirroring `mongorestore --drop` where possible):
+//   - Docs batch-insert into `_tmload_<coll>` staging collections; on
+//     success every staging collection is promoted onto its final name
+//     via renameCollection(dropTarget:true) — atomic per collection.
+//     Any failure drops the staging collections and leaves the
+//     pre-restore targets intact.
+//   - Indexes are replayed from the prelude's collection metadata
+//     (skipping the implicit `_id_`). Unparseable metadata (mongodump
+//     version drift) downgrades to a warning — the data still loads.
+//   - Empty collections declared in the prelude are created even when
+//     no body documents follow.
+//   - Collection OPTIONS (capped, validators, collation) are NOT
+//     replayed, and views/timeseries are skipped — logged so the
+//     operator can install mongorestore if those matter.
 func restoreViaDriver(ctx context.Context, conn *config.MongoConn, targetDB, sourceDB, dumpPath string) error {
 	if conn == nil || conn.URI == "" {
 		return errors.New("mongo wire restore: missing connection URI")
@@ -173,11 +190,53 @@ func restoreViaDriver(ctx context.Context, conn *config.MongoConn, targetDB, sou
 	defer func() { _ = rc.Close() }()
 
 	r := &archiveReader{r: rc}
-	if err := r.readHeader(); err != nil {
+	metas, err := r.readHeader()
+	if err != nil {
 		return fmt.Errorf("read archive header: %w", err)
 	}
 
-	dropped := map[string]bool{}
+	remap := func(db string) string {
+		if sourceDB != "" && db == sourceDB {
+			return targetDB
+		}
+		return db
+	}
+
+	st := &wireStager{client: client, staged: map[string]nsParts{}}
+	if err := st.run(ctx, r, metas, remap); err != nil {
+		st.cleanup(ctx)
+		return err
+	}
+
+	if err := replayIndexes(ctx, client, metas, remap); err != nil {
+		return err
+	}
+
+	slog.Info("mongo restore: wire-protocol fallback used (indexes replayed; collection options/views not)",
+		"path", dumpPath, "target_db", targetDB,
+		"hint", "install mongorestore on PATH or set ContainerRef on connections.mongodb for full fidelity")
+	return nil
+}
+
+// nsParts is one staged namespace, split into database + collection.
+type nsParts struct{ db, coll string }
+
+// wireStager owns the staging-collection lifecycle of one wire
+// restore: batch inserts into `_tmload_<coll>` collections, promotion
+// onto the final names, and failure cleanup.
+type wireStager struct {
+	client *mongo.Client
+	// staged maps the final "db.coll" of every live staging collection
+	// to its split pieces.
+	staged map[string]nsParts
+	batch  []any
+	curDB  string
+	curCol string
+}
+
+// run drains the archive body into staging collections, materializes
+// prelude-only (empty) collections, then promotes everything.
+func (s *wireStager) run(ctx context.Context, r *archiveReader, metas []collMeta, remap func(string) string) error {
 	for {
 		ns, doc, terminate, rerr := r.next()
 		if rerr != nil {
@@ -190,26 +249,171 @@ func restoreViaDriver(ctx context.Context, conn *config.MongoConn, targetDB, sou
 		if dbName == "" || coll == "" {
 			continue
 		}
-		if sourceDB != "" && dbName == sourceDB {
-			dbName = targetDB
-		}
-		// Drop-then-restore mirrors `mongorestore --drop`. We drop the
-		// destination collection on first encounter so a partially-
-		// loaded run is replaced wholesale, never doubled.
-		key := dbName + "." + coll
-		if !dropped[key] {
-			_ = client.Database(dbName).Collection(coll).Drop(ctx)
-			dropped[key] = true
-		}
-		if _, err := client.Database(dbName).Collection(coll).InsertOne(ctx, doc); err != nil {
-			return fmt.Errorf("insert into %s.%s: %w", dbName, coll, err)
+		if err := s.add(ctx, remap(dbName), coll, doc); err != nil {
+			return err
 		}
 	}
+	if err := s.flush(ctx); err != nil {
+		return err
+	}
+	// Prelude-declared collections with no body docs still exist in
+	// the dump — create them empty so the restored DB matches.
+	for _, m := range metas {
+		if m.skip() {
+			continue
+		}
+		db := remap(m.DB)
+		if _, ok := s.staged[db+"."+m.Collection]; ok {
+			continue
+		}
+		if err := s.stage(ctx, db, m.Collection); err != nil {
+			return err
+		}
+		if cerr := s.client.Database(db).CreateCollection(ctx, restoreStagePrefix+m.Collection); cerr != nil {
+			return fmt.Errorf("create empty staging %s.%s%s: %w", db, restoreStagePrefix, m.Collection, cerr)
+		}
+	}
+	return s.promote(ctx)
+}
 
-	slog.Warn("mongo restore: wire-protocol fallback used; indexes not replayed",
-		"path", dumpPath, "target_db", targetDB,
-		"hint", "install mongorestore on PATH or set ContainerRef on connections.mongodb for the fast path")
+// add routes one body document into its staging batch, flushing on
+// namespace switches and on full batches.
+func (s *wireStager) add(ctx context.Context, db, coll string, doc bson.Raw) error {
+	if db != s.curDB || coll != s.curCol {
+		if err := s.flush(ctx); err != nil {
+			return err
+		}
+		s.curDB, s.curCol = db, coll
+	}
+	if err := s.stage(ctx, db, coll); err != nil {
+		return err
+	}
+	s.batch = append(s.batch, doc)
+	if len(s.batch) >= restoreBatchSize {
+		return s.flush(ctx)
+	}
 	return nil
+}
+
+// flush InsertMany-s the pending batch into the current staging
+// collection.
+func (s *wireStager) flush(ctx context.Context) error {
+	if len(s.batch) == 0 {
+		return nil
+	}
+	_, err := s.client.Database(s.curDB).Collection(restoreStagePrefix+s.curCol).InsertMany(ctx, s.batch)
+	s.batch = s.batch[:0]
+	if err != nil {
+		return fmt.Errorf("insert batch into %s.%s%s: %w", s.curDB, restoreStagePrefix, s.curCol, err)
+	}
+	return nil
+}
+
+// stage registers a namespace's staging collection on first sight,
+// clearing any leftover from a previously crashed restore.
+func (s *wireStager) stage(ctx context.Context, db, coll string) error {
+	key := db + "." + coll
+	if _, ok := s.staged[key]; ok {
+		return nil
+	}
+	if err := s.client.Database(db).Collection(restoreStagePrefix + coll).Drop(ctx); err != nil {
+		return fmt.Errorf("drop stale staging %s.%s%s: %w", db, restoreStagePrefix, coll, err)
+	}
+	s.staged[key] = nsParts{db: db, coll: coll}
+	return nil
+}
+
+// promote renames every staging collection onto its final name —
+// atomic per collection, replacing the previous contents wholesale.
+func (s *wireStager) promote(ctx context.Context) error {
+	for key, p := range s.staged {
+		cmd := bson.D{
+			{Key: "renameCollection", Value: p.db + "." + restoreStagePrefix + p.coll},
+			{Key: "to", Value: key},
+			{Key: "dropTarget", Value: true},
+		}
+		if err := s.client.Database("admin").RunCommand(ctx, cmd).Err(); err != nil {
+			return fmt.Errorf("promote %s: %w", key, err)
+		}
+		delete(s.staged, key)
+	}
+	return nil
+}
+
+// cleanup reaps the surviving staging collections after a failed
+// restore, on a fresh short-lived context — ctx may be cancelled.
+func (s *wireStager) cleanup(ctx context.Context) {
+	bgctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	for _, p := range s.staged {
+		_ = s.client.Database(p.db).Collection(restoreStagePrefix + p.coll).Drop(bgctx)
+	}
+}
+
+// replayIndexes re-creates the indexes encoded in the prelude's
+// collection metadata on the (already promoted) target collections.
+// The implicit `_id_` index is skipped; the legacy `ns` field is
+// stripped (createIndexes rejects it on modern servers). Metadata that
+// fails to parse (mongodump extended-JSON drift) is warned + skipped —
+// the data already restored; a createIndexes refusal is a hard error,
+// matching mongorestore.
+func replayIndexes(ctx context.Context, client *mongo.Client, metas []collMeta, remap func(string) string) error {
+	for _, m := range metas {
+		if m.skip() {
+			continue
+		}
+		specs, perr := parseIndexSpecs(m.Metadata)
+		if perr != nil {
+			slog.Warn("mongo restore: collection metadata unparseable; indexes skipped",
+				"ns", m.DB+"."+m.Collection, "err", perr)
+			continue
+		}
+		if len(specs) == 0 {
+			continue
+		}
+		db := remap(m.DB)
+		cmd := bson.D{
+			{Key: "createIndexes", Value: m.Collection},
+			{Key: "indexes", Value: specs},
+		}
+		if err := client.Database(db).RunCommand(ctx, cmd).Err(); err != nil {
+			return fmt.Errorf("replay %d index(es) on %s.%s: %w", len(specs), db, m.Collection, err)
+		}
+	}
+	return nil
+}
+
+// parseIndexSpecs extracts the index documents from one collection's
+// metadata blob (extended JSON), dropping the implicit `_id_` index
+// and the legacy per-index `ns` field.
+func parseIndexSpecs(metaJSON string) ([]bson.D, error) {
+	if metaJSON == "" {
+		return nil, nil
+	}
+	var m struct {
+		Indexes []bson.D `bson:"indexes"`
+	}
+	if err := bson.UnmarshalExtJSON([]byte(metaJSON), false, &m); err != nil {
+		return nil, err
+	}
+	out := make([]bson.D, 0, len(m.Indexes))
+	for _, idx := range m.Indexes {
+		spec := make(bson.D, 0, len(idx))
+		isID := false
+		for _, e := range idx {
+			if e.Key == "ns" {
+				continue
+			}
+			if e.Key == "name" && e.Value == "_id_" {
+				isID = true
+			}
+			spec = append(spec, e)
+		}
+		if !isID && len(spec) > 0 {
+			out = append(out, spec)
+		}
+	}
+	return out, nil
 }
 
 // archiveMagic is the first four bytes every `mongodump --archive`
@@ -238,13 +442,42 @@ type archiveReader struct {
 	inBlock bool
 }
 
-func (a *archiveReader) readHeader() error {
+// collMeta is one prelude CollectionMetadata entry: the namespace plus
+// its metadata blob (an extended-JSON string carrying index defs,
+// collection options, and the collection type).
+type collMeta struct {
+	DB         string `bson:"db"`
+	Collection string `bson:"collection"`
+	Metadata   string `bson:"metadata"`
+}
+
+// skip reports whether this prelude entry should be ignored by the
+// restore: views and timeseries aren't plain collections — the wire
+// fallback can't recreate them via insert+rename (mongorestore is the
+// path for those).
+func (m collMeta) skip() bool {
+	if m.DB == "" || m.Collection == "" {
+		return true
+	}
+	if m.Metadata == "" {
+		return false
+	}
+	var t struct {
+		Type string `bson:"type"`
+	}
+	if err := bson.UnmarshalExtJSON([]byte(m.Metadata), false, &t); err != nil {
+		return false // unparseable metadata: still restore the data
+	}
+	return t.Type != "" && t.Type != "collection"
+}
+
+func (a *archiveReader) readHeader() ([]collMeta, error) {
 	var magic uint32
 	if err := binary.Read(a.r, binary.LittleEndian, &magic); err != nil {
-		return err
+		return nil, err
 	}
 	if magic != archiveMagic {
-		return fmt.Errorf("not a mongodump archive (magic %#x; want %#x)", magic, archiveMagic)
+		return nil, fmt.Errorf("not a mongodump archive (magic %#x; want %#x)", magic, archiveMagic)
 	}
 	// Prelude wire format:
 	//
@@ -254,32 +487,41 @@ func (a *archiveReader) readHeader() error {
 	//   ...
 	//   [TERMINATOR (0xFFFFFFFF)]
 	//
-	// We don't currently parse the metadata (index replay is a TODO);
-	// just consume every doc up to the terminator so the body-stream
+	// Every doc up to the terminator must be consumed so the body-stream
 	// parser sees the first NamespaceHeader exactly where it should.
 	// Reading one BSON doc and stopping (the old bug) misclassified
 	// subsequent CollectionMetadata BSONs as namespace headers and
 	// body documents, doubling rows for archives with >1 collection.
+	// The metadata docs are parsed (not just skipped) — they carry the
+	// index definitions replayIndexes re-creates after the load.
 	if _, err := readBSONDoc(a.r); err != nil {
-		return fmt.Errorf("prelude header doc: %w", err)
+		return nil, fmt.Errorf("prelude header doc: %w", err)
 	}
+	var metas []collMeta
 	for {
 		var head [4]byte
 		if _, err := io.ReadFull(a.r, head[:]); err != nil {
-			return fmt.Errorf("prelude metadata: %w", err)
+			return nil, fmt.Errorf("prelude metadata: %w", err)
 		}
 		sz := binary.LittleEndian.Uint32(head[:])
 		if sz == archiveTerminator {
-			return nil
+			return metas, nil
 		}
 		if sz < 5 {
-			return fmt.Errorf("invalid prelude BSON length %d", sz)
+			return nil, fmt.Errorf("invalid prelude BSON length %d", sz)
 		}
 		body := make([]byte, sz-4)
 		if _, err := io.ReadFull(a.r, body); err != nil {
-			return fmt.Errorf("prelude metadata body: %w", err)
+			return nil, fmt.Errorf("prelude metadata body: %w", err)
 		}
-		// metadata is discarded; future work: parse for index defs.
+		raw := make([]byte, sz)
+		copy(raw[:4], head[:])
+		copy(raw[4:], body)
+		var m collMeta
+		if err := bson.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("prelude metadata bson: %w", err)
+		}
+		metas = append(metas, m)
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	enginepkg "github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/yamlpatch"
@@ -88,10 +89,14 @@ func RenderGlobalTemplate() string {
 
 	// snapshots: machine-wide template cache + retention (global-only).
 	snapshots := mapNode(
+		"cap_per_repo", scalar("8"),
+		"keep_per_source", scalar("500"),
 		"max_age_days", scalar("30"),
 		"max_total_gb", scalar("20"),
 	)
-	mapKeyNode(snapshots, "max_age_days").HeadComment = "post-migration template cache eviction policy"
+	mapKeyNode(snapshots, "cap_per_repo").HeadComment = "post-migration template cache eviction policy"
+	mapKeyNode(snapshots, "cap_per_repo").LineComment = "LRU cap per repo"
+	mapKeyNode(snapshots, "keep_per_source").LineComment = "max templates kept per migration-content source"
 	mapSet(root, "snapshots", snapshots)
 
 	// logs: daemon prune of the shared event log (global-only).
@@ -214,6 +219,13 @@ func RenderTemplate(cwd string) string {
 			"clones", scalar("auto"),
 			"name_template", scalar(name+"_testing_{slug}_test_{n}"),
 		))
+		// prewarm only applies to Postgres (the only engine with a
+		// constant-time whole-database rename to claim spares with) —
+		// scaffold it where it's valid so users discover the knob.
+		if fam, ok := enginepkg.Canonical(engine); ok && fam == enginepkg.FamilyPostgres {
+			mapSet(db, "prewarm", scalar("2"))
+			mapKeyNode(db, "prewarm").LineComment = "spare clones pre-restored from the template; cache-hit creates claim one via rename (ms)"
+		}
 		mapSet(root, "databases", seqNode(db))
 	}
 

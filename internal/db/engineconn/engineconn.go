@@ -43,6 +43,11 @@ type Conn interface {
 	// DropSnapshot drops exactly the named cached template (not a prefix
 	// reap). Idempotent.
 	DropSnapshot(ctx context.Context, name string) error
+	// ListMatching returns every namespace whose name starts with
+	// `prefix` — database names for name-scoped engines, index names
+	// for ES. Redis returns (nil, nil): enumerating a key prefix means
+	// a full SCAN, too expensive for inspection probes.
+	ListMatching(ctx context.Context, prefix string) ([]string, error)
 	// SizeKB is the on-disk size of `name` in KiB, or 0 when the engine
 	// exposes no size.
 	SizeKB(ctx context.Context, name string) int64
@@ -61,6 +66,10 @@ func (c mysqlConn) DropMatching(ctx context.Context, n string) (int, error) {
 	return len(dropped), err
 }
 func (c mysqlConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
+
+func (c mysqlConn) ListMatching(ctx context.Context, p string) ([]string, error) {
+	return c.d.ListMatching(ctx, p)
+}
 
 func (c mysqlConn) SizeKB(ctx context.Context, n string) int64 {
 	// SUM(data_length+index_length) — bytes-on-disk per
@@ -93,6 +102,10 @@ func (c postgresConn) DropSnapshot(ctx context.Context, n string) error {
 	return c.d.DropSnapshot(ctx, n)
 }
 
+func (c postgresConn) ListMatching(ctx context.Context, p string) ([]string, error) {
+	return c.d.ListMatching(ctx, p)
+}
+
 func (c postgresConn) SizeKB(ctx context.Context, n string) int64 {
 	var size int64
 	_ = c.d.DB.QueryRowContext(ctx, "SELECT pg_database_size($1)/1024", n).Scan(&size)
@@ -118,6 +131,10 @@ func (c mongoConn) DropMatching(ctx context.Context, n string) (int, error) {
 }
 func (c mongoConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
 
+func (c mongoConn) ListMatching(ctx context.Context, p string) ([]string, error) {
+	return c.d.ListMatching(ctx, p)
+}
+
 func (c mongoConn) SizeKB(ctx context.Context, n string) int64 {
 	b, _ := c.d.DataSizeBytes(ctx, n)
 	return b / 1024
@@ -135,6 +152,10 @@ func (c redisConn) DropMatching(ctx context.Context, n string) (int, error) {
 	return c.d.DropPrefix(ctx, n)
 }
 func (c redisConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
+
+// ListMatching is nil for Redis: enumerating a key prefix needs a full
+// SCAN — too expensive for an inspection probe (mirrors SizeKB).
+func (redisConn) ListMatching(context.Context, string) ([]string, error) { return nil, nil }
 
 // SizeKB is 0 for Redis: prefix size has no cheap server-side query —
 // it would need a SCAN + per-key MEMORY USAGE, too expensive for an
@@ -156,6 +177,10 @@ func (c esConn) DropMatching(ctx context.Context, n string) (int, error) {
 	return len(dropped), err
 }
 func (c esConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
+
+func (c esConn) ListMatching(ctx context.Context, p string) ([]string, error) {
+	return c.d.ListMatching(ctx, p)
+}
 
 func (c esConn) SizeKB(ctx context.Context, n string) int64 {
 	b, _ := c.d.StoreSizeBytes(ctx, n)

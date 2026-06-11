@@ -21,6 +21,7 @@ import (
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/slug"
+	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/wtreg"
 )
@@ -253,6 +254,28 @@ func applyDoctorFixes(ctx context.Context, results []doctorResult) []doctorResul
 				continue
 			}
 			results[i] = checkRegistry(ctx, repoRoot)
+		case "snapshots":
+			cfg, err := resolve.LoadResolved(repoRoot)
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			st, err := openStore(ctx)
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			orphans, ferr := snapshot.FindOrphans(ctx, &cfg, st)
+			_ = st.Close()
+			if ferr != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", ferr)
+				continue
+			}
+			if _, errs := snapshot.DropOrphans(ctx, &cfg, orphans); len(errs) > 0 {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", errors.Join(errs...))
+				continue
+			}
+			results[i] = checkSnapshots(ctx, repoRoot)
 		}
 	}
 	return results
@@ -269,8 +292,69 @@ func runDoctorChecks(ctx context.Context) []doctorResult {
 		checkSchema(repoRoot),
 		checkFrameworks(repoRoot),
 		checkRegistry(ctx, repoRoot),
+		checkSnapshots(ctx, repoRoot),
 	)
 	return out
+}
+
+// checkSnapshots mirrors the CLI doctor's snapshots probe: cache row
+// count vs cap, recorded size, spare-pool count, and ORPHAN templates
+// (engine-side `_tm_*` namespaces with no snapshots row — stranded by
+// a crash between SnapshotCreate and RecordSnapshot; doctor --fix /
+// fix=true reclaims them).
+func checkSnapshots(ctx context.Context, repoRoot string) doctorResult {
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return doctorResult{Name: "snapshots", Status: "skip", Detail: "config not loadable: " + err.Error()}
+	}
+	if len(cfg.Databases) == 0 {
+		return doctorResult{Name: "snapshots", Status: "skip", Detail: "no databases configured"}
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return doctorResult{Name: "snapshots", Status: "fail", Detail: err.Error()}
+	}
+	defer func() { _ = st.Close() }()
+
+	var rowCount int
+	if repoID, rerr := st.LookupRepoID(ctx, repoRoot); rerr == nil {
+		if rows, lerr := st.ListSnapshotsForRepo(ctx, repoID); lerr == nil {
+			rowCount = len(rows)
+		}
+	}
+	totalBytes, _ := st.SumSnapshotBytes(ctx)
+	detail := fmt.Sprintf("%d cached template(s) (cap %d), %.1f MiB recorded across repos",
+		rowCount, cfg.Snapshots.CapPerRepo, float64(totalBytes)/(1<<20))
+	if counts, serr := snapshot.SpareCounts(ctx, &cfg); serr == nil && len(counts) > 0 {
+		total := 0
+		for _, n := range counts {
+			total += n
+		}
+		detail += fmt.Sprintf(", %d pre-warmed spare(s) across %d template(s)", total, len(counts))
+	}
+
+	orphans, oerr := snapshot.FindOrphans(ctx, &cfg, st)
+	if oerr != nil {
+		return doctorResult{
+			Name:   "snapshots",
+			Status: "warn",
+			Detail: detail + " — orphan probe incomplete: " + oerr.Error(),
+			Hint:   "an engine was unreachable; start it and re-run doctor",
+		}
+	}
+	if len(orphans) > 0 {
+		names := make([]string, 0, len(orphans))
+		for _, o := range orphans {
+			names = append(names, fmt.Sprintf("%s:%s", o.Family, o.Name))
+		}
+		return doctorResult{
+			Name:   "snapshots",
+			Status: "warn",
+			Detail: fmt.Sprintf("%s; %d ORPHAN template(s) holding disk: %s", detail, len(orphans), strings.Join(names, ", ")),
+			Hint:   "reclaim with doctor fix=true",
+		}
+	}
+	return doctorResult{Name: "snapshots", Status: "ok", Detail: detail}
 }
 
 func checkDaemon(ctx context.Context) doctorResult {
@@ -1066,6 +1150,10 @@ type snapshotsListRow struct {
 	Engine       string `json:"engine"`
 	TemplateName string `json:"template_name"`
 	SourceDB     string `json:"source_db"`
+	// Spares is the engine-side pre-warmed spare count for this
+	// template (databases[].prewarm). Spares carry no SQLite row, so
+	// this is the only programmatic surface that exposes the pool.
+	Spares int `json:"spares,omitempty"`
 }
 type snapshotsListOut struct {
 	Repo      string             `json:"repo"`
@@ -1115,6 +1203,14 @@ func collectRepoSnapshots(ctx context.Context, repo string, limit int) (snapshot
 	if len(cands) > limit {
 		cands = cands[:limit]
 	}
+	// Best-effort spare-pool counts: an unreachable engine just leaves
+	// the field zero.
+	spares := map[string]int{}
+	if cfg, lerr := resolve.LoadResolved(repoRoot); lerr == nil {
+		if sc, serr := snapshot.SpareCounts(ctx, &cfg); serr == nil {
+			spares = sc
+		}
+	}
 	rows := make([]snapshotsListRow, 0, len(cands))
 	for _, c := range cands {
 		rows = append(rows, snapshotsListRow{
@@ -1122,6 +1218,7 @@ func collectRepoSnapshots(ctx context.Context, repo string, limit int) (snapshot
 			Engine:       c.Engine,
 			TemplateName: c.TemplateName,
 			SourceDB:     c.SourceDB,
+			Spares:       spares[c.TemplateName],
 		})
 	}
 	return snapshotsListOut{Repo: repoRoot, Snapshots: rows}, nil

@@ -177,12 +177,16 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 	runTrigger("delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
 	// Release the per-worktree port reservations back into the pool
 	// so a future `wt create` can re-use them.
-	_ = st.ReleaseWorktreePorts(ctx, id.WtID)
+	if err := st.ReleaseWorktreePorts(ctx, id.WtID); err != nil {
+		slog.Warn("wt delete: release ports (freed ports stay blocked)", "wt", wtPath, "err", err)
+	}
 	// Drop every active-branch marker for this worktree. teardownBranchScoped
 	// only clears markers for currently-configured branch_scoped databases;
 	// this bulk clear also reaps markers for databases since removed from
 	// config, so a re-created worktree at the same path starts clean.
-	_ = st.ClearActiveBranchesForWorktree(ctx, id.WtID)
+	if err := st.ClearActiveBranchesForWorktree(ctx, id.WtID); err != nil {
+		slog.Warn("wt delete: clear active-branch markers (stale markers survive recreate)", "wt", wtPath, "err", err)
+	}
 	_ = st.MarkWorktreeDeleted(ctx, id.WtID)
 	args := []string{"worktree", "remove"}
 	if force {

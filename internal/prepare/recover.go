@@ -3,6 +3,7 @@ package prepare
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/stubbedev/treeman/internal/config"
 	dbes "github.com/stubbedev/treeman/internal/db/es"
@@ -305,7 +306,12 @@ func recoverBranchScoped(
 	if err := eng.drv.Drop(ctx, active); err != nil {
 		return err
 	}
-	_ = st.ClearActiveBranch(ctx, worktreeID, active)
+	// A failed clear matters: the marker says `active` still exists, so
+	// the next prepare would skip its rebuild against a dropped DB.
+	if err := st.ClearActiveBranch(ctx, worktreeID, active); err != nil {
+		slog.Warn("recover: clear active-branch marker (next prepare may skip rebuild)",
+			"active", active, "err", err)
+	}
 	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeRecoverDrop,
 		fmt.Sprintf("%s: dropped active %s (branch_scoped; durable kept)", d.Engine, active),
 		repoID, worktreeID, "", 0, map[string]string{

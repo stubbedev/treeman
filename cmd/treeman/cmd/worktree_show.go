@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -58,6 +59,7 @@ func wtShow() *cli.Command {
 			}
 
 			printWtHeader(ctx, st, wt)
+			printWtPrepareSummary(ctx, st, wt.ID)
 
 			// Recent events.
 			evs, _ := st.QueryEvents(ctx, store.EventFilter{
@@ -115,6 +117,98 @@ func printWtHeader(ctx context.Context, st *store.Store, wt worktreeRow) {
 		}
 	}
 	_, _ = fmt.Fprintln(ui.Out)
+}
+
+// printWtPrepareSummary prints the "last prepare" block: per-database
+// outcome (cache hit vs cold build + wall-clock + clone count) and the
+// per-phase duration breakdown from that run's prepare:phase events.
+// Everything here was already in the event log — this renders it so
+// "why was that create slow?" doesn't require spelunking `logs tail`.
+func printWtPrepareSummary(ctx context.Context, st *store.Store, wtID int64) {
+	ends, _ := st.QueryEvents(ctx, store.EventFilter{
+		WorktreeID: wtID,
+		EventTypes: []string{store.EvtPrepareEnd},
+		Limit:      10,
+	})
+	if len(ends) == 0 {
+		return
+	}
+	// Newest run per (engine, source_db) — the query returns newest
+	// first, so first sighting wins.
+	type prep struct {
+		engine, sourceDB, cacheHit, clones string
+		durMs, ts                          int64
+	}
+	seen := map[string]bool{}
+	var preps []prep
+	oldest := ends[0].Ts
+	for _, e := range ends {
+		p := decodePayload(e.PayloadJSON)
+		key := p["engine"] + "|" + p["source_db"]
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		dur := e.DurationMs.Int64
+		if ms, err := strconv.ParseInt(p["duration_ms"], 10, 64); err == nil {
+			dur = ms
+		}
+		preps = append(preps, prep{
+			engine: p["engine"], sourceDB: p["source_db"],
+			cacheHit: p["cache_hit"], clones: p["clones"],
+			durMs: dur, ts: e.Ts,
+		})
+		if e.Ts < oldest {
+			oldest = e.Ts
+		}
+	}
+	// Phase breakdowns belong to the runs above: scope to a window just
+	// before the oldest rendered prepare:end (phases precede their end
+	// event; 30 minutes generously covers the slowest cold build).
+	phases, _ := st.QueryEvents(ctx, store.EventFilter{
+		WorktreeID:  wtID,
+		EventTypes:  []string{store.EvtPreparePhase},
+		SinceMs:     oldest - 30*60*1000,
+		OldestFirst: true,
+		Limit:       100,
+	})
+	phaseByKey := map[string][]string{}
+	for _, e := range phases {
+		p := decodePayload(e.PayloadJSON)
+		key := p["engine"] + "|" + p["source_db"]
+		phaseByKey[key] = append(phaseByKey[key],
+			fmt.Sprintf("%s %s", e.Phase, (time.Duration(e.DurationMs.Int64)*time.Millisecond).String()))
+	}
+
+	_, _ = fmt.Fprintln(ui.Out, ui.Bold("last prepare"))
+	for _, p := range preps {
+		mode := ui.Yellow("cold build")
+		if p.cacheHit == "true" {
+			mode = ui.Green("cache hit")
+		}
+		line := fmt.Sprintf("  %s %s: %s in %s", ui.Cyan(p.engine), p.sourceDB, mode,
+			(time.Duration(p.durMs) * time.Millisecond).String())
+		if p.clones != "" && p.clones != "0" {
+			line += fmt.Sprintf(" (%s clones)", p.clones)
+		}
+		line += ui.Dim("  " + formatTs(p.ts))
+		_, _ = fmt.Fprintln(ui.Out, line)
+		if ph := phaseByKey[p.engine+"|"+p.sourceDB]; len(ph) > 0 {
+			_, _ = fmt.Fprintln(ui.Out, ui.Dim("    "+strings.Join(ph, " · ")))
+		}
+	}
+	_, _ = fmt.Fprintln(ui.Out)
+}
+
+// decodePayload unmarshals an event's payload_json into a flat string
+// map; malformed or empty payloads yield an empty map.
+func decodePayload(raw string) map[string]string {
+	out := map[string]string{}
+	if raw == "" {
+		return out
+	}
+	_ = json.Unmarshal([]byte(raw), &out)
+	return out
 }
 
 // printWtHookRuns prints the recent hook runs table (nothing when the

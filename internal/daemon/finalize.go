@@ -137,7 +137,12 @@ func FinalizeWorktree(
 	// that's the canonical source for the worktree's env going
 	// forward.
 	if len(inheritedEnv) > 0 {
-		_ = st.Store.SaveInheritedEnv(ctx, wtID, inheritedEnv)
+		// A failed save is worth a warning: watcher-driven re-runs
+		// rehydrate PATH etc. from this row, and an empty env quietly
+		// breaks git/hook execution on every later re-prepare.
+		if err := st.Store.SaveInheritedEnv(ctx, wtID, inheritedEnv); err != nil {
+			slog.Warn("save inherited env (watcher re-runs will lack PATH)", "wt", wtRoot, "err", err)
+		}
 	}
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateStart,
@@ -652,11 +657,15 @@ func TeardownWorktree(
 	// not enough: ListUsedPorts skips them, but the unique index on
 	// (repo_id, name, port) still rejects the re-insert, so the freed
 	// port silently climbs out of the range. Mirror the CLI inline path.
-	_ = st.Store.ReleaseWorktreePorts(ctx, wtID)
+	if err := st.Store.ReleaseWorktreePorts(ctx, wtID); err != nil {
+		slog.Warn("release worktree ports (freed ports stay blocked for reallocation)", "wt", wtRoot, "err", err)
+	}
 	// Reap every active-branch marker too, so a worktree later created at
 	// the same path starts clean (also clears markers for databases since
 	// removed from config).
-	_ = st.Store.ClearActiveBranchesForWorktree(ctx, wtID)
+	if err := st.Store.ClearActiveBranchesForWorktree(ctx, wtID); err != nil {
+		slog.Warn("clear active-branch markers (stale markers survive recreate)", "wt", wtRoot, "err", err)
+	}
 
 	_ = st.Store.MarkWorktreeDeleted(ctx, wtID)
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteEnd,

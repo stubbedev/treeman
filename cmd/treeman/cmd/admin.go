@@ -15,7 +15,9 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/ui"
 	"github.com/stubbedev/treeman/internal/wtreg"
@@ -215,16 +217,38 @@ func SnapshotsCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
+					// Pre-warmed spare pools are engine-side only (no
+					// SQLite rows) — count them here so `prewarm` users
+					// can see their pools without psql. Best-effort: an
+					// unreachable engine just blanks the column.
+					spares := map[string]int{}
+					if cfg, lerr := resolve.LoadResolved(repoRoot); lerr == nil {
+						if sc, serr := snapshot.SpareCounts(ctx, &cfg); serr == nil {
+							spares = sc
+						}
+					}
 					if c.Bool("json") {
-						return jsonStream(map[string]any{"repo": repoRoot, "snapshots": cands})
+						type snapRow struct {
+							store.SnapshotEvictionCandidate
+							Spares int `json:"spares"`
+						}
+						rows := make([]snapRow, 0, len(cands))
+						for _, sc := range cands {
+							rows = append(rows, snapRow{sc, spares[sc.TemplateName]})
+						}
+						return jsonStream(map[string]any{"repo": repoRoot, "snapshots": rows})
 					}
 					if len(cands) == 0 {
 						PrintInfo("no snapshots cached for %s", repoRoot)
 						return nil
 					}
-					t := ui.NewTable("ENGINE", "TEMPLATE", "SOURCE_DB", "FINGERPRINT")
+					t := ui.NewTable("ENGINE", "TEMPLATE", "SOURCE_DB", "SPARES", "FINGERPRINT")
 					for _, sc := range cands {
-						t.Row(ui.Cyan(sc.Engine), sc.TemplateName, sc.SourceDB, ui.Dim(sc.Fingerprint))
+						spareCol := "-"
+						if n, ok := spares[sc.TemplateName]; ok {
+							spareCol = strconv.Itoa(n)
+						}
+						t.Row(ui.Cyan(sc.Engine), sc.TemplateName, sc.SourceDB, spareCol, ui.Dim(sc.Fingerprint))
 					}
 					t.Render(nil)
 					return nil
