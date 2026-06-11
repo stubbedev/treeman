@@ -27,9 +27,9 @@ import (
 // path must be absolute — caller's responsibility, so we don't have
 // to disambiguate cache keys across cwd changes.
 //
-// This is the workhorse behind snapshot.LockfileHashesFor and the
-// HashChecksum branch of framework.MigrationsHash, which previously
-// rehashed every dump file + every migration file on every prepare.
+// This is the workhorse behind snapshot.LockfileHashesFor and
+// framework.MigrationsHash, which would otherwise rehash every dump
+// file + every migration file on every prepare.
 //
 // Callers hashing many paths in one go should prefer
 // BatchHashedFiles, which folds the lookups into a single SELECT IN
@@ -83,11 +83,17 @@ func statLivePaths(paths []string) ([]string, map[string]fileStat, error) {
 //  2. one SELECT … WHERE path IN(?,?,…) to fetch cached rows.
 //  3. for cached rows whose (size, mtime_ns) matches the live stat,
 //     return immediately. Refresh `cached_at` so LRU keeps hot files.
-//  4. for misses, consult the content-addressable secondary index
-//     (size, mtime_ns) — same content across worktrees reuses an
-//     existing row without re-reading bytes.
-//  5. for true misses, compute BLAKE3 in parallel (GOMAXPROCS) and
-//     upsert each fresh row.
+//  4. for misses, compute BLAKE3 in parallel (GOMAXPROCS) and upsert
+//     each fresh row.
+//
+// The cache is gated on each path's OWN (size, mtime_ns) — there is no
+// cross-path content-addressable reuse. Reusing a hash from a
+// different path solely because (size, mtime_ns) collide is unsafe on
+// coarse-mtime filesystems (macOS HFS+, SMB, some FUSE mounts resolve
+// mtime to 1 second): two distinct same-size files written in the same
+// second would alias to one hash and an edited migration could keep a
+// stale fingerprint. Per-path gating keeps detection content-correct
+// across every filesystem.
 //
 // Returns a map keyed on the input absolute path. Missing or
 // non-regular files are silently absent from the result (matches the
@@ -125,9 +131,8 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 
 	now := nowMillis()
 	var (
-		hits     []string
-		misses   []string
-		secondHi []secondaryHit
+		hits   []string
+		misses []string
 	)
 
 	for _, p := range live {
@@ -140,17 +145,7 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 		misses = append(misses, p)
 	}
 
-	// Secondary (content-addressable) lookup for misses: any row with
-	// the same (size, mtime_ns) lets us reuse its hash without a disk
-	// read. Resolved in one batched query per chunk of distinct pairs
-	// rather than a QueryRow per miss — on a cold prepare every file is
-	// a miss, so the per-miss form fired N round trips (each returning
-	// nothing while the table is still empty).
-	if len(misses) > 0 {
-		misses, secondHi = s.resolveSecondaryHits(ctx, misses, stats, out)
-	}
-
-	// Hash true misses in parallel.
+	// Hash misses in parallel.
 	if len(misses) > 0 {
 		limit := max(runtime.GOMAXPROCS(0), 1)
 		var mu sync.Mutex
@@ -177,14 +172,10 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 			return out, err
 		}
 		maps.Copy(out, fresh)
-		// Upsert fresh rows + secondary-index hits as their own
-		// rows so future runs hit by path directly.
+		// Upsert fresh rows keyed by path so future runs hit directly.
 		if err := s.upsertHashRows(ctx, fresh, stats, now); err != nil {
 			slog.Warn("file_hashes batch upsert failed", "err", err)
 		}
-	}
-	if len(secondHi) > 0 {
-		s.upsertSecondaryHits(ctx, secondHi, now)
 	}
 	if len(hits) > 0 {
 		// Refresh cached_at so age-based pruning keeps hot files.
@@ -195,85 +186,11 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 	return out, nil
 }
 
-// resolveSecondaryHits runs the content-addressable secondary lookup
-// for `misses`: it batches the distinct (size, mtime_ns) pairs, fills
-// `out` for every miss whose pair matches an existing row, and returns
-// (stillMissing, secondaryHits). stillMissing aliases misses' backing
-// array — the in-place filter is safe because append never outruns the
-// read cursor.
-func (s *Store) resolveSecondaryHits(
-	ctx context.Context,
-	misses []string,
-	stats map[string]fileStat,
-	out map[string]string,
-) ([]string, []secondaryHit) {
-	// byPair maps a distinct (size,mtime) to its reusable hash
-	// ("" once seen, filled when the query finds a match).
-	byPair := make(map[hashPair]string, len(misses))
-	distinct := make([]hashPair, 0, len(misses))
-	for _, p := range misses {
-		k := hashPair(stats[p])
-		if _, ok := byPair[k]; !ok {
-			byPair[k] = ""
-			distinct = append(distinct, k)
-		}
-	}
-	// 2 placeholders per pair; cap each chunk well under SQLite's
-	// 32766 variable limit.
-	const pairChunk = 400
-	for i := 0; i < len(distinct); i += pairChunk {
-		j := min(i+pairChunk, len(distinct))
-		if !s.loadSecondaryHashChunk(ctx, distinct[i:j], byPair) {
-			break
-		}
-	}
-	// Map each miss back to its pair's hash, preserving order.
-	var secondHi []secondaryHit
-	stillMissing := misses[:0]
-	for _, p := range misses {
-		st := stats[p]
-		if h := byPair[hashPair(st)]; h != "" {
-			out[p] = h
-			secondHi = append(secondHi, secondaryHit{p, h, st.size, st.mtime})
-			continue
-		}
-		stillMissing = append(stillMissing, p)
-	}
-	return stillMissing, secondHi
-}
-
-// upsertSecondaryHits persists secondary-index hits as their own rows
-// so future runs hit by path directly. Failures are advisory — the
-// result map is already populated.
-func (s *Store) upsertSecondaryHits(ctx context.Context, secondHi []secondaryHit, now int64) {
-	rowMap := make(map[string]string, len(secondHi))
-	statMap := make(map[string]fileStat, len(secondHi))
-	for _, e := range secondHi {
-		rowMap[e.path] = e.hash
-		statMap[e.path] = fileStat{size: e.size, mtime: e.mt}
-	}
-	if err := s.upsertHashRows(ctx, rowMap, statMap, now); err != nil {
-		slog.Warn("file_hashes secondary upsert failed", "err", err)
-	}
-}
-
-// hashPair is a distinct (size, mtime_ns) key for the content-
-// addressable secondary lookup in BatchHashedFiles.
-type hashPair struct{ size, mtime int64 }
-
 // fileStat is the live (size, mtime_ns) stat for one path, used to
-// match cached / secondary-index rows in BatchHashedFiles.
+// match cached rows in BatchHashedFiles.
 type fileStat struct {
 	size  int64
 	mtime int64
-}
-
-// secondaryHit records a miss resolved via the content-addressable
-// secondary index — carries the reused hash plus the stat so the row
-// can be upserted under its own path.
-type secondaryHit struct {
-	path, hash string
-	size, mt   int64
 }
 
 // loadFileHashChunk runs the primary `path IN (…)` cache lookup for one
@@ -317,48 +234,6 @@ func (s *Store) loadFileHashChunk(ctx context.Context, batch []string, cached ma
 	}
 	if err := rows.Err(); err != nil {
 		slog.Warn("file_hashes batch iteration failed", "err", err)
-		return false
-	}
-	return true
-}
-
-// loadSecondaryHashChunk runs the content-addressable `(size, mtime_ns)`
-// lookup for one chunk of distinct pairs, filling `byPair` with any
-// reusable hash found. Returns false (advising the caller to stop
-// chunking) when the query or row iteration fails — advisory, so the
-// caller hashes the remaining misses as true misses.
-func (s *Store) loadSecondaryHashChunk(ctx context.Context, batch []hashPair, byPair map[hashPair]string) bool {
-	clauses := make([]string, len(batch))
-	args := make([]any, 0, len(batch)*2)
-	for k, pr := range batch {
-		clauses[k] = "(size = ? AND mtime_ns = ?)"
-		args = append(args, pr.size, pr.mtime)
-	}
-	//nolint:gosec // only `?`-placeholder clauses are concatenated; values are parameterized
-	q := "SELECT size, mtime_ns, hash FROM file_hashes WHERE " + strings.Join(clauses, " OR ")
-	rows, err := s.DB.QueryContext(ctx, q, args...)
-	if err != nil {
-		// Advisory — fall through and hash these as true misses.
-		slog.Warn("file_hashes secondary batch lookup failed", "err", err)
-		return false
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var sz, mt int64
-		var h string
-		if err := rows.Scan(&sz, &mt, &h); err != nil {
-			continue
-		}
-		if h == "" {
-			continue
-		}
-		k := hashPair{sz, mt}
-		if cur, ok := byPair[k]; ok && cur == "" {
-			byPair[k] = h
-		}
-	}
-	if err := rows.Err(); err != nil {
-		slog.Warn("file_hashes secondary batch iteration failed", "err", err)
 		return false
 	}
 	return true
