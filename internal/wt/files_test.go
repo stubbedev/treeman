@@ -3,6 +3,7 @@ package wt
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -156,6 +157,61 @@ func TestBringInFilesCopiesDirectoryRecursively(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(wtDir, "seeds", "fixtures", "b.sql")); string(got) != "b" {
 		t.Errorf("missing seeds/fixtures/b.sql in copy: %q", got)
+	}
+}
+
+// TestBringInFilesCopiesLargeTreeConcurrently stresses the fan-out copy
+// path (copyFanout workers + reflink-or-stream per file) on a tree far
+// wider than the worker pool: every file must arrive with its content
+// and mode intact, and the report's file/byte tallies must be exact.
+func TestBringInFilesCopiesLargeTreeConcurrently(t *testing.T) {
+	main := t.TempDir()
+	wtDir := t.TempDir()
+	const dirs, perDir = 8, 25
+	var wantBytes int64
+	for d := range dirs {
+		dir := filepath.Join(main, "vendor", "pkg"+strconv.Itoa(d))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for f := range perDir {
+			body := strings.Repeat("x", d*perDir+f+1)
+			wantBytes += int64(len(body))
+			perm := os.FileMode(0o644)
+			if f%5 == 0 {
+				perm = 0o755
+			}
+			if err := os.WriteFile(filepath.Join(dir, "f"+strconv.Itoa(f)+".js"), []byte(body), perm); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	res, err := BringInFilesReport(main, wtDir, []string{"vendor"}, "copy", NoopSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Files != dirs*perDir || res[0].Bytes != wantBytes {
+		t.Fatalf("report mismatch: %+v (want files=%d bytes=%d)", res, dirs*perDir, wantBytes)
+	}
+	for d := range dirs {
+		for f := range perDir {
+			path := filepath.Join(wtDir, "vendor", "pkg"+strconv.Itoa(d), "f"+strconv.Itoa(f)+".js")
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("missing copy %s: %v", path, err)
+			}
+			if want := d*perDir + f + 1; len(got) != want {
+				t.Fatalf("%s: got %d bytes, want %d", path, len(got), want)
+			}
+			info, _ := os.Stat(path)
+			wantPerm := os.FileMode(0o644)
+			if f%5 == 0 {
+				wantPerm = 0o755
+			}
+			if info.Mode().Perm() != wantPerm {
+				t.Fatalf("%s: mode %v, want %v", path, info.Mode().Perm(), wantPerm)
+			}
+		}
 	}
 }
 

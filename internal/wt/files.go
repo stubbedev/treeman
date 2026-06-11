@@ -6,9 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
+	"golang.org/x/sync/errgroup"
 )
 
 // hasGlobMeta reports whether `p` carries any glob meta-character we
@@ -134,58 +136,94 @@ func BringInFilesReport(repoRoot, wtPath string, paths []string, mode string, si
 	return results, nil
 }
 
+// copyFanout bounds how many regular-file copies run concurrently
+// inside one copyPath call. Bring-in trees are typically node_modules
+// / vendor style — tens of thousands of small files where per-file
+// syscall latency, not bandwidth, dominates — so a modest fan-out
+// recovers most of the wall-clock without flooding the page cache or
+// fd table.
+const copyFanout = 8
+
 // copyPath copies src → dst, returning the count of regular files
 // written and total bytes copied (for observability). Regular files
-// are copied byte-for-byte with the source's mode preserved;
-// directories are recursed; symlinks in the source tree are recreated
-// as symlinks pointing at the same target (counted as a file, 0 bytes).
+// are copied with the source's mode preserved — reflinked when the
+// filesystem supports it, byte-for-byte otherwise — and fan out across
+// copyFanout workers; directories are recursed; symlinks in the source
+// tree are recreated as symlinks pointing at the same target (counted
+// as a file, 0 bytes). Directory structure and symlinks are created
+// synchronously during the walk so every queued file copy already has
+// its parent directory in place.
 func copyPath(src, dst string, info os.FileInfo) (files int, bytes int64, err error) {
+	var (
+		g      errgroup.Group
+		nFiles atomic.Int64
+		nBytes atomic.Int64
+	)
+	g.SetLimit(copyFanout)
+	walkErr := copyWalk(src, dst, info, &g, &nFiles, &nBytes)
+	copyErr := g.Wait()
+	if walkErr == nil {
+		walkErr = copyErr
+	}
+	return int(nFiles.Load()), nBytes.Load(), walkErr
+}
+
+// copyWalk recursively materializes dirs + symlinks inline and queues
+// regular-file copies on g. Counters track successful work only.
+func copyWalk(src, dst string, info os.FileInfo, g *errgroup.Group, files, bytes *atomic.Int64) error {
 	mode := info.Mode()
 	switch {
 	case mode&os.ModeSymlink != 0:
 		target, err := os.Readlink(src)
 		if err != nil {
-			return 0, 0, err
+			return err
 		}
 		if err := os.Symlink(target, dst); err != nil {
-			return 0, 0, err
+			return err
 		}
-		return 1, 0, nil
+		files.Add(1)
+		return nil
 	case mode.IsDir():
 		if err := os.MkdirAll(dst, mode.Perm()); err != nil {
-			return 0, 0, err
+			return err
 		}
 		entries, err := os.ReadDir(src)
 		if err != nil {
-			return 0, 0, err
+			return err
 		}
 		for _, e := range entries {
 			childSrc := filepath.Join(src, e.Name())
 			childDst := filepath.Join(dst, e.Name())
 			childInfo, err := os.Lstat(childSrc)
 			if err != nil {
-				return files, bytes, err
+				return err
 			}
-			cf, cb, err := copyPath(childSrc, childDst, childInfo)
-			files += cf
-			bytes += cb
-			if err != nil {
-				return files, bytes, err
+			if err := copyWalk(childSrc, childDst, childInfo, g, files, bytes); err != nil {
+				return err
 			}
 		}
-		return files, bytes, nil
+		return nil
 	case mode.IsRegular():
-		n, err := copyRegularFile(src, dst, mode.Perm())
-		if err != nil {
-			return 0, n, err
-		}
-		return 1, n, nil
+		perm := mode.Perm()
+		g.Go(func() error {
+			n, err := copyRegularFile(src, dst, perm)
+			if err != nil {
+				return err
+			}
+			files.Add(1)
+			bytes.Add(n)
+			return nil
+		})
+		return nil
 	default:
-		return 0, 0, fmt.Errorf("unsupported file type for %s (mode=%v)", src, mode)
+		return fmt.Errorf("unsupported file type for %s (mode=%v)", src, mode)
 	}
 }
 
 // copyRegularFile copies src → dst and returns the bytes written.
+// It first attempts a reflink clone (constant-time copy-on-write on
+// btrfs/XFS — see cloneFile), falling back to a streamed io.Copy on
+// filesystems without reflink support.
 func copyRegularFile(src, dst string, perm os.FileMode) (int64, error) {
 	sf, err := os.Open(src)
 	if err != nil {
@@ -196,10 +234,17 @@ func copyRegularFile(src, dst string, perm os.FileMode) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	n, err := io.Copy(df, sf)
-	if err != nil {
-		_ = df.Close()
-		return n, err
+	var n int64
+	if cloneErr := cloneFile(df, sf); cloneErr == nil {
+		if st, err := sf.Stat(); err == nil {
+			n = st.Size()
+		}
+	} else {
+		n, err = io.Copy(df, sf)
+		if err != nil {
+			_ = df.Close()
+			return n, err
+		}
 	}
 	// Check the close: a deferred close would swallow a failed final
 	// flush, leaving dst silently truncated.
