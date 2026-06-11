@@ -301,9 +301,25 @@ func (d *Driver) copyAliases(ctx context.Context, src, dst, srcPrefix, dstPrefix
 }
 
 func (d *Driver) cloneAPICall(ctx context.Context, src, dst string) error {
+	// Force 0 replicas on the clone. treeman's ES indices are ephemeral
+	// per-template / per-worktree copies, typically on a single-node dev
+	// cluster where a replica can never be allocated. `_clone` otherwise
+	// inherits the source's replica count (usually 1), which doubles the
+	// shard count and leaves every replica perpetually unassigned —
+	// inflating the cluster toward max_shards_per_node until clones start
+	// failing with "this action would add [N] shards". 0 keeps each clone
+	// to one shard per index and the cluster green.
+	cloneBody, err := json.Marshal(map[string]any{
+		"settings": map[string]any{
+			"index.number_of_replicas": 0,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("POST /%s/_clone/%s: marshal body: %w", src, dst, err)
+	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		fmt.Sprintf("%s/%s/_clone/%s", d.Base, src, dst),
-		bytes.NewReader([]byte("{}")))
+		bytes.NewReader(cloneBody))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.HTTP.Do(req)
 	if err != nil {

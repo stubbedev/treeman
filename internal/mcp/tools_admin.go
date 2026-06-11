@@ -423,6 +423,12 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 			store.EvtWorktreeCreateStart, store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError,
 			store.EvtWorktreeDeleteStart, store.EvtWorktreeDeleteEnd,
 			store.EvtWorktreeReapStart, store.EvtWorktreeReapEnd,
+			// A standalone prepare_run (manual or via repair) emits
+			// prepare:* but no worktree:create:end, so a successful
+			// recovery after a prior create error must be read off the
+			// prepare terminal events too — otherwise the stale error
+			// pins the worktree to "failed" forever.
+			store.EvtPrepareEnd, store.EvtPrepareError,
 		},
 		Limit: 1,
 	})
@@ -432,7 +438,7 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 	switch last := rows[0]; last.EventType {
 	case store.EvtWorktreeCreateStart:
 		return "preparing", "up"
-	case store.EvtWorktreeCreateError:
+	case store.EvtWorktreeCreateError, store.EvtPrepareError:
 		if last.Level == store.LevelError {
 			return "error", "failed"
 		}
@@ -440,6 +446,8 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 	case store.EvtWorktreeDeleteStart, store.EvtWorktreeReapStart:
 		return "teardown", "down"
 	default:
+		// worktree:create:end / *:delete:end / *:reap:end / prepare:end
+		// — the most recent lifecycle signal is a success.
 		return "ready", "stable"
 	}
 }

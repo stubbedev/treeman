@@ -83,15 +83,45 @@ func resolveRepo(override string) (string, error) {
 	return gitenv.MainRoot(context.Background(), cwd)
 }
 
-// resolveWorktree expands "" → cwd, then canonicalises to an
-// absolute path. Branch is read from .git/HEAD when available.
+// resolveWorktree maps the MCP `worktree` argument to an absolute
+// worktree path plus its branch. The argument may be:
+//
+//   - ""                                 → the current working directory
+//   - a registered slug / branch / basename → that worktree's path
+//   - a filesystem path                  → canonicalised to absolute
+//
+// A registered name is resolved against the repo inferred from cwd and
+// wins over the raw-path interpretation, so a bare name like "develop"
+// resolves to the tracked worktree instead of being mis-read as
+// <cwd>/develop — a non-existent path that downstream registration
+// would otherwise persist as a phantom worktree row (plus per-branch
+// databases that no teardown reclaims). Branch is read from .git/HEAD.
 func resolveWorktree(path string) (wt, branch string) {
 	if path == "" {
 		path, _ = os.Getwd()
+		wt, _ = filepath.Abs(path)
+		return wt, detectBranch(wt)
 	}
 	wt, _ = filepath.Abs(path)
-	branch = detectBranch(wt)
-	return wt, branch
+	// An existing directory is an explicit path the caller chose —
+	// honour it verbatim.
+	if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
+		return wt, detectBranch(wt)
+	}
+	// Not an on-disk path: try resolving it as a registered worktree
+	// name (slug / branch / basename) against the repo inferred from
+	// cwd. Local-only lookup, so a Background context is fine.
+	if cwd, err := os.Getwd(); err == nil {
+		if repoRoot, err := gitenv.MainRoot(context.Background(), cwd); err == nil {
+			if p, ok := wtpkg.LookupWorktree(context.Background(), repoRoot, path, wtpkg.NoopSink{}); ok {
+				return p, detectBranch(p)
+			}
+		}
+	}
+	// Unresolved name and no such path: return the absolute form. The
+	// ResolveIdentity guard refuses to register a non-worktree path, so
+	// a typo surfaces as a clear error instead of a phantom row.
+	return wt, detectBranch(wt)
 }
 
 func detectBranch(worktree string) string {
