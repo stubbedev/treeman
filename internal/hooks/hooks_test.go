@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -268,10 +269,12 @@ func TestRenderActionNoContainerPassesThrough(t *testing.T) {
 	}
 }
 
-// TestBuildEnvUserPathWins asserts the user's PATH from
-// inheritedEnv is preserved verbatim — no merge with the daemon's
-// PATH, no override. The user's PATH is authoritative because it
-// carries their version-manager shims (asdf, nvm, mise, …).
+// TestBuildEnvUserPathWins asserts the user's PATH from inheritedEnv
+// keeps precedence — its directories lead the merged PATH, so their
+// version-manager shims (asdf, nvm, mise, …) resolve first. The
+// login-shell PATH is merged in after (see shellenv.BaseEnv), so the
+// user's dirs stay at the front while the user's profile bin dirs are
+// still guaranteed present.
 func TestBuildEnvUserPathWins(t *testing.T) {
 	env := buildEnv(map[string]string{"PATH": "/user/shims:/user/bin"}, "/repo", "/wt", "slug", false)
 	pathLine := ""
@@ -280,8 +283,8 @@ func TestBuildEnvUserPathWins(t *testing.T) {
 			pathLine = kv
 		}
 	}
-	if pathLine != "PATH=/user/shims:/user/bin" {
-		t.Errorf("user PATH not preserved: %q", pathLine)
+	if !strings.HasPrefix(pathLine, "PATH=/user/shims:/user/bin") {
+		t.Errorf("user PATH should lead the merged PATH, got: %q", pathLine)
 	}
 }
 

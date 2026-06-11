@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/shellenv"
 	"github.com/stubbedev/treeman/internal/template"
 )
 
@@ -134,24 +135,20 @@ func Run(
 	c := exec.CommandContext(ctx, "sh", "-c", spec.Run)
 	c.Dir = repoRoot
 
-	// Build the subprocess env. User's cached env wins; fall back to
-	// the daemon's PATH only when the user's env has none (rare —
-	// see hooks.buildEnv doc-comment for the rationale).
-	env := make([]string, 0, len(inheritedEnv)+len(renderedEnv)+2)
-	havePath := false
-	for k, v := range inheritedEnv {
-		if k == "PATH" {
-			havePath = true
-		}
-		env = append(env, k+"="+v)
-	}
-	if !havePath {
-		if p := os.Getenv("PATH"); p != "" {
-			env = append(env, "PATH="+p)
-		}
-	}
-	env = append(env, "TREEMAN_TARGET_DB="+targetDB)
+	// Build the subprocess env via the same model as hooks: daemon
+	// floor, overlaid with the user's cached env, with the login-shell
+	// PATH always merged in (see shellenv.BaseEnv). This gives migrate/
+	// seed commands the same env they'd have in the user's own terminal,
+	// and keeps them working when inheritedEnv is empty (an externally-
+	// created worktree finalized by the lifecycle watcher). Rendered env
+	// and TREEMAN_TARGET_DB are layered last so they win.
+	merged := shellenv.BaseEnv(inheritedEnv)
+	merged["TREEMAN_TARGET_DB"] = targetDB
 	for k, v := range renderedEnv {
+		merged[k] = v
+	}
+	env := make([]string, 0, len(merged))
+	for k, v := range merged {
 		env = append(env, k+"="+v)
 	}
 	c.Env = env

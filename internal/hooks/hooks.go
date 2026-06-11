@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +25,7 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/safego"
+	"github.com/stubbedev/treeman/internal/shellenv"
 )
 
 // RunOutcome bundles every group's status.
@@ -424,16 +424,7 @@ func spawnDetached(
 // is still safe (the daemon's env fills the floor), and a user with a
 // rich shell setup still gets their PATH / shims propagated.
 func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug string, isMain bool) []string {
-	merged := make(map[string]string, len(inheritedEnv)+32)
-	for _, kv := range os.Environ() {
-		for i := range len(kv) {
-			if kv[i] == '=' {
-				merged[kv[:i]] = kv[i+1:]
-				break
-			}
-		}
-	}
-	maps.Copy(merged, inheritedEnv)
+	merged := shellenv.BaseEnv(inheritedEnv)
 	merged["TREEMAN_MAIN_ROOT"] = repoRoot
 	merged["TREEMAN_WORKTREE"] = worktreePath
 	merged["TREEMAN_SLUG"] = slug
