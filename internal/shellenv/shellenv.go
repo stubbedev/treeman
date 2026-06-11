@@ -25,12 +25,15 @@
 package shellenv
 
 import (
+	"context"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"os/user"
 	"strings"
 	"sync"
+	"time"
 )
 
 // BaseEnv returns the foundational env map: daemon floor, overlaid with
@@ -39,13 +42,11 @@ import (
 func BaseEnv(inheritedEnv map[string]string) map[string]string {
 	merged := make(map[string]string, len(inheritedEnv)+32)
 	for _, kv := range os.Environ() {
-		if i := strings.IndexByte(kv, '='); i >= 0 {
-			merged[kv[:i]] = kv[i+1:]
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			merged[k] = v
 		}
 	}
-	for k, v := range inheritedEnv {
-		merged[k] = v
-	}
+	maps.Copy(merged, inheritedEnv)
 	merged["PATH"] = MergePaths(merged["PATH"], LoginShellPATH())
 	return merged
 }
@@ -57,7 +58,12 @@ func BaseEnv(inheritedEnv map[string]string) map[string]string {
 // on any failure, in which case MergePaths leaves the existing PATH
 // untouched.
 var LoginShellPATH = sync.OnceValue(func() string {
-	shell := userLoginShell()
+	// Bound the shell probes — an interactive shell with a broken rc
+	// file could otherwise hang the daemon.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	shell := userLoginShell(ctx)
 	if shell == "" {
 		return ""
 	}
@@ -71,7 +77,7 @@ var LoginShellPATH = sync.OnceValue(func() string {
 	// `printf %s "$PATH"` keeps stdout clean of any rc-file noise.
 	for _, flags := range [][]string{{"-ilc"}, {"-lc"}, {"-ic"}, {"-c"}} {
 		args := append(append([]string{}, flags...), `printf %s "$PATH"`)
-		out, err := exec.Command(shell, args...).Output()
+		out, err := exec.CommandContext(ctx, shell, args...).Output()
 		if err != nil {
 			continue
 		}
@@ -87,9 +93,9 @@ var LoginShellPATH = sync.OnceValue(func() string {
 // process. It reads /etc/passwd via `getent` (authoritative even under
 // systemd, where $SHELL is often unset), falling back to $SHELL and
 // then /bin/sh.
-func userLoginShell() string {
+func userLoginShell(ctx context.Context) string {
 	if u, err := user.Current(); err == nil && u.Uid != "" {
-		if out, err := exec.Command("getent", "passwd", u.Uid).Output(); err == nil {
+		if out, err := exec.CommandContext(ctx, "getent", "passwd", u.Uid).Output(); err == nil {
 			// passwd line: name:passwd:uid:gid:gecos:home:shell
 			fields := strings.Split(strings.TrimSpace(string(out)), ":")
 			if len(fields) >= 7 && fields[6] != "" {
@@ -115,13 +121,14 @@ func MergePaths(base, extra string) string {
 	}
 	sep := string(os.PathListSeparator)
 	seen := make(map[string]struct{})
-	for _, d := range strings.Split(base, sep) {
+	for d := range strings.SplitSeq(base, sep) {
 		if d != "" {
 			seen[d] = struct{}{}
 		}
 	}
-	out := base
-	for _, d := range strings.Split(extra, sep) {
+	var out strings.Builder
+	out.WriteString(base)
+	for d := range strings.SplitSeq(extra, sep) {
 		if d == "" {
 			continue
 		}
@@ -129,7 +136,8 @@ func MergePaths(base, extra string) string {
 			continue
 		}
 		seen[d] = struct{}{}
-		out += sep + d
+		out.WriteString(sep)
+		out.WriteString(d)
 	}
-	return out
+	return out.String()
 }

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -144,9 +145,7 @@ func Run(
 	// and TREEMAN_TARGET_DB are layered last so they win.
 	merged := shellenv.BaseEnv(inheritedEnv)
 	merged["TREEMAN_TARGET_DB"] = targetDB
-	for k, v := range renderedEnv {
-		merged[k] = v
-	}
+	maps.Copy(merged, renderedEnv)
 	env := make([]string, 0, len(merged))
 	for k, v := range merged {
 		env = append(env, k+"="+v)
