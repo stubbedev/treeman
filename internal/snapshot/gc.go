@@ -152,7 +152,17 @@ func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvict
 		return err
 	}
 	defer func() { _ = conn.Close() }()
-	return conn.DropSnapshot(ctx, c.TemplateName)
+	if err := conn.DropSnapshot(ctx, c.TemplateName); err != nil {
+		return err
+	}
+	// Reap the template's pre-warmed spare family too — spares are
+	// anonymous engine-side copies with no SQLite row of their own, so
+	// nothing else would ever collect them once the template is gone.
+	// Prefix-reap is a no-op for engines/templates without spares.
+	if _, err := conn.DropMatching(ctx, c.TemplateName+PrewarmSuffix); err != nil {
+		return fmt.Errorf("drop spare family %s%s*: %w", c.TemplateName, PrewarmSuffix, err)
+	}
+	return nil
 }
 
 // SweepByAge drops every cached template whose `last_used_at` is

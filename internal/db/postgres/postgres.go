@@ -294,6 +294,24 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 	return nil
 }
 
+// RenameDatabase renames `from` to `to` via ALTER DATABASE … RENAME TO
+// — a catalog-only metadata operation, constant-time regardless of DB
+// size. Postgres requires zero live connections on `from` (true for
+// idle pre-warmed spares) and fails — never overwrites — when `to`
+// already exists, which is exactly the atomicity the spare-claim path
+// leans on: of two racing claimers, exactly one wins the rename.
+func (d *Driver) RenameDatabase(ctx context.Context, from, to string) error {
+	qfrom, err := ident.QuotePostgres(from)
+	if err != nil {
+		return err
+	}
+	qto, err := ident.QuotePostgres(to)
+	if err != nil {
+		return err
+	}
+	return d.execOutsideTx(ctx, "ALTER DATABASE "+qfrom+" RENAME TO "+qto)
+}
+
 func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
 	qtemplate, err := ident.QuotePostgres(template)
 	if err != nil {

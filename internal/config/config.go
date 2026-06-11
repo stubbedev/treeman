@@ -1338,6 +1338,19 @@ type DatabaseConfig struct {
 	// (max_connections, PG pg_database lock contention, etc.).
 	Fanout uint32 `yaml:"fanout,omitempty" jsonschema:"minimum=0,maximum=64"`
 
+	// Prewarm keeps N spare clones pre-restored from this database's
+	// cached template (Postgres only — other engines have no
+	// constant-time whole-database rename, so the knob is rejected at
+	// config load). A cache-hit prepare claims a spare via
+	// `ALTER DATABASE … RENAME` (milliseconds, size-independent)
+	// instead of paying `CREATE DATABASE … TEMPLATE` per restore; a
+	// detached replenisher then tops the pool back up. Spares are
+	// named `<template>_spare<n>`, survive worktree teardown (they
+	// belong to the template cache, not a worktree), and are dropped
+	// with their template on snapshot eviction. Range 0–16; default
+	// 0 (off). Mutually exclusive with `branch_scoped`.
+	Prewarm uint32 `yaml:"prewarm,omitempty" jsonschema:"minimum=0,maximum=16"`
+
 	// BranchScoped turns this database into a git-for-databases
 	// working copy: the app always talks to one stable ACTIVE
 	// namespace, while treeman keeps a DURABLE per-branch copy of its

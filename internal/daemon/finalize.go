@@ -819,8 +819,18 @@ func detectBranch(worktree string) string {
 func waitForCheckoutSettled(ctx context.Context, st *State, wtRoot string, repoID, wtID int64, timeout time.Duration) error {
 	started := time.Now()
 	deadline := started.Add(timeout)
+	// HEAD's top-level entry list is fixed for the duration of the wait,
+	// so the `git ls-tree` subprocess runs at most once (after .git
+	// appears); every later iteration is stat-only.
+	var (
+		entries     []string
+		haveEntries bool
+	)
 	for {
-		if isCheckoutSettled(ctx, wtRoot) {
+		if !haveEntries {
+			entries, haveEntries = checkoutEntries(ctx, wtRoot)
+		}
+		if haveEntries && entriesPresent(wtRoot, entries) {
 			waited := time.Since(started)
 			level := store.LevelDebug
 			if waited > 50*time.Millisecond {
@@ -844,23 +854,33 @@ func waitForCheckoutSettled(ctx context.Context, st *State, wtRoot string, repoI
 	}
 }
 
-// isCheckoutSettled reports whether every top-level path in HEAD exists
-// on disk inside wtRoot. `git worktree add` writes the entries in tree
-// order, so the LAST one to appear is the latest top-level entry — once
-// every one is present the working tree is materialized.
-func isCheckoutSettled(ctx context.Context, wtRoot string) bool {
+// checkoutEntries lists HEAD's top-level paths for wtRoot. ok is false
+// while .git is still missing (worktree add hasn't started writing);
+// once .git exists the result is cacheable — an unborn HEAD /
+// pre-commit repo yields (nil, true), meaning nothing to wait for.
+func checkoutEntries(ctx context.Context, wtRoot string) (entries []string, ok bool) {
 	if _, err := os.Stat(filepath.Join(wtRoot, ".git")); err != nil {
-		return false
+		return nil, false
 	}
 	out, err := exec.CommandContext(ctx, "git", "-C", wtRoot, "ls-tree", "--name-only", "HEAD").Output()
 	if err != nil {
 		// Unborn HEAD / pre-commit repo: nothing to wait for.
-		return true
+		return nil, true
 	}
 	for name := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		if name == "" {
-			continue
+		if name != "" {
+			entries = append(entries, name)
 		}
+	}
+	return entries, true
+}
+
+// entriesPresent reports whether every top-level path in HEAD exists
+// on disk inside wtRoot. `git worktree add` writes the entries in tree
+// order, so the LAST one to appear is the latest top-level entry — once
+// every one is present the working tree is materialized.
+func entriesPresent(wtRoot string, entries []string) bool {
+	for _, name := range entries {
 		if _, err := os.Stat(filepath.Join(wtRoot, name)); err != nil {
 			return false
 		}

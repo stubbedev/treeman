@@ -80,6 +80,47 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 	return &r, nil
 }
 
+// LookupAndTouchSnapshot returns the snapshot row for `fingerprint` —
+// bumping `last_used_at` + `use_count` in the same statement — or
+// (nil, nil) if no row exists. Collapses the cache-hit path's lookup +
+// touch into one round-trip, and marks the row most-recently-used
+// atomically with reading it, so a concurrent EvictExcess can never
+// observe the gap between the two and reap the template we are about
+// to restore from.
+func (s *Store) LookupAndTouchSnapshot(ctx context.Context, fingerprint string) (*SnapshotRecord, error) {
+	row := s.DB.QueryRowContext(ctx, `
+		UPDATE snapshots
+		SET last_used_at = ?, use_count = use_count + 1
+		WHERE fingerprint = ?
+		RETURNING fingerprint, engine, engine_version, source_db, template_name,
+		          migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
+		          COALESCE(inputs_json,'{}'),
+		          COALESCE(size_bytes,0), created_at, last_used_at, use_count`,
+		nowMillis(), fingerprint)
+	var r SnapshotRecord
+	var lockJSON, inputsJSON string
+	err := row.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
+		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
+		&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lockJSON != "" {
+		if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
+			return nil, fmt.Errorf("decode lockfile_hashes_json for %s: %w", fingerprint, err)
+		}
+	}
+	if inputsJSON != "" && inputsJSON != "{}" {
+		if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
+			return nil, fmt.Errorf("decode inputs_json for %s: %w", fingerprint, err)
+		}
+	}
+	return &r, nil
+}
+
 // RecordSnapshot inserts (or updates on conflict) the snapshots row
 // for a freshly built template. `sizeBytes` may be 0 if unknown.
 //

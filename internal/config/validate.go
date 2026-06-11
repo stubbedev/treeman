@@ -295,5 +295,31 @@ func (d DatabaseConfig) validate(path string) error {
 				"%s: branch_scoped databases do not fan out — remove `fanout` (it only applies to the test-clone path)", path))
 		}
 	}
+
+	errs = append(errs, d.validatePrewarm(path)...)
 	return errors.Join(errs...)
+}
+
+// validatePrewarm guards `databases[].prewarm`. It rides on
+// `ALTER DATABASE … RENAME` — only Postgres offers a constant-time
+// whole-database rename (MySQL's cross-DB RENAME TABLE breaks on
+// triggers; Mongo/Redis/ES have no rename at all). Reject rather than
+// silently ignore so the knob never reads as dead config.
+func (d DatabaseConfig) validatePrewarm(path string) []error {
+	if d.Prewarm == 0 {
+		return nil
+	}
+	var errs []error
+	if fam, ok := engine.Canonical(d.Engine); !ok || fam != engine.FamilyPostgres {
+		errs = append(errs, fmt.Errorf(
+			"%s: prewarm is postgres-only — engine %q has no constant-time database rename to claim a spare with",
+			path, d.Engine))
+	}
+	if d.BranchScoped {
+		errs = append(errs, fmt.Errorf(
+			"%s: branch_scoped and prewarm are mutually exclusive — branch_scoped databases bypass the template cache that spares are cloned from",
+			path,
+		))
+	}
+	return errs
 }

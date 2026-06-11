@@ -97,6 +97,8 @@ that emits it.
 | `snapshots:evict:size` | `store.EvtSnapshotsEvictSize` |
 | `snapshots:purge` | `store.EvtSnapshotsPurge` |
 | `snapshots:purge:end` | `store.EvtSnapshotsPurgeEnd` |
+| `snapshots:prewarm` | `store.EvtSnapshotsPrewarm` |
+| `snapshots:prewarm:claim` | `store.EvtSnapshotsPrewarmClaim` |
 
 ## auto_fetch — fetch + branch maintenance
 

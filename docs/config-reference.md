@@ -171,6 +171,7 @@ databases:
         name_template: '...'
       key_prefix: '...'
       fanout: 0
+      prewarm: 0
       branch_scoped: false
 # Lifecycle hooks fired around worktree create/delete/checkout and
 hooks:
@@ -671,6 +672,22 @@ Range 0–64. Raise only if the server is provisioned
 (max_connections, PG pg_database lock contention, etc.).
 
 _min: 0 · max: 64_
+
+#### `prewarm` *(integer)*
+
+Prewarm keeps N spare clones pre-restored from this database's
+cached template (Postgres only — other engines have no
+constant-time whole-database rename, so the knob is rejected at
+config load). A cache-hit prepare claims a spare via
+`ALTER DATABASE … RENAME` (milliseconds, size-independent)
+instead of paying `CREATE DATABASE … TEMPLATE` per restore; a
+detached replenisher then tops the pool back up. Spares are
+named `<template>_spare<n>`, survive worktree teardown (they
+belong to the template cache, not a worktree), and are dropped
+with their template on snapshot eviction. Range 0–16; default
+0 (off). Mutually exclusive with `branch_scoped`.
+
+_min: 0 · max: 16_
 
 #### `branch_scoped` *(boolean)*
 

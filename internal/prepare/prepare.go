@@ -605,6 +605,10 @@ func RunFiltered(
 	if runid.From(ctx) == "" {
 		ctx = runid.With(ctx, runid.New())
 	}
+	// Share engine version / max_connections probes across the parallel
+	// per-database goroutines below — N databases on one engine pay one
+	// round-trip instead of N.
+	ctx = withProbeCache(ctx)
 	tplCtx := template.FromSlug(sl)
 
 	results := make([]Outcome, len(cfg.Databases))
@@ -696,8 +700,11 @@ func prepareMySQL(
 	}
 	defer func() { _ = drv.Close() }()
 
-	version, _ := drv.EngineVersion(ctx)
-	maxConns, _ := drv.MaxConnections(ctx)
+	// Probe keys need only the engine family: a config carries at most
+	// one connection per engine, so within one run the family IS the
+	// server identity.
+	version, _ := cachedProbe(ctx, "mysql-version", func() (string, error) { return drv.EngineVersion(ctx) })
+	maxConns, _ := cachedProbe(ctx, "mysql-maxconns", func() (int, error) { return drv.MaxConnections(ctx) })
 
 	// branch_scoped databases bypass the fingerprint template cache
 	// entirely — their content is per-branch live data swapped through
@@ -931,17 +938,17 @@ func cacheHitGeneric(
 	maxConns int,
 	started time.Time,
 ) (Outcome, bool, error) {
-	// A LookupSnapshot error is treated as a cache miss (fall through to
-	// cold build), matching the original `err == nil && rec != nil` guard.
-	rec, _ := st.LookupSnapshot(ctx, key.Fingerprint())
+	// A lookup error is treated as a cache miss (fall through to cold
+	// build), matching the original `err == nil && rec != nil` guard.
+	// The lookup also touches the row in the same statement — BEFORE the
+	// existence probe — so a concurrent EvictExcess sees this template
+	// as most-recently-used and won't pick it as the LRU victim while
+	// we're about to use it.
+	rec, _ := st.LookupAndTouchSnapshot(ctx, key.Fingerprint())
 	if rec == nil {
 		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissNoRow)
 		return Outcome{}, false, nil
 	}
-	// Touch the row BEFORE the existence probe so a concurrent
-	// EvictExcess sees this template as most-recently-used and won't
-	// pick it as the LRU victim while we're about to use it.
-	_ = st.TouchSnapshot(ctx, key.Fingerprint())
 	alive, _ := exists(ctx, rec.TemplateName)
 	if !alive {
 		// Row stale (template was dropped externally). Wipe so the
@@ -1827,7 +1834,7 @@ func preparePostgres(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
-) (Outcome, error) {
+) (out Outcome, err error) {
 	started := time.Now()
 	sourceDB, err := template.Render(d.NameTemplate, tplCtx)
 	if err != nil {
@@ -1844,8 +1851,8 @@ func preparePostgres(
 	}
 	defer func() { _ = drv.Close() }()
 
-	version, _ := drv.EngineVersion(ctx)
-	maxConns, _ := drv.MaxConnections(ctx)
+	version, _ := cachedProbe(ctx, "postgres-version", func() (string, error) { return drv.EngineVersion(ctx) })
+	maxConns, _ := cachedProbe(ctx, "postgres-maxconns", func() (int, error) { return drv.MaxConnections(ctx) })
 
 	if d.BranchScoped {
 		return runBranchScoped(ctx, branchScopedArgs{
@@ -1872,6 +1879,14 @@ func preparePostgres(
 	unpinTemplate := snapshot.Pin(key.Fingerprint())
 	defer unpinTemplate()
 
+	// Top the spare pool back up after ANY successful exit that leaves
+	// this template in place — cache hit (spares were claimed),
+	// incremental/rollback/dump-only and cold builds (fresh template,
+	// empty pool). Detached: the user-visible prepare never waits on it.
+	defer func() {
+		maybeSpawnPrewarm(cfg, st, repoID, worktreeID, d, key.Fingerprint(), templateName, out, err)
+	}()
+
 	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareStart,
 		fmt.Sprintf("engine=postgres source=%s template=%s", sourceDB, templateName),
 		repoID, worktreeID, "", 0, map[string]string{
@@ -1881,11 +1896,15 @@ func preparePostgres(
 			"fingerprint": key.Fingerprint(),
 		})
 
-	// Cache hit? Fingerprint covers every declared input.
+	// Cache hit? Fingerprint covers every declared input. With a spare
+	// pool configured, restores (source + fanout clones alike) first try
+	// to claim a pre-warmed spare via rename before paying a full
+	// `CREATE DATABASE … TEMPLATE`.
+	restore := postgresRestoreFor(drv, st, repoID, worktreeID, d)
 	out, done, err := cacheHitGeneric(
 		ctx,
 		drv.DatabaseExists,
-		drv.SnapshotRestore,
+		restore,
 		d,
 		tplCtx,
 		worktreePath,
@@ -2118,7 +2137,7 @@ func prepareMongo(
 	}
 	defer func() { _ = drv.Close(ctx) }()
 
-	version, _ := drv.EngineVersion(ctx)
+	version, _ := cachedProbe(ctx, "mongo-version", func() (string, error) { return drv.EngineVersion(ctx) })
 
 	if d.BranchScoped {
 		return runBranchScoped(ctx, branchScopedArgs{
@@ -2383,7 +2402,7 @@ func prepareRedisPrefix(
 	if err != nil {
 		return Outcome{}, fmt.Errorf("render key_prefix: %w", err)
 	}
-	version, _ := drv.EngineVersion(ctx)
+	version, _ := cachedProbe(ctx, "redis-version", func() (string, error) { return drv.EngineVersion(ctx) })
 	key := computeSnapshotKey(ctx, st, d, worktreePath, version)
 	templatePrefix := "_tm:" + key.Fingerprint()[:16] + ":"
 
@@ -2616,7 +2635,7 @@ func prepareES(
 		return Outcome{}, err
 	}
 
-	version, _ := drv.EngineVersion(ctx)
+	version, _ := cachedProbe(ctx, "es-version", func() (string, error) { return drv.EngineVersion(ctx) })
 	if d.BranchScoped {
 		return runBranchScoped(ctx, branchScopedArgs{
 			cfg:          cfg,

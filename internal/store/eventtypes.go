@@ -71,6 +71,8 @@ const (
 	EvtSnapshotsEvictSize     = "snapshots:evict:size"
 	EvtSnapshotsPurge         = "snapshots:purge"
 	EvtSnapshotsPurgeEnd      = "snapshots:purge:end"
+	EvtSnapshotsPrewarm       = "snapshots:prewarm"
+	EvtSnapshotsPrewarmClaim  = "snapshots:prewarm:claim"
 
 	// auto_fetch — fetch + branch maintenance
 	EvtFetchPull          = "fetch:pull"
