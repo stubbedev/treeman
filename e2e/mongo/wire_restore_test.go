@@ -79,6 +79,7 @@ func TestWireRestoreFidelityAndAtomicity(t *testing.T) {
 	if !contains(names, "audit_log") {
 		t.Errorf("empty prelude collection audit_log missing; have %v", names)
 	}
+	assertCapped(t, ctx, target, "audit_log")
 	for _, c := range names {
 		if len(c) >= 8 && c[:8] == "_tmload_" {
 			t.Errorf("staging junk survived successful restore: %s", c)
@@ -141,7 +142,7 @@ func buildArchive(t *testing.T, gzipped bool) []byte {
 	})
 	doc(bson.M{
 		"db": "srcdb", "collection": "audit_log",
-		"metadata": `{"indexes":[{"v":2,"key":{"_id":1},"name":"_id_"}],"type":"collection"}`,
+		"metadata": `{"indexes":[{"v":2,"key":{"_id":1},"name":"_id_"}],"options":{"capped":true,"size":4096},"type":"collection"}`,
 	})
 	w32(0xFFFFFFFF) // end of prelude
 	doc(bson.M{"db": "srcdb", "collection": "users"})
@@ -174,6 +175,32 @@ func assertIndexExists(t *testing.T, ctx context.Context, coll *mongo.Collection
 		}
 	}
 	t.Errorf("index %s missing on %s", name, coll.Name())
+}
+
+// assertCapped verifies a collection's options replayed: listCollections
+// must report capped:true for it.
+func assertCapped(t *testing.T, ctx context.Context, db *mongo.Database, coll string) {
+	t.Helper()
+	cur, err := db.ListCollections(ctx, bson.D{{Key: "name", Value: coll}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cur.Close(ctx) }()
+	for cur.Next(ctx) {
+		var info struct {
+			Options struct {
+				Capped bool `bson:"capped"`
+			} `bson:"options"`
+		}
+		if err := cur.Decode(&info); err != nil {
+			t.Fatal(err)
+		}
+		if !info.Options.Capped {
+			t.Errorf("%s: capped option not replayed", coll)
+		}
+		return
+	}
+	t.Errorf("%s not found in listCollections", coll)
 }
 
 func contains(ss []string, want string) bool {

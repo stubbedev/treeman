@@ -202,7 +202,11 @@ func restoreViaDriver(ctx context.Context, conn *config.MongoConn, targetDB, sou
 		return db
 	}
 
-	st := &wireStager{client: client, staged: map[string]nsParts{}}
+	st := &wireStager{
+		client: client,
+		staged: map[string]nsParts{},
+		opts:   collectCollOptions(metas, remap),
+	}
 	if err := st.run(ctx, r, metas, remap); err != nil {
 		st.cleanup(ctx)
 		return err
@@ -212,7 +216,7 @@ func restoreViaDriver(ctx context.Context, conn *config.MongoConn, targetDB, sou
 		return err
 	}
 
-	slog.Info("mongo restore: wire-protocol fallback used (indexes replayed; collection options/views not)",
+	slog.Info("mongo restore: wire-protocol fallback used (indexes + collection options replayed; views/timeseries not)",
 		"path", dumpPath, "target_db", targetDB,
 		"hint", "install mongorestore on PATH or set ContainerRef on connections.mongodb for full fidelity")
 	return nil
@@ -229,6 +233,11 @@ type wireStager struct {
 	// staged maps the final "db.coll" of every live staging collection
 	// to its split pieces.
 	staged map[string]nsParts
+	// opts carries each namespace's collection options (capped,
+	// validators, collation, …) parsed from the prelude metadata,
+	// keyed by final "db.coll". Applied at staging-create time so the
+	// promoted collection keeps them (rename preserves options).
+	opts   map[string]bson.D
 	batch  []any
 	curDB  string
 	curCol string
@@ -269,8 +278,10 @@ func (s *wireStager) run(ctx context.Context, r *archiveReader, metas []collMeta
 		if err := s.stage(ctx, db, m.Collection); err != nil {
 			return err
 		}
-		if cerr := s.client.Database(db).CreateCollection(ctx, restoreStagePrefix+m.Collection); cerr != nil {
-			return fmt.Errorf("create empty staging %s.%s%s: %w", db, restoreStagePrefix, m.Collection, cerr)
+		if !s.stagedWithOptions(db, m.Collection) {
+			if cerr := s.client.Database(db).CreateCollection(ctx, restoreStagePrefix+m.Collection); cerr != nil {
+				return fmt.Errorf("create empty staging %s.%s%s: %w", db, restoreStagePrefix, m.Collection, cerr)
+			}
 		}
 	}
 	return s.promote(ctx)
@@ -309,8 +320,13 @@ func (s *wireStager) flush(ctx context.Context) error {
 	return nil
 }
 
-// stage registers a namespace's staging collection on first sight,
-// clearing any leftover from a previously crashed restore.
+// stage registers a namespace's staging collection on first sight:
+// clears any leftover from a previously crashed restore, then — when
+// the prelude carried collection options for this namespace — creates
+// the staging collection explicitly with those options via a raw
+// `create` command (listCollections options ARE create options, so
+// they pass through verbatim). Optionless collections materialize
+// lazily on first insert, as before.
 func (s *wireStager) stage(ctx context.Context, db, coll string) error {
 	key := db + "." + coll
 	if _, ok := s.staged[key]; ok {
@@ -319,8 +335,21 @@ func (s *wireStager) stage(ctx context.Context, db, coll string) error {
 	if err := s.client.Database(db).Collection(restoreStagePrefix + coll).Drop(ctx); err != nil {
 		return fmt.Errorf("drop stale staging %s.%s%s: %w", db, restoreStagePrefix, coll, err)
 	}
+	if o := s.opts[key]; len(o) > 0 {
+		cmd := append(bson.D{{Key: "create", Value: restoreStagePrefix + coll}}, o...)
+		if err := s.client.Database(db).RunCommand(ctx, cmd).Err(); err != nil {
+			return fmt.Errorf("create staging %s.%s%s with options: %w", db, restoreStagePrefix, coll, err)
+		}
+	}
 	s.staged[key] = nsParts{db: db, coll: coll}
 	return nil
+}
+
+// stagedWithOptions reports whether stage() already created this
+// namespace's staging collection explicitly (options path) — callers
+// materializing EMPTY collections skip their plain create in that case.
+func (s *wireStager) stagedWithOptions(db, coll string) bool {
+	return len(s.opts[db+"."+coll]) > 0
 }
 
 // promote renames every staging collection onto its final name —
@@ -381,6 +410,30 @@ func replayIndexes(ctx context.Context, client *mongo.Client, metas []collMeta, 
 		}
 	}
 	return nil
+}
+
+// collectCollOptions parses every prelude entry's `options` blob into
+// a final-namespace-keyed map. Unparseable metadata is skipped (the
+// data still restores; same policy as index replay).
+func collectCollOptions(metas []collMeta, remap func(string) string) map[string]bson.D {
+	out := map[string]bson.D{}
+	for _, m := range metas {
+		if m.skip() || m.Metadata == "" {
+			continue
+		}
+		var parsed struct {
+			Options bson.D `bson:"options"`
+		}
+		if err := bson.UnmarshalExtJSON([]byte(m.Metadata), false, &parsed); err != nil {
+			slog.Warn("mongo restore: collection metadata unparseable; options skipped",
+				"ns", m.DB+"."+m.Collection, "err", err)
+			continue
+		}
+		if len(parsed.Options) > 0 {
+			out[remap(m.DB)+"."+m.Collection] = parsed.Options
+		}
+	}
+	return out
 }
 
 // parseIndexSpecs extracts the index documents from one collection's

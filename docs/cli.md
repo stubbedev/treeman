@@ -514,6 +514,14 @@ ask the daemon to re-read config + restart watchers (no process restart)
 |---|---|
 | `--json` |  |
 
+### `treeman daemon state`
+
+live runtime snapshot — watchers, in-flight finalizes/teardowns, auto-fetch backoffs (CLI twin of the MCP daemon_state tool)
+
+| Flag | Usage |
+|---|---|
+| `--json` |  |
+
 ### `treeman daemon install`
 
 ### `treeman daemon uninstall`

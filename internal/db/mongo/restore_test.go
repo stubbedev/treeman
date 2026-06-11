@@ -273,3 +273,37 @@ func TestReadHeaderParsesCollectionMetadata(t *testing.T) {
 		t.Fatalf("body misaligned after metadata parse: ns=%q terminate=%v err=%v", ns, terminate, err)
 	}
 }
+
+// TestCollectCollOptions: the options blob comes back keyed by the
+// REMAPPED namespace; optionless/unparseable/view entries are absent.
+func TestCollectCollOptions(t *testing.T) {
+	metas := []collMeta{
+		{DB: "src", Collection: "logs", Metadata: `{"options":{"capped":true,"size":4096},"type":"collection"}`},
+		{DB: "src", Collection: "plain", Metadata: `{"options":{},"type":"collection"}`},
+		{DB: "src", Collection: "v", Metadata: `{"options":{"viewOn":"logs"},"type":"view"}`},
+		{DB: "src", Collection: "broken", Metadata: `{nope`},
+	}
+	remap := func(db string) string {
+		if db == "src" {
+			return "dst"
+		}
+		return db
+	}
+	out := collectCollOptions(metas, remap)
+	if len(out) != 1 {
+		t.Fatalf("got %d entries, want 1: %v", len(out), out)
+	}
+	opts, ok := out["dst.logs"]
+	if !ok {
+		t.Fatalf("capped collection missing under remapped ns: %v", out)
+	}
+	found := false
+	for _, e := range opts {
+		if e.Key == "capped" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("capped option not preserved: %v", opts)
+	}
+}

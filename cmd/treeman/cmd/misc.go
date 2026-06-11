@@ -197,6 +197,10 @@ func submitPlan(ctx context.Context, req rpc.Request) rpc.Response {
 	if resp, err := rpc.Call(ctx, req); err == nil {
 		return resp
 	}
+	// Say so BEFORE running: without this line a task the user expects
+	// to queue detached silently blocks the terminal for the whole
+	// prepare instead.
+	PrintWarn("daemon unreachable — running in-process (blocks until done; `treeman daemon start` restores detached dispatch)")
 	resp, err := daemon.RunPlanInProcess(ctx, *req.RunPlan)
 	if err != nil {
 		return rpc.Response{Kind: rpc.KindError, Message: err.Error()}
@@ -798,6 +802,12 @@ func DaemonCmd() *cli.Command {
 				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json"}},
 				Action: daemonStatus,
 			},
+			{
+				Name:   "state",
+				Usage:  "live runtime snapshot — watchers, in-flight finalizes/teardowns, auto-fetch backoffs (CLI twin of the MCP daemon_state tool)",
+				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json"}},
+				Action: daemonState,
+			},
 			{Name: "install", Action: daemonInstall},
 			{
 				Name: "uninstall",
@@ -833,6 +843,64 @@ func daemonReload(ctx context.Context, c *cli.Command) error {
 		PrintOK("config reload requested (all repos)")
 	} else {
 		PrintOK("config reload requested (%s)", repoPath)
+	}
+	return nil
+}
+
+// daemonState — `treeman daemon state` prints the daemon's live
+// runtime snapshot. Answers "is a finalize already running for this
+// worktree / why isn't this repo auto-fetching?" without reaching for
+// the MCP server.
+func daemonState(ctx context.Context, c *cli.Command) error {
+	resp, err := rpc.Call(ctx, rpc.Request{Method: rpc.MethodDaemonState})
+	if err != nil {
+		return fmt.Errorf("daemon not reachable: %w (start it with `treeman daemon start`)", err)
+	}
+	if resp.Kind == rpc.KindError {
+		return fmt.Errorf("daemon: %s", resp.Message)
+	}
+	if c.Bool("json") {
+		return jsonStream(resp.State)
+	}
+	st := resp.State
+	if st == nil {
+		PrintInfo("daemon returned no state snapshot")
+		return nil
+	}
+	_, _ = fmt.Fprintf(ui.Out, "%s %d repo watcher(s)\n", ui.Bold("watchers:"), st.WatcherCount)
+	for _, w := range st.Watchers {
+		_, _ = fmt.Fprintf(ui.Out, "  %s (%d worktree(s))\n", w.Repo, w.WorktreeCount)
+	}
+	if len(st.WorktreeWatchers) > 0 {
+		_, _ = fmt.Fprintf(ui.Out, "%s %s\n", ui.Bold("worktree watchers:"), strings.Join(st.WorktreeWatchers, ", "))
+	}
+	if len(st.LifecycleWatchers) > 0 {
+		_, _ = fmt.Fprintf(ui.Out, "%s %s\n", ui.Bold("lifecycle watchers:"), strings.Join(st.LifecycleWatchers, ", "))
+	}
+	if len(st.InFlightFinalizes) > 0 {
+		_, _ = fmt.Fprintln(ui.Out, ui.Bold("in-flight finalizes:"))
+		for _, f := range st.InFlightFinalizes {
+			_, _ = fmt.Fprintf(ui.Out, "  %s (running %ds)\n", f.WorktreePath, f.AgeSeconds)
+		}
+	}
+	if len(st.InFlightTeardowns) > 0 {
+		_, _ = fmt.Fprintf(ui.Out, "%s %s\n", ui.Bold("in-flight teardowns:"), strings.Join(st.InFlightTeardowns, ", "))
+	}
+	if len(st.SyncBackoffs) > 0 {
+		_, _ = fmt.Fprintln(ui.Out, ui.Bold("auto-fetch backoffs:"))
+		for _, b := range st.SyncBackoffs {
+			next := "eligible now"
+			if b.NextRetryUnix > 0 {
+				next = "next retry " + time.Unix(b.NextRetryUnix, 0).Format(time.TimeOnly)
+			}
+			_, _ = fmt.Fprintf(ui.Out, "  %s: %d consecutive failure(s), %s\n", b.RepoPath, b.ConsecFailures, next)
+		}
+	}
+	for repo, reason := range st.SyncLastSkips {
+		_, _ = fmt.Fprintf(ui.Out, "%s %s: %s\n", ui.Bold("last fetch skip:"), repo, reason)
+	}
+	if st.WatcherCount == 0 && len(st.InFlightFinalizes) == 0 && len(st.InFlightTeardowns) == 0 {
+		PrintInfo("daemon idle — no watchers or in-flight work")
 	}
 	return nil
 }
