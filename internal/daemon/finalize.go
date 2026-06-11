@@ -68,11 +68,19 @@ func FinalizeWorktree(
 		err = nil
 	}()
 
-	// Derive a cancellable ctx that TeardownWorktree can preempt via
-	// CancelFinalize. ctx.Err() is consulted at each phase boundary
-	// below so a concurrent `wt delete` preempts before prepare.Run
-	// creates databases the cleanup would then have to chase.
-	ctx, cancel := context.WithCancel(ctx)
+	// Derive a cancellable, DEADLINE-bound ctx. Two jobs:
+	//   1. TeardownWorktree preempts via CancelFinalize (the cancel func is
+	//      registered with MarkFinalizeInFlight below). ctx.Err() is consulted
+	//      at each phase boundary so a concurrent `wt delete` preempts before
+	//      prepare.Run creates databases the cleanup would then have to chase.
+	//   2. The finalizeTimeout deadline self-cancels a wedged run instead of
+	//      relying solely on the external FinalizeWatchdogLoop — a prepare that
+	//      hangs inside an engine/network op stops pinning its slot (and the
+	//      machine) the moment a phase boundary observes the expired ctx, plus
+	//      every engine HTTP call inherits the deadline. The watchdog stays as
+	//      the backstop that emits the error event + recovery if a phase never
+	//      reaches a boundary.
+	ctx, cancel := context.WithTimeout(ctx, finalizeTimeout)
 	defer cancel()
 
 	// Pin the caller's shell PATH onto ctx for every git subprocess

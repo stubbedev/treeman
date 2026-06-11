@@ -11,14 +11,21 @@ import (
 )
 
 // finalizeTimeout caps how long any single FinalizeWorktree run is
-// allowed to occupy its slot before the watchdog cancels it and
-// emits a worktree:create:error error event. 30 minutes is comfortably above
-// every realistic cold-build we've measured (largest production
-// schema with seed data: ~12 min) while still catching the silent-
-// stall class from issue #9 within the same workday. Not yet
-// user-configurable — promote to DaemonConfig if a legitimate need
-// arises.
-const finalizeTimeout = 30 * time.Minute
+// allowed to occupy its slot before it is cancelled and a
+// worktree:create:error event is emitted. It is enforced twice: the
+// finalize pipeline derives its ctx with context.WithTimeout(_,
+// finalizeTimeout) so a wedged run self-cancels at the next phase
+// boundary, and FinalizeWatchdogLoop below is the backstop that emits
+// the error event + recovery for a phase that never reaches a boundary.
+//
+// 15 minutes sits just above the largest realistic cold-build we've
+// measured (largest production schema with seed data: ~12 min) so a
+// legitimate slow build is never aborted, while halving the previous
+// 30-min ceiling: a silent stall (the issue-#9 / ES-meltdown class)
+// stops pinning a slot — and the machine — within ~15 min + one
+// watchdog interval instead of 30. Not yet user-configurable — promote
+// to DaemonConfig if a schema legitimately needs longer.
+const finalizeTimeout = 15 * time.Minute
 
 // watchdogInterval bounds detection latency. A finalize that wedges
 // at minute 25 (5min under the cap) is detected within 2 minutes —

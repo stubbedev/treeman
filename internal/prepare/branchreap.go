@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -172,6 +173,132 @@ func ReapOrphanDurables(ctx context.Context, cfg *config.Config, st *store.Store
 				})
 		}
 		closeEng()
+	}
+}
+
+// esDurableMarker is the index-name prefix branchEngine.durable emits for the
+// elasticsearch scope ("tmbs_<16hex>_"). Disjoint from the snapshot-cache
+// marker ("tm_"), the active clone prefix ("kho_"), and base data
+// ("client_*"/"dev_*"), so a prefix scan for it can only ever match treeman ES
+// branch durables.
+const esDurableMarker = "tmbs_"
+
+// hasESBranchScoped reports whether the repo configures a branch_scoped
+// elasticsearch database — the only case the ES orphan reconcile applies to.
+func hasESBranchScoped(cfg *config.Config) bool {
+	for _, d := range cfg.Databases {
+		if !d.BranchScoped {
+			continue
+		}
+		if _, eng, ok := branchScopeFor(d.Engine); ok && eng == "elasticsearch" {
+			return true
+		}
+	}
+	return false
+}
+
+// esDurablePrefix extracts the durable family prefix "tmbs_<16hex>_" from an ES
+// index name, mirroring branchEngine.durable for the prefix/elasticsearch
+// scope. ok=false for any name that isn't a treeman ES durable — snapshot-cache
+// (`tm_`), active clones (`kho_`), and base data (`client_*`/`dev_*`) all fall
+// through untouched, so the reconcile can never reach live or cached data.
+func esDurablePrefix(index string) (string, bool) {
+	rest, ok := strings.CutPrefix(index, esDurableMarker)
+	if !ok {
+		return "", false
+	}
+	// bsHash emits exactly 16 lowercase-hex chars, followed by the trailing '_'.
+	if len(rest) < 17 || rest[16] != '_' {
+		return "", false
+	}
+	for i := range 16 {
+		c := rest[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", false
+		}
+	}
+	return esDurableMarker + rest[:16] + "_", true
+}
+
+// ReapUntrackedESDurables drops branch_scoped Elasticsearch durable index
+// families (`tmbs_<hash>_*`) that NO repo's branch_durables row references. It
+// is the catch-all the two registry-driven reapers structurally can't be: both
+// ReapBranchDurables and ReapOrphanDurables key off the branch_durables table,
+// so a durable with no row at all is invisible to them. Those untracked
+// durables come from durables captured before the branch_durables table existed
+// (migration 0012), a Capture that wrote the index but died before
+// RecordBranchDurable, or a DropDurable that failed after the row was deleted.
+// Left unbounded they accumulate as ES shards until the single-node dev cluster
+// can't recover them on restart (the 2625-index meltdown).
+//
+// Safe by construction: the namespace a live worktree connects to is
+// `kho_<slug>_*`, never `tmbs_*`; the keep-set is built across ALL repos so a
+// shared cluster never has one repo's sweep drop another's durable; and on any
+// registry- or list-read error it declines to drop (same posture as
+// ReapOrphanDurables on a git error). The caller skips it while a finalize is
+// in flight so it can't race a Capture that hasn't yet recorded its row.
+func ReapUntrackedESDurables(ctx context.Context, cfg *config.Config, st *store.Store, repoID int64) {
+	if !hasESBranchScoped(cfg) {
+		return
+	}
+	be, closeEng, err := connectBranchEngine(ctx, cfg, "elasticsearch", nil)
+	if err != nil {
+		slog.Warn("reap untracked es durables: connect engine", "err", err)
+		closeEng()
+		return
+	}
+	defer closeEng()
+	if be == nil {
+		return
+	}
+	esa, ok := be.drv.(esNS)
+	if !ok {
+		return
+	}
+
+	keep, err := st.ListAllDurableNamesByEngine(ctx, "elasticsearch")
+	if err != nil {
+		// Couldn't read the registry — declining to drop is the safe default;
+		// the next sweep retries. Dropping on an unreadable keep-set would risk
+		// wiping every durable.
+		slog.Warn("reap untracked es durables: list registry", "err", err)
+		return
+	}
+	indices, err := esa.d.ListMatching(ctx, esDurableMarker)
+	if err != nil {
+		slog.Warn("reap untracked es durables: list indices", "err", err)
+		return
+	}
+
+	orphans := map[string]struct{}{}
+	for _, idx := range indices {
+		prefix, ok := esDurablePrefix(idx)
+		if !ok {
+			continue
+		}
+		if _, referenced := keep[prefix]; referenced {
+			continue
+		}
+		orphans[prefix] = struct{}{}
+	}
+	for prefix := range orphans {
+		dropped, derr := esa.d.DropMatching(ctx, prefix)
+		if derr != nil {
+			slog.Warn("reap untracked es durables: drop", "prefix", prefix, "err", derr)
+			continue
+		}
+		if len(dropped) == 0 {
+			continue
+		}
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtBranchReap,
+			fmt.Sprintf("elasticsearch: dropped %d untracked durable index(es) under %q (no branch_durables row in any repo)",
+				len(dropped), prefix),
+			repoID, 0, "", 0, map[string]string{
+				"engine":  "elasticsearch",
+				"durable": prefix,
+				"dropped": strconv.Itoa(len(dropped)),
+				"reason":  "orphan_untracked",
+			})
 	}
 }
 

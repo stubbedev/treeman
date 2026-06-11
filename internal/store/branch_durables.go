@@ -65,6 +65,33 @@ func (s *Store) DeleteBranchDurable(ctx context.Context, repoID int64, durableNa
 	return err
 }
 
+// ListAllDurableNamesByEngine returns the set of durable_name values across
+// EVERY repo for the given engine (canonicalised to match the write-side
+// convention). The ES orphan reconcile uses it as its keep-set without per-repo
+// scoping: a treeman ES cluster can be shared by several repos, and an index
+// family is an orphan only if NO repo tracks it — so building the keep-set
+// repo-wide is what stops one repo's sweep from dropping another repo's durable.
+func (s *Store) ListAllDurableNamesByEngine(ctx context.Context, eng string) (map[string]struct{}, error) {
+	if fam, ok := engine.Canonical(eng); ok {
+		eng = string(fam)
+	}
+	out := map[string]struct{}{}
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT durable_name FROM branch_durables WHERE engine = ?`, eng)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out[n] = struct{}{}
+	}
+	return out, rows.Err()
+}
+
 // ListBranchDurables returns every tracked durable for a repo, ordered by
 // branch then durable_name for stable output. Empty (not nil) when none, so
 // callers can range without a nil check. repoID 0 returns empty (guards

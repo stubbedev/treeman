@@ -236,6 +236,18 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 	// missed it). ReapBranchDurables above only covers branches THIS tick
 	// pruned via a live worktree; this reclaims the rest by recorded name.
 	prepare.ReapOrphanDurables(ctx, cfg, st.Store, r.ID, r.Path)
+
+	// Deeper catch-all for Elasticsearch: drop ES durable index families
+	// (`tmbs_*`) that NO repo's registry references at all — durables that
+	// predate the branch_durables table or were left by a Capture that died
+	// before recording its row. Both reapers above are registry-driven and
+	// can't see those; left unbounded they pile up as ES shards until the
+	// single-node dev cluster can't recover. Skip while ANY finalize is in
+	// flight so the sweep can't race a Capture that hasn't recorded its row yet
+	// (it runs every tick — next one reclaims them).
+	if len(st.SnapshotInFlightFinalizes()) == 0 {
+		prepare.ReapUntrackedESDurables(ctx, cfg, st.Store, r.ID)
+	}
 	return nil
 }
 
