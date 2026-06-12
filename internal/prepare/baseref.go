@@ -214,7 +214,9 @@ func mainWorktreeBaseDB(
 	// seed a branch from an unrelated DB.
 	mb, err := gitcmd.String(ctx, repoRoot, "merge-base", newBranch, mainBranch)
 	if err != nil || strings.TrimSpace(mb) == "" {
-		return "", false, nil
+		// `merge-base` exits non-zero for unrelated branches; treat that (and
+		// an empty result) as "no shared history", not a propagatable error.
+		return "", false, nil //nolint:nilerr // unrelated branch is not an error here
 	}
 	// Prefer the enrolled main worktree row's path; fall back to the repo
 	// root checkout for repos that don't enroll a main worktree.
