@@ -79,7 +79,7 @@ the opt-in. Use --backend to probe a specific sender.`,
 			if err := sender.Send(ctx, n); err != nil {
 				return fmt.Errorf("send test notification: %w", err)
 			}
-			fmt.Printf("sent a test notification via %s\n", displayBackend(backend))
+			PrintOK("sent a test notification via %s", displayBackend(backend))
 			return nil
 		},
 	}

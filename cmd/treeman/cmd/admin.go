@@ -33,6 +33,7 @@ func RegistryCmd() *cli.Command {
 		Name:  "registry",
 		Usage: "SQLite worktree-registry maintenance",
 		Commands: []*cli.Command{
+			RegistryListCmd(),
 			{
 				Name:  "repair",
 				Usage: "reconcile the SQLite registry with `git worktree list` (register drift / mark missing)",

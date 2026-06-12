@@ -88,7 +88,8 @@ func syncStatusAction(ctx context.Context, target string, jsonOut bool) error {
 
 func renderSyncStatuses(rows []rpc.SyncRepoStatus) {
 	if len(rows) == 0 {
-		ui.Hint("no registered repos")
+		ui.Info("no registered repos")
+		ui.Hint("%s", "enroll one by running `treeman init` then `treeman prepare` inside a repo")
 		return
 	}
 	for _, r := range rows {
@@ -98,20 +99,21 @@ func renderSyncStatuses(rows []rpc.SyncRepoStatus) {
 		}
 		retry := ""
 		if r.NextRetryUnix > 0 {
-			retry = fmt.Sprintf(" backoff_until=%s (failures=%d)",
-				time.Unix(r.NextRetryUnix, 0).Format(time.RFC3339), r.ConsecFailures)
+			retry = " " + ui.Yellow(fmt.Sprintf("backoff_until=%s (failures=%d)",
+				time.Unix(r.NextRetryUnix, 0).Format(time.RFC3339), r.ConsecFailures))
 		}
-		fmt.Printf("%s  mode=%s last_fetch=%s%s\n", ui.Bold(r.RepoPath), r.Mode, last, retry)
+		ui.Plain("%s  %s%s", ui.Bold(r.RepoPath),
+			ui.Dim(fmt.Sprintf("mode=%s last_fetch=%s", r.Mode, last)), retry)
 		for _, w := range r.Worktrees {
 			tag := ""
 			switch {
 			case w.LastSkipReason != "":
-				tag = " skip=" + w.LastSkipReason
+				tag = " " + ui.Yellow("skip="+w.LastSkipReason)
 			case w.Ahead == 0 && w.Behind == 0 && !w.Dirty:
-				tag = " in-sync"
+				tag = " " + ui.Green("in-sync")
 			}
-			fmt.Printf("    %s  branch=%s ahead=%d behind=%d dirty=%v%s\n",
-				w.Path, w.Branch, w.Ahead, w.Behind, w.Dirty, tag)
+			pos := fmt.Sprintf("ahead=%d behind=%d dirty=%v", w.Ahead, w.Behind, w.Dirty)
+			ui.Plain("    %s  %s %s%s", w.Path, ui.Cyan(w.Branch), ui.Dim(pos), tag)
 		}
 	}
 }

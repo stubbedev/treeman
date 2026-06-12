@@ -35,7 +35,7 @@ Examples:
 |---|---|
 | `--from` | base branch |
 | `--path` | explicit worktree path |
-| `--repo` | repo root override |
+| `-r`, `--repo` | repo root override |
 | `--skip-hooks` |  |
 | `--skip-prepare` |  |
 | `--no-fetch` | skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits) |
@@ -60,7 +60,7 @@ Examples:
 
 | Flag | Usage |
 |---|---|
-| `--repo` |  |
+| `-r`, `--repo` |  |
 | `-f`, `--force` |  |
 | `-y`, `--yes` | skip the confirmation prompt |
 | `--detached` |  |
@@ -72,7 +72,7 @@ register a worktree path (metadata only)
 | Flag | Usage |
 |---|---|
 | `-b`, `--branch` |  |
-| `--repo` |  |
+| `-r`, `--repo` |  |
 
 ### `treeman worktree unregister`
 
@@ -104,6 +104,7 @@ show details, recent events, and hook runs for a worktree (defaults to the workt
 | `--events` | number of recent events to show |
 | `--hooks` | number of recent hook runs to show |
 | `--no-pager` | disable the pager even when stdout is a TTY |
+| `--json` |  |
 
 ### `treeman worktree logs`
 
@@ -141,7 +142,7 @@ rerun setup + prepare for a worktree (default via daemon; --local runs inline)
 
 | Flag | Usage |
 |---|---|
-| `--repo` |  |
+| `-r`, `--repo` |  |
 | `--local` | run setup + prepare in this process instead of dispatching to the daemon |
 
 ### `treeman worktree back`
@@ -172,6 +173,21 @@ resolve/create/checkout a worktree by name or branch (use as cd "$(treeman wt go
 | `--from` | base branch (with --create/--checkout) |
 | `-r`, `--repo` |  |
 | `--no-fetch` | skip the pre-checkout `git fetch origin <base>` |
+
+### `treeman repos`
+
+list repos enrolled in treeman
+
+```
+Reads the SQLite registry directly (no daemon round-trip), so it
+works while the daemon is down. A repo is enrolled the first time
+treeman touches it (wt create, prepare, or daemon watch); drop one
+with `treeman registry remove`.
+```
+
+| Flag | Usage |
+|---|---|
+| `--json` |  |
 
 ### `treeman status`
 
@@ -570,6 +586,23 @@ health-check the local treeman setup
 ### `treeman registry`
 
 SQLite worktree-registry maintenance
+
+### `treeman registry list`
+
+Aliases: `ls`
+
+list repos enrolled in the registry
+
+```
+Reads the SQLite registry directly (no daemon round-trip), so it
+works while the daemon is down. A repo is enrolled the first time
+treeman touches it (wt create, prepare, or daemon watch); drop one
+with `treeman registry remove`.
+```
+
+| Flag | Usage |
+|---|---|
+| `--json` |  |
 
 ### `treeman registry repair`
 

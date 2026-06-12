@@ -32,9 +32,10 @@ func wtShow() *cli.Command {
 			&cli.IntFlag{Name: "events", Value: 10, Usage: "number of recent events to show"},
 			&cli.IntFlag{Name: "hooks", Value: 5, Usage: "number of recent hook runs to show"},
 			&cli.BoolFlag{Name: "no-pager", Usage: "disable the pager even when stdout is a TTY"},
+			&cli.BoolFlag{Name: "json"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			pager := newPagerIfEligible(c, false, false)
+			pager := newPagerIfEligible(c, false, c.Bool("json"))
 			if pager != nil {
 				_ = pager.Start()
 				defer pager.Close()
@@ -58,9 +59,6 @@ func wtShow() *cli.Command {
 				return err
 			}
 
-			printWtHeader(ctx, st, wt)
-			printWtPrepareSummary(ctx, st, wt.ID)
-
 			// Recent events.
 			evs, _ := st.QueryEvents(ctx, store.EventFilter{
 				WorktreeID: wt.ID,
@@ -68,6 +66,29 @@ func wtShow() *cli.Command {
 				HydrateWT:  false,
 			})
 			reverseEvents(evs)
+
+			if c.Bool("json") {
+				runs, _ := st.QueryHookRuns(ctx, wt.ID, c.Int("hooks"))
+				state, detail := finalizeState(ctx, st, wt.ID)
+				ports, _ := st.LoadWorktreePorts(ctx, wt.ID)
+				branches, _ := st.ListActiveBranches(ctx, wt.ID)
+				return jsonStream(map[string]any{
+					"id":            wt.ID,
+					"slug":          wt.Slug,
+					"branch":        wt.Branch,
+					"path":          wt.Path,
+					"created_at":    wt.CreatedAt,
+					"state":         ui.StripANSI(state),
+					"state_detail":  ui.StripANSI(detail),
+					"ports":         ports,
+					"branch_scoped": branches,
+					"events":        evs,
+					"hook_runs":     runs,
+				})
+			}
+
+			printWtHeader(ctx, st, wt)
+			printWtPrepareSummary(ctx, st, wt.ID)
 			if len(evs) > 0 {
 				_, _ = fmt.Fprintln(ui.Out, ui.Bold("recent events"))
 				for _, e := range evs {

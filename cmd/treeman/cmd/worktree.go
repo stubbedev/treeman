@@ -63,7 +63,7 @@ Examples:
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "from", Usage: "base branch"},
 			&cli.StringFlag{Name: "path", Usage: "explicit worktree path"},
-			&cli.StringFlag{Name: "repo", Usage: "repo root override"},
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "repo root override"},
 			&cli.BoolFlag{Name: "skip-hooks"},
 			&cli.BoolFlag{Name: "skip-prepare"},
 			&cli.BoolFlag{
@@ -181,7 +181,7 @@ Examples:
   treeman wt delete PROJ-1234
   treeman wt delete /path/to/wt --force      # remove stale registry entry`,
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "repo"},
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "force", Aliases: []string{"f"}},
 			&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip the confirmation prompt"},
 			// `--detached` is the internal flag set by detachLocalDelete
@@ -244,7 +244,7 @@ func wtRegister() *cli.Command {
 		Usage: "register a worktree path (metadata only)",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "branch", Aliases: []string{"b"}},
-			&cli.StringFlag{Name: "repo"},
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			path := "."
@@ -564,7 +564,7 @@ func wtFinalize() *cli.Command {
 		Usage:     "rerun setup + prepare for a worktree (default via daemon; --local runs inline)",
 		ArgsUsage: "[path|slug|branch]",
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "repo"},
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "local", Usage: "run setup + prepare in this process instead of dispatching to the daemon"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {

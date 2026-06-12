@@ -412,9 +412,9 @@ func TestLogsCLI(t *testing.T) {
 			name: "tail/--json emits NDJSON without scope preamble",
 			cwd:  fx.wt1aPath,
 			args: []string{"logs", "tail", "-n", "50", "--json"},
-			// Field names are PascalCase because store.Event has no json
-			// tags — the test pins that contract.
-			wantStdout: []string{`"EventType"`, `"Level"`, `"WorktreeSlug":"wt1a"`},
+			// Field names are snake_case via store.Event's MarshalJSON
+			// (events_json.go) — the test pins that contract.
+			wantStdout: []string{`"event_type"`, `"level"`, `"worktree_slug":"wt1a"`},
 			notStderr:  []string{"# scope:"},
 		},
 		{
@@ -500,7 +500,7 @@ func TestLogsCLI(t *testing.T) {
 			name:       "hooks/--all --json emits NDJSON hook rows",
 			cwd:        outsideDir,
 			args:       []string{"logs", "hooks", "-n", "20", "--all", "--json"},
-			wantStdout: []string{`"WorktreeSlug":"wt1a"`, `"WorktreeSlug":"wt2a"`},
+			wantStdout: []string{`"worktree_slug":"wt1a"`, `"worktree_slug":"wt2a"`},
 		},
 		{
 			name:        "hooks/unknown worktree name errors",
@@ -528,7 +528,7 @@ func TestLogsCLI(t *testing.T) {
 			name:       "hooks/--show --json emits chunk envelopes",
 			cwd:        outsideDir,
 			args:       []string{"logs", "hooks", "--all", "--show", "1", "--json"},
-			wantStdout: []string{`"Stream":"merged"`, `"HookRunID":1`},
+			wantStdout: []string{`"stream":"merged"`, `"hook_run_id":1`},
 		},
 
 		// ── purge ────────────────────────────────────────────────

@@ -132,15 +132,19 @@ func mainStatusAction(ctx context.Context, c *cli.Command) error {
 		})
 	}
 
-	fmt.Printf("%s\n", ui.Bold(repoRoot))
-	fmt.Printf("  enabled        : %v\n", cfg.MainWorktree.Enabled)
-	fmt.Printf("  current branch : %s\n", branch)
+	enabled := ui.Gray("false")
+	if cfg.MainWorktree.Enabled {
+		enabled = ui.Green("true")
+	}
+	ui.Plain("%s", ui.Bold(repoRoot))
+	ui.Plain("  %s %s", ui.Dim("enabled        :"), enabled)
+	ui.Plain("  %s %s", ui.Dim("current branch :"), ui.Cyan(branch))
 	if row.ID == 0 {
-		fmt.Printf("  enrolled        : no row\n")
+		ui.Plain("  %s %s", ui.Dim("enrolled       :"), ui.Gray("no row"))
 		return nil
 	}
-	fmt.Printf("  enrolled slug   : %s (row %d)\n", row.Slug, row.ID)
-	fmt.Printf("  enrolled branch : %s\n", row.Branch)
+	ui.Plain("  %s %s %s", ui.Dim("enrolled slug  :"), ui.Cyan(row.Slug), ui.Dim(fmt.Sprintf("(row %d)", row.ID)))
+	ui.Plain("  %s %s", ui.Dim("enrolled branch:"), ui.Cyan(row.Branch))
 	return nil
 }
 

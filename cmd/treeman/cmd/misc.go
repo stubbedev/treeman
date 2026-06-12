@@ -333,10 +333,13 @@ func DbCmd() *cli.Command {
 					for _, d := range dbs {
 						active := d.ActiveBranch
 						if active == "" {
-							active = "(none)"
+							active = ui.Dim("(none)")
+						} else {
+							active = ui.Cyan(active)
 						}
-						fmt.Printf("[%s] %s — active branch: %s; resumable: %s\n",
-							d.Engine, d.Active, active, strings.Join(d.ResumableBranches, ", "))
+						ui.Plain("%s %s — active branch: %s; resumable: %s",
+							ui.Cyan("["+d.Engine+"]"), ui.Bold(d.Active), active,
+							ui.Dim(strings.Join(d.ResumableBranches, ", ")))
 					}
 					return nil
 				},
@@ -1083,7 +1086,7 @@ func FwCmd() *cli.Command {
 				} else {
 					migs.Render(nil)
 				}
-				fmt.Println()
+				ui.Plain("")
 				tests := ui.NewTable("TEST_FW", "LANGUAGE", "STRATEGY", "WORKER_IDX", "WORKER_ENV")
 				detTests := testfw.DetectAll(repoRoot)
 				for _, t := range detTests {
@@ -1094,10 +1097,9 @@ func FwCmd() *cli.Command {
 				} else {
 					tests.Render(nil)
 				}
-				fmt.Printf(
-					"\nauto-clones (replication target): %s\n",
-					ui.Bold(strconv.FormatUint(uint64(testfw.DetectedCloneCount(repoRoot)), 10)),
-				)
+				ui.Plain("")
+				ui.Plain("auto-clones (replication target): %s",
+					ui.Bold(strconv.FormatUint(uint64(testfw.DetectedCloneCount(repoRoot)), 10)))
 				return nil
 			},
 		}},

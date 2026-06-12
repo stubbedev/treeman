@@ -149,6 +149,7 @@ treeman daemon start        # idempotent — uses systemctl/launchctl when insta
 
 # Sanity check whenever something feels off:
 treeman doctor              # probes daemon, config, schema, git ↔ registry drift
+treeman repos               # every enrolled repo: worktrees, snapshots, last activity
 
 # 3. Spin up a worktree end-to-end.
 treeman wt create proj-123
