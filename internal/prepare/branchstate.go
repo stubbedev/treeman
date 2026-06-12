@@ -511,13 +511,19 @@ type branchScopedArgs struct {
 	// store base-branch resolver. Only tests set it; production leaves it
 	// nil so `fill` uses resolveBaseSourceDB.
 	resolveParent func(ctx context.Context, branch string) (string, bool, error)
+	// resolveBaseBranchFn, when non-nil, overrides the git base-branch
+	// resolver used by the durable-snapshot seed fallback. Only tests set
+	// it; production leaves it nil so `baseBranchDurable` uses
+	// resolveBaseBranch.
+	resolveBaseBranchFn func(ctx context.Context, branch string) string
 }
 
 // runBranchScoped is the unified swap lifecycle for one branch-scoped
 // database. It runs on every prepare (create + HEAD-switch finalize):
 //
 //   - active doesn't exist → seed it (this branch's durable copy, else
-//     the parent branch's live data, else dump, else empty).
+//     the base branch's live data, else the base branch's durable
+//     snapshot, else dump, else empty).
 //   - active exists but unmarked → adopt: back it up as this branch's
 //     durable copy, leave the data in place (first-enable / migrating
 //     an existing DB into the branch-scoped world).
@@ -629,9 +635,10 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 }
 
 // seedFresh handles the `!exists` arm of runBranchScoped: the active
-// slot is empty, so seed this branch's data (durable/parent via fill,
-// else dump, else empty). Returns (builtEmpty, decision). Extracted
-// verbatim from runBranchScoped's `case !exists` block.
+// slot is empty, so seed this branch's data (durable / live parent /
+// base-branch durable snapshot via fill, else dump, else empty).
+// Returns (builtEmpty, decision). Extracted verbatim from
+// runBranchScoped's `case !exists` block.
 func (a branchScopedArgs) seedFresh(ctx context.Context, active, branch string) (bool, string, error) {
 	filled, how, ferr := a.fill(ctx, active, branch)
 	if ferr != nil {
@@ -778,9 +785,11 @@ func (a branchScopedArgs) recordClean(ctx context.Context, active, branch, decis
 }
 
 // fill populates `active` with `branch`'s data. Order: the branch's own
-// durable copy (resume) → the parent branch's live namespace (seed from
-// upstream). Returns (filled, how) — filled=false means neither source
-// was available and the caller decides the fallback.
+// durable copy (resume) → the base branch's live namespace (seed from the
+// upstream checkout) → the base branch's freshest durable SNAPSHOT (seed
+// from a parked base, e.g. `develop` that lives only as a ref). Returns
+// (filled, how) — filled=false means no source was available and the
+// caller decides the fallback (empty).
 func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool, string, error) {
 	dur := a.eng.durable(active, branch)
 	if ok, _ := a.eng.drv.Exists(ctx, dur); ok {
@@ -802,7 +811,97 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 			return true, "parent", nil
 		}
 	}
+	// The base branch's live DB is unavailable — its worktree was torn
+	// down, or the base (e.g. `develop`) exists only as a ref while the
+	// main checkout sits on another branch. Seed from the freshest durable
+	// SNAPSHOT of the base branch instead of cold-building an empty schema.
+	// migrate then applies only the new branch's own added migrations on
+	// top (incremental), so a branch off develop still inherits develop's
+	// data without a dump.
+	if snap, base, ok := a.baseBranchDurable(ctx, branch); ok {
+		if err := a.eng.drv.Restore(ctx, snap, active); err != nil {
+			return false, "", fmt.Errorf("seed %q from base branch %q durable snapshot %q: %w",
+				active, base, snap, err)
+		}
+		return true, "parent-snapshot", nil
+	}
 	return false, "", nil
+}
+
+// baseBranchName resolves the local branch the new worktree's branch_scoped
+// seed should inherit from (e.g. `develop`). Tests override via
+// resolveBaseBranchFn; production uses the git-upstream + main-worktree
+// resolver shared with resolveBaseSourceDB.
+func (a branchScopedArgs) baseBranchName(ctx context.Context, branch string) string {
+	if a.resolveBaseBranchFn != nil {
+		return a.resolveBaseBranchFn(ctx, branch)
+	}
+	return resolveBaseBranch(ctx, a.st, a.repoPath(ctx), a.repoID, branch)
+}
+
+// baseBranchDurable finds the freshest existing durable snapshot of the base
+// branch for THIS logical database (databases[dbIdx]), to seed a branch
+// forked off it when the base branch's LIVE database isn't available to
+// copy. It scopes candidates to dbIdx by forward-computing, for every
+// worktree (and the main overlay), the durable name that branch would carry
+// — `durable(active, base)` — so durables of sibling databases that merely
+// share a name prefix (e.g. the test DB) are never matched. Among existing
+// candidates it picks the most-recently-used. Returns ("", "", false) when
+// no base branch resolves or no snapshot exists.
+func (a branchScopedArgs) baseBranchDurable(ctx context.Context, branch string) (string, string, bool) {
+	base := a.baseBranchName(ctx, branch)
+	if base == "" || base == branch {
+		return "", "", false
+	}
+	rows, err := a.st.ListWorktreesForRepo(ctx, a.repoID)
+	if err != nil {
+		return "", "", false
+	}
+	mainCfg := *a.cfg
+	config.ApplyMainWorktreeOverlay(&mainCfg)
+	candidates := map[string]struct{}{}
+	for _, wt := range rows {
+		// Deleted worktrees stay in the scan: teardown keeps branch
+		// durables alive precisely so a later worktree can seed from
+		// them, and their stored path still renders the active name the
+		// durable was hashed under.
+		dbForWt := a.d
+		if wt.IsMain && a.dbIdx < len(mainCfg.Databases) {
+			dbForWt = mainCfg.Databases[a.dbIdx]
+		}
+		act, aerr := activeNamespace(dbForWt, a.eng.scope, wt.Path)
+		if aerr != nil {
+			continue
+		}
+		candidates[a.eng.durable(act, base)] = struct{}{}
+	}
+	if len(candidates) == 0 {
+		return "", "", false
+	}
+	durs, err := a.st.ListBranchDurables(ctx, a.repoID)
+	if err != nil {
+		return "", "", false
+	}
+	best, bestUsed := "", int64(-1)
+	for _, d := range durs {
+		if d.Engine != a.eng.engine || d.Branch != base {
+			continue
+		}
+		if _, ok := candidates[d.DurableName]; !ok {
+			continue
+		}
+		if d.LastUsedAt <= bestUsed {
+			continue
+		}
+		if ex, _ := a.eng.drv.Exists(ctx, d.DurableName); !ex {
+			continue
+		}
+		best, bestUsed = d.DurableName, d.LastUsedAt
+	}
+	if best == "" {
+		return "", "", false
+	}
+	return best, base, true
 }
 
 // parentSourceKeep returns a predicate excluding keys/indices that belong

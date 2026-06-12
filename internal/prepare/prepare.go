@@ -233,8 +233,9 @@ type Outcome struct {
 	Clones       []string
 	// Decision is set only for branch_scoped databases: how the active
 	// namespace was filled this run — `seed:empty`, `seed:dump`,
-	// `seed:parent`, `swap:resume`, `swap:parent`, `swap:branch-point`,
-	// `adopt`, or `noop`. Empty for the template/clone path.
+	// `seed:parent`, `seed:parent-snapshot`, `swap:resume`, `swap:parent`,
+	// `swap:parent-snapshot`, `swap:branch-point`, `adopt`, or `noop`.
+	// Empty for the template/clone path.
 	Decision string
 	// Skipped is true when the engine's connection block is absent
 	// from the resolved config — declaring `databases: [{engine:

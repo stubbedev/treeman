@@ -136,6 +136,7 @@ type bsFixture struct {
 	worktreeID   int64
 	active       string
 	parent       func(branch string) (string, bool, error)
+	baseBranch   func(branch string) string
 	migrateFP    string
 }
 
@@ -185,10 +186,14 @@ func (f *bsFixture) run(branch string) Outcome {
 	if f.parent != nil {
 		rp = func(_ context.Context, b string) (string, bool, error) { return f.parent(b) }
 	}
+	var rbb func(ctx context.Context, branch string) string
+	if f.baseBranch != nil {
+		rbb = func(_ context.Context, b string) string { return f.baseBranch(b) }
+	}
 	out, err := runBranchScoped(ctx, branchScopedArgs{
 		cfg: f.cfg, d: f.d, dbIdx: 0, worktreePath: f.worktreePath,
 		st: f.st, repoID: f.repoID, worktreeID: f.worktreeID,
-		eng: f.eng, resolveParent: rp, migrateFP: f.migrateFP,
+		eng: f.eng, resolveParent: rp, resolveBaseBranchFn: rbb, migrateFP: f.migrateFP,
 	})
 	if err != nil {
 		f.t.Fatalf("runBranchScoped(%s): %v", branch, err)
@@ -272,6 +277,76 @@ func TestBranchScopedSeedsFromParent(t *testing.T) {
 	f.run("develop")
 	f.assertActive("p")
 	f.assertMarker("develop")
+}
+
+// TestBranchScopedSeedsFromBaseDurable: no active, no own durable, and no
+// LIVE base-branch DB to copy — but a durable SNAPSHOT of the base branch
+// (develop) exists. The new feature branch must seed from that snapshot
+// instead of cold-building an empty schema.
+func TestBranchScopedSeedsFromBaseDurable(t *testing.T) {
+	f := newBSFixture(t)
+	ctx := context.Background()
+
+	// A develop durable snapshot exists for this logical DB, named the way
+	// branchEngine.durable derives it for this worktree's active namespace.
+	devDur := f.eng.durable(f.active, "develop")
+	f.set(devDur, map[string]string{"dev": "1"})
+	if err := f.st.RecordBranchDurable(ctx, store.BranchDurableRow{
+		RepoID: f.repoID, WorktreeID: f.worktreeID, Engine: "mysql",
+		DBKey: f.active, Branch: "develop", DurableName: devDur,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No LIVE parent DB to copy; base branch resolves to develop.
+	f.parent = func(string) (string, bool, error) { return "", false, nil }
+	f.baseBranch = func(string) string { return "develop" }
+
+	out := f.run("feature/x")
+	if out.Decision != "seed:parent-snapshot" {
+		t.Fatalf("decision = %q, want seed:parent-snapshot", out.Decision)
+	}
+	f.assertActive("dev") // seeded from develop's snapshot
+	f.assertMarker("feature/x")
+}
+
+// TestBranchScopedSeedsFromDeletedWorktreeDurable: the base branch's
+// durable was captured in a worktree that has since been torn down
+// (teardown keeps durables). The snapshot seed must still find it via
+// the deleted worktree row's stored path.
+func TestBranchScopedSeedsFromDeletedWorktreeDurable(t *testing.T) {
+	f := newBSFixture(t)
+	ctx := context.Background()
+
+	sibPath := t.TempDir()
+	sibID, err := f.st.EnsureWorktree(ctx, f.repoID, sibPath, "sibslug", "develop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibActive, err := activeNamespace(f.d, scopeName, sibPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibDur := f.eng.durable(sibActive, "develop")
+	f.set(sibDur, map[string]string{"dev": "1"})
+	if err := f.st.RecordBranchDurable(ctx, store.BranchDurableRow{
+		RepoID: f.repoID, WorktreeID: sibID, Engine: "mysql",
+		DBKey: sibActive, Branch: "develop", DurableName: sibDur,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.MarkWorktreeDeleted(ctx, sibID); err != nil {
+		t.Fatal(err)
+	}
+
+	f.parent = func(string) (string, bool, error) { return "", false, nil }
+	f.baseBranch = func(string) string { return "develop" }
+
+	out := f.run("feature/x")
+	if out.Decision != "seed:parent-snapshot" {
+		t.Fatalf("decision = %q, want seed:parent-snapshot", out.Decision)
+	}
+	f.assertActive("dev")
 }
 
 // TestBranchScopedAdoptsExistingUnmarked: active present, no marker →
