@@ -40,11 +40,19 @@ func (s *Store) AllocateWorktreePort(ctx context.Context, repoID, worktreeID int
 		// SQLite reports both unique-index conflicts as the same
 		// constraint kind, so we need to distinguish via a follow-up
 		// query whether the conflict was on (repo, name, port) or
-		// (worktree, name). The former is recoverable (caller picks
-		// the next port); the latter is a programming bug.
+		// (worktree, name). Both are recoverable:
+		//
+		//   - (worktree, name): this worktree already holds the slot.
+		//     Happens when two allocate passes for the same worktree
+		//     race — the synchronous create handler and the detached
+		//     FinalizeWorktree both call Allocate, and the loser's
+		//     INSERT lands after the winner's row. Idempotent, not a
+		//     bug: signal the caller to reuse the recorded port.
+		//   - (repo, name, port): another live worktree holds this
+		//     exact port. Caller picks the next candidate.
 		if isUniqueConflict(err) {
 			if held, herr := s.LookupWorktreePort(ctx, worktreeID, name); herr == nil && held > 0 {
-				return fmt.Errorf("allocate worktree port: worktree %d already holds slot %q (port=%d)", worktreeID, name, held)
+				return ErrSlotHeld
 			}
 			return ErrPortInUse
 		}
@@ -57,6 +65,12 @@ func (s *Store) AllocateWorktreePort(ctx context.Context, repoID, worktreeID int
 // worktree. The allocator catches this, picks the next port in the
 // range, and retries.
 var ErrPortInUse = errors.New("port already allocated")
+
+// ErrSlotHeld signals that THIS worktree already holds the slot — a
+// concurrent allocate pass for the same worktree won the insert race.
+// The allocator catches this and reuses the recorded port instead of
+// failing the create.
+var ErrSlotHeld = errors.New("worktree already holds slot")
 
 // LookupWorktreePort returns the port assigned to (worktreeID, name)
 // or 0 if no row matches.

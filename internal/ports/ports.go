@@ -98,7 +98,7 @@ func (defaultAllocator) Allocate(
 			continue
 		}
 		spec := cfg.Ports[name]
-		port, err := allocateOne(ctx, st, repoID, worktreeID, name, spec)
+		port, reused, err := allocateOne(ctx, st, repoID, worktreeID, name, spec)
 		if err != nil {
 			// Roll back only the slots this call added — ports the
 			// worktree already held must survive a partial-allocation
@@ -108,7 +108,12 @@ func (defaultAllocator) Allocate(
 			}
 			return nil, fmt.Errorf("allocate port %q: %w", name, err)
 		}
-		allocatedThisCall = append(allocatedThisCall, name)
+		// A reused slot was written by a concurrent allocate pass, not
+		// this one — leave it out of the rollback set so a later failure
+		// can't delete the other pass's row.
+		if !reused {
+			allocatedThisCall = append(allocatedThisCall, name)
+		}
 		out = append(out, Allocation{Name: name, Port: port})
 	}
 	return out, nil
@@ -117,16 +122,21 @@ func (defaultAllocator) Allocate(
 // allocateOne reserves one free port for (repoID, worktreeID, name)
 // from spec.Range. Returns ErrExhausted when every port in the range
 // is taken by another live worktree or by a foreign process.
+//
+// The reused return is true when a concurrent allocate pass for the
+// same worktree already claimed the slot: instead of failing, the port
+// that pass recorded is looked up and returned. The caller uses the
+// flag to keep that row out of its rollback set.
 func allocateOne(
 	ctx context.Context,
 	st *store.Store,
 	repoID, worktreeID int64,
 	name string,
 	spec config.PortSpec,
-) (uint16, error) {
+) (uint16, bool, error) {
 	used, err := st.ListUsedPorts(ctx, repoID, name)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	// Iterate with an int so candidate == 65535 + 1 doesn't wrap a
 	// uint16 back to 0 and loop forever.
@@ -140,16 +150,30 @@ func allocateOne(
 		}
 		switch err := st.AllocateWorktreePort(ctx, repoID, worktreeID, name, candidate); {
 		case err == nil:
-			return candidate, nil
+			return candidate, false, nil
+		case errors.Is(err, store.ErrSlotHeld):
+			// A concurrent allocate pass for this same worktree won the
+			// insert race for this slot. Reuse the port it recorded
+			// rather than failing the create.
+			held, herr := st.LookupWorktreePort(ctx, worktreeID, name)
+			if herr != nil {
+				return 0, false, herr
+			}
+			if held > 0 {
+				return held, true, nil
+			}
+			// Row vanished between conflict and lookup (teardown race);
+			// fall through and try the next candidate.
+			continue
 		case errors.Is(err, store.ErrPortInUse):
 			// Race: another worktree create grabbed this port between
 			// ListUsedPorts and AllocateWorktreePort. Try the next.
 			continue
 		default:
-			return 0, err
+			return 0, false, err
 		}
 	}
-	return 0, fmt.Errorf("%w: slot %q range [%d, %d]", ErrExhausted, name, spec.Range.Min, spec.Range.Max)
+	return 0, false, fmt.Errorf("%w: slot %q range [%d, %d]", ErrExhausted, name, spec.Range.Min, spec.Range.Max)
 }
 
 // ErrExhausted reports that no free port remains in a slot's range.

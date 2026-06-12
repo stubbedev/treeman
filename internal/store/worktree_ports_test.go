@@ -62,14 +62,25 @@ func TestAllocateReturnsErrPortInUse(t *testing.T) {
 	}
 }
 
-func TestAllocateRejectsDoubleSameSlot(t *testing.T) {
+// TestAllocateSameSlotReturnsErrSlotHeld pins the conflict-classification
+// half of the concurrent-allocate fix: when the SAME worktree re-inserts
+// a slot it already holds (two allocate passes racing — the synchronous
+// create handler and the detached FinalizeWorktree), the (worktree, name)
+// unique index rejects it and the store reports ErrSlotHeld so the
+// allocator reuses the recorded port instead of failing the create.
+// Distinct from TestAllocateReturnsErrPortInUse, where a DIFFERENT
+// worktree collides on the (repo, name, port) index and gets ErrPortInUse.
+func TestAllocateSameSlotReturnsErrSlotHeld(t *testing.T) {
 	ctx := context.Background()
 	st, repoID, wtID := openTestStoreWithWt(t)
 	if err := st.AllocateWorktreePort(ctx, repoID, wtID, "octane", 8042); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AllocateWorktreePort(ctx, repoID, wtID, "octane", 8043); err == nil {
-		t.Errorf("want error for double-allocating same slot on same worktree")
+	// Same worktree, same slot, different port: the one-per-slot index
+	// rejects it and we must get ErrSlotHeld (not ErrPortInUse, not a
+	// fatal error) so the caller can recover by reusing 8042.
+	if err := st.AllocateWorktreePort(ctx, repoID, wtID, "octane", 8043); !errors.Is(err, ErrSlotHeld) {
+		t.Fatalf("want ErrSlotHeld for same-worktree same-slot re-insert, got %v", err)
 	}
 }
 
