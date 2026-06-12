@@ -225,10 +225,10 @@ func bringInAndPatch(
 	tplCtx template.Context,
 	sink Sink,
 ) error {
-	if err := BringInFiles(repoRoot, wtPath, cfg.Worktrees.Links, "link", sink); err != nil {
+	if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Links, "link", sink); err != nil {
 		return err
 	}
-	if err := BringInFiles(repoRoot, wtPath, cfg.Worktrees.Copies, "copy", sink); err != nil {
+	if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Copies, "copy", sink); err != nil {
 		return err
 	}
 	return applyPatches(ctx, cfg.Patches, wtPath, tplCtx, sink)

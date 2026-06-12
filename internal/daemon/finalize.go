@@ -171,6 +171,12 @@ func FinalizeWorktree(
 	// from (src == dst), same rationale as patches.
 	if !isMain {
 		if err := bringInWithEvents(ctx, st, repoRoot, wtRoot, &cfg, repoID, wtID); err != nil {
+			// A cancelled ctx here means a concurrent teardown preempted the
+			// copy (it now honors ctx mid-tree) — a clean stop, not a create
+			// error. Record it like the pipeline's phase-boundary checks.
+			if cancelledBefore(ctx, st, "bring-in", repoID, wtID) {
+				return nil
+			}
 			return err
 		}
 	}
@@ -261,7 +267,7 @@ func bringInWithEvents(
 		_ = st.Store.WriteEvent(ctx, store.LevelInfo, startEvt,
 			fmt.Sprintf("entries=%d", len(paths)),
 			repoID, wtID, "", 0, map[string]any{"entries": len(paths)})
-		results, brErr := wt.BringInFilesReport(repoRoot, wtRoot, paths, mode, nil)
+		results, brErr := wt.BringInFilesReport(ctx, repoRoot, wtRoot, paths, mode, nil)
 		var files, brought, skipped int
 		var bytes, totalMs int64
 		for _, r := range results {
@@ -596,7 +602,10 @@ func TeardownWorktree(
 			mu.Lock()
 			gitArgs := []string{"-C", repoRoot, "worktree", "remove", "--force", wtRoot}
 			_ = lowPriorityCommand(ctx, "git", gitArgs).Run()
-			pruneEmptyParentsBelow(wtRoot, worktreesRootOf(cfg.Worktrees.Root, repoRoot))
+			// RemoveWorktreeTree (not just pruneEmptyParentsBelow) so
+			// untracked bring-in / hook-generated leftovers don't strand
+			// and block the next create — see reap.go's fallback path.
+			wt.RemoveWorktreeTree(wtRoot, worktreesRootOf(cfg.Worktrees.Root, repoRoot))
 			mu.Unlock()
 		}
 		return nil

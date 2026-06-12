@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/wt"
 )
 
 // trashDirName is the subdirectory under worktreesRoot where deleted
@@ -64,6 +65,13 @@ func removeWorktreeViaTrash(
 	if runErr := lowPriorityCommand(ctx, "git", gitArgs).Run(); runErr != nil {
 		return "", runErr
 	}
+	// `git worktree remove` drops tracked files + the admin entry but
+	// leaves untracked bring-in / hook-generated dirs (storage/, vendor/,
+	// node_modules/) behind, so the next `wt create` at this path trips
+	// "destination path already exists". Nuke them — mirrors the CLI
+	// inlineTeardown path. Guarded to paths under worktreesRoot, so the
+	// cross-FS case (wtRoot outside the worktrees root) is a safe no-op.
+	wt.RemoveWorktreeTree(wtRoot, worktreesRoot)
 	return "", nil
 }
 

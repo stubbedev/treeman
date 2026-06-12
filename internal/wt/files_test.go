@@ -1,6 +1,7 @@
 package wt
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,7 +16,7 @@ func TestBringInFilesCopiesGitignoredFile(t *testing.T) {
 	if err := os.WriteFile(src, []byte("DB_NAME=app\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := BringInFiles(main, wtDir, []string{".env"}, "copy", NoopSink{}); err != nil {
+	if err := BringInFiles(context.Background(), main, wtDir, []string{".env"}, "copy", NoopSink{}); err != nil {
 		t.Fatalf("BringInFiles: %v", err)
 	}
 	dst := filepath.Join(wtDir, ".env")
@@ -46,7 +47,7 @@ func TestBringInFilesSymlinkMode(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "marker"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := BringInFiles(main, wtDir, []string{"vendor"}, "link", NoopSink{}); err != nil {
+	if err := BringInFiles(context.Background(), main, wtDir, []string{"vendor"}, "link", NoopSink{}); err != nil {
 		t.Fatalf("BringInFiles: %v", err)
 	}
 	dst := filepath.Join(wtDir, "vendor")
@@ -69,7 +70,7 @@ func TestBringInFilesIdempotent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(main, ".env"), []byte("X=1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := BringInFiles(main, wtDir, []string{".env"}, "copy", NoopSink{}); err != nil {
+	if err := BringInFiles(context.Background(), main, wtDir, []string{".env"}, "copy", NoopSink{}); err != nil {
 		t.Fatal(err)
 	}
 	// User mutates the worktree's copy.
@@ -77,7 +78,7 @@ func TestBringInFilesIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Re-run: should NOT overwrite the mutated copy.
-	if err := BringInFiles(main, wtDir, []string{".env"}, "copy", NoopSink{}); err != nil {
+	if err := BringInFiles(context.Background(), main, wtDir, []string{".env"}, "copy", NoopSink{}); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := os.ReadFile(filepath.Join(wtDir, ".env"))
@@ -105,7 +106,7 @@ func TestBringInFilesDoublestarGlobMatchesBaseAndNested(t *testing.T) {
 	if err := os.WriteFile(nested, []byte("nested"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := BringInFiles(main, wtDir, []string{"config/**/*.local.php"}, "copy", NoopSink{}); err != nil {
+	if err := BringInFiles(context.Background(), main, wtDir, []string{"config/**/*.local.php"}, "copy", NoopSink{}); err != nil {
 		t.Fatalf("BringInFiles: %v", err)
 	}
 	if got, _ := os.ReadFile(filepath.Join(wtDir, "config", "app.local.php")); string(got) != "base" {
@@ -127,7 +128,7 @@ func TestBringInFilesBraceGlob(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := BringInFiles(main, wtDir, []string{"{.env,.env.local}"}, "copy", NoopSink{}); err != nil {
+	if err := BringInFiles(context.Background(), main, wtDir, []string{"{.env,.env.local}"}, "copy", NoopSink{}); err != nil {
 		t.Fatalf("BringInFiles: %v", err)
 	}
 	for _, n := range []string{".env", ".env.local"} {
@@ -149,7 +150,7 @@ func TestBringInFilesCopiesDirectoryRecursively(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(main, "seeds", "fixtures", "b.sql"), []byte("b"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := BringInFiles(main, wtDir, []string{"seeds"}, "copy", NoopSink{}); err != nil {
+	if err := BringInFiles(context.Background(), main, wtDir, []string{"seeds"}, "copy", NoopSink{}); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := os.ReadFile(filepath.Join(wtDir, "seeds", "a.sql")); string(got) != "a" {
@@ -186,7 +187,7 @@ func TestBringInFilesCopiesLargeTreeConcurrently(t *testing.T) {
 			}
 		}
 	}
-	res, err := BringInFilesReport(main, wtDir, []string{"vendor"}, "copy", NoopSink{})
+	res, err := BringInFilesReport(context.Background(), main, wtDir, []string{"vendor"}, "copy", NoopSink{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,6 +216,33 @@ func TestBringInFilesCopiesLargeTreeConcurrently(t *testing.T) {
 	}
 }
 
+// TestBringInFilesCancelledStopsBeforeNextEntry guards the cancellation
+// contract relied on by daemon teardown: an already-cancelled ctx aborts
+// the bring-in before the first entry is copied, returning ctx.Err() and
+// leaving the destination untouched. Without this, a teardown that
+// preempts an in-flight create finalize would let the copy run to
+// completion and resurrect a dir the teardown just removed.
+func TestBringInFilesCancelledStopsBeforeNextEntry(t *testing.T) {
+	main := t.TempDir()
+	wtDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(main, "seeds"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(main, "seeds", "a.sql"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := BringInFiles(ctx, main, wtDir, []string{"seeds"}, "copy", NoopSink{})
+	if err == nil {
+		t.Fatal("want error from cancelled ctx, got nil")
+	}
+	if _, statErr := os.Stat(filepath.Join(wtDir, "seeds")); statErr == nil {
+		t.Fatal("cancelled bring-in copied entry anyway")
+	}
+}
+
 // TestBringInFilesReportCountsAndSkips guards the per-entry observability
 // report: files + bytes are tallied on first copy, and a second
 // idempotent pass reports the entry as skipped with zero files copied.
@@ -231,7 +259,7 @@ func TestBringInFilesReportCountsAndSkips(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := BringInFilesReport(main, wtDir, []string{"seeds"}, "copy", NoopSink{})
+	res, err := BringInFilesReport(context.Background(), main, wtDir, []string{"seeds"}, "copy", NoopSink{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +274,7 @@ func TestBringInFilesReportCountsAndSkips(t *testing.T) {
 	}
 
 	// Idempotent second pass: dst exists → skipped, nothing copied.
-	res2, err := BringInFilesReport(main, wtDir, []string{"seeds"}, "copy", NoopSink{})
+	res2, err := BringInFilesReport(context.Background(), main, wtDir, []string{"seeds"}, "copy", NoopSink{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +284,7 @@ func TestBringInFilesReportCountsAndSkips(t *testing.T) {
 	}
 
 	// Missing non-glob source is tallied, not fatal.
-	res3, err := BringInFilesReport(main, wtDir, []string{"nope"}, "copy", NoopSink{})
+	res3, err := BringInFilesReport(context.Background(), main, wtDir, []string{"nope"}, "copy", NoopSink{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +351,7 @@ func TestBringInFilesWritesGitExclude(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := BringInFiles(main, wtDir, []string{".claude"}, "link", NoopSink{}); err != nil {
+	if err := BringInFiles(context.Background(), main, wtDir, []string{".claude"}, "link", NoopSink{}); err != nil {
 		t.Fatalf("BringInFiles: %v", err)
 	}
 
@@ -337,7 +365,7 @@ func TestBringInFilesWritesGitExclude(t *testing.T) {
 	}
 
 	// Re-run: idempotent — no duplicate pattern, single header.
-	if err := BringInFiles(main, wtDir, []string{".claude"}, "link", NoopSink{}); err != nil {
+	if err := BringInFiles(context.Background(), main, wtDir, []string{".claude"}, "link", NoopSink{}); err != nil {
 		t.Fatalf("BringInFiles re-run: %v", err)
 	}
 	body2, _ := os.ReadFile(excludePath)

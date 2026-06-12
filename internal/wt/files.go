@@ -1,6 +1,7 @@
 package wt
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -42,8 +43,8 @@ type BringInResult struct {
 // BringInFiles is the fire-and-forget form of BringInFilesReport: it
 // performs the same work and discards the per-entry report. Retained
 // for callers (CLI sync path, tests) that don't emit events.
-func BringInFiles(repoRoot, wtPath string, paths []string, mode string, sink Sink) error {
-	_, err := BringInFilesReport(repoRoot, wtPath, paths, mode, sink)
+func BringInFiles(ctx context.Context, repoRoot, wtPath string, paths []string, mode string, sink Sink) error {
+	_, err := BringInFilesReport(ctx, repoRoot, wtPath, paths, mode, sink)
 	return err
 }
 
@@ -56,13 +57,21 @@ func BringInFiles(repoRoot, wtPath string, paths []string, mode string, sink Sin
 // Missing non-glob sources are reported via the sink as warnings;
 // missing glob expansions are silent. On error the partial report up
 // to and including the failing entry is returned alongside the error.
-func BringInFilesReport(repoRoot, wtPath string, paths []string, mode string, sink Sink) ([]BringInResult, error) {
+//
+// ctx cancellation is honored between entries and (for copy mode) between
+// files — a concurrent teardown that cancels an in-flight create finalize
+// stops the recursive copy promptly instead of running it to completion
+// and resurrecting a dir the teardown just removed.
+func BringInFilesReport(ctx context.Context, repoRoot, wtPath string, paths []string, mode string, sink Sink) ([]BringInResult, error) {
 	if sink == nil {
 		sink = NoopSink{}
 	}
 	results := make([]BringInResult, 0, len(paths))
 	var broughtRels []string
 	for _, rel := range paths {
+		if err := ctx.Err(); err != nil {
+			return results, err
+		}
 		res := BringInResult{Rel: rel, Mode: mode}
 		start := time.Now()
 		var matches []string
@@ -112,7 +121,7 @@ func BringInFilesReport(repoRoot, wtPath string, paths []string, mode string, si
 				res.Brought++
 				res.Files++
 			case "copy":
-				files, bytes, err := copyPath(src, dst, info)
+				files, bytes, err := copyPath(ctx, src, dst, info)
 				res.Files += files
 				res.Bytes += bytes
 				if err != nil {
@@ -153,14 +162,17 @@ const copyFanout = 8
 // as a file, 0 bytes). Directory structure and symlinks are created
 // synchronously during the walk so every queued file copy already has
 // its parent directory in place.
-func copyPath(src, dst string, info os.FileInfo) (files int, bytes int64, err error) {
+func copyPath(ctx context.Context, src, dst string, info os.FileInfo) (files int, bytes int64, err error) {
 	var (
-		g      errgroup.Group
 		nFiles atomic.Int64
 		nBytes atomic.Int64
 	)
+	// errgroup.WithContext so a cancelled parent ctx (teardown preempting
+	// an in-flight finalize) aborts queued + pending file copies instead of
+	// draining the whole fan-out.
+	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(copyFanout)
-	walkErr := copyWalk(src, dst, info, &g, &nFiles, &nBytes)
+	walkErr := copyWalk(gctx, src, dst, info, g, &nFiles, &nBytes)
 	copyErr := g.Wait()
 	if walkErr == nil {
 		walkErr = copyErr
@@ -170,7 +182,11 @@ func copyPath(src, dst string, info os.FileInfo) (files int, bytes int64, err er
 
 // copyWalk recursively materializes dirs + symlinks inline and queues
 // regular-file copies on g. Counters track successful work only.
-func copyWalk(src, dst string, info os.FileInfo, g *errgroup.Group, files, bytes *atomic.Int64) error {
+// ctx is checked at each node so a cancellation aborts the walk mid-tree.
+func copyWalk(ctx context.Context, src, dst string, info os.FileInfo, g *errgroup.Group, files, bytes *atomic.Int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	mode := info.Mode()
 	switch {
 	case mode&os.ModeSymlink != 0:
@@ -198,7 +214,7 @@ func copyWalk(src, dst string, info os.FileInfo, g *errgroup.Group, files, bytes
 			if err != nil {
 				return err
 			}
-			if err := copyWalk(childSrc, childDst, childInfo, g, files, bytes); err != nil {
+			if err := copyWalk(ctx, childSrc, childDst, childInfo, g, files, bytes); err != nil {
 				return err
 			}
 		}
@@ -206,6 +222,9 @@ func copyWalk(src, dst string, info os.FileInfo, g *errgroup.Group, files, bytes
 	case mode.IsRegular():
 		perm := mode.Perm()
 		g.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			n, err := copyRegularFile(src, dst, perm)
 			if err != nil {
 				return err
