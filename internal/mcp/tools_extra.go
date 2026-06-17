@@ -368,11 +368,23 @@ func subscribePollPath(
 			return logsSubscribeOut{Events: store.EventsJSON(collected), Anchor: anchor, Notifications: notifications, Mode: "poll"}
 		}
 		if time.Now().After(deadline) {
-			return logsSubscribeOut{Events: store.EventsJSON(collected), Anchor: anchor, TimedOut: true, Notifications: notifications, Mode: "poll"}
+			return logsSubscribeOut{
+				Events:        store.EventsJSON(collected),
+				Anchor:        anchor,
+				TimedOut:      true,
+				Notifications: notifications,
+				Mode:          "poll",
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return logsSubscribeOut{Events: store.EventsJSON(collected), Anchor: anchor, TimedOut: true, Notifications: notifications, Mode: "poll"}
+			return logsSubscribeOut{
+				Events:        store.EventsJSON(collected),
+				Anchor:        anchor,
+				TimedOut:      true,
+				Notifications: notifications,
+				Mode:          "poll",
+			}
 		case <-tick.C:
 		}
 	}
