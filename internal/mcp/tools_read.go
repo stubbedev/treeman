@@ -747,7 +747,7 @@ type worktreeShowOut struct {
 	// and which branch's data currently occupies it — the swap state an
 	// agent needs to reason about resume/seed behaviour.
 	BranchScoped []store.ActiveBranchRow `json:"branch_scoped,omitempty"`
-	Recent       []store.Event           `json:"recent_events"`
+	Recent       []store.EventJSON       `json:"recent_events"`
 }
 
 func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeShowIn) (*mcpsdk.CallToolResult, worktreeShowOut, error) {
@@ -793,7 +793,7 @@ func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 	if err != nil {
 		return nil, worktreeShowOut{}, err
 	}
-	return nil, worktreeShowOut{Worktree: w, Ports: ports, BranchScoped: branchScoped, Recent: events}, nil
+	return nil, worktreeShowOut{Worktree: w, Ports: ports, BranchScoped: branchScoped, Recent: store.EventsJSON(events)}, nil
 }
 
 // ─── branch_scoped_status ─────────────────────────────────────────
@@ -868,7 +868,7 @@ type logsQueryIn struct {
 	Limit       int      `json:"limit,omitempty"        jsonschema:"default 50, max 1000"`
 }
 type logsQueryOut struct {
-	Events []store.Event `json:"events"`
+	Events []store.EventJSON `json:"events"`
 }
 
 func clampLogLimit(limit int) int {
@@ -968,7 +968,7 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 		events[i].Message = redactSecrets(events[i].Message)
 		events[i].PayloadJSON = redactSecrets(events[i].PayloadJSON)
 	}
-	return nil, logsQueryOut{Events: events}, nil
+	return nil, logsQueryOut{Events: store.EventsJSON(events)}, nil
 }
 
 func validateLevels(in []string) []string {
@@ -1040,7 +1040,7 @@ type logsHooksIn struct {
 	Limit    int    `json:"limit,omitempty" jsonschema:"default 50"`
 }
 type logsHooksOut struct {
-	Runs []store.HookRun `json:"runs"`
+	Runs []store.HookRunJSON `json:"runs"`
 }
 
 func logsHooksTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsHooksIn) (*mcpsdk.CallToolResult, logsHooksOut, error) {
@@ -1076,7 +1076,7 @@ func logsHooksTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsHooksI
 		runs[i].StdoutTail = redactSecrets(runs[i].StdoutTail)
 		runs[i].StderrTail = redactSecrets(runs[i].StderrTail)
 	}
-	return nil, logsHooksOut{Runs: runs}, nil
+	return nil, logsHooksOut{Runs: store.HookRunsJSON(runs)}, nil
 }
 
 // ─── fw_detect / slug_compute / daemon_status ─────────────────────

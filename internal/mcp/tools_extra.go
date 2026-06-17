@@ -43,9 +43,9 @@ type logsWaitIn struct {
 }
 
 type logsWaitOut struct {
-	Events   []store.Event `json:"events"`
-	TimedOut bool          `json:"timed_out"`
-	Anchor   int64         `json:"anchor_id" jsonschema:"highest event id at the moment the wait started; only events newer than this count"`
+	Events   []store.EventJSON `json:"events"`
+	TimedOut bool              `json:"timed_out"`
+	Anchor   int64             `json:"anchor_id" jsonschema:"highest event id at the moment the wait started; only events newer than this count"`
 }
 
 // logsWaitTool blocks until min_count new events match the filter, or
@@ -111,14 +111,14 @@ func logsWaitTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsWaitIn)
 			}
 		}
 		if len(collected) >= minCount {
-			return nil, logsWaitOut{Events: collected, Anchor: anchor}, nil
+			return nil, logsWaitOut{Events: store.EventsJSON(collected), Anchor: anchor}, nil
 		}
 		if time.Now().After(deadline) {
-			return nil, logsWaitOut{Events: collected, Anchor: anchor, TimedOut: true}, nil
+			return nil, logsWaitOut{Events: store.EventsJSON(collected), Anchor: anchor, TimedOut: true}, nil
 		}
 		select {
 		case <-ctx.Done():
-			return nil, logsWaitOut{Events: collected, Anchor: anchor, TimedOut: true}, ctx.Err()
+			return nil, logsWaitOut{Events: store.EventsJSON(collected), Anchor: anchor, TimedOut: true}, ctx.Err()
 		case <-tick.C:
 		}
 	}
@@ -158,11 +158,11 @@ type logsSubscribeIn struct {
 // records whether events came via daemon push or a polling fallback —
 // useful for debugging "did my streaming actually stream".
 type logsSubscribeOut struct {
-	Events        []store.Event `json:"events"`
-	TimedOut      bool          `json:"timed_out"`
-	Anchor        int64         `json:"anchor_id"          jsonschema:"highest event id at the moment the subscription started"`
-	Notifications int           `json:"notifications_sent" jsonschema:"how many notifications were dispatched to the session"`
-	Mode          string        `json:"mode"               jsonschema:"push (daemon streaming) | poll (sqlite fallback when daemon unreachable)"`
+	Events        []store.EventJSON `json:"events"`
+	TimedOut      bool              `json:"timed_out"`
+	Anchor        int64             `json:"anchor_id"          jsonschema:"highest event id at the moment the subscription started"`
+	Notifications int               `json:"notifications_sent" jsonschema:"how many notifications were dispatched to the session"`
+	Mode          string            `json:"mode"               jsonschema:"push (daemon streaming) | poll (sqlite fallback when daemon unreachable)"`
 }
 
 // logsSubscribeTool blocks until min_count new events match the filter
@@ -259,7 +259,7 @@ func subscribePushPath(
 				// if we haven't met min_count.
 				timedOut := len(collected) < minCount
 				return logsSubscribeOut{
-					Events: collected, Anchor: anchor, TimedOut: timedOut,
+					Events: store.EventsJSON(collected), Anchor: anchor, TimedOut: timedOut,
 					Notifications: notifications, Mode: "push",
 				}, true
 			}
@@ -270,18 +270,18 @@ func subscribePushPath(
 			notifications += dispatchEventNotification(ctx, req, progressToken, len(collected), minCount, ev)
 			if len(collected) >= minCount {
 				return logsSubscribeOut{
-					Events: collected, Anchor: anchor,
+					Events: store.EventsJSON(collected), Anchor: anchor,
 					Notifications: notifications, Mode: "push",
 				}, true
 			}
 		case <-deadlineCh:
 			return logsSubscribeOut{
-				Events: collected, Anchor: anchor, TimedOut: true,
+				Events: store.EventsJSON(collected), Anchor: anchor, TimedOut: true,
 				Notifications: notifications, Mode: "push",
 			}, true
 		case <-ctx.Done():
 			return logsSubscribeOut{
-				Events: collected, Anchor: anchor, TimedOut: true,
+				Events: store.EventsJSON(collected), Anchor: anchor, TimedOut: true,
 				Notifications: notifications, Mode: "push",
 			}, true
 		}
@@ -365,14 +365,14 @@ func subscribePollPath(
 			notifications += dispatchEventNotification(ctx, req, progressToken, len(collected), minCount, e)
 		}
 		if len(collected) >= minCount {
-			return logsSubscribeOut{Events: collected, Anchor: anchor, Notifications: notifications, Mode: "poll"}
+			return logsSubscribeOut{Events: store.EventsJSON(collected), Anchor: anchor, Notifications: notifications, Mode: "poll"}
 		}
 		if time.Now().After(deadline) {
-			return logsSubscribeOut{Events: collected, Anchor: anchor, TimedOut: true, Notifications: notifications, Mode: "poll"}
+			return logsSubscribeOut{Events: store.EventsJSON(collected), Anchor: anchor, TimedOut: true, Notifications: notifications, Mode: "poll"}
 		}
 		select {
 		case <-ctx.Done():
-			return logsSubscribeOut{Events: collected, Anchor: anchor, TimedOut: true, Notifications: notifications, Mode: "poll"}
+			return logsSubscribeOut{Events: store.EventsJSON(collected), Anchor: anchor, TimedOut: true, Notifications: notifications, Mode: "poll"}
 		case <-tick.C:
 		}
 	}
