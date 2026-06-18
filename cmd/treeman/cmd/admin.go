@@ -3,9 +3,12 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -30,6 +33,7 @@ func RegistryCmd() *cli.Command {
 		Name:  "registry",
 		Usage: "SQLite worktree-registry maintenance",
 		Commands: []*cli.Command{
+			RegistryListCmd(),
 			{
 				Name:  "repair",
 				Usage: "reconcile the SQLite registry with `git worktree list` (register drift / mark missing)",
@@ -42,18 +46,16 @@ func RegistryCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
-					st, err := openDefaultStore(ctx)
-					if err != nil {
-						return err
-					}
-					defer st.Close()
-					res, err := wtreg.Repair(ctx, st, repoRoot, detectBranchOfWorktree)
-					if err != nil {
-						return err
-					}
+					task := rpc.Task{Type: rpc.TaskRegistryRepair, RepoPath: repoRoot}
 					if c.Bool("json") {
-						return jsonStream(res)
+						return runResultJSON(ctx, task)
 					}
+					payload, err := resultPayload(ctx, task)
+					if err != nil {
+						return err
+					}
+					var res wtreg.RepairResult
+					_ = json.Unmarshal(payload, &res)
 					for _, p := range res.Registered {
 						PrintOK("registered %s", p)
 					}
@@ -111,7 +113,7 @@ Examples:
 			force := c.Bool("force")
 			if !c.Bool("yes") && !c.Bool("json") {
 				if !ui.Confirm(fmt.Sprintf("remove %s from the treeman registry?", repoRoot)) {
-					return fmt.Errorf("aborted")
+					return errors.New("aborted")
 				}
 			}
 
@@ -137,7 +139,7 @@ Examples:
 			if err != nil {
 				return err
 			}
-			defer st.Close()
+			defer func() { _ = st.Close() }()
 			repoID, err := st.LookupRepoID(ctx, repoRoot)
 			if err != nil {
 				return err
@@ -203,7 +205,7 @@ func SnapshotsCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
-					defer st.Close()
+					defer func() { _ = st.Close() }()
 					repoID, err := lookupRepoID(ctx, st, repoRoot)
 					if err != nil {
 						if c.Bool("json") {
@@ -216,16 +218,38 @@ func SnapshotsCmd() *cli.Command {
 					if err != nil {
 						return err
 					}
+					// Pre-warmed spare pools are engine-side only (no
+					// SQLite rows) — count them here so `prewarm` users
+					// can see their pools without psql. Best-effort: an
+					// unreachable engine just blanks the column.
+					spares := map[string]int{}
+					if cfg, lerr := resolve.LoadResolved(repoRoot); lerr == nil {
+						if sc, serr := snapshot.SpareCounts(ctx, &cfg); serr == nil {
+							spares = sc
+						}
+					}
 					if c.Bool("json") {
-						return jsonStream(map[string]any{"repo": repoRoot, "snapshots": cands})
+						type snapRow struct {
+							store.SnapshotEvictionCandidate
+							Spares int `json:"spares"`
+						}
+						rows := make([]snapRow, 0, len(cands))
+						for _, sc := range cands {
+							rows = append(rows, snapRow{sc, spares[sc.TemplateName]})
+						}
+						return jsonStream(map[string]any{"repo": repoRoot, "snapshots": rows})
 					}
 					if len(cands) == 0 {
 						PrintInfo("no snapshots cached for %s", repoRoot)
 						return nil
 					}
-					t := ui.NewTable("ENGINE", "TEMPLATE", "SOURCE_DB", "FINGERPRINT")
+					t := ui.NewTable("ENGINE", "TEMPLATE", "SOURCE_DB", "SPARES", "FINGERPRINT")
 					for _, sc := range cands {
-						t.Row(ui.Cyan(sc.Engine), sc.TemplateName, sc.SourceDB, ui.Dim(sc.Fingerprint))
+						spareCol := "-"
+						if n, ok := spares[sc.TemplateName]; ok {
+							spareCol = strconv.Itoa(n)
+						}
+						t.Row(ui.Cyan(sc.Engine), sc.TemplateName, sc.SourceDB, spareCol, ui.Dim(sc.Fingerprint))
 					}
 					t.Render(nil)
 					return nil
@@ -237,38 +261,25 @@ func SnapshotsCmd() *cli.Command {
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 					&cli.BoolFlag{Name: "json"},
+					&cli.BoolFlag{
+						Name:    "foreground",
+						Aliases: []string{"wait", "f"},
+						Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+					},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
 					repoRoot, err := resolveRepo(c.String("repo"))
 					if err != nil {
 						return err
 					}
-					cfg, err := resolve.LoadResolved(repoRoot)
-					if err != nil {
-						return fmt.Errorf("load config: %w", err)
+					task := rpc.Task{
+						Type: rpc.TaskSnapshotsPurge, RepoPath: repoRoot,
+						InheritedEnv: CaptureInheritedEnv(),
 					}
-					st, err := openDefaultStore(ctx)
-					if err != nil {
-						return err
-					}
-					defer st.Close()
-					repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-					if err != nil {
-						return fmt.Errorf("ensure repo: %w", err)
-					}
-					dropped, errs := snapshot.PurgeRepo(ctx, &cfg, st, repoID)
 					if c.Bool("json") {
-						msgs := make([]string, 0, len(errs))
-						for _, e := range errs {
-							msgs = append(msgs, e.Error())
-						}
-						return jsonStream(map[string]any{"repo": repoRoot, "dropped": dropped, "errors": msgs})
+						return runResultJSON(ctx, task)
 					}
-					PrintOK("purged %d snapshot(s) for %s", dropped, repoRoot)
-					for _, e := range errs {
-						PrintWarn("%s", e)
-					}
-					return nil
+					return dispatchTask(ctx, task, c.Bool("foreground"), "snapshots purge")
 				},
 			},
 		},
@@ -298,47 +309,48 @@ never wipe the whole table.
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.String("repo") == "" && c.String("worktree") == "" && c.String("older-than") == "" &&
 				len(c.StringSlice("level")) == 0 && len(c.StringSlice("event-type")) == 0 {
-				return fmt.Errorf("at least one filter (--repo, --worktree, --older-than, --level, --event-type) is required")
+				return errors.New("at least one filter (--repo, --worktree, --older-than, --level, --event-type) is required")
 			}
-			f := store.EventFilter{
-				Levels:     validateLevels(c.StringSlice("level")),
-				EventTypes: c.StringSlice("event-type"),
+			// Build the purge filter as task params; the daemon owns the
+			// DELETE (single SQLite writer). Scope paths are resolved to
+			// absolute here — the daemon's cwd is not the user's.
+			params := map[string]string{}
+			if lv := validateLevels(c.StringSlice("level")); len(lv) > 0 {
+				params["levels"] = strings.Join(lv, ",")
+			}
+			if et := c.StringSlice("event-type"); len(et) > 0 {
+				params["event_types"] = strings.Join(et, ",")
 			}
 			if v := c.String("older-than"); v != "" {
 				t, err := parseOlderThan(v)
 				if err != nil {
 					return err
 				}
-				f.UntilMs = t.UnixMilli()
+				params["until_ms"] = strconv.FormatInt(t.UnixMilli(), 10)
 			}
-			st, err := openDefaultStore(ctx)
-			if err != nil {
-				return err
-			}
-			defer st.Close()
-			if c.String("repo") != "" || c.String("worktree") != "" {
-				repoRoot, err := resolveRepo(c.String("repo"))
-				if err == nil && repoRoot != "" {
-					if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
-						f.RepoID = rid
-					}
+			if r := c.String("repo"); r != "" {
+				repoAbs, err := resolveRepo(r)
+				if err != nil {
+					return err
 				}
-				if wname := c.String("worktree"); wname != "" {
-					wid, _ := st.LookupWorktreeID(ctx, f.RepoID, wname)
-					if wid == 0 {
-						return fmt.Errorf("no worktree matches %q", wname)
-					}
-					f.WorktreeID = wid
-				}
+				params["repo"] = repoAbs
 			}
-			n, err := st.PurgeEvents(ctx, f)
-			if err != nil {
-				return err
+			if w := c.String("worktree"); w != "" {
+				params["worktree"] = w
 			}
+			task := rpc.Task{Type: rpc.TaskLogsPurge, Params: params}
 			if c.Bool("json") {
-				return jsonStream(map[string]any{"rows_removed": n})
+				return runResultJSON(ctx, task)
 			}
-			PrintOK("removed %d event row(s)", n)
+			payload, err := resultPayload(ctx, task)
+			if err != nil {
+				return err
+			}
+			var r struct {
+				RowsRemoved int64 `json:"rows_removed"`
+			}
+			_ = json.Unmarshal(payload, &r)
+			PrintOK("removed %d event row(s)", r.RowsRemoved)
 			return nil
 		},
 	}
@@ -364,7 +376,7 @@ Examples:
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 2 {
-				return fmt.Errorf("usage: treeman config set <path> <value>")
+				return errors.New("usage: treeman config set <path> <value>")
 			}
 			path := c.Args().Get(0)
 			rawValue := c.Args().Get(1)
@@ -373,50 +385,14 @@ Examples:
 				return err
 			}
 			p := filepath.Join(repoRoot, ".treeman.yaml")
-			raw, err := os.ReadFile(p)
-			if err != nil {
-				return fmt.Errorf("read %s: %w", p, err)
-			}
-			var doc yaml.Node
-			if err := yaml.Unmarshal(raw, &doc); err != nil {
-				return fmt.Errorf("parse %s: %w", p, err)
-			}
-			segs, err := yamlpatch.ParsePath(path)
+			body, prev, value, err := applyConfigSet(p, path, rawValue)
 			if err != nil {
 				return err
 			}
-			var value any
-			if err := json.Unmarshal([]byte(rawValue), &value); err != nil {
-				value = rawValue
-			}
-			newNode, err := yamlpatch.ValueToNode(value)
-			if err != nil {
-				return fmt.Errorf("encode value: %w", err)
-			}
-			prev, err := yamlpatch.Set(&doc, segs, newNode)
-			if err != nil {
+			if err := writeConfig(ctx, repoRoot, p, body); err != nil {
 				return err
 			}
-			body, err := yamlpatch.Marshal(&doc)
-			if err != nil {
-				return fmt.Errorf("encode yaml: %w", err)
-			}
-			var validated config.Config
-			if err := yaml.Unmarshal(body, &validated); err != nil {
-				return fmt.Errorf("validation failed — patched file would not parse as config.Config: %w", err)
-			}
-			if err := atomicWriteFile(p, body); err != nil {
-				return err
-			}
-			prevJSON := ""
-			if prev != nil {
-				var v any
-				if err := prev.Decode(&v); err == nil {
-					if b, err := json.Marshal(v); err == nil {
-						prevJSON = string(b)
-					}
-				}
-			}
+			prevJSON := decodePrevJSON(prev)
 			newJSON, _ := json.Marshal(value)
 			if c.Bool("json") {
 				return jsonStream(map[string]any{
@@ -436,6 +412,68 @@ Examples:
 	}
 }
 
+// applyConfigSet reads .treeman.yaml at p, patches the dotted path with
+// rawValue (parsed as JSON when possible, literal string otherwise),
+// and validates the result still parses as config.Config. Returns the
+// new body, the previous node at that path (nil for a new key), and the
+// parsed value.
+func applyConfigSet(p, path, rawValue string) (body []byte, prev *yaml.Node, value any, err error) {
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read %s: %w", p, err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, nil, nil, fmt.Errorf("parse %s: %w", p, err)
+	}
+	segs, err := yamlpatch.ParsePath(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(segs) > 0 && segs[0].Key != "" {
+		if err := config.CheckKeyInLayer(segs[0].Key, "repo"); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	if err := json.Unmarshal([]byte(rawValue), &value); err != nil {
+		value = rawValue
+	}
+	newNode, err := yamlpatch.ValueToNode(value)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("encode value: %w", err)
+	}
+	prev, err = yamlpatch.Set(&doc, segs, newNode)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	body, err = yamlpatch.Marshal(&doc)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("encode yaml: %w", err)
+	}
+	var validated config.Config
+	if err := yaml.Unmarshal(body, &validated); err != nil {
+		return nil, nil, nil, fmt.Errorf("validation failed — patched file would not parse as config.Config: %w", err)
+	}
+	return body, prev, value, nil
+}
+
+// decodePrevJSON renders a patched-over node as compact JSON for the
+// "old → new" diff line. Returns "" for a new key or any decode failure.
+func decodePrevJSON(prev *yaml.Node) string {
+	if prev == nil {
+		return ""
+	}
+	var v any
+	if prev.Decode(&v) != nil {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // openDefaultStore opens the default SQLite event store.
 func openDefaultStore(ctx context.Context) (*store.Store, error) {
 	p, err := store.DefaultDBPath()
@@ -444,18 +482,6 @@ func openDefaultStore(ctx context.Context) (*store.Store, error) {
 	}
 	return store.Open(ctx, p)
 }
-
-// atomicWriteFile delegates to yamlpatch.AtomicWriteWithBackup so
-// every config-set / config-write path keeps the last 5 backups in
-// case an agent (or human) clobbers something important.
-func atomicWriteFile(path string, data []byte) error {
-	return yamlpatch.AtomicWriteWithBackup(path, data, configBackupKeep)
-}
-
-// configBackupKeep is the rotation depth for `.treeman.yaml.bak.*`
-// snapshots created on every config_set / config_write. Five is
-// arbitrary but covers a typical session of trial-and-error edits.
-const configBackupKeep = 5
 
 // parseOlderThan accepts "24h" / "7d" / RFC3339. For durations the
 // cutoff is interpreted as "older than now-d".

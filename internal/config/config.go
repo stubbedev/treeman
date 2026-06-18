@@ -14,7 +14,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/invopop/jsonschema"
 	orderedmap "github.com/pb33f/ordered-map/v2"
@@ -24,31 +27,31 @@ import (
 // Config is the top-level structure of a `.treeman.yaml` plus the
 // global `~/.config/treeman/config.yaml`.
 type Config struct {
-	// Daemon process settings: socket path, log level, log database
-	// location. Typically lives in the user-global config.
-	Daemon DaemonConfig `yaml:"daemon,omitempty"`
+	// Daemon process settings: stderr log level. Typically lives in
+	// the user-global config.
+	Daemon DaemonConfig `yaml:"daemon,omitempty" scope:"global"`
 
 	// Connection blocks per supported engine (MySQL, Postgres,
 	// MongoDB, Redis, Elasticsearch). Treeman dials these to create
 	// per-worktree clone databases, run migrations.
-	Connections ConnectionsConfig `yaml:"connections,omitempty"`
+	Connections ConnectionsConfig `yaml:"connections,omitempty" scope:"both"`
 
-	// Snapshot cache settings: where post-migration template
-	// snapshots are cached on disk, plus retention/eviction policy.
-	Snapshots SnapshotsConfig `yaml:"snapshots,omitempty"`
+	// Snapshot retention/eviction policy for cached post-migration
+	// template snapshots: per-repo cap, per-source keep, max age,
+	// max total size, GC cadence.
+	Snapshots SnapshotsConfig `yaml:"snapshots,omitempty" scope:"global"`
 
-	// Worktree creation/deletion behaviour: root path, symlink mirrors,
-	// async vs sync semantics for hooks.
-	Worktrees WorktreesConfig `yaml:"worktrees,omitempty"`
+	// Worktree creation behaviour: root path, symlinked mirrors
+	// (links), and copied files (copies).
+	Worktrees WorktreesConfig `yaml:"worktrees,omitempty" scope:"both"`
 
 	// EnvSources is the ordered list of `.env*` files the credential
 	// resolver consults when looking up DB passwords and other
-	// secrets. Later entries override earlier ones. Empty falls back
-	// to the default search order:
-	//   .env → .env.local → .env.test → .env.testing →
-	//   .env.test.local → .env.testing.local
+	// secrets. Later entries override earlier ones. Empty means no
+	// env files are read — `treeman init` scaffolds a
+	// framework-tailored `env_sources` list.
 	// Per-worktree rewriting of these files lives in `patches:`.
-	EnvSources []string `yaml:"env_sources,omitempty"`
+	EnvSources []string `yaml:"env_sources,omitempty" scope:"repo"`
 
 	// Files to rewrite inside each worktree with per-worktree values
 	// (slug-substituted DB names, cache prefixes, etc.). Supports
@@ -63,40 +66,44 @@ type Config struct {
 	// Re-applied on every `treeman wt finalize` so a branch switch
 	// inside an existing worktree re-evaluates each patch against
 	// the new HEAD's slug.
-	Patches []Patch `yaml:"patches,omitempty"`
+	Patches []Patch `yaml:"patches,omitempty" scope:"repo"`
 
 	// One entry per database the project owns. Each entry pairs an
 	// engine with a dump path, migration source, test-clone fanout,
 	// and optional namespace template.
-	Databases []DatabaseConfig `yaml:"databases,omitempty"`
+	Databases []DatabaseConfig `yaml:"databases,omitempty" scope:"repo"`
 
-	// Lifecycle hooks fired around worktree create/delete. Two phases:
-	// `setup` (after create) and `teardown` (before delete). Run
-	// async by default; `worktrees.async_create` / `async_delete`
-	// control whether the CLI blocks on completion.
-	Hooks HooksConfig `yaml:"hooks,omitempty"`
+	// Lifecycle hooks fired around worktree create/delete/checkout and
+	// on watched-file changes. A flat block of trigger-keyed action
+	// lists (create-before-engines, create-after-engines,
+	// delete-before-engines, delete-after-engines, checkout,
+	// file-change); see HooksConfig. Dispatched non-blocking via
+	// the daemon; when the daemon is unreachable they run inline
+	// (blocking) in the CLI.
+	Hooks HooksConfig `yaml:"hooks,omitempty" scope:"repo"`
 
 	// DebounceMs is the file-watcher debounce window in
 	// milliseconds. Coalesces editor save bursts into one re-prep
 	// dispatch. Default 500.
-	DebounceMs uint64 `yaml:"debounce_ms,omitempty"`
+	DebounceMs uint64 `yaml:"debounce_ms,omitempty" scope:"both"`
 
 	// User-defined migration frameworks keyed by name. Use this when
 	// the built-in framework presets don't cover your tool — declare
-	// the markers, migration dirs, file pattern, and hash policy
-	// explicitly.
-	Frameworks map[string]CustomFramework `yaml:"frameworks,omitempty"`
+	// the markers, migration dirs, file pattern, lockfiles, and
+	// engine hint explicitly.
+	Frameworks map[string]CustomFramework `yaml:"frameworks,omitempty" scope:"both"`
 
 	// Logs retention. Daemon-side prune drops rows older than
 	// `keep_days` from the events, hook_runs, and hook_log_chunks
 	// tables on a fixed interval. Set 0 to keep forever (no prune).
-	Logs LogsConfig `yaml:"logs,omitempty"`
+	Logs LogsConfig `yaml:"logs,omitempty" scope:"global"`
 
 	// AutoFetch policy. Daemon-side periodic `git fetch --all --prune`
-	// per registered repo, followed by a `git merge --ff-only @{u}`
-	// per active worktree. Skips dirty trees, non-ff branches, and
+	// per registered repo, followed by a fast-forward (`merge
+	// --ff-only @{u}`) or rebase per active worktree, per
+	// `auto_fetch.mode`. Skips dirty trees, non-ff branches, and
 	// upstreamless branches. Enabled by default at a 15-minute cadence.
-	AutoFetch AutoFetchConfig `yaml:"auto_fetch,omitempty"`
+	AutoFetch AutoFetchConfig `yaml:"auto_fetch,omitempty" scope:"both"`
 
 	// MainWorktree opts the repo's main checkout (repo root) into the
 	// same watcher-driven prepare/migrate/teardown lifecycle that
@@ -104,7 +111,7 @@ type Config struct {
 	// — flipping it on for an existing repo will start creating
 	// per-branch databases when the user switches branches at the
 	// repo root.
-	MainWorktree MainWorktreeConfig `yaml:"main_worktree,omitempty"`
+	MainWorktree MainWorktreeConfig `yaml:"main_worktree,omitempty" scope:"repo"`
 
 	// Ports declares per-worktree port slots. Each entry is a named
 	// slot with a port range; treeman allocates a free port per slot
@@ -116,7 +123,86 @@ type Config struct {
 	// Use slot names that match the role they fill in your app (e.g.
 	// `octane`, `webpack`, `reverb`) — the name shows up in every
 	// `{port_<name>}` reference and in `wt show` output.
-	Ports map[string]PortSpec `yaml:"ports,omitempty"`
+	Ports map[string]PortSpec `yaml:"ports,omitempty" scope:"both"`
+
+	// Status configures the `treeman status` widget output (icons,
+	// labels, hover lines, custom bar formats). Lives in the global
+	// config since the widget aggregates worktrees across every repo.
+	Status StatusConfig `yaml:"status,omitempty" scope:"global"`
+
+	// Notifications opts into desktop notifications (notify-send on
+	// Linux, the native banner via osascript on macOS) when a worktree
+	// changes lifecycle state. Off by default. Lives in the global
+	// config since the daemon that emits them is a single cross-repo
+	// process.
+	Notifications NotificationsConfig `yaml:"notifications,omitempty" scope:"global"`
+}
+
+// StatusConfig configures `treeman status` — the bar/waybar widget
+// that aggregates worktree health across every registered repo. Each
+// active worktree falls into one of four buckets:
+//
+//	stable  — ready (last finalize succeeded, or never ran)
+//	up      — being prepared (finalize in progress)
+//	down    — being torn down (teardown in progress)
+//	failed  — last finalize errored
+//
+// All knobs below feed the `{key}` template syntax used elsewhere in
+// `.treeman.yaml` (no separate templating engine). The built-in
+// `--format` values are `icon`, `hover`, `waybar`, and `json`; entries
+// in `formats` add or override named single-line formats.
+type StatusConfig struct {
+	// Icons holds the glyph for each bucket. Exposed to format
+	// templates as `{icon_stable}` / `{icon_up}` / `{icon_down}` /
+	// `{icon_failed}`, plus `{icon}` for the worst non-empty bucket.
+	// Defaults to Nerd Font glyphs; set an icon to a single space to
+	// suppress it (an empty string falls back to the default).
+	Icons StatusBuckets `yaml:"icons,omitempty"`
+
+	// Labels holds the text label for each bucket. Exposed as
+	// `{label_stable}` etc. Defaults to the bucket name.
+	Labels StatusBuckets `yaml:"labels,omitempty"`
+
+	// Separator joins the segments of the built-in `icon` line and is
+	// exposed to templates as `{sep}`. Default " | ".
+	Separator string `yaml:"separator,omitempty"`
+
+	// Header is the `{key}` template for each repo heading in the
+	// built-in `hover` format. Tokens: `{repo}`, `{total}`,
+	// `{stable}`, `{up}`, `{down}`, `{failed}` (repo-scoped counts).
+	// Default "{repo}  ({total})".
+	Header string `yaml:"header,omitempty"`
+
+	// Row is the `{key}` template for each worktree line in the
+	// built-in `hover` format. Tokens: `{branch}`, `{slug}`,
+	// `{state}`, `{bucket}`, `{main}`, `{state_suffix}`, `{path}`,
+	// `{icon}`. Default "  {main}{branch}{state_suffix}".
+	Row string `yaml:"row,omitempty"`
+
+	// MainMarker is substituted for `{main}` on a repo's main-worktree
+	// row (empty string on linked worktrees). Default "★ ".
+	MainMarker string `yaml:"main_marker,omitempty"`
+
+	// Formats declares named single-line `{key}` templates selectable
+	// with `treeman status --format <name>`. A name matching the
+	// built-in `icon` line overrides it; the structured built-ins
+	// `hover`/`waybar`/`json` are reserved and cannot be overridden.
+	// Available tokens match
+	// the `icon` line: `{total}`, `{stable}`, `{up}`, `{down}`,
+	// `{failed}`, `{icon_*}`, `{icon}`, `{label_*}`, `{class}`,
+	// `{sep}`. A flat template cannot express the multi-line hover
+	// body — customize that with `header` / `row` instead.
+	Formats map[string]string `yaml:"formats,omitempty"`
+}
+
+// StatusBuckets carries one string per worktree bucket. Reused for
+// both the `icons` and `labels` maps so the four bucket names stay in
+// lockstep across the schema.
+type StatusBuckets struct {
+	Stable string `yaml:"stable,omitempty"`
+	Up     string `yaml:"up,omitempty"`
+	Down   string `yaml:"down,omitempty"`
+	Failed string `yaml:"failed,omitempty"`
 }
 
 // AutoFetchConfig — `auto_fetch:` block. Periodic daemon-side
@@ -168,6 +254,52 @@ func (a AutoFetchConfig) ResolvedMode() string {
 	default:
 		return "ff"
 	}
+}
+
+// NotificationsConfig — `notifications:` block. Opt-in desktop
+// notifications fired by the daemon when a worktree crosses a lifecycle
+// status boundary. Backend is auto-detected per OS (notify-send on
+// Linux, `osascript -e 'display notification'` on macOS); platforms
+// without a known sender silently no-op.
+//
+// Each notification is keyed to one of the four `treeman status`
+// buckets:
+//   - stable: a worktree finished preparing and is ready (finalize done)
+//   - up:     a worktree began preparing (finalize started)
+//   - down:   a worktree began tearing down
+//   - failed: a worktree's finalize errored
+//
+// `up` and `down` are transient and chatty, so the default
+// (`events:` unset) only notifies on `stable` + `failed` — ready and
+// errored, the two resting states worth surfacing. Set `events:`
+// explicitly to opt into the transient ones, or to a subset.
+type NotificationsConfig struct {
+	// Enabled toggles the whole feature. Off by default — every
+	// existing install sees zero behaviour change until it's set.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Events is the set of status buckets that fire a notification.
+	// Allowed values: stable, up, down, failed. When unset (nil) the
+	// default of [stable, failed] applies (see applyDefaults). An
+	// explicit empty list (`events: []`) disables every bucket while
+	// leaving the feature otherwise "enabled" — useful as a base for a
+	// per-repo override that re-adds buckets.
+	Events []string `yaml:"events,omitempty" jsonschema:"enum=stable,enum=up,enum=down,enum=failed"`
+
+	// Backend forces a specific sender instead of OS auto-detection.
+	// Allowed values: auto (default), notify-send, osascript, none.
+	// `none` disables sending without unsetting `enabled` — handy to
+	// mute notifications on one host while keeping the shared config.
+	Backend string `yaml:"backend,omitempty" jsonschema:"enum=auto,enum=notify-send,enum=osascript,enum=none"`
+}
+
+// NotifyOn reports whether the given status bucket should fire a
+// notification under this config. A disabled config never fires.
+func (n NotificationsConfig) NotifyOn(bucket string) bool {
+	if !n.Enabled {
+		return false
+	}
+	return slices.Contains(n.Events, bucket)
 }
 
 // MainWorktreeConfig — `main_worktree:` block. Opt-in handle that
@@ -284,9 +416,10 @@ type ConnectionsConfig struct {
 	S3 *S3Conn `yaml:"s3,omitempty"`
 }
 
-// MysqlConn — host/port/user. `Password` is runtime-only; never
-// serialised. The resolver fills it from the repo's `.env*` files
-// + process env.
+// ContainerRef points a connection at a running container or compose
+// service: treeman rewrites the connection's `Host`/`Port` via
+// `<engine> inspect` before dialing, so you don't have to hardcode a
+// published port.
 //
 // `Container` (optional): when set, treeman runs `<engine> inspect`
 // on the container and uses either its published host-port mapping
@@ -304,7 +437,7 @@ type ConnectionsConfig struct {
 // network alongside any explicit ones).
 //
 // `ContainerEngine` is the engine binary — `docker` (default),
-// `podman`, `nerdctl`, `finch`, `orbctl`. Any binary that supports
+// `podman`, `nerdctl`, `finch`. Any binary that supports
 // `inspect` and `ps --filter label=...` works.
 //
 // When treeman itself runs inside a container (devcontainer, CI,
@@ -333,8 +466,9 @@ type ContainerRef struct {
 	ComposeProject string `yaml:"compose_project,omitempty"`
 
 	// Container engine binary: `docker` (default), `podman`,
-	// `nerdctl`, `finch`, `orbctl`. Any binary that supports
-	// `inspect` and `ps --filter label=...` works.
+	// `nerdctl`, `finch`. Any binary that supports
+	// `inspect` and `ps --filter label=...` works. OrbStack users
+	// keep the `docker` default — its CLI is a docker symlink.
 	ContainerEngine string `yaml:"container_engine,omitempty"`
 
 	// Docker network name. When the container is attached to several
@@ -372,8 +506,10 @@ type MysqlConn struct {
 	Password string `yaml:"password,omitempty"`
 
 	// Maximum open connections in the daemon's pool to this server.
-	// Defaults to a per-engine safe value. Raise only if the server
-	// is provisioned for it (max_connections raised, etc.).
+	// Defaults to 8 when the connection is auto-resolved from env; if
+	// you configure the connection explicitly and omit this, the Go
+	// sql driver's own pooling default applies. Raise only if the
+	// server is provisioned for it (max_connections raised, etc.).
 	PoolMax uint32 `yaml:"pool_max,omitempty"`
 
 	ContainerRef `yaml:",inline"`
@@ -402,9 +538,12 @@ func (c *MysqlConn) UnmarshalYAML(node *yaml.Node) error {
 }
 
 // JSONSchema for MysqlConn: scalar DSN OR full structured object.
-func (MysqlConn) JSONSchema() *jsonschema.Schema {
+// sqlConnStructSchema reflects the structured-object form shared by the
+// MySQL and Postgres connection types — they carry the identical field
+// set, so the schema is generated once here.
+func sqlConnStructSchema() *jsonschema.Schema {
 	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
-	obj := r.Reflect(&struct {
+	return r.Reflect(&struct {
 		Host         string       `yaml:"host,omitempty"`
 		Port         uint16       `yaml:"port,omitempty"`
 		User         string       `yaml:"user"`
@@ -412,38 +551,99 @@ func (MysqlConn) JSONSchema() *jsonschema.Schema {
 		PoolMax      uint32       `yaml:"pool_max,omitempty"`
 		ContainerRef ContainerRef `yaml:",inline"`
 	}{})
+}
+
+// dsnOrStructSchema wraps the shared structured form in a OneOf with the
+// bare-DSN string alternative. `dsnDesc` documents the string form;
+// `desc` is the overall connection description.
+func dsnOrStructSchema(dsnDesc, desc string) *jsonschema.Schema {
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
-			{Type: "string", Description: "DSN: `mysql://user:pass@host:port/dbname`. Equivalent to the structured form below."},
-			obj,
+			{Type: "string", Description: dsnDesc},
+			sqlConnStructSchema(),
 		},
-		Description: "MySQL connection — bare DSN string OR structured object.",
+		Description: desc,
 	}
 }
 
-// parseMysqlDSN fills cfg from a URL-form DSN.
-func parseMysqlDSN(dsn string, cfg *MysqlConn) error {
+func (MysqlConn) JSONSchema() *jsonschema.Schema {
+	return dsnOrStructSchema(
+		"DSN: `mysql://user:pass@host:port/dbname`. Equivalent to the structured form below.",
+		"MySQL connection — bare DSN string OR structured object.",
+	)
+}
+
+// dsnParts holds the fields parsed from a URL-style DSN. The has* flags
+// preserve the "field was present in the DSN" distinction so the caller
+// only overwrites its struct's defaults for values the DSN actually
+// specified (a bare `user@host` must not blank an existing password).
+type dsnParts struct {
+	host        string
+	port        uint16
+	hasPort     bool
+	user        string
+	hasUser     bool
+	password    string
+	hasPassword bool
+}
+
+// parseConnDSN parses host/port/user/password from a URL-style DSN,
+// validating the scheme against `schemes`. `label` prefixes error
+// messages; `schemeHint` is the human-readable accepted-scheme string in
+// the scheme error. Shared by the mysql and postgres DSN parsers.
+func parseConnDSN(dsn, label, schemeHint string, schemes ...string) (dsnParts, error) {
+	var p dsnParts
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return fmt.Errorf("parse mysql DSN: %w", err)
+		return p, fmt.Errorf("parse %s DSN: %w", label, err)
 	}
-	if u.Scheme != "mysql" && u.Scheme != "mariadb" {
-		return fmt.Errorf("mysql DSN: scheme must be mysql(:|maria:)//, got %q", u.Scheme)
+	if !slices.Contains(schemes, u.Scheme) {
+		return p, fmt.Errorf("%s DSN: scheme must be %s, got %q", label, schemeHint, u.Scheme)
 	}
-	cfg.Host = u.Hostname()
-	if p := u.Port(); p != "" {
-		n, err := strconv.Atoi(p)
+	p.host = u.Hostname()
+	if ps := u.Port(); ps != "" {
+		n, err := strconv.Atoi(ps)
 		if err != nil {
-			return fmt.Errorf("mysql DSN port: %w", err)
+			return p, fmt.Errorf("%s DSN port: %w", label, err)
 		}
-		cfg.Port = uint16(n)
+		if n < 0 || n > 65535 {
+			return p, fmt.Errorf("%s DSN port out of range: %d", label, n)
+		}
+		p.port = uint16(n)
+		p.hasPort = true
 	}
 	if u.User != nil {
-		cfg.User = u.User.Username()
+		p.hasUser = true
+		p.user = u.User.Username()
 		if pw, ok := u.User.Password(); ok {
-			cfg.Password = pw
+			p.password = pw
+			p.hasPassword = true
 		}
 	}
+	return p, nil
+}
+
+// applyDSNParts writes the parsed DSN fields into a connection struct's
+// host/port/user/password, only for fields the DSN actually specified.
+func applyDSNParts(p dsnParts, host *string, port *uint16, user, password *string) {
+	*host = p.host
+	if p.hasPort {
+		*port = p.port
+	}
+	if p.hasUser {
+		*user = p.user
+		if p.hasPassword {
+			*password = p.password
+		}
+	}
+}
+
+func parseMysqlDSN(dsn string, cfg *MysqlConn) error {
+	p, err := parseConnDSN(dsn, "mysql", "mysql(:|maria:)//", "mysql", "mariadb")
+	if err != nil {
+		return err
+	}
+	applyDSNParts(p, &cfg.Host, &cfg.Port, &cfg.User, &cfg.Password)
 	return nil
 }
 
@@ -456,8 +656,8 @@ type PostgresConn struct {
 	// TCP port. Defaults to 5432.
 	Port uint16 `yaml:"port,omitempty"`
 
-	// Database role. Required. Needs CREATEDB to clone, and
-	// REPLICATION when wire-protocol replay is enabled.
+	// Database role. Required. Needs the CREATEDB privilege to clone
+	// databases (clones issue `CREATE DATABASE … TEMPLATE`).
 	User string `yaml:"user"`
 
 	// Password is either a literal value or a `$NAME` / `${NAME}`
@@ -467,7 +667,7 @@ type PostgresConn struct {
 
 	// Maximum open connections in the daemon's pool.
 	PoolMax      uint32 `yaml:"pool_max,omitempty"`
-	ContainerRef `yaml:",inline"`
+	ContainerRef `       yaml:",inline"`
 }
 
 // UnmarshalYAML accepts either a bare DSN string
@@ -486,47 +686,19 @@ func (c *PostgresConn) UnmarshalYAML(node *yaml.Node) error {
 
 // JSONSchema for PostgresConn: scalar DSN OR full structured object.
 func (PostgresConn) JSONSchema() *jsonschema.Schema {
-	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
-	obj := r.Reflect(&struct {
-		Host         string       `yaml:"host,omitempty"`
-		Port         uint16       `yaml:"port,omitempty"`
-		User         string       `yaml:"user"`
-		Password     string       `yaml:"password,omitempty"`
-		PoolMax      uint32       `yaml:"pool_max,omitempty"`
-		ContainerRef ContainerRef `yaml:",inline"`
-	}{})
-	return &jsonschema.Schema{
-		OneOf: []*jsonschema.Schema{
-			{Type: "string", Description: "DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below."},
-			obj,
-		},
-		Description: "Postgres connection — bare DSN string OR structured object.",
-	}
+	return dsnOrStructSchema(
+		"DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below.",
+		"Postgres connection — bare DSN string OR structured object.",
+	)
 }
 
 // parsePostgresDSN fills cfg from a URL-form DSN.
 func parsePostgresDSN(dsn string, cfg *PostgresConn) error {
-	u, err := url.Parse(dsn)
+	p, err := parseConnDSN(dsn, "postgres", "postgres(ql)://", "postgres", "postgresql")
 	if err != nil {
-		return fmt.Errorf("parse postgres DSN: %w", err)
+		return err
 	}
-	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
-		return fmt.Errorf("postgres DSN: scheme must be postgres(ql)://, got %q", u.Scheme)
-	}
-	cfg.Host = u.Hostname()
-	if p := u.Port(); p != "" {
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			return fmt.Errorf("postgres DSN port: %w", err)
-		}
-		cfg.Port = uint16(n)
-	}
-	if u.User != nil {
-		cfg.User = u.User.Username()
-		if pw, ok := u.User.Password(); ok {
-			cfg.Password = pw
-		}
-	}
+	applyDSNParts(p, &cfg.Host, &cfg.Port, &cfg.User, &cfg.Password)
 	return nil
 }
 
@@ -536,8 +708,13 @@ type MongoConn struct {
 	// MongoDB connection URI (`mongodb://[user:pass@]host:port/[...]`).
 	// Required. When a ContainerRef is set, host/port are rewritten
 	// at dial time using the container's published mapping or IP.
-	URI          string `yaml:"uri"`
-	ContainerRef `yaml:",inline"`
+	URI string `yaml:"uri"`
+
+	// Maximum open connections in the driver's pool (maxPoolSize).
+	// Defaults to the driver's own default when unset. Same knob as
+	// the SQL engines' pool_max.
+	PoolMax      uint32 `yaml:"pool_max,omitempty"`
+	ContainerRef `       yaml:",inline"`
 }
 
 func (c *MongoConn) UnmarshalYAML(node *yaml.Node) error {
@@ -555,8 +732,13 @@ func (MongoConn) JSONSchema() *jsonschema.Schema { return uriOrMap("mongodb", "u
 type RedisConn struct {
 	// Redis connection URL (`redis://[:pass@]host:port[/db]`).
 	// Required. ContainerRef rewrites host/port at dial time.
-	URL          string `yaml:"url"`
-	ContainerRef `yaml:",inline"`
+	URL string `yaml:"url"`
+
+	// Maximum connections in the driver's pool (PoolSize). Defaults to
+	// the driver's own default when unset. Same knob as the SQL
+	// engines' pool_max.
+	PoolMax      uint32 `yaml:"pool_max,omitempty"`
+	ContainerRef `       yaml:",inline"`
 }
 
 func (c *RedisConn) UnmarshalYAML(node *yaml.Node) error {
@@ -576,8 +758,13 @@ type EsConn struct {
 	// Elasticsearch / OpenSearch HTTP URL
 	// (`http://host:9200` or `https://...`). Required.
 	// ContainerRef rewrites host/port at dial time.
-	URL          string `yaml:"url"`
-	ContainerRef `yaml:",inline"`
+	URL string `yaml:"url"`
+
+	// Maximum simultaneous HTTP connections to the cluster
+	// (http.Transport.MaxConnsPerHost). Defaults to the Go HTTP
+	// default when unset. Same knob as the SQL engines' pool_max.
+	PoolMax      uint32 `yaml:"pool_max,omitempty"`
+	ContainerRef `       yaml:",inline"`
 }
 
 func (c *EsConn) UnmarshalYAML(node *yaml.Node) error {
@@ -656,6 +843,14 @@ func (S3Conn) JSONSchema() *jsonschema.Schema {
 func uriOrMap(engine, urlField string) *jsonschema.Schema {
 	objProps := orderedmap.New[string, *jsonschema.Schema]()
 	objProps.Set(urlField, &jsonschema.Schema{Type: "string"})
+	objProps.Set(
+		"pool_max",
+		&jsonschema.Schema{
+			Type:        "integer",
+			Minimum:     json.Number("0"),
+			Description: "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency.",
+		},
+	)
 	objProps.Set("container", &jsonschema.Schema{Type: "string"})
 	objProps.Set("compose_service", &jsonschema.Schema{Type: "string"})
 	objProps.Set("compose_project", &jsonschema.Schema{Type: "string"})
@@ -874,54 +1069,53 @@ type Patch struct {
 	Set map[string]string `yaml:"set,omitempty"`
 }
 
-// HooksConfig — `hooks:` block. A flat map keyed by trigger name.
-// Each key's value is a list of Actions that fire when that trigger
-// happens. Actions in the same list run in parallel; the trigger
-// key itself encodes BOTH the lifecycle phase AND the timing point,
-// so there's no separate `when:` field anywhere.
+// HooksConfig — `hooks:` block. A flat set of trigger-keyed action
+// lists. Each key's value is a list of Actions that fire when that
+// trigger happens. Actions in the same list run in parallel; the
+// trigger key itself encodes BOTH the lifecycle phase AND the timing
+// point, so there's no separate `when:` field anywhere.
 //
 // Triggers (all optional — omit any you don't need):
 //
-//   - on-create-before-engines — during `wt create`, after patches +
+//   - create-before-engines — during `wt create`, after patches +
 //     bring-in (copies/links), BEFORE engine prepare. Standard
 //     home of dependency installs (composer/yarn/pip) so migrate
 //     can find vendor/.
-//   - on-create-after-engines — during `wt create`, after engine
+//   - create-after-engines — during `wt create`, after engine
 //     prepare. Use when actions need a populated database
 //     (cache warming, seed verification).
-//   - on-delete-before-engines — during `wt delete`, BEFORE DB
+//   - delete-before-engines — during `wt delete`, BEFORE DB
 //     drop. Graceful shutdown: drain queues, docker compose stop.
-//   - on-delete-after-engines — during `wt delete`, AFTER DB drop +
+//   - delete-after-engines — during `wt delete`, AFTER DB drop +
 //     git worktree remove. External notifications (Slack, CDN
 //     purge) that should announce only once the data is gone.
-//   - on-checkout — fires when the HEAD watcher sees a branch
+//   - checkout — fires when the HEAD watcher sees a branch
 //     switch inside an existing worktree. Re-runs in addition to
 //     the regular finalize-on-HEAD-change behaviour.
-//   - on-file-change — fires when any `databases[].inputs[]` glob
+//   - file-change — fires when any `databases[].inputs[]` glob
 //     matches a filesystem event. Each action can optionally
 //     `match: <label>` to filter by the input entry's label.
 //
-// The map shape lets new triggers be added without touching every
-// existing config. Daemon execution is always non-blocking from the
-// CLI's perspective — each list of actions dispatches in parallel.
+// Daemon execution is always non-blocking from the CLI's
+// perspective — each list of actions dispatches in parallel.
 type HooksConfig struct {
 	// OnCreateBeforeEngines — actions fire after worktree create +
 	// patches + bring-in, before engine prepare.
-	OnCreateBeforeEngines []Action `yaml:"on-create-before-engines,omitempty"`
+	OnCreateBeforeEngines []Action `yaml:"create-before-engines,omitempty"`
 
 	// OnCreateAfterEngines — actions fire after engine prepare completes.
-	OnCreateAfterEngines []Action `yaml:"on-create-after-engines,omitempty"`
+	OnCreateAfterEngines []Action `yaml:"create-after-engines,omitempty"`
 
 	// OnDeleteBeforeEngines — actions fire before DB drop on delete.
-	OnDeleteBeforeEngines []Action `yaml:"on-delete-before-engines,omitempty"`
+	OnDeleteBeforeEngines []Action `yaml:"delete-before-engines,omitempty"`
 
 	// OnDeleteAfterEngines — actions fire after DB drop + worktree
 	// remove on delete.
-	OnDeleteAfterEngines []Action `yaml:"on-delete-after-engines,omitempty"`
+	OnDeleteAfterEngines []Action `yaml:"delete-after-engines,omitempty"`
 
 	// OnCheckout — actions fire when the HEAD watcher detects a
 	// branch switch inside an existing worktree.
-	OnCheckout []Action `yaml:"on-checkout,omitempty"`
+	OnCheckout []Action `yaml:"checkout,omitempty"`
 
 	// OnFileChange — actions fire when any `databases[].inputs[]`
 	// glob matches a filesystem event. Each action can optionally
@@ -931,15 +1125,15 @@ type HooksConfig struct {
 	//
 	// The subprocess receives extra env vars naming the trigger:
 	//   TREEMAN_WATCH_PATH   — absolute path that fired
-	//   TREEMAN_WATCH_MODE   — auto | delta | rebuild
 	//   TREEMAN_WATCH_LABEL  — the label on the matched watch entry (or "")
 	//   TREEMAN_WATCH_ENGINE — engine of the owning database (mysql, postgres, …)
 	//   TREEMAN_WATCH_DB_NAME — rendered name_template of the owning database
-	OnFileChange []FilteredAction `yaml:"on-file-change,omitempty"`
+	OnFileChange []FilteredAction `yaml:"file-change,omitempty"`
 }
 
-// Action — one entry under `hooks.{setup,teardown}.actions`. Every
-// action is a mapping; there are no shorthand forms.
+// Action — one entry in a `hooks.<trigger>` list (e.g.
+// `hooks.create-before-engines`). Every action is a mapping;
+// there are no shorthand forms.
 //
 //   - `run` is the work, as either a single shell string (one
 //     command) or a list of shell strings (sequenced steps chained
@@ -947,13 +1141,14 @@ type HooksConfig struct {
 //   - `cwd` is the group-level working directory; all steps in the
 //     action share it. Use multiple actions if you need different
 //     cwds.
-//   - `container` / `compose_service` (mutually exclusive) wrap the
-//     whole action in `<engine> exec` / `<engine> compose exec` so
-//     it runs inside the named container. `in_container` is an
-//     accepted alias for `container`. `engine` is an alias for
-//     `container_engine`.
+//   - `container` / `compose_service` (mutually exclusive) run the
+//     action inside the named container. `compose_service` resolves
+//     the running container via the standard compose labels; either
+//     way each step is wrapped in `<engine> exec <id> sh -c` and
+//     chained with `&&`. `in_container` is an accepted alias for
+//     `container`. `engine` is an alias for `container_engine`.
 //
-// Actions in the same `actions:` list run in parallel; steps within
+// Actions within one trigger's list run in parallel; steps within
 // one action run sequentially.
 type Action struct {
 	// Run is the shell command(s) for this action. The YAML accepts
@@ -973,7 +1168,7 @@ type Action struct {
 
 	// ComposeService is the docker-compose service name. Treeman
 	// resolves the running container via the standard compose
-	// labels and wraps every step in `<engine> compose exec`.
+	// labels and wraps every step in `<engine> exec <id> sh -c`.
 	// Mutually exclusive with Container.
 	ComposeService string `yaml:"compose_service,omitempty"`
 
@@ -983,7 +1178,7 @@ type Action struct {
 	ComposeProject string `yaml:"compose_project,omitempty"`
 
 	// Engine is the container engine binary: `docker` (default),
-	// `podman`, `nerdctl`, `finch`, `orbctl`.
+	// `podman`, `nerdctl`, `finch`.
 	Engine string `yaml:"container_engine,omitempty"`
 }
 
@@ -1008,7 +1203,7 @@ func (Action) JSONSchema() *jsonschema.Schema {
 	})
 	props.Set("compose_service", &jsonschema.Schema{
 		Type:        "string",
-		Description: "Docker Compose service name. Wraps every step in `<engine> compose exec`. Mutually exclusive with `container`.",
+		Description: "Docker Compose service name. Resolves the container via compose labels and wraps every step in `<engine> exec`. Mutually exclusive with `container`.",
 	})
 	props.Set("compose_project", &jsonschema.Schema{
 		Type:        "string",
@@ -1016,7 +1211,7 @@ func (Action) JSONSchema() *jsonschema.Schema {
 	})
 	props.Set("container_engine", &jsonschema.Schema{
 		Type:        "string",
-		Description: "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.",
+		Description: "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`.",
 	})
 	return &jsonschema.Schema{
 		Type:                 "object",
@@ -1033,7 +1228,10 @@ func (Action) JSONSchema() *jsonschema.Schema {
 // configs surface a clear error rather than silently mis-parse.
 func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("action (line %d): want a mapping; bare strings + list shorthands have been removed — wrap each action in `{ run: ... }`", node.Line)
+		return fmt.Errorf(
+			"action (line %d): want a mapping; bare strings + list shorthands have been removed — wrap each action in `{ run: ... }`",
+			node.Line,
+		)
 	}
 	for i := 0; i < len(node.Content); i += 2 {
 		switch node.Content[i].Value {
@@ -1097,8 +1295,9 @@ type DatabaseConfig struct {
 	// Engine discriminator. Gates which connection block is dialed
 	// and which sub-fields (dump, migrations, namespaces) are valid.
 	// `postgresql` is an alias for `postgres`; `opensearch` is an
-	// alias for `elasticsearch`.
-	Engine string `yaml:"engine" jsonschema:"enum=mysql,enum=mariadb,enum=tidb,enum=postgres,enum=postgresql,enum=mongodb,enum=redis,enum=elasticsearch,enum=opensearch,enum=s3"`
+	// alias for `elasticsearch`; `valkey` and `dragonfly` are aliases
+	// for `redis` (same wire protocol, same key-prefix scoping).
+	Engine string `yaml:"engine" jsonschema:"enum=mysql,enum=mariadb,enum=tidb,enum=postgres,enum=postgresql,enum=mongodb,enum=redis,enum=valkey,enum=dragonfly,enum=elasticsearch,enum=opensearch,enum=s3"`
 
 	// Template for the per-worktree database/index name. Supports
 	// `{slug}`, `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`
@@ -1108,16 +1307,54 @@ type DatabaseConfig struct {
 	// config-load time — typos fail loud.
 	NameTemplate string `yaml:"name_template,omitempty"`
 
-	// Source dump used to seed clones. Path is relative to the repo
-	// root. Treeman hashes this file into the snapshot key, so
-	// changes invalidate the cache.
-	Dump *DumpSpec `yaml:"dump,omitempty"`
+	// Source dump(s) used to seed the source DB before migrate/seed
+	// run. Each path is relative to the repo root. Treeman hashes
+	// every dump into the snapshot key, so changes invalidate the
+	// cache. Three shapes:
+	//
+	//   dump: seed.sql                       # bare string
+	//   dump: { path: seed.sql, optional: true }  # mapping
+	//   dump:                                # sequence
+	//     - base.sql
+	//     - { path: extras.sql, optional: true }
+	//
+	// Sequence entries load in declared ORDER, so a base schema dump
+	// followed by per-feature patches is supported without splicing
+	// them into one file. Order matters for the fingerprint too —
+	// reordering reproducible dumps is a content change.
+	Dump DumpList `yaml:"dump,omitempty"`
 
 	// Migrate is the shell command that brings a freshly-loaded
 	// source DB up to the current schema. Required when any input
 	// glob matches migration files; optional otherwise (e.g. a DB
 	// that's purely seed-driven).
 	Migrate *Step `yaml:"migrate,omitempty"`
+
+	// Rollback is the OPTIONAL shell command that unwinds the most
+	// recently applied migrations, used to keep templates correct when
+	// an *already-applied* migration's content is edited. Treeman runs
+	// it against a clone of the prior template, then re-runs Migrate
+	// forward — the only path that re-applies an edit to a migration
+	// whose ledger row is baked into the source dump.
+	//
+	// Treeman injects the number of migrations to unwind as the env var
+	// TREEMAN_ROLLBACK_STEPS; reference it in Run, e.g.
+	//   rollback: { run: "php artisan migrate:rollback --step=$TREEMAN_ROLLBACK_STEPS" }
+	// (Run is passed verbatim to `sh -c`; only Env values are
+	// `{placeholder}`-rendered, so use the shell env var, not a brace
+	// placeholder.)
+	//
+	// WARNING: rollback runs the migration's CURRENT down() — the edited
+	// file on disk — not the original down() that matched the applied
+	// schema. For edits that change down(), or for lossy/irreversible
+	// down()s, this can produce a wrong or failing schema. Treeman
+	// hard-falls-back to a full cold rebuild on ANY rollback or migrate
+	// error, so a broken down() degrades to "slow but correct", never
+	// "fast but wrong"-at-the-engine — but a down() that *succeeds* while
+	// not faithfully inverting up() is the user's responsibility. Leave
+	// this unset to disable the rollback path entirely (cold rebuild
+	// only).
+	Rollback *Step `yaml:"rollback,omitempty"`
 
 	// Seed is the shell command that populates non-migration data
 	// (fixtures, ES mappings, Redis warm-cache keys, etc.). Runs
@@ -1131,13 +1368,12 @@ type DatabaseConfig struct {
 	//   1. Contributes a hash to the snapshot fingerprint (so any
 	//      change auto-invalidates the cached template).
 	//   2. Subscribes fsnotify so changes trigger a re-prep.
-	//   3. Carries an optional `label:` that `hooks.on-file-change`
+	//   3. Carries an optional `label:` that `hooks.file-change`
 	//      actions can match against.
 	//
-	// Glob patterns are repo-root-relative. Hash mode is per-entry:
-	// `filename` for append-only files (Laravel migrations, …),
-	// `checksum` for files edited in place (seeders, lockfiles).
-	// Default is checksum.
+	// Glob patterns are repo-root-relative. Every matched file is
+	// content-hashed (BLAKE3); a content, add, or remove moves the
+	// fingerprint.
 	//
 	// Cache-hit vs cold-build is derived purely from the input
 	// hashes — there's no separate `on: rebuild` knob. If you want
@@ -1166,6 +1402,19 @@ type DatabaseConfig struct {
 	// Range 0–64. Raise only if the server is provisioned
 	// (max_connections, PG pg_database lock contention, etc.).
 	Fanout uint32 `yaml:"fanout,omitempty" jsonschema:"minimum=0,maximum=64"`
+
+	// Prewarm keeps N spare clones pre-restored from this database's
+	// cached template (Postgres only — other engines have no
+	// constant-time whole-database rename, so the knob is rejected at
+	// config load). A cache-hit prepare claims a spare via
+	// `ALTER DATABASE … RENAME` (milliseconds, size-independent)
+	// instead of paying `CREATE DATABASE … TEMPLATE` per restore; a
+	// detached replenisher then tops the pool back up. Spares are
+	// named `<template>_spare<n>`, survive worktree teardown (they
+	// belong to the template cache, not a worktree), and are dropped
+	// with their template on snapshot eviction. Range 0–16; default
+	// 0 (off). Mutually exclusive with `branch_scoped`.
+	Prewarm uint32 `yaml:"prewarm,omitempty" jsonschema:"minimum=0,maximum=16"`
 
 	// BranchScoped turns this database into a git-for-databases
 	// working copy: the app always talks to one stable ACTIVE
@@ -1232,37 +1481,30 @@ type Input struct {
 	// Required.
 	Glob string `yaml:"glob"`
 
-	// Optional label that `hooks.on-file-change` actions can match
+	// Optional label that `hooks.file-change` actions can match
 	// against via their `match:` field. Multiple entries can share a
 	// label so one action handles a logical group of file types.
 	Label string `yaml:"label,omitempty"`
-
-	// Hash mode for files matching this glob:
-	//   `checksum` (default) — full content hash. Detects edits.
-	//     Right for lockfiles, seeders, factories, fixtures.
-	//   `filename`            — hash of the filename only. Cheaper.
-	//     Right for append-only directories (Laravel/Rails/Django
-	//     migrations where existing files never change).
-	Hash string `yaml:"hash,omitempty" jsonschema:"enum=checksum,enum=filename"`
 }
 
 // JSONSchema documents the polymorphic shape: an Input is either a
 // bare glob string (shorthand for `{glob: <string>}`) or a full
-// `{glob, label, hash}` mapping.
+// `{glob, label}` mapping. All inputs are content-hashed; there is no
+// per-entry hash mode (the historical `filename` shortcut relied on an
+// append-only-migrations assumption that wasn't actually enforced).
 func (Input) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
 	props.Set("glob", &jsonschema.Schema{Type: "string", Description: "Glob pattern (repo-root-relative). Required."})
-	props.Set("label", &jsonschema.Schema{Type: "string", Description: "Optional label for `hooks.on-file-change` matchers."})
-	props.Set("hash", &jsonschema.Schema{Type: "string", Enum: []any{"checksum", "filename"}, Description: "Hash mode: checksum (default) or filename (append-only files)."})
+	props.Set("label", &jsonschema.Schema{Type: "string", Description: "Optional label for `hooks.file-change` matchers."})
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
-			{Type: "string", Description: "Bare glob string. Equivalent to `{glob: <this string>}` with default hash mode."},
+			{Type: "string", Description: "Bare glob string. Equivalent to `{glob: <this string>}`."},
 			{
 				Type:                 "object",
 				Properties:           props,
 				Required:             []string{"glob"},
 				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Full input mapping with optional label + hash mode.",
+				Description:          "Full input mapping with optional label.",
 			},
 		},
 		Description: "One source of file state for the template fingerprint. Bare string OR full mapping.",
@@ -1285,7 +1527,7 @@ func (i *Input) UnmarshalYAML(node *yaml.Node) error {
 
 // FilteredAction is an Action with an optional `match:` that
 // filters which watch labels can trigger it. Used by
-// `hooks.on-file-change`.
+// `hooks.file-change`.
 type FilteredAction struct {
 	// Match restricts the action to a set of watch labels. Accepts
 	// either a single string (`match: migrations`) or a list of
@@ -1307,7 +1549,11 @@ func (FilteredAction) JSONSchema() *jsonschema.Schema {
 		base.Properties.Set("match", &jsonschema.Schema{
 			OneOf: []*jsonschema.Schema{
 				{Type: "string", Description: "Single watch label to match."},
-				{Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "Set of watch labels; the action fires when any of them matches."},
+				{
+					Type:        "array",
+					Items:       &jsonschema.Schema{Type: "string"},
+					Description: "Set of watch labels; the action fires when any of them matches.",
+				},
 			},
 			Description: "Restrict this action to watch events carrying one of the named labels. Omit to fire for every event.",
 		})
@@ -1321,7 +1567,7 @@ func (FilteredAction) JSONSchema() *jsonschema.Schema {
 // Action's UnmarshalYAML.
 func (f *FilteredAction) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("on-file-change action (line %d): want a mapping", node.Line)
+		return fmt.Errorf("file-change action (line %d): want a mapping", node.Line)
 	}
 	// Pull the `match:` value out separately so we can accept both
 	// scalar + sequence forms. Other keys are decoded by Action.
@@ -1339,12 +1585,12 @@ func (f *FilteredAction) UnmarshalYAML(node *yaml.Node) error {
 			f.Match = make([]string, 0, len(v.Content))
 			for _, child := range v.Content {
 				if child.Kind != yaml.ScalarNode {
-					return fmt.Errorf("on-file-change (line %d): every `match` entry must be a string label", child.Line)
+					return fmt.Errorf("file-change (line %d): every `match` entry must be a string label", child.Line)
 				}
 				f.Match = append(f.Match, child.Value)
 			}
 		default:
-			return fmt.Errorf("on-file-change (line %d): `match` must be a string or list of strings", v.Line)
+			return fmt.Errorf("file-change (line %d): `match` must be a string or list of strings", v.Line)
 		}
 		break
 	}
@@ -1359,12 +1605,7 @@ func (f FilteredAction) Matches(label string) bool {
 	if len(f.Match) == 0 {
 		return true
 	}
-	for _, m := range f.Match {
-		if m == label {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(f.Match, label)
 }
 
 // Step is one user-declared shell command executed against a target
@@ -1407,7 +1648,57 @@ type Step struct {
 	Env map[string]string `yaml:"env,omitempty"`
 }
 
-// DumpSpec — `dump:` sub-block of a DatabaseConfig. Accepts either
+// DumpList is the resolved value of the `dump:` config key. It accepts
+// three input shapes — a bare path string, a single mapping, or a
+// SEQUENCE of either — and yields an ordered list of DumpSpec entries.
+// See the field comment on DatabaseConfig.Dump for the YAML forms.
+type DumpList []DumpSpec
+
+// UnmarshalYAML accepts string, mapping, or sequence(of string|mapping).
+// DumpSpec already handles string-or-mapping itself, so this just
+// dispatches on top-level shape and recurses for sequence entries.
+func (l *DumpList) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode, yaml.MappingNode:
+		var d DumpSpec
+		if err := node.Decode(&d); err != nil {
+			return err
+		}
+		*l = DumpList{d}
+		return nil
+	case yaml.SequenceNode:
+		out := make(DumpList, len(node.Content))
+		for i, child := range node.Content {
+			if err := child.Decode(&out[i]); err != nil {
+				return fmt.Errorf("dump[%d] (line %d): %w", i, child.Line, err)
+			}
+		}
+		*l = out
+		return nil
+	default:
+		return fmt.Errorf("dump (line %d): want a string, mapping, or sequence", node.Line)
+	}
+}
+
+// JSONSchema documents the polymorphic shape (string / mapping / array).
+func (DumpList) JSONSchema() *jsonschema.Schema {
+	single := DumpSpec{}.JSONSchema()
+	// DumpSpec.JSONSchema returns a oneOf [string, mapping]. Flatten
+	// those into the DumpList oneOf alongside the new array form so
+	// docs surface every accepted shape side by side.
+	opts := append([]*jsonschema.Schema{}, single.OneOf...)
+	opts = append(opts, &jsonschema.Schema{
+		Type:        "array",
+		Items:       single,
+		Description: "Ordered list of dumps (each a string or mapping); loaded in declared order. Order is part of the snapshot fingerprint.",
+	})
+	return &jsonschema.Schema{
+		OneOf:       opts,
+		Description: "Source dump(s). Accepts a bare path string, a single mapping, or an ordered array of either.",
+	}
+}
+
+// DumpSpec — one entry of a DatabaseConfig.Dump list. Accepts either
 // a bare string (`dump: storage/dumps/seed.sql.gz`) or a full
 // mapping (`dump: { path: ..., optional: true }`).
 //
@@ -1423,9 +1714,9 @@ type Step struct {
 // `dump:` field works for `seed.sql`, `seed.sql.gz`, `seed.sql.zst`,
 // `dump.archive.gz`, etc.
 type DumpSpec struct {
-	// Path to the dump file relative to the repo root. The file is
-	// hashed into the snapshot key so changes invalidate cached
-	// snapshots.
+	// Path to the dump file relative to the worktree checkout root.
+	// The file is hashed into the snapshot key so changes invalidate
+	// cached snapshots.
 	Path string `yaml:"path"`
 
 	// When true, a missing dump file is not an error — treeman will
@@ -1445,8 +1736,15 @@ type DumpSpec struct {
 // JSONSchema documents the bare-string-or-mapping shape.
 func (DumpSpec) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
-	props.Set("path", &jsonschema.Schema{Type: "string", Description: "Dump file path, repo-root-relative. Required."})
+	props.Set("path", &jsonschema.Schema{Type: "string", Description: "Dump file path, relative to the worktree checkout root. Required."})
 	props.Set("optional", &jsonschema.Schema{Type: "boolean", Description: "When true, missing dump is not an error."})
+	props.Set(
+		"source_db",
+		&jsonschema.Schema{
+			Type:        "string",
+			Description: "MongoDB only: the database the archive was dumped from; remapped into the per-worktree target DB via mongorestore --nsFrom/--nsTo. Ignored by other engines.",
+		},
+	)
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
 			{Type: "string", Description: "Bare path string. Equivalent to `{path: <this string>}`."},
@@ -1455,10 +1753,10 @@ func (DumpSpec) JSONSchema() *jsonschema.Schema {
 				Properties:           props,
 				Required:             []string{"path"},
 				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Full dump mapping with optional `optional` flag.",
+				Description:          "Full dump mapping with optional `optional` + `source_db`.",
 			},
 		},
-		Description: "Source dump file. Bare string OR `{path, optional}` mapping.",
+		Description: "Source dump file. Bare string OR `{path, optional, source_db}` mapping.",
 	}
 }
 
@@ -1479,20 +1777,27 @@ func (d *DumpSpec) UnmarshalYAML(node *yaml.Node) error {
 // TestClonesSpec — `test_clones:` sub-block. Used by every parallel
 // test runner (paratest, pest, pytest-xdist, Jest workers, Go
 // `-parallel`, cargo nextest, …). `clones` is either `auto` (treeman
-// reads the project's worker-count config) or an explicit integer.
+// detects the test framework and uses the CPU count for per-worker
+// runners) or an explicit integer.
 type TestClonesSpec struct {
-	// Number of test-clone databases to pre-warm. `auto` reads the
-	// project's worker-count config (paratest's processes, pytest
-	// -n, Jest maxWorkers). Explicit integer overrides; 0 disables
-	// pre-warming entirely.
+	// Number of test-clone databases to pre-warm. `auto` detects the
+	// project's test framework and pre-warms one clone per CPU
+	// (`runtime.NumCPU`) when that framework clones per-worker,
+	// otherwise 1 (falling back to the CPU count when no framework is
+	// detected). Explicit integer overrides; 0 disables pre-warming
+	// entirely.
 	Clones ClonesSetting `yaml:"clones,omitempty"`
 
 	// Template for clone database names. Supports the same
 	// placeholders as `databases[].name_template` plus `{n}` —
-	// the 0-based clone index (only valid here). Required.
+	// the 1-based clone index (only valid here). Required.
 	// Example: `app_{slug}_test_{n}`.
 	NameTemplate string `yaml:"name_template"`
 }
+
+// clonesAuto is the sentinel `clones:` value selecting CPU-based
+// auto-sizing (vs an explicit integer).
+const clonesAuto = "auto"
 
 // ClonesSetting — `clones: auto | <integer>`.
 type ClonesSetting struct {
@@ -1506,13 +1811,14 @@ type ClonesSetting struct {
 func (ClonesSetting) JSONSchema() *jsonschema.Schema {
 	return &jsonschema.Schema{
 		Description: "Number of test-clone databases to pre-warm. " +
-			"Either the literal string `auto` (treeman reads the project's " +
-			"worker-count config) or a non-negative integer (0 disables pre-warming).",
+			"Either the literal string `auto` (treeman detects the test " +
+			"framework and uses the CPU count for per-worker runners) or a " +
+			"non-negative integer (0 disables pre-warming).",
 		OneOf: []*jsonschema.Schema{
 			{
 				Type:        "string",
-				Enum:        []any{"auto"},
-				Description: "Read the worker count from the project's test runner config (paratest processes, pytest -n, Jest maxWorkers, …).",
+				Enum:        []any{clonesAuto},
+				Description: "Detect the test framework and pre-warm one clone per CPU when it parallelizes per-worker (else 1).",
 			},
 			{
 				Type:        "integer",
@@ -1526,7 +1832,7 @@ func (ClonesSetting) JSONSchema() *jsonschema.Schema {
 // UnmarshalYAML parses `auto` or a non-negative integer.
 func (c *ClonesSetting) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind == yaml.ScalarNode {
-		if node.Value == "auto" || node.Value == "" {
+		if node.Value == clonesAuto || node.Value == "" {
 			c.Auto = true
 			return nil
 		}
@@ -1537,7 +1843,7 @@ func (c *ClonesSetting) UnmarshalYAML(node *yaml.Node) error {
 		c.Fixed = n
 		return nil
 	}
-	return fmt.Errorf("clones: want scalar")
+	return errors.New("clones: want scalar")
 }
 
 // WatcherPath is the internal projection of an Input that the
@@ -1555,18 +1861,22 @@ type WatcherPath struct {
 }
 
 // CustomFramework — `frameworks:` entry, lets users declare
-// migration frameworks treeman doesn't know about natively. Consumed
-// only by `treeman fw detect` and `treeman init` for scaffolding; at
-// runtime treeman reads `databases[].inputs[]` directly.
+// migration frameworks treeman doesn't know about natively. Added to
+// the detector registry (via RegistryFor) consulted by `treeman fw
+// detect` and `treeman doctor`; `treeman init` and the MCP
+// `fw_detect` tool use only the built-in registry and ignore these
+// entries. At runtime treeman watches `databases[].inputs[]` directly.
 type CustomFramework struct {
 	// Files (relative to repo root) whose presence indicates this
-	// framework is in use. Used by `treeman fw detect` to pick the
-	// framework when scaffolding a new config.
+	// framework is in use. All markers must be present for `treeman
+	// fw detect` / `treeman doctor` to recognise the framework.
 	// Example: `["alembic.ini", "migrations/env.py"]`.
 	Markers []string `yaml:"markers"`
 
 	// Glob patterns for the directories holding migration files.
-	// Emitted as `inputs[]` entries during `treeman init`.
+	// Carried on the detection Spec reported by `treeman fw detect` /
+	// `treeman doctor`; not emitted into `inputs[]` by `treeman init`
+	// (init scaffolds only from built-in frameworks).
 	MigrationDirs []string `yaml:"migration_dirs"`
 
 	// Glob pattern for individual migration files within
@@ -1574,19 +1884,16 @@ type CustomFramework struct {
 	// `V*__*.sql` (flyway).
 	FilePattern string `yaml:"file_pattern"`
 
-	// Hash strategy applied to the migration files: `filename`
-	// (default) or `checksum`. Maps to the `hash:` field on each
-	// emitted Input.
-	HashMode string `yaml:"hash_mode,omitempty" jsonschema:"enum=filename,enum=checksum"`
-
-	// Lockfiles whose contents are folded into the snapshot hash
-	// (e.g. `requirements.txt`, `pyproject.toml`, `composer.lock`).
-	// Emitted as `inputs[]` entries with label `lockfile`.
+	// Lockfiles (e.g. `requirements.txt`, `pyproject.toml`,
+	// `composer.lock`) carried on the detection Spec. To fold a
+	// lockfile into the snapshot hash, declare it under
+	// `databases[].inputs[]`.
 	Lockfiles []string `yaml:"lockfiles,omitempty"`
 
 	// Optional hint about the database engine this framework
-	// targets — `mysql`, `postgres`, etc. Pre-fills the engine field
-	// in `treeman init` when this framework is detected.
+	// targets — `mysql`, `postgres`, etc. Carried on the detection
+	// Spec; not used by `treeman init` (which scaffolds only from
+	// built-in frameworks).
 	EngineHint string `yaml:"engine_hint,omitempty"`
 }
 
@@ -1598,11 +1905,104 @@ func LoadGlobal() (Config, error) {
 	var cfg Config
 	applyDefaults(&cfg)
 	if g, ok := globalConfigPath(); ok {
+		if err := checkLayerScope(g, "global"); err != nil {
+			return cfg, err
+		}
 		if err := mergeYAMLFile(&cfg, g); err != nil {
 			return cfg, err
 		}
 	}
 	return cfg, nil
+}
+
+// checkLayerScope hard-rejects top-level keys that don't belong in the
+// given layer: a `scope:"global"` key (daemon, snapshots, logs, status,
+// notifications) in a repo `.treeman.yaml`, or a `scope:"repo"` key
+// (databases, patches, hooks, main_worktree, env_sources) in the
+// user-global config. `scope:"both"` keys are allowed in either. `layer`
+// is "global" or "repo". Missing/empty files pass. Unknown keys are left
+// to the decoder (KnownFields is off, so they're ignored) — this only
+// polices placement of recognised keys.
+//
+// This is a hard break: there is no flag to relax it. The layered merge
+// makes a misplaced key silently inert (e.g. a repo `daemon:` block the
+// daemon never reads), so surfacing it as an error is strictly better
+// than the old silent-no-op behaviour.
+func checkLayerScope(path, layer string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	return checkScopeBytes(b, path, layer)
+}
+
+// checkScopeBytes is checkLayerScope against an in-memory body, with
+// `label` used in the error message (a path or a generic word like
+// "config"). Empty / non-mapping / unparseable bodies pass — the merge
+// step surfaces any real parse error with its own wording.
+func checkScopeBytes(b []byte, label, layer string) error {
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil
+	}
+	// Unparseable / non-mapping bodies pass — the merge step surfaces
+	// real parse errors with its own wording. A parse failure leaves
+	// root.Content empty, so the mapping guard below catches it too.
+	var root yaml.Node
+	_ = yaml.Unmarshal(b, &root)
+	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	scopes := FieldScopes()
+	mapping := root.Content[0]
+	other := otherLayer(layer)
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		key := mapping.Content[i].Value
+		if scopes[key] == other {
+			return fmt.Errorf("%s: key %q belongs in the %s config, not the %s config — %s",
+				label, key, other, layer, scopeHint(other))
+		}
+	}
+	return nil
+}
+
+// CheckBodyScope validates that every top-level key in a config body
+// belongs in `layer` ("global" or "repo"). Used by config_write /
+// config_restore to reject a misplaced key at WRITE time rather than
+// letting it land on disk and hard-fail at the next load.
+func CheckBodyScope(body []byte, layer string) error {
+	return checkScopeBytes(body, "config", layer)
+}
+
+// CheckKeyInLayer validates a single top-level key against `layer`.
+// Used by config_set (which patches one dotted path) so setting e.g.
+// `daemon.log_level` in a repo file is refused up front. Unknown keys
+// (scope "" or "both") always pass.
+func CheckKeyInLayer(key, layer string) error {
+	if FieldScopes()[key] == otherLayer(layer) {
+		other := otherLayer(layer)
+		return fmt.Errorf("key %q belongs in the %s config, not the %s config — %s",
+			key, other, layer, scopeHint(other))
+	}
+	return nil
+}
+
+func otherLayer(layer string) string {
+	if layer == "global" {
+		return "repo"
+	}
+	return "global"
+}
+
+// scopeHint points the user at the right file for a misplaced key.
+func scopeHint(scope string) string {
+	if scope == "global" {
+		gp, _ := globalConfigPath()
+		return "move it to " + gp + " (or run `treeman init --global`)"
+	}
+	return "move it to the repo's .treeman.yaml"
 }
 
 // LoadLayered reads global + repo + repo-local YAML files into a
@@ -1612,16 +2012,22 @@ func LoadLayered(repoRoot string) (Config, error) {
 	var cfg Config
 	applyDefaults(&cfg)
 	if g, ok := globalConfigPath(); ok {
+		if err := checkLayerScope(g, "global"); err != nil {
+			return cfg, err
+		}
 		if err := mergeYAMLFile(&cfg, g); err != nil {
 			return cfg, err
 		}
 	}
 	if repoRoot != "" {
-		if err := mergeYAMLFile(&cfg, filepath.Join(repoRoot, ".treeman.yaml")); err != nil {
-			return cfg, err
-		}
-		if err := mergeYAMLFile(&cfg, filepath.Join(repoRoot, ".treeman.local.yaml")); err != nil {
-			return cfg, err
+		for _, name := range []string{".treeman.yaml", ".treeman.local.yaml"} {
+			p := filepath.Join(repoRoot, name)
+			if err := checkLayerScope(p, "repo"); err != nil {
+				return cfg, err
+			}
+			if err := mergeYAMLFile(&cfg, p); err != nil {
+				return cfg, err
+			}
 		}
 	}
 	normaliseAliases(&cfg)
@@ -1638,18 +2044,25 @@ func LoadLayeredForWorktree(mainRoot, wtRoot string) (Config, error) {
 	var cfg Config
 	applyDefaults(&cfg)
 	if g, ok := globalConfigPath(); ok {
+		if err := checkLayerScope(g, "global"); err != nil {
+			return cfg, err
+		}
 		if err := mergeYAMLFile(&cfg, g); err != nil {
 			return cfg, err
 		}
 	}
-	if err := mergeYAMLFile(&cfg, filepath.Join(mainRoot, ".treeman.yaml")); err != nil {
-		return cfg, err
-	}
-	if err := mergeYAMLFile(&cfg, filepath.Join(mainRoot, ".treeman.local.yaml")); err != nil {
-		return cfg, err
+	repoFiles := []string{
+		filepath.Join(mainRoot, ".treeman.yaml"),
+		filepath.Join(mainRoot, ".treeman.local.yaml"),
 	}
 	if wtRoot != "" && wtRoot != mainRoot {
-		if err := mergeYAMLFile(&cfg, filepath.Join(wtRoot, ".treeman.local.yaml")); err != nil {
+		repoFiles = append(repoFiles, filepath.Join(wtRoot, ".treeman.local.yaml"))
+	}
+	for _, p := range repoFiles {
+		if err := checkLayerScope(p, "repo"); err != nil {
+			return cfg, err
+		}
+		if err := mergeYAMLFile(&cfg, p); err != nil {
 			return cfg, err
 		}
 	}
@@ -1685,8 +2098,9 @@ func mergeYAMLFile(cfg *Config, path string) error {
 	return nil
 }
 
-// applyDefaults fills in the canonical defaults: async_create true,
-// retention defaults.
+// applyDefaults fills in the canonical defaults: daemon log level,
+// worktree root, snapshot retention caps, watcher debounce,
+// auto-fetch interval, log retention, and notification buckets.
 func applyDefaults(cfg *Config) {
 	if cfg.Daemon.LogLevel == "" {
 		cfg.Daemon.LogLevel = "info"
@@ -1725,6 +2139,59 @@ func applyDefaults(cfg *Config) {
 		// (handled by callers as <= 0).
 		cfg.Logs.KeepDays = 14
 	}
+	// Default notification buckets: the two resting states (ready +
+	// errored). nil means "key absent" → apply default; an explicit
+	// `events: []` is left empty (notify on nothing).
+	if cfg.Notifications.Events == nil {
+		cfg.Notifications.Events = []string{"stable", "failed"}
+	}
+	applyStatusDefaults(cfg)
+}
+
+// applyStatusDefaults fills the `status:` block defaults — separator,
+// templates, per-bucket labels, and Nerd Font icon glyphs. Split out
+// of applyDefaults to keep that function's branch count under the
+// cyclomatic-complexity gate.
+func applyStatusDefaults(cfg *Config) {
+	if cfg.Status.Separator == "" {
+		cfg.Status.Separator = " | "
+	}
+	if cfg.Status.Header == "" {
+		cfg.Status.Header = "{repo}  ({total})"
+	}
+	if cfg.Status.Row == "" {
+		cfg.Status.Row = "  {main}{branch}{state_suffix}"
+	}
+	if cfg.Status.MainMarker == "" {
+		cfg.Status.MainMarker = "★ "
+	}
+	if cfg.Status.Labels.Stable == "" {
+		cfg.Status.Labels.Stable = "stable"
+	}
+	if cfg.Status.Labels.Up == "" {
+		cfg.Status.Labels.Up = "up"
+	}
+	if cfg.Status.Labels.Down == "" {
+		cfg.Status.Labels.Down = "down"
+	}
+	if cfg.Status.Labels.Failed == "" {
+		cfg.Status.Labels.Failed = "failed"
+	}
+	// Nerd Font glyphs per bucket (Material Design, U+F14Cx). Written
+	// as \U escapes so they survive source round-trips. Set an icon to
+	// a single space in YAML to suppress it (empty re-triggers these).
+	if cfg.Status.Icons.Stable == "" {
+		cfg.Status.Icons.Stable = "\U000f14cf" // md-circle (stable)
+	}
+	if cfg.Status.Icons.Up == "" {
+		cfg.Status.Icons.Up = "\U000f14ca" // md-arrow-up (preparing)
+	}
+	if cfg.Status.Icons.Down == "" {
+		cfg.Status.Icons.Down = "\U000f14cb" // md-arrow-down (teardown)
+	}
+	if cfg.Status.Icons.Failed == "" {
+		cfg.Status.Icons.Failed = "\U000f14cc" // md-alert (failed)
+	}
 }
 
 func globalConfigPath() (string, bool) {
@@ -1737,4 +2204,34 @@ func globalConfigPath() (string, bool) {
 		xdg = filepath.Join(home, ".config")
 	}
 	return filepath.Join(xdg, "treeman", "config.yaml"), true
+}
+
+// GlobalConfigPath is the exported accessor for the user-global config
+// location (`$XDG_CONFIG_HOME/treeman/config.yaml`). Returns ok=false
+// only when the home dir can't be resolved. Used by `config init
+// --global` to know where to scaffold.
+func GlobalConfigPath() (string, bool) { return globalConfigPath() }
+
+// FieldScopes maps each top-level `Config` yaml key to its declared
+// `scope:` struct tag — "global", "repo", or "both". A field with no
+// scope tag defaults to "both" (it then appears in every scoped schema,
+// so a newly-added field is never silently dropped). Consumed by the
+// schema generator to emit global- vs repo-scoped variants and by
+// `config init` to decide which keys to scaffold.
+func FieldScopes() map[string]string {
+	t := reflect.TypeFor[Config]()
+	out := make(map[string]string, t.NumField())
+	for i := range t.NumField() {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		scope := f.Tag.Get("scope")
+		if scope == "" {
+			scope = "both"
+		}
+		out[name] = scope
+	}
+	return out
 }

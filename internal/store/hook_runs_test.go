@@ -16,7 +16,7 @@ func TestWriteHookRunPersistsAndQueries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	repoID, _ := s.EnsureRepo(ctx, "/repos/foo", "foo")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/repos/foo/.wt/x", "x", "feature/x")
@@ -72,7 +72,7 @@ func TestPathLookupsAreCaseInsensitive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	stored := "/Users/Jane/Repo"
 	wt := stored + "/.worktrees/Feat"
@@ -120,7 +120,7 @@ func TestWriteHookRunZeroWorktreeIsNoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if id, err := s.WriteHookRun(ctx, 0, "setup", 0, "noop", 1, 2, 0, "", ""); err != nil || id != 0 {
 		t.Fatalf("zero-wt should be a silent no-op, got id=%d err=%v", id, err)
 	}

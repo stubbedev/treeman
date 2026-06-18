@@ -16,7 +16,7 @@ func TestPruneOldLogsByCutoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	repoID, _ := st.EnsureRepo(ctx, "/r", "r")
 	wtID, _ := st.EnsureWorktree(ctx, repoID, "/r/w", "w", "main")
@@ -74,19 +74,68 @@ func TestPruneOldLogsByCutoff(t *testing.T) {
 	}
 }
 
+// TestPruneStaleHashCaches covers the hash-cache retention sweep:
+// file_hashes / dir_hashes rows older than the cutoff drop, fresher
+// rows survive, and cutoff<=0 is a no-op. These caches have no FK to
+// cascade on teardown, so age is the only reaping signal.
+func TestPruneStaleHashCaches(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	oldTs := int64(1_000_000)
+	newTs := int64(9_000_000)
+	mustExec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := st.DB.ExecContext(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustExec(`INSERT INTO file_hashes(path, size, mtime_ns, hash, cached_at) VALUES ('/gone/a', 1, 1, 'h', ?)`, oldTs)
+	mustExec(`INSERT INTO file_hashes(path, size, mtime_ns, hash, cached_at) VALUES ('/live/b', 1, 1, 'h', ?)`, newTs)
+	mustExec(
+		`INSERT INTO dir_hashes(dir, spec_name, hash_mode, mtime_ns, member_count, member_hash, cached_at) VALUES ('/gone/d', 's', 'm', 1, 1, 'h', ?)`,
+		oldTs,
+	)
+	mustExec(
+		`INSERT INTO dir_hashes(dir, spec_name, hash_mode, mtime_ns, member_count, member_hash, cached_at) VALUES ('/live/d', 's', 'm', 1, 1, 'h', ?)`,
+		newTs,
+	)
+
+	removed, err := st.PruneStaleHashCaches(ctx, 5_000_000) // between old and new
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed=%d, want 2 (1 file_hash + 1 dir_hash)", removed)
+	}
+	var nf, nd int
+	_ = st.DB.QueryRowContext(ctx, "SELECT count(*) FROM file_hashes").Scan(&nf)
+	_ = st.DB.QueryRowContext(ctx, "SELECT count(*) FROM dir_hashes").Scan(&nd)
+	if nf != 1 || nd != 1 {
+		t.Errorf("survivors wrong: file_hashes=%d dir_hashes=%d, want 1/1", nf, nd)
+	}
+	if n, err := st.PruneStaleHashCaches(ctx, 0); err != nil || n != 0 {
+		t.Errorf("cutoff<=0 should be no-op, got n=%d err=%v", n, err)
+	}
+}
+
 func TestPurgeEventsRequiresFilter(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	// Insert a couple of events so we can verify selective purge.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_ = st.WriteEvent(ctx, LevelInfo, "test", "msg", 0, 0, "", 0, nil)
 	}
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		_ = st.WriteEvent(ctx, LevelError, "test", "boom", 0, 0, "", 0, nil)
 	}
 
@@ -112,7 +161,7 @@ func TestListSnapshotsForRepoZeroRepoReturnsNil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	got, err := st.ListSnapshotsForRepo(ctx, 0)
 	if err != nil {
@@ -129,7 +178,7 @@ func TestListSnapshotsForRepoReturnsOnlyMatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	repoA, _ := st.EnsureRepo(ctx, "/a", "a")
 	repoB, _ := st.EnsureRepo(ctx, "/b", "b")

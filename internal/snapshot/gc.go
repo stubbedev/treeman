@@ -7,11 +7,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
-	dbes "github.com/stubbedev/treeman/internal/db/es"
-	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
-	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
-	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
-	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	"github.com/stubbedev/treeman/internal/db/engineconn"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -33,29 +29,48 @@ import (
 // running — the SQLite UPSERT on `RecordSnapshot` is idempotent and
 // `DROP DATABASE IF EXISTS` is engine-side idempotent.
 func EvictExcess(ctx context.Context, cfg *config.Config, st *store.Store, repoID int64) {
-	cap := cfg.Snapshots.CapPerRepo
-	candidates, err := st.ListLRUEvictable(ctx, repoID, cap)
+	capPerRepo := cfg.Snapshots.CapPerRepo
+	candidates, err := st.ListLRUEvictable(ctx, repoID, capPerRepo)
 	if err != nil {
 		slog.Warn("snapshot eviction lookup", "repo_id", repoID, "err", err)
 		return
 	}
-	if len(candidates) == 0 {
-		return
-	}
-	for _, c := range candidates {
+	evictCandidates(ctx, cfg, st, candidates, repoID, store.EvtSnapshotsEvictCap, "snapshot eviction",
+		func(c store.SnapshotEvictionCandidate) string {
+			return fmt.Sprintf("evicted %s (%s)", c.TemplateName, c.Engine)
+		})
+}
+
+// evictCandidates drops each candidate's engine-side template and SQLite
+// row, then writes one eviction event. Shared by the LRU / per-source /
+// age sweeps — the only things that vary between them are the candidate
+// query (done by the caller), the repo scope, the event type, the log
+// prefix, and the message text.
+//
+// Pinned fingerprints (held by an in-flight prepare) are skipped — the
+// sweep is best-effort and the next tick picks them up once the pin
+// clears. A per-candidate drop/delete failure is logged and skipped so
+// one bad row can't strand the rest; the row survives for a later retry.
+//
+// The size sweep (running-total accounting) and PurgeRepo (no pin check,
+// error-collecting) keep their own loops.
+func evictCandidates(
+	ctx context.Context, cfg *config.Config, st *store.Store,
+	cands []store.SnapshotEvictionCandidate, repoID int64,
+	eventType, logPrefix string, msg func(store.SnapshotEvictionCandidate) string,
+) {
+	for _, c := range cands {
+		if IsPinned(c.Fingerprint) {
+			continue
+		}
 		if err := dropTemplate(ctx, cfg, c); err != nil {
-			slog.Warn("snapshot eviction drop", "template", c.TemplateName,
-				"engine", c.Engine, "err", err)
-			// Continue so a missing row for one engine doesn't block
-			// pruning others. The row stays so a retry can pick it
-			// up next time.
+			slog.Warn(logPrefix+" drop", "template", c.TemplateName, "engine", c.Engine, "err", err)
 			continue
 		}
 		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
-			slog.Warn("snapshot eviction delete row", "fp", c.Fingerprint, "err", err)
+			slog.Warn(logPrefix+" delete row", "fp", c.Fingerprint, "template", c.TemplateName, "err", err)
 		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_evict",
-			fmt.Sprintf("evicted %s (%s)", c.TemplateName, c.Engine),
+		_ = st.WriteEvent(ctx, store.LevelInfo, eventType, msg(c),
 			repoID, 0, "", 0, map[string]string{
 				"engine":      c.Engine,
 				"template":    c.TemplateName,
@@ -89,7 +104,7 @@ func PurgeRepo(ctx context.Context, cfg *config.Config, st *store.Store, repoID 
 			continue
 		}
 		dropped++
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_purge",
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsPurge,
 			fmt.Sprintf("purged %s (%s)", c.TemplateName, c.Engine),
 			repoID, 0, "", 0, map[string]string{
 				"engine":      c.Engine,
@@ -101,73 +116,53 @@ func PurgeRepo(ctx context.Context, cfg *config.Config, st *store.Store, repoID 
 	return dropped, errs
 }
 
+// SweepBySource evicts cached templates that exceed
+// `cfg.Snapshots.KeepPerSource` per source, where a "source" is the
+// migration-content key (`migrations_hash`). Within each source the N
+// most-recently-used templates are kept; older ones are dropped. Bounds
+// the per-source template fan-out that accumulates as a project's
+// dump/lockfile/engine-version churn while migration content holds
+// steady. Runs as part of the daemon's periodic GC tick.
+func SweepBySource(ctx context.Context, cfg *config.Config, st *store.Store) {
+	keep := cfg.Snapshots.KeepPerSource
+	if keep == 0 {
+		return
+	}
+	cands, err := st.ListSnapshotsBeyondPerSource(ctx, keep)
+	if err != nil {
+		slog.Warn("snapshot source sweep query", "err", err)
+		return
+	}
+	evictCandidates(ctx, cfg, st, cands, 0, store.EvtSnapshotsEvictSource, "snapshot source sweep",
+		func(c store.SnapshotEvictionCandidate) string {
+			return fmt.Sprintf("evicted %s (over keep_per_source=%d)", c.TemplateName, keep)
+		})
+}
+
 func dropTemplate(ctx context.Context, cfg *config.Config, c store.SnapshotEvictionCandidate) error {
 	fam, ok := engine.Canonical(c.Engine)
 	if !ok {
 		return fmt.Errorf("eviction: unsupported engine %q", c.Engine)
 	}
-	switch fam {
-	case engine.FamilyMySQL:
-		if cfg.Connections.Mysql == nil {
-			return fmt.Errorf("connections.mysql not configured")
-		}
-		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-		if err != nil {
-			return err
-		}
-		defer drv.Close()
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	case engine.FamilyPostgres:
-		if cfg.Connections.Postgres == nil {
-			return fmt.Errorf("connections.postgres not configured")
-		}
-		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-		if err != nil {
-			return err
-		}
-		defer drv.Close()
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	case engine.FamilyMongo:
-		if cfg.Connections.Mongodb == nil {
-			return fmt.Errorf("connections.mongodb not configured")
-		}
-		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-		if err != nil {
-			return err
-		}
-		defer drv.Close(ctx)
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	case engine.FamilyES:
-		if cfg.Connections.Elasticsearch == nil {
-			return fmt.Errorf("connections.elasticsearch not configured")
-		}
-		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-		if err != nil {
-			return err
-		}
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	case engine.FamilyRedis:
-		if cfg.Connections.Redis == nil {
-			return fmt.Errorf("connections.redis not configured")
-		}
-		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-		if err != nil {
-			return err
-		}
-		defer drv.Close()
-		return drv.DropSnapshot(ctx, c.TemplateName)
-	case engine.FamilyS3:
-		if cfg.Connections.S3 == nil {
-			return fmt.Errorf("connections.s3 not configured")
-		}
-		// validate.go rejects branch_scoped/test_clones/dump for s3, so
-		// no `engine: s3` snapshot row is ever persisted. If one exists
-		// (stale row from a future feature), drop silently rather than
-		// wedging the GC sweep — the s3 driver has no DropSnapshot.
-		return nil
-	default:
-		return fmt.Errorf("eviction: unsupported engine family %q (alias %q)", fam, c.Engine)
+	conn, configured, err := engineconn.Connect(ctx, cfg, fam)
+	if !configured {
+		return fmt.Errorf("connections.%s not configured", fam)
 	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.DropSnapshot(ctx, c.TemplateName); err != nil {
+		return err
+	}
+	// Reap the template's pre-warmed spare family too — spares are
+	// anonymous engine-side copies with no SQLite row of their own, so
+	// nothing else would ever collect them once the template is gone.
+	// Prefix-reap is a no-op for engines/templates without spares.
+	if _, err := conn.DropMatching(ctx, c.TemplateName+PrewarmSuffix); err != nil {
+		return fmt.Errorf("drop spare family %s%s*: %w", c.TemplateName, PrewarmSuffix, err)
+	}
+	return nil
 }
 
 // SweepByAge drops every cached template whose `last_used_at` is
@@ -186,23 +181,10 @@ func SweepByAge(ctx context.Context, cfg *config.Config, st *store.Store) {
 		slog.Warn("snapshot age sweep query", "err", err)
 		return
 	}
-	for _, c := range cands {
-		if err := dropTemplate(ctx, cfg, c); err != nil {
-			slog.Warn("snapshot age sweep drop", "template", c.TemplateName, "err", err)
-			continue
-		}
-		if err := st.DeleteSnapshot(ctx, c.Fingerprint); err != nil {
-			slog.Warn("snapshot age sweep delete row",
-				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
-		}
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_age_evict",
-			fmt.Sprintf("evicted %s (older than %dd)", c.TemplateName, days),
-			0, 0, "", 0, map[string]string{
-				"engine":      c.Engine,
-				"template":    c.TemplateName,
-				"fingerprint": c.Fingerprint,
-			})
-	}
+	evictCandidates(ctx, cfg, st, cands, 0, store.EvtSnapshotsEvictAge, "snapshot age sweep",
+		func(c store.SnapshotEvictionCandidate) string {
+			return fmt.Sprintf("evicted %s (older than %dd)", c.TemplateName, days)
+		})
 }
 
 // SweepBySize evicts the largest cached templates until total
@@ -215,13 +197,13 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 	if gb == 0 {
 		return
 	}
-	cap := int64(gb) * 1024 * 1024 * 1024
+	capBytes := int64(gb) * 1024 * 1024 * 1024
 	total, err := st.SumSnapshotBytes(ctx)
 	if err != nil {
 		slog.Warn("snapshot size sweep sum", "err", err)
 		return
 	}
-	if total <= cap {
+	if total <= capBytes {
 		return
 	}
 	cands, sizes, err := st.ListSnapshotsLargestLRU(ctx)
@@ -230,8 +212,11 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 		return
 	}
 	for i, c := range cands {
-		if total <= cap {
+		if total <= capBytes {
 			break
+		}
+		if IsPinned(c.Fingerprint) {
+			continue
 		}
 		if err := dropTemplate(ctx, cfg, c); err != nil {
 			slog.Warn("snapshot size sweep drop", "template", c.TemplateName, "err", err)
@@ -242,7 +227,7 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 				"fp", c.Fingerprint, "template", c.TemplateName, "err", err)
 		}
 		total -= sizes[i]
-		_ = st.WriteEvent(ctx, store.LevelInfo, "snapshot_size_evict",
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsEvictSize,
 			fmt.Sprintf("evicted %s (size=%d)", c.TemplateName, sizes[i]),
 			0, 0, "", 0, map[string]string{
 				"engine":      c.Engine,

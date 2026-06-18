@@ -29,12 +29,46 @@ package gitcmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
+
+// pathCtxKey scopes a per-call PATH override onto a context.Context.
+// The daemon runs git on behalf of an interactive `treeman` invocation
+// whose shell env (captured as task.InheritedEnv) holds the user's real
+// PATH; treemand's own PATH under systemd --user is the stock
+// `/usr/bin:/bin:…` and lacks the nix profile / login additions. Pinning
+// the caller's PATH here makes daemon-spawned git — and crucially the
+// clean/smudge filter git shells out (`treeman patch-filter`), plus any
+// credential helper / ssh / git-invoked hook — resolve exactly as it
+// would in the user's shell.
+type pathCtxKey struct{}
+
+// WithPath returns a context carrying `path` as the PATH that
+// command() will use for git subprocesses spawned under it. Empty
+// `path` returns ctx unchanged so callers can pass an absent
+// InheritedEnv["PATH"] without branching. The override fully replaces
+// PATH (not prepends) — it IS the caller's shell PATH; withSelfOnPath
+// still runs afterward to guarantee treeman's own dir is present.
+func WithPath(ctx context.Context, path string) context.Context {
+	if path == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, pathCtxKey{}, path)
+}
+
+// pathFromCtx returns the PATH override stashed by WithPath, or "".
+func pathFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(pathCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // Error wraps an exec failure with the command + stderr tail so
 // callers' error messages include git's actual complaint.
@@ -145,6 +179,57 @@ func Exists(ctx context.Context, dir, ref string) bool {
 	return RunOptional(ctx, dir, "rev-parse", "--verify", "--quiet", ref) == nil
 }
 
+// PipeOutput runs `git src...` and streams its stdout into the stdin of
+// `git dst...`, returning dst's accumulated stdout. Both run read-only.
+//
+// The OS pipe between the two children means src's output is never buffered
+// whole in this process — required for `git log -p <huge-range> | git patch-id`,
+// where the `-p` diff of tens of thousands of commits would otherwise be held
+// in memory all at once. dst's stdout (patch-id's one-line-per-commit summary)
+// is small, so collecting it in a buffer is safe and can't deadlock the pipe.
+func PipeOutput(ctx context.Context, dir string, src, dst []string) ([]byte, error) {
+	srcCmd := command(ctx, dir, true, src...)
+	dstCmd := command(ctx, dir, true, dst...)
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("git pipe: %w", err)
+	}
+	srcCmd.Stdout = pw
+	dstCmd.Stdin = pr
+
+	var out, srcErr, dstErr bytes.Buffer
+	srcCmd.Stderr = &srcErr
+	dstCmd.Stdout = &out
+	dstCmd.Stderr = &dstErr
+
+	if err := dstCmd.Start(); err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
+		return nil, wrap(dst, err, dstErr.String())
+	}
+	if err := srcCmd.Start(); err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
+		_ = dstCmd.Wait()
+		return nil, wrap(src, err, srcErr.String())
+	}
+	// Both children hold their own dup of the pipe ends now; drop this
+	// process's copies so dst sees EOF once src exits and closes its write end.
+	_ = pw.Close()
+	_ = pr.Close()
+
+	srcWait := srcCmd.Wait()
+	dstWait := dstCmd.Wait()
+	if srcWait != nil {
+		return nil, wrap(src, srcWait, srcErr.String())
+	}
+	if dstWait != nil {
+		return nil, wrap(dst, dstWait, dstErr.String())
+	}
+	return out.Bytes(), nil
+}
+
 // command builds the exec.Cmd with the standard env scrubbing applied.
 func command(ctx context.Context, dir string, readOnly bool, args ...string) *exec.Cmd {
 	full := args
@@ -158,13 +243,71 @@ func command(ctx context.Context, dir string, readOnly bool, args ...string) *ex
 	if readOnly {
 		env = append(env, "GIT_OPTIONAL_LOCKS=0")
 	}
+	if p := pathFromCtx(ctx); p != "" {
+		env = setEnvKey(env, "PATH", p)
+	}
+	env = withSelfOnPath(env)
 	cmd.Env = env
 	return cmd
 }
 
+// setEnvKey replaces (or appends) `name=val` in `env`, returning the
+// updated slice. Later entries in a process env win, but rewriting in
+// place keeps the env compact and avoids relying on that ordering
+// quirk for PATH — which some libc getenv paths read first-match.
+func setEnvKey(env []string, name, val string) []string {
+	prefix := name + "="
+	for i, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			env[i] = prefix + val
+			return env
+		}
+	}
+	return append(env, prefix+val)
+}
+
+// withSelfOnPath prepends the running executable's directory to PATH
+// in `env`. Git invokes treeman's clean/smudge filter as the bare
+// program `treeman patch-filter` (see internal/patcher/install.go),
+// resolving it through the PATH of whatever process spawned git. When
+// that process is treemand running under systemd --user — whose PATH
+// is the stock `/usr/bin:/bin:…` and does NOT inherit the user's nix
+// profile or login shell — the bare `treeman` can't be found and the
+// filter fails with exit 127. Pinning our own bin dir onto the child
+// PATH guarantees the filter resolves to the SAME binary that's
+// driving the git operation, regardless of how the daemon was
+// launched. Best-effort: if os.Executable() fails, env is unchanged.
+func withSelfOnPath(env []string) []string {
+	exe, err := os.Executable()
+	if err != nil {
+		return env
+	}
+	dir := filepath.Dir(exe)
+	if dir == "" {
+		return env
+	}
+	for i, kv := range env {
+		name, val, ok := strings.Cut(kv, "=")
+		if !ok || name != "PATH" {
+			continue
+		}
+		// Skip if our dir is already the first PATH entry — avoids
+		// unbounded growth across nested git invocations that inherit
+		// this same env.
+		if val == dir || strings.HasPrefix(val, dir+string(os.PathListSeparator)) {
+			return env
+		}
+		env[i] = "PATH=" + dir + string(os.PathListSeparator) + val
+		return env
+	}
+	// No PATH in env at all — add one.
+	return append(env, "PATH="+dir)
+}
+
 func wrap(args []string, err error, stderr string) error {
 	code := 0
-	if exitErr, ok := err.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
 		code = exitErr.ExitCode()
 	}
 	return &Error{

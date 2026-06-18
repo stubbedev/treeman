@@ -8,7 +8,7 @@ speaks MCP — get a structured tool surface onto treeman's state.
 Transport is stdio; no extra processes, no network surface.
 
 ```sh
-treeman mcp                                    # all tools exposed
+treeman mcp                                    # core tools + `tools` gateway (lazy disclosure)
 ```
 
 ## What is this actually for
@@ -31,7 +31,7 @@ logs:
   `logs_hooks` (hook run summaries) + `hook_log_read` (full
   per-hook stdout/stderr) give the agent everything the daemon
   recorded. `worktree_show` is the per-worktree dossier.
-  `doctor` runs the health-check matrix. `snapshot_inspect`
+  `doctor` runs the health-check matrix. `snapshots_inspect`
   resolves a fingerprint to "is this row an orphan or live?" —
   the canonical answer for "cache hit but prepare still failed".
 
@@ -44,36 +44,94 @@ logs:
   reason about live shape vs. what the config says.
 
 - **Snapshot-cache maintenance.** `snapshots_list` shows what's
-  cached for the current repo; `snapshot_drop` evicts a single
+  cached for the current repo; `snapshots_drop` evicts a single
   fingerprint when a template went stale; `snapshots_purge`
   wipes the whole cache.
+
+## Tool discovery (lazy disclosure)
+
+To keep the model's context lean, `treeman mcp` advertises only a
+curated **core** set of six tools up front — `doctor`,
+`status_overview`, `worktree_create`, `worktree_list`, `prepare_run`,
+`logs_query` — plus one **`tools`** gateway. The rest are deferred:
+
+- `tools` with `action=list` returns every available tool grouped by
+  category with a one-line summary (no schemas).
+- `tools` with `action=enable` + `names=[…]` (or `category=…`) loads
+  the chosen tools' full schemas so they become callable; the client is
+  notified via `tools/list_changed`.
+
+Set `TREEMAN_MCP_ALL_TOOLS=1` to advertise every tool at startup
+instead (the pre-disclosure behavior). The full surface is always
+*reachable* — lazy mode only controls what's loaded into context first.
 
 ## Permission model
 
 `treeman mcp` takes no permission flags — every tool (read, write,
-engine introspection, worktree lifecycle) is exposed unconditionally.
-The MCP surface is designed as the fully-qualified link to treeman;
-clients that want a restricted surface should enforce that at the
-agent-policy layer (Claude Code's tool allow-list, Cursor's MCP
-allow rules, etc.), not here.
+engine introspection, worktree lifecycle) is reachable (loaded up front
+or via the `tools` gateway above). The MCP surface is designed as the
+fully-qualified link to treeman; clients that want a restricted surface
+should enforce that at the agent-policy layer (Claude Code's tool
+allow-list, Cursor's MCP allow rules, etc.), not here.
+
+### Destructive-action confirmation (elicitation)
+
+`worktree_delete`, `snapshots_purge`, `db_reset`, `repo_remove`,
+`logs_purge`, `registry_unregister`, and the write-mode engine tools
+(`db_query` / `es_request` with `write=true`) gate their mutation
+behind an MCP `notifications/elicitation` confirmation when invoked
+with `dry_run=false`. Clients that support
+elicitation (Claude Desktop, etc.) get a confirmation pop-up before
+the action runs; clients that don't support it (or that error out)
+fall through to proceed so non-interactive agents aren't blocked.
+
+Per-call overrides:
+
+- `dry_run=true` — skip elicitation; return the plan instead.
+- `ack=true` — skip elicitation; proceed (use when the agent has
+  already secured user approval out-of-band).
+
+Refusals (decline/cancel) come back as `refused: "<reason>"` on the
+tool result with no mutation performed.
 
 ## Tools exposed
 
-| Tool | What it does |
+The complete tool list — grouped by category, flagged **core** (loaded
+up front) vs revealed on demand — is generated from the live registry:
+**[mcp-tools.md](mcp-tools.md)**. It refreshes via `just sync-docs`, so it
+never drifts from the code (CI fails a PR that forgets to regenerate).
+
+## Resources
+
+Resources are read-only context attachments — cheaper than re-invoking
+tools each turn.
+
+| URI | What |
 |---|---|
-| `doctor`, `daemon_status` | Health checks. |
-| `config_get`, `config_validate`, `config_schema` | Read/validate the YAML config. `config_get` output is redacted (passwords in resolved connection strings). |
-| `worktree_list`, `worktree_show`, `snapshots_list` | Registry + snapshot-cache queries. `worktree_show` also reports allocated ports and branch_scoped active-namespace state. |
-| `branch_scoped_status` | Per branch_scoped database: active namespace, which branch's data occupies it now, and which local branches have a resumable durable copy. |
-| `logs_query`, `logs_hooks` | Event log + hook run history. Output is run through a secret-redaction pass (URI userinfo, AWS/GitHub tokens, JWTs, `KEY=value` for password/secret/token-shaped keys) before returning to the client. |
-| `fw_detect`, `slug_compute` | Detection helpers. |
-| `config_write`, `config_set`, `hook_run`, `prepare_run` | Replace the whole YAML body, patch a single field by dotted path, run a hook phase, run the prepare pipeline. |
-| `db_reset` | Re-sync a worktree's `branch_scoped` databases from the live base branch: drop each one's active namespace + the current branch's durable copy, then re-seed from the parent. Destructive for the current branch's working data; other branches' durable copies are kept. Optional `engine` restricts it to one family. |
-| `init_repo`, `schema_install` | Scaffold `.treeman.yaml`; install the JSON Schema (`target=repo` / `target=global` / `target=url`) and wire its modeline. Both in-process. |
-| `registry_register`, `registry_unregister`, `registry_repair` | Mutate the SQLite worktree registry directly. `repair` diffs `git worktree list` vs SQLite and auto-reconciles drift. |
-| `snapshots_purge`, `logs_purge` | Wipe the snapshot cache (forces next prepare to rebuild) / delete event-log rows by filter (at least one filter required). |
-| `daemon_control` | Start / stop treemand. Prefers the installed systemd/launchd unit; otherwise forks the `treemand` binary (start) or sends the shutdown RPC (stop). |
-| `worktree_create`, `worktree_delete` | Run the full git + hooks + prepare lifecycle in-process via `internal/wt`. The heavy tail (hooks + prepare for create; teardown for delete) is dispatched to the daemon; on daemon-unreachable the orchestrator spawns a detached `treeman wt finalize --local` / `wt delete --detached` child and returns immediately. Returns a structured result (`wt_path`, `status`, `slug`, `worktree_id`, `log_path`, `ports`). |
+| `treeman://config/raw` | The repo's `.treeman.yaml` byte-for-byte. |
+| `treeman://config/resolved` | Post-substitution view (env vars + connection strings rendered, credentials redacted). |
+| `treeman://config/schema` | JSON Schema for `.treeman.yaml`. |
+| `treeman://logs/recent` | The 200 most recent event-log rows (NDJSON). |
+| `treeman://worktrees/{slug}/events` | Per-worktree event-log slice. |
+| `treeman://worktrees/{slug}/hooks` | Per-worktree hook_run rows. |
+| `treeman://daemon/state` | Mirrors `daemon_state` — in-flight prepares/teardowns, watcher set, backoff timers. |
+| `treeman://repos/{repo}/snapshots` | Cached snapshots for one repo. Use `cwd` for the placeholder to mean "the current dir's repo". |
+| `treeman://repos/{repo}/branches` | Branch list with worktree occupancy. Same `cwd` placeholder. |
+
+## Prompts
+
+Prompts encode multi-step workflows so an agent doesn't reinvent each
+flow. Invoke from your MCP client to get a tailored briefing.
+
+| Name | What |
+|---|---|
+| `bootstrap-new-repo` | First-time enrollment: detect → probe engines → init → schema_install → daemon ensure → register → first prepare. |
+| `scaffold-from-framework` | Detect → scaffold `.treeman.yaml` → validate → review. Stops short of running prepare. |
+| `worktree-setup` | Pick branch → daemon ensure → create → wait → verify. |
+| `diagnose-prepare-failure` | Drives `logs_query` → `engine_status` → `snapshots_inspect` → root-cause report. |
+| `cache-cleanup` | Hunt orphan snapshots (template gone, SQLite row remains) and drop only those. |
+| `migration-trial` | Throw-away worktree → run migration → schema diff → tear down. |
+| `edit-config` | Pick the right config file (global vs repo), preview, apply scope-checked, validate. |
 
 ## Claude Code
 
@@ -140,16 +198,17 @@ wrap the command in anything that mixes the two.
 ## Security notes
 
 - The MCP server runs **as the invoking user** with full access
-  to the repo, the daemon socket, and any `.env` files. Every
-  tool is exposed unconditionally — there is no in-binary gate.
+  to the repo, the daemon socket, and any `.env` files. Lazy
+  disclosure (see *Tool discovery*) controls what loads into context
+  first, but every tool stays reachable — it is not a security gate.
   Restrict the exposed surface at the **agent-policy layer**
   (Claude Code's per-tool allow rules, Cursor's MCP allow list,
   etc.) for any agent you don't fully trust.
-- `worktree_delete` from MCP runs `wt.Delete` in-process. The
-  TTY confirmation prompt is a CLI-only concern (it lives in
-  the `wt delete` action closure, not the orchestrator), so MCP
-  callers get **no confirmation** — every `worktree_delete`
-  invocation runs the teardown.
+- `worktree_delete` and the other destructive tools run their
+  mutation in-process but gate it behind MCP elicitation (see
+  [Destructive-action confirmation](#destructive-action-confirmation-elicitation))
+  — clients without elicitation support fall through to proceed,
+  so enforce policy at the agent layer for untrusted agents.
 - Hook stdout/stderr and event payloads pass through
   `redactSecrets` (see `internal/mcp/ops.go`) before being
   returned to the client. False positives just hide a token;

@@ -26,6 +26,7 @@ package template
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 
@@ -87,9 +88,7 @@ func (c Context) WithPorts(ports map[string]uint16) Context {
 		return c
 	}
 	dup := make(map[string]uint16, len(ports))
-	for k, v := range ports {
-		dup[k] = v
-	}
+	maps.Copy(dup, ports)
 	c.Ports = dup
 	return c
 }
@@ -102,7 +101,7 @@ type RenderError struct {
 
 func (e *RenderError) Error() string {
 	if e.UnknownKey != "" {
-		return fmt.Sprintf("unknown template key: %s", e.UnknownKey)
+		return "unknown template key: " + e.UnknownKey
 	}
 	return fmt.Sprintf("unmatched '{' at offset %d", e.UnmatchedAt)
 }
@@ -111,6 +110,25 @@ func (e *RenderError) Error() string {
 // from ctx. Errors when an unknown key is encountered or a `{` has
 // no closing `}`.
 func Render(tmpl string, ctx Context) (string, error) {
+	return renderWith(tmpl, func(key string) (string, bool) { return lookup(key, ctx) })
+}
+
+// RenderMap renders the same `{key}` placeholder syntax as Render but
+// resolves keys against a flat map rather than the slug-centric
+// Context. Used by `treeman status` so its format strings share one
+// templating convention with the rest of `.treeman.yaml` instead of
+// introducing a second engine. Unknown keys fail loudly, same as
+// Render, so a typo in a status format surfaces immediately.
+func RenderMap(tmpl string, vals map[string]string) (string, error) {
+	return renderWith(tmpl, func(key string) (string, bool) {
+		v, ok := vals[key]
+		return v, ok
+	})
+}
+
+// renderWith is the shared `{key}` scanner. lookup resolves a key to
+// its replacement; returning ok=false triggers RenderError.UnknownKey.
+func renderWith(tmpl string, lookup func(key string) (string, bool)) (string, error) {
 	var b strings.Builder
 	b.Grow(len(tmpl))
 	i := 0
@@ -126,7 +144,7 @@ func Render(tmpl string, ctx Context) (string, error) {
 			return "", &RenderError{UnmatchedAt: i}
 		}
 		key := rest[:end]
-		val, ok := lookup(key, ctx)
+		val, ok := lookup(key)
 		if !ok {
 			return "", &RenderError{UnknownKey: key}
 		}

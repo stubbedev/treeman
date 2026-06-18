@@ -288,10 +288,21 @@ databases:
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = st.Close() }) // registered first → runs LAST
 	env := map[string]string{"PATH": os.Getenv("PATH")}
 
-	state := daemon.NewState(ctx, st)
+	// The HEAD watcher's finalize goroutines run on the State's
+	// background context. Use a cancellable one (not context.Background)
+	// so cleanup can stop the watcher and drain any in-flight finalize
+	// BEFORE the store closes — otherwise a debounced swap fires against a
+	// closed DB ("sql: database is closed") and leaks a goroutine into the
+	// next test.
+	daemonCtx, cancelDaemon := context.WithCancel(ctx)
+	state := daemon.NewState(daemonCtx, st)
+	t.Cleanup(func() { // registered after st.Close → runs FIRST
+		cancelDaemon()
+		_ = state.WaitFinalizeCleared(context.Background(), repoRoot, 10*time.Second)
+	})
 	if _, err := daemon.EnrollMainWorktree(ctx, state, repoRoot); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
@@ -327,20 +338,40 @@ databases:
 	// from develop's data (branch point). Wait for the swap to land
 	// (marker flips to feature/x) before mutating data.
 	mustGit(t, repoRoot, "checkout", "-q", "-b", "feature/x")
-	waitForMarker(t, st, mainWtID, active, "feature/x", 20*time.Second)
+	waitSwap(t, st, state, mainWtID, active, repoRoot, "feature/x")
 	assertItems(t, active, "develop")
 
 	mustExec(t, active, "INSERT INTO items(v) VALUES('feature')")
 
 	// Back to develop → feature isolated, develop restored.
 	mustGit(t, repoRoot, "checkout", "-q", "develop")
-	waitForMarker(t, st, mainWtID, active, "develop", 20*time.Second)
+	waitSwap(t, st, state, mainWtID, active, repoRoot, "develop")
 	assertItems(t, active, "develop")
 
 	// Forward to feature again → feature resumed.
 	mustGit(t, repoRoot, "checkout", "-q", "feature/x")
-	waitForMarker(t, st, mainWtID, active, "feature/x", 20*time.Second)
+	waitSwap(t, st, state, mainWtID, active, repoRoot, "feature/x")
 	assertItems(t, active, "develop", "feature")
+}
+
+// waitSwap blocks until the HEAD-triggered swap to `branch` has FULLY
+// completed, not merely started. Two gates:
+//
+//  1. the active-branch marker flips to `branch` — the swap captured the
+//     old branch's data and recorded the new owner; and
+//  2. the finalize clears — fill/restore (and any migrate) finished.
+//
+// Gate 1 alone is insufficient: runBranchScoped sets the marker BEFORE it
+// fills the active namespace (so a crash can't re-capture), so asserting
+// data right after the marker races the restore — the source of this
+// test's flake under load. Draining the in-flight finalize also keeps the
+// NEXT checkout from being deduped away by MarkFinalizeInFlight.
+func waitSwap(t *testing.T, st *store.Store, state *daemon.State, wtID int64, active, wtPath, branch string) {
+	t.Helper()
+	waitForMarker(t, st, wtID, active, branch, 20*time.Second)
+	if err := state.WaitFinalizeCleared(context.Background(), wtPath, 20*time.Second); err != nil {
+		t.Fatalf("finalize did not clear after swap to %s: %v", branch, err)
+	}
 }
 
 // waitForMarker polls the active-branch marker until it reads

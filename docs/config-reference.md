@@ -7,40 +7,307 @@ reflection that produces `schemas/treeman.schema.json`).
 Run `just sync-docs` after touching a config field to refresh.
 For worked examples and guidance see [configuration.md](configuration.md).
 
+## Config layers
+
+treeman reads config from two files that merge into one effective config:
+
+1. **User-global** — `~/.config/treeman/config.yaml` (`$XDG_CONFIG_HOME/treeman/config.yaml`). Machine-wide defaults shared by every repo. Scaffold it with `treeman init --global`.
+2. **Per-repo** — `<repo>/.treeman.yaml` (plus an optional git-ignored `.treeman.local.yaml` overlay). Project-specific settings.
+
+Later layers override earlier ones. Each top-level key has a **scope** that determines which file it may appear in — a key in the wrong file is a hard error at load time (no flag relaxes it):
+
+- **global** — only valid in the user-global config.
+- **repo** — only valid in a repo `.treeman.yaml`.
+- **both** — valid in either; the global value is the default, a repo value overrides it.
+
+| Key | Scope |
+|-----|-------|
+| `daemon` | global |
+| `connections` | both |
+| `snapshots` | global |
+| `worktrees` | both |
+| `env_sources` | repo |
+| `patches` | repo |
+| `databases` | repo |
+| `hooks` | repo |
+| `debounce_ms` | both |
+| `frameworks` | both |
+| `logs` | global |
+| `auto_fetch` | both |
+| `main_worktree` | repo |
+| `ports` | both |
+| `status` | global |
+| `notifications` | global |
+
+## Generated examples
+
+Complete examples covering every key valid in each layer, generated from the schema (placeholder values — replace with real ones).
+
+### User-global `~/.config/treeman/config.yaml`
+
+```yaml
+# Daemon process settings: stderr log level. Typically lives in
+daemon:
+    log_level: '...'
+# Connection blocks per supported engine (MySQL, Postgres,
+connections:
+    mysql: '...'
+    postgres: '...'
+    mongodb: '...'
+    redis: '...'
+    elasticsearch: '...'
+    s3:
+        endpoint: '...'
+        region: '...'
+        access_key: '...'
+        secret_key: '...'
+        use_path_style: false
+        container: '...'
+        compose_service: '...'
+        compose_project: '...'
+        container_engine: '...'
+        container_network: '...'
+# Snapshot retention/eviction policy for cached post-migration
+snapshots:
+    cap_per_repo: 0
+    keep_per_source: 0
+    max_age_days: 0
+    max_total_gb: 0
+    gc_interval_minutes: 0
+# Worktree creation behaviour: root path, symlinked mirrors
+worktrees:
+    root: '...'
+    links:
+        - '...'
+    copies:
+        - '...'
+# DebounceMs is the file-watcher debounce window in
+debounce_ms: 0
+# User-defined migration frameworks keyed by name. Use this when
+frameworks:
+    <name>:
+        markers:
+            - '...'
+        migration_dirs:
+            - '...'
+        file_pattern: '...'
+        lockfiles:
+            - '...'
+        engine_hint: '...'
+# Logs retention. Daemon-side prune drops rows older than
+logs:
+    keep_days: 0
+# AutoFetch policy. Daemon-side periodic `git fetch --all --prune`
+auto_fetch:
+    enabled: false
+    interval_minutes: 0
+    mode: ff
+# Ports declares per-worktree port slots. Each entry is a named
+ports:
+    <name>:
+        - 0
+# Status configures the `treeman status` widget output (icons,
+status:
+    icons:
+        stable: '...'
+        up: '...'
+        down: '...'
+        failed: '...'
+    labels:
+        stable: '...'
+        up: '...'
+        down: '...'
+        failed: '...'
+    separator: '...'
+    header: '...'
+    row: '...'
+    main_marker: '...'
+    formats:
+        <name>: '...'
+# Notifications opts into desktop notifications (notify-send on
+notifications:
+    enabled: false
+    events:
+        - stable
+    backend: auto
+```
+
+### Per-repo `.treeman.yaml`
+
+```yaml
+# Connection blocks per supported engine (MySQL, Postgres,
+connections:
+    mysql: '...'
+    postgres: '...'
+    mongodb: '...'
+    redis: '...'
+    elasticsearch: '...'
+    s3:
+        endpoint: '...'
+        region: '...'
+        access_key: '...'
+        secret_key: '...'
+        use_path_style: false
+        container: '...'
+        compose_service: '...'
+        compose_project: '...'
+        container_engine: '...'
+        container_network: '...'
+# Worktree creation behaviour: root path, symlinked mirrors
+worktrees:
+    root: '...'
+    links:
+        - '...'
+    copies:
+        - '...'
+# EnvSources is the ordered list of `.env*` files the credential
+env_sources:
+    - '...'
+# Files to rewrite inside each worktree with per-worktree values
+patches:
+    - file: '...'
+      format: dotenv
+      set:
+        <name>: '...'
+# One entry per database the project owns. Each entry pairs an
+databases:
+    - engine: mysql
+      name_template: '...'
+      dump: '...'
+      migrate:
+        run: '...'
+        env:
+            <name>: '...'
+      rollback:
+        run: '...'
+        env:
+            <name>: '...'
+      seed:
+        run: '...'
+        env:
+            <name>: '...'
+      inputs:
+        - '...'
+      test_clones:
+        clones: auto
+        name_template: '...'
+      key_prefix: '...'
+      fanout: 0
+      prewarm: 0
+      branch_scoped: false
+# Lifecycle hooks fired around worktree create/delete/checkout and
+hooks:
+    create-before-engines:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    create-after-engines:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    delete-before-engines:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    delete-after-engines:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    checkout:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+    file-change:
+        - run: '...'
+          cwd: '...'
+          container: '...'
+          compose_service: '...'
+          compose_project: '...'
+          container_engine: '...'
+          match: '...'
+# DebounceMs is the file-watcher debounce window in
+debounce_ms: 0
+# User-defined migration frameworks keyed by name. Use this when
+frameworks:
+    <name>:
+        markers:
+            - '...'
+        migration_dirs:
+            - '...'
+        file_pattern: '...'
+        lockfiles:
+            - '...'
+        engine_hint: '...'
+# AutoFetch policy. Daemon-side periodic `git fetch --all --prune`
+auto_fetch:
+    enabled: false
+    interval_minutes: 0
+    mode: ff
+# MainWorktree opts the repo's main checkout (repo root) into the
+main_worktree:
+    enabled: false
+    databases:
+        - name_template: '...'
+          key_prefix: '...'
+          test_clones:
+            clones: auto
+            name_template: '...'
+          fanout: 0
+# Ports declares per-worktree port slots. Each entry is a named
+ports:
+    <name>:
+        - 0
+```
+
 ## Top-level keys
 
-### `daemon` *([DaemonConfig](#daemonconfig))*
+### `daemon` *([DaemonConfig](#daemonconfig))* _[global]_
 
-Daemon process settings: socket path, log level, log database
-location. Typically lives in the user-global config.
+Daemon process settings: stderr log level. Typically lives in
+the user-global config.
 
-### `connections` *([ConnectionsConfig](#connectionsconfig))*
+### `connections` *([ConnectionsConfig](#connectionsconfig))* _[both]_
 
 Connection blocks per supported engine (MySQL, Postgres,
 MongoDB, Redis, Elasticsearch). Treeman dials these to create
 per-worktree clone databases, run migrations.
 
-### `snapshots` *([SnapshotsConfig](#snapshotsconfig))*
+### `snapshots` *([SnapshotsConfig](#snapshotsconfig))* _[global]_
 
-Snapshot cache settings: where post-migration template
-snapshots are cached on disk, plus retention/eviction policy.
+Snapshot retention/eviction policy for cached post-migration
+template snapshots: per-repo cap, per-source keep, max age,
+max total size, GC cadence.
 
-### `worktrees` *([WorktreesConfig](#worktreesconfig))*
+### `worktrees` *([WorktreesConfig](#worktreesconfig))* _[both]_
 
-Worktree creation/deletion behaviour: root path, symlink mirrors,
-async vs sync semantics for hooks.
+Worktree creation behaviour: root path, symlinked mirrors
+(links), and copied files (copies).
 
-### `env_sources` *(array of string)*
+### `env_sources` *(array of string)* _[repo]_
 
 EnvSources is the ordered list of `.env*` files the credential
 resolver consults when looking up DB passwords and other
-secrets. Later entries override earlier ones. Empty falls back
-to the default search order:
-  .env → .env.local → .env.test → .env.testing →
-  .env.test.local → .env.testing.local
+secrets. Later entries override earlier ones. Empty means no
+env files are read — `treeman init` scaffolds a
+framework-tailored `env_sources` list.
 Per-worktree rewriting of these files lives in `patches:`.
 
-### `patches` *(array of [Patch](#patch))*
+### `patches` *(array of [Patch](#patch))* _[repo]_
 
 Files to rewrite inside each worktree with per-worktree values
 (slug-substituted DB names, cache prefixes, etc.). Supports
@@ -56,46 +323,50 @@ Re-applied on every `treeman wt finalize` so a branch switch
 inside an existing worktree re-evaluates each patch against
 the new HEAD's slug.
 
-### `databases` *(array of [DatabaseConfig](#databaseconfig))*
+### `databases` *(array of [DatabaseConfig](#databaseconfig))* _[repo]_
 
 One entry per database the project owns. Each entry pairs an
 engine with a dump path, migration source, test-clone fanout,
 and optional namespace template.
 
-### `hooks` *([HooksConfig](#hooksconfig))*
+### `hooks` *([HooksConfig](#hooksconfig))* _[repo]_
 
-Lifecycle hooks fired around worktree create/delete. Two phases:
-`setup` (after create) and `teardown` (before delete). Run
-async by default; `worktrees.async_create` / `async_delete`
-control whether the CLI blocks on completion.
+Lifecycle hooks fired around worktree create/delete/checkout and
+on watched-file changes. A flat block of trigger-keyed action
+lists (create-before-engines, create-after-engines,
+delete-before-engines, delete-after-engines, checkout,
+file-change); see HooksConfig. Dispatched non-blocking via
+the daemon; when the daemon is unreachable they run inline
+(blocking) in the CLI.
 
-### `debounce_ms` *(integer)*
+### `debounce_ms` *(integer)* _[both]_
 
 DebounceMs is the file-watcher debounce window in
 milliseconds. Coalesces editor save bursts into one re-prep
 dispatch. Default 500.
 
-### `frameworks` *(map of name → [CustomFramework](#customframework))*
+### `frameworks` *(map of name → [CustomFramework](#customframework))* _[both]_
 
 User-defined migration frameworks keyed by name. Use this when
 the built-in framework presets don't cover your tool — declare
-the markers, migration dirs, file pattern, and hash policy
-explicitly.
+the markers, migration dirs, file pattern, lockfiles, and
+engine hint explicitly.
 
-### `logs` *([LogsConfig](#logsconfig))*
+### `logs` *([LogsConfig](#logsconfig))* _[global]_
 
 Logs retention. Daemon-side prune drops rows older than
 `keep_days` from the events, hook_runs, and hook_log_chunks
 tables on a fixed interval. Set 0 to keep forever (no prune).
 
-### `auto_fetch` *([AutoFetchConfig](#autofetchconfig))*
+### `auto_fetch` *([AutoFetchConfig](#autofetchconfig))* _[both]_
 
 AutoFetch policy. Daemon-side periodic `git fetch --all --prune`
-per registered repo, followed by a `git merge --ff-only @{u}`
-per active worktree. Skips dirty trees, non-ff branches, and
+per registered repo, followed by a fast-forward (`merge
+--ff-only @{u}`) or rebase per active worktree, per
+`auto_fetch.mode`. Skips dirty trees, non-ff branches, and
 upstreamless branches. Enabled by default at a 15-minute cadence.
 
-### `main_worktree` *([MainWorktreeConfig](#mainworktreeconfig))*
+### `main_worktree` *([MainWorktreeConfig](#mainworktreeconfig))* _[repo]_
 
 MainWorktree opts the repo's main checkout (repo root) into the
 same watcher-driven prepare/migrate/teardown lifecycle that
@@ -104,7 +375,7 @@ linked `.worktrees/<slug>` checkouts already get. Off by default
 per-branch databases when the user switches branches at the
 repo root.
 
-### `ports` *(map of name → [PortSpec](#portspec))*
+### `ports` *(map of name → [PortSpec](#portspec))* _[both]_
 
 Ports declares per-worktree port slots. Each entry is a named
 slot with a port range; treeman allocates a free port per slot
@@ -116,6 +387,20 @@ restarts; freed on `wt delete`.
 Use slot names that match the role they fill in your app (e.g.
 `octane`, `webpack`, `reverb`) — the name shows up in every
 `{port_<name>}` reference and in `wt show` output.
+
+### `status` *([StatusConfig](#statusconfig))* _[global]_
+
+Status configures the `treeman status` widget output (icons,
+labels, hover lines, custom bar formats). Lives in the global
+config since the widget aggregates worktrees across every repo.
+
+### `notifications` *([NotificationsConfig](#notificationsconfig))* _[global]_
+
+Notifications opts into desktop notifications (notify-send on
+Linux, the native banner via osascript on macOS) when a worktree
+changes lifecycle state. Off by default. Lives in the global
+config since the daemon that emits them is a single cross-repo
+process.
 
 ## Types
 
@@ -137,7 +422,7 @@ Container name or ID. When set, every step is wrapped in `<engine> exec`. Mutual
 
 #### `compose_service` *(string)*
 
-Docker Compose service name. Wraps every step in `<engine> compose exec`. Mutually exclusive with `container`.
+Docker Compose service name. Resolves the container via compose labels and wraps every step in `<engine> exec`. Mutually exclusive with `container`.
 
 #### `compose_project` *(string)*
 
@@ -145,7 +430,7 @@ Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or pa
 
 #### `container_engine` *(string)*
 
-Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.
+Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`.
 
 ### AutoFetchConfig
 
@@ -186,7 +471,7 @@ _Allowed: `ff`, `rebase`_
 
 ### ClonesSetting
 
-Number of test-clone databases to pre-warm. Either the literal string `auto` (treeman reads the project's worker-count config) or a non-negative integer (0 disables pre-warming).
+Number of test-clone databases to pre-warm. Either the literal string `auto` (treeman detects the test framework and uses the CPU count for per-worker runners) or a non-negative integer (0 disables pre-warming).
 
 ### ConnectionsConfig
 
@@ -227,21 +512,25 @@ per-worktree buckets named via the entry's `key_prefix`.
 ### CustomFramework
 
 CustomFramework — `frameworks:` entry, lets users declare
-migration frameworks treeman doesn't know about natively. Consumed
-only by `treeman fw detect` and `treeman init` for scaffolding; at
-runtime treeman reads `databases[].inputs[]` directly.
+migration frameworks treeman doesn't know about natively. Added to
+the detector registry (via RegistryFor) consulted by `treeman fw
+detect` and `treeman doctor`; `treeman init` and the MCP
+`fw_detect` tool use only the built-in registry and ignore these
+entries. At runtime treeman watches `databases[].inputs[]` directly.
 
 #### `markers` *(array of string)* — **required**
 
 Files (relative to repo root) whose presence indicates this
-framework is in use. Used by `treeman fw detect` to pick the
-framework when scaffolding a new config.
+framework is in use. All markers must be present for `treeman
+fw detect` / `treeman doctor` to recognise the framework.
 Example: `["alembic.ini", "migrations/env.py"]`.
 
 #### `migration_dirs` *(array of string)* — **required**
 
 Glob patterns for the directories holding migration files.
-Emitted as `inputs[]` entries during `treeman init`.
+Carried on the detection Spec reported by `treeman fw detect` /
+`treeman doctor`; not emitted into `inputs[]` by `treeman init`
+(init scaffolds only from built-in frameworks).
 
 #### `file_pattern` *(string)* — **required**
 
@@ -249,25 +538,19 @@ Glob pattern for individual migration files within
 `migration_dirs`. Example: `[0-9]*_*.py` (alembic) or
 `V*__*.sql` (flyway).
 
-#### `hash_mode` *(string)*
-
-Hash strategy applied to the migration files: `filename`
-(default) or `checksum`. Maps to the `hash:` field on each
-emitted Input.
-
-_Allowed: `filename`, `checksum`_
-
 #### `lockfiles` *(array of string)*
 
-Lockfiles whose contents are folded into the snapshot hash
-(e.g. `requirements.txt`, `pyproject.toml`, `composer.lock`).
-Emitted as `inputs[]` entries with label `lockfile`.
+Lockfiles (e.g. `requirements.txt`, `pyproject.toml`,
+`composer.lock`) carried on the detection Spec. To fold a
+lockfile into the snapshot hash, declare it under
+`databases[].inputs[]`.
 
 #### `engine_hint` *(string)*
 
 Optional hint about the database engine this framework
-targets — `mysql`, `postgres`, etc. Pre-fills the engine field
-in `treeman init` when this framework is detected.
+targets — `mysql`, `postgres`, etc. Carried on the detection
+Spec; not used by `treeman init` (which scaffolds only from
+built-in frameworks).
 
 ### DaemonConfig
 
@@ -299,9 +582,10 @@ PG pg_database lock contention acceptable, etc.).
 Engine discriminator. Gates which connection block is dialed
 and which sub-fields (dump, migrations, namespaces) are valid.
 `postgresql` is an alias for `postgres`; `opensearch` is an
-alias for `elasticsearch`.
+alias for `elasticsearch`; `valkey` and `dragonfly` are aliases
+for `redis` (same wire protocol, same key-prefix scoping).
 
-_Allowed: `mysql`, `mariadb`, `tidb`, `postgres`, `postgresql`, `mongodb`, `redis`, `elasticsearch`, `opensearch`, `s3`_
+_Allowed: `mysql`, `mariadb`, `tidb`, `postgres`, `postgresql`, `mongodb`, `redis`, `valkey`, `dragonfly`, `elasticsearch`, `opensearch`, `s3`_
 
 #### `name_template` *(string)*
 
@@ -312,11 +596,23 @@ Template for the per-worktree database/index name. Supports
 scope by database name (MySQL, Postgres, Mongo). Validated at
 config-load time — typos fail loud.
 
-#### `dump` *([DumpSpec](#dumpspec))*
+#### `dump` *([DumpList](#dumplist))*
 
-Source dump used to seed clones. Path is relative to the repo
-root. Treeman hashes this file into the snapshot key, so
-changes invalidate the cache.
+Source dump(s) used to seed the source DB before migrate/seed
+run. Each path is relative to the repo root. Treeman hashes
+every dump into the snapshot key, so changes invalidate the
+cache. Three shapes:
+
+  dump: seed.sql                       # bare string
+  dump: { path: seed.sql, optional: true }  # mapping
+  dump:                                # sequence
+    - base.sql
+    - { path: extras.sql, optional: true }
+
+Sequence entries load in declared ORDER, so a base schema dump
+followed by per-feature patches is supported without splicing
+them into one file. Order matters for the fingerprint too —
+reordering reproducible dumps is a content change.
 
 #### `migrate` *([Step](#step))*
 
@@ -324,6 +620,33 @@ Migrate is the shell command that brings a freshly-loaded
 source DB up to the current schema. Required when any input
 glob matches migration files; optional otherwise (e.g. a DB
 that's purely seed-driven).
+
+#### `rollback` *([Step](#step))*
+
+Rollback is the OPTIONAL shell command that unwinds the most
+recently applied migrations, used to keep templates correct when
+an *already-applied* migration's content is edited. Treeman runs
+it against a clone of the prior template, then re-runs Migrate
+forward — the only path that re-applies an edit to a migration
+whose ledger row is baked into the source dump.
+
+Treeman injects the number of migrations to unwind as the env var
+TREEMAN_ROLLBACK_STEPS; reference it in Run, e.g.
+  rollback: { run: "php artisan migrate:rollback --step=$TREEMAN_ROLLBACK_STEPS" }
+(Run is passed verbatim to `sh -c`; only Env values are
+`{placeholder}`-rendered, so use the shell env var, not a brace
+placeholder.)
+
+WARNING: rollback runs the migration's CURRENT down() — the edited
+file on disk — not the original down() that matched the applied
+schema. For edits that change down(), or for lossy/irreversible
+down()s, this can produce a wrong or failing schema. Treeman
+hard-falls-back to a full cold rebuild on ANY rollback or migrate
+error, so a broken down() degrades to "slow but correct", never
+"fast but wrong"-at-the-engine — but a down() that *succeeds* while
+not faithfully inverting up() is the user's responsibility. Leave
+this unset to disable the rollback path entirely (cold rebuild
+only).
 
 #### `seed` *([Step](#step))*
 
@@ -340,13 +663,12 @@ template state. Each entry:
   1. Contributes a hash to the snapshot fingerprint (so any
      change auto-invalidates the cached template).
   2. Subscribes fsnotify so changes trigger a re-prep.
-  3. Carries an optional `label:` that `hooks.on-file-change`
+  3. Carries an optional `label:` that `hooks.file-change`
      actions can match against.
 
-Glob patterns are repo-root-relative. Hash mode is per-entry:
-`filename` for append-only files (Laravel migrations, …),
-`checksum` for files edited in place (seeders, lockfiles).
-Default is checksum.
+Glob patterns are repo-root-relative. Every matched file is
+content-hashed (BLAKE3); a content, add, or remove moves the
+fingerprint.
 
 Cache-hit vs cold-build is derived purely from the input
 hashes — there's no separate `on: rebuild` knob. If you want
@@ -379,6 +701,22 @@ Range 0–64. Raise only if the server is provisioned
 (max_connections, PG pg_database lock contention, etc.).
 
 _min: 0 · max: 64_
+
+#### `prewarm` *(integer)*
+
+Prewarm keeps N spare clones pre-restored from this database's
+cached template (Postgres only — other engines have no
+constant-time whole-database rename, so the knob is rejected at
+config load). A cache-hit prepare claims a spare via
+`ALTER DATABASE … RENAME` (milliseconds, size-independent)
+instead of paying `CREATE DATABASE … TEMPLATE` per restore; a
+detached replenisher then tops the pool back up. Spares are
+named `<template>_spare<n>`, survive worktree teardown (they
+belong to the template cache, not a worktree), and are dropped
+with their template on snapshot eviction. Range 0–16; default
+0 (off). Mutually exclusive with `branch_scoped`.
+
+_min: 0 · max: 16_
 
 #### `branch_scoped` *(boolean)*
 
@@ -459,9 +797,9 @@ Field semantics:
 
 #### `fanout` *(integer)*
 
-### DumpSpec
+### DumpList
 
-Source dump file. Bare string OR `{path, optional}` mapping.
+Source dump(s). Accepts a bare path string, a single mapping, or an ordered array of either.
 
 ### EsConn
 
@@ -485,7 +823,7 @@ Container name or ID. When set, every step is wrapped in `<engine> exec`. Mutual
 
 #### `compose_service` *(string)*
 
-Docker Compose service name. Wraps every step in `<engine> compose exec`. Mutually exclusive with `container`.
+Docker Compose service name. Resolves the container via compose labels and wraps every step in `<engine> exec`. Mutually exclusive with `container`.
 
 #### `compose_project` *(string)*
 
@@ -493,7 +831,7 @@ Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or pa
 
 #### `container_engine` *(string)*
 
-Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`, `orbctl`.
+Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`.
 
 #### `match` *(one of: string, array of string)*
 
@@ -501,61 +839,60 @@ Restrict this action to watch events carrying one of the named labels. Omit to f
 
 ### HooksConfig
 
-HooksConfig — `hooks:` block. A flat map keyed by trigger name.
-Each key's value is a list of Actions that fire when that trigger
-happens. Actions in the same list run in parallel; the trigger
-key itself encodes BOTH the lifecycle phase AND the timing point,
-so there's no separate `when:` field anywhere.
+HooksConfig — `hooks:` block. A flat set of trigger-keyed action
+lists. Each key's value is a list of Actions that fire when that
+trigger happens. Actions in the same list run in parallel; the
+trigger key itself encodes BOTH the lifecycle phase AND the timing
+point, so there's no separate `when:` field anywhere.
 
 Triggers (all optional — omit any you don't need):
 
-  - on-create-before-engines — during `wt create`, after patches +
+  - create-before-engines — during `wt create`, after patches +
     bring-in (copies/links), BEFORE engine prepare. Standard
     home of dependency installs (composer/yarn/pip) so migrate
     can find vendor/.
-  - on-create-after-engines — during `wt create`, after engine
+  - create-after-engines — during `wt create`, after engine
     prepare. Use when actions need a populated database
     (cache warming, seed verification).
-  - on-delete-before-engines — during `wt delete`, BEFORE DB
+  - delete-before-engines — during `wt delete`, BEFORE DB
     drop. Graceful shutdown: drain queues, docker compose stop.
-  - on-delete-after-engines — during `wt delete`, AFTER DB drop +
+  - delete-after-engines — during `wt delete`, AFTER DB drop +
     git worktree remove. External notifications (Slack, CDN
     purge) that should announce only once the data is gone.
-  - on-checkout — fires when the HEAD watcher sees a branch
+  - checkout — fires when the HEAD watcher sees a branch
     switch inside an existing worktree. Re-runs in addition to
     the regular finalize-on-HEAD-change behaviour.
-  - on-file-change — fires when any `databases[].inputs[]` glob
+  - file-change — fires when any `databases[].inputs[]` glob
     matches a filesystem event. Each action can optionally
     `match: <label>` to filter by the input entry's label.
 
-The map shape lets new triggers be added without touching every
-existing config. Daemon execution is always non-blocking from the
-CLI's perspective — each list of actions dispatches in parallel.
+Daemon execution is always non-blocking from the CLI's
+perspective — each list of actions dispatches in parallel.
 
-#### `on-create-before-engines` *(array of [Action](#action))*
+#### `create-before-engines` *(array of [Action](#action))*
 
 OnCreateBeforeEngines — actions fire after worktree create +
 patches + bring-in, before engine prepare.
 
-#### `on-create-after-engines` *(array of [Action](#action))*
+#### `create-after-engines` *(array of [Action](#action))*
 
 OnCreateAfterEngines — actions fire after engine prepare completes.
 
-#### `on-delete-before-engines` *(array of [Action](#action))*
+#### `delete-before-engines` *(array of [Action](#action))*
 
 OnDeleteBeforeEngines — actions fire before DB drop on delete.
 
-#### `on-delete-after-engines` *(array of [Action](#action))*
+#### `delete-after-engines` *(array of [Action](#action))*
 
 OnDeleteAfterEngines — actions fire after DB drop + worktree
 remove on delete.
 
-#### `on-checkout` *(array of [Action](#action))*
+#### `checkout` *(array of [Action](#action))*
 
 OnCheckout — actions fire when the HEAD watcher detects a
 branch switch inside an existing worktree.
 
-#### `on-file-change` *(array of [FilteredAction](#filteredaction))*
+#### `file-change` *(array of [FilteredAction](#filteredaction))*
 
 OnFileChange — actions fire when any `databases[].inputs[]`
 glob matches a filesystem event. Each action can optionally
@@ -565,7 +902,6 @@ input event (any engine, any label).
 
 The subprocess receives extra env vars naming the trigger:
   TREEMAN_WATCH_PATH   — absolute path that fired
-  TREEMAN_WATCH_MODE   — auto | delta | rebuild
   TREEMAN_WATCH_LABEL  — the label on the matched watch entry (or "")
   TREEMAN_WATCH_ENGINE — engine of the owning database (mysql, postgres, …)
   TREEMAN_WATCH_DB_NAME — rendered name_template of the owning database
@@ -636,6 +972,49 @@ mongodb connection — bare URL string OR structured object.
 ### MysqlConn
 
 MySQL connection — bare DSN string OR structured object.
+
+### NotificationsConfig
+
+NotificationsConfig — `notifications:` block. Opt-in desktop
+notifications fired by the daemon when a worktree crosses a lifecycle
+status boundary. Backend is auto-detected per OS (notify-send on
+Linux, `osascript -e 'display notification'` on macOS); platforms
+without a known sender silently no-op.
+
+Each notification is keyed to one of the four `treeman status`
+buckets:
+  - stable: a worktree finished preparing and is ready (finalize done)
+  - up:     a worktree began preparing (finalize started)
+  - down:   a worktree began tearing down
+  - failed: a worktree's finalize errored
+
+`up` and `down` are transient and chatty, so the default
+(`events:` unset) only notifies on `stable` + `failed` — ready and
+errored, the two resting states worth surfacing. Set `events:`
+explicitly to opt into the transient ones, or to a subset.
+
+#### `enabled` *(boolean)*
+
+Enabled toggles the whole feature. Off by default — every
+existing install sees zero behaviour change until it's set.
+
+#### `events` *(array of string)*
+
+Events is the set of status buckets that fire a notification.
+Allowed values: stable, up, down, failed. When unset (nil) the
+default of [stable, failed] applies (see applyDefaults). An
+explicit empty list (`events: []`) disables every bucket while
+leaving the feature otherwise "enabled" — useful as a base for a
+per-repo override that re-adds buckets.
+
+#### `backend` *(string)*
+
+Backend forces a specific sender instead of OS auto-detection.
+Allowed values: auto (default), notify-send, osascript, none.
+`none` disables sending without unsetting `enabled` — handy to
+mute notifications on one host while keeping the shared config.
+
+_Allowed: `auto`, `notify-send`, `osascript`, `none`_
 
 ### Patch
 
@@ -766,6 +1145,85 @@ dir exceeds N gigabytes on disk. Default 50.
 Cadence (minutes) of the daemon's periodic snapshot-sweep
 goroutine. Default 60.
 
+### StatusBuckets
+
+StatusBuckets carries one string per worktree bucket. Reused for
+both the `icons` and `labels` maps so the four bucket names stay in
+lockstep across the schema.
+
+#### `stable` *(string)*
+
+#### `up` *(string)*
+
+#### `down` *(string)*
+
+#### `failed` *(string)*
+
+### StatusConfig
+
+StatusConfig configures `treeman status` — the bar/waybar widget
+that aggregates worktree health across every registered repo. Each
+active worktree falls into one of four buckets:
+
+	stable  — ready (last finalize succeeded, or never ran)
+	up      — being prepared (finalize in progress)
+	down    — being torn down (teardown in progress)
+	failed  — last finalize errored
+
+All knobs below feed the `{key}` template syntax used elsewhere in
+`.treeman.yaml` (no separate templating engine). The built-in
+`--format` values are `icon`, `hover`, `waybar`, and `json`; entries
+in `formats` add or override named single-line formats.
+
+#### `icons` *([StatusBuckets](#statusbuckets))*
+
+Icons holds the glyph for each bucket. Exposed to format
+templates as `{icon_stable}` / `{icon_up}` / `{icon_down}` /
+`{icon_failed}`, plus `{icon}` for the worst non-empty bucket.
+Defaults to Nerd Font glyphs; set an icon to a single space to
+suppress it (an empty string falls back to the default).
+
+#### `labels` *([StatusBuckets](#statusbuckets))*
+
+Labels holds the text label for each bucket. Exposed as
+`{label_stable}` etc. Defaults to the bucket name.
+
+#### `separator` *(string)*
+
+Separator joins the segments of the built-in `icon` line and is
+exposed to templates as `{sep}`. Default " | ".
+
+#### `header` *(string)*
+
+Header is the `{key}` template for each repo heading in the
+built-in `hover` format. Tokens: `{repo}`, `{total}`,
+`{stable}`, `{up}`, `{down}`, `{failed}` (repo-scoped counts).
+Default "{repo}  ({total})".
+
+#### `row` *(string)*
+
+Row is the `{key}` template for each worktree line in the
+built-in `hover` format. Tokens: `{branch}`, `{slug}`,
+`{state}`, `{bucket}`, `{main}`, `{state_suffix}`, `{path}`,
+`{icon}`. Default "  {main}{branch}{state_suffix}".
+
+#### `main_marker` *(string)*
+
+MainMarker is substituted for `{main}` on a repo's main-worktree
+row (empty string on linked worktrees). Default "★ ".
+
+#### `formats` *(object)*
+
+Formats declares named single-line `{key}` templates selectable
+with `treeman status --format <name>`. A name matching the
+built-in `icon` line overrides it; the structured built-ins
+`hover`/`waybar`/`json` are reserved and cannot be overridden.
+Available tokens match
+the `icon` line: `{total}`, `{stable}`, `{up}`, `{down}`,
+`{failed}`, `{icon_*}`, `{icon}`, `{label_*}`, `{class}`,
+`{sep}`. A flat template cannot express the multi-line hover
+body — customize that with `header` / `row` instead.
+
 ### Step
 
 Step is one user-declared shell command executed against a target
@@ -814,20 +1272,23 @@ file). See the type doc-comment for the full list of supported
 TestClonesSpec — `test_clones:` sub-block. Used by every parallel
 test runner (paratest, pest, pytest-xdist, Jest workers, Go
 `-parallel`, cargo nextest, …). `clones` is either `auto` (treeman
-reads the project's worker-count config) or an explicit integer.
+detects the test framework and uses the CPU count for per-worker
+runners) or an explicit integer.
 
 #### `clones` *([ClonesSetting](#clonessetting))*
 
-Number of test-clone databases to pre-warm. `auto` reads the
-project's worker-count config (paratest's processes, pytest
--n, Jest maxWorkers). Explicit integer overrides; 0 disables
-pre-warming entirely.
+Number of test-clone databases to pre-warm. `auto` detects the
+project's test framework and pre-warms one clone per CPU
+(`runtime.NumCPU`) when that framework clones per-worker,
+otherwise 1 (falling back to the CPU count when no framework is
+detected). Explicit integer overrides; 0 disables pre-warming
+entirely.
 
 #### `name_template` *(string)* — **required**
 
 Template for clone database names. Supports the same
 placeholders as `databases[].name_template` plus `{n}` —
-the 0-based clone index (only valid here). Required.
+the 1-based clone index (only valid here). Required.
 Example: `app_{slug}_test_{n}`.
 
 ### WorktreesConfig

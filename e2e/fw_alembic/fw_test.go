@@ -62,12 +62,13 @@ func TestAlembicEndToEnd(t *testing.T) {
 				Migrate: &config.Step{
 					Run: fmt.Sprintf(
 						`docker exec -w %s -e ALEMBIC_DATABASE_URL=postgresql://postgres:pgpw@postgres:5432/${DB_NAME} %s alembic upgrade head`,
-						wt, pyContainer,
+						wt,
+						pyContainer,
 					),
 					Env: map[string]string{"DB_NAME": "{target_db}"},
 				},
 				Inputs: []config.Input{
-					{Glob: "migrations/versions/*.py", Label: "migrations", Hash: "filename"},
+					{Glob: "migrations/versions/*.py", Label: "migrations"},
 				},
 			},
 		},

@@ -125,7 +125,20 @@ func ensureFilterConfig(ctx context.Context, worktreePath string) error {
 	pairs := [][2]string{
 		{"filter." + FilterName + ".clean", "treeman patch-filter clean %f"},
 		{"filter." + FilterName + ".smudge", "treeman patch-filter smudge %f"},
-		{"filter." + FilterName + ".required", "true"},
+		// required=false: when the filter program can't be resolved
+		// (treeman not on PATH for the spawning process — common for
+		// `git worktree add` invoked outside the user's interactive
+		// shell), git falls back to identity content rather than
+		// aborting. required=true made any such hiccup a fatal
+		// `git worktree add: exit status 128`, killing worktree
+		// creation over a missing binary. Matches filter.go's
+		// passthrough-on-error contract: a degraded filter must
+		// no-op, not corrupt or block. Cost when treeman is truly
+		// absent: the clean direction no longer projects patched keys
+		// back to HEAD, so patched files may show as modified in
+		// `git status` until the next finalize — cosmetic and
+		// recoverable, unlike a blocked worktree.
+		{"filter." + FilterName + ".required", "false"},
 	}
 	for _, kv := range pairs {
 		if _, err := gitcmd.OutputRW(ctx, worktreePath, false, "config", "--local", kv[0], kv[1]); err != nil {
@@ -156,6 +169,7 @@ func writeAttributes(gitDir string, files []string) error {
 		tail += "\n\n"
 	}
 	tail += attrsHeader + "\n"
+	var tailSb159 strings.Builder
 	for _, f := range files {
 		// Quote paths with whitespace; otherwise git treats only the
 		// first token as the pattern. Plain quoting (no escape) is
@@ -165,8 +179,9 @@ func writeAttributes(gitDir string, files []string) error {
 		if strings.ContainsAny(pattern, " \t") {
 			pattern = `"` + pattern + `"`
 		}
-		tail += pattern + " filter=" + FilterName + "\n"
+		tailSb159.WriteString(pattern + " filter=" + FilterName + "\n")
 	}
+	tail += tailSb159.String()
 	tail += "\n"
 	return os.WriteFile(attrPath, []byte(tail), 0o644)
 }
@@ -177,7 +192,7 @@ func writeAttributes(gitDir string, files []string) error {
 func dropTreemanBlock(body string) string {
 	var out strings.Builder
 	skipping := false
-	for _, line := range strings.Split(body, "\n") {
+	for line := range strings.SplitSeq(body, "\n") {
 		if line == attrsHeader {
 			skipping = true
 			continue

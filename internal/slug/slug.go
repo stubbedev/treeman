@@ -180,7 +180,7 @@ func sysvCksum(input []byte) uint32 {
 
 func crcUpdate(crc uint32, b byte) uint32 {
 	crc ^= uint32(b) << 24
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		if crc&0x80000000 != 0 {
 			crc = (crc << 1) ^ 0x04C11DB7
 		} else {

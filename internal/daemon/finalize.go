@@ -11,10 +11,13 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/patcher"
+	"github.com/stubbedev/treeman/internal/ports"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/wt"
@@ -23,24 +26,71 @@ import (
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
-// goroutine) tail of `treeman wt create` when
-// `worktrees.async_create` is true. Runs setup hooks + prepare
-// against the main repo root.
+// goroutine) tail of `treeman wt create`: it runs the create
+// hook pipeline + engine prepare against the main repo root,
+// detached from the CLI invocation.
 func FinalizeWorktree(
 	ctx context.Context,
 	st *State,
 	repoPath, worktreePath string,
 	inheritedEnv map[string]string,
-) error {
+) (err error) {
 	repoRoot := repoPath
 	wtRoot := worktreePath
+	// Captured by the terminal-event defer below. Populated once the
+	// row identity is known so a hook/prepare error after that point
+	// always produces a worktree:create:error event scoped to the right row.
+	var (
+		termRepoID int64
+		termWtID   int64
+	)
+	defer func() {
+		if err == nil {
+			return
+		}
+		if termWtID == 0 {
+			// Pre-identity error (LoadResolved, EnsureRepo,
+			// ResolveIdentity): we don't have a row to attach a
+			// terminal event to. Let the dispatch-level safety net at
+			// dispatch.go log a global worktree:create:error error instead.
+			return
+		}
+		// Terminal event for `finalizeState` — without this, a
+		// prepare/hook failure leaves the row derived as preparing
+		// forever (see #11). Swallow the returned error afterwards so
+		// dispatch doesn't double-log the same failure as a second
+		// (row-less) worktree:create:error event.
+		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError, err.Error(),
+			termRepoID, termWtID, "", 0, map[string]string{
+				"repo_path":     repoRoot,
+				"worktree_path": wtRoot,
+			})
+		err = nil
+	}()
 
-	// Derive a cancellable ctx that TeardownWorktree can preempt via
-	// CancelFinalize. ctx.Err() is consulted at each phase boundary
-	// below so a concurrent `wt delete` preempts before prepare.Run
-	// creates databases the cleanup would then have to chase.
-	ctx, cancel := context.WithCancel(ctx)
+	// Derive a cancellable, DEADLINE-bound ctx. Two jobs:
+	//   1. TeardownWorktree preempts via CancelFinalize (the cancel func is
+	//      registered with MarkFinalizeInFlight below). ctx.Err() is consulted
+	//      at each phase boundary so a concurrent `wt delete` preempts before
+	//      prepare.Run creates databases the cleanup would then have to chase.
+	//   2. The finalizeTimeout deadline self-cancels a wedged run instead of
+	//      relying solely on the external FinalizeWatchdogLoop — a prepare that
+	//      hangs inside an engine/network op stops pinning its slot (and the
+	//      machine) the moment a phase boundary observes the expired ctx, plus
+	//      every engine HTTP call inherits the deadline. The watchdog stays as
+	//      the backstop that emits the error event + recovery if a phase never
+	//      reaches a boundary.
+	ctx, cancel := context.WithTimeout(ctx, finalizeTimeout)
 	defer cancel()
+
+	// Pin the caller's shell PATH onto ctx for every git subprocess
+	// this finalize spawns — notably EnsureFilter's `git add
+	// --renormalize`, which runs the clean filter (`treeman
+	// patch-filter`). The async create tail and the file/HEAD watchers
+	// reach here on st.BgCtx, which does NOT carry runOneTask's
+	// override, so re-pin from inheritedEnv (the CLI-captured env,
+	// rehydrated from the store on watcher-driven runs).
+	ctx = gitcmd.WithPath(ctx, inheritedEnv["PATH"])
 
 	// Dedup against concurrent finalize attempts on the same wtPath
 	// — both the CLI's wt-create dispatch AND the lifecycle watcher
@@ -78,6 +128,7 @@ func FinalizeWorktree(
 		return err
 	}
 	sl, wtID, isMain := id.Slug, id.WtID, id.IsMain
+	termRepoID, termWtID = repoID, wtID
 
 	// Cache the user's shell env per-worktree so daemon-driven re-
 	// runs (HEAD watcher, file watcher) can rehydrate PATH etc.
@@ -86,12 +137,49 @@ func FinalizeWorktree(
 	// that's the canonical source for the worktree's env going
 	// forward.
 	if len(inheritedEnv) > 0 {
-		_ = st.Store.SaveInheritedEnv(ctx, wtID, inheritedEnv)
+		// A failed save is worth a warning: watcher-driven re-runs
+		// rehydrate PATH etc. from this row, and an empty env quietly
+		// breaks git/hook execution on every later re-prepare.
+		if err := st.Store.SaveInheritedEnv(ctx, wtID, inheritedEnv); err != nil {
+			slog.Warn("save inherited env (watcher re-runs will lack PATH)", "wt", wtRoot, "err", err)
+		}
 	}
 
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_start",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateStart,
 		"daemon-detached setup + prepare beginning",
 		repoID, wtID, "", 0, nil)
+
+	// Wait for `git worktree add` to finish checking out the tree
+	// before firing hooks. Watcher-triggered finalize can race: the
+	// new worktree dir + .git file land first, the daemon's filesystem
+	// watcher sees them and dispatches finalize, but git is still
+	// writing subdirs. A user `create-before-engines` hook with a
+	// `cwd: frontend` then fails with `cd: can't cd to frontend`. CLI-
+	// triggered finalize is already past the git wait so this is a
+	// near-zero-cost no-op there. Bounded so a wedged checkout still
+	// surfaces a clear error rather than blocking forever.
+	if err := waitForCheckoutSettled(ctx, st, wtRoot, repoID, wtID, 60*time.Second); err != nil {
+		return err
+	}
+
+	// Bring in worktrees.links / worktrees.copies. Offloaded from the CLI
+	// (`wt create`) to here so the CLI returns immediately instead of
+	// blocking on a recursive copy of e.g. a vendor/ tree. Idempotent —
+	// existing destinations are skipped. Done before port alloc + patches
+	// so the copied `.env` exists for the patch render below. Skipped for
+	// the main worktree, which is the source the links/copies originate
+	// from (src == dst), same rationale as patches.
+	if !isMain {
+		if err := bringInWithEvents(ctx, st, repoRoot, wtRoot, &cfg, repoID, wtID); err != nil {
+			// A cancelled ctx here means a concurrent teardown preempted the
+			// copy (it now honors ctx mid-tree) — a clean stop, not a create
+			// error. Record it like the pipeline's phase-boundary checks.
+			if cancelledBefore(ctx, st, "bring-in", repoID, wtID) {
+				return nil
+			}
+			return err
+		}
+	}
 
 	// Re-apply top-level patches: every finalize evaluates them
 	// against the current HEAD's slug. Idempotent — Unchanged is a
@@ -108,83 +196,241 @@ func FinalizeWorktree(
 	// real `.env` (e.g. point `DB_DATABASE` at a per-branch name when
 	// the main worktree's branch_scoped active DB is the bare,
 	// overlay-resolved name the root `.env` already targets).
-	if len(cfg.Patches) > 0 && !isMain {
-		portMap, _ := st.Store.LoadWorktreePorts(ctx, wtID)
-		tplCtx := template.FromSlug(sl).WithPorts(portMap)
-		files := make([]string, 0, len(cfg.Patches))
-		for _, p := range cfg.Patches {
-			files = append(files, p.File)
-			res, err := patcher.Apply(p, wtRoot, tplCtx)
-			if err != nil {
-				slog.Warn("patch failed", "wt", wtRoot, "file", p.File, "err", err)
-				continue
-			}
-			if res.Outcome == patcher.Updated {
-				_ = st.Store.WriteEvent(ctx, store.LevelInfo, "patch_applied",
-					fmt.Sprintf("driver=%s file=%s", res.Driver, res.File),
-					repoID, wtID, "", 0, map[string]string{
-						"driver": res.Driver,
-						"file":   res.File,
-					})
-			}
-		}
-		if err := patcher.EnsureFilter(ctx, wtRoot, files); err != nil {
-			slog.Warn("install patch filter", "wt", wtRoot, "err", err)
-		}
+	// Ensure the declared port slots are allocated before patches/hooks
+	// render `{{ port.* }}`. The CLI allocates at `wt create` time; an
+	// external `git worktree add` reaches finalize via the lifecycle
+	// watcher with no ports yet, so without this its patches/hooks would
+	// see empty port values. Allocate is idempotent — a no-op when the
+	// CLI already filled every slot. Skipped for the main worktree
+	// (same rationale as patches: it IS the canonical clone).
+	if len(cfg.Ports) > 0 && !isMain {
+		allocatePortsWithEvents(ctx, st, &cfg, wtRoot, repoID, wtID)
 	}
 
-	// Three-step setup pipeline: on-create-before-engines actions →
-	// engine prepare → on-create-after-engines actions. Each step waits
+	if len(cfg.Patches) > 0 && !isMain {
+		applyFinalizePatches(ctx, st, &cfg, wtRoot, sl, repoID, wtID)
+	}
+
+	// Three-step setup pipeline: create-before-engines actions →
+	// engine prepare → create-after-engines actions. Each step waits
 	// for the previous on the daemon side; the CLI never sees this
 	// (it already returned).
 	//
 	// Phase boundaries double as cancellation checkpoints: a
 	// concurrent TeardownWorktree fires `cancel` via CancelFinalize,
 	// and the next check bails before prepare creates databases.
-	if err := ctx.Err(); err != nil {
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
-			"finalize aborted before pre-hooks", repoID, wtID, "", 0, nil)
-		return nil
-	}
-	if err := runTriggerActions(ctx, st, "on-create-before-engines",
-		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
-		isMain, repoID, wtID, inheritedEnv); err != nil {
+	done, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl, isMain, repoID, wtID, inheritedEnv)
+	if err != nil {
 		return err
 	}
-	if err := ctx.Err(); err != nil {
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
-			"finalize aborted before prepare", repoID, wtID, "", 0, nil)
+	if done {
 		return nil
-	}
-	if len(cfg.Databases) > 0 {
-		if _, err := prepare.Run(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return fmt.Errorf("prepare: %w", err)
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "wt_finalize_cancelled",
-			"finalize aborted before post-hooks", repoID, wtID, "", 0, nil)
-		return nil
-	}
-	if err := runTriggerActions(ctx, st, "on-create-after-engines",
-		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
-		isMain, repoID, wtID, inheritedEnv); err != nil {
-		return err
 	}
 
 	// Start (or keep) the per-worktree fsnotify watcher so subsequent
 	// migration edits inside the worktree trigger a prepare rerun.
 	if err := startWorktreeWatcher(ctx, st, repoRoot, wtRoot); err != nil {
 		slog.Warn("start worktree watcher", "wt", wtRoot, "err", err)
+	} else {
+		_ = st.Store.WriteEvent(ctx, store.LevelDebug, store.EvtWatchStart,
+			"per-worktree fsnotify watcher active",
+			repoID, wtID, "", 0, nil)
 	}
 
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_finalize_done",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateEnd,
 		"daemon-detached setup + prepare complete",
 		repoID, wtID, "", 0, nil)
 	return nil
+}
+
+// bringInWithEvents runs the link + copy bring-in passes for a non-main
+// worktree, emitting <domain>:start / <domain>:path (debug) / <domain>:end
+// per pass where <domain> is `copies` or `links`. Bring-in is the single
+// biggest silent cost on create (a recursive copy of e.g. vendor/ or
+// node_modules/ can run for tens of seconds); the per-entry line carries
+// files + bytes + duration so a slow copy is attributable to a specific
+// configured path. Extracted from FinalizeWorktree to keep that function
+// under the complexity gate.
+func bringInWithEvents(
+	ctx context.Context,
+	st *State,
+	repoRoot, wtRoot string,
+	cfg *config.Config,
+	repoID, wtID int64,
+) error {
+	// startEvt/pathEvt/endEvt are the copies:* or links:* event types;
+	// mode is the wt.BringInFilesReport verb (copy|link).
+	emit := func(startEvt, pathEvt, endEvt, mode string, paths []string) error {
+		if len(paths) == 0 {
+			return nil
+		}
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, startEvt,
+			fmt.Sprintf("entries=%d", len(paths)),
+			repoID, wtID, "", 0, map[string]any{"entries": len(paths)})
+		results, brErr := wt.BringInFilesReport(ctx, repoRoot, wtRoot, paths, mode, nil)
+		var files, brought, skipped int
+		var bytes, totalMs int64
+		for _, r := range results {
+			files += r.Files
+			brought += r.Brought
+			skipped += r.Skipped
+			bytes += r.Bytes
+			totalMs += r.DurationMs
+			_ = st.Store.WriteEvent(ctx, store.LevelDebug, pathEvt,
+				fmt.Sprintf("%s files=%d bytes=%d duration=%dms", r.Rel, r.Files, r.Bytes, r.DurationMs),
+				repoID, wtID, "", r.DurationMs, map[string]any{
+					"path": r.Rel, "matches": r.Matches,
+					"brought": r.Brought, "skipped": r.Skipped, "missing": r.Missing,
+					"files": r.Files, "bytes": r.Bytes,
+				})
+		}
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, endEvt,
+			fmt.Sprintf("entries=%d brought=%d skipped=%d files=%d bytes=%d", len(results), brought, skipped, files, bytes),
+			repoID, wtID, "", totalMs, map[string]any{
+				"entries": len(results), "brought": brought,
+				"skipped": skipped, "files": files, "bytes": bytes,
+			})
+		return brErr
+	}
+	if err := emit(store.EvtLinksStart, store.EvtLinksPath, store.EvtLinksEnd, "link", cfg.Worktrees.Links); err != nil {
+		return err
+	}
+	return emit(store.EvtCopiesStart, store.EvtCopiesPath, store.EvtCopiesEnd, "copy", cfg.Worktrees.Copies)
+}
+
+// allocatePortsWithEvents allocates the configured port slots for a
+// non-main worktree, emitting wt_port_alloc on success (with the
+// slot→port map) or wt_port_alloc_error on failure. Idempotent — a
+// no-op when the CLI already filled every slot. Extracted from
+// FinalizeWorktree to keep that function under the complexity gate.
+func allocatePortsWithEvents(
+	ctx context.Context,
+	st *State,
+	cfg *config.Config,
+	wtRoot string,
+	repoID, wtID int64,
+) {
+	allocs, err := ports.New().Allocate(ctx, st.Store, cfg, repoID, wtID)
+	switch {
+	case err != nil:
+		slog.Warn("finalize: port allocation", "wt", wtRoot, "err", err)
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtPortsError,
+			err.Error(), repoID, wtID, "", 0, nil)
+	case len(allocs) > 0:
+		slots := make(map[string]any, len(allocs))
+		for _, a := range allocs {
+			slots[a.Name] = a.Port
+		}
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtPortsAllocate,
+			fmt.Sprintf("allocated %d port slot(s)", len(allocs)),
+			repoID, wtID, "", 0, map[string]any{"slots": slots})
+	}
+}
+
+// applyFinalizePatches re-applies the top-level `patches:` against the
+// current HEAD's slug and re-asserts the git clean/smudge filter.
+// Idempotent; failures are logged but non-fatal. Extracted from
+// FinalizeWorktree to keep that function under the complexity gate.
+func applyFinalizePatches(
+	ctx context.Context,
+	st *State,
+	cfg *config.Config,
+	wtRoot string,
+	sl slug.Slug,
+	repoID, wtID int64,
+) {
+	portMap, _ := st.Store.LoadWorktreePorts(ctx, wtID)
+	tplCtx := template.FromSlug(sl).WithPorts(portMap)
+	files := make([]string, 0, len(cfg.Patches))
+	for _, p := range cfg.Patches {
+		files = append(files, p.File)
+		res, err := patcher.Apply(p, wtRoot, tplCtx)
+		if err != nil {
+			slog.Warn("patch failed", "wt", wtRoot, "file", p.File, "err", err)
+			continue
+		}
+		if res.Outcome == patcher.Updated {
+			_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtPatchesApply,
+				fmt.Sprintf("driver=%s file=%s", res.Driver, res.File),
+				repoID, wtID, "", 0, map[string]string{
+					"driver": res.Driver,
+					"file":   res.File,
+				})
+		}
+	}
+	if err := patcher.EnsureFilter(ctx, wtRoot, files); err != nil {
+		slog.Warn("install patch filter", "wt", wtRoot, "err", err)
+	}
+}
+
+// runFinalizeSetupPipeline runs the three-step setup pipeline:
+// create-before-engines actions → engine prepare →
+// create-after-engines actions. Each phase boundary is a
+// cancellation checkpoint: when a concurrent TeardownWorktree fires
+// `cancel`, the next check writes a worktree:create:cancel event and
+// returns (done=true, nil) so the caller stops short of starting the
+// watcher / emitting the done event. A non-nil error aborts the
+// pipeline. Extracted from FinalizeWorktree to keep that function
+// under the cyclomatic-complexity gate.
+func runFinalizeSetupPipeline(
+	ctx context.Context,
+	st *State,
+	cfg *config.Config,
+	repoRoot, wtRoot string,
+	sl slug.Slug,
+	isMain bool,
+	repoID, wtID int64,
+	inheritedEnv map[string]string,
+) (done bool, err error) {
+	if cancelledBefore(ctx, st, "pre-hooks", repoID, wtID) {
+		return true, nil
+	}
+	if err := runTriggerActions(ctx, st, "create-before-engines",
+		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
+		isMain, repoID, wtID, inheritedEnv); err != nil {
+		return false, err
+	}
+	if cancelledBefore(ctx, st, "prepare", repoID, wtID) {
+		return true, nil
+	}
+	if len(cfg.Databases) > 0 {
+		_, prepErr := prepare.Run(ctx, cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv)
+		// A cancelled context means a concurrent teardown preempted
+		// prepare — a clean stop regardless of whether prepare.Run
+		// surfaced an error on the way out. Mirrors the un-extracted
+		// FinalizeWorktreeForWatch path; nilerr can't tell this
+		// ctx-cancellation guard apart from a swallowed prepare error.
+		if ctx.Err() != nil {
+			return true, nil //nolint:nilerr // cancellation is a clean stop, not an error
+		}
+		if prepErr != nil {
+			return false, fmt.Errorf("prepare: %w", prepErr)
+		}
+	}
+	if cancelledBefore(ctx, st, "post-hooks", repoID, wtID) {
+		return true, nil
+	}
+	if err := runTriggerActions(ctx, st, "create-after-engines",
+		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
+		isMain, repoID, wtID, inheritedEnv); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// cancelledBefore is a phase-boundary cancellation checkpoint: when a
+// concurrent TeardownWorktree has fired `cancel`, it records a
+// worktree:create:cancel event naming the phase about to be skipped and
+// reports true so the pipeline bails. Isolating the ctx.Err() check
+// here keeps the "cancelled, not an error" return out of the call
+// site's error-handling flow.
+func cancelledBefore(ctx context.Context, st *State, phase string, repoID, wtID int64) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeCreateCancel,
+		"finalize aborted before "+phase, repoID, wtID, "", 0, nil)
+	return true
 }
 
 // FinalizeWorktreeForWatch is the watcher-driven re-prepare path.
@@ -213,6 +459,10 @@ func FinalizeWorktreeForWatch(
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Same PATH pin as FinalizeWorktree — this watcher path re-applies
+	// patches (EnsureFilter → `git add --renormalize` → clean filter)
+	// and runs on st.BgCtx with no inherited override.
+	ctx = gitcmd.WithPath(ctx, inheritedEnv["PATH"])
 	if !st.MarkFinalizeInFlight(wtRoot, cancel) {
 		return nil
 	}
@@ -352,7 +602,10 @@ func TeardownWorktree(
 			mu.Lock()
 			gitArgs := []string{"-C", repoRoot, "worktree", "remove", "--force", wtRoot}
 			_ = lowPriorityCommand(ctx, "git", gitArgs).Run()
-			pruneEmptyParentsBelow(wtRoot, worktreesRootOf(cfg.Worktrees.Root, repoRoot))
+			// RemoveWorktreeTree (not just pruneEmptyParentsBelow) so
+			// untracked bring-in / hook-generated leftovers don't strand
+			// and block the next create — see reap.go's fallback path.
+			wt.RemoveWorktreeTree(wtRoot, worktreesRootOf(cfg.Worktrees.Root, repoRoot))
 			mu.Unlock()
 		}
 		return nil
@@ -375,15 +628,15 @@ func TeardownWorktree(
 	slugVal := row.Slug
 	worktreesRoot := worktreesRootOf(cfg.Worktrees.Root, repoRoot)
 
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_start",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteStart,
 		"daemon-detached teardown hooks + db teardown + git remove beginning",
 		repoID, wtID, "", 0, nil)
 
-	// Three-step teardown: on-delete-before-engines actions →
+	// Three-step teardown: delete-before-engines actions →
 	// engine drop (inline + synchronous so post-engine actions can
-	// observe the drop) → on-delete-after-engines actions. Drop
+	// observe the drop) → delete-after-engines actions. Drop
 	// failures are logged but don't abort the rest.
-	_ = runTriggerActions(ctx, st, "on-delete-before-engines",
+	_ = runTriggerActions(ctx, st, "delete-before-engines",
 		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, slugVal,
 		row.IsMain, repoID, wtID, inheritedEnv)
 	if len(cfg.Databases) > 0 {
@@ -391,7 +644,7 @@ func TeardownWorktree(
 			slog.Warn("teardown DB drop", "wt", wtRoot, "err", err)
 		}
 	}
-	_ = runTriggerActions(ctx, st, "on-delete-after-engines",
+	_ = runTriggerActions(ctx, st, "delete-after-engines",
 		cfg.Hooks.OnDeleteAfterEngines, repoRoot, wtRoot, slugVal,
 		row.IsMain, repoID, wtID, inheritedEnv)
 
@@ -408,8 +661,23 @@ func TeardownWorktree(
 		return fmt.Errorf("worktree remove: %w (pass --force to override)", removeErr)
 	}
 
+	// Physically drop the port reservations so the freed ports can be
+	// re-used by the next allocation. Soft-deleting the worktree row is
+	// not enough: ListUsedPorts skips them, but the unique index on
+	// (repo_id, name, port) still rejects the re-insert, so the freed
+	// port silently climbs out of the range. Mirror the CLI inline path.
+	if err := st.Store.ReleaseWorktreePorts(ctx, wtID); err != nil {
+		slog.Warn("release worktree ports (freed ports stay blocked for reallocation)", "wt", wtRoot, "err", err)
+	}
+	// Reap every active-branch marker too, so a worktree later created at
+	// the same path starts clean (also clears markers for databases since
+	// removed from config).
+	if err := st.Store.ClearActiveBranchesForWorktree(ctx, wtID); err != nil {
+		slog.Warn("clear active-branch markers (stale markers survive recreate)", "wt", wtRoot, "err", err)
+	}
+
 	_ = st.Store.MarkWorktreeDeleted(ctx, wtID)
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "wt_teardown_done",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteEnd,
 		"daemon-detached teardown complete",
 		repoID, wtID, "", 0, nil)
 
@@ -515,9 +783,18 @@ func runTriggerActions(
 	}
 	started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, trigger, len(actions))
 	out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtRoot, slugVal, isMain, inheritedEnv, true)
-	hooks.PersistOutcome(ctx, st.Store, repoID, wtID, trigger, started, nowMillis(), out)
+	runIDs := hooks.PersistOutcome(ctx, st.Store, repoID, wtID, trigger, started, nowMillis(), out)
 	if err != nil {
 		return fmt.Errorf("%s: %w", trigger, err)
+	}
+	// RunHooks records non-zero child exits on the outcome but does not
+	// itself error (it leaves the decision to the caller). For the
+	// create pipeline a failed phase must abort: the next phase
+	// (engine prepare / migrate) depends on this one having populated
+	// vendor/ etc., so letting it proceed only produces a confusing
+	// downstream failure. Abort here with the real cause.
+	if failErr := hooks.FirstFailureError(trigger, out, runIDs); failErr != nil {
+		return failErr
 	}
 	return nil
 }
@@ -544,4 +821,87 @@ func detectBranch(worktree string) string {
 		return ref
 	}
 	return ""
+}
+
+// waitForCheckoutSettled blocks until every top-level entry recorded in
+// HEAD exists on disk inside wtRoot, or `timeout` elapses. Run before
+// firing setup hooks so a hook with a `cwd: <subdir>` action never
+// races a still-running `git worktree add` that hasn't reached that
+// subdir yet. CLI-triggered finalize already completed git checkout
+// before this point, so the first probe succeeds instantly; the wait
+// only kicks in on the watcher-triggered path.
+//
+// Always emits a `worktree:create:checkout` event so the stage is never invisible:
+// at info level when the wait was non-trivial (>50ms) so a slow checkout
+// stands out, at debug otherwise (the instant CLI-triggered path).
+func waitForCheckoutSettled(ctx context.Context, st *State, wtRoot string, repoID, wtID int64, timeout time.Duration) error {
+	started := time.Now()
+	deadline := started.Add(timeout)
+	// HEAD's top-level entry list is fixed for the duration of the wait,
+	// so the `git ls-tree` subprocess runs at most once (after .git
+	// appears); every later iteration is stat-only.
+	var (
+		entries     []string
+		haveEntries bool
+	)
+	for {
+		if !haveEntries {
+			entries, haveEntries = checkoutEntries(ctx, wtRoot)
+		}
+		if haveEntries && entriesPresent(wtRoot, entries) {
+			waited := time.Since(started)
+			level := store.LevelDebug
+			if waited > 50*time.Millisecond {
+				level = store.LevelInfo
+			}
+			_ = st.Store.WriteEvent(ctx, level, store.EvtWorktreeCreateCheckout,
+				fmt.Sprintf("git worktree add settled after %dms", waited.Milliseconds()),
+				repoID, wtID, "", waited.Milliseconds(), map[string]any{
+					"waited_ms": waited.Milliseconds(),
+				})
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("git worktree add did not settle in %s; top-level HEAD entries missing under %s", timeout, wtRoot)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(75 * time.Millisecond):
+		}
+	}
+}
+
+// checkoutEntries lists HEAD's top-level paths for wtRoot. ok is false
+// while .git is still missing (worktree add hasn't started writing);
+// once .git exists the result is cacheable — an unborn HEAD /
+// pre-commit repo yields (nil, true), meaning nothing to wait for.
+func checkoutEntries(ctx context.Context, wtRoot string) (entries []string, ok bool) {
+	if _, err := os.Stat(filepath.Join(wtRoot, ".git")); err != nil {
+		return nil, false
+	}
+	out, err := exec.CommandContext(ctx, "git", "-C", wtRoot, "ls-tree", "--name-only", "HEAD").Output()
+	if err != nil {
+		// Unborn HEAD / pre-commit repo: nothing to wait for.
+		return nil, true
+	}
+	for name := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		if name != "" {
+			entries = append(entries, name)
+		}
+	}
+	return entries, true
+}
+
+// entriesPresent reports whether every top-level path in HEAD exists
+// on disk inside wtRoot. `git worktree add` writes the entries in tree
+// order, so the LAST one to appear is the latest top-level entry — once
+// every one is present the working tree is materialized.
+func entriesPresent(wtRoot string, entries []string) bool {
+	for _, name := range entries {
+		if _, err := os.Stat(filepath.Join(wtRoot, name)); err != nil {
+			return false
+		}
+	}
+	return true
 }

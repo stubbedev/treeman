@@ -20,24 +20,63 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
       - run: go build ./...
       - run: go vet ./...
-      - name: gofmt
-        run: |
-          out=$(gofmt -l ./cmd ./internal)
-          if [ -n "$out" ]; then
-            echo "::error::gofmt would rewrite the following files:"
-            printf '%s\n' "$out"
-            echo
-            echo "--- proposed diff ---"
-            gofmt -d ./cmd ./internal
-            exit 1
-          fi
       - run: go test ./...
+
+  # Container-free e2e on every push/PR. The full e2e matrix (engines,
+  # frameworks, …) needs Docker and only runs on release tags; the `lite`
+  # batch (cli_surface, logs, notifications) exercises the CLI / daemon /
+  # event surface with no engine, so it catches event/hook/status-name
+  # drift here instead of at release. Engine tests gate on
+  # harness.SkipIfNoDocker, so even if a docker test sneaks into the batch
+  # it skips rather than fails.
+  e2e-lite:
+    name: e2e (container-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: install just
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+            | bash -s -- --to "$(go env GOPATH)/bin"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: run container-free e2e batch
+        run: just test-e2e lite
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Install pinned golangci-lint + just as prebuilt binaries (no build,
+      # so neither depends on the CI Go version matching their releases').
+      - name: install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: install just
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+            | bash -s -- --to "$(go env GOPATH)/bin"
+      # Run the exact same gate developers run locally: `just lint-check`
+      # (golangci-lint fmt --diff + go vet + golangci-lint run). Single
+      # source of truth so CI and local can't drift.
+      - name: just lint-check
+        run: just lint-check
 
   nix:
     name: nix flake check
@@ -52,7 +91,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
       - uses: DeterminateSystems/nix-installer-action@v22
-      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
 
       # Inline `just sync-flake`. Rewrites flake.nix's vendorHash to
       # match the current go.sum. On master pushes the result is
@@ -124,40 +163,45 @@ jobs:
           # step below.
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
 
-      # Regenerate `schemas/treeman.schema.json` from the current
-      # config.Config Go types. On master pushes drift is auto-
-      # committed; on PRs we fail so reviewers see the drift.
-      - name: regenerate treeman.schema.json
+      # Regenerate the published JSON schemas from the current
+      # config.Config Go types. Two scoped schemas are published:
+      #   treeman.schema.json        — repo scope, validates .treeman.yaml
+      #   treeman.global.schema.json — global scope, validates the
+      #                                user-global config.yaml
+      # On master pushes drift is auto-committed; on PRs we fail so
+      # reviewers see the drift.
+      - name: regenerate JSON schemas
         run: |
           set -euo pipefail
           mkdir -p schemas
-          go run ./cmd/treeman schema dump --out schemas/treeman.schema.json
+          go run ./cmd/treeman schema dump --scope repo   --out schemas/treeman.schema.json
+          go run ./cmd/treeman schema dump --scope global --out schemas/treeman.global.schema.json
 
-      - name: assert schema in sync (PR)
+      - name: assert schemas in sync (PR)
         if: github.event_name == 'pull_request'
         run: |
-          if [ -n "$(git status --porcelain schemas/treeman.schema.json)" ]; then
-            echo "::error::schemas/treeman.schema.json is stale. Run 'just sync-schema' locally and commit the result."
-            git --no-pager diff schemas/treeman.schema.json
+          if [ -n "$(git status --porcelain schemas/treeman.schema.json schemas/treeman.global.schema.json)" ]; then
+            echo "::error::JSON schemas are stale. Run 'just sync-schema' locally and commit the result."
+            git --no-pager diff schemas/treeman.schema.json schemas/treeman.global.schema.json
             exit 1
           fi
 
       - name: auto-commit schema bump (master)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
-          if [ -z "$(git status --porcelain schemas/treeman.schema.json)" ]; then
-            echo "schemas/treeman.schema.json already in sync; nothing to commit."
+          if [ -z "$(git status --porcelain schemas/treeman.schema.json schemas/treeman.global.schema.json)" ]; then
+            echo "schemas already in sync; nothing to commit."
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add schemas/treeman.schema.json
-          git commit -m 'chore: auto-bump treeman.schema.json [skip ci]'
+          git add schemas/treeman.schema.json schemas/treeman.global.schema.json
+          git commit -m 'chore: auto-bump JSON schemas [skip ci]'
           git push origin HEAD:master
 
   docs:
@@ -172,40 +216,45 @@ jobs:
           # step below.
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
 
-      # Regenerate the generated docs from the live binary: `docs/cli.md`
-      # from the cli.Command tree and `docs/config-reference.md` from the
-      # config.Config types. On master pushes drift is auto-committed; on
-      # PRs we fail so reviewers see the drift. Mirrors the schema job.
+      # Regenerate the generated docs from the live binary + registries:
+      # cli.md (cli.Command tree), config-reference.md (config.Config),
+      # mcp-tools.md (mcp.Catalog), events.md (store.Evt* consts). On
+      # master pushes drift is auto-committed; on PRs we fail so reviewers
+      # see the drift. Mirrors the schema job.
       - name: regenerate generated docs
         run: |
           set -euo pipefail
           mkdir -p docs
           go run ./cmd/treeman-gen-docs docs/cli.md
           go run ./cmd/treeman-gen-config-docs docs/config-reference.md
+          go run ./cmd/treeman-gen-mcp-docs docs/mcp-tools.md
+          go run ./cmd/treeman-gen-events-docs docs/events.md
+          go run ./cmd/treeman-gen-frameworks-docs docs/frameworks.md
+          go run ./cmd/treeman-gen-rpc-docs docs/rpc-reference.md
 
       - name: assert docs in sync (PR)
         if: github.event_name == 'pull_request'
         run: |
-          if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md)" ]; then
+          if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md)" ]; then
             echo "::error::generated docs are stale. Run 'just sync-docs' locally and commit the result."
-            git --no-pager diff docs/cli.md docs/config-reference.md
+            git --no-pager diff docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md
             exit 1
           fi
 
       - name: auto-commit docs bump (master)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
-          if [ -z "$(git status --porcelain docs/cli.md docs/config-reference.md)" ]; then
+          if [ -z "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md)" ]; then
             echo "generated docs already in sync; nothing to commit."
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add docs/cli.md docs/config-reference.md
+          git add docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md
           git commit -m 'chore: auto-bump generated docs [skip ci]'
           git push origin HEAD:master

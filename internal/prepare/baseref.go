@@ -60,7 +60,13 @@ func baseBranchOf(ctx context.Context, repoRoot, branch string) string {
 // pointed at `develop` on the remote but the worktree's
 // `@{upstream}` was unset. The main-wt fallback fills that gap.
 func resolveBaseBranch(ctx context.Context, st *store.Store, repoRoot string, repoID int64, newBranch string) string {
-	if b := baseBranchOf(ctx, repoRoot, newBranch); b != "" {
+	// A pushed feature branch tracks its OWN remote (`git push -u`
+	// sets `@{upstream}` to `origin/<newBranch>`), so baseBranchOf
+	// returns newBranch itself. That is not a base — discard it and
+	// fall through to the main-worktree fallback so the branch still
+	// seeds from `develop`. Without the `b != newBranch` guard every
+	// pushed feature branch silently degraded to `seed:empty`.
+	if b := baseBranchOf(ctx, repoRoot, newBranch); b != "" && b != newBranch {
 		return b
 	}
 	mainBranch := lookupMainBranch(ctx, st, repoRoot, repoID)
@@ -103,18 +109,18 @@ func lookupMainBranch(ctx context.Context, st *store.Store, repoRoot string, rep
 // first path component names a configured git remote. `origin/develop`
 // → `develop`; a local ref like `develop` is returned unchanged.
 func stripRemotePrefix(ctx context.Context, repoRoot, ref string) string {
-	slash := strings.IndexByte(ref, '/')
-	if slash < 0 {
+	before, after, ok := strings.Cut(ref, "/")
+	if !ok {
 		return ref
 	}
-	candidate := ref[:slash]
+	candidate := before
 	remotes, err := gitcmd.Output(ctx, repoRoot, "remote")
 	if err != nil {
 		return ref
 	}
-	for _, r := range strings.Split(strings.TrimSpace(string(remotes)), "\n") {
+	for r := range strings.SplitSeq(strings.TrimSpace(string(remotes)), "\n") {
 		if strings.TrimSpace(r) == candidate {
-			return ref[slash+1:]
+			return after
 		}
 	}
 	return ref
@@ -147,33 +153,78 @@ func resolveBaseSourceDB(
 	newBranch string,
 ) (string, bool, error) {
 	baseBranch := resolveBaseBranch(ctx, st, repoRoot, repoID, newBranch)
-	if baseBranch == "" {
+	if baseBranch != "" {
+		rows, err := st.ListWorktreesForRepo(ctx, repoID)
+		if err != nil {
+			return "", false, err
+		}
+		for _, w := range rows {
+			if w.Deleted || w.Branch != baseBranch {
+				continue
+			}
+			if w.IsMain {
+				return renderMainBaseDB(cfg, dbIdx, scope, w.Path, baseBranch)
+			}
+			// A linked worktree's active namespace is branch-independent —
+			// keyed off its path, not its stored (branch-derived) slug.
+			return renderWorktreeBaseDB(cfg, dbIdx, scope, slug.For(w.Path, ""))
+		}
+
+		// Base branch not in any tracked worktree row — is the repo root
+		// itself on it? (The common case: develop sits at the repo root,
+		// not enrolled as a treeman main worktree.)
+		if cur, _ := gitcmd.String(ctx, repoRoot, "rev-parse", "--abbrev-ref", "HEAD"); cur == baseBranch {
+			return renderMainBaseDB(cfg, dbIdx, scope, repoRoot, baseBranch)
+		}
+	}
+
+	// The resolved base branch is not checked out in any worktree or at the
+	// repo root — the common case being a dev box whose repo root is parked
+	// on some other feature branch while the real base (e.g. `develop`)
+	// exists only as a ref. The main worktree's branch-scoped name is bare
+	// (no `{slug}`), so its live DB is branch-agnostic and a valid seed for
+	// any branch that shares history with it. Fall back to it instead of
+	// cold-seeding an empty schema (the branch_scoped app DB has no
+	// `dump.path`, so "no source" otherwise means "empty database").
+	return mainWorktreeBaseDB(ctx, st, cfg, repoRoot, repoID, dbIdx, scope, newBranch)
+}
+
+// mainWorktreeBaseDB resolves the main worktree's active database for
+// databases[dbIdx] as a last-resort seed source for newBranch, gated on
+// shared git history. It backstops resolveBaseSourceDB when the resolved
+// base branch is not independently checked out anywhere treeman can read
+// its DB. Returns ("", false, nil) when there is no usable main worktree or
+// the branches are unrelated, leaving the caller to fall through to
+// `dump.path` (or an empty seed when none is configured).
+func mainWorktreeBaseDB(
+	ctx context.Context,
+	st *store.Store,
+	cfg *config.Config,
+	repoRoot string,
+	repoID int64,
+	dbIdx int,
+	scope bsScope,
+	newBranch string,
+) (string, bool, error) {
+	mainBranch := lookupMainBranch(ctx, st, repoRoot, repoID)
+	if mainBranch == "" || mainBranch == newBranch {
 		return "", false, nil
 	}
-
-	rows, err := st.ListWorktreesForRepo(ctx, repoID)
-	if err != nil {
-		return "", false, err
+	// Shared-history guard, mirroring resolveBaseBranch's tier-2 check — never
+	// seed a branch from an unrelated DB.
+	mb, err := gitcmd.String(ctx, repoRoot, "merge-base", newBranch, mainBranch)
+	if err != nil || strings.TrimSpace(mb) == "" {
+		// `merge-base` exits non-zero for unrelated branches; treat that (and
+		// an empty result) as "no shared history", not a propagatable error.
+		return "", false, nil //nolint:nilerr // unrelated branch is not an error here
 	}
-	for _, w := range rows {
-		if w.Deleted || w.Branch != baseBranch {
-			continue
-		}
-		if w.IsMain {
-			return renderMainBaseDB(cfg, dbIdx, scope, w.Path, baseBranch)
-		}
-		// A linked worktree's active namespace is branch-independent —
-		// keyed off its path, not its stored (branch-derived) slug.
-		return renderWorktreeBaseDB(cfg, dbIdx, scope, slug.For(w.Path, ""))
+	// Prefer the enrolled main worktree row's path; fall back to the repo
+	// root checkout for repos that don't enroll a main worktree.
+	path := repoRoot
+	if row, lerr := st.LookupMainWorktree(ctx, repoID); lerr == nil && !row.Deleted && row.Path != "" {
+		path = row.Path
 	}
-
-	// Base branch not in any tracked worktree row — is the repo root
-	// itself on it? (The common case: develop sits at the repo root,
-	// not enrolled as a treeman main worktree.)
-	if cur, _ := gitcmd.String(ctx, repoRoot, "rev-parse", "--abbrev-ref", "HEAD"); cur == baseBranch {
-		return renderMainBaseDB(cfg, dbIdx, scope, repoRoot, baseBranch)
-	}
-	return "", false, nil
+	return renderMainBaseDB(cfg, dbIdx, scope, path, mainBranch)
 }
 
 // baseTemplate returns the active-namespace template for `d` under

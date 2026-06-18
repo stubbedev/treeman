@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/sync/errgroup"
@@ -19,6 +21,19 @@ import (
 // Driver wraps the mongo Client.
 type Driver struct {
 	Client *mongo.Client
+	cfg    config.MongoConn
+
+	// dumpToolsOnce caches whether mongodump+mongorestore exist in the
+	// configured container, so the dump/restore fast path is probed
+	// once rather than per clone.
+	dumpToolsOnce sync.Once
+	dumpToolsOK   bool
+
+	// archives caches a per-template `mongodump --archive` so a fan-out
+	// dumps the (immutable, fingerprint-named) template once and each
+	// clone restores from that archive. Keyed by template DB name →
+	// *mongoArchive. See dumprestore.go.
+	archives sync.Map
 }
 
 // Connect parses cfg.URI, probes TCP reachability (when the URI
@@ -34,7 +49,7 @@ func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 			Network:        cfg.Network,
 			InternalPort:   containerip.URIPort(uri, 27017),
 		}
-		addr, err := containerip.ResolveAddr(opts)
+		addr, err := containerip.ResolveAddr(ctx, opts)
 		if err != nil {
 			return nil, fmt.Errorf("resolve container: %w", err)
 		}
@@ -47,7 +62,11 @@ func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 			return nil, err
 		}
 	}
-	c, err := mongo.Connect(options.Client().ApplyURI(uri))
+	clientOpts := options.Client().ApplyURI(uri)
+	if cfg.PoolMax > 0 {
+		clientOpts.SetMaxPoolSize(uint64(cfg.PoolMax))
+	}
+	c, err := mongo.Connect(clientOpts)
 	if err != nil {
 		return nil, fmt.Errorf("mongo connect: %w", err)
 	}
@@ -55,10 +74,23 @@ func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 		_ = c.Disconnect(ctx)
 		return nil, fmt.Errorf("mongo ping: %w", err)
 	}
-	return &Driver{Client: c}, nil
+	return &Driver{Client: c, cfg: cfg}, nil
 }
 
 func (d *Driver) Close(ctx context.Context) error { return d.Client.Disconnect(ctx) }
+
+// DataSizeBytes returns the logical document size (dbStats.dataSize) of
+// the named database in bytes, or 0 on error. Used by the MCP
+// snapshot-inspect size estimate.
+func (d *Driver) DataSizeBytes(ctx context.Context, name string) (int64, error) {
+	var res struct {
+		DataSize float64 `bson:"dataSize"`
+	}
+	if err := d.Client.Database(name).RunCommand(ctx, bson.D{{Key: "dbStats", Value: 1}}).Decode(&res); err != nil {
+		return 0, err
+	}
+	return int64(res.DataSize), nil
+}
 
 // DropMatching drops every database whose name starts with prefix.
 // Returns the names that were actually dropped.
@@ -81,7 +113,6 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	}
 	g.SetLimit(limit)
 	for _, n := range names {
-		n := n
 		g.Go(func() error {
 			if err := d.Client.Database(n).Drop(gctx); err != nil {
 				return fmt.Errorf("drop mongo db %q: %w", n, err)

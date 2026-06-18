@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -48,10 +49,8 @@ func (d *Driver) DatabaseExists(ctx context.Context, name string) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	for _, n := range names {
-		if n == name {
-			return true, nil
-		}
+	if slices.Contains(names, name) {
+		return true, nil
 	}
 	return false, nil
 }
@@ -86,8 +85,9 @@ func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) e
 }
 
 // DropSnapshot drops the named template database. Used by the
-// snapshot GC sweep.
+// snapshot GC sweep. Also reaps the cached dump archive (best-effort).
 func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
+	d.dropArchive(ctx, template)
 	return d.Client.Database(template).Drop(ctx)
 }
 
@@ -100,10 +100,12 @@ func (d *Driver) DropDatabase(ctx context.Context, name string) error {
 	return d.Client.Database(name).Drop(ctx)
 }
 
-// cloneDatabase is the shared inner loop for SnapshotCreate /
-// SnapshotRestore: list source collections, fan out the per-
-// collection clones (limit 6 — same as DropMatching), copy indexes.
-func (d *Driver) cloneDatabase(ctx context.Context, source, dest string) error {
+// cloneViaOut is the wire-protocol clone — the fallback cloneDatabase
+// uses when the in-container mongodump/mongorestore tools aren't
+// available (see dumprestore.go). Lists source collections, fans out the
+// per-collection $out clones (limit 6 — same as DropMatching), copies
+// indexes.
+func (d *Driver) cloneViaOut(ctx context.Context, source, dest string) error {
 	srcDB := d.Client.Database(source)
 	colls, err := srcDB.ListCollectionNames(ctx, bson.D{})
 	if err != nil {
@@ -124,7 +126,6 @@ func (d *Driver) cloneDatabase(ctx context.Context, source, dest string) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(6)
 	for _, coll := range colls {
-		coll := coll
 		g.Go(func() error {
 			return d.cloneCollection(gctx, source, dest, coll)
 		})
@@ -165,7 +166,7 @@ func copyIndexes(ctx context.Context, src, dst *mongo.Collection) error {
 	if err != nil {
 		return fmt.Errorf("list indexes: %w", err)
 	}
-	defer cur.Close(ctx)
+	defer func() { _ = cur.Close(ctx) }()
 
 	var models []mongo.IndexModel
 	for cur.Next(ctx) {

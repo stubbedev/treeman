@@ -1,6 +1,7 @@
 package template
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/slug"
@@ -33,7 +34,8 @@ func TestUnknownKeyErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error")
 	}
-	if re, ok := err.(*RenderError); !ok || re.UnknownKey != "nope" {
+	var re *RenderError
+	if !errors.As(err, &re) || re.UnknownKey != "nope" {
 		t.Errorf("wrong error: %v", err)
 	}
 }
@@ -69,8 +71,8 @@ func TestPortTokenUnknownSlotErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error for unknown port slot")
 	}
-	re, ok := err.(*RenderError)
-	if !ok || re.UnknownKey != "port_typo" {
+	var re *RenderError
+	if !errors.As(err, &re) || re.UnknownKey != "port_typo" {
 		t.Errorf("wrong error: %v", err)
 	}
 }
@@ -78,6 +80,24 @@ func TestPortTokenUnknownSlotErrors(t *testing.T) {
 func TestPortTokenWithoutAnyPortsErrors(t *testing.T) {
 	if _, err := Render("{port_octane}", ctx()); err == nil {
 		t.Fatal("want error when ports map empty")
+	}
+}
+
+func TestRenderMapResolvesAndFailsLoudly(t *testing.T) {
+	vals := map[string]string{"failed": "2", "total": "7", "sep": " | "}
+	got, err := RenderMap("{failed}{sep}{total}", vals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "2 | 7" {
+		t.Errorf("got %q", got)
+	}
+	// A key absent from the map is an unknown-key error, mirroring
+	// Render — a typo in a status format must not render as empty.
+	_, err = RenderMap("{failed}/{totl}", vals)
+	var re *RenderError
+	if !errors.As(err, &re) || re.UnknownKey != "totl" {
+		t.Errorf("wrong error: %v", err)
 	}
 }
 

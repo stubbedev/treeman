@@ -162,4 +162,33 @@ func TestFwDetect(t *testing.T) {
 			t.Errorf("expected 'django' in fw detect output:\n%s", res.stdout)
 		}
 	})
+
+	// The user-defined `frameworks:` block: a custom detector keyed by
+	// its marker files. Previously dead config (fw detect only consulted
+	// the built-in registry); now RegistryFor merges it in.
+	t.Run("detects user-defined frameworks: block", func(t *testing.T) {
+		repo := newGitRepo(t)
+		if err := os.WriteFile(filepath.Join(repo, "myframework.config"), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		yaml := `frameworks:
+  acme-migrate:
+    markers: ["myframework.config"]
+    migration_dirs: ["db/acme"]
+    file_pattern: "*.sql"
+    hash_mode: filename
+    engine_hint: postgres
+`
+		if err := os.WriteFile(filepath.Join(repo, ".treeman.yaml"), []byte(yaml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		e := newEnv(t)
+		res := e.run(t, repo, "fw", "detect")
+		if res.err != nil {
+			t.Fatalf("fw detect: %v\nstderr:\n%s", res.err, res.stderr)
+		}
+		if !strings.Contains(res.stdout, "acme-migrate") {
+			t.Errorf("custom frameworks: entry 'acme-migrate' not detected (frameworks: block ignored?):\n%s", res.stdout)
+		}
+	})
 }

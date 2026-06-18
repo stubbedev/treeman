@@ -119,6 +119,131 @@ func TestConfigSet(t *testing.T) {
 			t.Errorf("expected error when called with no args, got stdout:\n%s", res.stdout)
 		}
 	})
+
+	t.Run("rejects a global-only key in a repo file", func(t *testing.T) {
+		before, _ := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))
+		res := e.run(t, repo, "config", "set", "daemon.log_level", "debug")
+		if res.err == nil {
+			t.Errorf("config set daemon.log_level in a repo should be rejected")
+		}
+		if !strings.Contains(res.stderr+res.stdout, "global config") {
+			t.Errorf("error should explain the scope violation:\n%s%s", res.stdout, res.stderr)
+		}
+		after, _ := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))
+		if string(before) != string(after) {
+			t.Errorf("rejected set must not modify the file")
+		}
+	})
+}
+
+// TestConfigHistory verifies that overwriting the config stashes the
+// PRIOR content as a per-repo generation in SQLite (newest-first) and
+// that NO `.treeman.yaml.bak.*` files are left in the project root — the
+// backups now live in the DB, not beside the file.
+func TestConfigHistory(t *testing.T) {
+	repo := newGitRepo(t)
+	writeConfig(t, repo, minimalConfig+"\nworker_slots: 1\n")
+	e := newEnv(t)
+
+	// Two overwrites → two stored generations (the pre-write content of
+	// each `config set`).
+	if res := e.run(t, repo, "config", "set", "worker_slots", "2"); res.err != nil {
+		t.Fatalf("set #1: %v\nstderr:\n%s", res.err, res.stderr)
+	}
+	if res := e.run(t, repo, "config", "set", "worker_slots", "3"); res.err != nil {
+		t.Fatalf("set #2: %v\nstderr:\n%s", res.err, res.stderr)
+	}
+
+	t.Run("history lists generations newest-first via JSON", func(t *testing.T) {
+		res := e.run(t, repo, "config", "history", "--json")
+		if res.err != nil {
+			t.Fatalf("config history: %v\nstderr:\n%s", res.err, res.stderr)
+		}
+		var out struct {
+			Generations []struct {
+				Generation int `json:"generation"`
+				Bytes      int `json:"bytes"`
+			} `json:"generations"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(res.stdout)), &out); err != nil {
+			t.Fatalf("decode history JSON %q: %v", res.stdout, err)
+		}
+		if len(out.Generations) != 2 {
+			t.Fatalf("expected 2 generations, got %d: %s", len(out.Generations), res.stdout)
+		}
+		if out.Generations[0].Generation != 2 || out.Generations[1].Generation != 1 {
+			t.Errorf("expected newest-first [2,1], got [%d,%d]",
+				out.Generations[0].Generation, out.Generations[1].Generation)
+		}
+	})
+
+	t.Run("no .bak files written to repo root", func(t *testing.T) {
+		entries, err := os.ReadDir(repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ent := range entries {
+			if strings.Contains(ent.Name(), ".treeman.yaml.bak") {
+				t.Errorf("found stray backup file in repo root: %s", ent.Name())
+			}
+		}
+	})
+}
+
+// TestConfigRestore verifies that `config restore <gen>` writes a stored
+// generation back to .treeman.yaml, and that the restore is itself
+// reversible (it snapshots the pre-restore content as a new generation).
+func TestConfigRestore(t *testing.T) {
+	repo := newGitRepo(t)
+	writeConfig(t, repo, minimalConfig+"\nworker_slots: 10\n")
+	e := newEnv(t)
+
+	// Overwrite once: gen 1 captures the original (worker_slots: 10).
+	if res := e.run(t, repo, "config", "set", "worker_slots", "20"); res.err != nil {
+		t.Fatalf("set: %v\nstderr:\n%s", res.err, res.stderr)
+	}
+
+	t.Run("restores stored generation onto disk", func(t *testing.T) {
+		res := e.run(t, repo, "config", "restore", "1")
+		if res.err != nil {
+			t.Fatalf("config restore 1: %v\nstderr:\n%s", res.err, res.stderr)
+		}
+		body, err := os.ReadFile(filepath.Join(repo, ".treeman.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), "worker_slots: 10") {
+			t.Errorf("expected original worker_slots: 10 after restore:\n%s", body)
+		}
+	})
+
+	t.Run("restore is reversible — pre-restore content stored as new gen", func(t *testing.T) {
+		// After the restore above, the worker_slots:20 body should have
+		// been snapshotted as gen 2, so history now has 2 generations.
+		res := e.run(t, repo, "config", "history", "--json")
+		if res.err != nil {
+			t.Fatalf("config history: %v\nstderr:\n%s", res.err, res.stderr)
+		}
+		var out struct {
+			Generations []struct {
+				Generation int `json:"generation"`
+			} `json:"generations"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(res.stdout)), &out); err != nil {
+			t.Fatalf("decode history JSON %q: %v", res.stdout, err)
+		}
+		if len(out.Generations) != 2 {
+			t.Fatalf("expected 2 generations after reversible restore, got %d: %s",
+				len(out.Generations), res.stdout)
+		}
+	})
+
+	t.Run("missing generation errors", func(t *testing.T) {
+		res := e.run(t, repo, "config", "restore", "99")
+		if res.err == nil {
+			t.Errorf("expected error restoring nonexistent generation, got stdout:\n%s", res.stdout)
+		}
+	})
 }
 
 // ── treeman schema ───────────────────────────────────────────────
@@ -157,6 +282,98 @@ func TestSchemaInstall(t *testing.T) {
 	// should be 0 and produce output.
 	if strings.TrimSpace(res.stdout+res.stderr) == "" {
 		t.Errorf("schema install produced no output (expected at least a path/hint)")
+	}
+}
+
+// TestSchemaDumpScoped verifies the --scope flag emits the right
+// top-level key subset: global drops repo-only keys, repo drops
+// global-only keys.
+func TestSchemaDumpScoped(t *testing.T) {
+	e := newEnv(t)
+	repo := newGitRepo(t)
+
+	props := func(scope string) map[string]any {
+		res := e.run(t, repo, "schema", "dump", "--scope", scope)
+		if res.err != nil {
+			t.Fatalf("schema dump --scope %s: %v\nstderr:\n%s", scope, res.err, res.stderr)
+		}
+		var got struct {
+			Properties map[string]any `json:"properties"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(res.stdout)), &got); err != nil {
+			t.Fatalf("decode %s schema: %v", scope, err)
+		}
+		return got.Properties
+	}
+
+	g := props("global")
+	for _, k := range []string{"daemon", "snapshots", "logs"} {
+		if _, ok := g[k]; !ok {
+			t.Errorf("global schema missing %q", k)
+		}
+	}
+	for _, k := range []string{"databases", "patches", "hooks"} {
+		if _, ok := g[k]; ok {
+			t.Errorf("global schema should drop repo-only %q", k)
+		}
+	}
+
+	r := props("repo")
+	for _, k := range []string{"databases", "patches", "hooks"} {
+		if _, ok := r[k]; !ok {
+			t.Errorf("repo schema missing %q", k)
+		}
+	}
+	for _, k := range []string{"daemon", "snapshots", "logs"} {
+		if _, ok := r[k]; ok {
+			t.Errorf("repo schema should drop global-only %q", k)
+		}
+	}
+
+	if res := e.run(t, repo, "schema", "dump", "--scope", "bogus"); res.err == nil {
+		t.Errorf("expected error for invalid --scope, got stdout:\n%s", res.stdout)
+	}
+}
+
+// TestInitGlobal verifies `treeman init --global` scaffolds the
+// user-global config.yaml with only global-scoped keys, installs a
+// global-scoped schema, and refuses to clobber without --force.
+func TestInitGlobal(t *testing.T) {
+	e := newEnv(t)
+	// init --global is repo-independent; run from a throwaway cwd. The
+	// env block isolates XDG_CONFIG_HOME so we write into the temp tree.
+	cwd := newGitRepo(t)
+
+	res := e.run(t, cwd, "init", "--global")
+	if res.err != nil {
+		t.Fatalf("init --global: %v\nstderr:\n%s", res.err, res.stderr)
+	}
+	cfgPath := filepath.Join(e.configDir, "treeman", "config.yaml")
+	body, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("global config not written at %s: %v", cfgPath, err)
+	}
+	bs := string(body)
+	for _, k := range []string{"daemon:", "snapshots:", "logs:"} {
+		if !strings.Contains(bs, k) {
+			t.Errorf("global config missing %q:\n%s", k, bs)
+		}
+	}
+	for _, k := range []string{"databases:", "patches:", "hooks:"} {
+		if strings.Contains(bs, k) {
+			t.Errorf("global config should not contain repo-only %q:\n%s", k, bs)
+		}
+	}
+	if !strings.Contains(bs, "# yaml-language-server: $schema=") {
+		t.Errorf("global config missing schema modeline:\n%s", bs)
+	}
+	// Global-scoped schema installed alongside.
+	if _, err := os.Stat(filepath.Join(e.configDir, "treeman", "treeman.schema.json")); err != nil {
+		t.Errorf("global schema not installed: %v", err)
+	}
+	// Refuses to clobber without --force.
+	if res := e.run(t, cwd, "init", "--global"); res.err == nil {
+		t.Errorf("expected init --global to refuse overwriting existing config")
 	}
 }
 

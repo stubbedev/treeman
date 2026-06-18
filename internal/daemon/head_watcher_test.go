@@ -46,8 +46,7 @@ func TestHeadWatcherFiresOnBranchSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHeadWatcher: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	defer hw.Stop()
 	go func() { _ = hw.Start(ctx) }()
 	// Give Start a beat to subscribe + seed lastSeen.
@@ -90,8 +89,7 @@ func TestHeadWatcherDebouncesRapidChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	defer hw.Stop()
 	go func() { _ = hw.Start(ctx) }()
 	time.Sleep(100 * time.Millisecond)

@@ -31,7 +31,7 @@ func TestInspectFingerprint_DerivesPerInputHashes(t *testing.T) {
 		Engine:       "mysql",
 		NameTemplate: "app_{slug}",
 		Inputs: []config.Input{
-			{Glob: "db/migrations/*.sql", Hash: "filename"},
+			{Glob: "db/migrations/*.sql"},
 			{Glob: "composer.lock"}, // default checksum
 		},
 		Migrate: &config.Step{Run: "echo migrate"},
@@ -41,7 +41,7 @@ func TestInspectFingerprint_DerivesPerInputHashes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	rep := InspectFingerprint(ctx, s, d, dir, "app_test", "8.0.36")
 
@@ -81,7 +81,7 @@ func TestInspectFingerprint_DetectsCachedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	r1 := InspectFingerprint(ctx, s, d, dir, "x", "8.0")
 	if r1.CacheHitAvailable {
@@ -120,7 +120,7 @@ func TestInspectFingerprint_VersionChangesFlipFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	a := InspectFingerprint(ctx, s, d, dir, "x", "8.0.0")
 	b := InspectFingerprint(ctx, s, d, dir, "x", "8.0.1")
@@ -152,7 +152,7 @@ func TestInspectFingerprint_DoublestarChecksumGlobFoldsBaseDirFiles(t *testing.T
 	d := config.DatabaseConfig{
 		Engine:       "mysql",
 		NameTemplate: "app_{slug}",
-		Inputs:       []config.Input{{Glob: glob, Hash: "checksum"}},
+		Inputs:       []config.Input{{Glob: glob}},
 		Migrate:      &config.Step{Run: "php artisan migrate"},
 	}
 
@@ -160,7 +160,7 @@ func TestInspectFingerprint_DoublestarChecksumGlobFoldsBaseDirFiles(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	r1 := InspectFingerprint(ctx, s, d, dir, "app_test", "8.0.36")
 	agg, ok := r1.InputHashes[glob]

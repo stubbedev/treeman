@@ -19,8 +19,8 @@
 package patcher
 
 import (
-	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -67,7 +67,10 @@ type Pair struct {
 func PatchEnvFile(path string, pairs []Pair) (Outcome, error) {
 	original, err := readFile(path)
 	if err != nil {
-		return Missing, nil
+		if os.IsNotExist(err) {
+			return Missing, nil
+		}
+		return Missing, fmt.Errorf("read %s: %w", path, err)
 	}
 	content := original
 	for _, p := range pairs {
@@ -105,7 +108,10 @@ func patchEnvOne(content, key, value string) string {
 func PatchPhpunitFile(path string, pairs []Pair) (Outcome, error) {
 	original, err := readFile(path)
 	if err != nil {
-		return Missing, nil
+		if os.IsNotExist(err) {
+			return Missing, nil
+		}
+		return Missing, fmt.Errorf("read %s: %w", path, err)
 	}
 	content := original
 	for _, p := range pairs {
@@ -194,33 +200,17 @@ func PatchJSONFile(path string, pairs map[string]string) (Outcome, error) {
 		}
 		return Missing, fmt.Errorf("read %s: %w", path, err)
 	}
-	var doc any
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return Missing, fmt.Errorf("parse %s: %w", path, err)
-	}
-	changed := false
-	for _, k := range sortedKeys(pairs) {
-		segs, err := yamlpatch.ParsePath(k)
-		if err != nil {
-			return Missing, fmt.Errorf("json driver: path %q: %w", k, err)
-		}
-		prev, err := setJSONPath(doc, segs, jsonScalar(pairs[k]))
-		if err != nil {
-			return Missing, fmt.Errorf("json driver: set %q: %w", k, err)
-		}
-		if !jsonEqual(prev, jsonScalar(pairs[k])) {
-			changed = true
-		}
+	// Byte-preserving value splice for existing keys (create falls back
+	// to the reordering marshal). Keeps clean(apply(HEAD)) == HEAD so the
+	// patched file never shows as modified in `git status`.
+	out, changed, err := setJSONInPlace(string(body), pairs)
+	if err != nil {
+		return Missing, fmt.Errorf("json driver %s: %w", path, err)
 	}
 	if !changed {
 		return Unchanged, nil
 	}
-	out, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return Updated, fmt.Errorf("json driver: marshal %s: %w", path, err)
-	}
-	out = append(out, '\n')
-	if err := os.WriteFile(path, out, 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
 		return Updated, fmt.Errorf("write %s: %w", path, err)
 	}
 	return Updated, nil
@@ -245,35 +235,34 @@ func jsonScalar(v string) any {
 // the terminal node. Mirrors yamlpatch.Set for JSON. Maps are walked
 // via map[string]any; sequences via []any. Missing intermediate keys
 // (in maps) are created; out-of-range sequence indices error so the
-// caller can't silently reshape a list. Returns the previous value
-// (or nil when a new key was created).
+// caller can't silently reshape a list.
 //
 // Implementation: walk to the parent of the terminal segment, then
 // mutate parent[terminal] = newVal. Both maps and slices are
 // reference types in Go, so mutating through `parent` propagates
 // back to root without needing addressable values.
-func setJSONPath(root any, segs []yamlpatch.Segment, newVal any) (any, error) {
+func setJSONPath(root any, segs []yamlpatch.Segment, newVal any) error {
 	if len(segs) == 0 {
-		return nil, fmt.Errorf("empty path")
+		return errors.New("empty path")
 	}
 	parent := root
 	// Walk to parent of last segment, creating missing map intermediates.
-	for i := 0; i < len(segs)-1; i++ {
+	for i := range len(segs) - 1 {
 		seg := segs[i]
 		if seg.IsIndex {
 			arr, ok := parent.([]any)
 			if !ok {
-				return nil, fmt.Errorf("segment %d: expected array, got %T", i, parent)
+				return fmt.Errorf("segment %d: expected array, got %T", i, parent)
 			}
 			if seg.Idx < 0 || seg.Idx >= len(arr) {
-				return nil, fmt.Errorf("segment %d: index %d out of range (len=%d)", i, seg.Idx, len(arr))
+				return fmt.Errorf("segment %d: index %d out of range (len=%d)", i, seg.Idx, len(arr))
 			}
 			parent = arr[seg.Idx]
 			continue
 		}
 		m, ok := parent.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("segment %d (%q): expected object, got %T", i, seg.Key, parent)
+			return fmt.Errorf("segment %d (%q): expected object, got %T", i, seg.Key, parent)
 		}
 		next, exists := m[seg.Key]
 		if !exists {
@@ -286,32 +275,20 @@ func setJSONPath(root any, segs []yamlpatch.Segment, newVal any) (any, error) {
 	if last.IsIndex {
 		arr, ok := parent.([]any)
 		if !ok {
-			return nil, fmt.Errorf("terminal segment: expected array, got %T", parent)
+			return fmt.Errorf("terminal segment: expected array, got %T", parent)
 		}
 		if last.Idx < 0 || last.Idx >= len(arr) {
-			return nil, fmt.Errorf("terminal segment: index %d out of range (len=%d)", last.Idx, len(arr))
+			return fmt.Errorf("terminal segment: index %d out of range (len=%d)", last.Idx, len(arr))
 		}
-		prev := arr[last.Idx]
 		arr[last.Idx] = newVal
-		return prev, nil
+		return nil
 	}
 	m, ok := parent.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("terminal segment (%q): expected object, got %T", last.Key, parent)
+		return fmt.Errorf("terminal segment (%q): expected object, got %T", last.Key, parent)
 	}
-	prev := m[last.Key]
 	m[last.Key] = newVal
-	return prev, nil
-}
-
-func jsonEqual(a, b any) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+	return nil
 }
 
 func sortedKeys(m map[string]string) []string {

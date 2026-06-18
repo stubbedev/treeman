@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -72,6 +73,87 @@ func TestRunSubstitutesTargetDB(t *testing.T) {
 	}
 	if !strings.Contains(out.StdoutTail, "TREEMAN_TARGET_DB=myapp_template_feature-x") {
 		t.Errorf("TREEMAN_TARGET_DB missing: %q", out.StdoutTail)
+	}
+}
+
+// TestRunTeesStdoutAndStderrToLogPath asserts that when Spec.LogPath
+// is set, the merged stdout+stderr stream lands on disk so a failure
+// remains debuggable after the in-memory tail is gone. Regression
+// guard for the prepare incident where Laravel migrate exit 1 wrote
+// its diagnostic to stdout, daemon emitted only StderrTail (empty),
+// and the failure reason was lost.
+func TestRunTeesStdoutAndStderrToLogPath(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "deep", "nested", "migrate.log")
+	spec := FromMigrate(config.Step{
+		Run: `echo OUT-LINE; echo ERR-LINE 1>&2; exit 7`,
+	}).WithLogPath(logPath)
+
+	out, err := Run(context.Background(), spec, dir, "anydb", template.Context{}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.ExitCode != 7 {
+		t.Fatalf("exit %d, want 7; stderr=%q stdout=%q", out.ExitCode, out.StderrTail, out.StdoutTail)
+	}
+	if out.LogPath != logPath {
+		t.Errorf("Outcome.LogPath = %q, want %q", out.LogPath, logPath)
+	}
+	body, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatalf("read log: %v", readErr)
+	}
+	if !strings.Contains(string(body), "OUT-LINE") {
+		t.Errorf("log missing stdout content: %q", body)
+	}
+	if !strings.Contains(string(body), "ERR-LINE") {
+		t.Errorf("log missing stderr content: %q", body)
+	}
+}
+
+// TestFormatErrorIncludesStdoutTail guards the actual KON incident:
+// `php artisan migrate` writes failure output to stdout via Symfony
+// Console; the prepare error message used to interpolate only
+// StderrTail and turned exit 1 into a literal empty diagnostic.
+func TestFormatErrorIncludesStdoutTail(t *testing.T) {
+	msg := FormatError("migrate source", "kontainer_testing_wt_x", Outcome{
+		ExitCode:   1,
+		StdoutTail: "SQLSTATE[42S02]: Base table or view not found",
+		StderrTail: "",
+		LogPath:    "/tmp/x.log",
+	})
+	if !strings.Contains(msg, "exit 1") {
+		t.Errorf("message missing exit code: %q", msg)
+	}
+	if !strings.Contains(msg, "SQLSTATE[42S02]") {
+		t.Errorf("stdout tail dropped (KON incident regression): %q", msg)
+	}
+	if !strings.Contains(msg, "/tmp/x.log") {
+		t.Errorf("log path pointer missing: %q", msg)
+	}
+}
+
+// TestFormatErrorBothStreams asserts both tails are surfaced when
+// both are non-empty.
+func TestFormatErrorBothStreams(t *testing.T) {
+	msg := FormatError("seed source", "appdb", Outcome{
+		ExitCode:   2,
+		StdoutTail: "OUT",
+		StderrTail: "ERR",
+	})
+	if !strings.Contains(msg, `stdout="OUT"`) || !strings.Contains(msg, `stderr="ERR"`) {
+		t.Errorf("both streams should appear: %q", msg)
+	}
+}
+
+// TestFormatErrorNoOutput keeps the diagnostic actionable even when
+// nothing was captured (subprocess killed before printing, runaway
+// fork, etc.) — without this branch the message would silently lose
+// its trailing colon and look like a string-formatting bug.
+func TestFormatErrorNoOutput(t *testing.T) {
+	msg := FormatError("migrate source", "x", Outcome{ExitCode: 137})
+	if !strings.Contains(msg, "<no output captured>") {
+		t.Errorf("empty-output sentinel missing: %q", msg)
 	}
 }
 

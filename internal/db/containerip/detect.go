@@ -3,6 +3,7 @@
 package containerip
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strings"
@@ -60,9 +61,10 @@ func detectInsideContainer() bool {
 // Used to gate inspect-based lookups so a devcontainer with no
 // docker socket mounted doesn't spend 30s timing out per
 // connection attempt.
-func engineSocketReachable(engine string) bool {
+func engineSocketReachable(ctx context.Context, engine string) bool {
 	if v, ok := engineOnce.Load(engine); ok {
-		return v.(bool)
+		cached, _ := v.(bool)
+		return cached
 	}
 	ok := func() bool {
 		if _, err := exec.LookPath(engine); err != nil {
@@ -70,11 +72,8 @@ func engineSocketReachable(engine string) bool {
 		}
 		// `info` is cheap and proves the daemon socket answers.
 		// Output discarded — exit code is the signal.
-		return exec.Command(engine, "info", "--format", "ok").Run() == nil
+		return exec.CommandContext(ctx, engine, "info", "--format", "ok").Run() == nil
 	}()
 	engineOnce.Store(engine, ok)
 	return ok
 }
-
-// resetEngineReachableCache is for tests.
-func resetEngineReachableCache() { engineOnce = sync.Map{} }

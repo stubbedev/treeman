@@ -25,9 +25,9 @@ install:
     @echo "Installed treeman + treemand to $(go env GOBIN || echo $(go env GOPATH)/bin)"
 
 fmt:
-    gofmt -w ./cmd ./internal
+    golangci-lint fmt ./...
 
-# Point git at .githooks/ so the pre-commit gofmt gate fires. One-shot
+# Point git at .githooks/ so the pre-commit format gate fires. One-shot
 # per clone; idempotent. CI still runs the same check as the
 # authoritative gate — the hook just catches drift earlier.
 install-hooks:
@@ -35,31 +35,31 @@ install-hooks:
     set -euo pipefail
     git config core.hooksPath .githooks
     echo "git config core.hooksPath = .githooks"
-    echo "pre-commit gofmt gate is now active (bypass with --no-verify)."
+    echo "pre-commit golangci-lint fmt gate is now active (bypass with --no-verify)."
 
-# Auto-fix formatting drift, then vet. Same dev contract as the
-# sync-schema / sync-docs / sync-flake recipes: anything that *can*
-# be regenerated *is* regenerated, and the release flow commits the
-# diff. CI uses a separate read-only gofmt check (in ci.yml) as the
-# strict gate so a broken `just lint` never silently re-fixes the
+# Auto-fix formatting drift (golangci-lint fmt = gofumpt + goimports +
+# golines), then vet + the full golangci-lint gate. Same dev contract as
+# the sync-schema / sync-docs / sync-flake recipes: anything that *can* be
+# regenerated *is* regenerated. CI uses the read-only `lint-check` variant
+# as the strict gate so a broken `just lint` never silently re-fixes the
 # CI workspace.
 lint: fmt
     go vet ./...
+    golangci-lint run ./...
 
-# Strict read-only gofmt check — same logic CI runs, exposed for
-# local pre-push verification.
+# Strict read-only check — same logic CI runs, exposed for local pre-push
+# verification. Fails if formatting would change or any linter fires.
 lint-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    out=$(gofmt -l ./cmd ./internal)
+    out=$(golangci-lint fmt --diff ./...)
     if [ -n "$out" ]; then
-        echo "gofmt would rewrite:"
+        echo "code is not formatted; run 'just fmt':"
         printf '%s\n' "$out"
-        echo
-        gofmt -d ./cmd ./internal
         exit 1
     fi
     go vet ./...
+    golangci-lint run ./...
 
 test:
     go test ./...
@@ -69,8 +69,139 @@ test:
 # and binds local ports 13306-13356 + 15432 + 27117 + 16379 + 19200
 # — make sure those are free. Each subtest brings up + tears down
 # its own docker-compose stack.
-test-e2e:
-    go test -tags=e2e ./e2e/... -timeout 30m
+#
+# Suites are grouped into batches so docker doesn't drown under the
+# full ~60-suite fanout. Within a batch up to `parallel` compose
+# stacks run at once (default 4 — enough throughput without choking
+# the docker daemon). Between batches we stop any leftover compose
+# stacks under e2e/ so a flaky teardown can't bleed containers into
+# the next batch.
+#
+# First arg picks one batch (engines|fw1|fw2|matrix|watcher|features|cli)
+# or `all` for every batch. Second arg overrides the in-batch
+# concurrency. `just test-e2e-list` prints batch membership.
+test-e2e batch="all" parallel="4":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    declare -A BATCHES
+    BATCHES[engines]="mysql postgres mongo redis elasticsearch"
+    BATCHES[fw1]="fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
+    BATCHES[fw2]="fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
+    BATCHES[matrix]="matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
+    BATCHES[watcher]="autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
+    BATCHES[features]="clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
+    BATCHES[cli]="cli cli_engine cli_surface mcp mcp_write mongo_dump"
+    BATCHES[lite]="cli_surface logs notifications"
+
+    ORDER=(engines fw1 fw2 matrix watcher features cli)
+
+    cleanup_e2e_stacks() {
+        for d in e2e/*/; do
+            local name
+            name=$(basename "$d")
+            [ "$name" = "harness" ] && continue
+            [ -f "$d/docker-compose.yml" ] || continue
+            local running
+            running=$(docker ps -aq --filter "label=com.docker.compose.project=$name" 2>/dev/null || true)
+            if [ -n "$running" ]; then
+                echo "  cleanup: stopping leftover stack '$name'"
+                (cd "$d" && docker compose down -v --remove-orphans >/dev/null 2>&1 || true)
+            fi
+        done
+    }
+
+    run_batch() {
+        local name=$1
+        local suites=${BATCHES[$name]:-}
+        if [ -z "$suites" ]; then
+            echo "unknown batch: $name (valid: ${ORDER[*]})" >&2
+            exit 2
+        fi
+        local pkgs=""
+        for s in $suites; do
+            if [ ! -d "e2e/$s" ]; then
+                echo "  warn: e2e/$s missing — skipping"
+                continue
+            fi
+            pkgs+=" ./e2e/$s/..."
+        done
+        echo
+        echo "==================== batch: $name ===================="
+        echo "suites: $suites"
+        echo "parallel: {{parallel}}"
+        go test -tags=e2e -p {{parallel}} -timeout 30m $pkgs
+        echo "==================== cleanup after $name ===================="
+        cleanup_e2e_stacks
+    }
+
+    SEL="{{batch}}"
+    if [ "$SEL" = "all" ]; then
+        cleanup_e2e_stacks
+        for b in "${ORDER[@]}"; do run_batch "$b"; done
+    else
+        run_batch "$SEL"
+    fi
+
+# Pre-pull every docker image an e2e batch needs, with retry, so the
+# suite's own `docker compose up --wait` hits a warm local cache
+# instead of racing a cold pull against a flaky Docker Hub. Transient
+# registry timeouts (context deadline / Client.Timeout) are the #1
+# source of release-e2e flakes; one retried pull up front absorbs them.
+#
+# Non-fatal by design: if a pull still fails after retries the recipe
+# returns 0 and lets the per-test compose up try again — prepull is an
+# optimisation, not a gate. BATCHES mirrors `test-e2e`; keep in sync.
+e2e-prepull batch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    declare -A BATCHES
+    BATCHES[engines]="mysql postgres mongo redis elasticsearch"
+    BATCHES[fw1]="fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
+    BATCHES[fw2]="fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
+    BATCHES[matrix]="matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
+    BATCHES[watcher]="autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
+    BATCHES[features]="clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
+    BATCHES[cli]="cli cli_engine cli_surface mcp mcp_write mongo_dump"
+    BATCHES[lite]="cli_surface logs notifications"
+
+    suites=${BATCHES[{{batch}}]:-}
+    if [ -z "$suites" ]; then
+        echo "unknown batch: {{batch}}" >&2
+        exit 2
+    fi
+
+    pull_retry() {
+        local dir=$1 n=0
+        while [ "$n" -lt 3 ]; do
+            if (cd "$dir" && docker compose pull -q); then return 0; fi
+            n=$((n + 1))
+            echo "  prepull retry $n/3 for $dir after registry error" >&2
+            sleep $((n * 10))
+        done
+        echo "  WARN: prepull failed for $dir after 3 tries; suite will pull on demand" >&2
+        return 0
+    }
+
+    for s in $suites; do
+        [ -f "e2e/$s/docker-compose.yml" ] || continue
+        echo "prepull e2e/$s"
+        pull_retry "e2e/$s"
+    done
+
+# List the e2e batch groupings used by `just test-e2e`.
+test-e2e-list:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "engines  : mysql postgres mongo redis elasticsearch"
+    echo "fw1      : fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
+    echo "fw2      : fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
+    echo "matrix   : matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
+    echo "watcher  : autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
+    echo "features : clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc patches poolmax race retention sighup snapshot_gc switchback teardown worktrees_root"
+    echo "cli      : cli cli_engine cli_surface mcp mcp_write mongo_dump"
+    echo "lite     : cli_surface logs notifications (container-free)"
 
 check: lint test sync-schema sync-docs sync-flake
 
@@ -85,7 +216,11 @@ sync-docs:
     mkdir -p docs
     go run ./cmd/treeman-gen-docs docs/cli.md
     go run ./cmd/treeman-gen-config-docs docs/config-reference.md
-    if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md)" ]; then
+    go run ./cmd/treeman-gen-mcp-docs docs/mcp-tools.md
+    go run ./cmd/treeman-gen-events-docs docs/events.md
+    go run ./cmd/treeman-gen-frameworks-docs docs/frameworks.md
+    go run ./cmd/treeman-gen-rpc-docs docs/rpc-reference.md
+    if [ -n "$(git status --porcelain docs/cli.md docs/config-reference.md docs/mcp-tools.md docs/events.md docs/frameworks.md docs/rpc-reference.md)" ]; then
         echo "sync-docs: regenerated generated docs"
     else
         echo "sync-docs: generated docs already in sync"
@@ -96,15 +231,22 @@ sync-docs:
 # every `just check` to keep the canonical schema URL in sync with
 # the binary on disk. CI asserts no drift on PRs and auto-commits
 # on master pushes.
+#
+# The canonical schema is REPO-scoped: it validates `.treeman.yaml`
+# (the file `treeman init`'s modeline points at via the URL), so it
+# excludes global-only keys (daemon, snapshots, logs, status,
+# notifications). The global config gets its own scoped schema from
+# `treeman schema install --global` / `treeman init --global`.
 sync-schema:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p schemas
-    go run ./cmd/treeman schema dump --out schemas/treeman.schema.json
-    if [ -n "$(git status --porcelain schemas/treeman.schema.json)" ]; then
-        echo "sync-schema: regenerated schemas/treeman.schema.json"
+    go run ./cmd/treeman schema dump --scope repo   --out schemas/treeman.schema.json
+    go run ./cmd/treeman schema dump --scope global --out schemas/treeman.global.schema.json
+    if [ -n "$(git status --porcelain schemas/treeman.schema.json schemas/treeman.global.schema.json)" ]; then
+        echo "sync-schema: regenerated schemas/"
     else
-        echo "sync-schema: schemas/treeman.schema.json already in sync"
+        echo "sync-schema: schemas already in sync"
     fi
 
 clean:

@@ -59,3 +59,49 @@ func TestActiveBranchRoundTrip(t *testing.T) {
 		t.Error("all markers should be cleared for the worktree")
 	}
 }
+
+// TestActiveBranchCleanColumns covers the lever-1 bookkeeping: a plain
+// SetActiveBranch records clean=0 (the safe "must capture" default), a
+// marker advance re-resets it, and SetActiveBranchClean round-trips the
+// clean flag + watermark.
+func TestActiveBranchCleanColumns(t *testing.T) {
+	ctx := context.Background()
+	st, repoID, wtID := openTestStoreWithWt(t)
+
+	// No marker → not clean, no watermark.
+	if clean, wm, ok, err := st.GetActiveBranchClean(ctx, wtID, "app"); err != nil || ok || clean || wm != "" {
+		t.Fatalf("no marker: clean=%t wm=%q ok=%t err=%v", clean, wm, ok, err)
+	}
+
+	// SetActiveBranch always records clean=0 (safe default).
+	if err := st.SetActiveBranch(ctx, repoID, wtID, "app", "develop", "mysql"); err != nil {
+		t.Fatal(err)
+	}
+	if clean, wm, ok, _ := st.GetActiveBranchClean(ctx, wtID, "app"); !ok || clean || wm != "" {
+		t.Fatalf("after SetActiveBranch: clean=%t wm=%q ok=%t, want clean=false", clean, wm, ok)
+	}
+
+	// Mark clean with a watermark.
+	if err := st.SetActiveBranchClean(ctx, repoID, wtID, "app", "develop", "mysql", true, "wm:7"); err != nil {
+		t.Fatal(err)
+	}
+	if clean, wm, _, _ := st.GetActiveBranchClean(ctx, wtID, "app"); !clean || wm != "wm:7" {
+		t.Fatalf("after SetActiveBranchClean(true): clean=%t wm=%q, want true/wm:7", clean, wm)
+	}
+
+	// A marker advance (re-fill) must reset clean back to the safe default.
+	if err := st.SetActiveBranch(ctx, repoID, wtID, "app", "feature", "mysql"); err != nil {
+		t.Fatal(err)
+	}
+	if clean, wm, _, _ := st.GetActiveBranchClean(ctx, wtID, "app"); clean || wm != "" {
+		t.Fatalf("marker advance must reset clean: clean=%t wm=%q", clean, wm)
+	}
+
+	// clean=false stores an empty watermark even if one is passed.
+	if err := st.SetActiveBranchClean(ctx, repoID, wtID, "app", "feature", "mysql", false, "wm:9"); err != nil {
+		t.Fatal(err)
+	}
+	if clean, wm, _, _ := st.GetActiveBranchClean(ctx, wtID, "app"); clean || wm != "" {
+		t.Fatalf("clean=false must blank the watermark: clean=%t wm=%q", clean, wm)
+	}
+}

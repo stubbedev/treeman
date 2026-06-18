@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,7 +198,7 @@ func TestInheritedEnvReachesSubprocess(t *testing.T) {
 
 func TestRenderActionChainsWithAnd(t *testing.T) {
 	a := config.Action{Run: []string{"echo a", "echo b"}}
-	got, err := renderAction(a, "/tmp/x")
+	got, err := renderAction(context.Background(), a, "/tmp/x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +217,7 @@ func TestRenderActionChainsWithAnd(t *testing.T) {
 func TestRenderActionGroupLevelCwd(t *testing.T) {
 	// Explicit cwd on the Action applies to every step.
 	a := config.Action{Run: []string{"yarn install", "yarn build"}, Cwd: "frontend"}
-	got, err := renderAction(a, "/tmp/x")
+	got, err := renderAction(context.Background(), a, "/tmp/x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +239,7 @@ func TestRenderActionWrapsInDockerExec(t *testing.T) {
 		Run:       []string{"composer install", "php artisan migrate"},
 		Cwd:       "/var/www/html",
 	}
-	got, err := renderAction(a, "/host/wt")
+	got, err := renderAction(context.Background(), a, "/host/wt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +260,7 @@ func TestRenderActionWrapsInDockerExec(t *testing.T) {
 
 func TestRenderActionNoContainerPassesThrough(t *testing.T) {
 	entry := config.Action{Run: []string{"echo hi"}}
-	got, err := renderAction(entry, "/host/wt")
+	got, err := renderAction(context.Background(), entry, "/host/wt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,10 +269,12 @@ func TestRenderActionNoContainerPassesThrough(t *testing.T) {
 	}
 }
 
-// TestBuildEnvUserPathWins asserts the user's PATH from
-// inheritedEnv is preserved verbatim — no merge with the daemon's
-// PATH, no override. The user's PATH is authoritative because it
-// carries their version-manager shims (asdf, nvm, mise, …).
+// TestBuildEnvUserPathWins asserts the user's PATH from inheritedEnv
+// keeps precedence — its directories lead the merged PATH, so their
+// version-manager shims (asdf, nvm, mise, …) resolve first. The
+// login-shell PATH is merged in after (see shellenv.BaseEnv), so the
+// user's dirs stay at the front while the user's profile bin dirs are
+// still guaranteed present.
 func TestBuildEnvUserPathWins(t *testing.T) {
 	env := buildEnv(map[string]string{"PATH": "/user/shims:/user/bin"}, "/repo", "/wt", "slug", false)
 	pathLine := ""
@@ -280,8 +283,8 @@ func TestBuildEnvUserPathWins(t *testing.T) {
 			pathLine = kv
 		}
 	}
-	if pathLine != "PATH=/user/shims:/user/bin" {
-		t.Errorf("user PATH not preserved: %q", pathLine)
+	if !strings.HasPrefix(pathLine, "PATH=/user/shims:/user/bin") {
+		t.Errorf("user PATH should lead the merged PATH, got: %q", pathLine)
 	}
 }
 
@@ -304,6 +307,44 @@ func TestBuildEnvFallsBackToDaemonPath(t *testing.T) {
 	}
 	if !foundPath {
 		t.Error("buildEnv should fall back to os.Getenv(PATH) when inheritedEnv has none")
+	}
+}
+
+func TestFirstFailureErrorNilWhenAllZero(t *testing.T) {
+	out := RunOutcome{Groups: []GroupOutcome{
+		{Command: "composer install", ExitCode: 0},
+		{Command: "yarn install", ExitCode: 0},
+	}}
+	if err := FirstFailureError("create-before-engines", out, []int64{1, 2}); err != nil {
+		t.Fatalf("want nil, got %v", err)
+	}
+}
+
+func TestFirstFailureErrorReportsFirstFailureWithIDAndTail(t *testing.T) {
+	out := RunOutcome{Groups: []GroupOutcome{
+		{Command: "composer install", ExitCode: 0},
+		{Command: "yarn install", ExitCode: 1, StderrTail: "ENOENT: clean-css missing"},
+	}}
+	err := FirstFailureError("create-before-engines", out, []int64{10, 11})
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{"exited 1", "yarn install", "ENOENT: clean-css missing", "--show 11"} {
+		if indexOf(msg, want) < 0 {
+			t.Errorf("error missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+func TestFirstFailureErrorFallsBackWhenIDUnknown(t *testing.T) {
+	out := RunOutcome{Groups: []GroupOutcome{{Command: "composer install", ExitCode: 2}}}
+	err := FirstFailureError("create-before-engines", out, nil)
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if indexOf(err.Error(), "logs hooks --all") < 0 {
+		t.Errorf("want generic pointer, got:\n%s", err.Error())
 	}
 }
 

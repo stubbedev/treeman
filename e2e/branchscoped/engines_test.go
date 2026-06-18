@@ -199,6 +199,238 @@ func TestWorktreeSwapElasticsearch(t *testing.T) {
 	esAssertVals(t, prefix, map[string]string{"a": "develop", "b": "feature"}) // resumed
 }
 
+// ─── TestDbResetSparesSiblingPrefixElasticsearch ─────────────────────
+//
+// Prefix-engine analogue of TestDbResetDropsActiveExactNotPrefixMySQL.
+// On the main worktree the branch_scoped active prefix is bare
+// (overlay-resolved, slug-free), so it is a prefix of every linked
+// worktree's `<prefix>_<slug>_*` indices. `db reset` must drop only what
+// THIS worktree owns and spare the sibling's. Name-scoped engines solve
+// this with an EXACT drop; ES has no exact drop, so the swap layer
+// excludes any index carrying a sibling slug token. Without that filter
+// DropMatching(bare) wipes the sibling's live data — the ES twin of the
+// mysql exact-drop regression.
+func TestDbResetSparesSiblingPrefixElasticsearch(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitES(t)
+	ctx := context.Background()
+
+	const activePrefix = "bsexactes_"          // bare main-wt active prefix
+	const siblingPrefix = "bsexactes_feature_" // a linked wt's prefix — nests under the bare one
+	const mainIndex = activePrefix + "items"
+	const siblingIndex = siblingPrefix + "items"
+
+	dropESIndex(t, mainIndex)
+	dropESIndex(t, siblingIndex)
+	t.Cleanup(func() { dropESIndex(t, mainIndex); dropESIndex(t, siblingIndex) })
+
+	esIndex(t, activePrefix, "1", "main")     // → mainIndex
+	esIndex(t, siblingPrefix, "1", "feature") // → siblingIndex
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Elasticsearch: &config.EsConn{URL: esURL},
+		},
+		// Bare key_prefix (no {slug}) models the main worktree's
+		// overlay-resolved active prefix.
+		Databases: []config.DatabaseConfig{{
+			Engine:       "elasticsearch",
+			KeyPrefix:    activePrefix,
+			BranchScoped: true,
+		}},
+	}
+
+	st := openStore(t)
+	repoRoot := t.TempDir()
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Main worktree (runs the reset) + a sibling whose slug is "feature";
+	// the sibling slug is what the swap layer uses to spare its indices.
+	mainWtID, err := st.EnsureWorktree(ctx, repoID, repoRoot, "main", "develop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureWorktree(ctx, repoID, filepath.Join(repoRoot, "feature"), "feature", "feature"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := prepare.ResetBranchScoped(ctx, cfg, repoRoot, repoID, mainWtID, st, ""); err != nil {
+		t.Fatalf("ResetBranchScoped: %v", err)
+	}
+
+	if n := esCount(t, mainIndex+"*"); n != 0 {
+		t.Fatalf("reset should have dropped the main worktree's own index %q, found %d docs", mainIndex, n)
+	}
+	if n := esCount(t, siblingIndex+"*"); n != 1 {
+		t.Fatalf(
+			"reset wiped sibling index %q via a bare-prefix match — sibling-isolation regression (found %d docs, want 1)",
+			siblingIndex,
+			n,
+		)
+	}
+}
+
+// ─── TestDbResetSparesSiblingPrefixRedis ─────────────────────────────
+//
+// Redis twin of TestDbResetSparesSiblingPrefixElasticsearch (and the
+// prefix-engine analogue of TestDbResetDropsActiveExactNotPrefixMySQL).
+// On the main worktree the branch_scoped active prefix is bare, so it is
+// a prefix of every linked worktree's `<prefix>_<slug>_*` keys. `db reset`
+// must drop only the keys THIS worktree owns and spare the sibling's;
+// without the sibling-exclusion filter DropPrefix(bare) wipes the
+// sibling's live data.
+func TestDbResetSparesSiblingPrefixRedis(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitRedis(t)
+	ctx := context.Background()
+
+	// `:`-delimited prefix (idiomatic redis) exercises the delimiter-
+	// agnostic sibling-token boundary — the bare prefix still nests the
+	// sibling's `<prefix>:<slug>:*` keys.
+	const activePrefix = "bsexactrd:"          // bare main-wt active prefix
+	const siblingPrefix = "bsexactrd:feature:" // a linked wt's prefix — nests under the bare one
+	mainKey := activePrefix + "a"
+	siblingKey := siblingPrefix + "a"
+
+	c := redisClient(t)
+	_ = c.Del(ctx, mainKey, siblingKey).Err()
+	t.Cleanup(func() { _ = c.Del(context.Background(), mainKey, siblingKey).Err() })
+
+	rset(t, mainKey, "main")
+	rset(t, siblingKey, "feature")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Redis: &config.RedisConn{URL: "redis://" + redisAddr},
+		},
+		// Bare key_prefix (no {slug}) models the main worktree's
+		// overlay-resolved active prefix.
+		Databases: []config.DatabaseConfig{{
+			Engine:       "redis",
+			KeyPrefix:    activePrefix,
+			BranchScoped: true,
+		}},
+	}
+
+	st := openStore(t)
+	repoRoot := t.TempDir()
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainWtID, err := st.EnsureWorktree(ctx, repoID, repoRoot, "main", "develop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureWorktree(ctx, repoID, filepath.Join(repoRoot, "feature"), "feature", "feature"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := prepare.ResetBranchScoped(ctx, cfg, repoRoot, repoID, mainWtID, st, ""); err != nil {
+		t.Fatalf("ResetBranchScoped: %v", err)
+	}
+
+	if n, _ := c.Exists(ctx, mainKey).Result(); n != 0 {
+		t.Fatalf("reset should have dropped the main worktree's own key %q", mainKey)
+	}
+	if n, _ := c.Exists(ctx, siblingKey).Result(); n != 1 {
+		t.Fatalf("reset wiped sibling key %q via a bare-prefix match — sibling-isolation regression", siblingKey)
+	}
+}
+
+// ─── TestParentSeedExcludesSiblingDataElasticsearch ──────────────────
+//
+// Parent-seed isolation for a prefix engine: when a feature branch seeds
+// from a base branch that lives at the repo root, the base namespace is
+// the bare main-worktree prefix — which is a prefix of every linked
+// worktree's `<prefix>_<slug>_*` data. The seed must copy only the base
+// worktree's OWN keys, never a sibling worktree's. Name-scoped engines get
+// this free (exact-db copy); the prefix engines need the source filter.
+// Without it the new branch is seeded with every sibling's data too.
+func TestParentSeedExcludesSiblingDataElasticsearch(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	requireGit(t)
+	waitES(t)
+
+	ctx := context.Background()
+	repoRoot := t.TempDir()
+	mustGit(t, "", "init", "-q", "-b", "develop", repoRoot)
+	mustGit(t, repoRoot, "config", "user.email", "t@t")
+	mustGit(t, repoRoot, "config", "user.name", "t")
+	writeFile(t, repoRoot, "README", "hi")
+	mustGit(t, repoRoot, "add", "-A")
+	mustGit(t, repoRoot, "commit", "-q", "-m", "init")
+	mustGit(t, repoRoot, "remote", "add", "origin", repoRoot)
+	mustGit(t, repoRoot, "update-ref", "refs/remotes/origin/develop", "refs/heads/develop")
+
+	wtPath := filepath.Join(repoRoot, ".worktrees", "feature-x")
+	mustGit(t, repoRoot, "worktree", "add", "-q", "-b", "feature/x", wtPath, "origin/develop")
+	mustGit(t, wtPath, "branch", "--set-upstream-to=origin/develop", "feature/x")
+
+	// main_worktree overlay makes the base (develop @ repo root) namespace a
+	// bare, slug-free prefix `pp_`. Linked worktrees use `pp_{slug}_`.
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Elasticsearch: &config.EsConn{URL: esURL},
+		},
+		MainWorktree: config.MainWorktreeConfig{
+			Enabled:   true,
+			Databases: []config.DatabaseOverlay{{KeyPrefix: "pp_"}},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "elasticsearch",
+			KeyPrefix:    "pp_{slug}_",
+			BranchScoped: true,
+		}},
+	}
+
+	// Base worktree's OWN data lives under the bare prefix: `pp_items`.
+	esIndex(t, "pp_", "1", "base")
+	// A sibling linked worktree's branch_scoped data nests under the bare
+	// prefix: `pp_<siblingSlug>_items`. Register the sibling so the swap
+	// layer knows its namespace, and plant junk it must NOT copy.
+	siblingPath := filepath.Join(repoRoot, ".worktrees", "sibling")
+	siblingSlug := slug.For(siblingPath, "").Value
+	siblingPrefix := "pp_" + siblingSlug + "_"
+	esIndex(t, siblingPrefix, "1", "sibling-junk")
+
+	st := openStore(t)
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureWorktree(ctx, repoID, siblingPath, siblingSlug, "feature/sibling"); err != nil {
+		t.Fatal(err)
+	}
+	featSlug := slug.For(wtPath, "")
+	wtID, err := st.EnsureWorktree(ctx, repoID, wtPath, featSlug.Value, "feature/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	featPrefix := "pp_" + featSlug.Value + "_"
+	t.Cleanup(func() {
+		dropESIndex(t, "pp_items")
+		dropESIndex(t, siblingPrefix+"items")
+		dropESIndex(t, featPrefix+"items")
+		dropESIndex(t, featPrefix+siblingSlug+"_items") // the junk a broken seed would create
+	})
+
+	if _, err := prepare.Run(ctx, cfg, wtPath, featSlug, st, repoID, wtID, nil); err != nil {
+		t.Fatalf("prepare feature/x: %v", err)
+	}
+
+	// Seeded from the base worktree's own data only.
+	esAssertVals(t, featPrefix, map[string]string{"1": "base"})
+	// The sibling's nested data must NOT have been dragged in.
+	if n := esCount(t, featPrefix+siblingSlug+"_items*"); n != 0 {
+		t.Fatalf("parent seed dragged in sibling data under %s%s_* (%d docs) — source-filter regression",
+			featPrefix, siblingSlug, n)
+	}
+}
+
 // ─── TestDbResetReseedsFromParentMySQL ───────────────────────────────
 //
 // The HIGH-severity regression, end-to-end against a real engine: after
@@ -395,6 +627,244 @@ func TestWorktreeDeleteKeepsDurableMySQL(t *testing.T) {
 	assertItems(t, active, "feature-data") // durable kept → resumed
 }
 
+// ─── TestReapBranchDurablesMySQL ─────────────────────────────────────
+//
+// Complement to TestWorktreeDeleteKeepsDurableMySQL: when a branch is
+// DELETED (the daemon's auto-fetch prune of a merged, gone-upstream
+// branch), ReapBranchDurables must drop that branch's durable copy — but
+// ONLY that durable. The active namespace (live data the app connects to)
+// and any other branch's durable must survive. A regression that dropped
+// the active namespace would be silent live-data loss.
+func TestReapBranchDurablesMySQL(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitMySQL(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mysql: &config.MysqlConn{Host: "127.0.0.1", Port: 13390, User: "root", Password: "rootpw"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mysql",
+			NameTemplate: "tm_bsreap_{slug}",
+			BranchScoped: true,
+		}},
+	}
+
+	// develop: seed schema + a row.
+	active := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "develop")
+	t.Cleanup(func() { dropMySQL(t, active) })
+	mustExec(t, active, "CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(32))")
+	mustExec(t, active, "INSERT INTO items(v) VALUES('develop-data')")
+
+	// Switch develop→feature so develop's data is captured into its durable
+	// copy. The diff isolates the durable this switch created.
+	before := listMySQLDBsWithPrefix(t, "_tmbs_")
+	drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	mustExec(t, active, "INSERT INTO items(v) VALUES('feature-data')")
+	newDurables := diffStrings(listMySQLDBsWithPrefix(t, "_tmbs_"), before)
+	if len(newDurables) != 1 {
+		t.Fatalf("expected exactly one durable from the develop→feature switch, got %v", newDurables)
+	}
+	developDurable := newDurables[0]
+	t.Cleanup(func() { dropMySQL(t, developDurable) })
+
+	// Reaping a branch with no durable (feature is live in active) is a
+	// no-op: it must touch neither the active namespace nor develop's durable.
+	prepare.ReapBranchDurables(ctx, cfg, st, repoID, "feature")
+	if !mysqlDBExists(t, active) {
+		t.Fatal("reaping a live branch must not drop the active namespace")
+	}
+	if !mysqlDBExists(t, developDurable) {
+		t.Fatalf("reaping %q must not touch develop's durable %s", "feature", developDurable)
+	}
+
+	// Reaping the deleted branch drops ITS durable, and only that — the
+	// active namespace and its live data survive.
+	prepare.ReapBranchDurables(ctx, cfg, st, repoID, "develop")
+	if mysqlDBExists(t, developDurable) {
+		t.Fatalf("ReapBranchDurables(develop) must drop develop's durable %s", developDurable)
+	}
+	if !mysqlDBExists(t, active) {
+		t.Fatal("reap must never drop the active namespace (live data)")
+	}
+	assertItems(t, active, "develop-data", "feature-data")
+}
+
+// ─── TestWorktreeDeleteKeepsDurablePostgres ──────────────────────────
+//
+// Postgres mirror of TestWorktreeDeleteKeepsDurableMySQL: `wt delete`
+// teardown captures the active DB into the current branch's durable copy
+// and drops the active, so re-creating the worktree on the same branch
+// resumes the diverged data.
+func TestWorktreeDeleteKeepsDurablePostgres(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitPostgres(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+	sl := slug.For(wtPath, "")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Postgres: &config.PostgresConn{Host: "127.0.0.1", Port: 15490, User: "postgres", Password: "pgpw"},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "postgres",
+			NameTemplate: "tm_bsdelpg_{slug}",
+			BranchScoped: true,
+		}},
+	}
+
+	active := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	pgExec(t, active, "CREATE TABLE items (id SERIAL PRIMARY KEY, v TEXT)")
+	pgExec(t, active, "INSERT INTO items(v) VALUES('feature-data')")
+	pgAssertItems(t, active, "feature-data")
+
+	// Teardown (the `wt delete` DB path): captures durable, drops active.
+	if err := prepare.TeardownDatabases(ctx, cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	if pgDBExists(t, active) {
+		t.Fatalf("teardown should have dropped the active DB %s", active)
+	}
+
+	// Re-prepare on the same branch → resumes from the durable copy.
+	if got := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature"); got != active {
+		t.Fatalf("active namespace drifted after re-create: %s → %s", active, got)
+	}
+	pgAssertItems(t, active, "feature-data") // durable kept → resumed
+}
+
+// ─── TestWorktreeDeleteKeepsDurableMongo ─────────────────────────────
+//
+// MongoDB mirror of the MySQL/Postgres delete case.
+func TestWorktreeDeleteKeepsDurableMongo(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitMongo(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+	sl := slug.For(wtPath, "")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Mongodb: &config.MongoConn{URI: mongoURI},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "mongodb",
+			NameTemplate: "tm_bsdelmongo_{slug}",
+			BranchScoped: true,
+		}},
+	}
+
+	active := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	mongoInsert(t, active, "feature-data")
+	mongoAssert(t, active, "feature-data")
+
+	if err := prepare.TeardownDatabases(ctx, cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	if mongoDBExists(t, active) {
+		t.Fatalf("teardown should have dropped the active DB %s", active)
+	}
+
+	if got := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature"); got != active {
+		t.Fatalf("active namespace drifted after re-create: %s → %s", active, got)
+	}
+	mongoAssert(t, active, "feature-data") // durable kept → resumed
+}
+
+// ─── TestWorktreeDeleteKeepsDurableRedis ─────────────────────────────
+//
+// Redis mirror, prefix-scoped: teardown drops every key under the active
+// prefix but keeps the per-branch durable copy.
+func TestWorktreeDeleteKeepsDurableRedis(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitRedis(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+	sl := slug.For(wtPath, "")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Redis: &config.RedisConn{URL: "redis://" + redisAddr},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "redis",
+			KeyPrefix:    "bsdel:{slug}:",
+			BranchScoped: true,
+		}},
+	}
+
+	prefix := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	rset(t, prefix+"a", "feature-data")
+	assertRedisVals(t, prefix, map[string]string{"a": "feature-data"})
+
+	if err := prepare.TeardownDatabases(ctx, cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	assertRedisVals(t, prefix, map[string]string{}) // active keys dropped
+
+	if got := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature"); got != prefix {
+		t.Fatalf("active prefix drifted after re-create: %s → %s", prefix, got)
+	}
+	assertRedisVals(t, prefix, map[string]string{"a": "feature-data"}) // durable kept → resumed
+}
+
+// ─── TestWorktreeDeleteKeepsDurableElasticsearch ─────────────────────
+//
+// Elasticsearch mirror, prefix-scoped: teardown drops every index under
+// the active prefix but keeps the per-branch durable copy.
+func TestWorktreeDeleteKeepsDurableElasticsearch(t *testing.T) {
+	harness.SkipIfNoDocker(t)
+	waitES(t)
+
+	ctx := context.Background()
+	wtPath := t.TempDir()
+	st := openStore(t)
+	repoID, wtID := registerWorktree(t, st, wtPath)
+	sl := slug.For(wtPath, "")
+
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{
+			Elasticsearch: &config.EsConn{URL: esURL},
+		},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "elasticsearch",
+			KeyPrefix:    "bsdeles_{slug}_",
+			BranchScoped: true,
+		}},
+	}
+
+	prefix := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature")
+	esIndex(t, prefix, "a", "feature-data")
+	esAssertVals(t, prefix, map[string]string{"a": "feature-data"})
+
+	if err := prepare.TeardownDatabases(ctx, cfg, sl.Value, repoID, wtID, st); err != nil {
+		t.Fatalf("TeardownDatabases: %v", err)
+	}
+	if n := esCount(t, prefix+"*"); n != 0 {
+		t.Fatalf("teardown should have dropped active indices under %s*, found %d docs", prefix, n)
+	}
+
+	if got := drivePrepare(t, st, cfg, wtPath, repoID, wtID, "feature"); got != prefix {
+		t.Fatalf("active prefix drifted after re-create: %s → %s", prefix, got)
+	}
+	esAssertVals(t, prefix, map[string]string{"a": "feature-data"}) // durable kept → resumed
+}
+
 // ─── helpers: shared ─────────────────────────────────────────────────
 
 func renderName(t *testing.T, tmpl string, sl slug.Slug) string {
@@ -466,6 +936,20 @@ func pgAssertItems(t *testing.T, dbName string, want ...string) {
 	}
 }
 
+// pgDBExists reports whether a database named `name` lives in the
+// cluster — checked from the `postgres` maintenance DB so it works even
+// after `name` has been dropped.
+func pgDBExists(t *testing.T, name string) bool {
+	t.Helper()
+	db := pgConn(t, "postgres")
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pg_database WHERE datname = $1", name).Scan(&n); err != nil {
+		t.Fatalf("pg exists %s: %v", name, err)
+	}
+	return n == 1
+}
+
 func waitPostgres(t *testing.T) {
 	harness.WaitForReady(t, "postgres:"+pgAddr, 60*time.Second, func() error {
 		c, err := net.DialTimeout("tcp", pgAddr, time.Second)
@@ -524,6 +1008,18 @@ func mongoAssert(t *testing.T, dbName string, want ...string) {
 	}
 }
 
+// mongoDBExists reports whether a database named `name` is listed by the
+// server. Mongo creates databases lazily, so a dropped name is absent.
+func mongoDBExists(t *testing.T, name string) bool {
+	t.Helper()
+	c := mongoConn(t)
+	names, err := c.ListDatabaseNames(context.Background(), bson.M{"name": name})
+	if err != nil {
+		t.Fatalf("mongo list dbs: %v", err)
+	}
+	return len(names) == 1
+}
+
 func waitMongo(t *testing.T) {
 	harness.WaitForReady(t, "mongo:"+mongoURI, 60*time.Second, func() error {
 		c, err := net.DialTimeout("tcp", "127.0.0.1:27190", time.Second)
@@ -560,6 +1056,20 @@ func esIndex(t *testing.T, prefix, id, v string) {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("es index %s/%s: %s: %s", index, id, resp.Status, b)
 	}
+}
+
+// dropESIndex deletes one index by EXACT name. 200 (deleted) and 404
+// (already absent) are both fine — used for test pre-clean + cleanup.
+// Exact name avoids the wildcard-DELETE rejection ES enforces when
+// action.destructive_requires_name is on (the cluster default).
+func dropESIndex(t *testing.T, index string) {
+	t.Helper()
+	req, _ := http.NewRequest("DELETE", esURL+"/"+index, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("es delete %s: %v", index, err)
+	}
+	resp.Body.Close()
 }
 
 func esAssertVals(t *testing.T, prefix string, want map[string]string) {
@@ -600,6 +1110,30 @@ func esAssertVals(t *testing.T, prefix string, want map[string]string) {
 			t.Fatalf("es %s key %q = %q, want %q (full: %v)", index, k, got[k], v, got)
 		}
 	}
+}
+
+// esCount returns the document count across every index matching the
+// wildcard `pattern` (e.g. "bsdeles_<slug>_*"). A pattern that matches no
+// index returns 0 (wildcard expansion to empty is allowed), which is the
+// clean "namespace is gone" signal after a teardown.
+func esCount(t *testing.T, pattern string) int {
+	t.Helper()
+	resp, err := http.Get(esURL + "/" + pattern + "/_count")
+	if err != nil {
+		t.Fatalf("es count %s: %v", pattern, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("es count %s: %s: %s", pattern, resp.Status, body)
+	}
+	var out struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("es count parse %s: %v: %s", pattern, err, body)
+	}
+	return out.Count
 }
 
 func waitES(t *testing.T) {

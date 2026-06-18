@@ -79,7 +79,7 @@ func TestLaravelEndToEnd(t *testing.T) {
 					},
 				},
 				Inputs: []config.Input{
-					{Glob: "database/migrations/*.php", Label: "migrations", Hash: "filename"},
+					{Glob: "database/migrations/*.php", Label: "migrations"},
 				},
 			},
 		},

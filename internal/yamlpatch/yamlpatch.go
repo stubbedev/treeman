@@ -6,13 +6,11 @@ package yamlpatch
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -29,10 +27,10 @@ type Segment struct {
 // may chain (e.g. "x[0][1]") to walk nested sequences.
 func ParsePath(p string) ([]Segment, error) {
 	if p == "" {
-		return nil, fmt.Errorf("path is empty")
+		return nil, errors.New("path is empty")
 	}
 	var segs []Segment
-	for _, part := range strings.Split(p, ".") {
+	for part := range strings.SplitSeq(p, ".") {
 		if part == "" {
 			return nil, fmt.Errorf("empty segment in path %q", p)
 		}
@@ -128,6 +126,62 @@ func Set(root *yaml.Node, segs []Segment, newVal *yaml.Node) (prev *yaml.Node, e
 	return nil, nil
 }
 
+// Unset walks the YAML AST in `root` to `segs` and removes the terminal
+// node: for a mapping it drops the key + value pair, for a sequence it
+// splices out the index (shifting later elements down). Returns the
+// removed value node. A path whose terminal key/index doesn't exist is
+// an error so callers can tell a no-op delete from a real one.
+func Unset(root *yaml.Node, segs []Segment) (removed *yaml.Node, err error) {
+	if len(segs) == 0 {
+		return nil, errors.New("path is empty")
+	}
+	cur := root
+	if cur.Kind == yaml.DocumentNode {
+		if len(cur.Content) == 0 {
+			return nil, errors.New("document is empty — nothing to delete")
+		}
+		cur = cur.Content[0]
+	}
+	for i, seg := range segs {
+		last := i == len(segs)-1
+		if seg.IsIndex {
+			if cur.Kind != yaml.SequenceNode {
+				return nil, fmt.Errorf("segment %d: expected sequence at this position, got %s", i, KindName(cur.Kind))
+			}
+			if seg.Idx < 0 || seg.Idx >= len(cur.Content) {
+				return nil, fmt.Errorf("segment %d: index %d out of range (len=%d)", i, seg.Idx, len(cur.Content))
+			}
+			if last {
+				removed = cur.Content[seg.Idx]
+				cur.Content = append(cur.Content[:seg.Idx], cur.Content[seg.Idx+1:]...)
+				return removed, nil
+			}
+			cur = cur.Content[seg.Idx]
+			continue
+		}
+		if cur.Kind != yaml.MappingNode {
+			return nil, fmt.Errorf("segment %d (%q): expected mapping at this position, got %s", i, seg.Key, KindName(cur.Kind))
+		}
+		idx := -1
+		for k := 0; k < len(cur.Content); k += 2 {
+			if cur.Content[k].Value == seg.Key {
+				idx = k
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("segment %d: key %q not found", i, seg.Key)
+		}
+		if last {
+			removed = cur.Content[idx+1]
+			cur.Content = append(cur.Content[:idx], cur.Content[idx+2:]...)
+			return removed, nil
+		}
+		cur = cur.Content[idx+1]
+	}
+	return nil, errors.New("unreachable: path consumed without reaching terminal")
+}
+
 // ValueToNode round-trips any JSON-decoded value through yaml.Marshal
 // → yaml.Unmarshal so the result is a proper *yaml.Node suitable for
 // splicing into the AST.
@@ -161,32 +215,11 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// AtomicWriteWithBackup writes `data` to `path` via the standard
-// tmp+rename dance, but first snapshots the existing file content
-// to `<path>.bak.<timestamp>` and prunes older backups so at most
-// `keepN` remain. Used by `config_write` / `config_set` (CLI + MCP)
-// so an agent or human mistake doesn't silently lose the previous
-// `.treeman.yaml`. When the source file doesn't exist yet the
-// backup step is skipped (nothing to preserve).
-//
-// keepN=0 disables backups entirely; keepN<0 keeps every backup.
-func AtomicWriteWithBackup(path string, data []byte, keepN int) error {
-	if keepN != 0 {
-		if _, err := os.Stat(path); err == nil {
-			ts := time.Now().UTC().Format("20060102-150405")
-			bakPath := path + ".bak." + ts
-			src, err := os.ReadFile(path)
-			if err != nil {
-				return fmt.Errorf("read for backup: %w", err)
-			}
-			if err := os.WriteFile(bakPath, src, 0o600); err != nil {
-				return fmt.Errorf("write backup %s: %w", bakPath, err)
-			}
-			if keepN > 0 {
-				pruneBackups(path, keepN)
-			}
-		}
-	}
+// AtomicWrite writes `data` to `path` via the standard tmp+rename
+// dance. History of the previous content is no longer stashed beside
+// the file — callers that want a recoverable trail snapshot the prior
+// bytes into SQLite (store.SnapshotConfig) before calling this.
+func AtomicWrite(path string, data []byte) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
@@ -196,35 +229,6 @@ func AtomicWriteWithBackup(path string, data []byte, keepN int) error {
 		return err
 	}
 	return nil
-}
-
-// pruneBackups deletes oldest backups so at most `keep` remain.
-// Sorts by name (timestamps are zero-padded, so lexical = chrono).
-// Best-effort: prune errors are swallowed — the next call retries.
-func pruneBackups(path string, keep int) {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path) + ".bak."
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	var bakNames []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if strings.HasPrefix(e.Name(), base) {
-			bakNames = append(bakNames, e.Name())
-		}
-	}
-	if len(bakNames) <= keep {
-		return
-	}
-	sort.Strings(bakNames)
-	drop := len(bakNames) - keep
-	for _, name := range bakNames[:drop] {
-		_ = os.Remove(filepath.Join(dir, name))
-	}
 }
 
 // KindName returns a human-readable label for a yaml.Kind.

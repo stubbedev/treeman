@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/wt"
 )
 
 // trashDirName is the subdirectory under worktreesRoot where deleted
@@ -38,7 +39,7 @@ func removeWorktreeViaTrash(
 	if _, statErr := os.Stat(wtRoot); statErr != nil {
 		// Working tree already gone — just prune git's view of it.
 		_ = runGitPrune(ctx, repoRoot)
-		return "", nil
+		return "", nil //nolint:nilerr // idempotent: a missing worktree is success for a removal
 	}
 
 	trashRoot := filepath.Join(worktreesRoot, trashDirName)
@@ -64,6 +65,13 @@ func removeWorktreeViaTrash(
 	if runErr := lowPriorityCommand(ctx, "git", gitArgs).Run(); runErr != nil {
 		return "", runErr
 	}
+	// `git worktree remove` drops tracked files + the admin entry but
+	// leaves untracked bring-in / hook-generated dirs (storage/, vendor/,
+	// node_modules/) behind, so the next `wt create` at this path trips
+	// "destination path already exists". Nuke them — mirrors the CLI
+	// inlineTeardown path. Guarded to paths under worktreesRoot, so the
+	// cross-FS case (wtRoot outside the worktrees root) is a safe no-op.
+	wt.RemoveWorktreeTree(wtRoot, worktreesRoot)
 	return "", nil
 }
 
@@ -91,7 +99,7 @@ func scheduleBackgroundReap(st *State, repoPath, trashPath string) {
 	default:
 		// Queue full (highly unlikely with a 64-slot buffer): fall
 		// back to a one-shot reaper so we never lose the trash entry.
-		safeGo("wt_reap:"+trashPath, func() {
+		safeGo(lblWorktreeReap, trashPath, func() {
 			if err := parallelRemoveAll(st.BgCtx, trashPath, 4); err != nil {
 				slog.Warn("background reap", "trash", trashPath, "err", err)
 			}
@@ -110,7 +118,7 @@ func (st *State) reapQueueFor(repoPath string) chan string {
 	}
 	q := make(chan string, 64)
 	st.reapQueues[repoPath] = q
-	safeGo("wt_reap_drain:"+repoPath, func() {
+	safeGo(lblWorktreeReapDrain, repoPath, func() {
 		for {
 			select {
 			case <-st.BgCtx.Done():
@@ -159,6 +167,52 @@ func SweepTrashDirs(ctx context.Context, st *State, repoPaths []string) {
 	}
 }
 
+// ReapDeadRepos hard-removes (via RemoveRepo's cascade over events,
+// hook_runs, snapshots, worktrees) every registered repo whose root
+// path no longer exists on disk. Called once on daemon boot to reclaim
+// rows left by ephemeral repos — e2e test checkouts under /tmp, scratch
+// clones, etc. — that were never explicitly unregistered.
+//
+// Conservative by design: only a repo whose path is fully gone is
+// reaped, and each removal is logged at WARN with the path. The known
+// false-positive is a repo on a temporarily-unmounted volume; on a dev
+// host that risk is acceptable against unbounded row growth, but the
+// loud log lets an operator notice if a real repo vanished.
+func ReapDeadRepos(ctx context.Context, st *State) {
+	refs, err := st.Store.ListRepoRefs(ctx)
+	if err != nil {
+		slog.Warn("dead-repo reap: list repos", "err", err)
+		return
+	}
+	for _, r := range refs {
+		if _, err := os.Stat(r.Path); err == nil {
+			continue
+		}
+		if err := st.Store.RemoveRepo(ctx, r.ID); err != nil {
+			slog.Warn("dead-repo reap: remove", "repo", r.Path, "id", r.ID, "err", err)
+			continue
+		}
+		slog.Warn("dead-repo reap: removed registry rows for missing repo", "repo", r.Path, "id", r.ID)
+	}
+}
+
+// SweepOrphanWorktreePorts physically drops port reservations left
+// behind by soft-deleted (or vanished) worktrees. Called once on
+// daemon boot so leaked rows from an interrupted teardown — or from a
+// pre-release binary that soft-deleted without releasing — don't pin
+// the allocation range upward forever. Failures are logged + skipped;
+// a sweep error must not abort startup.
+func SweepOrphanWorktreePorts(ctx context.Context, st *State) {
+	n, err := st.Store.PurgeDeletedWorktreePorts(ctx)
+	if err != nil {
+		slog.Warn("port sweep: purge orphan reservations", "err", err)
+		return
+	}
+	if n > 0 {
+		slog.Info("port sweep: reaped orphan reservations", "rows", n)
+	}
+}
+
 // parallelRemoveAll splits the top-level entries of root across up to
 // `workers` concurrent `rm -rf` children, each wrapped in
 // lowPriorityCommand (chrt -i 0 / ionice / nice). After all entries
@@ -190,13 +244,13 @@ func parallelRemoveAll(ctx context.Context, root string, workers int) error {
 			target := filepath.Join(root, e.Name())
 			sem <- struct{}{}
 			wg.Add(1)
-			go func(t string) {
+			safeGo(lblWorktreeReap, target, func() {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if runErr := lowPriorityCommand(ctx, "rm", []string{"-rf", t}).Run(); runErr != nil {
-					slog.Debug("reap rm", "path", t, "err", runErr)
+				if runErr := lowPriorityCommand(ctx, "rm", []string{"-rf", target}).Run(); runErr != nil {
+					slog.Debug("reap rm", "path", target, "err", runErr)
 				}
-			}(target)
+			})
 		}
 		wg.Wait()
 	}

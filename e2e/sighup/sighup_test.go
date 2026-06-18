@@ -100,7 +100,7 @@ databases:
     inputs:
       - { glob: "globA/*", label: a }
 hooks:
-  on-file-change:
+  file-change:
     - run: echo "$TREEMAN_WATCH_LABEL" >> /tmp/treeman-e2e-sighup-events
 `
 	if err := os.WriteFile(filepath.Join(mainRepo, ".treeman.yaml"),
@@ -150,7 +150,7 @@ databases:
     inputs:
       - { glob: "globB/*", label: b }
 hooks:
-  on-file-change:
+  file-change:
     - run: echo "$TREEMAN_WATCH_LABEL" >> /tmp/treeman-e2e-sighup-events
 `
 	if err := os.WriteFile(filepath.Join(mainRepo, ".treeman.yaml"),

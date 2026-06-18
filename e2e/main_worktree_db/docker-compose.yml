@@ -1,0 +1,16 @@
+# MySQL fixture for the main-worktree overlay → real-database e2e.
+# Port 13342 is distinct from the other suites so they run concurrently.
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: treeman-e2e-mwdb-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+    ports:
+      - "13342:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s

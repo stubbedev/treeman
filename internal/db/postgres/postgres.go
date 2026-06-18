@@ -6,11 +6,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	// Register the pgx database/sql driver under the name "pgx".
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"golang.org/x/sync/errgroup"
@@ -67,10 +69,10 @@ func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 		)
 	} else {
 		dsn = fmt.Sprintf(
-			"postgres://%s:%s@%s:%d/postgres?sslmode=disable",
+			"postgres://%s:%s@%s/postgres?sslmode=disable",
 			url.QueryEscape(cfg.User),
 			url.QueryEscape(cfg.Password),
-			cfg.Host, cfg.Port,
+			net.JoinHostPort(cfg.Host, strconv.Itoa(int(cfg.Port))),
 		)
 	}
 	db, err := sql.Open("pgx", dsn)
@@ -79,7 +81,7 @@ func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 	}
 	adapter.ConfigurePool(db, int(cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 	return &Driver{DB: db, cfg: cfg}, nil
@@ -103,10 +105,10 @@ func (d *Driver) OpenScoped(ctx context.Context, dbName string) (*sql.DB, error)
 		)
 	} else {
 		dsn = fmt.Sprintf(
-			"postgres://%s:%s@%s:%d/%s?sslmode=disable",
+			"postgres://%s:%s@%s/%s?sslmode=disable",
 			url.QueryEscape(d.cfg.User),
 			url.QueryEscape(d.cfg.Password),
-			d.cfg.Host, d.cfg.Port,
+			net.JoinHostPort(d.cfg.Host, strconv.Itoa(int(d.cfg.Port))),
 			url.QueryEscape(dbName),
 		)
 	}
@@ -114,8 +116,12 @@ func (d *Driver) OpenScoped(ctx context.Context, dbName string) (*sql.DB, error)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres %s: %w", dbName, err)
 	}
+	// Apply the same pool tuning as the primary Connect pool so scoped
+	// handles don't inherit the stdlib MaxIdleConns=2 / no-max-lifetime
+	// defaults (idle-connection churn + stale conns across server recycle).
+	adapter.ConfigurePool(db, int(d.cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres %s: %w", dbName, err)
 	}
 	return db, nil
@@ -145,6 +151,25 @@ func (d *Driver) MaxConnections(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// WriteWatermark returns a sound, monotonic, PER-DATABASE write-counter
+// token: tup_inserted + tup_updated + tup_deleted from pg_stat_database
+// for `db`. The statistics collector is on by default (track_counts) and
+// these counters only increase, so an unchanged token between two calls
+// proves `db` received no row writes in between. Per-database (unlike the
+// server-wide MySQL token), so it isn't perturbed by writes to sibling
+// databases. An error or a missing row returns "" so the caller declines
+// to skip work.
+func (d *Driver) WriteWatermark(ctx context.Context, db string) (string, error) {
+	var n sql.NullInt64
+	err := d.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(tup_inserted,0) + COALESCE(tup_updated,0) + COALESCE(tup_deleted,0)
+		 FROM pg_stat_database WHERE datname = $1`, db).Scan(&n)
+	if err != nil {
+		return "", err
+	}
+	return "pg:" + strconv.FormatInt(n.Int64, 10), nil
+}
+
 func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 	qname, err := ident.QuotePostgres(name)
 	if err != nil {
@@ -157,8 +182,7 @@ func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 	if exists {
 		return nil
 	}
-	_, err = d.execOutsideTx(ctx, "CREATE DATABASE "+qname)
-	return err
+	return d.execOutsideTx(ctx, "CREATE DATABASE "+qname)
 }
 
 func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
@@ -182,7 +206,6 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	}
 	g.SetLimit(limit)
 	for _, n := range matched {
-		n := n
 		g.Go(func() error {
 			qn, err := ident.QuotePostgres(n)
 			if err != nil {
@@ -191,7 +214,7 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 			// Boot any straggler connections so DROP can proceed.
 			_, _ = d.DB.ExecContext(gctx,
 				"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1", n)
-			if _, err := d.execOutsideTx(gctx, "DROP DATABASE IF EXISTS "+qn); err != nil {
+			if err := d.execOutsideTx(gctx, "DROP DATABASE IF EXISTS "+qn); err != nil {
 				return fmt.Errorf("DROP DATABASE %s: %w", qn, err)
 			}
 			return nil
@@ -204,13 +227,19 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 }
 
 func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, error) {
+	// Escape LIKE metacharacters in the prefix so a literal `_` (present in
+	// every templated `name_<slug>`) is not treated as a single-char
+	// wildcard — otherwise DropMatching/FlushDatabase could reap sibling
+	// databases. Postgres LIKE uses backslash as the default escape char,
+	// matching the MySQL driver's identical guard.
+	like := strings.NewReplacer(`\`, `\\`, `_`, `\_`, `%`, `\%`).Replace(prefix) + "%"
 	rows, err := d.DB.QueryContext(ctx,
 		"SELECT datname FROM pg_database WHERE datname LIKE $1 ORDER BY datname",
-		prefix+"%")
+		like)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var s string
@@ -241,7 +270,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 		return err
 	}
 	// Fence the source so no new connections sneak in mid-clone.
-	if _, err := d.execOutsideTx(ctx,
+	if err := d.execOutsideTx(ctx,
 		"ALTER DATABASE "+qsource+" ALLOW_CONNECTIONS = false"); err != nil {
 		return err
 	}
@@ -252,17 +281,35 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 		// read-only-to-new-clients forever.
 		bgctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, _ = d.execOutsideTx(bgctx,
+		_ = d.execOutsideTx(bgctx,
 			"ALTER DATABASE "+qsource+" ALLOW_CONNECTIONS = true")
 	}()
 	_, _ = d.DB.ExecContext(ctx,
 		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1", source)
-	_, _ = d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
-	if _, err := d.execOutsideTx(ctx,
+	_ = d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
+	if err := d.execOutsideTx(ctx,
 		"CREATE DATABASE "+qtemplate+" TEMPLATE "+qsource); err != nil {
 		return err
 	}
 	return nil
+}
+
+// RenameDatabase renames `from` to `to` via ALTER DATABASE … RENAME TO
+// — a catalog-only metadata operation, constant-time regardless of DB
+// size. Postgres requires zero live connections on `from` (true for
+// idle pre-warmed spares) and fails — never overwrites — when `to`
+// already exists, which is exactly the atomicity the spare-claim path
+// leans on: of two racing claimers, exactly one wins the rename.
+func (d *Driver) RenameDatabase(ctx context.Context, from, to string) error {
+	qfrom, err := ident.QuotePostgres(from)
+	if err != nil {
+		return err
+	}
+	qto, err := ident.QuotePostgres(to)
+	if err != nil {
+		return err
+	}
+	return d.execOutsideTx(ctx, "ALTER DATABASE "+qfrom+" RENAME TO "+qto)
 }
 
 func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
@@ -274,12 +321,11 @@ func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) e
 	if err != nil {
 		return err
 	}
-	if _, err := d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
+	if err := d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
 		return err
 	}
-	_, err = d.execOutsideTx(ctx,
+	return d.execOutsideTx(ctx,
 		"CREATE DATABASE "+qtarget+" TEMPLATE "+qtemplate)
-	return err
 }
 
 func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
@@ -287,8 +333,7 @@ func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
 	if err != nil {
 		return err
 	}
-	_, err = d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
-	return err
+	return d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
 }
 
 // DropDatabase drops EXACTLY the named database — never a prefix match.
@@ -303,8 +348,7 @@ func (d *Driver) DropDatabase(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	_, err = d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qn)
-	return err
+	return d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qn)
 }
 
 // DatabaseExists returns true iff the named DB is present in
@@ -327,11 +371,12 @@ func (d *Driver) dbExists(ctx context.Context, name string) (bool, error) {
 
 // execOutsideTx runs a DDL statement that cannot live inside a
 // transaction (CREATE / DROP / ALTER DATABASE).
-func (d *Driver) execOutsideTx(ctx context.Context, stmt string) (sql.Result, error) {
+func (d *Driver) execOutsideTx(ctx context.Context, stmt string) error {
 	conn, err := d.DB.Conn(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer conn.Close()
-	return conn.ExecContext(ctx, stmt)
+	defer func() { _ = conn.Close() }()
+	_, err = conn.ExecContext(ctx, stmt)
+	return err
 }

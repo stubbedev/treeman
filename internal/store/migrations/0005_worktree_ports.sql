@@ -3,18 +3,23 @@
 -- `.treeman.yaml`. One row per (worktree, slot name) — the same
 -- worktree may own several slots (`octane`, `webpack`, `reverb`).
 --
--- Two uniqueness constraints, both expressed as partial unique
--- indexes so a soft-deleted worktree row can release its ports
--- back into the pool without a row delete:
+-- Two uniqueness constraints:
 --
---   1. Each live worktree has at most one port per slot name.
---   2. Within one repo + slot, each port can be held by at most
---      one live worktree (avoids two worktrees claiming the same
---      TCP port for their octane server).
+--   1. Each worktree has at most one port per slot name.
+--   2. Within one repo + slot, each port is held by at most one
+--      worktree (avoids two worktrees claiming the same TCP port
+--      for their octane server).
 --
--- Allocations are released by deleting rows when the worktree is
--- deleted; the freed (repo_id, name, port) tuple is then available
--- to the next `wt create`.
+-- Both are plain (non-partial) unique indexes, so they apply to
+-- EVERY row, including rows whose worktree has been soft-deleted.
+-- A reservation is therefore released only by physically DELETEing
+-- its row (store.ReleaseWorktreePorts) — soft-deleting the worktree
+-- is not enough. ListUsedPorts would skip a soft-deleted row when
+-- scanning for free ports, but index (2) would still reject the
+-- re-insert, so the freed (repo_id, name, port) tuple stays
+-- unusable until the row is gone. Every teardown path (CLI inline,
+-- daemon TeardownWorktree, lifecycle teardownOrphan) must call
+-- ReleaseWorktreePorts before MarkWorktreeDeleted.
 CREATE TABLE worktree_ports (
     id          INTEGER PRIMARY KEY,
     repo_id     INTEGER NOT NULL REFERENCES repos(id)     ON DELETE CASCADE,

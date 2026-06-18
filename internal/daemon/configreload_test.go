@@ -22,7 +22,7 @@ func TestLockRepoSerialisesConcurrentReloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	st := NewState(ctx, s)
 	cr, err := NewConfigReloader(st)
 	if err != nil {
@@ -32,10 +32,8 @@ func TestLockRepoSerialisesConcurrentReloads(t *testing.T) {
 	var active atomic.Int32
 	var maxActive atomic.Int32
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			mu := cr.lockRepo("/repos/x")
 			mu.Lock()
 			defer mu.Unlock()
@@ -45,7 +43,7 @@ func TestLockRepoSerialisesConcurrentReloads(t *testing.T) {
 				maxActive.Store(n)
 			}
 			time.Sleep(5 * time.Millisecond)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -64,7 +62,7 @@ func TestLockRepoDifferentReposParallelise(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	st := NewState(ctx, s)
 	cr, err := NewConfigReloader(st)
 	if err != nil {
@@ -81,9 +79,12 @@ func TestLockRepoDifferentReposParallelise(t *testing.T) {
 	// muB should be acquirable while muA is held.
 	done := make(chan struct{})
 	go func() {
-		muB.Lock()
-		muB.Unlock()
-		close(done)
+		// muB must be acquirable while muA is held — independent
+		// per-repo mutexes don't block each other.
+		if muB.TryLock() {
+			muB.Unlock()
+			close(done)
+		}
 	}()
 	select {
 	case <-done:

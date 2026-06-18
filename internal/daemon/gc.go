@@ -75,6 +75,7 @@ func runGCSweep(ctx context.Context, st *State) {
 	}
 	snapshot.SweepByAge(ctx, &globalCfg, st.Store)
 	snapshot.SweepBySize(ctx, &globalCfg, st.Store)
+	snapshot.SweepBySource(ctx, &globalCfg, st.Store)
 }
 
 // filepathBase mirrors filepath.Base but lives here to keep this

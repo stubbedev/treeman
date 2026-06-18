@@ -66,7 +66,7 @@ func TestSqlxCliEndToEnd(t *testing.T) {
 					Env: map[string]string{"DB_NAME": "{target_db}"},
 				},
 				Inputs: []config.Input{
-					{Glob: "migrations/*.sql", Label: "migrations", Hash: "filename"},
+					{Glob: "migrations/*.sql", Label: "migrations"},
 				},
 			},
 		},

@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
@@ -179,9 +181,20 @@ func SyncStatusSnapshot(ctx context.Context, st *State, repoFilter string) []rpc
 		paths := []string{r.Path}
 		linked, _ := wtreg.GitWorktreePaths(ctx, r.Path)
 		paths = append(paths, linked...)
-		for _, p := range paths {
-			rs.Worktrees = append(rs.Worktrees, worktreeSyncStatus(ctx, st, p))
+		// Probe worktrees concurrently: each worktreeSyncStatus spawns 3
+		// git subprocesses and they're fully independent across worktrees,
+		// so serial probing made the status RPC O(N×3) in wall-clock. Bound
+		// the fanout and write distinct slice indices to preserve order.
+		rs.Worktrees = make([]rpc.SyncWorktreeStatus, len(paths))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(8)
+		for i, p := range paths {
+			g.Go(func() error {
+				rs.Worktrees[i] = worktreeSyncStatus(gctx, st, p)
+				return nil
+			})
 		}
+		_ = g.Wait()
 		out = append(out, rs)
 	}
 	return out

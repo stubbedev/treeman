@@ -2,12 +2,12 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,9 +27,9 @@ import (
 // path must be absolute — caller's responsibility, so we don't have
 // to disambiguate cache keys across cwd changes.
 //
-// This is the workhorse behind snapshot.LockfileHashesFor and the
-// HashChecksum branch of framework.MigrationsHash, which previously
-// rehashed every dump file + every migration file on every prepare.
+// This is the workhorse behind snapshot.LockfileHashesFor and
+// framework.MigrationsHash, which would otherwise rehash every dump
+// file + every migration file on every prepare.
 //
 // Callers hashing many paths in one go should prefer
 // BatchHashedFiles, which folds the lookups into a single SELECT IN
@@ -46,38 +46,17 @@ func (s *Store) HashedFile(ctx context.Context, path string) (string, error) {
 	return h, nil
 }
 
-// BatchHashedFiles returns BLAKE3-256 hex digests for every path
-// in `paths`. Paths must be absolute.
-//
-// Strategy:
-//  1. stat each path once (skip non-files / missing).
-//  2. one SELECT … WHERE path IN(?,?,…) to fetch cached rows.
-//  3. for cached rows whose (size, mtime_ns) matches the live stat,
-//     return immediately. Refresh `cached_at` so LRU keeps hot files.
-//  4. for misses, consult the content-addressable secondary index
-//     (size, mtime_ns) — same content across worktrees reuses an
-//     existing row without re-reading bytes.
-//  5. for true misses, compute BLAKE3 in parallel (GOMAXPROCS) and
-//     upsert each fresh row.
-//
-// Returns a map keyed on the input absolute path. Missing or
-// non-regular files are silently absent from the result (matches the
-// per-path callers' behaviour).
-func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[string]string, error) {
-	out := make(map[string]string, len(paths))
-	if len(paths) == 0 {
-		return out, nil
-	}
-
-	stats := make(map[string]struct {
-		size  int64
-		mtime int64
-	}, len(paths))
+// statLivePaths stats each distinct absolute path once, dropping
+// missing entries and directories. It returns the surviving paths in
+// input order plus their (size, mtime_ns) stats. A non-absolute path is
+// a hard error (matches BatchHashedFiles' contract).
+func statLivePaths(paths []string) ([]string, map[string]fileStat, error) {
+	stats := make(map[string]fileStat, len(paths))
 	live := make([]string, 0, len(paths))
 	seen := make(map[string]struct{}, len(paths))
 	for _, p := range paths {
 		if !filepath.IsAbs(p) {
-			return nil, fmt.Errorf("hashed file: not an absolute path: %s", p)
+			return nil, nil, fmt.Errorf("hashed file: not an absolute path: %s", p)
 		}
 		if _, dup := seen[p]; dup {
 			continue
@@ -90,11 +69,44 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 		if info.IsDir() {
 			continue
 		}
-		stats[p] = struct {
-			size  int64
-			mtime int64
-		}{size: info.Size(), mtime: info.ModTime().UnixNano()}
+		stats[p] = fileStat{size: info.Size(), mtime: info.ModTime().UnixNano()}
 		live = append(live, p)
+	}
+	return live, stats, nil
+}
+
+// BatchHashedFiles returns BLAKE3-256 hex digests for every path
+// in `paths`. Paths must be absolute.
+//
+// Strategy:
+//  1. stat each path once (skip non-files / missing).
+//  2. one SELECT … WHERE path IN(?,?,…) to fetch cached rows.
+//  3. for cached rows whose (size, mtime_ns) matches the live stat,
+//     return immediately. Refresh `cached_at` so LRU keeps hot files.
+//  4. for misses, compute BLAKE3 in parallel (GOMAXPROCS) and upsert
+//     each fresh row.
+//
+// The cache is gated on each path's OWN (size, mtime_ns) — there is no
+// cross-path content-addressable reuse. Reusing a hash from a
+// different path solely because (size, mtime_ns) collide is unsafe on
+// coarse-mtime filesystems (macOS HFS+, SMB, some FUSE mounts resolve
+// mtime to 1 second): two distinct same-size files written in the same
+// second would alias to one hash and an edited migration could keep a
+// stale fingerprint. Per-path gating keeps detection content-correct
+// across every filesystem.
+//
+// Returns a map keyed on the input absolute path. Missing or
+// non-regular files are silently absent from the result (matches the
+// per-path callers' behaviour).
+func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[string]string, error) {
+	out := make(map[string]string, len(paths))
+	if len(paths) == 0 {
+		return out, nil
+	}
+
+	live, stats, err := statLivePaths(paths)
+	if err != nil {
+		return nil, err
 	}
 	if len(live) == 0 {
 		return out, nil
@@ -111,48 +123,16 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 	// sets stay safe.
 	const chunk = 500
 	for i := 0; i < len(live); i += chunk {
-		j := i + chunk
-		if j > len(live) {
-			j = len(live)
-		}
-		batch := live[i:j]
-		ph := make([]string, len(batch))
-		args := make([]any, len(batch))
-		for k, p := range batch {
-			ph[k] = "?"
-			args[k] = p
-		}
-		q := "SELECT path, size, mtime_ns, hash FROM file_hashes WHERE path IN (" + strings.Join(ph, ",") + ")"
-		rows, err := s.DB.QueryContext(ctx, q, args...)
-		if err != nil {
-			// Cache lookup failure is advisory — fall through to
-			// recompute everything below.
-			slog.Warn("file_hashes batch lookup failed", "err", err)
+		j := min(i+chunk, len(live))
+		if !s.loadFileHashChunk(ctx, live[i:j], cached) {
 			break
 		}
-		for rows.Next() {
-			var p, h string
-			var sz, mt int64
-			if err := rows.Scan(&p, &sz, &mt, &h); err != nil {
-				continue
-			}
-			cached[p] = struct {
-				size  int64
-				mtime int64
-				hash  string
-			}{sz, mt, h}
-		}
-		rows.Close()
 	}
 
 	now := nowMillis()
 	var (
-		hits     []string
-		misses   []string
-		secondHi []struct {
-			path, hash string
-			size, mt   int64
-		}
+		hits   []string
+		misses []string
 	)
 
 	for _, p := range live {
@@ -165,43 +145,14 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 		misses = append(misses, p)
 	}
 
-	// Secondary (content-addressable) lookup for misses: same
-	// (size, mtime_ns) elsewhere → reuse hash without disk read.
+	// Hash misses in parallel.
 	if len(misses) > 0 {
-		stillMissing := misses[:0]
-		for _, p := range misses {
-			st := stats[p]
-			row := s.DB.QueryRowContext(ctx,
-				`SELECT hash FROM file_hashes WHERE size = ? AND mtime_ns = ? LIMIT 1`,
-				st.size, st.mtime)
-			var h string
-			if err := row.Scan(&h); err == nil && h != "" {
-				out[p] = h
-				secondHi = append(secondHi, struct {
-					path, hash string
-					size, mt   int64
-				}{p, h, st.size, st.mtime})
-				continue
-			} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				slog.Warn("file_hashes secondary lookup failed", "path", p, "err", err)
-			}
-			stillMissing = append(stillMissing, p)
-		}
-		misses = stillMissing
-	}
-
-	// Hash true misses in parallel.
-	if len(misses) > 0 {
-		limit := runtime.GOMAXPROCS(0)
-		if limit < 1 {
-			limit = 1
-		}
+		limit := max(runtime.GOMAXPROCS(0), 1)
 		var mu sync.Mutex
 		fresh := make(map[string]string, len(misses))
 		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(limit)
 		for _, p := range misses {
-			p := p
 			g.Go(func() error {
 				h, err := hashFileBLAKE3(p)
 				if err != nil {
@@ -220,30 +171,10 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 		if err := g.Wait(); err != nil {
 			return out, err
 		}
-		for p, h := range fresh {
-			out[p] = h
-		}
-		// Upsert fresh rows + secondary-index hits as their own
-		// rows so future runs hit by path directly.
+		maps.Copy(out, fresh)
+		// Upsert fresh rows keyed by path so future runs hit directly.
 		if err := s.upsertHashRows(ctx, fresh, stats, now); err != nil {
 			slog.Warn("file_hashes batch upsert failed", "err", err)
-		}
-	}
-	if len(secondHi) > 0 {
-		rowMap := make(map[string]string, len(secondHi))
-		statMap := make(map[string]struct {
-			size  int64
-			mtime int64
-		}, len(secondHi))
-		for _, e := range secondHi {
-			rowMap[e.path] = e.hash
-			statMap[e.path] = struct {
-				size  int64
-				mtime int64
-			}{size: e.size, mtime: e.mt}
-		}
-		if err := s.upsertHashRows(ctx, rowMap, statMap, now); err != nil {
-			slog.Warn("file_hashes secondary upsert failed", "err", err)
 		}
 	}
 	if len(hits) > 0 {
@@ -255,11 +186,62 @@ func (s *Store) BatchHashedFiles(ctx context.Context, paths []string) (map[strin
 	return out, nil
 }
 
+// fileStat is the live (size, mtime_ns) stat for one path, used to
+// match cached rows in BatchHashedFiles.
+type fileStat struct {
+	size  int64
+	mtime int64
+}
+
+// loadFileHashChunk runs the primary `path IN (…)` cache lookup for one
+// chunk of live paths, filling `cached` with every matching row.
+// Returns false (advising the caller to stop chunking) when the query
+// or row iteration fails — the failure is advisory, so the caller falls
+// through to recompute.
+func (s *Store) loadFileHashChunk(ctx context.Context, batch []string, cached map[string]struct {
+	size  int64
+	mtime int64
+	hash  string
+},
+) bool {
+	ph := make([]string, len(batch))
+	args := make([]any, len(batch))
+	for k, p := range batch {
+		ph[k] = "?"
+		args[k] = p
+	}
+	//nolint:gosec // only `?` placeholders are concatenated; values are parameterized
+	q := "SELECT path, size, mtime_ns, hash FROM file_hashes WHERE path IN (" + strings.Join(ph, ",") + ")"
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		// Cache lookup failure is advisory — fall through to
+		// recompute everything below.
+		slog.Warn("file_hashes batch lookup failed", "err", err)
+		return false
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var p, h string
+		var sz, mt int64
+		if err := rows.Scan(&p, &sz, &mt, &h); err != nil {
+			continue
+		}
+		cached[p] = struct {
+			size  int64
+			mtime int64
+			hash  string
+		}{sz, mt, h}
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("file_hashes batch iteration failed", "err", err)
+		return false
+	}
+	return true
+}
+
 func (s *Store) upsertHashRows(ctx context.Context, hashes map[string]string,
-	stats map[string]struct {
-		size  int64
-		mtime int64
-	}, now int64) error {
+	stats map[string]fileStat, now int64,
+) error {
 	if len(hashes) == 0 {
 		return nil
 	}
@@ -267,7 +249,7 @@ func (s *Store) upsertHashRows(ctx context.Context, hashes map[string]string,
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO file_hashes(path, size, mtime_ns, hash, cached_at)
 		VALUES (?, ?, ?, ?, ?)
@@ -279,7 +261,7 @@ func (s *Store) upsertHashRows(ctx context.Context, hashes map[string]string,
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 	for p, h := range hashes {
 		st := stats[p]
 		if _, err := stmt.ExecContext(ctx, p, st.size, st.mtime, h, now); err != nil {
@@ -297,12 +279,12 @@ func (s *Store) touchHashRows(ctx context.Context, paths []string, now int64) er
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	stmt, err := tx.PrepareContext(ctx, `UPDATE file_hashes SET cached_at = ? WHERE path = ?`)
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 	for _, p := range paths {
 		if _, err := stmt.ExecContext(ctx, now, p); err != nil {
 			return err
@@ -318,7 +300,7 @@ func hashFileBLAKE3(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := blake3.New(32, nil)
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err

@@ -6,9 +6,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/stubbedev/treeman/internal/engine"
 )
+
+// FileHash is one entry in an InputVector: the relpath of a file under
+// an input glob plus its content hash. Ordered by Path within a vector
+// so prefix comparisons are well-defined.
+type FileHash struct {
+	Path string `json:"path"`
+	Hash string `json:"hash"`
+}
+
+// InputVector is the ordered per-input file list (path + content hash)
+// captured at snapshot time. Used by FindAncestorSnapshot to detect a
+// cached template whose vectors are prefixes of the current run's —
+// the building block for incremental cold builds.
+type InputVector []FileHash
 
 // SnapshotRecord mirrors a row in the `snapshots` table.
 type SnapshotRecord struct {
@@ -20,11 +35,16 @@ type SnapshotRecord struct {
 	MigrationsHash string
 	DumpHash       string
 	LockfileHashes map[string]string
-	SizeBytes      int64
-	CreatedAt      int64
-	LastUsedAt     int64
-	UseCount       int64
-	RepoID         int64
+	// Inputs is the per-input ordered file vector captured at build
+	// time. Keys are input globs (matching the keys used in
+	// LockfileHashes). Empty for snapshots predating the inputs_json
+	// column (those can't participate as ancestors).
+	Inputs     map[string]InputVector
+	SizeBytes  int64
+	CreatedAt  int64
+	LastUsedAt int64
+	UseCount   int64
+	RepoID     int64
 }
 
 // LookupSnapshot returns the snapshot row for `fingerprint`, or
@@ -33,12 +53,13 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 	row := s.DB.QueryRowContext(ctx, `
 		SELECT fingerprint, engine, engine_version, source_db, template_name,
 		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
+		       COALESCE(inputs_json,'{}'),
 		       COALESCE(size_bytes,0), created_at, last_used_at, use_count
 		FROM snapshots WHERE fingerprint = ?`, fingerprint)
 	var r SnapshotRecord
-	var lockJSON string
+	var lockJSON, inputsJSON string
 	err := row.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
-		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON,
+		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
 		&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -49,6 +70,52 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 	if lockJSON != "" {
 		if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
 			return nil, fmt.Errorf("decode lockfile_hashes_json for %s: %w", fingerprint, err)
+		}
+	}
+	if inputsJSON != "" && inputsJSON != "{}" {
+		if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
+			return nil, fmt.Errorf("decode inputs_json for %s: %w", fingerprint, err)
+		}
+	}
+	return &r, nil
+}
+
+// LookupAndTouchSnapshot returns the snapshot row for `fingerprint` —
+// bumping `last_used_at` + `use_count` in the same statement — or
+// (nil, nil) if no row exists. Collapses the cache-hit path's lookup +
+// touch into one round-trip, and marks the row most-recently-used
+// atomically with reading it, so a concurrent EvictExcess can never
+// observe the gap between the two and reap the template we are about
+// to restore from.
+func (s *Store) LookupAndTouchSnapshot(ctx context.Context, fingerprint string) (*SnapshotRecord, error) {
+	row := s.DB.QueryRowContext(ctx, `
+		UPDATE snapshots
+		SET last_used_at = ?, use_count = use_count + 1
+		WHERE fingerprint = ?
+		RETURNING fingerprint, engine, engine_version, source_db, template_name,
+		          migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
+		          COALESCE(inputs_json,'{}'),
+		          COALESCE(size_bytes,0), created_at, last_used_at, use_count`,
+		nowMillis(), fingerprint)
+	var r SnapshotRecord
+	var lockJSON, inputsJSON string
+	err := row.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
+		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
+		&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lockJSON != "" {
+		if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
+			return nil, fmt.Errorf("decode lockfile_hashes_json for %s: %w", fingerprint, err)
+		}
+	}
+	if inputsJSON != "" && inputsJSON != "{}" {
+		if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
+			return nil, fmt.Errorf("decode inputs_json for %s: %w", fingerprint, err)
 		}
 	}
 	return &r, nil
@@ -73,6 +140,13 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	if err != nil {
 		return fmt.Errorf("encode lockfile_hashes: %w", err)
 	}
+	if r.Inputs == nil {
+		r.Inputs = map[string]InputVector{}
+	}
+	inputsJSON, err := json.Marshal(r.Inputs)
+	if err != nil {
+		return fmt.Errorf("encode inputs_json: %w", err)
+	}
 	now := nowMillis()
 	if r.CreatedAt == 0 {
 		r.CreatedAt = now
@@ -80,30 +154,302 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	if r.LastUsedAt == 0 {
 		r.LastUsedAt = now
 	}
-	var repoID interface{}
+	var repoID any
 	if r.RepoID > 0 {
 		repoID = r.RepoID
 	}
 	_, err = s.DB.ExecContext(ctx, `
 		INSERT INTO snapshots(fingerprint, engine, engine_version, source_db,
 		                      template_name, migrations_hash, dump_hash,
-		                      lockfile_hashes_json, size_bytes, created_at,
+		                      lockfile_hashes_json, inputs_json,
+		                      size_bytes, created_at,
 		                      last_used_at, use_count, repo_id)
-		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, NULLIF(?,0), ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, ?, NULLIF(?,0), ?, ?, ?, ?)
 		ON CONFLICT(fingerprint) DO UPDATE SET
 		    template_name        = excluded.template_name,
 		    engine_version       = excluded.engine_version,
 		    source_db            = excluded.source_db,
 		    migrations_hash      = excluded.migrations_hash,
-		    dump_hash            = excluded.dump_hash,
+		    dump_hash             = excluded.dump_hash,
 		    lockfile_hashes_json = excluded.lockfile_hashes_json,
+		    inputs_json          = excluded.inputs_json,
 		    size_bytes           = excluded.size_bytes,
 		    last_used_at         = excluded.last_used_at,
 		    repo_id              = excluded.repo_id`,
 		r.Fingerprint, r.Engine, r.EngineVersion, r.SourceDB,
-		r.TemplateName, r.MigrationsHash, r.DumpHash, string(lockJSON),
+		r.TemplateName, r.MigrationsHash, r.DumpHash, string(lockJSON), string(inputsJSON),
 		r.SizeBytes, r.CreatedAt, r.LastUsedAt, r.UseCount, repoID)
 	return err
+}
+
+// CommandsHashKey is the well-known LockfileHashes map key that
+// computeSnapshotKey stuffs the migrate+seed run/env hash under. It's
+// the only non-input fold-in today; pulling it out as a constant lets
+// FindAncestorSnapshot compare commands explicitly without having to
+// distinguish "real input glob" entries from this synthetic one.
+const CommandsHashKey = "__commands__"
+
+// DumpOnlyMarkerKey tags a snapshot whose template holds the post-dump,
+// pre-migrate, pre-seed state — the intermediate "dump-only" template
+// the dump-only fast path clones from. Stored in LockfileHashes with
+// value "1". These rows are intentionally excluded from ancestor
+// lookups (they have empty Inputs, which would otherwise read as a
+// prefix of every run and let an incremental build skip seed); only the
+// exact-fingerprint LookupSnapshot path resolves them.
+const DumpOnlyMarkerKey = "__dump_only__"
+
+// FindAncestorSnapshot returns the cached snapshot that is the LONGEST
+// content-prefix ancestor of the current run, or (nil, nil) when none
+// qualifies. An ancestor is a row in the same repo with identical
+// (engine, engine_version, dump_hash, commands_hash) where every input
+// glob present in the candidate also appears in the current run AND
+// the candidate's vector is a PREFIX of the current run's vector for
+// that glob. The current run may carry additional entries at the end
+// of any vector or additional input globs entirely — those represent
+// the new files an incremental migrate will apply on top of the
+// ancestor template.
+//
+// "Best" = the candidate whose Inputs collectively cover the most
+// files (longest total vector). Returns (nil, nil) when no candidate
+// is a STRICT ancestor — exact-equality matches are the
+// LookupSnapshot cache-hit path, not an incremental case.
+//
+// Pure read: callers decide whether to act on the result.
+func (s *Store) FindAncestorSnapshot(
+	ctx context.Context,
+	repoID int64,
+	eng, engineVersion, dumpHash, currentCommandsHash string,
+	currentInputs map[string]InputVector,
+) (*SnapshotRecord, error) {
+	cands, err := s.candidateSnapshots(ctx, repoID, eng, engineVersion, dumpHash)
+	if err != nil {
+		return nil, err
+	}
+	currentTotal := vectorTotalLen(currentInputs)
+	var best *SnapshotRecord
+	bestLen := -1
+	for i := range cands {
+		r := cands[i]
+		// Commands must match exactly. A different migrate/seed run-
+		// string or env would change which migrations get applied, so
+		// the ancestor isn't a safe clone target.
+		if r.LockfileHashes[CommandsHashKey] != currentCommandsHash {
+			continue
+		}
+		if !vectorsAreAncestor(r.Inputs, currentInputs) {
+			continue
+		}
+		total := vectorTotalLen(r.Inputs)
+		// A candidate with the same total as current is an exact match
+		// — that's the LookupSnapshot path. Strict prefix only.
+		if total >= currentTotal {
+			continue
+		}
+		if total > bestLen {
+			bestCopy := r
+			best = &bestCopy
+			bestLen = total
+		}
+	}
+	return best, nil
+}
+
+// FindRollbackAncestor finds the prior snapshot best suited to a
+// "rollback + re-migrate" rebuild after an EXISTING migration was
+// edited (or removed) mid-sequence. Unlike FindAncestorSnapshot — which
+// requires a strict content-prefix (pure append) — this looks for a
+// candidate that DIVERGES from the current inputs: it shares the longest
+// common prefix and then differs.
+//
+// Both the candidate's and the current run's per-glob vectors are merged
+// into one global list ordered by file basename (timestamp-prefixed
+// migration filenames sort in ledger order for Laravel/Rails/Django/…),
+// because single-ledger frameworks roll back by a single global step
+// count, not per-glob. `steps` is the number of the candidate's
+// migrations at or after the first divergent position — i.e. how many
+// ledger entries `migrate:rollback` must unwind to reach the last-good
+// common state before re-running `migrate` forward.
+//
+// Pure-append and exact-match candidates are skipped (those are
+// FindAncestorSnapshot's / LookupSnapshot's job). Returns (nil, 0, nil)
+// when no diverging candidate exists. The chosen candidate maximises the
+// common-prefix length (minimises steps).
+func (s *Store) FindRollbackAncestor(
+	ctx context.Context,
+	repoID int64,
+	eng, engineVersion, dumpHash, currentCommandsHash string,
+	currentInputs map[string]InputVector,
+) (*SnapshotRecord, int, error) {
+	cands, err := s.candidateSnapshots(ctx, repoID, eng, engineVersion, dumpHash)
+	if err != nil {
+		return nil, 0, err
+	}
+	curMerged := mergeVectorsByBasename(currentInputs)
+	var best *SnapshotRecord
+	bestSteps := 0
+	bestPrefix := -1
+	for i := range cands {
+		r := cands[i]
+		if r.LockfileHashes[CommandsHashKey] != currentCommandsHash {
+			continue
+		}
+		candMerged := mergeVectorsByBasename(r.Inputs)
+		prefix := commonPrefixLen(candMerged, curMerged)
+		if prefix == len(candMerged) {
+			// Candidate fully consumed as a prefix of current → pure
+			// append or exact match, not a rollback target.
+			continue
+		}
+		steps := len(candMerged) - prefix
+		// Prefer the longest common prefix (fewest migrations to unwind).
+		if prefix > bestPrefix {
+			bestCopy := r
+			best = &bestCopy
+			bestPrefix = prefix
+			bestSteps = steps
+		}
+	}
+	return best, bestSteps, nil
+}
+
+// candidateSnapshots runs the shared (repo, engine, version, dump)
+// filter query and returns every matching snapshot row with its
+// lockfile/inputs JSON decoded. Rows whose JSON fails to decode are
+// skipped (mirrors the lenient behaviour of the prior inline loop).
+func (s *Store) candidateSnapshots(
+	ctx context.Context,
+	repoID int64,
+	eng, engineVersion, dumpHash string,
+) ([]SnapshotRecord, error) {
+	if fam, ok := engine.Canonical(eng); ok {
+		eng = string(fam)
+	}
+	dumpArg := sql.NullString{String: dumpHash, Valid: dumpHash != ""}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT fingerprint, engine, engine_version, source_db, template_name,
+		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
+		       COALESCE(inputs_json,'{}'),
+		       COALESCE(size_bytes,0), created_at, last_used_at, use_count
+		FROM snapshots
+		WHERE repo_id = ?
+		  AND engine = ?
+		  AND engine_version = ?
+		  AND COALESCE(dump_hash,'') = COALESCE(?,'')`, repoID, eng, engineVersion, dumpArg)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []SnapshotRecord
+	for rows.Next() {
+		var r SnapshotRecord
+		var lockJSON, inputsJSON string
+		if err := rows.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
+			&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
+			&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount); err != nil {
+			return nil, err
+		}
+		if lockJSON != "" {
+			if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
+				continue
+			}
+		}
+		if inputsJSON != "" && inputsJSON != "{}" {
+			if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
+				continue
+			}
+		}
+		// Never offer a dump-only template as an ancestor: its empty
+		// Inputs would read as a prefix of every run and an incremental
+		// build off it would skip seed.
+		if r.LockfileHashes[DumpOnlyMarkerKey] == "1" {
+			continue
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// mergeVectorsByBasename flattens every per-glob InputVector into one
+// list ordered by file basename. Migration filenames are timestamp- or
+// sequence-prefixed, so basename order approximates the framework's
+// single global ledger order across multiple migration dirs/globs. Ties
+// on basename (rare — same filename under two globs) break by full path
+// for determinism.
+func mergeVectorsByBasename(m map[string]InputVector) []FileHash {
+	var all []FileHash
+	for _, v := range m {
+		all = append(all, v...)
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		bi, bj := pathBase(all[i].Path), pathBase(all[j].Path)
+		if bi != bj {
+			return bi < bj
+		}
+		return all[i].Path < all[j].Path
+	})
+	return all
+}
+
+// commonPrefixLen returns the number of leading entries that are
+// identical (path AND hash) in both merged vectors.
+func commonPrefixLen(a, b []FileHash) int {
+	n := 0
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
+	}
+	return n
+}
+
+// pathBase returns the basename of a slash- or OS-separated relpath
+// without importing path/filepath semantics that differ across OSes —
+// InputVector paths are stored slash-normalised, but tolerate either.
+func pathBase(p string) string {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' || p[i] == '\\' {
+			return p[i+1:]
+		}
+	}
+	return p
+}
+
+// vectorTotalLen sums the lengths of every input vector — the metric
+// used to pick the "longest" ancestor when more than one qualifies.
+func vectorTotalLen(m map[string]InputVector) int {
+	n := 0
+	for _, v := range m {
+		n += len(v)
+	}
+	return n
+}
+
+// vectorsAreAncestor reports whether `cand` is a per-input prefix of
+// `current`. Every input glob present in `cand` must also be present
+// in `current` with the candidate's entries appearing at the same
+// positions; `current` may carry additional entries at the end or
+// additional input globs entirely (those represent the new files an
+// incremental migrate would apply on top of the ancestor).
+func vectorsAreAncestor(cand, current map[string]InputVector) bool {
+	for glob, cVec := range cand {
+		curVec, ok := current[glob]
+		if !ok {
+			// Candidate has an input the current run doesn't — it's
+			// not a subset of current's state, so not an ancestor.
+			return false
+		}
+		if len(cVec) > len(curVec) {
+			return false
+		}
+		for i := range cVec {
+			if cVec[i] != curVec[i] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // SnapshotEvictionCandidate is the slim view returned by
@@ -120,11 +466,11 @@ type SnapshotEvictionCandidate struct {
 // repo, ordered by LRU (`last_used_at` ascending). Used by the
 // inline GC fired after a fresh RecordSnapshot.
 //
-// `cap == 0` is treated as "no cap" and returns an empty slice
+// `keep == 0` is treated as "no cap" and returns an empty slice
 // (defense against a misconfigured config that would otherwise wipe
 // every cached template).
-func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, cap uint32) ([]SnapshotEvictionCandidate, error) {
-	if cap == 0 || repoID == 0 {
+func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, keep uint32) ([]SnapshotEvictionCandidate, error) {
+	if keep == 0 || repoID == 0 {
 		return nil, nil
 	}
 	rows, err := s.DB.QueryContext(ctx, `
@@ -132,11 +478,11 @@ func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, cap uint32) 
 		FROM snapshots
 		WHERE repo_id = ?
 		ORDER BY last_used_at DESC
-		LIMIT -1 OFFSET ?`, repoID, cap)
+		LIMIT -1 OFFSET ?`, repoID, keep)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SnapshotEvictionCandidate
 	for rows.Next() {
 		var c SnapshotEvictionCandidate
@@ -144,6 +490,28 @@ func (s *Store) ListLRUEvictable(ctx context.Context, repoID int64, cap uint32) 
 			return nil, err
 		}
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListAllTemplateNames returns the template_name of every snapshot row
+// across ALL repos. The orphan probe compares engine-side `_tm_*`
+// namespaces against this set — a template the engine carries but no
+// row references can never be cache-hit, restored from, or GC'd, so
+// it's reclaimable junk.
+func (s *Store) ListAllTemplateNames(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT template_name FROM snapshots`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out[n] = true
 	}
 	return out, rows.Err()
 }
@@ -177,7 +545,7 @@ func (s *Store) ListSnapshotsOlderThan(ctx context.Context, cutoffMillis int64) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []SnapshotEvictionCandidate
 	for rows.Next() {
 		var c SnapshotEvictionCandidate
@@ -218,7 +586,51 @@ func (s *Store) ListSnapshotsForRepo(ctx context.Context, repoID int64) ([]Snaps
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
+	var out []SnapshotEvictionCandidate
+	for rows.Next() {
+		var c SnapshotEvictionCandidate
+		if err := rows.Scan(&c.Fingerprint, &c.Engine, &c.TemplateName, &c.SourceDB); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ListSnapshotsBeyondPerSource returns the snapshots that exceed `keep`
+// per source, where a "source" is the migration-content key
+// (`migrations_hash`) — templates that share migration content but
+// differ in dump/lockfile/engine-version pile up under one source as a
+// project's deps churn. Within each source the `keep` most-recently-used
+// rows are retained; the rest (LRU) are returned for eviction.
+//
+// `keep == 0` is treated as "no limit" and returns an empty slice — a
+// guard against a misconfigured 0 wiping every cached template (mirrors
+// ListLRUEvictable's cap==0 guard).
+//
+// Implemented with a correlated count rather than a window function so
+// it works regardless of the bundled SQLite version: a row is beyond the
+// limit when at least `keep` siblings in the same source are strictly
+// newer (ties broken deterministically by fingerprint).
+func (s *Store) ListSnapshotsBeyondPerSource(ctx context.Context, keep uint32) ([]SnapshotEvictionCandidate, error) {
+	if keep == 0 {
+		return nil, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT fingerprint, engine, template_name, source_db
+		FROM snapshots s
+		WHERE (
+			SELECT COUNT(*) FROM snapshots s2
+			WHERE s2.migrations_hash = s.migrations_hash
+			  AND (s2.last_used_at > s.last_used_at
+			       OR (s2.last_used_at = s.last_used_at AND s2.fingerprint > s.fingerprint))
+		) >= ?
+		ORDER BY migrations_hash, last_used_at ASC`, keep)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
 	var out []SnapshotEvictionCandidate
 	for rows.Next() {
 		var c SnapshotEvictionCandidate
@@ -241,7 +653,7 @@ func (s *Store) ListSnapshotsLargestLRU(ctx context.Context) ([]SnapshotEviction
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var (
 		cands []SnapshotEvictionCandidate
 		sizes []int64

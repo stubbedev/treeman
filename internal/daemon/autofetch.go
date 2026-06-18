@@ -7,17 +7,19 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
+	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/wtreg"
 )
 
-// Skip-reason codes emitted as `auto_fetch_skipped` events and stamped
+// Skip-reason codes emitted as `fetch:skip` events and stamped
 // onto `State.syncLastSkip` so the sync_status RPC can answer "why
 // didn't this branch advance on the last sweep?".
 const (
@@ -69,6 +71,15 @@ func repoJitter(repoPath string) time.Duration {
 	return time.Duration(off)
 }
 
+// autoFetchInterval maps the configured `auto_fetch.interval_minutes`
+// to a ticker duration, clamping sub-minute values up to 1m so a
+// misconfigured `interval_minutes: 0` can't spin a tight ticker that
+// hammers every remote on every tick.
+func autoFetchInterval(cfg config.AutoFetchConfig) time.Duration {
+	d := max(time.Duration(cfg.IntervalMinutes)*time.Minute, time.Minute)
+	return d
+}
+
 // AutoFetchLoop runs a periodic `git fetch --all --prune` against
 // every registered repo, then advances every active worktree (main +
 // linked) by either fast-forward or rebase depending on
@@ -95,13 +106,7 @@ func AutoFetchLoop(ctx context.Context, st *State) {
 		slog.Info("auto_fetch_loop disabled by global config")
 		return
 	}
-	interval := time.Duration(cfg.AutoFetch.IntervalMinutes) * time.Minute
-	if interval < time.Minute {
-		// Defensive clamp — a misconfigured `interval_minutes: 0`
-		// would otherwise spin a tight ticker that hammers every
-		// remote on every tick.
-		interval = time.Minute
-	}
+	interval := autoFetchInterval(cfg.AutoFetch)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	slog.Info("auto_fetch_loop started", "interval", interval)
@@ -189,9 +194,9 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 		slog.Warn("auto_fetch fetch failed",
 			"repo", r.Path, "err", err,
 			"consecutive_failures", failures)
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, "auto_fetch_fetch_failed",
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtFetchError,
 			err.Error(), r.ID, 0, "", 0, map[string]string{
-				"consecutive_failures": fmt.Sprintf("%d", failures),
+				"consecutive_failures": strconv.Itoa(failures),
 				"next_retry_at":        st.SyncBackoffUntil(r.Path).UTC().Format(time.RFC3339),
 			})
 		return err
@@ -211,9 +216,37 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 	mode := cfg.AutoFetch.ResolvedMode()
 	for _, wtPath := range paths {
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // ctx cancelled mid-loop: stop syncing cleanly, not a failure
 		}
 		_ = SyncWorktree(ctx, st, r.ID, wtPath, mode)
+	}
+
+	// After the mainline branch has advanced, prune local branches whose
+	// upstream was deleted and that are provably merged, then reap the
+	// branch_scoped durable databases those deleted branches left behind.
+	for _, branch := range pruneGoneLocals(ctx, r.Path) {
+		prepare.ReapBranchDurables(ctx, cfg, st.Store, r.ID, branch)
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtBranchPrune,
+			"pruned merged branch with deleted upstream: "+branch,
+			r.ID, 0, "", 0, map[string]string{"branch": branch})
+	}
+
+	// Catch-all: drop any tracked durable whose branch is gone regardless of
+	// HOW it went away (worktree removed, branch deleted out-of-band, prune
+	// missed it). ReapBranchDurables above only covers branches THIS tick
+	// pruned via a live worktree; this reclaims the rest by recorded name.
+	prepare.ReapOrphanDurables(ctx, cfg, st.Store, r.ID, r.Path)
+
+	// Deeper catch-all for Elasticsearch: drop ES durable index families
+	// (`tmbs_*`) that NO repo's registry references at all — durables that
+	// predate the branch_durables table or were left by a Capture that died
+	// before recording its row. Both reapers above are registry-driven and
+	// can't see those; left unbounded they pile up as ES shards until the
+	// single-node dev cluster can't recover. Skip while ANY finalize is in
+	// flight so the sweep can't race a Capture that hasn't recorded its row yet
+	// (it runs every tick — next one reclaims them).
+	if len(st.SnapshotInFlightFinalizes()) == 0 {
+		prepare.ReapUntrackedESDurables(ctx, cfg, st.Store, r.ID)
 	}
 	return nil
 }
@@ -236,7 +269,7 @@ func SyncWorktree(ctx context.Context, st *State, repoID int64, wtPath, mode str
 	head, err := gitcmd.String(ctx, wtPath, "symbolic-ref", "--quiet", "HEAD")
 	if err != nil {
 		emitSkip(ctx, st, repoID, wtPath, "", SyncSkipDetached, "detached HEAD or no branch")
-		return nil
+		return nil //nolint:nilerr // refusable precondition: not a sync candidate, not a failure
 	}
 	// Strip `refs/heads/` for the event payload below.
 	branch := strings.TrimSpace(strings.TrimPrefix(head, "refs/heads/"))
@@ -301,7 +334,7 @@ func advanceRebase(ctx context.Context, st *State, repoID int64, wtPath, branch 
 		if abortErr := gitcmd.Run(ctx, wtPath, "rebase", "--abort"); abortErr != nil {
 			slog.Error("auto_fetch rebase --abort failed; worktree may be half-rebased",
 				"wt", wtPath, "branch", branch, "abort_err", abortErr, "rebase_err", err)
-			_ = st.Store.WriteEvent(ctx, store.LevelError, "auto_fetch_rebase_abort_failed",
+			_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtFetchRebaseError,
 				abortErr.Error(), repoID, lookupWorktreeID(ctx, st, wtPath), "", 0,
 				map[string]string{"wt": wtPath, "branch": branch})
 		}
@@ -312,13 +345,13 @@ func advanceRebase(ctx context.Context, st *State, repoID int64, wtPath, branch 
 	return nil
 }
 
-// emitSkip writes an `auto_fetch_skipped` event and stamps the
+// emitSkip writes an `fetch:skip` event and stamps the
 // worktree's last-skip-reason on State so sync_status can surface it
 // without scanning the event log.
 func emitSkip(ctx context.Context, st *State, repoID int64, wtPath, branch, reason, detail string) {
 	slog.Debug("auto_fetch skip", "wt", wtPath, "branch", branch, "reason", reason)
 	st.RecordSyncSkip(wtPath, reason)
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "auto_fetch_skipped",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtFetchSkip,
 		detail, repoID, lookupWorktreeID(ctx, st, wtPath), "", 0, map[string]string{
 			"wt":     wtPath,
 			"branch": branch,
@@ -326,12 +359,12 @@ func emitSkip(ctx context.Context, st *State, repoID int64, wtPath, branch, reas
 		})
 }
 
-// emitAdvance writes an `auto_fetch_pulled` event and clears any
+// emitAdvance writes an `fetch:pull` event and clears any
 // previous skip marker for the worktree (the branch did advance).
 func emitAdvance(ctx context.Context, st *State, repoID int64, wtPath, branch, mode, detail string) {
 	slog.Info(detail, "wt", wtPath, "branch", branch, "mode", mode)
 	st.RecordSyncSkip(wtPath, "")
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "auto_fetch_pulled",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtFetchPull,
 		detail+" "+branch, repoID, lookupWorktreeID(ctx, st, wtPath), "", 0, map[string]string{
 			"wt":     wtPath,
 			"branch": branch,

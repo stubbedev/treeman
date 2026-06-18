@@ -3,14 +3,17 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/prepare"
@@ -18,6 +21,7 @@ import (
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/slug"
+	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/wtreg"
 )
@@ -26,118 +30,182 @@ import (
 // Reads never mutate state (no shell commands, no SQLite writes,
 // no file modifications) so they're always available.
 func registerReadTools(srv *mcpsdk.Server) {
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "doctor",
-		Description: "Run treeman health checks. Call this FIRST when investigating any \"why isn't treeman working\" question — covers daemon reachability, .treeman.yaml load, JSON schema install, migration framework detection, and registry/git worktree drift. Returns one result per check (status: ok|warn|fail|skip) plus a remediation hint.",
-		Annotations: readOnlyAnno("Treeman doctor", true),
-	}, doctorTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "config_get",
-		Description: "Read the .treeman.yaml for the current (or specified) repo. Pass resolved=true to see the post-substitution config treeman will actually execute against (env vars expanded, connection strings rendered). Use this before any config_write/config_set to know the current state.",
-		Annotations: readOnlyAnno("Get .treeman.yaml", false),
-	}, configGetTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "config_validate",
-		Description: "Parse and validate .treeman.yaml; report the first parse or validation error. Run this after every config_write to confirm the file still loads — config_write itself validates, but config_validate covers manual edits made outside MCP.",
-		Annotations: readOnlyAnno("Validate .treeman.yaml", false),
-	}, configValidateTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "config_schema",
-		Description: "Return the JSON Schema for .treeman.yaml, generated via reflection from config.Config. Use this to drive autocomplete or validate a proposed config body before calling config_write.",
-		Annotations: readOnlyAnno("Config JSON Schema", false),
-	}, configSchemaTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "worktree_list",
-		Description: "List active worktrees from the SQLite registry. Optionally filter by repo path. Use this to discover slugs, branches, and paths before calling worktree_show, worktree_delete, or scoping a logs_query.",
-		Annotations: readOnlyAnno("List worktrees", false),
-	}, worktreeListTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "worktree_show",
-		Description: "Show details for one worktree: slug, branch, path, created-at, allocated ports, branch_scoped active-namespace state (which branch's data occupies each), and the most recent finalize event. Use this to confirm a worktree exists and reached finalize before driving prepare_run or hook_run against it.",
-		Annotations: readOnlyAnno("Show worktree", false),
-	}, worktreeShowTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "branch_scoped_status",
-		Description: "Inspect a worktree's branch_scoped databases. For each: the active namespace (DB name / key prefix the app connects to), which branch's data currently occupies it, and which local git branches have a durable copy a swap could resume from. Connects each engine to probe the deterministic durable names. Use to answer \"what branches can I resume?\" or to debug why a swap re-seeded instead of resuming. No-op (empty) when no databases are branch_scoped.",
-		Annotations: readOnlyAnno("Branch-scoped status", true),
-	}, branchScopedStatusTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "logs_query",
-		Description: "Query the SQLite event log. The PRIMARY tool for diagnosing anything that happened in treeman — every prepare/finalize/teardown/hook/watcher action emits events. All filters are optional and AND-combined: levels, event_types, phases, since (10m|2h|RFC3339), payload_like, run_id (8-char correlation id stamped on every event from one flow). When watching a long-running prepare, prefer logs_wait over polling this.",
-		Annotations: readOnlyAnno("Query event log", false),
-	}, logsQueryTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "logs_hooks",
-		Description: "List the most recent hook_run rows for one worktree (resolved by slug, branch, or basename). Each row carries the hook command, exit code, and stdout/stderr tails. Pair with hook_log_read when a tail isn't enough.",
-		Annotations: readOnlyAnno("Hook run history", false),
-	}, logsHooksTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "fw_detect",
-		Description: "Detect migration and test frameworks for the current (or specified) repo. Call this BEFORE init_repo to know which scaffold template will be used. Returns the same data as `treeman fw detect --json`.",
-		Annotations: readOnlyAnno("Detect frameworks", true),
-	}, fwDetectTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "slug_compute",
-		Description: "Compute the slug treeman would derive for a worktree path. Call this before worktree_create to know which database/redis prefix/index suffix the new worktree will get.",
-		Annotations: readOnlyAnno("Compute slug", false),
-	}, slugComputeTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "daemon_status",
-		Description: "Probe the running treemand for version, PID, and watcher count. Returns status=running when the socket answers, status=not-running when it doesn't. Use this before any daemon-backed action (prepare_run, worktree_create) to confirm the daemon is alive.",
-		Annotations: readOnlyAnno("Daemon status", true),
-	}, daemonStatusTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "snapshots_list",
-		Description: "List cached snapshots (template DBs) for the current (or specified) repo. Use this BEFORE snapshots_purge to see what would be wiped. For per-snapshot drilldown, follow up with snapshot_inspect on each fingerprint.",
-		Annotations: readOnlyAnno("List snapshots", false),
-	}, snapshotsListTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "logs_wait",
-		Description: "Block until at least min_count new events match the supplied filter, or timeout_seconds elapses. Use this instead of polling logs_query when you're watching a long prepare/finalize/teardown to surface its outcome — pair with run_id to scope the wait to one flow's events. Returns the matching events; on timeout returns whatever arrived plus a timed_out=true flag.",
-		Annotations: readOnlyAnno("Wait for events", false),
-	}, logsWaitTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "branches_list",
-		Description: "List local + remote-only git branches for the current (or specified) repo, annotated with whether each branch occupies a live worktree. Call this before worktree_create to pick an unoccupied branch — the same data the CLI's `treeman branches` shows.",
-		Annotations: readOnlyAnno("List branches", true),
-	}, branchesListTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "config_diff",
-		Description: "Diff a proposed .treeman.yaml body against the current resolved config. Returns added/removed/changed paths so you can preview the effect of config_write before committing. Body is parsed and validated first; a parse error short-circuits the diff.",
-		Annotations: readOnlyAnno("Diff config", false),
-	}, configDiffTool)
-
-	mcpsdk.AddTool(srv, &mcpsdk.Tool{
-		Name:        "inputs_fingerprint",
-		Description: "Compute the current snapshot fingerprint for a worktree's databases — the per-input hash breakdown plus whether a matching cached snapshot exists. Use this to answer \"why did this prepare cold-build instead of cache-hit?\": compare the returned input_hashes against the cached_snapshot fields. Omit db_index to report on every database, or pass an integer index to scope. Set probe_engine=true to fetch the live engine version (otherwise the fingerprint won't match the cached one).",
-		Annotations: readOnlyAnno("Inspect input hashes", true),
-	}, inputsFingerprintTool)
-
+	registerCoreReadTools(srv)
+	registerWorktreeReadTools(srv)
+	registerLogsReadTools(srv)
+	registerDaemonReadTools(srv)
+	registerPlanningReadTools(srv)
 	registerEngineReadTools(srv)
 	registerSyncReadTools(srv)
 }
 
+// registerCoreReadTools binds the four "always-on" tools agents reach for
+// first: doctor + the three .treeman.yaml inspectors.
+func registerCoreReadTools(srv *mcpsdk.Server) {
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "doctor",
+		Description: "Run treeman health checks — daemon, .treeman.yaml load, JSON schema install, framework detection, registry/git drift. Call this first whenever something is wrong. Returns ok|warn|fail|skip per check + a remediation hint. Pass fix=true to auto-remediate the fixable checks (schema reinstall, registry repair) and re-probe.",
+		Annotations: writeAnno("Run treeman doctor", false, true, true),
+	}, doctorTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "config_locate",
+		Description: "List where every config treeman reads lives — the user-global config (~/.config/treeman/config.yaml), the repo .treeman.yaml, and the repo-local .treeman.local.yaml — with exists + bytes per file. Call this first when you need to know WHICH file to edit (global vs repo). The loader merges them global → repo → repo-local.",
+		Annotations: readOnlyAnno("Locate config files", false),
+	}, configLocateTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "config_get",
+		Description: "Read a config. scope=repo (default — the layered/resolved .treeman.yaml view) | global (~/.config/treeman/config.yaml alone). Always call before config_set/config_write/config_unset/config_diff. Pass resolved=true (repo scope only) for the post-substitution view (env vars + connection strings rendered) — credentials are redacted.",
+		Annotations: readOnlyAnno("Get config", false),
+	}, configGetTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "config_validate",
+		Description: "Confirm a config still parses + validates. scope=repo (default — layered .treeman.yaml) | global (~/.config/treeman/config.yaml standalone). Use after any manual edit (outside MCP) — config_write/config_set/config_unset already validate inline.",
+		Annotations: readOnlyAnno("Validate config", false),
+	}, configValidateTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "config_schema",
+		Description: "Get the JSON Schema for treeman config (reflected from config.Config). scope=repo (default, .treeman.yaml keys) | global (~/.config/treeman/config.yaml keys) | full. Repo and global accept different key subsets — daemon/snapshots/logs/status/notifications are global-only; databases/patches/hooks/main_worktree/env_sources are repo-only.",
+		Annotations: readOnlyAnno("Get config schema", false),
+	}, configSchemaTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "config_diff",
+		Description: "Preview the effect of a proposed config body — returns added/removed/changed dotted paths. scope=repo (default — diff against .treeman.yaml) | global (diff against ~/.config/treeman/config.yaml). Call before config_write. Parse errors short-circuit the diff.",
+		Annotations: readOnlyAnno("Diff config", false),
+	}, configDiffTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "config_history",
+		Description: "List stored generations of a config — every config_set/config_write/config_unset/config_delete/main-enable snapshots the prior content into SQLite (newest-first). scope=repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml). Returns {generation, created_at, bytes}. Pair with config_restore to roll back a bad edit.",
+		Annotations: readOnlyAnno("List config history", false),
+	}, configHistoryTool)
+}
+
+// registerWorktreeReadTools binds the worktree-introspection tools.
+func registerWorktreeReadTools(srv *mcpsdk.Server) {
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "worktree_list",
+		Description: "List active worktrees (slug, branch, path) from the registry. Use to discover slugs before worktree_show / worktree_delete / scoping logs_query. Capped at limit (default 200).",
+		Annotations: readOnlyAnno("List worktrees", false),
+	}, worktreeListTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "worktree_show",
+		Description: "Show the full dossier for one worktree: slug, branch, path, ports, branch_scoped active-namespace, recent events. Call before prepare_run/hook_run to confirm the worktree exists + reached finalize.",
+		Annotations: readOnlyAnno("Show worktree", false),
+	}, worktreeShowTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "branch_scoped_status",
+		Description: "Inspect every branch_scoped DB — active namespace, occupying branch, resumable durable copies. Use to answer \"which branches can I resume?\" and \"why did the swap re-seed?\". No-op when no DBs are branch_scoped.",
+		Annotations: readOnlyAnno("Inspect branch-scoped status", true),
+	}, branchScopedStatusTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "branches_list",
+		Description: "List local + origin-only branches, annotated with which already occupy a worktree. Call before worktree_create to pick an unoccupied branch. For the full create flow use the worktree-setup prompt. Capped at limit (default 200).",
+		Annotations: readOnlyAnno("List branches", true),
+	}, branchesListTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "slug_compute",
+		Description: "Preview the slug treeman will derive for a worktree path — which DB / redis prefix / index suffix the new worktree gets. Call before worktree_create.",
+		Annotations: readOnlyAnno("Compute slug", false),
+	}, slugComputeTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "fw_detect",
+		Description: "Detect migration + test frameworks in the repo. Call before init_repo to know which scaffold template will be used.",
+		Annotations: readOnlyAnno("Detect frameworks", true),
+	}, fwDetectTool)
+}
+
+// registerLogsReadTools binds the event-log tools.
+func registerLogsReadTools(srv *mcpsdk.Server) {
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "logs_query",
+		Description: "Query the SQLite event log — the PRIMARY diagnostic surface. Every prepare/finalize/teardown/hook/watcher emits events. Filters AND-combine: levels, event_types, phases, since (10m|2h|RFC3339), payload_like, run_id (8-char correlation id). To wait on a live flow use logs_wait; to debug an end-to-end prepare use the diagnose-prepare-failure prompt.",
+		Annotations: readOnlyAnno("Query event log", false),
+	}, logsQueryTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "logs_hooks",
+		Description: "List recent hook_run rows for one worktree — command, exit code, stdout/stderr tails. Pair with hook_log_read for full bodies.",
+		Annotations: readOnlyAnno("List hook runs", false),
+	}, logsHooksTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "logs_wait",
+		Description: "Block until min_count new events match the filter (or timeout). Use instead of polling logs_query when watching a long prepare/finalize — scope with run_id. Returns matched events; on timeout, whatever arrived + timed_out=true. For live streaming via MCP progress notifications, prefer logs_subscribe.",
+		Annotations: readOnlyAnno("Wait for events", false),
+	}, logsWaitTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "logs_subscribe",
+		Description: "Live-stream events as they arrive via MCP progress notifications. Prefers push mode (streaming RPC subscription to the daemon, zero polling); falls back to 500ms SQLite polling when the daemon is unreachable. Each matching event becomes a notifications/progress + notifications/message; the final return carries the collected batch + a mode field (push|poll). Same filter shape as logs_wait.",
+		Annotations: readOnlyAnno("Stream events live", false),
+	}, logsSubscribeTool)
+}
+
+// registerDaemonReadTools binds the daemon-probe tools.
+func registerDaemonReadTools(srv *mcpsdk.Server) {
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "daemon_status",
+		Description: "Check treemand: version, PID, watcher count. Returns status=running|not-running. Call before any daemon-backed action (prepare_run, worktree_create). If not-running, follow with daemon_control(action=\"start\"). For the rich runtime view (in-flight prepares, queued teardowns, backoff timers), use daemon_state.",
+		Annotations: readOnlyAnno("Check daemon status", true),
+	}, daemonStatusTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "daemon_state",
+		Description: "Inspect treemand's runtime state — currently-running finalize/teardown goroutines (with age), watcher set (repo + per-worktree + lifecycle), per-repo sync backoff timers, last-skip reasons. Use to answer \"is the daemon already busy with this worktree?\" without scanning logs.",
+		Annotations: readOnlyAnno("Inspect daemon state", true),
+	}, daemonStateTool)
+}
+
+// registerPlanningReadTools binds the snapshot + fingerprint + prepare-plan
+// tools — the agent's view of "what would prepare do, what's cached".
+func registerPlanningReadTools(srv *mcpsdk.Server) {
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "snapshots_list",
+		Description: "List cached snapshots (template DBs) for the repo. Call before snapshots_purge to preview what will be wiped, or before snapshots_inspect for drilldown. For orphan-only sweeps use the cache-cleanup prompt. Capped at limit (default 100).",
+		Annotations: readOnlyAnno("List snapshots", false),
+	}, snapshotsListTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "inputs_fingerprint",
+		Description: "Compute the per-database input-hash breakdown + check whether a matching snapshot exists. Use to answer \"why did prepare cold-build instead of cache-hit?\". Pair with snapshots_inspect on the expected fingerprint. Set probe_engine=true for a cache-comparable engine_version (slower).",
+		Annotations: readOnlyAnno("Inspect input hashes", true),
+	}, inputsFingerprintTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "prepare_dry_run",
+		Description: "Render the prepare pipeline plan for a worktree WITHOUT executing — per-database: rendered source-db name, dump files that would be loaded, migrate + seed commands (with env), fanout count, expected fingerprint. No engine I/O. Use to reason about the pipeline before invoking prepare_run, or to debug why a step ran what it did.",
+		Annotations: readOnlyAnno("Plan prepare pipeline", false),
+	}, prepareDryRunTool)
+
+	addTool(srv, &mcpsdk.Tool{
+		Name:        "prompts_list",
+		Description: "List every MCP prompt treeman registers — name, title, description, arguments, and a when-to-use trigger phrase. Use when the client doesn't surface MCP prompts prominently and you want to discover the canned multi-step workflows (diagnose-prepare-failure, worktree-setup, bootstrap-new-repo, …) without invoking each one.",
+		Annotations: readOnlyAnno("List prompts", false),
+	}, promptsListTool)
+}
+
 // ─── doctor ───────────────────────────────────────────────────────
 
-type doctorIn struct{}
-type doctorOut struct {
-	Results []doctorResult `json:"results"`
-}
+type (
+	doctorIn struct {
+		Fix bool `json:"fix,omitempty" jsonschema:"auto-apply remediations for the fixable checks (schema → schema_install, registry → registry_repair), then re-probe so the returned status reflects the post-fix state"`
+	}
+	doctorOut struct {
+		Results []doctorResult `json:"results"`
+		Fixed   bool           `json:"fixed,omitempty"`
+	}
+)
+
 type doctorResult struct {
 	Name   string `json:"name"`
 	Status string `json:"status"` // ok|warn|fail|skip
@@ -145,8 +213,72 @@ type doctorResult struct {
 	Hint   string `json:"hint,omitempty"`
 }
 
-func doctorTool(ctx context.Context, _ *mcpsdk.CallToolRequest, _ doctorIn) (*mcpsdk.CallToolResult, doctorOut, error) {
-	return nil, doctorOut{Results: runDoctorChecks(ctx)}, nil
+func doctorTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in doctorIn) (*mcpsdk.CallToolResult, doctorOut, error) {
+	results := runDoctorChecks(ctx)
+	if in.Fix {
+		results = applyDoctorFixes(ctx, results)
+		return nil, doctorOut{Results: results, Fixed: true}, nil
+	}
+	return nil, doctorOut{Results: results}, nil
+}
+
+// applyDoctorFixes remediates the auto-fixable warn/fail checks (schema
+// → reinstall, registry → repair) and re-probes each so the returned
+// status reflects the post-fix state. Mirrors the CLI's `doctor --fix`.
+func applyDoctorFixes(ctx context.Context, results []doctorResult) []doctorResult {
+	repoRoot, _ := resolveRepo("")
+	if repoRoot == "" {
+		return results
+	}
+	for i, r := range results {
+		if r.Status == "ok" || r.Status == "skip" {
+			continue
+		}
+		switch r.Name {
+		case "schema":
+			if _, _, err := schema.Install(repoRoot, schema.TargetRepo); err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			results[i] = checkSchema(repoRoot)
+		case "registry":
+			st, err := openStore(ctx)
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			_, err = wtreg.Repair(ctx, st, repoRoot, detectBranch)
+			_ = st.Close()
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			results[i] = checkRegistry(ctx, repoRoot)
+		case "snapshots":
+			cfg, err := resolve.LoadResolved(repoRoot)
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			st, err := openStore(ctx)
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			orphans, ferr := snapshot.FindOrphans(ctx, &cfg, st)
+			_ = st.Close()
+			if ferr != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", ferr)
+				continue
+			}
+			if _, errs := snapshot.DropOrphans(ctx, &cfg, orphans); len(errs) > 0 {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", errors.Join(errs...))
+				continue
+			}
+			results[i] = checkSnapshots(ctx, repoRoot)
+		}
+	}
+	return results
 }
 
 func runDoctorChecks(ctx context.Context) []doctorResult {
@@ -160,8 +292,69 @@ func runDoctorChecks(ctx context.Context) []doctorResult {
 		checkSchema(repoRoot),
 		checkFrameworks(repoRoot),
 		checkRegistry(ctx, repoRoot),
+		checkSnapshots(ctx, repoRoot),
 	)
 	return out
+}
+
+// checkSnapshots mirrors the CLI doctor's snapshots probe: cache row
+// count vs cap, recorded size, spare-pool count, and ORPHAN templates
+// (engine-side `_tm_*` namespaces with no snapshots row — stranded by
+// a crash between SnapshotCreate and RecordSnapshot; doctor --fix /
+// fix=true reclaims them).
+func checkSnapshots(ctx context.Context, repoRoot string) doctorResult {
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return doctorResult{Name: "snapshots", Status: "skip", Detail: "config not loadable: " + err.Error()}
+	}
+	if len(cfg.Databases) == 0 {
+		return doctorResult{Name: "snapshots", Status: "skip", Detail: "no databases configured"}
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return doctorResult{Name: "snapshots", Status: "fail", Detail: err.Error()}
+	}
+	defer func() { _ = st.Close() }()
+
+	var rowCount int
+	if repoID, rerr := st.LookupRepoID(ctx, repoRoot); rerr == nil {
+		if rows, lerr := st.ListSnapshotsForRepo(ctx, repoID); lerr == nil {
+			rowCount = len(rows)
+		}
+	}
+	totalBytes, _ := st.SumSnapshotBytes(ctx)
+	detail := fmt.Sprintf("%d cached template(s) (cap %d), %.1f MiB recorded across repos",
+		rowCount, cfg.Snapshots.CapPerRepo, float64(totalBytes)/(1<<20))
+	if counts, serr := snapshot.SpareCounts(ctx, &cfg); serr == nil && len(counts) > 0 {
+		total := 0
+		for _, n := range counts {
+			total += n
+		}
+		detail += fmt.Sprintf(", %d pre-warmed spare(s) across %d template(s)", total, len(counts))
+	}
+
+	orphans, oerr := snapshot.FindOrphans(ctx, &cfg, st)
+	if oerr != nil {
+		return doctorResult{
+			Name:   "snapshots",
+			Status: "warn",
+			Detail: detail + " — orphan probe incomplete: " + oerr.Error(),
+			Hint:   "an engine was unreachable; start it and re-run doctor",
+		}
+	}
+	if len(orphans) > 0 {
+		names := make([]string, 0, len(orphans))
+		for _, o := range orphans {
+			names = append(names, fmt.Sprintf("%s:%s", o.Family, o.Name))
+		}
+		return doctorResult{
+			Name:   "snapshots",
+			Status: "warn",
+			Detail: fmt.Sprintf("%s; %d ORPHAN template(s) holding disk: %s", detail, len(orphans), strings.Join(names, ", ")),
+			Hint:   "reclaim with doctor fix=true",
+		}
+	}
+	return doctorResult{Name: "snapshots", Status: "ok", Detail: detail}
 }
 
 func checkDaemon(ctx context.Context) doctorResult {
@@ -172,7 +365,11 @@ func checkDaemon(ctx context.Context) doctorResult {
 	if resp.Kind == rpc.KindError {
 		return doctorResult{Name: "daemon", Status: "fail", Detail: resp.Message}
 	}
-	return doctorResult{Name: "daemon", Status: "ok", Detail: fmt.Sprintf("treemand %s pid=%d watchers=%d", resp.DaemonVersion, resp.Pid, resp.WatcherCount)}
+	return doctorResult{
+		Name:   "daemon",
+		Status: "ok",
+		Detail: fmt.Sprintf("treemand %s pid=%d watchers=%d", resp.DaemonVersion, resp.Pid, resp.WatcherCount),
+	}
 }
 
 func checkConfig(repoRoot string) doctorResult {
@@ -191,11 +388,11 @@ func checkSchema(repoRoot string) doctorResult {
 	ref := schema.ReadModeline(repoRoot)
 	modelineDetail := ""
 	if ref != "" {
-		if ok, detail := schema.ProbeRef(repoRoot, ref); ok {
+		ok, detail := schema.ProbeRef(repoRoot, ref)
+		if ok {
 			return doctorResult{Name: "schema", Status: "ok", Detail: "modeline → " + detail}
-		} else {
-			modelineDetail = detail
 		}
+		modelineDetail = detail
 	}
 
 	if gp, err := schema.GlobalPath(); err == nil {
@@ -214,7 +411,8 @@ func checkSchema(repoRoot string) doctorResult {
 }
 
 func checkFrameworks(repoRoot string) doctorResult {
-	detected := framework.DefaultRegistry().DetectAll(repoRoot)
+	cfg, _ := resolve.LoadResolved(repoRoot)
+	detected := framework.RegistryFor(&cfg).DetectAll(repoRoot)
 	if len(detected) == 0 {
 		return doctorResult{Name: "framework", Status: "warn", Detail: "no migration framework detected"}
 	}
@@ -234,19 +432,22 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 	if err != nil {
 		return doctorResult{Name: "registry", Status: "fail", Detail: err.Error()}
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `SELECT w.path FROM worktrees w
 		JOIN repos r ON r.id = w.repo_id WHERE r.path = ? AND w.deleted_at IS NULL`, repoRoot)
 	if err != nil {
 		return doctorResult{Name: "registry", Status: "fail", Detail: err.Error()}
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	dbPaths := map[string]bool{}
 	for rows.Next() {
 		var p string
 		if rows.Scan(&p) == nil {
 			dbPaths[p] = true
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return doctorResult{Name: "registry", Status: "fail", Detail: err.Error()}
 	}
 	gitSet := map[string]bool{}
 	var onlyInGit, onlyInDB []string
@@ -281,8 +482,9 @@ func gitWorktreePaths(ctx context.Context, repoRoot string) ([]string, error) {
 // ─── config_get / validate / schema ───────────────────────────────
 
 type configGetIn struct {
-	Repo     string `json:"repo,omitempty" jsonschema:"repo root override (defaults to cwd)"`
-	Resolved bool   `json:"resolved,omitempty" jsonschema:"include resolved connection strings"`
+	Repo     string `json:"repo,omitempty"     jsonschema:"repo root override (defaults to cwd)"`
+	Resolved bool   `json:"resolved,omitempty" jsonschema:"include resolved connection strings (repo scope only)"`
+	Scope    string `json:"scope,omitempty"    jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml)"`
 }
 
 // configGetTool returns the loaded config as a map so the SDK's
@@ -295,6 +497,23 @@ type configGetIn struct {
 // value pairs are scrubbed. LLM clients see structure + which
 // secrets exist, never the literal values.
 func configGetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configGetIn) (*mcpsdk.CallToolResult, map[string]any, error) {
+	// Global scope reads the user-global config alone (no repo/env-file
+	// overlay) — `resolved` and connection-string substitution are
+	// repo-only and silently ignored here.
+	if strings.EqualFold(in.Scope, "global") {
+		path, ok := config.GlobalConfigPath()
+		if !ok {
+			return nil, nil, errors.New("cannot resolve global config path (no home dir)")
+		}
+		cfg, err := config.LoadGlobal()
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, redactMap(map[string]any{"scope": "global", "path": path, "config": cfg}), nil
+	}
+	if in.Scope != "" && !strings.EqualFold(in.Scope, "repo") {
+		return nil, nil, fmt.Errorf("invalid scope %q (want repo|global)", in.Scope)
+	}
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		return nil, nil, err
@@ -303,7 +522,7 @@ func configGetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configGetIn)
 	if err != nil {
 		return nil, nil, err
 	}
-	out := map[string]any{"repo": repoRoot, "config": cfg}
+	out := map[string]any{"scope": "repo", "repo": repoRoot, "config": cfg}
 	if in.Resolved {
 		out["resolved"] = resolve.Resolve(&cfg, repoRoot)
 	}
@@ -327,35 +546,125 @@ func redactMap(m map[string]any) map[string]any {
 	return out
 }
 
+type configHistoryIn struct {
+	Repo  string `json:"repo,omitempty"  jsonschema:"repo root override (defaults to cwd)"`
+	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml) | global (~/.config/treeman/config.yaml)"`
+}
+type configGenerationOut struct {
+	Generation int64  `json:"generation"`
+	CreatedAt  string `json:"created_at"`
+	Bytes      int    `json:"bytes"`
+}
+type configHistoryOut struct {
+	Repo        string                `json:"repo"`
+	Path        string                `json:"path"`
+	Generations []configGenerationOut `json:"generations"`
+}
+
+func configHistoryTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in configHistoryIn,
+) (*mcpsdk.CallToolResult, configHistoryOut, error) {
+	p, histRoot, _, err := resolveConfigTarget(in.Scope, in.Repo)
+	if err != nil {
+		return nil, configHistoryOut{}, err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, configHistoryOut{}, err
+	}
+	defer func() { _ = st.Close() }()
+	gens, err := st.ListConfigGenerations(ctx, histRoot, p)
+	if err != nil {
+		return nil, configHistoryOut{}, err
+	}
+	out := configHistoryOut{Repo: histRoot, Path: p, Generations: make([]configGenerationOut, 0, len(gens))}
+	for _, g := range gens {
+		out.Generations = append(out.Generations, configGenerationOut{
+			Generation: g.Generation,
+			CreatedAt:  time.UnixMilli(g.CreatedAt).UTC().Format(time.RFC3339),
+			Bytes:      len(g.Content),
+		})
+	}
+	return nil, out, nil
+}
+
 type configValidateIn struct {
-	Repo string `json:"repo,omitempty"`
+	Repo  string `json:"repo,omitempty"`
+	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml, layered) | global (~/.config/treeman/config.yaml alone)"`
 }
 type configValidateOut struct {
 	OK        bool   `json:"ok"`
+	Scope     string `json:"scope,omitempty"`
 	Repo      string `json:"repo,omitempty"`
+	Path      string `json:"path,omitempty"`
 	Databases int    `json:"databases,omitempty"`
 	Error     string `json:"error,omitempty"`
 }
 
-func configValidateTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configValidateIn) (*mcpsdk.CallToolResult, configValidateOut, error) {
+func configValidateTool(
+	_ context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in configValidateIn,
+) (*mcpsdk.CallToolResult, configValidateOut, error) {
+	// Global scope validates the user-global file standalone: load it
+	// (scope-checks repo-only keys), then run cross-field Validate.
+	if strings.EqualFold(in.Scope, "global") {
+		path, _ := config.GlobalConfigPath()
+		cfg, err := config.LoadGlobal()
+		if err == nil {
+			err = cfg.Validate()
+		}
+		if err != nil {
+			//nolint:nilerr // validation failure is tool output, not a transport error
+			return nil, configValidateOut{
+				OK:    false,
+				Scope: "global",
+				Path:  path,
+				Error: err.Error(),
+			}, nil
+		}
+		return nil, configValidateOut{OK: true, Scope: "global", Path: path}, nil
+	}
+	if in.Scope != "" && !strings.EqualFold(in.Scope, "repo") {
+		return nil, configValidateOut{OK: false, Error: fmt.Sprintf("invalid scope %q (want repo|global)", in.Scope)}, nil
+	}
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
-		return nil, configValidateOut{OK: false, Error: err.Error()}, nil
+		out := configValidateOut{OK: false, Error: err.Error()}
+		return nil, out, nil //nolint:nilerr // validation failure is tool output, not a transport error
 	}
 	cfg, err := resolve.LoadResolved(repoRoot)
 	if err != nil {
-		return nil, configValidateOut{OK: false, Repo: repoRoot, Error: err.Error()}, nil
+		out := configValidateOut{OK: false, Scope: "repo", Repo: repoRoot, Error: err.Error()}
+		return nil, out, nil //nolint:nilerr // validation failure is tool output, not a transport error
 	}
-	return nil, configValidateOut{OK: true, Repo: repoRoot, Databases: len(cfg.Databases)}, nil
+	return nil, configValidateOut{OK: true, Scope: "repo", Repo: repoRoot, Databases: len(cfg.Databases)}, nil
 }
 
-type configSchemaIn struct{}
+type configSchemaIn struct {
+	Scope string `json:"scope,omitempty" jsonschema:"repo (default — .treeman.yaml keys) | global (~/.config/treeman/config.yaml keys) | full (every key). Repo and global accept different key subsets."`
+}
 
 // configSchemaTool returns the JSON Schema as a map[string]any so
 // the SDK serialises it as a nested object instead of the byte-array
-// shape that json.RawMessage produces by default.
-func configSchemaTool(_ context.Context, _ *mcpsdk.CallToolRequest, _ configSchemaIn) (*mcpsdk.CallToolResult, map[string]any, error) {
-	b, err := schema.Render()
+// shape that json.RawMessage produces by default. Defaults to the
+// repo-scoped schema — the one that validates `.treeman.yaml`, which is
+// what an agent pre-validating a repo config body wants.
+func configSchemaTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSchemaIn) (*mcpsdk.CallToolResult, map[string]any, error) {
+	var sc schema.Scope
+	switch strings.ToLower(in.Scope) {
+	case "", "repo":
+		sc = schema.ScopeRepo
+	case "global":
+		sc = schema.ScopeGlobal
+	case "full":
+		sc = schema.ScopeFull
+	default:
+		return nil, nil, fmt.Errorf("invalid scope %q (want repo|global|full)", in.Scope)
+	}
+	b, err := schema.RenderScoped(sc)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -363,13 +672,14 @@ func configSchemaTool(_ context.Context, _ *mcpsdk.CallToolRequest, _ configSche
 	if err := json.Unmarshal(b, &out); err != nil {
 		return nil, nil, err
 	}
-	return nil, map[string]any{"schema": out}, nil
+	return nil, map[string]any{"schema": out, "scope": string(sc)}, nil
 }
 
 // ─── worktree_list / show ─────────────────────────────────────────
 
 type worktreeListIn struct {
-	Repo string `json:"repo,omitempty"`
+	Repo  string `json:"repo,omitempty"`
+	Limit int    `json:"limit,omitempty" jsonschema:"max rows returned (default 200, max 1000)"`
 }
 type worktreeRow struct {
 	ID        int64  `json:"id"`
@@ -388,7 +698,7 @@ func worktreeListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 	if err != nil {
 		return nil, worktreeListOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	q := `SELECT w.id, r.path, w.path, w.slug, COALESCE(w.branch,''), w.created_at
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
 		WHERE w.deleted_at IS NULL`
@@ -401,12 +711,20 @@ func worktreeListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 		q += " AND r.path = ?"
 		args = append(args, repo)
 	}
-	q += " ORDER BY w.id"
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	q += " ORDER BY w.id LIMIT ?"
+	args = append(args, limit)
 	rows, err := st.DB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, worktreeListOut{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []worktreeRow
 	for rows.Next() {
 		var w worktreeRow
@@ -429,7 +747,7 @@ type worktreeShowOut struct {
 	// and which branch's data currently occupies it — the swap state an
 	// agent needs to reason about resume/seed behaviour.
 	BranchScoped []store.ActiveBranchRow `json:"branch_scoped,omitempty"`
-	Recent       []store.Event           `json:"recent_events"`
+	Recent       []store.EventJSON       `json:"recent_events"`
 }
 
 func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktreeShowIn) (*mcpsdk.CallToolResult, worktreeShowOut, error) {
@@ -437,7 +755,7 @@ func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 	if err != nil {
 		return nil, worktreeShowOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	var w worktreeRow
 	var id int64
@@ -475,7 +793,7 @@ func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 	if err != nil {
 		return nil, worktreeShowOut{}, err
 	}
-	return nil, worktreeShowOut{Worktree: w, Ports: ports, BranchScoped: branchScoped, Recent: events}, nil
+	return nil, worktreeShowOut{Worktree: w, Ports: ports, BranchScoped: branchScoped, Recent: store.EventsJSON(events)}, nil
 }
 
 // ─── branch_scoped_status ─────────────────────────────────────────
@@ -488,7 +806,11 @@ type branchScopedStatusOut struct {
 	Databases []prepare.BranchScopedDB `json:"databases"`
 }
 
-func branchScopedStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in branchScopedStatusIn) (*mcpsdk.CallToolResult, branchScopedStatusOut, error) {
+func branchScopedStatusTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in branchScopedStatusIn,
+) (*mcpsdk.CallToolResult, branchScopedStatusOut, error) {
 	dbs, err := runBranchScopedStatus(ctx, in.Worktree, in.Repo)
 	if err != nil {
 		return nil, branchScopedStatusOut{}, err
@@ -523,7 +845,9 @@ func worktreeRowFromCwd(ctx context.Context, st *store.Store) (worktreeRow, erro
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return worktreeRow{}, fmt.Errorf("not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)")
+			return worktreeRow{}, errors.New(
+				"not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)",
+			)
 		}
 		dir = parent
 	}
@@ -533,26 +857,81 @@ func worktreeRowFromCwd(ctx context.Context, st *store.Store) (worktreeRow, erro
 
 type logsQueryIn struct {
 	Repo        string   `json:"repo,omitempty"`
-	Worktree    string   `json:"worktree,omitempty" jsonschema:"slug, branch, or basename"`
-	Levels      []string `json:"levels,omitempty" jsonschema:"any of debug|info|warn|error"`
+	Worktree    string   `json:"worktree,omitempty"     jsonschema:"slug, branch, or basename"`
+	Levels      []string `json:"levels,omitempty"       jsonschema:"any of debug|info|warn|error"`
 	EventTypes  []string `json:"event_types,omitempty"`
 	Phases      []string `json:"phases,omitempty"`
-	Since       string   `json:"since,omitempty" jsonschema:"duration (10m, 2h) or RFC3339"`
-	PayloadLike string   `json:"payload_like,omitempty"`
-	RunID       string   `json:"run_id,omitempty" jsonschema:"exact correlation id (8-char hex stamped on every event from one prepare/finalize/teardown/watcher flow)"`
-	Limit       int      `json:"limit,omitempty" jsonschema:"default 50, max 1000"`
+	Since       string   `json:"since,omitempty"        jsonschema:"duration (10m, 2h) or RFC3339"`
+	PayloadLike string   `json:"payload_like,omitempty" jsonschema:"SQL LIKE substring against the payload JSON (DB-side, fast)"`
+	Regex       string   `json:"regex,omitempty"        jsonschema:"RE2 regex matched (in-process) against each event's message AND payload — use for patterns SQL LIKE can't express. Scans a window of up to 5000 recent matches of the other filters, then caps to limit."`
+	RunID       string   `json:"run_id,omitempty"       jsonschema:"exact correlation id (8-char hex stamped on every event from one prepare/finalize/teardown/watcher flow)"`
+	Limit       int      `json:"limit,omitempty"        jsonschema:"default 50, max 1000"`
 }
 type logsQueryOut struct {
-	Events []store.Event `json:"events"`
+	Events []store.EventJSON `json:"events"`
+}
+
+func clampLogLimit(limit int) int {
+	if limit <= 0 {
+		return 50
+	}
+	if limit > 1000 {
+		return 1000
+	}
+	return limit
+}
+
+// applyLogRepoScope resolves in.Repo/in.Worktree into RepoID/WorktreeID on f.
+func applyLogRepoScope(ctx context.Context, st *store.Store, in logsQueryIn, f *store.EventFilter) error {
+	if in.Repo == "" && in.Worktree == "" {
+		return nil
+	}
+	repoRoot, err := resolveRepo(in.Repo)
+	if err == nil && repoRoot != "" {
+		if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
+			f.RepoID = rid
+		}
+	}
+	if in.Worktree != "" {
+		wid, _ := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
+		if wid == 0 {
+			return fmt.Errorf("no worktree matches %q", in.Worktree)
+		}
+		f.WorktreeID = wid
+	}
+	return nil
+}
+
+// filterEventsByRegex keeps events whose message or payload matches re,
+// capping the result at limit.
+func filterEventsByRegex(events []store.Event, re *regexp.Regexp, limit int) []store.Event {
+	filtered := events[:0]
+	for _, e := range events {
+		if re.MatchString(e.Message) || re.MatchString(e.PayloadJSON) {
+			filtered = append(filtered, e)
+			if len(filtered) >= limit {
+				break
+			}
+		}
+	}
+	return filtered
 }
 
 func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryIn) (*mcpsdk.CallToolResult, logsQueryOut, error) {
-	limit := in.Limit
-	if limit <= 0 {
-		limit = 50
+	limit := clampLogLimit(in.Limit)
+	var re *regexp.Regexp
+	if in.Regex != "" {
+		var err error
+		re, err = regexp.Compile(in.Regex)
+		if err != nil {
+			return nil, logsQueryOut{}, fmt.Errorf("invalid regex: %w", err)
+		}
 	}
-	if limit > 1000 {
-		limit = 1000
+	// With a regex we scan a wider window DB-side (regex can't push down
+	// to SQL), filter in-process, then cap to the requested limit.
+	fetchLimit := limit
+	if re != nil {
+		fetchLimit = 5000
 	}
 	f := store.EventFilter{
 		Levels:      validateLevels(in.Levels),
@@ -561,7 +940,7 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 		PayloadLike: in.PayloadLike,
 		RunID:       in.RunID,
 		HydrateWT:   true,
-		Limit:       limit,
+		Limit:       fetchLimit,
 	}
 	if in.Since != "" {
 		t, err := parseSince(in.Since)
@@ -574,31 +953,22 @@ func logsQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsQueryI
 	if err != nil {
 		return nil, logsQueryOut{}, err
 	}
-	defer st.Close()
-	if in.Repo != "" || in.Worktree != "" {
-		repoRoot, err := resolveRepo(in.Repo)
-		if err == nil && repoRoot != "" {
-			if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
-				f.RepoID = rid
-			}
-		}
-		if in.Worktree != "" {
-			wid, _ := st.LookupWorktreeID(ctx, f.RepoID, in.Worktree)
-			if wid == 0 {
-				return nil, logsQueryOut{}, fmt.Errorf("no worktree matches %q", in.Worktree)
-			}
-			f.WorktreeID = wid
-		}
+	defer func() { _ = st.Close() }()
+	if err := applyLogRepoScope(ctx, st, in, &f); err != nil {
+		return nil, logsQueryOut{}, err
 	}
 	events, err := st.QueryEvents(ctx, f)
 	if err != nil {
 		return nil, logsQueryOut{}, err
 	}
+	if re != nil {
+		events = filterEventsByRegex(events, re, limit)
+	}
 	for i := range events {
 		events[i].Message = redactSecrets(events[i].Message)
 		events[i].PayloadJSON = redactSecrets(events[i].PayloadJSON)
 	}
-	return nil, logsQueryOut{Events: events}, nil
+	return nil, logsQueryOut{Events: store.EventsJSON(events)}, nil
 }
 
 func validateLevels(in []string) []string {
@@ -637,18 +1007,45 @@ func lookupRepoID(ctx context.Context, st *store.Store, root string) (int64, err
 	return id, nil
 }
 
+// applyRepoWorktreeFilter resolves the optional repo/worktree scope onto
+// an EventFilter. A resolvable repo sets RepoID (lookup failures are
+// ignored — an unmatched repo simply leaves the filter unscoped); a
+// non-empty worktree must resolve or the call errors so a typo never
+// silently widens the query.
+func applyRepoWorktreeFilter(ctx context.Context, st *store.Store, f *store.EventFilter, repo, worktree string) error {
+	if repo == "" && worktree == "" {
+		return nil
+	}
+	if repoRoot, err := resolveRepo(repo); err == nil && repoRoot != "" {
+		if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil && rid > 0 {
+			f.RepoID = rid
+		}
+	}
+	if worktree != "" {
+		wid, err := st.LookupWorktreeID(ctx, f.RepoID, worktree)
+		if err != nil {
+			return err
+		}
+		if wid == 0 {
+			return fmt.Errorf("no worktree matches %q", worktree)
+		}
+		f.WorktreeID = wid
+	}
+	return nil
+}
+
 type logsHooksIn struct {
 	Repo     string `json:"repo,omitempty"`
-	Worktree string `json:"worktree" jsonschema:"slug, branch, or basename"`
+	Worktree string `json:"worktree"        jsonschema:"slug, branch, or basename"`
 	Limit    int    `json:"limit,omitempty" jsonschema:"default 50"`
 }
 type logsHooksOut struct {
-	Runs []store.HookRun `json:"runs"`
+	Runs []store.HookRunJSON `json:"runs"`
 }
 
 func logsHooksTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsHooksIn) (*mcpsdk.CallToolResult, logsHooksOut, error) {
 	if in.Worktree == "" {
-		return nil, logsHooksOut{}, fmt.Errorf("worktree is required")
+		return nil, logsHooksOut{}, errors.New("worktree is required")
 	}
 	limit := in.Limit
 	if limit <= 0 {
@@ -658,7 +1055,7 @@ func logsHooksTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsHooksI
 	if err != nil {
 		return nil, logsHooksOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoRoot, err := resolveRepo(in.Repo)
 	if err != nil {
 		return nil, logsHooksOut{}, err
@@ -679,7 +1076,7 @@ func logsHooksTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsHooksI
 		runs[i].StdoutTail = redactSecrets(runs[i].StdoutTail)
 		runs[i].StderrTail = redactSecrets(runs[i].StderrTail)
 	}
-	return nil, logsHooksOut{Runs: runs}, nil
+	return nil, logsHooksOut{Runs: store.HookRunsJSON(runs)}, nil
 }
 
 // ─── fw_detect / slug_compute / daemon_status ─────────────────────
@@ -731,48 +1128,88 @@ func slugComputeTool(_ context.Context, _ *mcpsdk.CallToolRequest, in slugComput
 	}, nil
 }
 
-type daemonStatusIn struct{}
-type daemonStatusOut struct {
-	Status   string `json:"status"`
-	Version  string `json:"version,omitempty"`
-	PID      int    `json:"pid,omitempty"`
-	Watchers int    `json:"watchers,omitempty"`
-	Error    string `json:"error,omitempty"`
-}
+type (
+	daemonStatusIn  struct{}
+	daemonStatusOut struct {
+		Status   string `json:"status"`
+		Version  string `json:"version,omitempty"`
+		PID      int    `json:"pid,omitempty"`
+		Watchers int    `json:"watchers,omitempty"`
+		Error    string `json:"error,omitempty"`
+	}
+)
 
 // ─── snapshots_list ───────────────────────────────────────────────
 
 type snapshotsListIn struct {
-	Repo string `json:"repo,omitempty"`
+	Repo  string `json:"repo,omitempty"`
+	Limit int    `json:"limit,omitempty" jsonschema:"max rows returned (default 100, max 500)"`
 }
 type snapshotsListRow struct {
 	Fingerprint  string `json:"fingerprint"`
 	Engine       string `json:"engine"`
 	TemplateName string `json:"template_name"`
 	SourceDB     string `json:"source_db"`
+	// Spares is the engine-side pre-warmed spare count for this
+	// template (databases[].prewarm). Spares carry no SQLite row, so
+	// this is the only programmatic surface that exposes the pool.
+	Spares int `json:"spares,omitempty"`
 }
 type snapshotsListOut struct {
 	Repo      string             `json:"repo"`
 	Snapshots []snapshotsListRow `json:"snapshots"`
 }
 
-func snapshotsListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapshotsListIn) (*mcpsdk.CallToolResult, snapshotsListOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+func snapshotsListTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in snapshotsListIn,
+) (*mcpsdk.CallToolResult, snapshotsListOut, error) {
+	out, err := collectRepoSnapshots(ctx, in.Repo, in.Limit)
 	if err != nil {
 		return nil, snapshotsListOut{}, err
+	}
+	return nil, out, nil
+}
+
+// collectRepoSnapshots is the shared implementation for the
+// snapshots_list tool and the treeman://repos/{repo}/snapshots
+// resource. limit≤0 → default 100, capped at 500.
+func collectRepoSnapshots(ctx context.Context, repo string, limit int) (snapshotsListOut, error) {
+	repoRoot, err := resolveRepo(repo)
+	if err != nil {
+		return snapshotsListOut{}, err
 	}
 	st, err := openStore(ctx)
 	if err != nil {
-		return nil, snapshotsListOut{}, err
+		return snapshotsListOut{}, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := lookupRepoID(ctx, st, repoRoot)
 	if err != nil {
-		return nil, snapshotsListOut{Repo: repoRoot}, nil
+		// Unknown repo → empty list, not an error.
+		return snapshotsListOut{Repo: repoRoot}, nil
 	}
 	cands, err := st.ListSnapshotsForRepo(ctx, repoID)
 	if err != nil {
-		return nil, snapshotsListOut{}, err
+		return snapshotsListOut{}, err
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	if len(cands) > limit {
+		cands = cands[:limit]
+	}
+	// Best-effort spare-pool counts: an unreachable engine just leaves
+	// the field zero.
+	spares := map[string]int{}
+	if cfg, lerr := resolve.LoadResolved(repoRoot); lerr == nil {
+		if sc, serr := snapshot.SpareCounts(ctx, &cfg); serr == nil {
+			spares = sc
+		}
 	}
 	rows := make([]snapshotsListRow, 0, len(cands))
 	for _, c := range cands {
@@ -781,15 +1218,47 @@ func snapshotsListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in snapsh
 			Engine:       c.Engine,
 			TemplateName: c.TemplateName,
 			SourceDB:     c.SourceDB,
+			Spares:       spares[c.TemplateName],
 		})
 	}
-	return nil, snapshotsListOut{Repo: repoRoot, Snapshots: rows}, nil
+	return snapshotsListOut{Repo: repoRoot, Snapshots: rows}, nil
+}
+
+// daemonStateIn — no inputs; the snapshot is always whole-daemon.
+type daemonStateIn struct{}
+
+// daemonStateOut wraps the RPC payload so JSON shape stays stable when
+// the rpc package adds fields later.
+type daemonStateOut struct {
+	Status string                   `json:"status"          jsonschema:"running|not-running"`
+	State  *rpc.DaemonStateSnapshot `json:"state,omitempty"`
+	Error  string                   `json:"error,omitempty"`
+}
+
+func daemonStateTool(ctx context.Context, _ *mcpsdk.CallToolRequest, _ daemonStateIn) (*mcpsdk.CallToolResult, daemonStateOut, error) {
+	return nil, collectDaemonState(ctx), nil
+}
+
+// collectDaemonState is the shared implementation for the daemon_state
+// tool and the treeman://daemon/state resource. A daemon-down return
+// is encoded as status=not-running rather than a transport error so
+// agents can react without parsing the error string.
+func collectDaemonState(ctx context.Context) daemonStateOut {
+	resp, err := rpc.Call(ctx, rpc.Request{Method: rpc.MethodDaemonState})
+	if err != nil {
+		return daemonStateOut{Status: "not-running", Error: err.Error()}
+	}
+	if resp.Kind == rpc.KindError {
+		return daemonStateOut{Status: "error", Error: resp.Message}
+	}
+	return daemonStateOut{Status: "running", State: resp.State}
 }
 
 func daemonStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, _ daemonStatusIn) (*mcpsdk.CallToolResult, daemonStatusOut, error) {
 	resp, err := rpc.Call(ctx, rpc.Request{Method: rpc.MethodStatus})
 	if err != nil {
-		return nil, daemonStatusOut{Status: "not-running", Error: err.Error()}, nil
+		out := daemonStatusOut{Status: "not-running", Error: err.Error()}
+		return nil, out, nil //nolint:nilerr // daemon-down is tool output, not a transport error
 	}
 	if resp.Kind == rpc.KindError {
 		return nil, daemonStatusOut{Status: "error", Error: resp.Message}, nil

@@ -19,6 +19,11 @@ import (
 func makeWorktreeFixture(t *testing.T, e *env) (repo, wtA, wtB string) {
 	t.Helper()
 	repo = newGitRepo(t)
+	// `wt delete` against this fixture auto-spawns a daemon that does the
+	// git-worktree teardown inside `repo` asynchronously. Stop + drain it
+	// before the repo's temp dir is removed (registered after newGitRepo
+	// so it runs first under LIFO cleanup) to avoid a RemoveAll race.
+	t.Cleanup(func() { stopDaemon(t, e) })
 	writeConfig(t, repo, minimalConfig)
 	wtA = filepath.Join(repo, ".worktrees", "feat_a")
 	wtB = filepath.Join(repo, ".worktrees", "feat_b")
@@ -185,24 +190,24 @@ func TestWtShow(t *testing.T) {
 	})
 }
 
-// ── treeman wt switch / back / resolve / prev ────────────────────
+// ── treeman wt go / back / prev ──────────────────────────────────
 
-func TestWtSwitchAndBack(t *testing.T) {
+func TestWtGoAndBack(t *testing.T) {
 	e := newEnv(t)
 	repo, wtA, _ := makeWorktreeFixture(t, e)
 
-	t.Run("wt switch prints path on stdout", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "switch", "feat_a")
+	t.Run("wt go by name prints path on stdout", func(t *testing.T) {
+		res := e.run(t, repo, "wt", "go", "feat_a")
 		if res.err != nil {
-			t.Fatalf("wt switch: %v\nstderr:\n%s", res.err, res.stderr)
+			t.Fatalf("wt go: %v\nstderr:\n%s", res.err, res.stderr)
 		}
 		if strings.TrimSpace(res.stdout) != wtA {
-			t.Errorf("wt switch stdout = %q, want %q", strings.TrimSpace(res.stdout), wtA)
+			t.Errorf("wt go stdout = %q, want %q", strings.TrimSpace(res.stdout), wtA)
 		}
 	})
 
-	t.Run("wt switch unknown name errors", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "switch", "ghost")
+	t.Run("wt go unknown name errors", func(t *testing.T) {
+		res := e.run(t, repo, "wt", "go", "ghost")
 		if res.err == nil {
 			t.Errorf("expected error for unknown name, got stdout:\n%s", res.stdout)
 		}
@@ -223,22 +228,22 @@ func TestWtSwitchAndBack(t *testing.T) {
 	})
 }
 
-func TestWtResolve(t *testing.T) {
+func TestWtGoResolveByBranch(t *testing.T) {
 	e := newEnv(t)
 	repo, wtA, _ := makeWorktreeFixture(t, e)
 
 	t.Run("by branch returns worktree path", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "resolve", "feature/a")
+		res := e.run(t, repo, "wt", "go", "feature/a")
 		if res.err != nil {
-			t.Fatalf("wt resolve: %v\nstderr:\n%s", res.err, res.stderr)
+			t.Fatalf("wt go: %v\nstderr:\n%s", res.err, res.stderr)
 		}
 		if strings.TrimSpace(res.stdout) != wtA {
-			t.Errorf("wt resolve = %q, want %q", strings.TrimSpace(res.stdout), wtA)
+			t.Errorf("wt go = %q, want %q", strings.TrimSpace(res.stdout), wtA)
 		}
 	})
 
 	t.Run("unknown branch exits nonzero", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "resolve", "no/such/branch")
+		res := e.run(t, repo, "wt", "go", "no/such/branch")
 		if res.err == nil {
 			t.Errorf("expected nonzero exit, got stdout:\n%s", res.stdout)
 		}

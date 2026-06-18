@@ -229,5 +229,7 @@ func filter(all []string, prefixes ...string) []string {
 
 // unused-import suppressor for the `time` package when nothing else
 // references it directly in this file's import list above.
-var _ = fmt.Sprintf
-var _ = time.Second
+var (
+	_ = fmt.Sprintf
+	_ = time.Second
+)

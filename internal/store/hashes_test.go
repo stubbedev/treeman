@@ -15,7 +15,7 @@ func openTestStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -28,13 +28,15 @@ func writeFile(t *testing.T, dir, name, body string) string {
 	return abs
 }
 
-func cachedRow(t *testing.T, s *Store, path string) (size, mtime int64, hash string, cachedAt int64, ok bool) {
+func cachedRow(t *testing.T, s *Store, path string) (cachedAt int64, ok bool) {
 	t.Helper()
+	var size, mtime int64
+	var hash string
 	row := s.DB.QueryRow(`SELECT size, mtime_ns, hash, cached_at FROM file_hashes WHERE path = ?`, path)
 	if err := row.Scan(&size, &mtime, &hash, &cachedAt); err != nil {
-		return 0, 0, "", 0, false
+		return 0, false
 	}
-	return size, mtime, hash, cachedAt, true
+	return cachedAt, true
 }
 
 func TestBatchHashedFiles_FreshAndCacheHit(t *testing.T) {
@@ -51,7 +53,7 @@ func TestBatchHashedFiles_FreshAndCacheHit(t *testing.T) {
 	if first[a] == "" || first[b] == "" || first[a] == first[b] {
 		t.Fatalf("unexpected fresh hashes: %+v", first)
 	}
-	_, _, _, firstCachedAt, ok := cachedRow(t, s, a)
+	firstCachedAt, ok := cachedRow(t, s, a)
 	if !ok {
 		t.Fatal("row not persisted")
 	}
@@ -66,7 +68,7 @@ func TestBatchHashedFiles_FreshAndCacheHit(t *testing.T) {
 	if second[a] != first[a] || second[b] != first[b] {
 		t.Fatalf("hash drift across cache hit: first=%+v second=%+v", first, second)
 	}
-	_, _, _, secondCachedAt, _ := cachedRow(t, s, a)
+	secondCachedAt, _ := cachedRow(t, s, a)
 	if secondCachedAt <= firstCachedAt {
 		t.Errorf("cached_at not refreshed on hit: %d → %d", firstCachedAt, secondCachedAt)
 	}
@@ -99,10 +101,10 @@ func TestBatchHashedFiles_StaleMtimeInvalidates(t *testing.T) {
 	}
 }
 
-func TestBatchHashedFiles_SecondaryIndexReuse(t *testing.T) {
-	// Worktree A and B carry identical content with identical mtime
-	// at different absolute paths. The secondary (size, mtime_ns)
-	// index lets the second-worktree lookup skip the disk read.
+func TestBatchHashedFiles_IdenticalContentSameHash(t *testing.T) {
+	// Identical bytes at two paths hash to the same digest because
+	// BLAKE3 is content-derived — each path is hashed independently
+	// (no cross-path reuse). Each gets its own stat-gated row.
 	ctx := context.Background()
 	s := openTestStore(t)
 	root := t.TempDir()
@@ -131,15 +133,56 @@ func TestBatchHashedFiles_SecondaryIndexReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	if resA[pA] == "" || resA[pA] != resB[pB] {
-		t.Fatalf("expected identical hashes across worktrees: %s vs %s", resA[pA], resB[pB])
+		t.Fatalf("identical content must hash identically: %s vs %s", resA[pA], resB[pB])
 	}
-	// Both paths must now have their own row so future lookups hit
-	// directly without hitting the secondary index.
-	if _, _, _, _, ok := cachedRow(t, s, pA); !ok {
+	if _, ok := cachedRow(t, s, pA); !ok {
 		t.Error("pA row missing after first lookup")
 	}
-	if _, _, _, _, ok := cachedRow(t, s, pB); !ok {
-		t.Error("pB row missing — secondary-index path didn't upsert")
+	if _, ok := cachedRow(t, s, pB); !ok {
+		t.Error("pB row missing after first lookup")
+	}
+}
+
+// TestBatchHashedFiles_NoCrossPathAliasing is the macOS-safety
+// regression. Two DISTINCT-content files that share an identical
+// (size, mtime_ns) — the collision a 1-second-resolution filesystem
+// (HFS+, SMB, some FUSE mounts) routinely produces — must hash to
+// DIFFERENT digests. The removed content-addressable secondary index
+// keyed reuse purely on (size, mtime_ns), so it would have aliased
+// these to one hash and let an edited migration keep a stale
+// fingerprint. Per-path gating reads each file's own bytes.
+func TestBatchHashedFiles_NoCrossPathAliasing(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := t.TempDir()
+
+	// Same byte length, different content; pinned to the same mtime.
+	pX := writeFile(t, root, "x.sql", "ALTER TABLE a;")
+	pY := writeFile(t, root, "y.sql", "ALTER TABLE b;")
+	stamp := time.Now().Add(-time.Hour)
+	for _, p := range []string{pX, pY} {
+		if err := os.Chtimes(p, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Hash pX first so its (size,mtime,hash) row is persisted. The old
+	// secondary index queried persisted rows, so it only aliased across
+	// separate calls — hashing both at once on an empty table wouldn't
+	// reproduce it. Two calls is the faithful regression.
+	resX, err := s.BatchHashedFiles(ctx, []string{pX})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resY, err := s.BatchHashedFiles(ctx, []string{pY})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resX[pX] == "" || resY[pY] == "" {
+		t.Fatalf("missing hash: x=%q y=%q", resX[pX], resY[pY])
+	}
+	if resX[pX] == resY[pY] {
+		t.Fatalf("distinct content sharing (size,mtime) must not alias: both %s", resX[pX])
 	}
 }
 

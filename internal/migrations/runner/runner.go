@@ -8,22 +8,41 @@ package runner
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/shellenv"
 	"github.com/stubbedev/treeman/internal/template"
 )
 
 // Spec is the shape the runner accepts: a shell command + env-var
 // overrides + a label used in error messages so callers know which
 // YAML block produced the failure.
+//
+// LogPath (optional): when non-empty, the merged stdout+stderr stream
+// is teed to this file so a post-mortem can read the full output after
+// the in-memory tails roll over. Parent directories are created. The
+// file is truncated on each invocation — callers wanting history
+// should rotate the path themselves.
 type Spec struct {
-	Run   string
-	Env   map[string]string
-	Label string // e.g. "migrations.migrate" or "seed"
+	Run     string
+	Env     map[string]string
+	Label   string // e.g. "migrations.migrate" or "seed"
+	LogPath string
+	// ExtraEnv holds already-resolved literal env vars (NOT template-
+	// rendered, unlike Env) layered onto the subprocess after the
+	// inherited base and rendered Env. Used to pass runtime values the
+	// command needs but the user can't template — e.g.
+	// TREEMAN_ROLLBACK_STEPS for the rollback path.
+	ExtraEnv map[string]string
 }
 
 // FromMigrate converts a `databases[].migrate` block to a Spec.
@@ -36,11 +55,67 @@ func FromSeed(s config.Step) Spec {
 	return Spec{Run: s.Run, Env: s.Env, Label: "seed"}
 }
 
+// FromRollback converts a `databases[].rollback` block to a Spec.
+// `steps` is the number of migrations to unwind; it's exposed to the
+// command as the TREEMAN_ROLLBACK_STEPS env var (Run is not template-
+// rendered, so a brace placeholder wouldn't be substituted).
+func FromRollback(s config.Step, steps int) Spec {
+	return Spec{
+		Run:      s.Run,
+		Env:      s.Env,
+		Label:    "rollback",
+		ExtraEnv: map[string]string{"TREEMAN_ROLLBACK_STEPS": strconv.Itoa(steps)},
+	}
+}
+
+// WithLogPath returns a copy of the Spec with LogPath set. Lets call
+// sites stay fluent without mutating the source Spec.
+func (s Spec) WithLogPath(p string) Spec {
+	s.LogPath = p
+	return s
+}
+
 // Outcome is the result of one runner invocation.
 type Outcome struct {
 	ExitCode   int
 	StdoutTail string
 	StderrTail string
+	LogPath    string // mirror of Spec.LogPath; empty when no log was teed
+}
+
+// FormatError builds the canonical "<label> <target> exit N: …" string
+// used by every prepare call site. Includes both stderr and stdout tails
+// because frameworks like Laravel/Symfony Console write failure
+// diagnostics to stdout, not stderr — earlier versions formatted only
+// StderrTail and turned exit 1 into an empty diagnostic. Trailing
+// whitespace is trimmed and empty streams are skipped. When a LogPath
+// was teed, append a pointer to the full log.
+func FormatError(label, target string, out Outcome) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s exit %d", label, target, out.ExitCode)
+	stderrTrim := strings.TrimSpace(out.StderrTail)
+	stdoutTrim := strings.TrimSpace(out.StdoutTail)
+	wrote := false
+	if stderrTrim != "" {
+		fmt.Fprintf(&b, ": stderr=%q", stderrTrim)
+		wrote = true
+	}
+	if stdoutTrim != "" {
+		if wrote {
+			b.WriteString(" ")
+		} else {
+			b.WriteString(": ")
+		}
+		fmt.Fprintf(&b, "stdout=%q", stdoutTrim)
+		wrote = true
+	}
+	if !wrote {
+		b.WriteString(": <no output captured>")
+	}
+	if out.LogPath != "" {
+		fmt.Fprintf(&b, " (full log: %s)", out.LogPath)
+	}
+	return b.String()
 }
 
 // Run executes `spec.Run` via `sh -c` against `targetDB`.
@@ -81,38 +156,52 @@ func Run(
 	c := exec.CommandContext(ctx, "sh", "-c", spec.Run)
 	c.Dir = repoRoot
 
-	// Build the subprocess env. User's cached env wins; fall back to
-	// the daemon's PATH only when the user's env has none (rare —
-	// see hooks.buildEnv doc-comment for the rationale).
-	env := make([]string, 0, len(inheritedEnv)+len(renderedEnv)+2)
-	havePath := false
-	for k, v := range inheritedEnv {
-		if k == "PATH" {
-			havePath = true
-		}
-		env = append(env, k+"="+v)
-	}
-	if !havePath {
-		if p := os.Getenv("PATH"); p != "" {
-			env = append(env, "PATH="+p)
-		}
-	}
-	env = append(env, "TREEMAN_TARGET_DB="+targetDB)
-	for k, v := range renderedEnv {
+	// Build the subprocess env via the same model as hooks: daemon
+	// floor, overlaid with the user's cached env, with the login-shell
+	// PATH always merged in (see shellenv.BaseEnv). This gives migrate/
+	// seed commands the same env they'd have in the user's own terminal,
+	// and keeps them working when inheritedEnv is empty (an externally-
+	// created worktree finalized by the lifecycle watcher). Rendered env
+	// and TREEMAN_TARGET_DB are layered last so they win.
+	merged := shellenv.BaseEnv(inheritedEnv)
+	merged["TREEMAN_TARGET_DB"] = targetDB
+	maps.Copy(merged, renderedEnv)
+	// ExtraEnv carries already-resolved literals (e.g.
+	// TREEMAN_ROLLBACK_STEPS); layer last so it wins.
+	maps.Copy(merged, spec.ExtraEnv)
+	env := make([]string, 0, len(merged))
+	for k, v := range merged {
 		env = append(env, k+"="+v)
 	}
 	c.Env = env
 
 	var stdout, stderr bytes.Buffer
-	c.Stdout = tailWriter(&stdout, 16*1024)
-	c.Stderr = tailWriter(&stderr, 16*1024)
+	var stdoutW io.Writer = tailWriter(&stdout, 16*1024)
+	var stderrW io.Writer = tailWriter(&stderr, 16*1024)
+
+	if spec.LogPath != "" {
+		if mkErr := os.MkdirAll(filepath.Dir(spec.LogPath), 0o755); mkErr != nil {
+			return Outcome{ExitCode: -1}, fmt.Errorf("%s log dir: %w", spec.Label, mkErr)
+		}
+		f, fErr := os.Create(spec.LogPath)
+		if fErr != nil {
+			return Outcome{ExitCode: -1}, fmt.Errorf("%s log open: %w", spec.Label, fErr)
+		}
+		defer func() { _ = f.Close() }()
+		stdoutW = io.MultiWriter(stdoutW, f)
+		stderrW = io.MultiWriter(stderrW, f)
+	}
+	c.Stdout = stdoutW
+	c.Stderr = stderrW
 
 	err := c.Run()
 	out := Outcome{
 		StdoutTail: stdout.String(),
 		StderrTail: stderr.String(),
+		LogPath:    spec.LogPath,
 	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
 		out.ExitCode = exitErr.ExitCode()
 		return out, nil
 	}

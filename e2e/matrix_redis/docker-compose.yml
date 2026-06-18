@@ -1,0 +1,14 @@
+# Redis (auth-enabled via requirepass) for the per-engine option matrix.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: treeman-e2e-mxredis
+    command: ["redis-server", "--requirepass", "redispw"]
+    ports:
+      - "16385:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redispw", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s

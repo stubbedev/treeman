@@ -9,6 +9,7 @@ import (
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
+	"github.com/stubbedev/treeman/internal/template"
 )
 
 // RunLocalFinalize executes the setup + prepare tail in the calling
@@ -46,11 +47,29 @@ func RunLocalFinalize(
 			trigger, len(actions), wtPath)
 		return nil
 	}
-	if err := runTrigger("on-create-before-engines", cfg.Hooks.OnCreateBeforeEngines); err != nil {
+	// Materialize links/copies + render patches before hooks fire (a
+	// before-engines hook may read the copied/patched `.env`). The daemon
+	// path does this in FinalizeWorktree; this mirror covers the detached
+	// child / `wt finalize --local` fallback. Skipped for the main
+	// worktree (src == dst), matching the daemon.
+	if !isMain {
+		if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Links, "link", sink); err != nil {
+			return err
+		}
+		if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Copies, "copy", sink); err != nil {
+			return err
+		}
+		portMap, _ := st.LoadWorktreePorts(ctx, wtID)
+		tplCtx := template.FromSlug(sl).WithPorts(portMap)
+		if err := applyPatches(ctx, cfg.Patches, wtPath, tplCtx, sink); err != nil {
+			return err
+		}
+	}
+	if err := runTrigger("create-before-engines", cfg.Hooks.OnCreateBeforeEngines); err != nil {
 		return err
 	}
 	if skipPrepare || len(cfg.Databases) == 0 {
-		return runTrigger("on-create-after-engines", cfg.Hooks.OnCreateAfterEngines)
+		return runTrigger("create-after-engines", cfg.Hooks.OnCreateAfterEngines)
 	}
 	outs, err := prepare.Run(ctx, cfg, wtPath, sl, st, repoID, wtID, env)
 	if err != nil {
@@ -60,5 +79,5 @@ func RunLocalFinalize(
 		sink.Info("prepare[%s] %s template=%s clones=%d",
 			o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
 	}
-	return runTrigger("on-create-after-engines", cfg.Hooks.OnCreateAfterEngines)
+	return runTrigger("create-after-engines", cfg.Hooks.OnCreateAfterEngines)
 }

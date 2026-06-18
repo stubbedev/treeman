@@ -19,7 +19,7 @@ func openStore(t *testing.T) (*store.Store, int64, int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 	repoID, err := st.EnsureRepo(ctx, "/repos/test", "test")
 	if err != nil {
 		t.Fatal(err)
@@ -40,7 +40,7 @@ func pickFreePort(t *testing.T) uint16 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	_, p, err := net.SplitHostPort(l.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func pickFreePort(t *testing.T) uint16 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return uint16(n)
+	return uint16(n) //nolint:gosec // n parsed from a live TCP listener addr; always a valid 0-65535 port
 }
 
 func TestAllocateAssignsPortsInOrder(t *testing.T) {
@@ -88,10 +88,10 @@ func TestAllocateSkipsHeldPortAndPicksNext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	pn, _ := strconv.Atoi(p)
-	held := uint16(pn)
+	held := uint16(pn) //nolint:gosec // pn parsed from a live TCP listener addr; always a valid 0-65535 port
 	next := pickFreePort(t)
 	cfg := &config.Config{
 		Ports: map[string]config.PortSpec{
@@ -121,10 +121,10 @@ func TestAllocateExhaustsRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	pn, _ := strconv.Atoi(p)
-	port := uint16(pn)
+	port := uint16(pn) //nolint:gosec // pn parsed from a live TCP listener addr; always a valid 0-65535 port
 	cfg := &config.Config{
 		Ports: map[string]config.PortSpec{
 			"only": {Range: config.PortRange{Min: port, Max: port}},
@@ -153,10 +153,10 @@ func TestAllocateReleasesEarlierSlotsOnLaterFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	_, p, _ := net.SplitHostPort(l.Addr().String())
 	pn, _ := strconv.Atoi(p)
-	held := uint16(pn)
+	held := uint16(pn) //nolint:gosec // pn parsed from a live TCP listener addr; always a valid 0-65535 port
 	if held == a {
 		t.Skipf("test prerequisite: free port (%d) collided with held port (%d)", a, held)
 	}
@@ -179,6 +179,103 @@ func TestAllocateReleasesEarlierSlotsOnLaterFailure(t *testing.T) {
 	}
 	if len(leftover) != 0 {
 		t.Fatalf("mid-allocation failure must release earlier slots; leftover=%v", leftover)
+	}
+}
+
+// TestAllocateIsIdempotent pins the contract FinalizeWorktree relies
+// on: re-running Allocate keeps already-held slots untouched and fills
+// only newly-declared ones. Without this the daemon finalize path would
+// fail on every CLI-created worktree (slot already held) or never fill
+// ports for an external `git worktree add`.
+func TestAllocateIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	st, repoID, wtID := openStore(t)
+	a := pickFreePort(t)
+	cfg := &config.Config{
+		Ports: map[string]config.PortSpec{
+			"alpha": {Range: config.PortRange{Min: a, Max: a}},
+		},
+	}
+	first, err := New().Allocate(ctx, st, cfg, repoID, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second call, same config: no error, same port, no extra row.
+	second, err := New().Allocate(ctx, st, cfg, repoID, wtID)
+	if err != nil {
+		t.Fatalf("re-allocate should be a no-op, got %v", err)
+	}
+	if len(second) != 1 || second[0].Port != first[0].Port {
+		t.Fatalf("re-allocate changed alpha: first=%+v second=%+v", first, second)
+	}
+
+	// Now a new slot appears in config — Allocate fills it without
+	// disturbing alpha.
+	b := pickFreePort(t)
+	if b == a {
+		t.Skipf("test prerequisite: distinct free ports (a=%d b=%d)", a, b)
+	}
+	cfg.Ports["beta"] = config.PortSpec{Range: config.PortRange{Min: b, Max: b}}
+	third, err := New().Allocate(ctx, st, cfg, repoID, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]uint16{}
+	for _, al := range third {
+		got[al.Name] = al.Port
+	}
+	if got["alpha"] != a || got["beta"] != b {
+		t.Fatalf("expected alpha=%d beta=%d, got %+v", a, b, got)
+	}
+}
+
+// TestAllocateReusesSlotWonByConcurrentPass is the regression guard for
+// the `wt create` failure:
+//
+//	worktree_create: port allocation: allocate port "octane": allocate
+//	worktree port: worktree N already holds slot "octane" (port=8005)
+//
+// Two allocate passes run for the same worktree — the synchronous create
+// handler and the detached FinalizeWorktree. When they race, both read the
+// slot as unassigned, both probe the same free port, and both INSERT. The
+// loser's insert hits the (worktree_id, name) unique index. That used to
+// surface as a fatal error; it must instead reuse the port the winner
+// recorded so the create succeeds.
+//
+// allocateOne is exercised directly (white-box) because Allocate's
+// up-front LoadWorktreePorts pre-check skips the insert entirely once the
+// row exists — the conflict only fires when the row lands AFTER the
+// pre-check, which a pre-seeded row reproduces deterministically.
+func TestAllocateReusesSlotWonByConcurrentPass(t *testing.T) {
+	ctx := context.Background()
+	st, repoID, wtID := openStore(t)
+
+	// Simulate the winning pass: octane already on record for this wt.
+	won := pickFreePort(t)
+	if err := st.AllocateWorktreePort(ctx, repoID, wtID, "octane", won); err != nil {
+		t.Fatal(err)
+	}
+
+	// The losing pass walks the range and tries to insert — must reuse.
+	spec := config.PortSpec{Range: config.PortRange{Min: won, Max: max16(won, won+8)}}
+	port, reused, err := allocateOne(ctx, st, repoID, wtID, "octane", spec)
+	if err != nil {
+		t.Fatalf("concurrent same-worktree alloc must not fail, got %v", err)
+	}
+	if !reused {
+		t.Fatalf("expected reused=true for slot won by concurrent pass")
+	}
+	if port != won {
+		t.Fatalf("expected reuse of recorded port %d, got %d", won, port)
+	}
+
+	// Exactly one octane row survives — no duplicate, no leaked port.
+	held, err := st.LoadWorktreePorts(ctx, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(held) != 1 || held["octane"] != won {
+		t.Fatalf("expected single octane=%d row, got %v", won, held)
 	}
 }
 

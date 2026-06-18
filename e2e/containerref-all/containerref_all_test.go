@@ -110,7 +110,7 @@ func mysqlConfig(wt string, ref config.ContainerRef) *config.Config {
 		Databases: []config.DatabaseConfig{
 			{
 				Engine: "mysql", NameTemplate: sanitize(ref.Container) + "_{slug}",
-				Dump: &config.DumpSpec{Path: "seed.sql"},
+				Dump: config.DumpList{{Path: "seed.sql"}},
 			},
 		},
 	}
@@ -128,7 +128,7 @@ func postgresConfig(wt string, ref config.ContainerRef) *config.Config {
 		Databases: []config.DatabaseConfig{
 			{
 				Engine: "postgres", NameTemplate: sanitize(ref.Container) + "_{slug}",
-				Dump: &config.DumpSpec{Path: "seed.sql"},
+				Dump: config.DumpList{{Path: "seed.sql"}},
 			},
 		},
 	}
@@ -197,7 +197,9 @@ func (e *strErr) Error() string { return e.s }
 
 // Unused but imported defensively in case a sub-test wants to talk
 // HTTP to ES directly.
-var _ = json.Marshal
-var _ = io.Discard
-var _ = http.DefaultClient
-var _ = context.Background
+var (
+	_ = json.Marshal
+	_ = io.Discard
+	_ = http.DefaultClient
+	_ = context.Background
+)

@@ -2,25 +2,38 @@
 
 [← back to README](../README.md)
 
-treeman reads config in three layers, last-write-wins:
+treeman reads config from two files that merge into one effective
+config, last-write-wins:
 
-1. `~/.config/treeman/config.yaml` — global connection defaults
-2. `.treeman.yaml` — per-repo config (committed)
-3. `.treeman.local.yaml` — per-repo overrides (gitignored)
+1. `~/.config/treeman/config.yaml` — **user-global**, machine-wide defaults shared by every repo. Scaffold with `treeman init --global`.
+2. `<repo>/.treeman.yaml` — **per-repo**, committed. Plus an optional `.treeman.local.yaml` overlay (gitignored).
 
-Sample tree of every top-level block (all optional unless marked):
+Each top-level key has a **scope** that decides which file it may live
+in. **This is a hard rule — a key in the wrong file is an error at load
+time, with no flag to relax it** (the layered merge made a misplaced key
+silently inert, so it's surfaced loudly instead). Editors enforce it too:
+`.treeman.yaml` validates against the repo-scoped schema and the global
+config against the global-scoped one (`treeman schema install` /
+`treeman init --global` wire the right modeline).
+
+| Scope | Keys | Lives in |
+|-------|------|----------|
+| **global** | `daemon`, `snapshots`, `logs`, `status`, `notifications` | `~/.config/treeman/config.yaml` only |
+| **repo** | `databases`, `patches`, `hooks`, `main_worktree`, `env_sources` | `.treeman.yaml` only |
+| **both** | `connections`, `worktrees`, `auto_fetch`, `ports`, `frameworks`, `debounce_ms` | either (global = default, repo overrides) |
+
+For the full per-key reference + auto-generated examples see
+[config-reference.md](config-reference.md).
+
+### Per-repo `.treeman.yaml`
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/stubbedev/treeman/master/schemas/treeman.schema.json
 
-repo:
-  name: my-app                    # required for unambiguous slug derivation
-
 worktrees:
   root: .worktrees                # default
-  links: [".env"]                 # symlink from main repo into the worktree
-  async_create: true              # default — postcreate + prepare detach to daemon
-  async_delete: true              # default
+  copies: [".env"]                # copied into each worktree (patched per-branch; never shared)
+  links: ["node_modules"]         # symlinked from main (shared read-only cache)
 
 env_sources:                       # credential-resolver READ list
   - .env
@@ -30,7 +43,8 @@ env_sources:                       # credential-resolver READ list
 # credentials from `.env` / `.env.testing` (Laravel `DB_*`,
 # Spring-Boot `SPRING_DATASOURCE_*`, MySQL/PG/Redis component vars).
 # Declare anything below only when you want to override the auto-
-# detected value.
+# detected value. `connections` is scope "both": set machine-wide
+# defaults in the global config, override per-repo here.
 connections:
   mysql:
     host: 127.0.0.1
@@ -52,50 +66,72 @@ databases:
     dump: { path: storage/dumps/seed.sql.gz }
     fanout: 0                              # 0 = safe per-engine default (mysql 4, pg GOMAXPROCS, mongo 6, es 8).
                                            # raise only if the server is provisioned (max_connections bumped, etc.).
+    prewarm: 0                             # Postgres only: keep N spare clones pre-restored from the cached
+                                           # template; a cache-hit create claims one via ALTER DATABASE … RENAME
+                                           # (milliseconds, size-independent) instead of a full template copy.
+                                           # The pool replenishes in the background and is dropped with its
+                                           # template on eviction. See `treeman snapshots list` (SPARES column).
     migrate:                               # shell command + env-var redirects (point the CLI at the per-run template DB)
       run: "php artisan migrate --force"
       env:
         DB_DATABASE: "{target_db}"
         DB_TEST_DATABASE: "{target_db}"
     inputs:                                # files folded into the snapshot key; also watched for changes
-      - { glob: "database/migrations/**/*.php", label: migrations, hash: filename }
-      - composer.lock                      # bare string = checksum hash, no label
+      - { glob: "database/migrations/**/*.php", label: migrations }
+      - composer.lock                      # bare string = glob with no label
     test_clones:                           # parallel-test-runner fan-out
-      clones: auto                         # auto = detect from phpunit.xml / pyproject / Jest config
+      clones: auto                         # auto = one clone per CPU when the detected framework parallelizes per-worker
       name_template: "myapp_testing_{slug}_test_{n}"
 
 hooks:
   # Every entry under a trigger key is an action; actions in one
   # list run in PARALLEL. `run:` itself takes a string (one step) or
   # a list (steps chain sequentially with `&&` — failure short-circuits).
-  on-create-before-engines:                # fires after patches + bring-in, BEFORE engine prepare
+  create-before-engines:                # fires after patches + bring-in, BEFORE engine prepare
     - run: "git pull --ff-only"
-  on-create-after-engines:                 # fires after engine prepare
+  create-after-engines:                 # fires after engine prepare
     - run: composer install --no-interaction --prefer-dist
     - run: yarn install --frozen-lockfile
     - cwd: frontend                        # multi-step action — cd + build chain sequentially
       run:
         - yarn install
         - yarn build:dev
-  on-delete-before-engines:                # fires BEFORE engine drop + git remove
+  delete-before-engines:                # fires BEFORE engine drop + git remove
     - run: "echo dropping caches"
-  on-file-change:                          # filtered by `match:` against input labels
+  file-change:                          # filtered by `match:` against input labels
     - match: migrations                    # accepts string or list (e.g. [migrations, seeders])
       run: "echo migrations changed"
 
-snapshots:
-  cache_dir: ~/.cache/treeman/snapshots    # only used by GC reports
-  retention:
-    cap_per_repo: 8                        # NEW: hard cap, LRU evicts on new generation
-    max_age_days: 30
-    max_total_gb: 50
-    gc_interval_minutes: 60                # daemon background sweep
+debounce_ms: 500                         # file-watcher coalesce window (scope "both")
+```
 
-debounce_ms: 500                         # file-watcher coalesce window
+### User-global `~/.config/treeman/config.yaml`
 
+Machine-wide settings. `daemon`, `snapshots`, `logs`, `status`, and
+`notifications` are **only** valid here — putting them in a repo
+`.treeman.yaml` is a hard error.
+
+```yaml
 daemon:
-  socket: $XDG_RUNTIME_DIR/treeman.sock
-  log_level: info
+  log_level: info                          # debug | info | warn | error
+                                           # (socket path is derived from $XDG_RUNTIME_DIR — not configurable)
+
+snapshots:
+  cap_per_repo: 8                          # hard cap per repo, LRU evicts on new generation
+  keep_per_source: 500                     # max templates kept per migration-content source
+  max_age_days: 30                         # drop templates unused this long (0 = off)
+  max_total_gb: 50                         # evict largest-first above this total (0 = off)
+  gc_interval_minutes: 60                  # daemon background sweep cadence
+
+logs:
+  keep_days: 14                            # daemon prunes the shared event log; 0 keeps forever
+
+auto_fetch:                                # scope "both" — global default cadence; a repo may opt out
+  enabled: true
+  interval_minutes: 15
+
+notifications:
+  enabled: false                           # desktop banners on worktree lifecycle changes
 ```
 
 ## Templated names
@@ -107,9 +143,11 @@ worktree's slug:
 |---|---|
 | `{slug}` | `proj_123` |
 | `{slug_dash}` | `proj-123` |
-| `{slug_upper}` | `PROJ_123` |
-| `{slug_redis_index}` | `7` (deterministic 0–15 hash of slug) |
-| `{n}` | test-clone index (1-based) |
+| `{slug_redis_queue}` | `9` — checksum-derived Redis DB index (6–15) |
+| `{slug_redis_cache}` | `12` — checksum-derived Redis DB index (6–15), distinct from queue |
+| `{port_<name>}` | allocated port for the `ports:` slot `<name>` (e.g. `{port_octane}`) |
+| `{target_db}` | the rendered per-run DB name (only in `migrate.env` / `seed.env`) |
+| `{n}` | test-clone index, 1-based (only in `test_clones.name_template`) |
 
 ## Fully declarative — no hidden defaults
 
@@ -128,7 +166,7 @@ custom layouts.
 
 ## Hooks
 
-Each entry under a trigger key (e.g. `on-create-after-engines`) is
+Each entry under a trigger key (e.g. `create-after-engines`) is
 one **action**. Actions in the same list run in **parallel**. The
 `run:` field inside one action is the action's step list — steps
 chain sequentially with `&&` so the first non-zero exit aborts the
@@ -140,7 +178,7 @@ Every action must be a mapping with at minimum a `run:` field
 
 ```yaml
 hooks:
-  on-create-after-engines:
+  create-after-engines:
     # single-step action — `run:` is a string
     - run: "composer install"
 
@@ -155,9 +193,9 @@ hooks:
         - "yarn build:dev"
 ```
 
-Available triggers: `on-create-before-engines`,
-`on-create-after-engines`, `on-delete-before-engines`,
-`on-delete-after-engines`, `on-checkout`, `on-file-change`. The
+Available triggers: `create-before-engines`,
+`create-after-engines`, `delete-before-engines`,
+`delete-after-engines`, `checkout`, `file-change`. The
 `*-before-engines` variants run before treeman touches its managed
 engines, the `*-after-engines` variants after. Every hook trigger is
 async-dispatched — the CLI returns immediately after spawning
@@ -178,7 +216,7 @@ the named container rather than on the host. Useful for
 
 ```yaml
 hooks:
-  on-create-after-engines:
+  create-after-engines:
     # Single-step action, in a named container.
     - { run: "composer install", container: myapp-php }
 
@@ -207,13 +245,13 @@ unconditionally:
 | `TREEMAN_SLUG`     | The slug used to name resources for this run (e.g. `feature_x`, `main_develop`). |
 | `TREEMAN_IS_MAIN`  | `"1"` when the firing worktree is the repo root with main-wt enabled, else `"0"`. Branch on this to skip dev-only setup on linked worktrees, or vice versa. |
 
-`on-file-change` hooks additionally receive `TREEMAN_WATCH_PATH`,
+`file-change` hooks additionally receive `TREEMAN_WATCH_PATH`,
 `TREEMAN_WATCH_LABEL`, `TREEMAN_WATCH_ENGINE`, `TREEMAN_WATCH_DB_NAME`
 so the script can branch on the trigger details.
 
 ```yaml
 hooks:
-  on-create-after-engines:
+  create-after-engines:
     - run: |
         if [ "$TREEMAN_IS_MAIN" = "1" ]; then
           composer install --no-dev
@@ -232,8 +270,8 @@ checkout doesn't get its own per-branch databases.
 `main_worktree:` opts the repo root into the same lifecycle. Once
 enabled, flipping a branch at the repo root produces per-branch
 databases keyed by `main_<branch>` (instead of every non-ticket
-branch collapsing to one path-hash slug), and the on-checkout /
-on-file-change / on-create-* hooks fire against the repo root the
+branch collapsing to one path-hash slug), and the checkout /
+file-change / create-* hooks fire against the repo root the
 same way they do for linked worktrees.
 
 ```yaml
@@ -251,7 +289,7 @@ main_worktree:
 
 Flip on with `treeman main enable` — this patches `.treeman.yaml`,
 asks the daemon to reload, then dispatches a finalize against the
-repo root so `on-create-*` hooks run immediately. Reverse with
+repo root so `create-*` hooks run immediately. Reverse with
 `treeman main disable` (config flag flips, watcher stops, databases
 remain). Add `--purge` to drop every per-branch DB the
 `main_<branch>` slug owns across all local branches.
@@ -274,10 +312,10 @@ framework. Copy + paste into the `databases:` array of an existing
     run: "bin/rails db:migrate"
     env: { DB_NAME: "{target_db}" }
   inputs:
-    - { glob: "db/migrate/**/*.rb", label: migrations, hash: filename }
+    - { glob: "db/migrate/**/*.rb", label: migrations }
     - Gemfile.lock
   test_clones:
-    clones: auto          # reads parallel_workers from config/test.rb / spec_helper
+    clones: auto          # auto = one clone per CPU (framework detected, not worker-config parsed)
     name_template: "myapp_test_{slug}_w{n}"
 ```
 
@@ -290,12 +328,12 @@ framework. Copy + paste into the `databases:` array of an existing
     run: "python manage.py migrate --noinput"
     env: { DB_NAME: "{target_db}" }
   inputs:
-    - { glob: "**/migrations/[0-9]*_*.py", label: migrations, hash: filename }
+    - { glob: "**/migrations/[0-9]*_*.py", label: migrations }
     - poetry.lock
     - Pipfile.lock
     - requirements.txt
   test_clones:
-    clones: auto          # reads pytest -n / pytest-xdist config
+    clones: auto          # auto = one clone per CPU (framework detected, not worker-config parsed)
     name_template: "myapp_test_{slug}_w{n}"
 ```
 
@@ -312,15 +350,15 @@ framework. Copy + paste into the `databases:` array of an existing
     env:
       DATABASE_URL: "postgres://user:password@127.0.0.1:5432/{target_db}?sslmode=disable"
   inputs:
-    - { glob: "migrations/**/*.up.sql", label: migrations, hash: filename }
-    - { glob: "services/*/migrations/**/*.up.sql", label: migrations, hash: filename }
+    - { glob: "migrations/**/*.up.sql", label: migrations }
+    - { glob: "services/*/migrations/**/*.up.sql", label: migrations }
     - go.sum
   test_clones:
     clones: 4             # explicit count; Go's `-parallel` is per-package
     name_template: "svc_test_{slug}_w{n}"
 ```
 
-**sqlx-cli + Postgres** (migrations are mutable — checksum hash via default):
+**sqlx-cli + Postgres** (sqlx allows in-place migration edits — content hashing catches them):
 
 ```yaml
 - engine: postgres
@@ -331,13 +369,13 @@ framework. Copy + paste into the `databases:` array of an existing
       # sqlx-cli reads DATABASE_URL natively.
       DATABASE_URL: "postgres://user:password@127.0.0.1:5432/{target_db}?sslmode=disable"
   inputs:
-    # bare-string default = checksum hash, so edits to a migration
-    # rebuild the snapshot (sqlx allows mutable migrations).
+    # every matched file is content-hashed, so an in-place edit
+    # moves the fingerprint and rebuilds the snapshot.
     - "migrations/**/*.sql"
     - "crates/*/migrations/**/*.sql"
     - Cargo.lock
   test_clones:
-    clones: auto          # reads cargo nextest config
+    clones: auto          # auto = one clone per CPU (framework detected, not worker-config parsed)
     name_template: "app_test_{slug}_w{n}"
 ```
 
@@ -405,7 +443,7 @@ so a container restart settles within one retry.
 connections:
   mysql:
     container: myapp-mysql        # raw container name (`docker run --name`)
-    container_engine: docker      # docker | podman | nerdctl | finch | orbctl | …
+    container_engine: docker      # docker | podman | nerdctl | finch | …
     container_network: myapp_net  # optional: pin which network's IP to use
     port: 3306                    # internal port; defaults to engine default
     user: root
@@ -428,8 +466,9 @@ container's `Config.Env`. Skip the password block when you've
 already declared the secret on the container itself.
 
 **Engines.** Anything that supports `inspect` and `ps --filter
-label=...` works — `docker`, `podman`, `nerdctl`, `finch`,
-`orbctl`, `lima nerdctl`. Default is `docker`.
+label=...` works — `docker`, `podman`, `nerdctl`, `finch`. Default
+is `docker`. OrbStack users keep the default — its CLI is a docker
+symlink, so `container_engine: docker` already drives it.
 
 **Running treeman inside a devcontainer.** treeman detects
 `/.dockerenv`, `/run/.containerenv`, `REMOTE_CONTAINERS=true` and

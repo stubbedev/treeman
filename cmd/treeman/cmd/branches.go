@@ -46,45 +46,11 @@ func BranchesCmd() *cli.Command {
 			// Build occupancy map: branch → worktree path.
 			occ := branchOccupancy(ctx, repoRoot)
 
-			// Merge.
-			type row struct {
-				Branch      string `json:"branch"`
-				Local       bool   `json:"local"`
-				Remote      bool   `json:"remote"`
-				Worktree    string `json:"worktree,omitempty"`
-				HasWorktree bool   `json:"has_worktree"`
-			}
-			seen := make(map[string]*row)
-			for b := range localSet {
-				r := &row{Branch: b, Local: true}
-				_, r.Remote = remoteSet[b]
-				if p, ok := occ[b]; ok {
-					r.Worktree = p
-					r.HasWorktree = true
-				}
-				seen[b] = r
-			}
-			for b := range remoteSet {
-				if _, ok := seen[b]; ok {
-					continue
-				}
-				seen[b] = &row{Branch: b, Remote: true}
-			}
-
-			var rows []row
-			for _, r := range seen {
-				if c.Bool("local-only") && !r.Local {
-					continue
-				}
-				if c.Bool("remote-only") && (r.Local || !r.Remote) {
-					continue
-				}
-				if c.Bool("available") && r.HasWorktree {
-					continue
-				}
-				rows = append(rows, *r)
-			}
-			sort.Slice(rows, func(i, j int) bool { return rows[i].Branch < rows[j].Branch })
+			rows := mergeBranchRows(localSet, remoteSet, occ, branchFilter{
+				localOnly:  c.Bool("local-only"),
+				remoteOnly: c.Bool("remote-only"),
+				available:  c.Bool("available"),
+			})
 
 			if c.Bool("json") {
 				return jsonStream(rows)
@@ -93,27 +59,86 @@ func BranchesCmd() *cli.Command {
 				ui.Info("no branches match the given filters")
 				return nil
 			}
-			tbl := ui.NewTable("BRANCH", "ORIGIN", "WORKTREE")
-			for _, r := range rows {
-				origin := "-"
-				switch {
-				case r.Local && r.Remote:
-					origin = "local+remote"
-				case r.Local:
-					origin = "local"
-				case r.Remote:
-					origin = ui.Dim("remote-only")
-				}
-				wt := ui.Dim("-")
-				if r.Worktree != "" {
-					wt = ui.Cyan(r.Worktree)
-				}
-				tbl.Row(r.Branch, origin, wt)
-			}
-			tbl.Render(nil)
+			renderBranchTable(rows)
 			return nil
 		},
 	}
+}
+
+// branchRow is one merged local+remote branch entry with worktree
+// occupancy info.
+type branchRow struct {
+	Branch      string `json:"branch"`
+	Local       bool   `json:"local"`
+	Remote      bool   `json:"remote"`
+	Worktree    string `json:"worktree,omitempty"`
+	HasWorktree bool   `json:"has_worktree"`
+}
+
+// branchFilter captures the CLI include/exclude flags for branches.
+type branchFilter struct {
+	localOnly  bool
+	remoteOnly bool
+	available  bool
+}
+
+// mergeBranchRows folds the local set, remote set and occupancy map
+// into a sorted, filtered slice of branchRow.
+func mergeBranchRows(localSet, remoteSet map[string]struct{}, occ map[string]string, f branchFilter) []branchRow {
+	seen := make(map[string]*branchRow)
+	for b := range localSet {
+		r := &branchRow{Branch: b, Local: true}
+		_, r.Remote = remoteSet[b]
+		if p, ok := occ[b]; ok {
+			r.Worktree = p
+			r.HasWorktree = true
+		}
+		seen[b] = r
+	}
+	for b := range remoteSet {
+		if _, ok := seen[b]; ok {
+			continue
+		}
+		seen[b] = &branchRow{Branch: b, Remote: true}
+	}
+
+	var rows []branchRow
+	for _, r := range seen {
+		if f.localOnly && !r.Local {
+			continue
+		}
+		if f.remoteOnly && (r.Local || !r.Remote) {
+			continue
+		}
+		if f.available && r.HasWorktree {
+			continue
+		}
+		rows = append(rows, *r)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Branch < rows[j].Branch })
+	return rows
+}
+
+// renderBranchTable prints the human-readable branch table.
+func renderBranchTable(rows []branchRow) {
+	tbl := ui.NewTable("BRANCH", "ORIGIN", "WORKTREE")
+	for _, r := range rows {
+		origin := "-"
+		switch {
+		case r.Local && r.Remote:
+			origin = "local+remote"
+		case r.Local:
+			origin = "local"
+		case r.Remote:
+			origin = ui.Dim("remote-only")
+		}
+		wt := ui.Dim("-")
+		if r.Worktree != "" {
+			wt = ui.Cyan(r.Worktree)
+		}
+		tbl.Row(r.Branch, origin, wt)
+	}
+	tbl.Render(nil)
 }
 
 // listGitBranches returns local branch names (or origin-remote
@@ -132,7 +157,7 @@ func listGitBranches(repoRoot string, remote bool) []string {
 		return nil
 	}
 	var names []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		b := strings.TrimSpace(line)
 		if b == "" {
 			continue
@@ -163,7 +188,7 @@ func branchOccupancy(ctx context.Context, repoRoot string) map[string]string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT COALESCE(w.branch, ''), w.path
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
@@ -171,7 +196,7 @@ func branchOccupancy(ctx context.Context, repoRoot string) map[string]string {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := make(map[string]string)
 	for rows.Next() {
 		var branch, path string

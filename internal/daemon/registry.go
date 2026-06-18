@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -22,7 +24,7 @@ import (
 // invocation doesn't silently orphan running services.
 func removeRepoFromRegistry(ctx context.Context, st *State, repoPath string, force bool) error {
 	if repoPath == "" {
-		return fmt.Errorf("repo_remove: empty repo_path")
+		return errors.New("repo_remove: empty repo_path")
 	}
 	repoID, err := st.Store.LookupRepoID(ctx, repoPath)
 	if err != nil {
@@ -66,8 +68,8 @@ func removeRepoFromRegistry(ctx context.Context, st *State, repoPath string, for
 		return fmt.Errorf("remove repo: %w", err)
 	}
 	slog.Info("repo removed from registry", "repo", repoPath, "id", repoID, "force", force)
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, "registry_remove",
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtRegistryRemove,
 		"repo removed from registry", 0, 0, "", 0,
-		map[string]string{"repo": repoPath, "force": fmt.Sprintf("%t", force)})
+		map[string]string{"repo": repoPath, "force": strconv.FormatBool(force)})
 	return nil
 }

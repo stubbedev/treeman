@@ -45,7 +45,7 @@ func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
 			Network:        cfg.Network,
 			InternalPort:   containerip.URIPort(url, 6379),
 		}
-		addr, err := containerip.ResolveAddr(opts)
+		addr, err := containerip.ResolveAddr(ctx, opts)
 		if err != nil {
 			return nil, fmt.Errorf("resolve container: %w", err)
 		}
@@ -59,6 +59,9 @@ func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
 	opts, err := redis.ParseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("redis url: %w", err)
+	}
+	if cfg.PoolMax > 0 {
+		opts.PoolSize = int(cfg.PoolMax)
 	}
 	return &Driver{baseOpts: opts, clients: map[int]*redis.Client{}}, nil
 }
@@ -101,7 +104,7 @@ func (d *Driver) EngineVersion(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(info, "\n") {
+	for line := range strings.SplitSeq(info, "\n") {
 		line = strings.TrimRight(line, "\r")
 		if v, ok := strings.CutPrefix(line, "redis_version:"); ok {
 			return v, nil

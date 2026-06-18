@@ -13,7 +13,7 @@ import (
 // TestSnapshotLookupByEngineSource_PrefersMostRecentlyUsed seeds two
 // snapshots for the same (engine, source_db) pair with different
 // last_used_at timestamps and asserts the lookup helper returns the
-// most-recent row. This is the slow path the MCP snapshot_inspect
+// most-recent row. This is the slow path the MCP snapshots_inspect
 // tool falls back to when the caller doesn't have a fingerprint.
 func TestSnapshotLookupByEngineSource_PrefersMostRecentlyUsed(t *testing.T) {
 	ctx := context.Background()
@@ -21,7 +21,7 @@ func TestSnapshotLookupByEngineSource_PrefersMostRecentlyUsed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	older := store.SnapshotRecord{
 		Fingerprint: "old", Engine: "mysql", SourceDB: "app",
@@ -56,7 +56,7 @@ func TestSnapshotLookupByEngineSource_NoMatchReturnsNil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	got, err := snapshotLookupByEngineSource(ctx, s, "mysql", "nope")
 	if err != nil {
 		t.Fatalf("missing row should be (nil, nil), got err %v", err)
@@ -77,7 +77,7 @@ func TestHookLogReadTool_TruncatesWhenMaxBytesSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(hooksDir, "setup-0.log")
-	body := []byte(fmt.Sprintf("HEAD-PADDING-%s\nTAIL", string(make([]byte, 1000))))
+	body := fmt.Appendf(nil, "HEAD-PADDING-%s\nTAIL", string(make([]byte, 1000)))
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatal(err)
 	}

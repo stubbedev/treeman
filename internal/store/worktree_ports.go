@@ -40,11 +40,19 @@ func (s *Store) AllocateWorktreePort(ctx context.Context, repoID, worktreeID int
 		// SQLite reports both unique-index conflicts as the same
 		// constraint kind, so we need to distinguish via a follow-up
 		// query whether the conflict was on (repo, name, port) or
-		// (worktree, name). The former is recoverable (caller picks
-		// the next port); the latter is a programming bug.
+		// (worktree, name). Both are recoverable:
+		//
+		//   - (worktree, name): this worktree already holds the slot.
+		//     Happens when two allocate passes for the same worktree
+		//     race — the synchronous create handler and the detached
+		//     FinalizeWorktree both call Allocate, and the loser's
+		//     INSERT lands after the winner's row. Idempotent, not a
+		//     bug: signal the caller to reuse the recorded port.
+		//   - (repo, name, port): another live worktree holds this
+		//     exact port. Caller picks the next candidate.
 		if isUniqueConflict(err) {
 			if held, herr := s.LookupWorktreePort(ctx, worktreeID, name); herr == nil && held > 0 {
-				return fmt.Errorf("allocate worktree port: worktree %d already holds slot %q (port=%d)", worktreeID, name, held)
+				return ErrSlotHeld
 			}
 			return ErrPortInUse
 		}
@@ -57,6 +65,12 @@ func (s *Store) AllocateWorktreePort(ctx context.Context, repoID, worktreeID int
 // worktree. The allocator catches this, picks the next port in the
 // range, and retries.
 var ErrPortInUse = errors.New("port already allocated")
+
+// ErrSlotHeld signals that THIS worktree already holds the slot — a
+// concurrent allocate pass for the same worktree won the insert race.
+// The allocator catches this and reuses the recorded port instead of
+// failing the create.
+var ErrSlotHeld = errors.New("worktree already holds slot")
 
 // LookupWorktreePort returns the port assigned to (worktreeID, name)
 // or 0 if no row matches.
@@ -91,7 +105,7 @@ func (s *Store) LoadWorktreePorts(ctx context.Context, worktreeID int64) (map[st
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var name string
 		var port uint16
@@ -125,7 +139,7 @@ func (s *Store) ListUsedPorts(ctx context.Context, repoID int64, name string) (m
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var p uint16
 		if err := rows.Scan(&p); err != nil {
@@ -146,6 +160,47 @@ func (s *Store) ReleaseWorktreePorts(ctx context.Context, worktreeID int64) erro
 	_, err := s.DB.ExecContext(ctx,
 		`DELETE FROM worktree_ports WHERE worktree_id = ?`, worktreeID)
 	return err
+}
+
+// ReleaseWorktreePort drops a single (worktree, slot) row. Used to roll
+// back only the slots allocated in the current pass without disturbing
+// ports the worktree already held — the all-slot ReleaseWorktreePorts
+// would clobber pre-existing assignments on a partial-allocation retry.
+func (s *Store) ReleaseWorktreePort(ctx context.Context, worktreeID int64, name string) error {
+	if worktreeID <= 0 || name == "" {
+		return nil
+	}
+	_, err := s.DB.ExecContext(ctx,
+		`DELETE FROM worktree_ports WHERE worktree_id = ? AND name = ?`, worktreeID, name)
+	return err
+}
+
+// PurgeDeletedWorktreePorts physically drops every port row whose
+// worktree has been soft-deleted (deleted_at set) or whose worktree
+// row is gone entirely. Returns the number of rows reaped.
+//
+// Per-delete teardown already calls ReleaseWorktreePorts, but rows can
+// still leak when teardown is interrupted (daemon killed mid-teardown)
+// or when a worktree was deleted by an older binary that predates that
+// release. Leaked rows are invisible to ListUsedPorts (it filters on
+// deleted_at IS NULL) yet the unique index on (repo_id, name, port)
+// still rejects the re-insert, so the allocator climbs past every
+// leaked port instead of reusing it. Sweeping on daemon boot keeps the
+// allocation range from drifting upward indefinitely.
+func (s *Store) PurgeDeletedWorktreePorts(ctx context.Context) (int64, error) {
+	res, err := s.DB.ExecContext(ctx, `
+		DELETE FROM worktree_ports
+		WHERE worktree_id IN (
+			SELECT wp.worktree_id
+			FROM worktree_ports wp
+			LEFT JOIN worktrees w ON w.id = wp.worktree_id
+			WHERE w.id IS NULL OR w.deleted_at IS NOT NULL
+		)`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // SortedSlotNames returns the slot names of a port map in stable

@@ -3,11 +3,12 @@ package daemon
 import (
 	"context"
 	"fmt"
-	"log/slog"
+	"maps"
 	"sync"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/safego"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -26,6 +27,14 @@ type State struct {
 	// connection closes, and not context.Background(), which
 	// orphans the work on shutdown.
 	BgCtx context.Context
+
+	// SyncFinalize forces worktree-create's hooks+prepare tail to run
+	// synchronously instead of in a detached goroutine. The real daemon
+	// leaves this false (fast return; the tail outlives the RPC). The
+	// in-process executor (RunPlanInProcess, used by the CLI/MCP when no
+	// daemon is reachable) sets it true so the tail completes before the
+	// ephemeral State + store are torn down.
+	SyncFinalize bool
 
 	mu                sync.Mutex
 	watchers          map[string]*WatcherEntry
@@ -53,7 +62,7 @@ type State struct {
 	// state (DB + registry row) after the worktree has been deleted.
 	inFlightMu        sync.Mutex
 	inFlightTeardowns map[string]struct{}
-	inFlightFinalizes map[string]context.CancelFunc
+	inFlightFinalizes map[string]inFlightFinalize
 
 	// reapQueuesMu guards reapQueues. Each repo gets a single worker
 	// goroutine draining a buffered channel of trash paths — bursty
@@ -99,6 +108,16 @@ type State struct {
 	syncLastSkip map[string]string
 }
 
+// inFlightFinalize is the per-path tracking record kept in
+// State.inFlightFinalizes. cancel preempts the FinalizeWorktree
+// goroutine via its context; startedAt anchors the watchdog that
+// fails-out hung finalizes whose owning child has wedged (see
+// WatchdogStalePreparing).
+type inFlightFinalize struct {
+	cancel    context.CancelFunc
+	startedAt time.Time
+}
+
 // DBDropJob is one queued `prepare.TeardownDatabases` invocation,
 // scheduled by TeardownWorktree to run in the background after
 // teardown hooks complete. The cfg field is a value copy — the
@@ -129,14 +148,14 @@ func NewState(bg context.Context, s *store.Store) *State {
 	return &State{
 		Store:             s,
 		StartedAtUnix:     time.Now().Unix(),
-		PID:               uint32(syscallPid()),
+		PID:               uint32(syscallPid()), //nolint:gosec // a PID is non-negative and fits uint32
 		BgCtx:             bg,
 		watchers:          map[string]*WatcherEntry{},
 		wtWatchers:        map[string]*WatcherEntry{},
 		lifecycleWatchers: map[string]*WatcherEntry{},
 		teardownLks:       map[string]*sync.Mutex{},
 		inFlightTeardowns: map[string]struct{}{},
-		inFlightFinalizes: map[string]context.CancelFunc{},
+		inFlightFinalizes: map[string]inFlightFinalize{},
 		reapQueues:        map[string]chan string{},
 		dropQueues:        map[string]chan DBDropJob{},
 		syncBackoff:       map[string]time.Time{},
@@ -268,7 +287,7 @@ func (st *State) MarkFinalizeInFlight(wtPath string, cancel context.CancelFunc) 
 	if cancel == nil {
 		cancel = func() {}
 	}
-	st.inFlightFinalizes[wtPath] = cancel
+	st.inFlightFinalizes[wtPath] = inFlightFinalize{cancel: cancel, startedAt: time.Now()}
 	return true
 }
 
@@ -299,13 +318,28 @@ func (st *State) IsFinalizeInFlight(wtPath string) bool {
 // after the worktree has been removed.
 func (st *State) CancelFinalize(wtPath string) bool {
 	st.inFlightMu.Lock()
-	cancel, ok := st.inFlightFinalizes[wtPath]
+	entry, ok := st.inFlightFinalizes[wtPath]
 	st.inFlightMu.Unlock()
-	if !ok || cancel == nil {
+	if !ok || entry.cancel == nil {
 		return false
 	}
-	cancel()
+	entry.cancel()
 	return true
+}
+
+// SnapshotInFlightFinalizes returns a copy of (wtPath, startedAt) for
+// every FinalizeWorktree currently running. Used by the watchdog to
+// detect finalizes whose owning child has wedged past the prepare
+// timeout. Copying the map (rather than handing back the live one)
+// keeps the inFlightMu critical section short.
+func (st *State) SnapshotInFlightFinalizes() map[string]time.Time {
+	st.inFlightMu.Lock()
+	defer st.inFlightMu.Unlock()
+	out := make(map[string]time.Time, len(st.inFlightFinalizes))
+	for p, e := range st.inFlightFinalizes {
+		out[p] = e.startedAt
+	}
+	return out
 }
 
 // WaitFinalizeCleared blocks until no FinalizeWorktree is in flight
@@ -331,19 +365,37 @@ func (st *State) WaitFinalizeCleared(ctx context.Context, wtPath string, timeout
 	}
 }
 
-// safeGo runs fn in a new goroutine, recovering any panic so a
-// runtime error in one async task can't kill the whole daemon.
-// The panic is logged with the caller-supplied label.
-func safeGo(label string, fn func()) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Error("daemon goroutine panic",
-					"label", label, "panic", fmt.Sprint(r))
-			}
-		}()
-		fn()
-	}()
+// Goroutine labels for safeGo's panic logs. Same colon-hierarchy style
+// as the event types in store/eventtypes.go — one constant per
+// goroutine role, so the labels stay consistent and greppable instead
+// of being scattered string literals. The dynamic disambiguator (a
+// worktree/repo path) is passed to safeGo as `detail`, never glued
+// into the label.
+const (
+	lblLifecycle         = "lifecycle"
+	lblConfigReload      = "config:reload"
+	lblPlanRun           = "plan:run"
+	lblWorktreeFinalize  = "worktree:finalize"
+	lblWorktreeReap      = "worktree:reap"
+	lblWorktreeReapDrain = "worktree:reap:drain"
+	lblHeadActions       = "head:actions"
+	lblHeadFinalize      = "head:finalize"
+	lblHeadSync          = "head:sync"
+	lblWatcherHead       = "watcher:head"
+	lblWatcherFS         = "watcher:fs"
+	lblWatchActions      = "watch:actions"
+	lblWatchFinalize     = "watch:finalize"
+	lblDBDropOverflow    = "db:drop:overflow"
+	lblDBDropDrain       = "db:drop:drain"
+	lblNotify            = "notify:dispatch"
+	lblPlanLane          = "plan:lane"
+)
+
+// safeGo runs fn in a daemon goroutine with panic recovery (delegates
+// to safego.Go). label is an lbl* constant; detail is the worktree/repo
+// path the goroutine acts on ("" when process-wide).
+func safeGo(label, detail string, fn func()) {
+	safego.Go(label, detail, fn)
 }
 
 // LockRepoTeardown returns the per-repo teardown mutex, creating it
@@ -367,7 +419,7 @@ func (st *State) LockRepoTeardown(repoPath string) *sync.Mutex {
 func (st *State) WatcherCount() uint32 {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return uint32(len(st.watchers))
+	return uint32(len(st.watchers)) //nolint:gosec // watcher count is small and non-negative
 }
 
 // RegisterWatcher inserts (or replaces) an entry; Phase 10 wires the
@@ -487,6 +539,77 @@ func (st *State) HasLifecycleWatcher(repoPath string) bool {
 	defer st.mu.Unlock()
 	_, ok := st.lifecycleWatchers[repoPath]
 	return ok
+}
+
+// ListWtWatcherPaths returns the registered per-worktree watcher paths.
+// Used by daemon_state to surface which worktrees are observed.
+func (st *State) ListWtWatcherPaths() []string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := make([]string, 0, len(st.wtWatchers))
+	for p := range st.wtWatchers {
+		out = append(out, p)
+	}
+	return out
+}
+
+// ListLifecycleWatcherPaths returns the repo paths currently
+// covered by a lifecycle watcher.
+func (st *State) ListLifecycleWatcherPaths() []string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := make([]string, 0, len(st.lifecycleWatchers))
+	for p := range st.lifecycleWatchers {
+		out = append(out, p)
+	}
+	return out
+}
+
+// SnapshotInFlightTeardowns returns the set of worktree paths whose
+// primary TeardownWorktree is currently running.
+func (st *State) SnapshotInFlightTeardowns() []string {
+	st.inFlightMu.Lock()
+	defer st.inFlightMu.Unlock()
+	out := make([]string, 0, len(st.inFlightTeardowns))
+	for p := range st.inFlightTeardowns {
+		out = append(out, p)
+	}
+	return out
+}
+
+// SnapshotSyncBackoffs returns a copy of (repoPath, consec_failures,
+// next_retry_unix) for every repo currently in backoff. Entries with
+// no backoff window are omitted.
+func (st *State) SnapshotSyncBackoffs() map[string]struct {
+	Failures      int
+	NextRetryUnix int64
+} {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	out := make(map[string]struct {
+		Failures      int
+		NextRetryUnix int64
+	}, len(st.syncBackoff))
+	for repo, t := range st.syncBackoff {
+		out[repo] = struct {
+			Failures      int
+			NextRetryUnix int64
+		}{
+			Failures:      st.syncFailCount[repo],
+			NextRetryUnix: t.Unix(),
+		}
+	}
+	return out
+}
+
+// SnapshotSyncLastSkips returns a copy of the most-recent skip reason
+// per worktree (e.g. dirty, no-upstream). Read by daemon_state.
+func (st *State) SnapshotSyncLastSkips() map[string]string {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	out := make(map[string]string, len(st.syncLastSkip))
+	maps.Copy(out, st.syncLastSkip)
+	return out
 }
 
 // WatcherSummary mirrors `rpc.WatcherSummary` — duplicated to keep

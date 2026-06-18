@@ -17,9 +17,11 @@ import (
 	"sync"
 	"time"
 
+	// modernc.org/sqlite registers the pure-Go "sqlite" database/sql driver.
 	_ "modernc.org/sqlite"
 
 	"github.com/stubbedev/treeman/internal/runid"
+	"github.com/stubbedev/treeman/internal/safego"
 )
 
 //go:embed migrations/*.sql
@@ -67,19 +69,34 @@ type Store struct {
 	batchCancel context.CancelFunc
 	batchDone   chan struct{}
 	batchActive bool
+
+	// Event-hook registry. Hooks fire after every successful WriteEvent
+	// insert (both sync and batched paths). Used by the daemon's
+	// streaming RPC to fan-out events to MCP subscribers without
+	// polling SQLite. Hooks are best-effort — slow or panicking hooks
+	// don't block WriteEvent.
+	hookMu sync.RWMutex
+	hooks  map[string]EventHook
 }
+
+// EventHook is the callback registered via RegisterEventHook. Fires
+// once per WriteEvent (both sync and batched paths). Implementations
+// MUST return quickly — the call is on the WriteEvent path — and spawn
+// a goroutine if any real work (DB lookups, exec) is needed. The Event's
+// ID is best-effort: populated on the sync path, 0 on the batched path.
+type EventHook func(Event)
 
 // pendingEvent is one buffered events-table row awaiting flush.
 type pendingEvent struct {
 	tsMillis   int64
 	level      string
-	repoID     interface{}
-	worktreeID interface{}
+	repoID     any
+	worktreeID any
 	eventType  string
-	phase      interface{}
-	message    interface{}
+	phase      any
+	message    any
 	payload    string
-	durationMs interface{}
+	durationMs any
 }
 
 // batchFlushInterval bounds the worst-case latency between a
@@ -102,17 +119,103 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 	// modernc.org/sqlite's DSN supports query params for pragmas
 	// applied at connection open (compatible across the pool).
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", path)
+	dsn := fmt.Sprintf(
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)",
+		path,
+	)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite at %s: %w", path, err)
 	}
 	db.SetMaxOpenConns(8)
 	if err := migrate(ctx, db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return &Store{DB: db}, nil
+}
+
+// RegisterEventHook installs a callback that fires after every
+// WriteEvent insert (both sync and batched paths). id is a caller-
+// chosen unique key — re-registering the same id replaces the prior
+// hook. Hooks see a best-effort Event: ID is populated on the sync
+// path, 0 on the batched path. Cheap to register/unregister; takes
+// only the hook write-lock briefly.
+func (s *Store) RegisterEventHook(id string, fn EventHook) {
+	if id == "" || fn == nil {
+		return
+	}
+	s.hookMu.Lock()
+	if s.hooks == nil {
+		s.hooks = map[string]EventHook{}
+	}
+	s.hooks[id] = fn
+	s.hookMu.Unlock()
+}
+
+// UnregisterEventHook removes the named hook. No-op when the id was
+// never registered. Idempotent.
+func (s *Store) UnregisterEventHook(id string) {
+	s.hookMu.Lock()
+	delete(s.hooks, id)
+	s.hookMu.Unlock()
+}
+
+// fireEventHooks invokes every registered hook with ev. Panics in a
+// hook are recovered + logged so one misbehaving subscriber can't kill
+// the WriteEvent path. Hooks run synchronously under the read-lock —
+// they must return quickly (subscribers fan out in their own
+// goroutines).
+func (s *Store) fireEventHooks(ev Event) {
+	s.hookMu.RLock()
+	if len(s.hooks) == 0 {
+		s.hookMu.RUnlock()
+		return
+	}
+	hooks := make([]EventHook, 0, len(s.hooks))
+	for _, fn := range s.hooks {
+		hooks = append(hooks, fn)
+	}
+	s.hookMu.RUnlock()
+	for _, fn := range hooks {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Warn("event hook panic", "panic", fmt.Sprint(r))
+				}
+			}()
+			fn(ev)
+		}()
+	}
+}
+
+// pendingEventToEvent rebuilds an Event from the buffered row shape
+// used on the batched path. ID is 0 because the batched insert
+// doesn't capture lastrowid per row — subscribers that need ordering
+// should rely on Ts instead.
+func pendingEventToEvent(p pendingEvent) Event {
+	ev := Event{
+		Ts:          p.tsMillis,
+		Level:       p.level,
+		EventType:   p.eventType,
+		PayloadJSON: p.payload,
+	}
+	if v, ok := p.repoID.(int64); ok {
+		ev.RepoID = sql.NullInt64{Int64: v, Valid: true}
+	}
+	if v, ok := p.worktreeID.(int64); ok {
+		ev.WorktreeID = sql.NullInt64{Int64: v, Valid: true}
+	}
+	if v, ok := p.phase.(string); ok {
+		ev.Phase = v
+	}
+	if v, ok := p.message.(string); ok {
+		ev.Message = v
+	}
+	if v, ok := p.durationMs.(int64); ok {
+		ev.DurationMs = sql.NullInt64{Int64: v, Valid: true}
+	}
+	return ev
 }
 
 // Close shuts down the underlying pool. If the event batcher is
@@ -141,7 +244,7 @@ func (s *Store) StartEventBatcher(ctx context.Context) {
 	s.batchDone = make(chan struct{})
 	s.batchActive = true
 	s.batchMu.Unlock()
-	go s.eventBatchLoop()
+	safego.Go("store:event-batch", "", s.eventBatchLoop)
 }
 
 // StopEventBatcher cancels the flusher and synchronously drains any
@@ -315,7 +418,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		}
 		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
 			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-				return fmt.Errorf("apply migration %s: %w (rollback: %v)", e.Name(), err, rbErr)
+				return fmt.Errorf("apply migration %s: %w (rollback: %w)", e.Name(), err, rbErr)
 			}
 			return fmt.Errorf("apply migration %s: %w", e.Name(), err)
 		}
@@ -323,7 +426,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			"INSERT INTO _treeman_migrations(version, filename, applied_at) VALUES (?,?,?)",
 			version, e.Name(), nowMillis()); err != nil {
 			if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-				return fmt.Errorf("%w (rollback: %v)", err, rbErr)
+				return fmt.Errorf("%w (rollback: %w)", err, rbErr)
 			}
 			return err
 		}
@@ -384,11 +487,11 @@ func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path,
 		// `row.Deleted` check so predelete + db drop + git remove
 		// never run and the working tree lingers on disk forever.
 		// Also keep admin_dir current.
-		var br interface{}
+		var br any
 		if branch != "" {
 			br = branch
 		}
-		var ad interface{}
+		var ad any
 		if adminDir != "" {
 			ad = adminDir
 		}
@@ -405,11 +508,11 @@ func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path,
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
-	var br interface{}
+	var br any
 	if branch != "" {
 		br = branch
 	}
-	var ad interface{}
+	var ad any
 	if adminDir != "" {
 		ad = adminDir
 	}
@@ -436,7 +539,7 @@ func (s *Store) EnsureMainWorktree(ctx context.Context, repoID int64, path, slug
 	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
 	var id int64
 	if err := row.Scan(&id); err == nil {
-		var br interface{}
+		var br any
 		if branch != "" {
 			br = branch
 		}
@@ -453,7 +556,7 @@ func (s *Store) EnsureMainWorktree(ctx context.Context, repoID int64, path, slug
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
-	var br interface{}
+	var br any
 	if branch != "" {
 		br = branch
 	}
@@ -561,7 +664,7 @@ func (s *Store) ListWorktreesForRepo(ctx context.Context, repoID int64) ([]Workt
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []WorktreeRow
 	for rows.Next() {
 		var w WorktreeRow
@@ -600,7 +703,7 @@ func (s *Store) RemoveRepo(ctx context.Context, repoID int64) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	stmts := []string{
 		`DELETE FROM hook_runs WHERE worktree_id IN (SELECT id FROM worktrees WHERE repo_id = ?)`,
@@ -632,7 +735,7 @@ func (s *Store) ListRepoRefs(ctx context.Context) ([]RepoRef, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []RepoRef
 	for rows.Next() {
 		var r RepoRef
@@ -723,7 +826,7 @@ func (s *Store) LoadInheritedEnvByPath(ctx context.Context, worktreePath string)
 }
 
 // TouchWorktreeVisited stamps `last_visited_at = now` on the worktree
-// row. Called by `wt switch`, `wt go`, and any other path that
+// row. Called by `wt go` and any other path that
 // represents a user-driven move into a worktree. Used by `wt prev`
 // + `wt list --sort=visited` to surface recency.
 func (s *Store) TouchWorktreeVisited(ctx context.Context, id int64) error {
@@ -742,7 +845,7 @@ func (s *Store) TouchWorktreeVisitedByPath(ctx context.Context, path string) err
 	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE AND deleted_at IS NULL", path)
 	var id int64
 	if err := row.Scan(&id); err != nil {
-		return nil
+		return nil //nolint:nilerr // documented no-op when no worktree row matches the path
 	}
 	return s.TouchWorktreeVisited(ctx, id)
 }
@@ -848,7 +951,7 @@ func (s *Store) ListActiveWorktrees(ctx context.Context) ([]ActiveWorktree, erro
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []ActiveWorktree
 	for rows.Next() {
 		var a ActiveWorktree
@@ -867,7 +970,7 @@ func (s *Store) ListRepoPaths(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var p string
@@ -941,16 +1044,29 @@ func (s *Store) WriteEvent(ctx context.Context,
 			default:
 			}
 		}
+		// Fire hooks even on the batched path so subscribers see the
+		// event without waiting for the next flush. ID is 0 (assigned
+		// at flush time) — subscribers that need an ID can look it up
+		// via QueryEvents.
+		s.fireEventHooks(pendingEventToEvent(row))
 		return nil
 	}
 	s.batchMu.Unlock()
 
-	_, err = s.DB.ExecContext(ctx,
+	res, err := s.DB.ExecContext(ctx,
 		`INSERT INTO events(ts, level, repo_id, worktree_id, event_type, phase, message, payload_json, duration_ms)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		row.tsMillis, row.level, row.repoID, row.worktreeID,
 		row.eventType, row.phase, row.message, row.payload, row.durationMs)
-	return err
+	if err != nil {
+		return err
+	}
+	ev := pendingEventToEvent(row)
+	if id, idErr := res.LastInsertId(); idErr == nil {
+		ev.ID = id
+	}
+	s.fireEventHooks(ev)
+	return nil
 }
 
 // injectRunID stamps the ctx-bound run_id into payload so every event

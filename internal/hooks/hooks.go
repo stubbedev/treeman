@@ -13,8 +13,8 @@ package hooks
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -24,6 +24,8 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
+	"github.com/stubbedev/treeman/internal/safego"
+	"github.com/stubbedev/treeman/internal/shellenv"
 )
 
 // RunOutcome bundles every group's status.
@@ -81,7 +83,7 @@ func RunHooksOrphan(
 		return out, nil
 	}
 	if logDir == "" {
-		return out, fmt.Errorf("RunHooksOrphan: empty logDir")
+		return out, errors.New("RunHooksOrphan: empty logDir")
 	}
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return out, fmt.Errorf("create %s: %w", logDir, err)
@@ -94,7 +96,7 @@ func RunHooksOrphan(
 		}
 		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
 		// Default cwd is the repo root, not the (deleted) worktree.
-		cmdStr, err := renderAction(entry, repoRoot)
+		cmdStr, err := renderAction(ctx, entry, repoRoot)
 		if err != nil {
 			return out, err
 		}
@@ -112,7 +114,8 @@ func RunHooksOrphan(
 	if wait {
 		for idx, c := range cmds {
 			if err := c.Wait(); err != nil {
-				if exitErr, ok := err.(*exec.ExitError); ok {
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
 					out.Groups[idx].ExitCode = exitErr.ExitCode()
 				} else {
 					out.Groups[idx].ExitCode = -1
@@ -159,7 +162,7 @@ func RunHooks(
 			continue
 		}
 		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
-		cmdStr, err := renderAction(entry, worktreePath)
+		cmdStr, err := renderAction(ctx, entry, worktreePath)
 		if err != nil {
 			return out, err
 		}
@@ -181,7 +184,8 @@ func RunHooks(
 				// exit code on the outcome and let the caller
 				// decide. The same group's stdout/stderr are
 				// already in its log file.
-				if exitErr, ok := err.(*exec.ExitError); ok {
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
 					out.Groups[idx].ExitCode = exitErr.ExitCode()
 				} else {
 					out.Groups[idx].ExitCode = -1
@@ -201,6 +205,39 @@ func RunHooks(
 		}
 	}
 	return out, nil
+}
+
+// FirstFailureError returns a descriptive error for the first group in
+// out that exited non-zero, or nil when every group exited zero. The
+// message carries the failed group's command + the captured stderr
+// tail, plus a `treeman logs hooks --show <id>` pointer (when the id is
+// known via runIDs, index-aligned to out.Groups from PersistOutcome).
+//
+// Callers use this at a pipeline barrier — after a hook phase whose
+// success a later phase depends on — so the abort surfaces the true
+// cause (e.g. `composer install` exit 1) instead of a downstream
+// symptom (a `migrate` that fails only because vendor/ is half-written).
+func FirstFailureError(trigger string, out RunOutcome, runIDs []int64) error {
+	for i, g := range out.Groups {
+		if g.ExitCode == 0 {
+			continue
+		}
+		tail := strings.TrimSpace(g.StderrTail)
+		if len(tail) > 600 {
+			tail = "…" + tail[len(tail)-600:]
+		}
+		hint := "`treeman logs hooks --all`"
+		if i < len(runIDs) && runIDs[i] > 0 {
+			hint = fmt.Sprintf("`treeman logs hooks --all --show %d`", runIDs[i])
+		}
+		msg := fmt.Sprintf("%s: hook exited %d: %s", trigger, g.ExitCode, g.Command)
+		if tail != "" {
+			msg += "\n" + tail
+		}
+		msg += "\nfull output: " + hint
+		return errors.New(msg)
+	}
+	return nil
 }
 
 // readFileBytes returns the full body of path, or nil on any I/O
@@ -234,7 +271,7 @@ func lastBytes(b []byte, n int) string {
 // `defaultCwd` is the worktree root — used when the action's `cwd`
 // is empty on the host path. In the container path the absence of
 // `cwd` means "use the container's WORKDIR" (no `-w` flag).
-func renderAction(a config.Action, defaultCwd string) (string, error) {
+func renderAction(ctx context.Context, a config.Action, defaultCwd string) (string, error) {
 	if len(a.Run) == 0 {
 		return "", nil
 	}
@@ -254,7 +291,7 @@ func renderAction(a config.Action, defaultCwd string) (string, error) {
 	if engine == "" {
 		engine = "docker"
 	}
-	id, err := containerip.ContainerID(containerip.Opts{
+	id, err := containerip.ContainerID(ctx, containerip.Opts{
 		Container:      a.Container,
 		ComposeService: a.ComposeService,
 		ComposeProject: a.ComposeProject,
@@ -313,14 +350,20 @@ func shellSingleQuote(s string) string {
 // already deleted) it is the repo root, while `worktreePath` is the
 // deleted absolute path — surfaced in the env so user scripts can
 // still reference it.
-func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug string, isMain bool, logPath string, inheritedEnv map[string]string, wait bool) (*exec.Cmd, error) {
+func spawnDetached(
+	cmdStr, cwd, worktreePath, repoRoot, slug string,
+	isMain bool,
+	logPath string,
+	inheritedEnv map[string]string,
+	wait bool,
+) (*exec.Cmd, error) {
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open hook log %s: %w", logPath, err)
 	}
-	defer logFile.Close()
+	defer func() { _ = logFile.Close() }()
 
-	c := exec.Command("/bin/sh", "-c", cmdStr)
+	c := exec.Command("/bin/sh", "-c", cmdStr) //nolint:noctx // detached setsid hook; must outlive caller ctx
 	c.Dir = cwd
 	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug, isMain)
 	c.Stdout = logFile
@@ -336,55 +379,22 @@ func spawnDetached(cmdStr, cwd, worktreePath, repoRoot, slug string, isMain bool
 		// asynchronously so zombies don't pile up against this
 		// daemon process. Log non-zero exits at WARN so a background
 		// hook that's silently failing on every fire has a trail.
-		go func() {
+		safego.Go("hook:reap", "", func() {
 			err := c.Wait()
 			if err == nil {
 				return
 			}
-			if exitErr, ok := err.(*exec.ExitError); ok {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
 				slog.Warn("background hook non-zero exit",
 					"cmd", cmdStr, "exit_code", exitErr.ExitCode())
 				return
 			}
 			slog.Warn("background hook wait failed",
 				"cmd", cmdStr, "err", err)
-		}()
+		})
 	}
 	return c, nil
-}
-
-// runForeground runs one step synchronously, captures tails, returns
-// a GroupOutcome.
-func runForeground(ctx context.Context, cmdStr, cwd, repoRoot, worktreePath, slug string, isMain bool, inheritedEnv map[string]string) (GroupOutcome, error) {
-	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmdStr)
-	c.Dir = cwd
-	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug, isMain)
-	stdoutPipe, _ := c.StdoutPipe()
-	stderrPipe, _ := c.StderrPipe()
-	if err := c.Start(); err != nil {
-		return GroupOutcome{Command: cmdStr, ExitCode: -1}, fmt.Errorf("spawn `%s`: %w", cmdStr, err)
-	}
-	stdoutTail := captureTail(stdoutPipe, 16*1024)
-	stderrTail := captureTail(stderrPipe, 16*1024)
-	err := c.Wait()
-	g := GroupOutcome{Command: cmdStr, StdoutTail: stdoutTail, StderrTail: stderrTail}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		g.ExitCode = exitErr.ExitCode()
-	} else if err != nil {
-		g.ExitCode = -1
-	}
-	return g, nil
-}
-
-func captureTail(r io.Reader, cap int) string {
-	if r == nil {
-		return ""
-	}
-	all, _ := io.ReadAll(r)
-	if len(all) > cap {
-		all = all[len(all)-cap:]
-	}
-	return string(all)
 }
 
 // buildEnv assembles the env shipped to a hook subprocess. The goal:
@@ -407,25 +417,14 @@ func captureTail(r io.Reader, cap int) string {
 //     _SLUG, _IS_MAIN) so user scripts can address them. These always
 //     win. _IS_MAIN is "1" when this hook is firing for the repo
 //     root's main-wt enrollment, "0" for any linked worktree — lets a
-//     shared on-create-* hook branch behaviour (e.g. skip the dev .env
+//     shared create-* hook branch behaviour (e.g. skip the dev .env
 //     copy on linked wts).
 //
 // Layering order means the lifecycle watcher's empty `inheritedEnv`
 // is still safe (the daemon's env fills the floor), and a user with a
 // rich shell setup still gets their PATH / shims propagated.
 func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug string, isMain bool) []string {
-	merged := make(map[string]string, len(inheritedEnv)+32)
-	for _, kv := range os.Environ() {
-		for i := 0; i < len(kv); i++ {
-			if kv[i] == '=' {
-				merged[kv[:i]] = kv[i+1:]
-				break
-			}
-		}
-	}
-	for k, v := range inheritedEnv {
-		merged[k] = v
-	}
+	merged := shellenv.BaseEnv(inheritedEnv)
 	merged["TREEMAN_MAIN_ROOT"] = repoRoot
 	merged["TREEMAN_WORKTREE"] = worktreePath
 	merged["TREEMAN_SLUG"] = slug

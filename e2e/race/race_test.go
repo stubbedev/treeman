@@ -114,7 +114,7 @@ func TestDeleteDuringFinalize(t *testing.T) {
 worktrees:
   root: .worktrees
 hooks:
-  on-create-before-engines:
+  create-before-engines:
     - run: sleep 2
     - run: sleep 2
     - run: sleep 2

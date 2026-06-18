@@ -2,6 +2,7 @@ package wt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -69,10 +70,10 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 		sink = NoopSink{}
 	}
 	if req.Target == "" {
-		return DeleteResult{}, fmt.Errorf("target is required")
+		return DeleteResult{}, errors.New("target is required")
 	}
 	if req.RepoRoot == "" {
-		return DeleteResult{}, fmt.Errorf("repo_root is required")
+		return DeleteResult{}, errors.New("repo_root is required")
 	}
 
 	// Registry lookup wins over path interpretation. With Force we
@@ -87,7 +88,11 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 		}
 		wtPath = abs
 		if _, statErr := os.Stat(wtPath); statErr != nil && !req.Force {
-			return DeleteResult{}, fmt.Errorf("no worktree matches %q in %s (use --force to remove a stale registry entry)", req.Target, req.RepoRoot)
+			return DeleteResult{}, fmt.Errorf(
+				"no worktree matches %q in %s (use --force to remove a stale registry entry)",
+				req.Target,
+				req.RepoRoot,
+			)
 		}
 	}
 
@@ -99,7 +104,10 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 	// worktrees dir, never at the repo root, so this only trips on a
 	// main-worktree target.
 	if pathsEqual(wtPath, req.RepoRoot) {
-		return DeleteResult{}, fmt.Errorf("refusing to delete %q: it is the repo's main worktree (primary checkout), not a linked worktree", wtPath)
+		return DeleteResult{}, fmt.Errorf(
+			"refusing to delete %q: it is the repo's main worktree (primary checkout), not a linked worktree",
+			wtPath,
+		)
 	}
 
 	if req.Detached {
@@ -141,9 +149,9 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	branch := gitenv.DetectBranch(wtPath)
+	branch := gitenv.DetectBranch(ctx, wtPath)
 	id, err := ResolveIdentity(ctx, st, &cfg, repoRoot, wtPath, branch, repoID)
 	if err != nil {
 		return err
@@ -156,25 +164,29 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 		out, _ := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, id.Slug.Value, id.IsMain, env, true)
 		hooks.PersistOutcome(ctx, st, repoID, id.WtID, trigger, started, time.Now().UnixMilli(), out)
 	}
-	runTrigger("on-delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
+	runTrigger("delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
 	if err := prepare.TeardownDatabases(ctx, &cfg, id.Slug.Value, repoID, id.WtID, st); err != nil {
 		slog.Warn("wt delete: teardown databases",
 			"slug", id.Slug.Value, "repo", repoRoot, "wt", wtPath, "err", err)
-		_ = st.WriteEvent(ctx, store.LevelWarn, "wt_teardown_db_error",
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeDeleteError,
 			fmt.Sprintf("teardown databases: %v", err),
 			repoID, id.WtID, "", 0, map[string]any{
 				"slug": id.Slug.Value, "err": err.Error(),
 			})
 	}
-	runTrigger("on-delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
+	runTrigger("delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
 	// Release the per-worktree port reservations back into the pool
 	// so a future `wt create` can re-use them.
-	_ = st.ReleaseWorktreePorts(ctx, id.WtID)
+	if err := st.ReleaseWorktreePorts(ctx, id.WtID); err != nil {
+		slog.Warn("wt delete: release ports (freed ports stay blocked)", "wt", wtPath, "err", err)
+	}
 	// Drop every active-branch marker for this worktree. teardownBranchScoped
 	// only clears markers for currently-configured branch_scoped databases;
 	// this bulk clear also reaps markers for databases since removed from
 	// config, so a re-created worktree at the same path starts clean.
-	_ = st.ClearActiveBranchesForWorktree(ctx, id.WtID)
+	if err := st.ClearActiveBranchesForWorktree(ctx, id.WtID); err != nil {
+		slog.Warn("wt delete: clear active-branch markers (stale markers survive recreate)", "wt", wtPath, "err", err)
+	}
 	_ = st.MarkWorktreeDeleted(ctx, id.WtID)
 	args := []string{"worktree", "remove"}
 	if force {
@@ -186,7 +198,11 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 	if err := gitcmd.RunPiped(ctx, repoRoot, os.Stderr, os.Stderr, args...); err != nil && !force {
 		return fmt.Errorf("git worktree remove: %w", err)
 	}
-	PruneEmptyParents(wtPath, WorktreesRoot(cfg, repoRoot))
+	// git worktree remove leaves untracked copies/links bring-in behind
+	// (node_modules, vendored dirs, nested git repos). Nuke it plus the
+	// now-empty parent dirs so a future create at this path doesn't trip
+	// "destination path already exists".
+	RemoveWorktreeTree(wtPath, WorktreesRoot(cfg, repoRoot))
 	_ = sink
 	return nil
 }

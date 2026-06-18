@@ -9,6 +9,55 @@ permissions:
   contents: write
 
 jobs:
+  e2e:
+    name: e2e (${{ matrix.batch }})
+    # Docker-backed engine suites — run only on release tags, since the
+    # full ~60-suite fanout pulls ~3GB of images and is too heavy for
+    # every push/PR. Linux-only: GitHub's macOS runners have no usable
+    # Docker daemon, and every e2e test gates on harness.SkipIfNoDocker.
+    # Advisory: the publish job does NOT depend on this, so a failing
+    # (or flaky) batch surfaces in the run without blocking the release.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One runner per batch — mirrors the groupings in `just
+        # test-e2e` so the fanout parallelises instead of serialising
+        # behind a single docker daemon.
+        batch: [engines, fw1, fw2, matrix, watcher, features, cli]
+    timeout-minutes: 60
+    # Hoisted to job level so the login step's `if:` can read it —
+    # `secrets.*` isn't usable directly in a step `if`, and a step's
+    # own `env:` isn't in scope when its `if` is evaluated.
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: extractions/setup-just@v4
+      - name: docker preflight
+        run: docker version && docker compose version
+      # Authenticate to Docker Hub when credentials are configured.
+      # Raises the anonymous per-IP pull ceiling and gives steadier
+      # routing; skipped automatically on forks / runs without the
+      # secret so the suite still works unauthenticated.
+      - name: Log in to Docker Hub
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Warm the local image cache with retry before the suite runs, so
+      # a transient Docker Hub timeout retries here instead of failing a
+      # test's cold `docker compose up`.
+      - name: Pre-pull e2e images
+        run: just e2e-prepull ${{ matrix.batch }}
+      - name: run e2e batch
+        run: just test-e2e ${{ matrix.batch }}
+
   build:
     name: build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ${{ matrix.os }}
@@ -30,7 +79,7 @@ jobs:
             os: macos-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -58,6 +107,39 @@ jobs:
           name: ${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/treeman-*.tar.gz*
           retention-days: 7
+
+  cache:
+    name: push nix build to attic
+    # Build the nix package for this tag and push its closure to the
+    # self-hosted attic cache (nix.stubbe.dev/treeman) so `nix run`/flake
+    # consumers and the dotfiles substituter pull a prebuilt binary instead
+    # of recompiling. Independent of the Go release artifacts above.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+      - name: Build package
+        run: nix build .#treeman -L --print-out-paths | tee /tmp/treeman-outpaths
+
+      - name: Push to attic
+        # Best-effort: a cache-push failure (e.g. a transient 504 from the
+        # single-vCPU cache box on a large closure) must not redden a release.
+        # Retry with backoff, then give up softly.
+        continue-on-error: true
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          nix run nixpkgs#attic-client -- login stubbe https://nix.stubbe.dev "$ATTIC_TOKEN"
+          for attempt in 1 2 3; do
+            if nix run nixpkgs#attic-client -- push treeman $(cat /tmp/treeman-outpaths); then
+              exit 0
+            fi
+            echo "::warning::attic push attempt $attempt failed; retrying in $((attempt * 30))s"
+            sleep $((attempt * 30))
+          done
+          echo "::warning::attic push failed after 3 attempts; cache push is best-effort, continuing"
 
   release:
     name: publish github release

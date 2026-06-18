@@ -8,13 +8,17 @@
 package initgen
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/stubbedev/treeman/internal/config"
+	enginepkg "github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/yamlpatch"
@@ -35,6 +39,91 @@ func WriteYAML(cwd string, force bool) (path string, created bool, body string, 
 		return target, false, "", err
 	}
 	return target, !exists, body, nil
+}
+
+// WriteGlobalYAML scaffolds the user-global `config.yaml` at
+// config.GlobalConfigPath(). Returns the target path, whether a new
+// file was created, and the body. Refuses to clobber an existing file
+// unless force is set. The parent dir is created if missing.
+func WriteGlobalYAML(force bool) (path string, created bool, body string, err error) {
+	target, ok := config.GlobalConfigPath()
+	if !ok {
+		return "", false, "", errors.New("cannot resolve global config path (no home dir)")
+	}
+	_, statErr := os.Stat(target)
+	exists := statErr == nil
+	if exists && !force {
+		return target, false, "", fmt.Errorf("%s already exists (pass force to overwrite)", target)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return target, false, "", err
+	}
+	body = RenderGlobalTemplate()
+	if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+		return target, false, "", err
+	}
+	return target, !exists, body, nil
+}
+
+// RenderGlobalTemplate returns a commented `~/.config/treeman/config.yaml`
+// scaffold covering only the keys that make sense machine-wide (daemon,
+// snapshots, logs, auto_fetch, notifications). Repo-only blocks
+// (databases, patches, hooks, …) are intentionally omitted — those
+// belong in a per-repo `.treeman.yaml`. Pure function; no disk writes.
+//
+// The modeline points at the global schema file installed alongside it
+// (config.GlobalConfigPath's sibling) so editors validate the file
+// against the global-scoped schema, flagging repo-only keys.
+func RenderGlobalTemplate() string {
+	root := mapNode()
+	root.HeadComment = "yaml-language-server: $schema=" + schema.GlobalURL +
+		"\n\ntreeman user-global config — machine-wide defaults shared by every repo.\n" +
+		"Repo-specific blocks (databases, patches, hooks, main_worktree, env_sources)\n" +
+		"belong in each project's .treeman.yaml, not here."
+
+	// daemon: process-level settings (global-only). Plain scalars render
+	// unquoted, so `info`/`30`/`true` parse as the right YAML types.
+	daemon := mapNode("log_level", scalar("info"))
+	mapKeyNode(daemon, "log_level").LineComment = "debug | info | warn | error"
+	mapSet(root, "daemon", daemon)
+
+	// snapshots: machine-wide template cache + retention (global-only).
+	snapshots := mapNode(
+		"cap_per_repo", scalar("8"),
+		"keep_per_source", scalar("500"),
+		"max_age_days", scalar("30"),
+		"max_total_gb", scalar("20"),
+	)
+	mapKeyNode(snapshots, "cap_per_repo").HeadComment = "post-migration template cache eviction policy"
+	mapKeyNode(snapshots, "cap_per_repo").LineComment = "LRU cap per repo"
+	mapKeyNode(snapshots, "keep_per_source").LineComment = "max templates kept per migration-content source"
+	mapSet(root, "snapshots", snapshots)
+
+	// logs: daemon prune of the shared event log (global-only).
+	logs := mapNode("keep_days", scalar("14"))
+	mapKeyNode(logs, "keep_days").LineComment = "0 keeps forever"
+	mapSet(root, "logs", logs)
+
+	// auto_fetch: daemon periodic git fetch cadence (default; repos may
+	// opt out with `auto_fetch: {enabled: false}`).
+	af := mapNode(
+		"enabled", scalar("true"),
+		"interval_minutes", scalar("15"),
+	)
+	mapSet(root, "auto_fetch", af)
+
+	// notifications: desktop banners on lifecycle changes (global-only,
+	// off by default).
+	notif := mapNode("enabled", scalar("false"))
+	mapKeyNode(notif, "enabled").HeadComment = "desktop notifications on worktree lifecycle changes"
+	mapSet(root, "notifications", notif)
+
+	doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
+	out, err := yamlpatch.Marshal(doc)
+	if err != nil {
+		return "daemon:\n  log_level: info\n"
+	}
+	return string(out)
 }
 
 // RenderTemplate inspects `cwd` and returns a fully-declarative
@@ -117,16 +206,30 @@ func RenderTemplate(cwd string) string {
 			"engine", scalar(engine),
 			"name_template", scalar(name+"_testing_{slug}"),
 			"migrate", migrateBlock(spec),
-			"inputs", inputNodes(spec),
-			"test_clones", mapNode(
-				"clones", scalar("auto"),
-				"name_template", scalar(name+"_testing_{slug}_test_{n}"),
-			),
 		)
+		// Optional rollback block: only for frameworks with a clean
+		// step-based "undo last N migrations" CLI. Lets treeman re-apply
+		// an edited already-applied migration via rollback + re-migrate
+		// instead of a full cold rebuild. See DatabaseConfig.Rollback.
+		if spec.RollbackRun != "" {
+			mapSet(db, "rollback", rollbackBlock(spec))
+		}
+		mapSet(db, "inputs", inputNodes(spec))
+		mapSet(db, "test_clones", mapNode(
+			"clones", scalar("auto"),
+			"name_template", scalar(name+"_testing_{slug}_test_{n}"),
+		))
+		// prewarm only applies to Postgres (the only engine with a
+		// constant-time whole-database rename to claim spares with) —
+		// scaffold it where it's valid so users discover the knob.
+		if fam, ok := enginepkg.Canonical(engine); ok && fam == enginepkg.FamilyPostgres {
+			mapSet(db, "prewarm", scalar("2"))
+			mapKeyNode(db, "prewarm").LineComment = "spare clones pre-restored from the template; cache-hit creates claim one via rename (ms)"
+		}
 		mapSet(root, "databases", seqNode(db))
 	}
 
-	// hooks: on-create-before-engines:
+	// hooks: create-before-engines:
 	actions := seqNode()
 	if hasComposer {
 		actions.Content = append(actions.Content, hookGroup("composer install --no-interaction --prefer-dist"))
@@ -144,7 +247,7 @@ func RenderTemplate(cwd string) string {
 		actions.Style = yaml.FlowStyle
 		actions.HeadComment = "add install commands here — each action is one parallel group;\nuse run: [step1, step2] for sequenced commands inside one group."
 	}
-	hooks := mapNode("on-create-before-engines", actions)
+	hooks := mapNode("create-before-engines", actions)
 	mapSet(root, "hooks", hooks)
 	if len(detected) == 0 {
 		// Attach the "no databases yet" hint as a HeadComment on the
@@ -169,16 +272,29 @@ func RenderTemplate(cwd string) string {
 // that point the framework's migrate CLI at the per-run template DB.
 // Env keys are sorted so the emitted YAML is deterministic.
 func migrateBlock(spec framework.Spec) *yaml.Node {
-	out := mapNode("run", scalar(spec.MigrateRun))
-	if len(spec.MigrateEnv) > 0 {
-		envKeys := make([]string, 0, len(spec.MigrateEnv))
-		for k := range spec.MigrateEnv {
+	return stepBlock(spec.MigrateRun, spec.MigrateEnv)
+}
+
+// rollbackBlock renders the optional `databases[].rollback:` mapping —
+// the framework's step-based rollback CLI plus the same DB-targeting
+// env as migrate. Only emitted for frameworks that declare RollbackRun.
+func rollbackBlock(spec framework.Spec) *yaml.Node {
+	return stepBlock(spec.RollbackRun, spec.RollbackEnv)
+}
+
+// stepBlock renders a `{run, env}` step mapping. Env keys are sorted so
+// the emitted YAML is deterministic.
+func stepBlock(run string, envMap map[string]string) *yaml.Node {
+	out := mapNode("run", scalar(run))
+	if len(envMap) > 0 {
+		envKeys := make([]string, 0, len(envMap))
+		for k := range envMap {
 			envKeys = append(envKeys, k)
 		}
 		sort.Strings(envKeys)
 		env := mapNode()
 		for _, k := range envKeys {
-			mapSet(env, k, scalar(spec.MigrateEnv[k]))
+			mapSet(env, k, scalar(envMap[k]))
 		}
 		mapSet(out, "env", env)
 	}
@@ -187,38 +303,32 @@ func migrateBlock(spec framework.Spec) *yaml.Node {
 
 // inputNodes builds the `databases[].inputs:` sequence from a
 // detected framework. Each (migration_dir, file_glob) pair becomes
-// one entry with hash mode `filename` (migrations are append-only
-// in every framework we ship). Each lockfile becomes a bare-string
-// entry (default checksum hash).
+// one entry; each lockfile becomes another. All entries are content-
+// hashed — there is no per-entry hash mode anymore.
 func inputNodes(spec framework.Spec) *yaml.Node {
-	type entry struct {
-		glob, label, hash string
-	}
+	type entry struct{ glob, label string }
 	var entries []entry
 	seen := map[string]struct{}{}
-	add := func(glob, label, hash string) {
+	add := func(glob, label string) {
 		if _, dup := seen[glob]; dup {
 			return
 		}
 		seen[glob] = struct{}{}
-		entries = append(entries, entry{glob: glob, label: label, hash: hash})
+		entries = append(entries, entry{glob: glob, label: label})
 	}
 	for _, dir := range spec.MigrationDirs {
 		for _, pat := range spec.FileGlobs {
-			add(dir+"/**/"+pat, "migrations", "filename")
+			add(dir+"/**/"+pat, "migrations")
 		}
 	}
 	for _, lf := range spec.Lockfiles {
-		add(lf, "lockfile", "")
+		add(lf, "lockfile")
 	}
 	seq := seqNode()
 	for _, e := range entries {
 		m := mapNode("glob", scalar(e.glob))
 		if e.label != "" {
 			mapSet(m, "label", scalar(e.label))
-		}
-		if e.hash != "" {
-			mapSet(m, "hash", scalar(e.hash))
 		}
 		seq.Content = append(seq.Content, m)
 	}
@@ -244,13 +354,6 @@ func scalar(v string) *yaml.Node {
 	return &yaml.Node{Kind: yaml.ScalarNode, Value: v}
 }
 
-func scalarBool(b bool) *yaml.Node {
-	if b {
-		return &yaml.Node{Kind: yaml.ScalarNode, Value: "true", Tag: "!!bool"}
-	}
-	return &yaml.Node{Kind: yaml.ScalarNode, Value: "false", Tag: "!!bool"}
-}
-
 // mapNode constructs a mapping. Arguments alternate key (string) +
 // value (*yaml.Node).
 func mapNode(kv ...any) *yaml.Node {
@@ -270,14 +373,6 @@ func mapSet(m *yaml.Node, key string, value *yaml.Node) {
 func seqNode(items ...*yaml.Node) *yaml.Node {
 	n := &yaml.Node{Kind: yaml.SequenceNode}
 	n.Content = append(n.Content, items...)
-	return n
-}
-
-func stringSeq(items []string) *yaml.Node {
-	n := seqNode()
-	for _, s := range items {
-		n.Content = append(n.Content, scalar(s))
-	}
 	return n
 }
 
@@ -320,10 +415,8 @@ func defaultEnvSourcesFor(detected []framework.Spec, has func(string) bool) []st
 
 func hasFrameworkNamed(specs []framework.Spec, names ...string) bool {
 	for _, s := range specs {
-		for _, n := range names {
-			if s.Name == n {
-				return true
-			}
+		if slices.Contains(names, s.Name) {
+			return true
 		}
 	}
 	return false

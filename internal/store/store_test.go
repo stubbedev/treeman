@@ -13,14 +13,14 @@ func TestOpenAndMigrate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	// Re-opening should be a no-op.
 	s2, err := Open(ctx, p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2.Close()
+	_ = s2.Close()
 }
 
 func TestInheritedEnvRoundTrip(t *testing.T) {
@@ -29,7 +29,7 @@ func TestInheritedEnvRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	repoID, _ := s.EnsureRepo(ctx, "/repos/x", "x")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/wt/feat", "feat", "feat")
@@ -94,7 +94,7 @@ func TestEnsureRepoAndWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	repoID, err := s.EnsureRepo(ctx, "/repos/foo", "foo")
 	if err != nil {
@@ -128,7 +128,7 @@ func TestRemoveRepoCascadesChildren(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	repoID, err := s.EnsureRepo(ctx, "/repos/foo", "foo")
 	if err != nil {
@@ -138,7 +138,7 @@ func TestRemoveRepoCascadesChildren(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.WriteEvent(ctx, LevelInfo, "wt_finalize_start", "hi",
+	if err := s.WriteEvent(ctx, LevelInfo, EvtWorktreeCreateStart, "hi",
 		repoID, wtID, "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -182,9 +182,9 @@ func TestWriteEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
-	if err := s.WriteEvent(ctx, LevelInfo, "wt_finalize_start", "hi",
+	if err := s.WriteEvent(ctx, LevelInfo, EvtWorktreeCreateStart, "hi",
 		0, 0, "", 0, map[string]string{"engine": "mysql"}); err != nil {
 		t.Fatal(err)
 	}

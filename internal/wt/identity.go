@@ -2,8 +2,10 @@ package wt
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -47,6 +49,15 @@ func ResolveIdentity(
 	repoPath, wtPath, branch string,
 	repoID int64,
 ) (Identity, error) {
+	// Guard against registering a path that is not actually a worktree.
+	// Every legitimate caller passes either the repo root (the main
+	// worktree) or an existing git-linked worktree directory. A mistyped
+	// MCP `worktree` argument that resolved to <cwd>/<typo> would
+	// otherwise create a phantom registry row plus per-branch databases
+	// that no teardown ever reclaims.
+	if wtPath != repoPath && !gitenv.IsLinkedWorktree(wtPath) {
+		return Identity{}, fmt.Errorf("refusing to register %q: not a linked worktree", wtPath)
+	}
 	isMain := false
 	if wtPath == repoPath {
 		if cfg.MainWorktree.Enabled {

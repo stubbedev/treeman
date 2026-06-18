@@ -93,7 +93,11 @@ func TestPullOverwritesPatchedFile_DotenvIdentitySmudge(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(local, ".git", "info"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(local, ".git", "info", "attributes"), []byte(".env.testing filter=treeman-patch\n"), 0o644); err != nil {
+	if err := os.WriteFile(
+		filepath.Join(local, ".git", "info", "attributes"),
+		[]byte(".env.testing filter=treeman-patch\n"),
+		0o644,
+	); err != nil {
 		t.Fatal(err)
 	}
 	// Renormalize: pushes the cleaned content into the index so

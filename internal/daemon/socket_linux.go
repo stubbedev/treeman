@@ -30,7 +30,7 @@ func CheckPeerUID(c net.Conn) error {
 	if sockErr != nil {
 		return sockErr
 	}
-	our := uint32(os.Geteuid())
+	our := uint32(os.Geteuid()) //nolint:gosec // euid is always non-negative and fits uint32
 	if ucred.Uid != our {
 		return fmt.Errorf("peer uid %d != daemon uid %d", ucred.Uid, our)
 	}

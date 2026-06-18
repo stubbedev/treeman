@@ -25,11 +25,11 @@ import (
 )
 
 const (
-	endpoint   = "http://127.0.0.1:19000"
-	accessKey  = "minioadmin"
-	secretKey  = "minioadmin"
-	bucketLit  = "tme2es3-" // 8 char literal → satisfies validate.go's 6-char minLiteral guard
-	keyPrefix  = bucketLit + "{slug_dash}" // {slug} contains `_` which AWS rejects in bucket names; {slug_dash} substitutes hyphens
+	endpoint  = "http://127.0.0.1:19000"
+	accessKey = "minioadmin"
+	secretKey = "minioadmin"
+	bucketLit = "tme2es3-"                // 8 char literal → satisfies validate.go's 6-char minLiteral guard
+	keyPrefix = bucketLit + "{slug_dash}" // {slug} contains `_` which AWS rejects in bucket names; {slug_dash} substitutes hyphens
 )
 
 func TestS3EndToEnd(t *testing.T) {

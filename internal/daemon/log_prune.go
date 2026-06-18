@@ -53,4 +53,17 @@ func runLogPrune(ctx context.Context, st *State) {
 	if removed > 0 {
 		slog.Info("log_prune swept", "keep_days", keepDays, "rows_removed", removed)
 	}
+
+	// Same retention window reaps the path-keyed hash caches, which have
+	// no FK to cascade on teardown and otherwise grow unbounded as
+	// worktrees come and go (a live path's row is re-touched on every
+	// fingerprint scan, so an aged-out row is a dead path).
+	hashRows, err := st.Store.PruneStaleHashCaches(ctx, cutoff)
+	if err != nil {
+		slog.Warn("hash_cache_prune", "err", err)
+		return
+	}
+	if hashRows > 0 {
+		slog.Info("hash_cache_prune swept", "keep_days", keepDays, "rows_removed", hashRows)
+	}
 }

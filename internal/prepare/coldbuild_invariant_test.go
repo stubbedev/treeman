@@ -37,7 +37,10 @@ func TestColdBuildEmitsDropEventPerEngine(t *testing.T) {
 		t.Run(strings.TrimSuffix(lbl, ":"), func(t *testing.T) {
 			block := coldBuildBlock(t, body, lbl, labels, i)
 			if !strings.Contains(block, "emitColdBuildDrop(") {
-				t.Errorf("cold-build label %q missing emitColdBuildDrop(...) call — silent pre-drop regresses logs_query observability", lbl)
+				t.Errorf(
+					"cold-build label %q missing emitColdBuildDrop(...) call — silent pre-drop regresses logs_query observability",
+					lbl,
+				)
 			}
 		})
 	}
@@ -95,7 +98,10 @@ func TestColdBuildUsesSlugAnchoredDrop(t *testing.T) {
 		t.Run(strings.TrimSuffix(lbl, ":"), func(t *testing.T) {
 			block := coldBuildBlock(t, body, lbl, labels, i)
 			if banned.MatchString(block) {
-				t.Errorf("cold-build label %q calls bare DropMatching/DropPrefix — must use exact DropDatabase or DropMatchingFiltered/DropPrefixFiltered to avoid sibling-worktree wipe", lbl)
+				t.Errorf(
+					"cold-build label %q calls bare DropMatching/DropPrefix — must use exact DropDatabase or DropMatchingFiltered/DropPrefixFiltered to avoid sibling-worktree wipe",
+					lbl,
+				)
 			}
 		})
 	}

@@ -3,11 +3,12 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,15 +16,15 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/daemonctl"
-	"github.com/stubbedev/treeman/internal/engine"
-	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/initgen"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -40,62 +41,231 @@ func PrepareCmd() *cli.Command {
 			&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "json"},
+			&cli.BoolFlag{
+				Name:    "foreground",
+				Aliases: []string{"wait", "f"},
+				Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			outs, err := RunPrepareOnWorktree(ctx, c.String("worktree"), c.String("repo"))
+			wtPath, repoRoot, err := resolveWtRepo(c.String("worktree"), c.String("repo"))
 			if err != nil {
 				return err
 			}
+			task := rpc.Task{
+				Type: rpc.TaskPrepare, RepoPath: repoRoot, WorktreePath: wtPath,
+				InheritedEnv: CaptureInheritedEnv(),
+			}
 			if c.Bool("json") {
-				return jsonStream(map[string]any{"outcomes": outs})
+				return runResultJSON(ctx, task)
 			}
-			for _, o := range outs {
-				fmt.Printf("[%s] %s template=%s clones=%d\n", o.Engine, o.SourceDB, o.TemplateName, len(o.Clones))
-			}
-			return nil
+			return dispatchTask(ctx, task, c.Bool("foreground"), "prepare")
 		},
 	}
 }
 
-// RunPrepareOnWorktree is the shared core for `treeman prepare` and
-// the MCP `prepare_run` tool. Discovers the worktree + repo root,
-// loads resolved config, opens the SQLite store, and dispatches
-// prepare.Run. Returns the per-engine outcomes so callers can render
-// them however they like.
-func RunPrepareOnWorktree(ctx context.Context, worktree, repoOverride string) ([]prepare.Outcome, error) {
-	wt := worktree
-	if wt == "" {
-		cwd, _ := os.Getwd()
-		wt = cwd
+// The daemon is the preferred mutator of repo/worktree state: the CLI
+// builds a plan (parallel groups; tasks within a group run sequentially)
+// and dispatches it. When no daemon is reachable the same plan runs
+// in-process (submitPlan), so every command works daemon-less.
+
+// dispatchTask submits a single-task plan. When foreground is false it
+// queues the task on the daemon and returns at once; when no daemon is
+// reachable it runs the task in-process and reports the outcome. When
+// foreground is true it streams the daemon's live event tail (subscribing
+// before dispatch so no event is missed), or runs in-process when there's
+// no daemon. label is the human noun for messages.
+func dispatchTask(ctx context.Context, task rpc.Task, foreground bool, label string) error {
+	if foreground {
+		return foregroundTask(ctx, task, label)
 	}
-	wt = MustAbs(wt)
-	repoRoot, err := resolveRepo(repoOverride)
+	resp := submitPlan(ctx, rpc.Plan(false, rpc.One(task)))
+	switch resp.Kind {
+	case rpc.KindPlanQueued:
+		PrintOK("queued: %s detached to daemon — follow with `treeman logs tail --follow` (or re-run with --foreground)", label)
+		return nil
+	case rpc.KindPlanResult:
+		return reportInlineResult(resp, label) // ran in-process (no daemon)
+	default:
+		return fmt.Errorf("%s: %s", label, resp.Message)
+	}
+}
+
+// foregroundTask streams the daemon's live events to completion, or — when
+// no daemon is reachable — runs the plan in-process and reports the outcome.
+func foregroundTask(ctx context.Context, task rpc.Task, label string) error {
+	runID := runid.New()
+	ch, cancel, err := subscribeRun(ctx, runID)
 	if err != nil {
-		repoRoot, err = DiscoverRepoRoot(wt)
-		if err != nil {
-			return nil, err
+		return reportInlineResult(submitPlan(ctx, rpc.Plan(true, rpc.One(task))), label)
+	}
+	defer cancel()
+	req := rpc.Plan(false, rpc.One(task))
+	req.RunPlan.RunID = runID
+	if resp, callErr := rpc.Call(ctx, req); callErr != nil || resp.Kind != rpc.KindPlanQueued {
+		return reportInlineResult(submitPlan(ctx, rpc.Plan(true, rpc.One(task))), label)
+	}
+	return streamPlanEvents(ch, label)
+}
+
+// reportInlineResult prints the outcome of an in-process plan run and
+// surfaces the first failed task as an error.
+func reportInlineResult(resp rpc.Response, label string) error {
+	if resp.Kind == rpc.KindError {
+		return fmt.Errorf("%s: %s", label, resp.Message)
+	}
+	for _, r := range resp.TaskResults {
+		if !r.OK {
+			return fmt.Errorf("%s: %s", label, r.Message)
 		}
 	}
-	cfg, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
+	PrintOK("%s complete", label)
+	return nil
+}
+
+// resultTask runs a single-task plan to completion and returns the
+// per-task results (for --json / result-oriented callers). Dispatched to
+// the daemon when reachable, otherwise run in-process. A failed task
+// surfaces as an error.
+func resultTask(ctx context.Context, task rpc.Task) ([]rpc.TaskResult, error) {
+	resp := submitPlan(ctx, rpc.Plan(true, rpc.One(task)))
+	if resp.Kind == rpc.KindError {
+		return nil, errors.New(resp.Message)
+	}
+	if resp.Kind != rpc.KindPlanResult {
+		return nil, fmt.Errorf("unexpected response %q", resp.Kind)
+	}
+	for _, r := range resp.TaskResults {
+		if !r.OK {
+			return resp.TaskResults, fmt.Errorf("%s: %s", r.Type, r.Message)
+		}
+	}
+	return resp.TaskResults, nil
+}
+
+// resultPayload runs a single-task result plan and returns the task's
+// JSON payload bytes, for callers that render a human summary from the
+// structured result.
+func resultPayload(ctx context.Context, task rpc.Task) ([]byte, error) {
+	results, err := resultTask(ctx, task)
+	if err != nil || len(results) == 0 {
 		return nil, err
 	}
-	branch := detectBranchOfWorktree(wt)
-	dbPath, _ := store.DefaultDBPath()
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return nil, err
+	return []byte(results[0].PayloadJSON), nil
+}
+
+// runResultJSON runs a single-task result plan and prints the task's
+// structured JSON payload to stdout (the --json surface).
+func runResultJSON(ctx context.Context, task rpc.Task) error {
+	payload, err := resultPayload(ctx, task)
+	if err != nil || payload == nil {
+		return err
 	}
-	defer st.Close()
-	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	// Route through ResolveIdentity so this manual path matches the daemon:
-	// the main-worktree overlay is applied (bare active DB name) and a linked
-	// worktree's slug is its branch-independent path slug.
-	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
-	if err != nil {
-		return nil, err
+	_, werr := fmt.Fprintln(ui.Out, string(payload))
+	return werr
+}
+
+// finalizeRequest builds a fire-and-forget run_plan for the worktree-
+// finalize tail (setup hooks + prepare) — used by `wt finalize` and
+// `main enable`.
+func finalizeRequest(repoRoot, wtPath string) rpc.Request {
+	return rpc.Plan(false, rpc.One(rpc.Task{
+		Type:         rpc.TaskWorktreeFinalize,
+		RepoPath:     repoRoot,
+		WorktreePath: wtPath,
+		InheritedEnv: CaptureInheritedEnv(),
+	}))
+}
+
+// writeConfig persists a CLI-rendered config body through the daemon —
+// the sole writer of .treeman.yaml. The daemon snapshots the previous
+// content, atomic-writes the new body, and reloads the repo.
+func writeConfig(ctx context.Context, repoRoot, path string, body []byte) error {
+	_, err := resultTask(ctx, rpc.Task{
+		Type: rpc.TaskConfigWrite, RepoPath: repoRoot,
+		Params: map[string]string{rpc.ParamPath: path, rpc.ParamBody: string(body)},
+	})
+	return err
+}
+
+// submitPlan runs a plan: dispatch to the daemon when reachable, else
+// execute it in-process. treeman works daemon-less — the daemon is the
+// preferred mutator (fast async return, single writer), not a hard
+// requirement. Always yields a response: KindPlanQueued from a live
+// daemon, KindPlanResult from in-process, or KindError.
+func submitPlan(ctx context.Context, req rpc.Request) rpc.Response {
+	if resp, err := rpc.Call(ctx, req); err == nil {
+		return resp
 	}
-	return prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, CaptureInheritedEnv())
+	// Say so BEFORE running: without this line a task the user expects
+	// to queue detached silently blocks the terminal for the whole
+	// prepare instead.
+	PrintWarn("daemon unreachable — running in-process (blocks until done; `treeman daemon start` restores detached dispatch)")
+	resp, err := daemon.RunPlanInProcess(ctx, *req.RunPlan)
+	if err != nil {
+		return rpc.Response{Kind: rpc.KindError, Message: err.Error()}
+	}
+	return resp
+}
+
+// subscribeRun opens a run-id-scoped event subscription, starting the
+// daemon first if it isn't reachable.
+func subscribeRun(ctx context.Context, runID string) (<-chan rpc.EventEnvelope, func(), error) {
+	ch, cancel, err := rpc.SubscribeEvents(ctx, rpc.EventSubscribeArgs{RunID: runID})
+	if err != nil {
+		if startErr := wt2.EnsureDaemon(ctx); startErr != nil {
+			return nil, nil, err
+		}
+		ch, cancel, err = rpc.SubscribeEvents(ctx, rpc.EventSubscribeArgs{RunID: runID})
+	}
+	return ch, cancel, err
+}
+
+// streamPlanEvents prints the live event tail for a foreground plan and
+// returns when the daemon emits the terminal event: nil on plan:end,
+// an error on a run_plan error event. A closed channel (daemon gone)
+// returns a best-effort error.
+func streamPlanEvents(ch <-chan rpc.EventEnvelope, label string) error {
+	for ev := range ch {
+		switch ev.EventType {
+		case store.EvtPlanEnd:
+			return nil
+		case store.EvtPlanError:
+			if ev.Level == store.LevelError {
+				return fmt.Errorf("%s failed: %s", label, ev.Message)
+			}
+		}
+		printTaskEvent(ev)
+	}
+	return fmt.Errorf("%s: daemon closed the event stream before completion", label)
+}
+
+// printTaskEvent renders one streamed event line for a foreground plan.
+func printTaskEvent(ev rpc.EventEnvelope) {
+	switch ev.Level {
+	case store.LevelError, store.LevelWarn:
+		PrintWarn("%s: %s", ev.EventType, ev.Message)
+	default:
+		PrintInfo("%s: %s", ev.EventType, ev.Message)
+	}
+}
+
+// resolveWtRepo resolves a worktree arg (empty → cwd) to an absolute
+// path + its repo root, for dispatch args the daemon can act on (the
+// daemon's cwd is not the user's). Mirrors the resolution the prepare /
+// db-reset cores do inline.
+func resolveWtRepo(worktree, repoOverride string) (wtPath, repoRoot string, err error) {
+	wtPath = worktree
+	if wtPath == "" {
+		cwd, _ := os.Getwd()
+		wtPath = cwd
+	}
+	wtPath = MustAbs(wtPath)
+	repoRoot, err = resolveRepo(repoOverride)
+	if err != nil {
+		repoRoot, err = DiscoverRepoRoot(wtPath)
+	}
+	return wtPath, repoRoot, err
 }
 
 // DbCmd — `treeman db reset` re-syncs a worktree's branch_scoped
@@ -113,25 +283,31 @@ func DbCmd() *cli.Command {
 				ArgsUsage: "[worktree]",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
-					&cli.StringFlag{Name: "engine", Usage: "restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted)"},
+					&cli.StringFlag{
+						Name:  "engine",
+						Usage: "restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql/valkey/dragonfly accepted)",
+					},
 					&cli.BoolFlag{Name: "json"},
+					&cli.BoolFlag{
+						Name:    "foreground",
+						Aliases: []string{"wait", "f"},
+						Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+					},
 				},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					wt := c.Args().First()
-					outs, err := RunDbResetOnWorktree(ctx, wt, c.String("repo"), strings.ToLower(c.String("engine")))
+					wtPath, repoRoot, err := resolveWtRepo(c.Args().First(), c.String("repo"))
 					if err != nil {
 						return err
 					}
+					task := rpc.Task{
+						Type: rpc.TaskDBReset, RepoPath: repoRoot, WorktreePath: wtPath,
+						Params:       map[string]string{rpc.ParamEngineFilter: strings.ToLower(c.String("engine"))},
+						InheritedEnv: CaptureInheritedEnv(),
+					}
 					if c.Bool("json") {
-						return jsonStream(map[string]any{"outcomes": outs})
+						return runResultJSON(ctx, task)
 					}
-					for _, o := range outs {
-						fmt.Printf("[%s] %s re-seeded from base\n", o.Engine, o.SourceDB)
-					}
-					if len(outs) == 0 {
-						PrintInfo("no branch_scoped databases configured")
-					}
-					return nil
+					return dispatchTask(ctx, task, c.Bool("foreground"), "db reset")
 				},
 			},
 			{
@@ -157,10 +333,13 @@ func DbCmd() *cli.Command {
 					for _, d := range dbs {
 						active := d.ActiveBranch
 						if active == "" {
-							active = "(none)"
+							active = ui.Dim("(none)")
+						} else {
+							active = ui.Cyan(active)
 						}
-						fmt.Printf("[%s] %s — active branch: %s; resumable: %s\n",
-							d.Engine, d.Active, active, strings.Join(d.ResumableBranches, ", "))
+						ui.Plain("%s %s — active branch: %s; resumable: %s",
+							ui.Cyan("["+d.Engine+"]"), ui.Bold(d.Active), active,
+							ui.Dim(strings.Join(d.ResumableBranches, ", ")))
 					}
 					return nil
 				},
@@ -196,90 +375,13 @@ func RunDbStatusOnWorktree(ctx context.Context, worktree, repoOverride string) (
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
 	if err != nil {
 		return nil, err
 	}
 	return prepare.BranchScopedStatus(ctx, &cfg, repoRoot, wt, id.WtID, st)
-}
-
-// RunDbResetOnWorktree resolves the worktree + repo, drops every
-// branch_scoped database's active namespace + current durable copy,
-// then re-runs prepare so each is repopulated from the live base branch.
-func RunDbResetOnWorktree(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.Outcome, error) {
-	wt := worktree
-	if wt == "" {
-		cwd, _ := os.Getwd()
-		wt = cwd
-	}
-	wt = MustAbs(wt)
-	repoRoot, err := resolveRepo(repoOverride)
-	if err != nil {
-		repoRoot, err = DiscoverRepoRoot(wt)
-		if err != nil {
-			return nil, err
-		}
-	}
-	cfg, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
-		return nil, err
-	}
-	branch := detectBranchOfWorktree(wt)
-	dbPath, _ := store.DefaultDBPath()
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return nil, err
-	}
-	defer st.Close()
-	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	// Route through ResolveIdentity so the main-worktree overlay is applied
-	// (bare active DB name) and the slug matches the daemon's branch-
-	// independent value — reset operates on the same active namespace the
-	// swap lifecycle created.
-	id, err := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
-	if err != nil {
-		return nil, err
-	}
-	if err := prepare.ResetBranchScoped(ctx, &cfg, wt, repoID, id.WtID, st, engineFilter); err != nil {
-		return nil, err
-	}
-	outs, err := prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, CaptureInheritedEnv())
-	if err != nil {
-		return outs, err
-	}
-	// Surface only the seeded databases the reset actually touched.
-	// Match on the canonical engine family so an alias (mariadb, tidb,
-	// postgresql, opensearch) lines up with the canonical Outcome.Engine
-	// and an `--engine` filter written as the family name still hits.
-	filterLabel := engineFilter
-	if engineFilter != "" {
-		if fam, ok := engine.Canonical(engineFilter); ok {
-			filterLabel = string(fam)
-		}
-	}
-	var seeded []prepare.Outcome
-	for _, o := range outs {
-		for _, d := range cfg.Databases {
-			if !d.BranchScoped {
-				continue
-			}
-			fam, ok := engine.Canonical(d.Engine)
-			if !ok {
-				continue
-			}
-			label := string(fam)
-			if filterLabel != "" && label != filterLabel {
-				continue
-			}
-			if label == o.Engine {
-				seeded = append(seeded, o)
-				break
-			}
-		}
-	}
-	return seeded, nil
 }
 
 // HookCmd — `treeman hook run <phase>` runs the configured hooks
@@ -294,103 +396,33 @@ func HookCmd() *cli.Command {
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}},
 				&cli.BoolFlag{Name: "json"},
+				&cli.BoolFlag{
+					Name:    "foreground",
+					Aliases: []string{"wait", "f"},
+					Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+				},
 			},
 			Action: func(ctx context.Context, c *cli.Command) error {
 				if c.NArg() < 1 {
-					return fmt.Errorf("usage: treeman hook run <setup|teardown>")
+					return errors.New("usage: treeman hook run <phase>")
 				}
 				phase := c.Args().First()
-				out, err := RunHookPhase(ctx, phase, c.String("worktree"))
+				wtPath, repoRoot, err := resolveWtRepo(c.String("worktree"), "")
 				if err != nil {
 					return err
 				}
-				if c.Bool("json") {
-					return jsonStream(map[string]any{
-						"phase":   phase,
-						"outcome": out,
-					})
+				task := rpc.Task{
+					Type: rpc.TaskHookRun, RepoPath: repoRoot, WorktreePath: wtPath,
+					Params:       map[string]string{rpc.ParamPhase: phase},
+					InheritedEnv: CaptureInheritedEnv(),
 				}
-				fmt.Printf("%s: %d action(s) complete\n", phase, len(out.Groups))
-				return nil
+				if c.Bool("json") {
+					return runResultJSON(ctx, task)
+				}
+				return dispatchTask(ctx, task, c.Bool("foreground"), "hook "+phase)
 			},
 		}},
 	}
-}
-
-// RunHookPhase is the shared core for `treeman hook run <phase>`
-// and the MCP `hook_run` tool. Resolves cfg, runs the phase
-// synchronously, and returns the hooks.RunOutcome so callers can
-// inspect group exit codes / tails. Each run also persists a
-// hook_runs row + emits hook_start/hook_done events so the operation
-// is later searchable from `treeman logs`.
-func RunHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome, error) {
-	wt := worktree
-	if wt == "" {
-		cwd, _ := os.Getwd()
-		wt = cwd
-	}
-	wt = MustAbs(wt)
-	repoRoot, err := DiscoverRepoRoot(wt)
-	if err != nil {
-		return hooks.RunOutcome{}, err
-	}
-	cfg, err := resolve.LoadResolved(repoRoot)
-	if err != nil {
-		return hooks.RunOutcome{}, err
-	}
-	branch := detectBranchOfWorktree(wt)
-	env := CaptureInheritedEnv()
-
-	var (
-		st           *store.Store
-		repoID, wtID int64
-		sl           slug.Slug
-		isMain       bool
-		entries      int
-		startedMs    int64
-		out          hooks.RunOutcome
-		runErr       error
-	)
-	dbPath, _ := store.DefaultDBPath()
-	if dbPath != "" {
-		if s, oerr := store.Open(ctx, dbPath); oerr == nil {
-			st = s
-			defer st.Close()
-			repoID, _ = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-			id, idErr := wt2.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
-			if idErr != nil {
-				return hooks.RunOutcome{}, idErr
-			}
-			sl, wtID, isMain = id.Slug, id.WtID, id.IsMain
-		}
-	}
-	if sl.Value == "" {
-		// Store unreachable — fall back to a path-hash slug so the hook
-		// env still has something. $TREEMAN_IS_MAIN reads "0".
-		sl = slug.For(wt, branch)
-	}
-
-	var hookEntries []config.Action
-	switch phase {
-	case "on-create-before-engines":
-		hookEntries = cfg.Hooks.OnCreateBeforeEngines
-	case "on-create-after-engines":
-		hookEntries = cfg.Hooks.OnCreateAfterEngines
-	case "on-delete-before-engines":
-		hookEntries = cfg.Hooks.OnDeleteBeforeEngines
-	case "on-delete-after-engines":
-		hookEntries = cfg.Hooks.OnDeleteAfterEngines
-	case "on-checkout":
-		hookEntries = cfg.Hooks.OnCheckout
-	default:
-		return hooks.RunOutcome{}, fmt.Errorf("unknown phase: %s (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)", phase)
-	}
-	entries = len(hookEntries)
-
-	startedMs = hooks.EmitHookStart(ctx, st, repoID, wtID, phase, entries)
-	out, runErr = hooks.RunHooks(ctx, phase, hookEntries, repoRoot, wt, sl.Value, isMain, env, true)
-	hooks.PersistOutcome(ctx, st, repoID, wtID, phase, startedMs, time.Now().UnixMilli(), out)
-	return out, runErr
 }
 
 // padRight pads a possibly-ANSI-colored cell with trailing spaces.
@@ -488,11 +520,11 @@ func ConfigCmd() *cli.Command {
 						defer pager.Close()
 					}
 					b, _ := yaml.Marshal(cfg)
-					fmt.Fprint(ui.Out, string(b))
+					_, _ = fmt.Fprint(ui.Out, string(b))
 					if c.Bool("resolved") {
 						r := resolve.Resolve(&cfg, repoRoot)
-						fmt.Fprintln(ui.Out)
-						fmt.Fprintln(ui.Out, "# resolved connections")
+						_, _ = fmt.Fprintln(ui.Out)
+						_, _ = fmt.Fprintln(ui.Out, "# resolved connections")
 						printResolved("mysql", r.Mysql)
 						printResolved("postgres", r.Postgres)
 						printResolved("mongodb", r.Mongodb)
@@ -504,6 +536,114 @@ func ConfigCmd() *cli.Command {
 				},
 			},
 			configSet(),
+			configHistory(),
+			configRestore(),
+		},
+	}
+}
+
+// configHistory returns `treeman config history` — lists the per-repo
+// generations of `.treeman.yaml` stashed in SQLite each time the file
+// was overwritten by `config set` / `config write` / `main enable`.
+func configHistory() *cli.Command {
+	return &cli.Command{
+		Name:  "history",
+		Usage: "list stored .treeman.yaml generations for this repo",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+			&cli.BoolFlag{Name: "json"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			repoRoot, err := resolveRepo(c.String("repo"))
+			if err != nil {
+				return err
+			}
+			p := filepath.Join(repoRoot, ".treeman.yaml")
+			st, err := openDefaultStore(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = st.Close() }()
+			gens, err := st.ListConfigGenerations(ctx, repoRoot, p)
+			if err != nil {
+				return err
+			}
+			if c.Bool("json") {
+				rows := make([]map[string]any, 0, len(gens))
+				for _, g := range gens {
+					rows = append(rows, map[string]any{
+						"generation": g.Generation,
+						"created_at": time.UnixMilli(g.CreatedAt).UTC().Format(time.RFC3339),
+						"bytes":      len(g.Content),
+					})
+				}
+				return jsonStream(map[string]any{"repo": repoRoot, "generations": rows})
+			}
+			if len(gens) == 0 {
+				ui.Info("no stored generations for %s", p)
+				return nil
+			}
+			for _, g := range gens {
+				_, _ = fmt.Fprintf(ui.Out, "  %s  %s  %d bytes\n",
+					ui.Bold(fmt.Sprintf("gen %d", g.Generation)),
+					time.UnixMilli(g.CreatedAt).Local().Format("2006-01-02 15:04:05"),
+					len(g.Content))
+			}
+			ui.Hint("restore one with `treeman config restore <generation>`")
+			return nil
+		},
+	}
+}
+
+// configRestore returns `treeman config restore <generation>` — writes
+// a stored generation back to `.treeman.yaml`. The current content is
+// itself snapshotted first, so a restore is reversible.
+func configRestore() *cli.Command {
+	return &cli.Command{
+		Name:      "restore",
+		Usage:     "write a stored generation back to .treeman.yaml",
+		ArgsUsage: "<generation>",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+			&cli.BoolFlag{Name: "json"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			if c.NArg() < 1 {
+				return errors.New("usage: treeman config restore <generation>")
+			}
+			gen, err := strconv.ParseInt(c.Args().Get(0), 10, 64)
+			if err != nil {
+				return fmt.Errorf("generation must be an integer: %w", err)
+			}
+			repoRoot, err := resolveRepo(c.String("repo"))
+			if err != nil {
+				return err
+			}
+			p := filepath.Join(repoRoot, ".treeman.yaml")
+			st, err := openDefaultStore(ctx)
+			if err != nil {
+				return err
+			}
+			g, err := st.GetConfigGeneration(ctx, repoRoot, p, gen)
+			_ = st.Close()
+			if err != nil {
+				return fmt.Errorf("generation %d not found for %s", gen, p)
+			}
+			if err := config.CheckBodyScope(g.Content, "repo"); err != nil {
+				return fmt.Errorf("generation %d cannot be restored: %w", gen, err)
+			}
+			if err := writeConfig(ctx, repoRoot, p, g.Content); err != nil {
+				return err
+			}
+			if c.Bool("json") {
+				return jsonStream(map[string]any{
+					"repo":     repoRoot,
+					"restored": gen,
+					"bytes":    len(g.Content),
+				})
+			}
+			PrintOK("restored generation %d → %s (%d bytes)", gen, p, len(g.Content))
+			return nil
 		},
 	}
 }
@@ -514,19 +654,22 @@ func printResolved(name string, c any) {
 	// is good enough. Write through ui.Out so the pager wrap in
 	// `config show` captures these lines too.
 	if isNil(c) {
-		fmt.Fprintf(ui.Out, "# %s <- (none)\n", name)
+		_, _ = fmt.Fprintf(ui.Out, "# %s <- (none)\n", name)
 		return
 	}
-	b, _ := json.Marshal(c)
-	fmt.Fprintf(ui.Out, "# %s <- %s\n", name, string(b))
+	b, err := json.Marshal(c)
+	if err != nil {
+		_, _ = fmt.Fprintf(ui.Out, "# %s <- (unprintable: %v)\n", name, err)
+		return
+	}
+	_, _ = fmt.Fprintf(ui.Out, "# %s <- %s\n", name, string(b))
 }
 
 func isNil(v any) bool {
 	if v == nil {
 		return true
 	}
-	switch x := v.(type) {
-	case interface{ IsNil() bool }:
+	if x, ok := v.(interface{ IsNil() bool }); ok {
 		return x.IsNil()
 	}
 	// Reflection-free heuristic: stringify and look for the typed-
@@ -556,10 +699,28 @@ func SchemaCmd() *cli.Command {
 		Usage: "JSON schema helpers",
 		Commands: []*cli.Command{
 			{
-				Name:  "dump",
-				Flags: []cli.Flag{&cli.StringFlag{Name: "out"}},
+				Name: "dump",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "out"},
+					&cli.StringFlag{
+						Name:  "scope",
+						Value: "full",
+						Usage: "full (default, every key) | global (~/.config/treeman/config.yaml keys) | repo (.treeman.yaml keys)",
+					},
+				},
 				Action: func(ctx context.Context, c *cli.Command) error {
-					b, err := schema.Render()
+					var sc schema.Scope
+					switch c.String("scope") {
+					case "", "full":
+						sc = schema.ScopeFull
+					case "global":
+						sc = schema.ScopeGlobal
+					case "repo":
+						sc = schema.ScopeRepo
+					default:
+						return fmt.Errorf("invalid --scope %q (want full|global|repo)", c.String("scope"))
+					}
+					b, err := schema.RenderScoped(sc)
 					if err != nil {
 						return err
 					}
@@ -584,7 +745,7 @@ func SchemaCmd() *cli.Command {
 
 func schemaInstall(ctx context.Context, c *cli.Command) error {
 	if c.Bool("global") && c.Bool("url") {
-		return fmt.Errorf("--global and --url are mutually exclusive")
+		return errors.New("--global and --url are mutually exclusive")
 	}
 	cwd, _ := os.Getwd()
 	repoRoot, err := DiscoverRepoRoot(cwd)
@@ -610,7 +771,16 @@ func schemaInstall(ctx context.Context, c *cli.Command) error {
 		PrintOK("wrote %s", resolved)
 	}
 	if changed {
-		PrintOK("updated modeline in .treeman.yaml → %s", resolved)
+		// The modeline file depends on the target: --global rewrites the
+		// user-global config, every other target rewrites the repo
+		// `.treeman.yaml`. Report the file actually edited.
+		modelineFile := ".treeman.yaml"
+		if target == schema.TargetGlobal {
+			if gp, ok := config.GlobalConfigPath(); ok {
+				modelineFile = gp
+			}
+		}
+		PrintOK("updated modeline in %s → %s", modelineFile, resolved)
 	}
 	return nil
 }
@@ -635,6 +805,12 @@ func DaemonCmd() *cli.Command {
 				Name:   "status",
 				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json"}},
 				Action: daemonStatus,
+			},
+			{
+				Name:   "state",
+				Usage:  "live runtime snapshot — watchers, in-flight finalizes/teardowns, auto-fetch backoffs (CLI twin of the MCP daemon_state tool)",
+				Flags:  []cli.Flag{&cli.BoolFlag{Name: "json"}},
+				Action: daemonState,
 			},
 			{Name: "install", Action: daemonInstall},
 			{
@@ -671,6 +847,64 @@ func daemonReload(ctx context.Context, c *cli.Command) error {
 		PrintOK("config reload requested (all repos)")
 	} else {
 		PrintOK("config reload requested (%s)", repoPath)
+	}
+	return nil
+}
+
+// daemonState — `treeman daemon state` prints the daemon's live
+// runtime snapshot. Answers "is a finalize already running for this
+// worktree / why isn't this repo auto-fetching?" without reaching for
+// the MCP server.
+func daemonState(ctx context.Context, c *cli.Command) error {
+	resp, err := rpc.Call(ctx, rpc.Request{Method: rpc.MethodDaemonState})
+	if err != nil {
+		return fmt.Errorf("daemon not reachable: %w (start it with `treeman daemon start`)", err)
+	}
+	if resp.Kind == rpc.KindError {
+		return fmt.Errorf("daemon: %s", resp.Message)
+	}
+	if c.Bool("json") {
+		return jsonStream(resp.State)
+	}
+	st := resp.State
+	if st == nil {
+		PrintInfo("daemon returned no state snapshot")
+		return nil
+	}
+	_, _ = fmt.Fprintf(ui.Out, "%s %d repo watcher(s)\n", ui.Bold("watchers:"), st.WatcherCount)
+	for _, w := range st.Watchers {
+		_, _ = fmt.Fprintf(ui.Out, "  %s (%d worktree(s))\n", w.Repo, w.WorktreeCount)
+	}
+	if len(st.WorktreeWatchers) > 0 {
+		_, _ = fmt.Fprintf(ui.Out, "%s %s\n", ui.Bold("worktree watchers:"), strings.Join(st.WorktreeWatchers, ", "))
+	}
+	if len(st.LifecycleWatchers) > 0 {
+		_, _ = fmt.Fprintf(ui.Out, "%s %s\n", ui.Bold("lifecycle watchers:"), strings.Join(st.LifecycleWatchers, ", "))
+	}
+	if len(st.InFlightFinalizes) > 0 {
+		_, _ = fmt.Fprintln(ui.Out, ui.Bold("in-flight finalizes:"))
+		for _, f := range st.InFlightFinalizes {
+			_, _ = fmt.Fprintf(ui.Out, "  %s (running %ds)\n", f.WorktreePath, f.AgeSeconds)
+		}
+	}
+	if len(st.InFlightTeardowns) > 0 {
+		_, _ = fmt.Fprintf(ui.Out, "%s %s\n", ui.Bold("in-flight teardowns:"), strings.Join(st.InFlightTeardowns, ", "))
+	}
+	if len(st.SyncBackoffs) > 0 {
+		_, _ = fmt.Fprintln(ui.Out, ui.Bold("auto-fetch backoffs:"))
+		for _, b := range st.SyncBackoffs {
+			next := "eligible now"
+			if b.NextRetryUnix > 0 {
+				next = "next retry " + time.Unix(b.NextRetryUnix, 0).Format(time.TimeOnly)
+			}
+			_, _ = fmt.Fprintf(ui.Out, "  %s: %d consecutive failure(s), %s\n", b.RepoPath, b.ConsecFailures, next)
+		}
+	}
+	for repo, reason := range st.SyncLastSkips {
+		_, _ = fmt.Fprintf(ui.Out, "%s %s: %s\n", ui.Bold("last fetch skip:"), repo, reason)
+	}
+	if st.WatcherCount == 0 && len(st.InFlightFinalizes) == 0 && len(st.InFlightTeardowns) == 0 {
+		PrintInfo("daemon idle — no watchers or in-flight work")
 	}
 	return nil
 }
@@ -720,7 +954,7 @@ func daemonStatus(ctx context.Context, c *cli.Command) error {
 		ui.Warn("daemon not running")
 		ui.Hint("start it with: treeman daemon start")
 		ui.Hint("or auto-launch on login: treeman daemon install")
-		return nil
+		return nil //nolint:nilerr // "not running" is a normal status result, not a CLI error
 	}
 	if resp.Kind == rpc.KindError {
 		return fmt.Errorf("daemon: %s", resp.Message)
@@ -744,7 +978,7 @@ func daemonInstall(ctx context.Context, c *cli.Command) error {
 func daemonUninstall(ctx context.Context, c *cli.Command) error {
 	if !c.Bool("yes") {
 		if !ui.Confirm("remove the treemand systemd/launchd auto-start unit?") {
-			return fmt.Errorf("aborted")
+			return errors.New("aborted")
 		}
 	}
 	switch runtime.GOOS {
@@ -755,108 +989,41 @@ func daemonUninstall(ctx context.Context, c *cli.Command) error {
 	}
 }
 
+// The systemd/launchd install/uninstall implementations live in the
+// daemonctl package so the MCP daemon_control tool shares them. These
+// thin wrappers print the daemonctl summary; the test suite calls them
+// directly to exercise both OS branches on a single host.
+
 func daemonInstallSystemd(ctx context.Context) error {
-	unit := `[Install]
-WantedBy=default.target
-
-[Service]
-ExecStart=` + mustResolveTreemand() + `
-Restart=on-failure
-RestartSec=2
-Type=simple
-
-[Unit]
-After=default.target
-Description=Treeman per-worktree DB orchestrator daemon
-`
-	home, _ := os.UserHomeDir()
-	dst := filepath.Join(home, ".config", "systemd", "user", "treemand.service")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
+	msg, err := daemonctl.InstallSystemd(ctx)
+	if err == nil {
+		PrintOK("%s", msg)
 	}
-	if err := os.WriteFile(dst, []byte(unit), 0o644); err != nil {
-		return err
-	}
-	if err := exec.CommandContext(ctx, "systemctl", "--user", "daemon-reload").Run(); err != nil {
-		return err
-	}
-	if err := exec.CommandContext(ctx, "systemctl", "--user", "enable", "--now", "treemand").Run(); err != nil {
-		return err
-	}
-	PrintOK("installed + enabled treemand.service at %s", dst)
-	return nil
+	return err
 }
 
 func daemonUninstallSystemd(ctx context.Context) error {
-	_ = exec.CommandContext(ctx, "systemctl", "--user", "disable", "--now", "treemand").Run()
-	home, _ := os.UserHomeDir()
-	dst := filepath.Join(home, ".config", "systemd", "user", "treemand.service")
-	_ = os.Remove(dst)
-	_ = exec.CommandContext(ctx, "systemctl", "--user", "daemon-reload").Run()
-	PrintOK("uninstalled treemand.service")
-	return nil
+	msg, err := daemonctl.UninstallSystemd(ctx)
+	if err == nil {
+		PrintOK("%s", msg)
+	}
+	return err
 }
 
 func daemonInstallLaunchd(ctx context.Context) error {
-	bin := mustResolveTreemand()
-	home, _ := os.UserHomeDir()
-	logDir := filepath.Join(home, ".local", "share", "treeman")
-	_ = os.MkdirAll(logDir, 0o755)
-	// KeepAlive is a dict — `SuccessfulExit=false` keeps launchd from
-	// respawning the daemon after `treeman daemon stop` (which exits
-	// cleanly via the shutdown RPC). Crash exits (non-zero) still
-	// trigger relaunch. ThrottleInterval keeps a crash-loop from
-	// pegging the CPU while a misconfiguration drives the daemon to
-	// die on boot.
-	plist := `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>            <string>` + daemonctl.LaunchdLabel + `</string>
-    <key>ProgramArguments</key> <array><string>` + bin + `</string></array>
-    <key>RunAtLoad</key>        <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key> <integer>5</integer>
-    <key>StandardOutPath</key>  <string>` + filepath.Join(logDir, "treemand.log") + `</string>
-    <key>StandardErrorPath</key><string>` + filepath.Join(logDir, "treemand.log") + `</string>
-    <key>ProcessType</key>      <string>Background</string>
-</dict>
-</plist>
-`
-	dst := filepath.Join(home, "Library", "LaunchAgents", daemonctl.LaunchdLabel+".plist")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
+	msg, err := daemonctl.InstallLaunchd(ctx)
+	if err == nil {
+		PrintOK("%s", msg)
 	}
-	if err := os.WriteFile(dst, []byte(plist), 0o644); err != nil {
-		return err
-	}
-	uid := os.Getuid()
-	domain := fmt.Sprintf("gui/%d", uid)
-	// Best-effort unload first so re-install doesn't error.
-	_ = exec.CommandContext(ctx, "launchctl", "bootout", domain, dst).Run()
-	if err := exec.CommandContext(ctx, "launchctl", "bootstrap", domain, dst).Run(); err != nil {
-		return fmt.Errorf("launchctl bootstrap %s: %w", dst, err)
-	}
-	if err := exec.CommandContext(ctx, "launchctl", "enable", domain+"/"+daemonctl.LaunchdLabel).Run(); err != nil {
-		return fmt.Errorf("launchctl enable %s: %w", daemonctl.LaunchdLabel, err)
-	}
-	PrintOK("installed + enabled %s at %s", daemonctl.LaunchdLabel, dst)
-	return nil
+	return err
 }
 
 func daemonUninstallLaunchd(ctx context.Context) error {
-	home, _ := os.UserHomeDir()
-	dst := filepath.Join(home, "Library", "LaunchAgents", daemonctl.LaunchdLabel+".plist")
-	uid := os.Getuid()
-	domain := fmt.Sprintf("gui/%d", uid)
-	_ = exec.CommandContext(ctx, "launchctl", "bootout", domain, dst).Run()
-	_ = os.Remove(dst)
-	PrintOK("uninstalled %s", daemonctl.LaunchdLabel)
-	return nil
+	msg, err := daemonctl.UninstallLaunchd(ctx)
+	if err == nil {
+		PrintOK("%s", msg)
+	}
+	return err
 }
 
 // daemonAutoStartInstalled reports whether a systemd-user or launchd
@@ -882,19 +1049,12 @@ func daemonAutoStartInstalled() bool {
 	return false
 }
 
-func mustResolveTreemand() string {
-	if p, err := exec.LookPath("treemand"); err == nil {
-		return p
-	}
-	return "/usr/local/bin/treemand"
-}
-
 // FwCmd — `treeman fw detect` lists detected migration + test
 // frameworks.
 func FwCmd() *cli.Command {
 	return &cli.Command{
-		Name:    "fw",
-		Aliases: []string{"frameworks"},
+		Name:    "frameworks",
+		Aliases: []string{"fw"},
 		Usage:   "framework detection",
 		Commands: []*cli.Command{{
 			Name:  "detect",
@@ -905,7 +1065,10 @@ func FwCmd() *cli.Command {
 				if err != nil {
 					return err
 				}
-				r := framework.DefaultRegistry()
+				// Honour the user's `frameworks:` block alongside the
+				// built-in detectors.
+				cfg, _ := resolve.LoadResolved(repoRoot)
+				r := framework.RegistryFor(&cfg)
 				detected := r.DetectAll(repoRoot)
 				if c.Bool("json") {
 					return jsonStream(map[string]any{
@@ -915,16 +1078,16 @@ func FwCmd() *cli.Command {
 						"auto_clone_target": testfw.DetectedCloneCount(repoRoot),
 					})
 				}
-				migs := ui.NewTable("MIGRATION_FW", "HASH_MODE", "ON_MODIFY", "DIRS")
+				migs := ui.NewTable("MIGRATION_FW", "ON_MODIFY", "DIRS")
 				for _, s := range detected {
-					migs.Row(ui.Cyan(s.Name), string(s.HashMode), string(s.OnModify), ui.Dim(strings.Join(s.MigrationDirs, ",")))
+					migs.Row(ui.Cyan(s.Name), string(s.OnModify), ui.Dim(strings.Join(s.MigrationDirs, ",")))
 				}
 				if len(detected) == 0 {
 					ui.Info("no migration framework detected in %s", repoRoot)
 				} else {
 					migs.Render(nil)
 				}
-				fmt.Println()
+				ui.Plain("")
 				tests := ui.NewTable("TEST_FW", "LANGUAGE", "STRATEGY", "WORKER_IDX", "WORKER_ENV")
 				detTests := testfw.DetectAll(repoRoot)
 				for _, t := range detTests {
@@ -935,7 +1098,9 @@ func FwCmd() *cli.Command {
 				} else {
 					tests.Render(nil)
 				}
-				fmt.Printf("\nauto-clones (replication target): %s\n", ui.Bold(fmt.Sprintf("%d", testfw.DetectedCloneCount(repoRoot))))
+				ui.Plain("")
+				ui.Plain("auto-clones (replication target): %s",
+					ui.Bold(strconv.FormatUint(uint64(testfw.DetectedCloneCount(repoRoot)), 10)))
 				return nil
 			},
 		}},
@@ -994,8 +1159,15 @@ func InitCmd() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "force"},
 			&cli.BoolFlag{Name: "json"},
+			&cli.BoolFlag{
+				Name:  "global",
+				Usage: "scaffold the user-global ~/.config/treeman/config.yaml (machine-wide defaults) instead of a per-repo .treeman.yaml",
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
+			if c.Bool("global") {
+				return initGlobalAction(c)
+			}
 			cwd, _ := os.Getwd()
 			detected := framework.DefaultRegistry().DetectAll(cwd)
 			target, created, body, err := InitTreemanYAML(cwd, c.Bool("force"))
@@ -1043,6 +1215,38 @@ func InitTreemanYAML(cwd string, force bool) (path string, created bool, body st
 	return initgen.WriteYAML(cwd, force)
 }
 
+// initGlobalAction scaffolds the user-global config.yaml and installs
+// the matching global-scoped JSON Schema beside it so editors validate
+// against the narrower key set (repo-only keys flagged as unknown).
+func initGlobalAction(c *cli.Command) error {
+	target, created, body, err := initgen.WriteGlobalYAML(c.Bool("force"))
+	if err != nil {
+		return err
+	}
+	// Install the global-scoped schema next to the config and point its
+	// modeline at it. Install resolves the modeline file from the target,
+	// so for TargetGlobal it edits the global config we just wrote.
+	schemaPath, _, schemaErr := schema.Install("", schema.TargetGlobal)
+	if c.Bool("json") {
+		out := map[string]any{
+			"path":    target,
+			"created": created,
+			"bytes":   len(body),
+			"scope":   "global",
+		}
+		if schemaErr == nil {
+			out["schema"] = schemaPath
+		}
+		return jsonStream(out)
+	}
+	PrintOK("wrote %s", target)
+	if schemaErr == nil {
+		PrintHint("installed global schema:          %s", schemaPath)
+	}
+	PrintHint("machine-wide defaults only — repo-specific blocks go in each .treeman.yaml")
+	return nil
+}
+
 // detectBranchOfWorktree reads .git/HEAD (handles gitlink files for
 // linked worktrees) and returns the branch or "".
 func detectBranchOfWorktree(worktree string) string {
@@ -1062,8 +1266,8 @@ func detectBranchOfWorktree(worktree string) string {
 	}
 	s := strings.TrimSpace(string(b))
 	const pfx = "ref: refs/heads/"
-	if strings.HasPrefix(s, pfx) {
-		return strings.TrimPrefix(s, pfx)
+	if after, ok := strings.CutPrefix(s, pfx); ok {
+		return after
 	}
 	return ""
 }

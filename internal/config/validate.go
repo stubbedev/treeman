@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -23,22 +24,22 @@ func (c *Config) Validate() error {
 	var errs []error
 
 	if c.Connections.Mysql != nil {
-		errs = appendIfErr(errs, c.Connections.Mysql.ContainerRef.validate("connections.mysql"))
+		errs = appendIfErr(errs, c.Connections.Mysql.validate("connections.mysql"))
 	}
 	if c.Connections.Postgres != nil {
-		errs = appendIfErr(errs, c.Connections.Postgres.ContainerRef.validate("connections.postgres"))
+		errs = appendIfErr(errs, c.Connections.Postgres.validate("connections.postgres"))
 	}
 	if c.Connections.Mongodb != nil {
-		errs = appendIfErr(errs, c.Connections.Mongodb.ContainerRef.validate("connections.mongodb"))
+		errs = appendIfErr(errs, c.Connections.Mongodb.validate("connections.mongodb"))
 	}
 	if c.Connections.Redis != nil {
-		errs = appendIfErr(errs, c.Connections.Redis.ContainerRef.validate("connections.redis"))
+		errs = appendIfErr(errs, c.Connections.Redis.validate("connections.redis"))
 	}
 	if c.Connections.Elasticsearch != nil {
-		errs = appendIfErr(errs, c.Connections.Elasticsearch.ContainerRef.validate("connections.elasticsearch"))
+		errs = appendIfErr(errs, c.Connections.Elasticsearch.validate("connections.elasticsearch"))
 	}
 	if c.Connections.S3 != nil {
-		errs = appendIfErr(errs, c.Connections.S3.ContainerRef.validate("connections.s3"))
+		errs = appendIfErr(errs, c.Connections.S3.validate("connections.s3"))
 	}
 
 	for i := range c.Databases {
@@ -73,7 +74,11 @@ func (c *Config) Validate() error {
 			if strings.Contains(tmpl, "{slug") {
 				errs = appendIfErr(errs, fmt.Errorf(
 					"databases[%d]: branch_scoped + main_worktree.enabled requires a slug-free main_worktree.databases[%d].%s (got %q) — the main worktree's .env is not patched, so treeman must swap the bare name the app already connects to",
-					i, i, field, tmpl))
+					i,
+					i,
+					field,
+					tmpl,
+				))
 			}
 		}
 	}
@@ -87,6 +92,30 @@ func (c *Config) Validate() error {
 		errs = appendIfErr(errs, validatePatch(c.Patches[i], fmt.Sprintf("patches[%d]", i), allowedPorts))
 	}
 
+	errs = appendIfErr(errs, validateNotifications(c.Notifications))
+
+	return errors.Join(errs...)
+}
+
+// validateNotifications rejects unknown `events:` buckets and an
+// unrecognised `backend:`, so a typo (`stabel`, `notifysend`) surfaces
+// at config-load instead of silently never firing.
+func validateNotifications(n NotificationsConfig) error {
+	var errs []error
+	allowedBuckets := []string{"stable", "up", "down", "failed"}
+	for i, b := range n.Events {
+		if !slices.Contains(allowedBuckets, b) {
+			errs = appendIfErr(errs, fmt.Errorf(
+				"notifications.events[%d]: unknown bucket %q (allowed: %s)",
+				i, b, strings.Join(allowedBuckets, ", ")))
+		}
+	}
+	switch n.Backend {
+	case "", "auto", "notify-send", "osascript", "none":
+	default:
+		errs = appendIfErr(errs, fmt.Errorf(
+			"notifications.backend: unknown backend %q (allowed: auto, notify-send, osascript, none)", n.Backend))
+	}
 	return errors.Join(errs...)
 }
 
@@ -133,7 +162,7 @@ func mainActiveTemplate(c *Config, i int) (tmpl, field string) {
 
 func validatePortSlot(name string, spec PortSpec) error {
 	if name == "" {
-		return fmt.Errorf("ports: slot name must be non-empty")
+		return errors.New("ports: slot name must be non-empty")
 	}
 	if spec.Range.Min == 0 || spec.Range.Max == 0 {
 		return fmt.Errorf("ports[%s]: range [min, max] must be non-zero", name)
@@ -204,6 +233,58 @@ func (r ContainerRef) validate(path string) error {
 // rendering stage actually populates. The template checks catch
 // typos (`{target-db}`, `{slag}`, `{n}` outside test_clones) at
 // load time instead of at the first prepare run.
+// validateS3 enforces the object-store constraints for an `engine: s3`
+// database. S3 support is prefix-scoped and lifecycle-only: key_prefix
+// renders the per-worktree bucket name; snapshot/restore, schema, and
+// seeding are not implemented, so dump/branch_scoped/test_clones/
+// migrate/seed are all rejected with a pointer at the alternative.
+func (d DatabaseConfig) validateS3(path string) error {
+	if d.KeyPrefix == "" {
+		return fmt.Errorf(
+			"%s: key_prefix is required for engine \"s3\" (renders the per-worktree bucket name; AWS bucket-naming rules apply)",
+			path,
+		)
+	}
+	// Enforce a non-trivial literal prefix (everything before the first
+	// `{` template token). Teardown matches buckets by literal prefix
+	// across the whole AWS account, so a generic "dev" / "test" would
+	// reap unrelated buckets. Mirrors the runtime guard in
+	// s3.Driver.DropMatching.
+	literal := d.KeyPrefix
+	if i := strings.Index(literal, "{"); i >= 0 {
+		literal = literal[:i]
+	}
+	const minLiteral = 6
+	if len(literal) < minLiteral {
+		return fmt.Errorf(
+			"%s: key_prefix literal portion %q is too short (%d < %d) — S3 buckets share an account-wide namespace; use a project-specific literal like \"myapp-{slug}\" so teardown can't reap unrelated buckets",
+			path,
+			literal,
+			len(literal),
+			minLiteral,
+		)
+	}
+	if d.Dump != nil {
+		return fmt.Errorf("%s: engine \"s3\" does not support `dump:` yet (bucket lifecycle only)", path)
+	}
+	if d.BranchScoped {
+		return fmt.Errorf("%s: engine \"s3\" does not support `branch_scoped: true` yet (bucket lifecycle only — no object copy)", path)
+	}
+	if d.TestClones != nil {
+		return fmt.Errorf("%s: engine \"s3\" does not support `test_clones:` (no snapshot fan-out)", path)
+	}
+	if d.Migrate != nil {
+		return fmt.Errorf(
+			"%s: engine \"s3\" does not support `migrate:` (object stores have no schema; use a postcreate hook to populate)",
+			path,
+		)
+	}
+	if d.Seed != nil {
+		return fmt.Errorf("%s: engine \"s3\" does not support `seed:` (use a postcreate hook to populate the bucket with fixtures)", path)
+	}
+	return nil
+}
+
 func (d DatabaseConfig) validate(path string) error {
 	var errs []error
 	if d.Engine == "" {
@@ -217,40 +298,8 @@ func (d DatabaseConfig) validate(path string) error {
 		return fmt.Errorf("%s: name_template is required for engine %q (used to compute the per-worktree database name)", path, d.Engine)
 	}
 	if fam == engine.FamilyS3 {
-		// Prefix-scoped: key_prefix renders the per-worktree bucket
-		// name. Lifecycle-only support — snapshot/restore not
-		// implemented, so dump/branch_scoped/test_clones are rejected.
-		if d.KeyPrefix == "" {
-			return fmt.Errorf("%s: key_prefix is required for engine \"s3\" (renders the per-worktree bucket name; AWS bucket-naming rules apply)", path)
-		}
-		// Enforce a non-trivial literal prefix (everything before the
-		// first `{` template token). Teardown matches buckets by literal
-		// prefix across the whole AWS account, so a generic "dev" /
-		// "test" would reap unrelated buckets. Mirrors the runtime
-		// guard in s3.Driver.DropMatching.
-		literal := d.KeyPrefix
-		if i := strings.Index(literal, "{"); i >= 0 {
-			literal = literal[:i]
-		}
-		const minLiteral = 6
-		if len(literal) < minLiteral {
-			return fmt.Errorf("%s: key_prefix literal portion %q is too short (%d < %d) — S3 buckets share an account-wide namespace; use a project-specific literal like \"myapp-{slug}\" so teardown can't reap unrelated buckets",
-				path, literal, len(literal), minLiteral)
-		}
-		if d.Dump != nil {
-			return fmt.Errorf("%s: engine \"s3\" does not support `dump:` yet (bucket lifecycle only)", path)
-		}
-		if d.BranchScoped {
-			return fmt.Errorf("%s: engine \"s3\" does not support `branch_scoped: true` yet (bucket lifecycle only — no object copy)", path)
-		}
-		if d.TestClones != nil {
-			return fmt.Errorf("%s: engine \"s3\" does not support `test_clones:` (no snapshot fan-out)", path)
-		}
-		if d.Migrate != nil {
-			return fmt.Errorf("%s: engine \"s3\" does not support `migrate:` (object stores have no schema; use a postcreate hook to populate)", path)
-		}
-		if d.Seed != nil {
-			return fmt.Errorf("%s: engine \"s3\" does not support `seed:` (use a postcreate hook to populate the bucket with fixtures)", path)
+		if err := d.validateS3(path); err != nil {
+			return err
 		}
 	}
 
@@ -274,6 +323,13 @@ func (d DatabaseConfig) validate(path string) error {
 				template.Scope{AllowTargetDB: true}))
 		}
 	}
+	if d.Rollback != nil {
+		for k, v := range d.Rollback.Env {
+			errs = appendIfErr(errs, validateTemplate(
+				fmt.Sprintf("%s.rollback.env[%s]", path, k), v,
+				template.Scope{AllowTargetDB: true}))
+		}
+	}
 	if d.TestClones != nil && d.TestClones.NameTemplate != "" {
 		errs = appendIfErr(errs, validateTemplate(
 			path+".test_clones.name_template", d.TestClones.NameTemplate,
@@ -290,12 +346,40 @@ func (d DatabaseConfig) validate(path string) error {
 	if d.BranchScoped {
 		if d.TestClones != nil {
 			errs = appendIfErr(errs, fmt.Errorf(
-				"%s: branch_scoped and test_clones are mutually exclusive — a branch_scoped database is a stateful per-branch snapshot, not a reproducible test-clone source", path))
+				"%s: branch_scoped and test_clones are mutually exclusive — a branch_scoped database is a stateful per-branch snapshot, not a reproducible test-clone source",
+				path,
+			))
 		}
 		if d.Fanout > 0 {
 			errs = appendIfErr(errs, fmt.Errorf(
 				"%s: branch_scoped databases do not fan out — remove `fanout` (it only applies to the test-clone path)", path))
 		}
 	}
+
+	errs = append(errs, d.validatePrewarm(path)...)
 	return errors.Join(errs...)
+}
+
+// validatePrewarm guards `databases[].prewarm`. It rides on
+// `ALTER DATABASE … RENAME` — only Postgres offers a constant-time
+// whole-database rename (MySQL's cross-DB RENAME TABLE breaks on
+// triggers; Mongo/Redis/ES have no rename at all). Reject rather than
+// silently ignore so the knob never reads as dead config.
+func (d DatabaseConfig) validatePrewarm(path string) []error {
+	if d.Prewarm == 0 {
+		return nil
+	}
+	var errs []error
+	if fam, ok := engine.Canonical(d.Engine); !ok || fam != engine.FamilyPostgres {
+		errs = append(errs, fmt.Errorf(
+			"%s: prewarm is postgres-only — engine %q has no constant-time database rename to claim a spare with",
+			path, d.Engine))
+	}
+	if d.BranchScoped {
+		errs = append(errs, fmt.Errorf(
+			"%s: branch_scoped and prewarm are mutually exclusive — branch_scoped databases bypass the template cache that spares are cloned from",
+			path,
+		))
+	}
+	return errs
 }

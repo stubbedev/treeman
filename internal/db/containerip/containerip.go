@@ -1,5 +1,5 @@
 // Package containerip resolves connectivity details for a named
-// container (docker / podman / nerdctl / finch / orbctl / lima), so
+// container (docker / podman / nerdctl / finch), so
 // treeman can dial DB services that run inside a container with no
 // published port, behind a compose service name, or from inside a
 // devcontainer that shares a network with the database.
@@ -59,7 +59,7 @@ type Opts struct {
 	// service lookup to. Defaults to COMPOSE_PROJECT_NAME if unset.
 	ComposeProject string
 	// Engine is the container engine binary (docker, podman,
-	// nerdctl, finch, orbctl). Default "docker".
+	// nerdctl, finch). Default "docker".
 	Engine string
 	// Network is the preferred docker network name when the
 	// container is attached to several. Resolution picks this
@@ -91,7 +91,9 @@ var (
 )
 
 func cacheKey(opts Opts) string {
-	return opts.normEngine() + "/" + opts.Container + "/" + opts.ComposeProject + "/" + opts.ComposeService + "/" + opts.Network + "/" + strconv.Itoa(int(opts.InternalPort))
+	return opts.normEngine() + "/" + opts.Container + "/" + opts.ComposeProject + "/" + opts.ComposeService + "/" + opts.Network + "/" + strconv.Itoa(
+		int(opts.InternalPort),
+	)
 }
 
 func (o Opts) normEngine() string {
@@ -119,7 +121,7 @@ func (o Opts) empty() bool {
 //     - else use the preferred network's IPAddress + InternalPort.
 //  4. When inspect fails AND we're inside a container, fall back
 //     to host.docker.internal at InternalPort.
-func ResolveAddr(opts Opts) (*Addr, error) {
+func ResolveAddr(ctx context.Context, opts Opts) (*Addr, error) {
 	if opts.empty() {
 		return nil, nil
 	}
@@ -132,7 +134,7 @@ func ResolveAddr(opts Opts) (*Addr, error) {
 	}
 	mu.Unlock()
 
-	addr, err := resolveUncached(opts)
+	addr, err := resolveUncached(ctx, opts)
 	if err != nil {
 		// Last-resort fallback for treeman-in-container: try the
 		// host loopback alias before bubbling the error up.
@@ -154,18 +156,18 @@ func ResolveAddr(opts Opts) (*Addr, error) {
 	return addr, nil
 }
 
-func resolveUncached(opts Opts) (*Addr, error) {
+func resolveUncached(ctx context.Context, opts Opts) (*Addr, error) {
 	engine := opts.normEngine()
-	if InsideContainer() && !engineSocketReachable(engine) {
+	if InsideContainer() && !engineSocketReachable(ctx, engine) {
 		// Skip the inspect path entirely — let the caller's
 		// configured host (sibling compose DNS) handle it.
 		return nil, nil
 	}
-	id, err := resolveContainerID(opts)
+	id, err := resolveContainerID(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	info, err := inspectContainer(engine, id)
+	info, err := inspectContainer(ctx, engine, id)
 	if err != nil {
 		return nil, err
 	}
@@ -193,11 +195,11 @@ func resolveUncached(opts Opts) (*Addr, error) {
 // that don't want the full Addr shape (e.g. URI rewrites that only
 // substitute the host part). Returns the empty string for empty
 // `container` so callers can fall through to their configured Host.
-func Resolve(container, engine string) (string, error) {
+func Resolve(ctx context.Context, container, engine string) (string, error) {
 	if container == "" {
 		return "", nil
 	}
-	addr, err := ResolveAddr(Opts{Container: container, Engine: engine})
+	addr, err := ResolveAddr(ctx, Opts{Container: container, Engine: engine})
 	if err != nil {
 		return "", err
 	}
@@ -238,12 +240,12 @@ func RefreshOpts(opts Opts) {
 // Container ref this is the ref itself; for a ComposeService it
 // runs `<engine> ps -q --filter label=...` to find the running
 // container.
-func ContainerID(opts Opts) (string, error) {
-	return resolveContainerID(opts)
+func ContainerID(ctx context.Context, opts Opts) (string, error) {
+	return resolveContainerID(ctx, opts)
 }
 
 // resolveContainerID is the internal alias kept for older callers.
-func resolveContainerID(opts Opts) (string, error) {
+func resolveContainerID(ctx context.Context, opts Opts) (string, error) {
 	if opts.Container != "" {
 		return opts.Container, nil
 	}
@@ -252,16 +254,18 @@ func resolveContainerID(opts Opts) (string, error) {
 		project = os.Getenv("COMPOSE_PROJECT_NAME")
 	}
 	engine := opts.normEngine()
-	args := []string{"ps", "-q", "--filter", "status=running",
-		"--filter", "label=com.docker.compose.service=" + opts.ComposeService}
+	args := []string{
+		"ps", "-q", "--filter", "status=running",
+		"--filter", "label=com.docker.compose.service=" + opts.ComposeService,
+	}
 	if project != "" {
 		args = append(args, "--filter", "label=com.docker.compose.project="+project)
 	}
-	out, err := exec.Command(engine, args...).Output()
+	out, err := exec.CommandContext(ctx, engine, args...).Output()
 	if err != nil {
 		return "", fmt.Errorf("%s ps -q (service=%s, project=%s): %w", engine, opts.ComposeService, project, err)
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			return line, nil
@@ -287,8 +291,8 @@ type inspectInfo struct {
 	} `json:"Config"`
 }
 
-func inspectContainer(engine, id string) (*inspectInfo, error) {
-	out, err := exec.Command(engine, "inspect", id).Output()
+func inspectContainer(ctx context.Context, engine, id string) (*inspectInfo, error) {
+	out, err := exec.CommandContext(ctx, engine, "inspect", id).Output()
 	if err != nil {
 		return nil, fmt.Errorf("%s inspect %s: %w", engine, id, err)
 	}
@@ -369,23 +373,23 @@ func (i *inspectInfo) publishedHostPort(internalPort uint16) (uint16, bool) {
 // map. Empty map + nil error when opts has no container ref or
 // inspect fails (callers treat this as "no autodiscovery
 // available", not a fatal error).
-func EnvLookup(opts Opts) (map[string]string, error) {
+func EnvLookup(ctx context.Context, opts Opts) (map[string]string, error) {
 	if opts.empty() {
 		return nil, nil
 	}
 	engine := opts.normEngine()
-	id, err := resolveContainerID(opts)
+	id, err := resolveContainerID(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	info, err := inspectContainer(engine, id)
+	info, err := inspectContainer(ctx, engine, id)
 	if err != nil {
 		return nil, err
 	}
 	out := make(map[string]string, len(info.Config.Env))
 	for _, kv := range info.Config.Env {
-		if i := strings.IndexByte(kv, '='); i >= 0 {
-			out[kv[:i]] = kv[i+1:]
+		if before, after, ok := strings.Cut(kv, "="); ok {
+			out[before] = after
 		}
 	}
 	return out, nil
@@ -424,7 +428,7 @@ func RewriteHostPortInURIWithPort(uri, newHost string, newPort uint16) string {
 	if hostPart == "" {
 		return uri
 	}
-	_, port := splitHostPort(hostPart)
+	port := splitHostPort(hostPart)
 	newHostPort := newHost
 	switch {
 	case newPort != 0:
@@ -441,11 +445,11 @@ func RewriteHostPortInURIWithPort(uri, newHost string, newPort uint16) string {
 }
 
 func splitScheme(uri string) (scheme, rest string) {
-	i := strings.Index(uri, "://")
-	if i < 0 {
+	before, after, ok := strings.Cut(uri, "://")
+	if !ok {
 		return "", uri
 	}
-	return uri[:i], uri[i+3:]
+	return before, after
 }
 
 func splitUserinfo(s string) (userinfo, rest string) {
@@ -475,7 +479,7 @@ func URIPort(uri string, fallback uint16) uint16 {
 	}
 	_, hostPath := splitUserinfo(rest)
 	hostPart, _ := splitHostFromTail(hostPath)
-	_, p := splitHostPort(hostPart)
+	p := splitHostPort(hostPart)
 	if p == "" {
 		return fallback
 	}
@@ -486,11 +490,11 @@ func URIPort(uri string, fallback uint16) uint16 {
 	return uint16(n)
 }
 
-func splitHostPort(s string) (host, port string) {
+func splitHostPort(s string) (port string) {
 	if i := strings.LastIndex(s, ":"); i >= 0 && !strings.Contains(s[i+1:], "]") {
-		return s[:i], s[i+1:]
+		return s[i+1:]
 	}
-	return s, ""
+	return ""
 }
 
 // ErrNoContainer is returned when Resolve is called with no

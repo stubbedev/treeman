@@ -51,9 +51,19 @@ func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
 		if ctx.Err() != nil {
 			return fmt.Errorf(
 				"%s unreachable at %s:%d (tcp connect timeout — is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`)",
-				engine, host, port, port)
+				engine,
+				host,
+				port,
+				port,
+			)
 		}
-		return fmt.Errorf("%s unreachable at %s:%d (tcp connect refused: %v — if the service is in docker, set `container:`/`compose_service:` so treeman can find its bridge IP or published port)", engine, host, port, err)
+		return fmt.Errorf(
+			"%s unreachable at %s:%d (tcp connect refused: %w — if the service is in docker, set `container:`/`compose_service:` so treeman can find its bridge IP or published port)",
+			engine,
+			host,
+			port,
+			err,
+		)
 	}
 	_ = conn.Close()
 	return nil

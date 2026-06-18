@@ -13,8 +13,10 @@
 package resolve
 
 import (
+	"context"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -132,7 +134,10 @@ func ApplyEnvCredentials(cfg *config.Config, repoRoot string) {
 // loading. Drivers will surface the real connectivity error later.
 func fillFromContainerEnv(cfg *config.Config) {
 	if m := cfg.Connections.Mysql; m != nil && m.Password == "" && (m.Container != "" || m.ComposeService != "") {
-		env, _ := containerip.EnvLookup(containerip.Opts{
+		// No ctx available here: fillFromContainerEnv is reached via the
+		// cached LoadResolved loaders which have no ctx, and threading one
+		// through every config-load call site is out of scope.
+		env, _ := containerip.EnvLookup(context.Background(), containerip.Opts{
 			Container:      m.Container,
 			ComposeService: m.ComposeService,
 			ComposeProject: m.ComposeProject,
@@ -146,7 +151,7 @@ func fillFromContainerEnv(cfg *config.Config) {
 		}
 	}
 	if p := cfg.Connections.Postgres; p != nil && p.Password == "" && (p.Container != "" || p.ComposeService != "") {
-		env, _ := containerip.EnvLookup(containerip.Opts{
+		env, _ := containerip.EnvLookup(context.Background(), containerip.Opts{
 			Container:      p.Container,
 			ComposeService: p.ComposeService,
 			ComposeProject: p.ComposeProject,
@@ -159,27 +164,37 @@ func fillFromContainerEnv(cfg *config.Config) {
 			}
 		}
 	}
-	if s := cfg.Connections.S3; s != nil && (s.Container != "" || s.ComposeService != "") {
-		env, _ := containerip.EnvLookup(containerip.Opts{
-			Container:      s.Container,
-			ComposeService: s.ComposeService,
-			ComposeProject: s.ComposeProject,
-			Engine:         s.ContainerEngine,
-		})
-		if s.AccessKey == "" {
-			for _, k := range []string{"MINIO_ROOT_USER", "MINIO_ACCESS_KEY", "AWS_ACCESS_KEY_ID"} {
-				if v, ok := env[k]; ok && nonEmpty(v) {
-					s.AccessKey = v
-					break
-				}
+	fillS3FromContainerEnv(cfg.Connections.S3)
+}
+
+// fillS3FromContainerEnv back-fills S3 access/secret keys from the
+// container's own environment when they weren't supplied in config —
+// MinIO/Garage publish their root creds as well-known env vars
+// (MINIO_ROOT_USER/PASSWORD, AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY), so a
+// container-referenced block can authenticate with zero secret wiring.
+func fillS3FromContainerEnv(s *config.S3Conn) {
+	if s == nil || (s.Container == "" && s.ComposeService == "") {
+		return
+	}
+	env, _ := containerip.EnvLookup(context.Background(), containerip.Opts{
+		Container:      s.Container,
+		ComposeService: s.ComposeService,
+		ComposeProject: s.ComposeProject,
+		Engine:         s.ContainerEngine,
+	})
+	if s.AccessKey == "" {
+		for _, k := range []string{"MINIO_ROOT_USER", "MINIO_ACCESS_KEY", "AWS_ACCESS_KEY_ID"} {
+			if v, ok := env[k]; ok && nonEmpty(v) {
+				s.AccessKey = v
+				break
 			}
 		}
-		if s.SecretKey == "" {
-			for _, k := range []string{"MINIO_ROOT_PASSWORD", "MINIO_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"} {
-				if v, ok := env[k]; ok && nonEmpty(v) {
-					s.SecretKey = v
-					break
-				}
+	}
+	if s.SecretKey == "" {
+		for _, k := range []string{"MINIO_ROOT_PASSWORD", "MINIO_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"} {
+			if v, ok := env[k]; ok && nonEmpty(v) {
+				s.SecretKey = v
+				break
 			}
 		}
 	}
@@ -217,28 +232,13 @@ func resolveMysql(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.
 	}
 	// Spring Boot — SPRING_DATASOURCE_URL is JDBC-style; strip the
 	// jdbc: prefix and parse.
-	if v, ok := env.Get("SPRING_DATASOURCE_URL"); ok {
-		if u, eng := parseJDBC(v); eng == "mysql" || eng == "mariadb" || eng == "tidb" {
-			m := mysqlFromURL(u)
-			if pwd, ok := env.Get("SPRING_DATASOURCE_PASSWORD"); ok && nonEmpty(pwd) {
-				m.Password = pwd
-			} else if u.User != nil {
-				if p, ok := u.User.Password(); ok && nonEmpty(p) {
-					m.Password = p
-				}
-			}
-			if user, ok := env.Get("SPRING_DATASOURCE_USERNAME"); ok {
-				m.User = user
-			}
-			return &resolvedConn[config.MysqlConn]{Conn: m, Source: repoSrc(env)}
-		}
+	if m, ok := springMysql(env); ok {
+		return &resolvedConn[config.MysqlConn]{Conn: m, Source: repoSrc(env)}
 	}
 	if u, src, ok := pickURL(env, "MYSQL_URL", []string{"mysql", "mariadb", "tidb"}); ok {
 		m := mysqlFromURL(u)
-		if u.User != nil {
-			if p, ok := u.User.Password(); ok && nonEmpty(p) {
-				m.Password = p
-			}
+		if p, ok := urlPassword(u); ok {
+			m.Password = p
 		}
 		return &resolvedConn[config.MysqlConn]{Conn: m, Source: src}
 	}
@@ -269,6 +269,29 @@ func resolveMysql(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.
 	}
 }
 
+// springMysql parses SPRING_DATASOURCE_URL as a JDBC MySQL/MariaDB/TiDB
+// connection, overlaying SPRING_DATASOURCE_PASSWORD/USERNAME and any
+// URL-embedded password. Returns ok=false when the env var is absent or
+// the JDBC engine is not a MySQL dialect.
+func springMysql(env envfile.EnvFile) (config.MysqlConn, bool) {
+	v, ok := env.Get("SPRING_DATASOURCE_URL")
+	if !ok {
+		return config.MysqlConn{}, false
+	}
+	u, eng := parseJDBC(v)
+	if eng != "mysql" && eng != "mariadb" && eng != "tidb" {
+		return config.MysqlConn{}, false
+	}
+	m := mysqlFromURL(u)
+	if pw, ok := springPassword(env, u); ok {
+		m.Password = pw
+	}
+	if user, ok := env.Get("SPRING_DATASOURCE_USERNAME"); ok {
+		m.User = user
+	}
+	return m, true
+}
+
 func resolveMysqlPassword(env envfile.EnvFile, configured string) string {
 	if v := resolvePasswordValue(env, configured); v != "" {
 		return v
@@ -289,41 +312,47 @@ func resolvePostgres(cfg *config.Config, env envfile.EnvFile) *resolvedConn[conf
 		p.Password = resolvePostgresPassword(env, p.Password)
 		return &resolvedConn[config.PostgresConn]{Conn: p, Source: Source{Kind: SourceYaml}}
 	}
-	if v, ok := env.Get("SPRING_DATASOURCE_URL"); ok {
-		if u, eng := parseJDBC(v); eng == "postgres" || eng == "cockroach" {
-			p := postgresFromURL(u)
-			if pwd, ok := env.Get("SPRING_DATASOURCE_PASSWORD"); ok && nonEmpty(pwd) {
-				p.Password = pwd
-			} else if u.User != nil {
-				if pp, ok := u.User.Password(); ok && nonEmpty(pp) {
-					p.Password = pp
-				}
-			}
-			if user, ok := env.Get("SPRING_DATASOURCE_USERNAME"); ok {
-				p.User = user
-			}
-			return &resolvedConn[config.PostgresConn]{Conn: p, Source: repoSrc(env)}
-		}
+	if p, ok := springPostgres(env); ok {
+		return &resolvedConn[config.PostgresConn]{Conn: p, Source: repoSrc(env)}
 	}
 	if u, src, ok := pickURL(env, "POSTGRES_URL", []string{"postgres", "postgresql", "cockroach", "cockroachdb"}); ok {
 		p := postgresFromURL(u)
-		if u.User != nil {
-			if pp, ok := u.User.Password(); ok && nonEmpty(pp) {
-				p.Password = pp
-			}
+		if pw, ok := urlPassword(u); ok {
+			p.Password = pw
 		}
 		return &resolvedConn[config.PostgresConn]{Conn: p, Source: src}
 	}
 	if u, src, ok := pickURL(env, "PG_URL", []string{"postgres", "postgresql", "cockroach", "cockroachdb"}); ok {
 		p := postgresFromURL(u)
-		if u.User != nil {
-			if pp, ok := u.User.Password(); ok && nonEmpty(pp) {
-				p.Password = pp
-			}
+		if pw, ok := urlPassword(u); ok {
+			p.Password = pw
 		}
 		return &resolvedConn[config.PostgresConn]{Conn: p, Source: src}
 	}
 	return nil
+}
+
+// springPostgres parses SPRING_DATASOURCE_URL as a JDBC Postgres/Cockroach
+// connection, overlaying SPRING_DATASOURCE_PASSWORD/USERNAME and any
+// URL-embedded password. Returns ok=false when the env var is absent or
+// the JDBC engine is not a Postgres dialect.
+func springPostgres(env envfile.EnvFile) (config.PostgresConn, bool) {
+	v, ok := env.Get("SPRING_DATASOURCE_URL")
+	if !ok {
+		return config.PostgresConn{}, false
+	}
+	u, eng := parseJDBC(v)
+	if eng != "postgres" && eng != "cockroach" {
+		return config.PostgresConn{}, false
+	}
+	p := postgresFromURL(u)
+	if pw, ok := springPassword(env, u); ok {
+		p.Password = pw
+	}
+	if user, ok := env.Get("SPRING_DATASOURCE_USERNAME"); ok {
+		p.User = user
+	}
+	return p, true
 }
 
 func resolvePostgresPassword(env envfile.EnvFile, configured string) string {
@@ -637,6 +666,29 @@ func nonEmpty(s string) bool {
 	return s != "" && s != "null"
 }
 
+// urlPassword returns the URL's embedded password when present and
+// non-empty. Centralises the `u.User != nil && Password() ok &&
+// nonEmpty` dance repeated by every engine's URL/JDBC parsing.
+func urlPassword(u *url.URL) (string, bool) {
+	if u == nil || u.User == nil {
+		return "", false
+	}
+	if p, ok := u.User.Password(); ok && nonEmpty(p) {
+		return p, true
+	}
+	return "", false
+}
+
+// springPassword resolves the password for a Spring datasource: an
+// explicit SPRING_DATASOURCE_PASSWORD wins, otherwise fall back to any
+// password embedded in the JDBC URL.
+func springPassword(env envfile.EnvFile, u *url.URL) (string, bool) {
+	if pwd, ok := env.Get("SPRING_DATASOURCE_PASSWORD"); ok && nonEmpty(pwd) {
+		return pwd, true
+	}
+	return urlPassword(u)
+}
+
 func firstEnv(env envfile.EnvFile, keys ...string) string {
 	for _, k := range keys {
 		if v, ok := env.Get(k); ok && v != "" {
@@ -661,12 +713,7 @@ func envOr(env envfile.EnvFile, key, fallback string) string {
 }
 
 func containsString(haystack []string, needle string) bool {
-	for _, h := range haystack {
-		if h == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(haystack, needle)
 }
 
 func repoSrc(env envfile.EnvFile) Source {

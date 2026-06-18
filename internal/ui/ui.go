@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/mattn/go-isatty"
 )
@@ -163,8 +164,9 @@ func StripANSI(s string) string {
 	return b.String()
 }
 
-// Width returns the visible width of s (ANSI-stripped).
-func Width(s string) int { return len(StripANSI(s)) }
+// Width returns the visible width of s: ANSI-stripped, counted in
+// runes (not bytes) so multi-byte symbols like ★ or → pad correctly.
+func Width(s string) int { return utf8.RuneCountInString(StripANSI(s)) }
 
 // Out is where styled output goes. Tests override this; PagerStart
 // also retargets it for the duration of a pager session.

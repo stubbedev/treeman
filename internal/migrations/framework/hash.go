@@ -15,30 +15,11 @@ import (
 )
 
 // HashCache is the subset of *store.Store that MigrationsHashWithCache
-// needs. Defined here so the framework package doesn't depend on
-// internal/store.
+// needs: a stat-gated, content-addressed file-hash cache. Defined here
+// so the framework package doesn't depend on internal/store.
 type HashCache interface {
 	HashedFile(ctx context.Context, path string) (string, error)
 	BatchHashedFiles(ctx context.Context, paths []string) (map[string]string, error)
-	BatchDirHashes(ctx context.Context, dirs []string, specName, hashMode string) (map[string]DirHashCacheRecord, error)
-	UpsertDirHashes(ctx context.Context, entries []DirHashCacheKey, hashes map[string]string) error
-}
-
-// DirHashCacheRecord mirrors store.DirHashRecord. Re-declared here to
-// keep framework decoupled from internal/store.
-type DirHashCacheRecord struct {
-	MtimeNs     int64
-	MemberCount int64
-	MemberHash  string
-}
-
-// DirHashCacheKey mirrors store.DirHashKey.
-type DirHashCacheKey struct {
-	Dir       string
-	SpecName  string
-	HashMode  string
-	MtimeNs   int64
-	MemberCnt int64
 }
 
 // MigrationsHash fingerprints the set of migration files claimed by
@@ -57,14 +38,15 @@ func MigrationsHash(repoRoot string, spec Spec) (string, error) {
 // where <per-dir digest> is the hex BLAKE3-256 of, per file in that
 // directory in sorted order by basename:
 //
-//	"<basename>\0" + (HashMode=filename ? "" : "<blake3-of-bytes>") + "\n"
+//	"<basename>\0" + "<blake3-of-bytes>" + "\n"
 //
-// The per-dir digest is cached in `dir_hashes` keyed on absolute
-// dir path + (spec name, hash mode). A live (mtime_ns, member_count)
-// stat match makes the per-dir contribution reusable without
-// re-reading the directory or touching individual files. New /
-// changed / deleted migrations bump the dir mtime, invalidating the
-// cache automatically.
+// The fingerprint is purely content-derived: every member file is
+// content-hashed (the per-file work is cached in `file_hashes`,
+// stat-gated on each file's own size+mtime). There is deliberately no
+// directory-level (mtime, member-count) short-circuit — an in-place
+// content edit bumps the *file* mtime but not the parent directory's
+// mtime on Linux or macOS, so a dir-level gate would silently reuse a
+// stale digest and skip the rebuild. Content-only is the invariant.
 func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot string, spec Spec) (string, error) {
 	dirs, err := resolveMigrationDirs(repoRoot, spec)
 	if err != nil {
@@ -72,13 +54,10 @@ func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot stri
 	}
 
 	type dirEntry struct {
-		absDir  string
-		relDir  string
-		mtime   int64
-		entries []os.DirEntry // populated lazily on cache miss
+		absDir string
+		relDir string
 	}
 	dirRecords := make([]dirEntry, 0, len(dirs))
-	statDirs := make([]string, 0, len(dirs))
 	for _, abs := range dirs {
 		info, err := os.Stat(abs)
 		if err != nil || !info.IsDir() {
@@ -91,24 +70,11 @@ func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot stri
 		dirRecords = append(dirRecords, dirEntry{
 			absDir: abs,
 			relDir: filepath.ToSlash(rel),
-			mtime:  info.ModTime().UnixNano(),
 		})
-		statDirs = append(statDirs, abs)
 	}
 	sort.SliceStable(dirRecords, func(i, j int) bool { return dirRecords[i].relDir < dirRecords[j].relDir })
 
-	// Cache lookup for whole directories first. mtime + member count
-	// gating means new/renamed/deleted files invalidate the cached
-	// digest without a per-file check.
-	var cached map[string]DirHashCacheRecord
-	if cache != nil {
-		cached, _ = cache.BatchDirHashes(ctx, statDirs, spec.Name, string(spec.HashMode))
-	}
-
-	freshHashes := make(map[string]string)
-	freshKeys := make([]DirHashCacheKey, 0)
 	perDirDigest := make(map[string]string, len(dirRecords))
-
 	for i := range dirRecords {
 		d := &dirRecords[i]
 		entries, err := os.ReadDir(d.absDir)
@@ -116,30 +82,11 @@ func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot stri
 			continue
 		}
 		matches := filterMigrationEntries(entries, spec)
-		memberCount := int64(len(matches))
-
-		if rec, ok := cached[d.absDir]; ok && rec.MtimeNs == d.mtime && rec.MemberCount == memberCount {
-			perDirDigest[d.relDir] = rec.MemberHash
-			continue
-		}
-
-		digest, err := computeDirDigest(ctx, cache, d.absDir, matches, spec)
+		digest, err := computeDirDigest(ctx, cache, d.absDir, matches)
 		if err != nil {
 			return "", err
 		}
 		perDirDigest[d.relDir] = digest
-		freshHashes[d.absDir] = digest
-		freshKeys = append(freshKeys, DirHashCacheKey{
-			Dir:       d.absDir,
-			SpecName:  spec.Name,
-			HashMode:  string(spec.HashMode),
-			MtimeNs:   d.mtime,
-			MemberCnt: memberCount,
-		})
-	}
-
-	if cache != nil && len(freshKeys) > 0 {
-		_ = cache.UpsertDirHashes(ctx, freshKeys, freshHashes)
 	}
 
 	// Fold per-dir digests into the outer hash in sorted rel-dir order.
@@ -159,10 +106,12 @@ func MigrationsHashWithCache(ctx context.Context, cache HashCache, repoRoot stri
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// computeDirDigest produces the per-directory digest. HashChecksum
-// hashes file bytes (cache-assisted via BatchHashedFiles when
-// available); HashFilename skips bytes entirely.
-func computeDirDigest(ctx context.Context, cache HashCache, absDir string, matches []os.DirEntry, spec Spec) (string, error) {
+// computeDirDigest produces the per-directory digest by content-hashing
+// every migration file in sorted order. The historical `filename` mode
+// (hash filenames only) is gone — it relied on an append-only
+// convention that wasn't enforced, so an in-place edit could silently
+// keep an old cached template alive.
+func computeDirDigest(ctx context.Context, cache HashCache, absDir string, matches []os.DirEntry) (string, error) {
 	if len(matches) == 0 {
 		// Stable empty-dir digest so an empty migrations folder
 		// contributes a constant per-dir hash.
@@ -172,17 +121,7 @@ func computeDirDigest(ctx context.Context, cache HashCache, absDir string, match
 
 	sort.SliceStable(matches, func(i, j int) bool { return matches[i].Name() < matches[j].Name() })
 
-	if spec.HashMode != HashChecksum {
-		h := blake3.New(32, nil)
-		for _, e := range matches {
-			_, _ = h.Write([]byte(e.Name()))
-			_, _ = h.Write([]byte{0})
-			_, _ = h.Write([]byte{'\n'})
-		}
-		return hex.EncodeToString(h.Sum(nil)), nil
-	}
-
-	// HashChecksum: collect absolute paths, batch-lookup hashes
+	// Content hash: collect absolute paths, batch-lookup hashes
 	// (single SELECT IN + parallel-compute misses), then fold.
 	paths := make([]string, 0, len(matches))
 	for _, e := range matches {
@@ -315,7 +254,7 @@ func compiledMatcherFor(spec Spec) func(string) bool {
 	patterns := make([]string, 0, len(spec.FileGlobs)*2)
 	for _, g := range spec.FileGlobs {
 		patterns = append(patterns, g)
-		for _, alt := range strings.Split(g, "|") {
+		for alt := range strings.SplitSeq(g, "|") {
 			alt = strings.TrimSpace(alt)
 			if alt != "" && alt != g {
 				patterns = append(patterns, alt)
@@ -344,9 +283,13 @@ func hashFileBLAKE3(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := blake3.New(32, nil)
-	if _, err := io.Copy(h, f); err != nil {
+	// 1 MiB buffer: BLAKE3 hashes far faster than the default 32 KiB
+	// io.Copy chunk can feed it, so a bigger buffer cuts read syscalls
+	// on large migration files. Mirrors store.hashFileBLAKE3.
+	buf := make([]byte, 1<<20)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

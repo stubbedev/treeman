@@ -43,6 +43,13 @@ import (
 	"github.com/stubbedev/treeman/internal/yamlpatch"
 )
 
+// reSectionHeader matches an INI/TOML `[section]` header at line start.
+// Hoisted to package scope because iniSection/tomlSection are on the
+// hot clean/smudge path (they run on every `git status`/`git add` of a
+// patched file) and previously recompiled this constant pattern on
+// every call.
+var reSectionHeader = regexp.MustCompile(`(?m)^\[`)
+
 // Smudge applies one Patch's `set:` to `content` in memory. Mirrors
 // `Apply`'s patch-write step exactly — same driver dispatch, same
 // renderTemplates flow — but returns a string instead of writing
@@ -156,17 +163,17 @@ func Clean(p config.Patch, content, headContent string) (string, error) {
 // that exist in HEAD (i.e. need restore, not strip).
 func restoreContent(driver, content, headContent string, headVals map[string]string, present []string) (string, error) {
 	switch driver {
-	case "phpunit":
+	case DriverPhpunit:
 		return restorePhpunitFromHead(content, headContent, present), nil
-	case "dotenv":
+	case DriverDotenv:
 		return restoreDotenvFromHead(content, headContent, present), nil
-	case "ini":
+	case DriverINI:
 		return restoreINIFromHead(content, headContent, present), nil
-	case "toml":
+	case DriverTOML:
 		return restoreTOMLFromHead(content, headContent, present), nil
-	case "yaml":
+	case DriverYAML:
 		return restoreYAMLFromHead(content, headContent, headVals, present)
-	case "json":
+	case DriverJSON:
 		return restoreJSONFromHead(content, headContent, headVals, present)
 	}
 	subset := make(map[string]string, len(present))
@@ -232,7 +239,12 @@ func restoreINIFromHead(content, headContent string, dottedKeys []string) string
 		if headSec == "" || curSec == "" {
 			continue
 		}
-		lineRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `\s*=.*$`)
+		// Allow leading indentation so an indented `  k = v` key — which
+		// go-ini (extractINI) happily reports as present — is matched here
+		// too. Without the `[ \t]*` prefix the splice would silently miss
+		// it, leaving the smudged value in place and the file permanently
+		// git-dirty. Mirrors spliceAssignValue's `^\s*key` on the apply side.
+		lineRe := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(key) + `\s*=.*$`)
 		headLine := lineRe.FindString(headSec)
 		if headLine == "" {
 			continue
@@ -254,8 +266,7 @@ func restoreINIFromHead(content, headContent string, dottedKeys []string) string
 func iniSection(content, section string) (string, int, int) {
 	if section == "" || strings.EqualFold(section, "DEFAULT") {
 		// Body before first explicit [section].
-		re := regexp.MustCompile(`(?m)^\[`)
-		loc := re.FindStringIndex(content)
+		loc := reSectionHeader.FindStringIndex(content)
 		if loc == nil {
 			return content, 0, len(content)
 		}
@@ -269,8 +280,7 @@ func iniSection(content, section string) (string, int, int) {
 	}
 	bodyStart := loc[1]
 	// Next section header or EOF.
-	nextRe := regexp.MustCompile(`(?m)^\[`)
-	nextLoc := nextRe.FindStringIndex(content[bodyStart:])
+	nextLoc := reSectionHeader.FindStringIndex(content[bodyStart:])
 	bodyEnd := len(content)
 	if nextLoc != nil {
 		bodyEnd = bodyStart + nextLoc[0]
@@ -298,7 +308,9 @@ func restoreTOMLFromHead(content, headContent string, dottedKeys []string) strin
 		if headSec == "" || curSec == "" {
 			continue
 		}
-		lineRe := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(key) + `\s*=.*$`)
+		// Indentation-tolerant for the same reason as restoreINIFromHead:
+		// TOML permits indented keys and go-toml (extractTOML) accepts them.
+		lineRe := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(key) + `\s*=.*$`)
 		headLine := lineRe.FindString(headSec)
 		if headLine == "" {
 			continue
@@ -316,8 +328,7 @@ func restoreTOMLFromHead(content, headContent string, dottedKeys []string) strin
 // applyContent.
 func tomlSection(content, table string) (string, int, int) {
 	if table == "" {
-		re := regexp.MustCompile(`(?m)^\[`)
-		loc := re.FindStringIndex(content)
+		loc := reSectionHeader.FindStringIndex(content)
 		if loc == nil {
 			return content, 0, len(content)
 		}
@@ -329,8 +340,7 @@ func tomlSection(content, table string) (string, int, int) {
 		return "", -1, -1
 	}
 	bodyStart := loc[1]
-	nextRe := regexp.MustCompile(`(?m)^\[`)
-	nextLoc := nextRe.FindStringIndex(content[bodyStart:])
+	nextLoc := reSectionHeader.FindStringIndex(content[bodyStart:])
 	bodyEnd := len(content)
 	if nextLoc != nil {
 		bodyEnd = bodyStart + nextLoc[0]
@@ -350,25 +360,37 @@ func tomlSection(content, table string) (string, int, int) {
 // surface. Documented as a known limitation.
 func restoreYAMLFromHead(content, headContent string, headVals map[string]string, present []string) (string, error) {
 	fallback := []string{}
+	// HEAD is immutable across the loop, so parse it once rather than
+	// once per key (was 2N parses for N keys). `content` is mutated by
+	// each splice, shifting byte offsets, so it must still be reparsed
+	// per key.
+	headRoot, headOK := yamlRootNode(headContent)
 	for _, k := range present {
 		segs, err := yamlpatch.ParsePath(k)
 		if err != nil {
 			fallback = append(fallback, k)
 			continue
 		}
-		hLine, hStart, hEnd, ok := yamlScalarLineBytes(headContent, segs)
+		if !headOK {
+			fallback = append(fallback, k)
+			continue
+		}
+		hLine, _, _, ok := yamlScalarLineBytesNode(headContent, headRoot, segs)
 		if !ok {
 			fallback = append(fallback, k)
 			continue
 		}
-		_, cStart, cEnd, ok := yamlScalarLineBytes(content, segs)
+		curRoot, ok := yamlRootNode(content)
+		if !ok {
+			fallback = append(fallback, k)
+			continue
+		}
+		_, cStart, cEnd, ok := yamlScalarLineBytesNode(content, curRoot, segs)
 		if !ok {
 			fallback = append(fallback, k)
 			continue
 		}
 		content = content[:cStart] + hLine + content[cEnd:]
-		_ = hStart
-		_ = hEnd
 	}
 	if len(fallback) > 0 {
 		subset := make(map[string]string, len(fallback))
@@ -377,7 +399,7 @@ func restoreYAMLFromHead(content, headContent string, headVals map[string]string
 				subset[k] = v
 			}
 		}
-		out, err := applyContent("yaml", content, subset)
+		out, err := applyContent(DriverYAML, content, subset)
 		if err != nil {
 			return "", err
 		}
@@ -386,21 +408,31 @@ func restoreYAMLFromHead(content, headContent string, headVals map[string]string
 	return content, nil
 }
 
-// yamlScalarLineBytes parses `doc`, walks `segs` to the terminal
-// scalar, and returns that line's bytes + the start/end offsets in
-// `doc`. The returned line includes the leading indent so a splice
-// of head-line into content-line preserves indent depth. Empty +
-// false when the terminal isn't a scalar (mapping/sequence terminals
-// are unsupported — they'd require multi-line block detection).
-func yamlScalarLineBytes(doc string, segs []yamlpatch.Segment) (string, int, int, bool) {
+// yamlRootNode parses `doc` and returns its top content node (the
+// document node unwrapped). False if the doc doesn't parse or is empty.
+// Split out from yamlScalarLineBytesNode so callers can parse an
+// immutable document once and walk it for many keys.
+func yamlRootNode(doc string) (*yaml.Node, bool) {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte(doc), &root); err != nil {
-		return "", 0, 0, false
+		return nil, false
 	}
 	n := &root
 	if n.Kind == yaml.DocumentNode && len(n.Content) > 0 {
 		n = n.Content[0]
 	}
+	return n, true
+}
+
+// yamlScalarLineBytesNode walks a pre-parsed `root` (from yamlRootNode
+// over `doc`) along `segs` to the terminal scalar, and returns that
+// line's bytes + the start/end offsets in `doc`. The returned line
+// includes the leading indent so a splice of head-line into
+// content-line preserves indent depth. Empty + false when the terminal
+// isn't a scalar (mapping/sequence terminals are unsupported — they'd
+// require multi-line block detection).
+func yamlScalarLineBytesNode(doc string, root *yaml.Node, segs []yamlpatch.Segment) (string, int, int, bool) {
+	n := root
 	for _, seg := range segs {
 		switch {
 		case seg.IsIndex:
@@ -446,7 +478,7 @@ func lineByteRange(s string, line1 int) (int, int) {
 	}
 	cur := 1
 	start := 0
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if cur == line1 && s[i] == '\n' {
 			return start, i + 1
 		}
@@ -498,7 +530,7 @@ func restoreJSONFromHead(content, headContent string, headVals map[string]string
 				subset[k] = v
 			}
 		}
-		out, err := applyContent("json", content, subset)
+		out, err := applyContent(DriverJSON, content, subset)
 		if err != nil {
 			return "", err
 		}
@@ -521,34 +553,7 @@ func restoreJSONFromHead(content, headContent string, headVals map[string]string
 func jsonValueRange(doc string, segs []yamlpatch.Segment) (int, int, bool) {
 	dec := json.NewDecoder(strings.NewReader(doc))
 	dec.UseNumber()
-	type entry struct {
-		isArr      bool
-		pendingKey string // object: key whose value comes next; "" before key read
-		nextIdx    int    // array: index of value about to be emitted
-	}
-	var stack []entry
-
-	matches := func() bool {
-		if len(stack) != len(segs) {
-			return false
-		}
-		for i, e := range stack {
-			seg := segs[i]
-			if e.isArr != seg.IsIndex {
-				return false
-			}
-			if seg.IsIndex {
-				if e.nextIdx != seg.Idx {
-					return false
-				}
-			} else {
-				if e.pendingKey != seg.Key {
-					return false
-				}
-			}
-		}
-		return true
-	}
+	var stack []jsonStackEntry
 
 	for {
 		startOff := dec.InputOffset()
@@ -557,30 +562,11 @@ func jsonValueRange(doc string, segs []yamlpatch.Segment) (int, int, bool) {
 			return -1, -1, false
 		}
 		if d, ok := tok.(json.Delim); ok {
-			if d == '{' || d == '[' {
-				// Container opens. If we're at the target path, the
-				// requested leaf is a container — caller wanted a scalar
-				// so bail (current treeman patch leaves are always scalar).
-				if matches() {
-					return -1, -1, false
-				}
-				stack = append(stack, entry{isArr: d == '['})
-				continue
-			}
-			// Close delim — pop, then advance the parent's pointer
-			// past the just-closed value.
-			if len(stack) == 0 {
+			next, ok := jsonHandleDelim(stack, segs, d)
+			if !ok {
 				return -1, -1, false
 			}
-			stack = stack[:len(stack)-1]
-			if len(stack) > 0 {
-				top := &stack[len(stack)-1]
-				if top.isArr {
-					top.nextIdx++
-				} else {
-					top.pendingKey = ""
-				}
-			}
+			stack = next
 			continue
 		}
 		// Scalar token. Inside an object, before the value comes a key
@@ -593,7 +579,7 @@ func jsonValueRange(doc string, segs []yamlpatch.Segment) (int, int, bool) {
 			continue
 		}
 		// Value token. Check if it sits at the requested path.
-		if matches() {
+		if jsonStackMatches(stack, segs) {
 			endOff := dec.InputOffset()
 			s := int(startOff)
 			e := int(endOff)
@@ -602,15 +588,76 @@ func jsonValueRange(doc string, segs []yamlpatch.Segment) (int, int, bool) {
 			}
 			return s, e, true
 		}
-		if len(stack) > 0 {
-			top := &stack[len(stack)-1]
-			if top.isArr {
-				top.nextIdx++
-			} else {
-				top.pendingKey = ""
+		jsonAdvanceTop(stack)
+	}
+}
+
+// jsonStackEntry is one container frame in jsonValueRange's walk.
+type jsonStackEntry struct {
+	isArr      bool
+	pendingKey string // object: key whose value comes next; "" before key read
+	nextIdx    int    // array: index of value about to be emitted
+}
+
+// jsonStackMatches reports whether the current container stack exactly
+// corresponds to the requested path segments.
+func jsonStackMatches(stack []jsonStackEntry, segs []yamlpatch.Segment) bool {
+	if len(stack) != len(segs) {
+		return false
+	}
+	for i, e := range stack {
+		seg := segs[i]
+		if e.isArr != seg.IsIndex {
+			return false
+		}
+		if seg.IsIndex {
+			if e.nextIdx != seg.Idx {
+				return false
+			}
+		} else {
+			if e.pendingKey != seg.Key {
+				return false
 			}
 		}
 	}
+	return true
+}
+
+// jsonAdvanceTop moves the top container frame's pointer past a value
+// that has just been consumed.
+func jsonAdvanceTop(stack []jsonStackEntry) {
+	if len(stack) == 0 {
+		return
+	}
+	top := &stack[len(stack)-1]
+	if top.isArr {
+		top.nextIdx++
+	} else {
+		top.pendingKey = ""
+	}
+}
+
+// jsonHandleDelim processes an open/close delimiter token, returning the
+// updated stack. ok is false when the document terminated at a container
+// (caller wanted a scalar) or the close delim has no matching open.
+func jsonHandleDelim(stack []jsonStackEntry, segs []yamlpatch.Segment, d json.Delim) ([]jsonStackEntry, bool) {
+	if d == '{' || d == '[' {
+		// Container opens. If we're at the target path, the
+		// requested leaf is a container — caller wanted a scalar
+		// so bail (current treeman patch leaves are always scalar).
+		if jsonStackMatches(stack, segs) {
+			return stack, false
+		}
+		return append(stack, jsonStackEntry{isArr: d == '['}), true
+	}
+	// Close delim — pop, then advance the parent's pointer
+	// past the just-closed value.
+	if len(stack) == 0 {
+		return stack, false
+	}
+	stack = stack[:len(stack)-1]
+	jsonAdvanceTop(stack)
+	return stack, true
 }
 
 // jsonValueBytes returns the literal byte slice (as a string) of the
@@ -636,8 +683,8 @@ func patchDriver(p config.Patch) (string, error) {
 		return "", fmt.Errorf("patch %s: cannot infer format from extension; set `format:` explicitly", p.File)
 	}
 	// phpunit_env is a legacy alias for phpunit.
-	if d == "phpunit_env" {
-		d = "phpunit"
+	if d == DriverPhpunitEnv {
+		d = DriverPhpunit
 	}
 	return d, nil
 }
@@ -660,17 +707,17 @@ func applyContent(driver, content string, pairs map[string]string) (string, erro
 		return content, nil
 	}
 	switch driver {
-	case "dotenv":
+	case DriverDotenv:
 		return applyDotenvContent(content, pairs), nil
-	case "phpunit":
+	case DriverPhpunit:
 		return applyPhpunitContent(content, pairs), nil
-	case "yaml":
+	case DriverYAML:
 		return applyYAMLContent(content, pairs)
-	case "json":
+	case DriverJSON:
 		return applyJSONContent(content, pairs)
-	case "toml":
+	case DriverTOML:
 		return applyTOMLContent(content, pairs)
-	case "ini":
+	case DriverINI:
 		return applyINIContent(content, pairs)
 	}
 	return "", fmt.Errorf("unknown driver %q", driver)
@@ -685,17 +732,17 @@ func extractContent(driver, content string, keys []string) (map[string]string, e
 		return nil, nil
 	}
 	switch driver {
-	case "dotenv":
+	case DriverDotenv:
 		return extractDotenv(content, keys), nil
-	case "phpunit":
+	case DriverPhpunit:
 		return extractPhpunit(content, keys), nil
-	case "yaml":
+	case DriverYAML:
 		return extractYAML(content, keys)
-	case "json":
+	case DriverJSON:
 		return extractJSON(content, keys)
-	case "toml":
+	case DriverTOML:
 		return extractTOML(content, keys)
-	case "ini":
+	case DriverINI:
 		return extractINI(content, keys)
 	}
 	return nil, fmt.Errorf("unknown driver %q", driver)
@@ -716,17 +763,17 @@ func removeContent(driver, content string, keys []string) (string, error) {
 		return content, nil
 	}
 	switch driver {
-	case "dotenv":
+	case DriverDotenv:
 		return removeDotenvContent(content, keys), nil
-	case "phpunit":
+	case DriverPhpunit:
 		return removePhpunitContent(content, keys), nil
-	case "yaml":
+	case DriverYAML:
 		return removeYAMLContent(content, keys)
-	case "json":
+	case DriverJSON:
 		return removeJSONContent(content, keys)
-	case "toml":
+	case DriverTOML:
 		return removeTOMLContent(content, keys)
-	case "ini":
+	case DriverINI:
 		return removeINIContent(content, keys)
 	}
 	return "", fmt.Errorf("unknown driver %q", driver)
@@ -882,7 +929,17 @@ func yamlScalarAt(doc *yaml.Node, segs []yamlpatch.Segment) (string, bool) {
 
 // ─── json ────────────────────────────────────────────────────────────
 
+// applyJSONContent rewrites the patched values, preserving the file's
+// byte layout (key order, indentation) for keys that already exist so
+// the clean/smudge round-trip stays byte-stable and git sees no
+// modification. Only a create-missing-key falls through to the
+// reordering marshal path.
 func applyJSONContent(content string, pairs map[string]string) (string, error) {
+	out, _, err := setJSONInPlace(content, pairs)
+	return out, err
+}
+
+func applyJSONMarshal(content string, pairs map[string]string) (string, error) {
 	var doc any
 	if err := json.Unmarshal([]byte(content), &doc); err != nil {
 		return "", fmt.Errorf("json driver: parse: %w", err)
@@ -894,7 +951,7 @@ func applyJSONContent(content string, pairs map[string]string) (string, error) {
 			return "", fmt.Errorf("json driver: path %q: %w", k, err)
 		}
 		newVal := jsonScalar(pairs[k])
-		if _, err := setJSONPath(root, segs, newVal); err != nil {
+		if err := setJSONPath(root, segs, newVal); err != nil {
 			return "", fmt.Errorf("json driver: set %q: %w", k, err)
 		}
 	}
@@ -963,7 +1020,15 @@ func scalarAtJSONPath(root any, segs []yamlpatch.Segment) (string, bool) {
 
 // ─── toml ────────────────────────────────────────────────────────────
 
+// applyTOMLContent — byte-preserving value splice for existing keys;
+// see applyJSONContent. Marshal fallback (applyTOMLMarshal) only for a
+// create-missing-key.
 func applyTOMLContent(content string, pairs map[string]string) (string, error) {
+	out, _, err := setTOMLInPlace(content, pairs)
+	return out, err
+}
+
+func applyTOMLMarshal(content string, pairs map[string]string) (string, error) {
 	var doc map[string]any
 	if err := toml.Unmarshal([]byte(content), &doc); err != nil {
 		return "", fmt.Errorf("toml driver: parse: %w", err)
@@ -974,7 +1039,7 @@ func applyTOMLContent(content string, pairs map[string]string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("toml driver: path %q: %w", k, err)
 		}
-		if _, err := setJSONPath(root, segs, tomlScalar(pairs[k])); err != nil {
+		if err := setJSONPath(root, segs, tomlScalar(pairs[k])); err != nil {
 			return "", fmt.Errorf("toml driver: set %q: %w", k, err)
 		}
 	}
@@ -1007,7 +1072,15 @@ func extractTOML(content string, keys []string) (map[string]string, error) {
 
 // ─── ini ─────────────────────────────────────────────────────────────
 
+// applyINIContent — byte-preserving value splice for existing keys; see
+// applyJSONContent. Marshal fallback (applyINIMarshal) only for a
+// create-missing-key.
 func applyINIContent(content string, pairs map[string]string) (string, error) {
+	out, _, err := setINIInPlace(content, pairs)
+	return out, err
+}
+
+func applyINIMarshal(content string, pairs map[string]string) (string, error) {
 	cfg, err := ini.Load([]byte(content))
 	if err != nil {
 		return "", fmt.Errorf("ini driver: parse: %w", err)
@@ -1125,30 +1198,9 @@ func yamlDeleteAt(doc *yaml.Node, segs []yamlpatch.Segment) {
 		n = n.Content[0]
 	}
 	// Walk to parent of terminal segment.
-	for i := 0; i < len(segs)-1; i++ {
-		seg := segs[i]
-		switch {
-		case seg.IsIndex:
-			if n.Kind != yaml.SequenceNode || seg.Idx < 0 || seg.Idx >= len(n.Content) {
-				return
-			}
-			n = n.Content[seg.Idx]
-		default:
-			if n.Kind != yaml.MappingNode {
-				return
-			}
-			found := false
-			for i := 0; i+1 < len(n.Content); i += 2 {
-				if n.Content[i].Value == seg.Key {
-					n = n.Content[i+1]
-					found = true
-					break
-				}
-			}
-			if !found {
-				return
-			}
-		}
+	n, ok := yamlWalkToParent(n, segs)
+	if !ok {
+		return
 	}
 	last := segs[len(segs)-1]
 	if last.IsIndex {
@@ -1169,6 +1221,38 @@ func yamlDeleteAt(doc *yaml.Node, segs []yamlpatch.Segment) {
 			return
 		}
 	}
+}
+
+// yamlWalkToParent descends n along all but the last path segment,
+// returning the parent node of the terminal segment. ok is false when
+// any intermediate segment is missing or the node kind doesn't match.
+func yamlWalkToParent(n *yaml.Node, segs []yamlpatch.Segment) (*yaml.Node, bool) {
+	for i := 0; i < len(segs)-1; i++ {
+		seg := segs[i]
+		switch {
+		case seg.IsIndex:
+			if n.Kind != yaml.SequenceNode || seg.Idx < 0 || seg.Idx >= len(n.Content) {
+				return nil, false
+			}
+			n = n.Content[seg.Idx]
+		default:
+			if n.Kind != yaml.MappingNode {
+				return nil, false
+			}
+			found := false
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				if n.Content[i].Value == seg.Key {
+					n = n.Content[i+1]
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, false
+			}
+		}
+	}
+	return n, true
 }
 
 func removeJSONContent(content string, keys []string) (string, error) {
@@ -1219,7 +1303,7 @@ func deleteJSONPath(root any, segs []yamlpatch.Segment) {
 		return
 	}
 	parent := root
-	for i := 0; i < len(segs)-1; i++ {
+	for i := range len(segs) - 1 {
 		seg := segs[i]
 		switch p := parent.(type) {
 		case map[string]any:
@@ -1241,17 +1325,16 @@ func deleteJSONPath(root any, segs []yamlpatch.Segment) {
 		}
 	}
 	last := segs[len(segs)-1]
-	switch p := parent.(type) {
-	case map[string]any:
+	// Note: slice-typed terminals can't be removed in place without
+	// re-pointing the parent. Treeman patches only ever target
+	// scalar leaves in `patches[].set`, so that branch isn't
+	// reachable; if a future driver path needs it, surface the
+	// parent + index up here.
+	if p, ok := parent.(map[string]any); ok {
 		if last.IsIndex {
 			return
 		}
 		delete(p, last.Key)
-		// Note: slice-typed terminals can't be removed in place without
-		// re-pointing the parent. Treeman patches only ever target
-		// scalar leaves in `patches[].set`, so this branch isn't
-		// reachable; if a future driver path needs it, surface the
-		// parent + index up here.
 	}
 }
 

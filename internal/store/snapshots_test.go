@@ -15,7 +15,7 @@ func TestListLRUEvictable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	repoID, err := st.EnsureRepo(ctx, "/tmp/myrepo", "myrepo")
 	if err != nil {
@@ -23,7 +23,7 @@ func TestListLRUEvictable(t *testing.T) {
 	}
 
 	// Seed 10 snapshots with monotonically increasing LastUsedAt.
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		err := st.RecordSnapshot(ctx, SnapshotRecord{
 			Fingerprint:   fingerprintN(i),
 			Engine:        "mysql",
@@ -63,7 +63,7 @@ func TestListLRUEvictableZeroCapNoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, "/tmp/myrepo", "myrepo")
 	_ = st.RecordSnapshot(ctx, SnapshotRecord{
 		Fingerprint: "f", Engine: "mysql", EngineVersion: "8.0", SourceDB: "src",
@@ -75,6 +75,47 @@ func TestListLRUEvictableZeroCapNoop(t *testing.T) {
 	}
 	if len(cands) != 0 {
 		t.Errorf("cap=0 should return no candidates, got %d", len(cands))
+	}
+}
+
+// TestLookupAndTouchSnapshot guards the single-statement cache-hit
+// lookup: the row comes back fully hydrated AND its LRU fields are
+// bumped in the same call; a missing fingerprint yields (nil, nil).
+func TestLookupAndTouchSnapshot(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "treeman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	repoID, _ := st.EnsureRepo(ctx, "/tmp/myrepo", "myrepo")
+	if err := st.RecordSnapshot(ctx, SnapshotRecord{
+		Fingerprint: "f", Engine: "mysql", EngineVersion: "8.0", SourceDB: "src",
+		TemplateName: "tpl", LockfileHashes: map[string]string{"a.lock": "h1"},
+		LastUsedAt: 1, RepoID: repoID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := st.LookupAndTouchSnapshot(ctx, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec == nil || rec.TemplateName != "tpl" || rec.LockfileHashes["a.lock"] != "h1" {
+		t.Fatalf("hydration mismatch: %+v", rec)
+	}
+	if rec.LastUsedAt <= 1 || rec.UseCount < 1 {
+		t.Fatalf("LRU fields not bumped: last_used_at=%d use_count=%d", rec.LastUsedAt, rec.UseCount)
+	}
+	again, err := st.LookupAndTouchSnapshot(ctx, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.UseCount != rec.UseCount+1 {
+		t.Fatalf("use_count = %d, want %d", again.UseCount, rec.UseCount+1)
+	}
+	missing, err := st.LookupAndTouchSnapshot(ctx, "nope")
+	if err != nil || missing != nil {
+		t.Fatalf("missing fingerprint: got %+v, %v; want nil, nil", missing, err)
 	}
 }
 

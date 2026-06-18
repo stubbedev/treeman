@@ -61,20 +61,39 @@ func TestCLIEndToEnd(t *testing.T) {
 	buildBin(t, binDir, repoRoot, "treeman", "./cmd/treeman")
 	buildBin(t, binDir, repoRoot, "treemand", "./cmd/treemand")
 
+	// Put the freshly-built `treeman` on PATH. The patches clean/smudge
+	// filter is wired as the bare program `treeman patch-filter` (a
+	// documented contract — see internal/patcher/install.go). It's
+	// `required=false` (a missing binary degrades to identity rather
+	// than aborting git), but the clean filter must still resolve for
+	// patched files to compare equal to HEAD — without it git shows
+	// them as modified. Both the daemon (spawned below, inherits
+	// os.Environ) and this test's own `git` invocations rely on this.
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	// Per-test sockets + state so we don't collide with the
 	// developer's running daemon.
 	runtimeDir := t.TempDir()
 	stateDir := t.TempDir()
 	socket := filepath.Join(runtimeDir, "treeman.sock")
+	// Isolate the daemon's state DB. DefaultDBPath resolves to
+	// $TREEMAN_DB_PATH → $XDG_DATA_HOME/treeman → ~/.local/share/treeman —
+	// it does NOT consult XDG_STATE_HOME, so without this the test daemon
+	// opens the developer's REAL shared DB: it then contends with a running
+	// treemand for the SQLite write lock (stalling the detached teardown
+	// past the 30s wait) and accumulates stale repo rows across runs.
+	dbPath := filepath.Join(t.TempDir(), "treeman.db")
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
 	t.Setenv("XDG_STATE_HOME", stateDir)
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("TREEMAN_DB_PATH", dbPath)
 
 	// Start treemand in the background.
 	daemonCmd := exec.Command(filepath.Join(binDir, "treemand"))
 	daemonCmd.Env = append(os.Environ(),
 		"XDG_RUNTIME_DIR="+runtimeDir,
 		"XDG_STATE_HOME="+stateDir,
+		"TREEMAN_DB_PATH="+dbPath,
 	)
 	daemonStderr := &lineBuf{}
 	daemonCmd.Stderr = daemonStderr
@@ -84,6 +103,11 @@ func TestCLIEndToEnd(t *testing.T) {
 	t.Cleanup(func() {
 		_ = daemonCmd.Process.Kill()
 		_, _ = daemonCmd.Process.Wait()
+	})
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("daemon stderr (tail):\n%s", string(daemonStderr.buf))
+		}
 	})
 	// Wait for the socket to appear.
 	harness.WaitForReady(t, "treemand-socket", 10*time.Second, func() error {
@@ -158,6 +182,12 @@ databases:
 		t.Fatalf("worktree dir not created: %v", err)
 	}
 
+	// `wt create` dispatches the tail — links, copies, patches, prepare —
+	// to the daemon and returns immediately. Block on the daemon finishing
+	// before asserting on the materialized files (this is the real
+	// dispatch + async-finalize path end-to-end).
+	runTreeman(t, binDir, mainRepo, "wt", "wait", wtBranch)
+
 	// ── Links ──: vendor should be a symlink to main repo's vendor.
 	vendor := filepath.Join(wtPath, "vendor")
 	li, err := os.Lstat(vendor)
@@ -182,6 +212,21 @@ databases:
 		t.Errorf("phpunit.xml missing: %v", err)
 	} else if !strings.Contains(string(phpunit), `value="app_`) {
 		t.Errorf("phpunit.xml not patched: %s", phpunit)
+	}
+
+	// ── Patches don't trip git dirty checks ──: the tracked, per-worktree-
+	// rewritten phpunit.xml must NOT show as modified. `treeman wt create`
+	// wired the real clean filter (`treeman patch-filter clean`, via
+	// EnsureFilter); `git status` runs it and sees content == HEAD, so the
+	// worktree stays clean despite the on-disk rewrite. A regression here
+	// (clean filter not byte-stable, or filter not installed) surfaces as
+	// " M phpunit.xml" and blocks `git pull`/`checkout`.
+	porcelain := gitStatusPorcelain(t, wtPath)
+	if strings.Contains(porcelain, "phpunit.xml") {
+		t.Errorf("patched phpunit.xml shows as a git modification (clean filter not hiding the per-worktree rewrite):\n%s", porcelain)
+	}
+	if strings.TrimSpace(porcelain) != "" {
+		t.Logf("worktree git status (non-fatal, for context):\n%s", porcelain)
 	}
 
 	// ── Engine prepare ──: poll for the source DB to appear
@@ -219,9 +264,16 @@ databases:
 		}
 		return nil
 	})
-	if _, err := os.Stat(wtPath); err == nil {
-		t.Errorf("worktree dir still exists after delete: %s", wtPath)
-	}
+	// `wt delete` detaches teardown + DB teardown + git-remove to the daemon;
+	// the git-remove of the worktree dir is a separate async step from the DB
+	// drop above, so poll for it rather than asserting once (else a slow
+	// git-remove races the DB-drop readiness and flakes).
+	harness.WaitForReady(t, "remove-worktree-dir", 30*time.Second, func() error {
+		if _, err := os.Stat(wtPath); err == nil {
+			return fmt.Errorf("worktree dir still exists after delete: %s", wtPath)
+		}
+		return nil
+	})
 }
 
 // TestCLIPrintPathStreamDiscipline verifies the shell-shim contract:
@@ -316,6 +368,19 @@ func buildBin(t *testing.T, binDir, repoRoot, name, pkg string) {
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("build %s: %v", name, err)
 	}
+}
+
+// gitStatusPorcelain returns `git status --porcelain` for dir. Used to
+// assert that treeman's per-worktree patches stay hidden from git's
+// dirty checks via the installed clean filter.
+func gitStatusPorcelain(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", dir, "status", "--porcelain")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status --porcelain: %v\n%s", err, out)
+	}
+	return string(out)
 }
 
 func mustGit(t *testing.T, dir string, args ...string) {

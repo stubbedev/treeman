@@ -62,12 +62,13 @@ func TestTypeORMEndToEnd(t *testing.T) {
 				Migrate: &config.Step{
 					Run: fmt.Sprintf(
 						`docker exec -w %s -e DATABASE_URL=postgres://postgres:pgpw@postgres:5432/${DB_NAME} %s npx --no-install typeorm-ts-node-commonjs migration:run -d data-source.ts`,
-						wt, nodeContainer,
+						wt,
+						nodeContainer,
 					),
 					Env: map[string]string{"DB_NAME": "{target_db}"},
 				},
 				Inputs: []config.Input{
-					{Glob: "migrations/*.ts", Label: "migrations", Hash: "filename"},
+					{Glob: "migrations/*.ts", Label: "migrations"},
 				},
 			},
 		},

@@ -39,8 +39,7 @@ func TestDispatchesOnMatchingGlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go func() { _ = w.Start(ctx) }()
 
 	// Give the watcher a moment to register its dirs.
@@ -101,6 +100,67 @@ func TestIgnoresUnmatchedPaths(t *testing.T) {
 	if fired {
 		t.Error("dispatcher fired for unmatched path")
 	}
+}
+
+// TestReArmsAfterFlush asserts the debounce timer fires again for a
+// second burst after the first flush. This is the re-arm path that
+// replaced the always-on ticker: a regression here would dispatch the
+// first edit and then go permanently silent. Sequencing the second
+// write strictly after the first dispatch guarantees the two edits
+// land in separate debounce windows, so reaching 2 dispatches can
+// only happen if the timer re-armed.
+func TestReArmsAfterFlush(t *testing.T) {
+	repoRoot := t.TempDir()
+	migDir := filepath.Join(repoRoot, "database", "migrations")
+	if err := os.MkdirAll(migDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		mu    sync.Mutex
+		count int
+	)
+	dispatch := func(_ context.Context, _ Event) error {
+		mu.Lock()
+		count++
+		mu.Unlock()
+		return nil
+	}
+
+	const debounceMs uint64 = 80
+	w, err := New(repoRoot, []config.WatcherPath{{Glob: "database/migrations/**"}}, debounceMs, dispatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	go func() { _ = w.Start(ctx) }()
+	time.Sleep(150 * time.Millisecond) // let addAllDirs subscribe
+
+	waitFor := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			got := count
+			mu.Unlock()
+			if got >= n {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %d dispatches (re-arm likely broken)", n)
+	}
+
+	if err := os.WriteFile(filepath.Join(migDir, "001_a.sql"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(1)
+
+	// Second burst, strictly after the first window closed → re-arm.
+	if err := os.WriteFile(filepath.Join(migDir, "002_b.sql"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(2)
 }
 
 func TestStaticPrefix(t *testing.T) {

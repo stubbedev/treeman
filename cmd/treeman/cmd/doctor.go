@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/schema"
+	"github.com/stubbedev/treeman/internal/snapshot"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/ui"
 	"github.com/stubbedev/treeman/internal/wtreg"
@@ -36,7 +38,10 @@ func DoctorCmd() *cli.Command {
 		Usage: "health-check the local treeman setup",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "json", Usage: "emit one JSON line per check"},
-			&cli.BoolFlag{Name: "fix", Usage: "auto-apply remediations for `schema` (install) and `registry` (repair) checks; re-runs the probe so the printed result reflects the post-fix state"},
+			&cli.BoolFlag{
+				Name:  "fix",
+				Usage: "auto-apply remediations for `schema` (install) and `registry` (repair) checks; re-runs the probe so the printed result reflects the post-fix state",
+			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			results := RunDoctorChecks(ctx)
@@ -79,7 +84,7 @@ func DoctorCmd() *cli.Command {
 			}
 			// One-line summary so the user knows the verdict + next step
 			// without re-reading the per-check list.
-			fmt.Fprintln(ui.Out)
+			_, _ = fmt.Fprintln(ui.Out)
 			switch {
 			case failed > 0:
 				ui.Error("%d check(s) failed, %d warning(s)", failed, warned)
@@ -105,7 +110,7 @@ func DoctorCmd() *cli.Command {
 // applyDoctorFixes so the TLDR doesn't over-promise.
 func isFixable(name string) bool {
 	switch name {
-	case "schema", "registry":
+	case "schema", "registry", "snapshots":
 		return true
 	}
 	return false
@@ -142,12 +147,37 @@ func applyDoctorFixes(ctx context.Context, results []DoctorResult) []DoctorResul
 				continue
 			}
 			if _, err := wtreg.Repair(ctx, st, repoRoot, detectBranchOfWorktree); err != nil {
-				st.Close()
+				_ = st.Close()
 				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
 				continue
 			}
-			st.Close()
+			_ = st.Close()
 			results[i] = checkRegistry(ctx, repoRoot)
+		case "snapshots":
+			if repoRoot == "" {
+				continue
+			}
+			cfg, err := resolve.LoadResolved(repoRoot)
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			st, err := openDefaultStore(ctx)
+			if err != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", err)
+				continue
+			}
+			orphans, ferr := snapshot.FindOrphans(ctx, &cfg, st)
+			_ = st.Close()
+			if ferr != nil {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", ferr)
+				continue
+			}
+			if _, errs := snapshot.DropOrphans(ctx, &cfg, orphans); len(errs) > 0 {
+				results[i].Hint = fmt.Sprintf("fix failed: %v", errors.Join(errs...))
+				continue
+			}
+			results[i] = checkSnapshots(ctx, repoRoot)
 		}
 	}
 	return results
@@ -178,6 +208,7 @@ func RunDoctorChecks(ctx context.Context) []DoctorResult {
 		results = append(results, checkSchema(repoRoot))
 		results = append(results, checkFrameworks(repoRoot))
 		results = append(results, checkRegistry(ctx, repoRoot))
+		results = append(results, checkSnapshots(ctx, repoRoot))
 	} else {
 		results = append(results, doctorResult{
 			Name:   "repo",
@@ -186,6 +217,66 @@ func RunDoctorChecks(ctx context.Context) []DoctorResult {
 		})
 	}
 	return results
+}
+
+// checkSnapshots probes the template cache: row count vs cap, total
+// recorded size, pre-warmed spare count, and — the part that can rot
+// silently — ORPHAN templates: engine-side `_tm_*` databases/indexes
+// no snapshots row references (a crash between SnapshotCreate and
+// RecordSnapshot strands them; nothing else ever reclaims the disk).
+func checkSnapshots(ctx context.Context, repoRoot string) doctorResult {
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return doctorResult{Name: "snapshots", Status: "skip", Detail: "config not loadable: " + err.Error()}
+	}
+	if len(cfg.Databases) == 0 {
+		return doctorResult{Name: "snapshots", Status: "skip", Detail: "no databases configured"}
+	}
+	st, err := openDefaultStore(ctx)
+	if err != nil {
+		return doctorResult{Name: "snapshots", Status: "fail", Detail: err.Error()}
+	}
+	defer func() { _ = st.Close() }()
+
+	var rowCount int
+	if repoID, rerr := st.LookupRepoID(ctx, repoRoot); rerr == nil {
+		if rows, lerr := st.ListSnapshotsForRepo(ctx, repoID); lerr == nil {
+			rowCount = len(rows)
+		}
+	}
+	totalBytes, _ := st.SumSnapshotBytes(ctx)
+	detail := fmt.Sprintf("%d cached template(s) (cap %d), %.1f MiB recorded across repos",
+		rowCount, cfg.Snapshots.CapPerRepo, float64(totalBytes)/(1<<20))
+	if counts, serr := snapshot.SpareCounts(ctx, &cfg); serr == nil && len(counts) > 0 {
+		total := 0
+		for _, n := range counts {
+			total += n
+		}
+		detail += fmt.Sprintf(", %d pre-warmed spare(s) across %d template(s)", total, len(counts))
+	}
+
+	orphans, oerr := snapshot.FindOrphans(ctx, &cfg, st)
+	if oerr != nil {
+		return doctorResult{
+			Name:   "snapshots",
+			Status: "warn",
+			Detail: detail + " — orphan probe incomplete: " + oerr.Error(),
+			Hint:   "an engine was unreachable; start it and re-run treeman doctor",
+		}
+	}
+	if len(orphans) > 0 {
+		names := make([]string, 0, len(orphans))
+		for _, o := range orphans {
+			names = append(names, fmt.Sprintf("%s:%s", o.Family, o.Name))
+		}
+		return doctorResult{
+			Name:   "snapshots",
+			Status: "warn",
+			Detail: fmt.Sprintf("%s; %d ORPHAN template(s) holding disk: %s", detail, len(orphans), strings.Join(names, ", ")),
+			Hint:   "reclaim with: treeman doctor --fix",
+		}
+	}
+	return doctorResult{Name: "snapshots", Status: "ok", Detail: detail}
 }
 
 func checkDaemon(ctx context.Context) doctorResult {
@@ -251,15 +342,15 @@ func checkSchema(repoRoot string) doctorResult {
 	ref := schema.ReadModeline(repoRoot)
 	modelineDetail := ""
 	if ref != "" {
-		if ok, detail := schema.ProbeRef(repoRoot, ref); ok {
+		ok, detail := schema.ProbeRef(repoRoot, ref)
+		if ok {
 			return doctorResult{
 				Name:   "schema",
 				Status: "ok",
 				Detail: "modeline → " + detail,
 			}
-		} else {
-			modelineDetail = detail
 		}
+		modelineDetail = detail
 	}
 
 	if gp, err := schema.GlobalPath(); err == nil {
@@ -296,7 +387,8 @@ func checkSchema(repoRoot string) doctorResult {
 }
 
 func checkFrameworks(repoRoot string) doctorResult {
-	detected := framework.DefaultRegistry().DetectAll(repoRoot)
+	cfg, _ := resolve.LoadResolved(repoRoot)
+	detected := framework.RegistryFor(&cfg).DetectAll(repoRoot)
 	if len(detected) == 0 {
 		return doctorResult{
 			Name:   "framework",
@@ -338,7 +430,7 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 			Detail: err.Error(),
 		}
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `SELECT w.path FROM worktrees w
 		JOIN repos r ON r.id = w.repo_id WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL`, repoRoot)
 	if err != nil {
@@ -348,7 +440,7 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 			Detail: err.Error(),
 		}
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	dbPaths := map[string]bool{}
 	for rows.Next() {
 		var p string

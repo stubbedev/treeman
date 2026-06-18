@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -35,7 +36,7 @@ type Event struct {
 	// DBIndex is the index into cfg.Databases for the owning DB.
 	DBIndex int
 	// Label is the optional label on the matched Input, referenced
-	// by `hooks.on-file-change[].match:` for filtered dispatch.
+	// by `hooks.file-change[].match:` for filtered dispatch.
 	Label string
 }
 
@@ -45,10 +46,10 @@ type Dispatcher func(ctx context.Context, ev Event) error
 
 // Watcher tails one repo. Call Start in a goroutine; Stop to cancel.
 type Watcher struct {
-	repoPath   string
-	paths      []config.WatcherPath
-	dispatch   Dispatcher
-	debounceMs time.Duration
+	repoPath string
+	paths    []config.WatcherPath
+	dispatch Dispatcher
+	debounce time.Duration
 
 	fsw *fsnotify.Watcher
 
@@ -71,17 +72,24 @@ func New(repoPath string, paths []config.WatcherPath, debounceMs uint64, dispatc
 	if err != nil {
 		return nil, fmt.Errorf("fsnotify new: %w", err)
 	}
+	// Clamp before the int64 conversion so a pathological config value
+	// can't wrap time.Duration. maxDebounceMs is the largest ms window
+	// that still multiplies cleanly into an int64 nanosecond duration.
+	const maxDebounceMs = uint64(math.MaxInt64 / int64(time.Millisecond))
+	if debounceMs > maxDebounceMs {
+		debounceMs = maxDebounceMs
+	}
 	debounce := time.Duration(debounceMs) * time.Millisecond
 	if debounce == 0 {
 		debounce = 500 * time.Millisecond
 	}
 	return &Watcher{
-		repoPath:   repoPath,
-		paths:      paths,
-		dispatch:   dispatch,
-		debounceMs: debounce,
-		fsw:        fsw,
-		pending:    map[string]Event{},
+		repoPath: repoPath,
+		paths:    paths,
+		dispatch: dispatch,
+		debounce: debounce,
+		fsw:      fsw,
+		pending:  map[string]Event{},
 	}, nil
 }
 
@@ -90,7 +98,7 @@ func New(repoPath string, paths []config.WatcherPath, debounceMs uint64, dispatc
 // to fsnotify on first call (fsnotify is non-recursive on Linux);
 // new subdirectories are picked up via the Create event handler.
 func (w *Watcher) Start(ctx context.Context) error {
-	defer w.fsw.Close()
+	defer func() { _ = w.fsw.Close() }()
 
 	if len(w.paths) == 0 {
 		// No globs declared — nothing to watch. Sleep until ctx
@@ -100,12 +108,21 @@ func (w *Watcher) Start(ctx context.Context) error {
 		return nil
 	}
 
-	if err := w.addAllDirs(); err != nil {
-		return fmt.Errorf("watcher add dirs: %w", err)
-	}
+	w.addAllDirs()
 
-	ticker := time.NewTicker(w.debounceMs)
-	defer ticker.Stop()
+	// Debounce timer, armed only on the first event of a burst and
+	// disarmed after each flush. This coalesces a burst (e.g. a `git
+	// pull` dropping 40 migration files) into one flush ~debounceMs
+	// after the first event — the same bounded latency the previous
+	// always-on ticker gave, minus a wakeup every debounceMs while the
+	// repo sits idle (which, across many watched worktrees, was pure
+	// scheduler churn). Start the timer disarmed.
+	timer := time.NewTimer(w.debounce)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	armed := false
 
 	for {
 		select {
@@ -133,6 +150,15 @@ func (w *Watcher) Start(ctx context.Context) error {
 				RepoPath: w.repoPath, Path: ev.Name, DBIndex: dbIdx, Label: label,
 			}
 			w.mu.Unlock()
+			// Arm the debounce window on the first event of a burst.
+			// Subsequent events ride the same window (no reset) so a
+			// steady stream can't starve the flush past debounceMs.
+			// Resetting only when disarmed keeps the timer channel
+			// drained, so Reset never races a pending tick.
+			if !armed {
+				timer.Reset(w.debounce)
+				armed = true
+			}
 
 		case err, ok := <-w.fsw.Errors:
 			if !ok {
@@ -140,7 +166,8 @@ func (w *Watcher) Start(ctx context.Context) error {
 			}
 			slog.Warn("fsnotify error", "repo", w.repoPath, "err", err)
 
-		case <-ticker.C:
+		case <-timer.C:
+			armed = false
 			w.flush(ctx)
 		}
 	}
@@ -175,7 +202,7 @@ var noiseDirNames = map[string]struct{}{
 // existing directory to fsnotify. Globs are matched lazily on
 // emit. We add the parent dirs only — fsnotify reports events on
 // files within an added dir without recursing.
-func (w *Watcher) addAllDirs() error {
+func (w *Watcher) addAllDirs() {
 	added := map[string]struct{}{}
 	for _, p := range w.paths {
 		// Take the longest path prefix without a glob meta-character
@@ -184,7 +211,7 @@ func (w *Watcher) addAllDirs() error {
 		base := filepath.Join(w.repoPath, staticPrefix(p.Glob))
 		_ = filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
-				return nil
+				return nil //nolint:nilerr // skip unreadable entries and keep walking
 			}
 			if !d.IsDir() {
 				return nil
@@ -209,7 +236,6 @@ func (w *Watcher) addAllDirs() error {
 			return nil
 		})
 	}
-	return nil
 }
 
 // classify resolves an event path against the configured globs and

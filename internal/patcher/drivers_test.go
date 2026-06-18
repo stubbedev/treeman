@@ -30,7 +30,10 @@ func TestPatchYAMLFile_SetsNestedKey(t *testing.T) {
 	if err := yaml.Unmarshal(got, &doc); err != nil {
 		t.Fatalf("yaml: %v", err)
 	}
-	db := doc["database"].(map[string]any)
+	db, ok := doc["database"].(map[string]any)
+	if !ok {
+		t.Fatalf("database = %T, want map[string]any", doc["database"])
+	}
 	if db["name"] != "app_feature-x" {
 		t.Errorf("name = %v, want app_feature-x", db["name"])
 	}
@@ -66,7 +69,10 @@ func TestPatchJSONFile_SetsNestedKey(t *testing.T) {
 	if err := json.Unmarshal(got, &doc); err != nil {
 		t.Fatalf("json: %v", err)
 	}
-	co := doc["compilerOptions"].(map[string]any)
+	co, ok := doc["compilerOptions"].(map[string]any)
+	if !ok {
+		t.Fatalf("compilerOptions = %T, want map[string]any", doc["compilerOptions"])
+	}
 	if co["outDir"] != "dist/feature-x" {
 		t.Errorf("outDir = %v, want dist/feature-x", co["outDir"])
 	}
@@ -86,7 +92,11 @@ func TestPatchJSONFile_NumericValueBecomesNumber(t *testing.T) {
 	if err := json.Unmarshal(got, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc["db"].(float64) != 7 {
+	dbVal, ok := doc["db"].(float64)
+	if !ok {
+		t.Fatalf("db = %T, want float64", doc["db"])
+	}
+	if dbVal != 7 {
 		t.Errorf("db = %v, want 7 (numeric)", doc["db"])
 	}
 }

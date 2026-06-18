@@ -2,15 +2,22 @@ package daemon
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/rpc"
 	"github.com/stubbedev/treeman/internal/runid"
+	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
 	"github.com/stubbedev/treeman/internal/version"
 	"github.com/stubbedev/treeman/internal/watcher"
@@ -45,147 +52,411 @@ func Dispatch(ctx context.Context, st *State, shutdown chan<- struct{}, req rpc.
 		return rpc.Response{Kind: rpc.KindOk}
 
 	case rpc.MethodRepoRegister:
-		if req.RepoRegister == nil {
-			return errResp("repo_register: missing args")
-		}
-		id, err := st.Store.EnsureRepo(ctx, req.RepoRegister.Path, req.RepoRegister.Name)
-		if err != nil {
-			return errResp(err.Error())
-		}
-		return rpc.Response{Kind: rpc.KindRepoRegistered, RepoID: id}
+		return handleRepoRegister(ctx, st, req)
 
 	case rpc.MethodWatcherList:
-		s := st.ListWatchers()
-		out := make([]rpc.WatcherSummary, len(s))
-		for i, e := range s {
-			out[i] = rpc.WatcherSummary{Repo: e.Repo, WorktreeCount: e.WorktreeCount}
-		}
-		return rpc.Response{Kind: rpc.KindWatcherList, Repos: out}
-
-	case rpc.MethodWorktreeFinalize:
-		if req.WorktreeFinalize == nil {
-			return errResp("worktree_finalize: missing args")
-		}
-		args := *req.WorktreeFinalize
-		safeGo("wt_finalize", func() {
-			bg := runid.With(st.BgCtx, runid.New())
-			err := FinalizeWorktree(bg, st, args.RepoPath, args.WorktreePath, args.InheritedEnv)
-			if err != nil {
-				_ = st.Store.WriteEvent(bg, "error", "wt_finalize", err.Error(),
-					0, 0, "", 0, map[string]string{
-						"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
-					})
-			}
-		})
-		return rpc.Response{Kind: rpc.KindWorktreeFinalizeQueued, WorktreePath: args.WorktreePath}
-
-	case rpc.MethodWorktreeTeardown:
-		if req.WorktreeTeardown == nil {
-			return errResp("worktree_teardown: missing args")
-		}
-		args := *req.WorktreeTeardown
-		safeGo("wt_teardown", func() {
-			bg := runid.With(st.BgCtx, runid.New())
-			err := TeardownWorktree(bg, st, args.RepoPath, args.WorktreePath, args.Force, args.InheritedEnv)
-			if err != nil {
-				_ = st.Store.WriteEvent(bg, "error", "wt_teardown", err.Error(),
-					0, 0, "", 0, map[string]string{
-						"repo_path": args.RepoPath, "worktree_path": args.WorktreePath,
-					})
-			}
-		})
-		return rpc.Response{Kind: rpc.KindWorktreeTeardownQueued, WorktreePath: args.WorktreePath}
+		return handleWatcherList(st)
 
 	case rpc.MethodWatcherStart:
-		if req.WatcherStart == nil {
-			return errResp("watcher_start: missing args")
-		}
-		if err := startRepoWatcher(ctx, st, req.WatcherStart.RepoPath); err != nil {
-			return errResp(err.Error())
-		}
-		return rpc.Response{Kind: rpc.KindOk}
+		return handleWatcherStart(ctx, st, req)
 
 	case rpc.MethodWatcherStop:
-		if req.WatcherStop == nil {
-			return errResp("watcher_stop: missing args")
-		}
-		st.UnregisterWatcher(req.WatcherStop.RepoPath)
-		return rpc.Response{Kind: rpc.KindOk}
+		return handleWatcherStop(st, req)
 
 	case rpc.MethodConfigReload:
-		repoPath := ""
-		if req.ConfigReload != nil {
-			repoPath = req.ConfigReload.RepoPath
-		}
-		if st.ConfigReloader == nil {
-			return errResp("config_reload: reloader not initialised")
-		}
-		if repoPath == "" {
-			st.ConfigReloader.ReloadAll(st.BgCtx)
-		} else {
-			st.ConfigReloader.ReloadRepo(st.BgCtx, repoPath)
-		}
-		return rpc.Response{Kind: rpc.KindOk}
+		return handleConfigReload(st, req)
 
 	case rpc.MethodRepoRemove:
-		if req.RepoRemove == nil || req.RepoRemove.RepoPath == "" {
-			return errResp("repo_remove: missing repo_path")
-		}
-		if err := removeRepoFromRegistry(ctx, st, req.RepoRemove.RepoPath, req.RepoRemove.Force); err != nil {
-			return errResp(err.Error())
-		}
-		return rpc.Response{Kind: rpc.KindOk}
+		return handleRepoRemove(ctx, st, req)
 
 	case rpc.MethodWorktreeList:
-		if req.WorktreeList == nil {
-			return errResp("worktree_list: missing args")
-		}
-		paths, err := listWorktreePaths(ctx, st, req.WorktreeList.RepoPath)
-		if err != nil {
-			return errResp(err.Error())
-		}
-		return rpc.Response{
-			Kind:      rpc.KindWorktreeList,
-			RepoPath:  req.WorktreeList.RepoPath,
-			Worktrees: paths,
-		}
+		return handleWorktreeList(ctx, st, req)
 
 	case rpc.MethodSyncNow:
-		target := ""
-		if req.SyncNow != nil {
-			target = req.SyncNow.Path
-		}
-		statuses, errs := SyncNow(ctx, st, target)
-		return rpc.Response{
-			Kind:        rpc.KindSyncResult,
-			SyncedRepos: statuses,
-			SyncErrors:  errs,
-		}
+		return handleSyncNow(ctx, st, req)
 
 	case rpc.MethodSyncStatus:
-		filter := ""
-		if req.SyncStatus != nil {
-			filter = req.SyncStatus.RepoPath
-		}
-		statuses := SyncStatusSnapshot(ctx, st, filter)
-		return rpc.Response{
-			Kind:        rpc.KindSyncStatus,
-			SyncedRepos: statuses,
-		}
+		return handleSyncStatus(ctx, st, req)
+
+	case rpc.MethodDaemonState:
+		return handleDaemonState(st)
+
+	case rpc.MethodRunPlan:
+		return handleRunPlan(ctx, st, req)
 
 	default:
 		return errResp("unknown method: " + req.Method)
 	}
 }
 
-func phaseFor(method string) string {
-	switch method {
-	case rpc.MethodWatcherStart, rpc.MethodWatcherStop, rpc.MethodWorktreeList:
-		return "10 (watcher)"
-	case rpc.MethodWorktreeFinalize, rpc.MethodWorktreeTeardown:
-		return "8/10 (prepare + daemon supervisor)"
+// handleRepoRegister ensures the repo row exists and returns its ID.
+func handleRepoRegister(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	if req.RepoRegister == nil {
+		return errResp("repo_register: missing args")
 	}
-	return "TBD"
+	id, err := st.Store.EnsureRepo(ctx, req.RepoRegister.Path, req.RepoRegister.Name)
+	if err != nil {
+		return errResp(err.Error())
+	}
+	return rpc.Response{Kind: rpc.KindRepoRegistered, RepoID: id}
+}
+
+// handleWatcherList snapshots the running watcher set into the RPC
+// summary shape.
+func handleWatcherList(st *State) rpc.Response {
+	s := st.ListWatchers()
+	out := make([]rpc.WatcherSummary, len(s))
+	for i, e := range s {
+		out[i] = rpc.WatcherSummary{Repo: e.Repo, WorktreeCount: e.WorktreeCount}
+	}
+	return rpc.Response{Kind: rpc.KindWatcherList, Repos: out}
+}
+
+// handleWatcherStart validates args and spins up the per-repo watcher.
+func handleWatcherStart(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	if req.WatcherStart == nil {
+		return errResp("watcher_start: missing args")
+	}
+	if err := startRepoWatcher(ctx, st, req.WatcherStart.RepoPath); err != nil {
+		return errResp(err.Error())
+	}
+	return rpc.Response{Kind: rpc.KindOk}
+}
+
+// handleWatcherStop validates args and unregisters the per-repo watcher.
+func handleWatcherStop(st *State, req rpc.Request) rpc.Response {
+	if req.WatcherStop == nil {
+		return errResp("watcher_stop: missing args")
+	}
+	st.UnregisterWatcher(req.WatcherStop.RepoPath)
+	return rpc.Response{Kind: rpc.KindOk}
+}
+
+// handleConfigReload triggers a global or per-repo config reload.
+func handleConfigReload(st *State, req rpc.Request) rpc.Response {
+	repoPath := ""
+	if req.ConfigReload != nil {
+		repoPath = req.ConfigReload.RepoPath
+	}
+	if st.ConfigReloader == nil {
+		return errResp("config_reload: reloader not initialised")
+	}
+	if repoPath == "" {
+		st.ConfigReloader.ReloadAll(st.BgCtx)
+	} else {
+		st.ConfigReloader.ReloadRepo(st.BgCtx, repoPath)
+	}
+	return rpc.Response{Kind: rpc.KindOk}
+}
+
+// handleRepoRemove validates args and removes a repo from the registry.
+func handleRepoRemove(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	if req.RepoRemove == nil || req.RepoRemove.RepoPath == "" {
+		return errResp("repo_remove: missing repo_path")
+	}
+	if err := removeRepoFromRegistry(ctx, st, req.RepoRemove.RepoPath, req.RepoRemove.Force); err != nil {
+		return errResp(err.Error())
+	}
+	return rpc.Response{Kind: rpc.KindOk}
+}
+
+// handleWorktreeList validates args and lists the repo's active worktrees.
+func handleWorktreeList(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	if req.WorktreeList == nil {
+		return errResp("worktree_list: missing args")
+	}
+	paths, err := listWorktreePaths(ctx, st, req.WorktreeList.RepoPath)
+	if err != nil {
+		return errResp(err.Error())
+	}
+	return rpc.Response{
+		Kind:      rpc.KindWorktreeList,
+		RepoPath:  req.WorktreeList.RepoPath,
+		Worktrees: paths,
+	}
+}
+
+// handleSyncNow runs an on-demand fetch/merge sweep for the target.
+func handleSyncNow(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	target := ""
+	if req.SyncNow != nil {
+		target = req.SyncNow.Path
+	}
+	statuses, errs := SyncNow(ctx, st, target)
+	return rpc.Response{
+		Kind:        rpc.KindSyncResult,
+		SyncedRepos: statuses,
+		SyncErrors:  errs,
+	}
+}
+
+// IsStreamingMethod reports whether req.Method is a one-request →
+// many-response streaming subscription. The socket accept loop checks
+// this before dispatching so streaming methods skip the one-shot
+// Dispatch path and route through DispatchStreaming instead.
+func IsStreamingMethod(method string) bool {
+	return method == rpc.MethodEventSubscribe
+}
+
+// DispatchStreaming handles a streaming RPC method. Writes Response
+// envelopes to enc as events arrive until ctx cancels, the client
+// closes (next enc.Encode fails), or the underlying subscription
+// ends. Returns when the connection should be torn down. Errors are
+// logged + swallowed; the connection close terminates the stream.
+func DispatchStreaming(ctx context.Context, st *State, enc *json.Encoder, req rpc.Request) {
+	switch req.Method {
+	case rpc.MethodEventSubscribe:
+		streamEvents(ctx, st, enc, req)
+	default:
+		// Best-effort error envelope; ignore write failures (client
+		// has likely already closed).
+		_ = enc.Encode(&rpc.Response{Kind: rpc.KindError, Message: "not a streaming method: " + req.Method}) //nolint:errchkjson
+	}
+}
+
+// streamEvents registers a hook on st.Store that filters events
+// against args and writes matching ones to enc as KindEvent responses.
+// Blocks until ctx cancels, the client closes, or a write fails.
+// Filter semantics: every non-empty field is AND-combined; empty
+// fields match everything (matches logs_query exactly).
+func streamEvents(ctx context.Context, st *State, enc *json.Encoder, req rpc.Request) {
+	args := rpc.EventSubscribeArgs{}
+	if req.EventSubscribe != nil {
+		args = *req.EventSubscribe
+	}
+	repoID, worktreeID := resolveSubscribeIDs(ctx, st, args)
+
+	// Buffered channel keeps the hook fast even when the socket peer
+	// is slow. On overflow, oldest events are dropped (the agent gets
+	// "we missed some events" via the run_id gap, not a stall).
+	const bufSize = 256
+	ch := make(chan rpc.EventEnvelope, bufSize)
+	// Hook id combines a channel-pointer fingerprint (already unique
+	// per allocation) with random bytes so two subscriptions whose
+	// channel addresses happen to alias after GC can't share or
+	// clobber registrations. crypto/rand is overkill but cheap once.
+	var salt [4]byte
+	_, _ = cryptorand.Read(salt[:])
+	hookID := fmt.Sprintf("sub:%p:%x", ch, salt[:])
+	filter := buildSubscribeFilter(args, repoID, worktreeID)
+
+	st.Store.RegisterEventHook(hookID, func(ev store.Event) {
+		if !filter(ev) {
+			return
+		}
+		select {
+		case ch <- toEnvelope(ev):
+		default:
+			// Buffer full — drop. Subscriber-side gap detection is on
+			// the user; we never block WriteEvent.
+		}
+	})
+	defer st.Store.UnregisterEventHook(hookID)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-ch:
+			resp := rpc.Response{Kind: rpc.KindEvent, Event: &ev}
+			if err := enc.Encode(&resp); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// resolveSubscribeIDs resolves the repo/worktree path filters to ids
+// once before the hot path, so every WriteEvent doesn't re-look-up.
+func resolveSubscribeIDs(ctx context.Context, st *State, args rpc.EventSubscribeArgs) (repoID, worktreeID int64) {
+	if args.RepoPath != "" {
+		if id, err := st.Store.LookupRepoID(ctx, args.RepoPath); err == nil {
+			repoID = id
+		}
+	}
+	if args.WorktreePath != "" {
+		row, err := st.Store.LookupActiveWorktreeByPath(ctx, args.WorktreePath)
+		if err == nil && row.ID != 0 {
+			worktreeID = row.ID
+		}
+	}
+	return repoID, worktreeID
+}
+
+// buildSubscribeFilter closes over the resolved args + ids and returns
+// the per-event predicate. Extracted from streamEvents to keep the
+// outer function under the cyclomatic-complexity budget.
+func buildSubscribeFilter(args rpc.EventSubscribeArgs, repoID, worktreeID int64) func(store.Event) bool {
+	// Match SQLite LIKE semantics for PayloadLike: wrap a bare needle in
+	// `%…%` so callers can pass either an LIKE-style pattern (`%key%`)
+	// or a plain substring. Mirrors store.EventFilter.PayloadLike's
+	// behaviour so push and poll mode produce identical results.
+	payloadNeedle := args.PayloadLike
+	if payloadNeedle != "" && !strings.ContainsAny(payloadNeedle, "%_") {
+		payloadNeedle = "%" + payloadNeedle + "%"
+	}
+	return func(ev store.Event) bool {
+		if repoID != 0 && (!ev.RepoID.Valid || ev.RepoID.Int64 != repoID) {
+			return false
+		}
+		if worktreeID != 0 && (!ev.WorktreeID.Valid || ev.WorktreeID.Int64 != worktreeID) {
+			return false
+		}
+		if len(args.Levels) > 0 && !containsCI(args.Levels, ev.Level) {
+			return false
+		}
+		if len(args.EventTypes) > 0 && !containsCI(args.EventTypes, ev.EventType) {
+			return false
+		}
+		if len(args.Phases) > 0 && !containsCI(args.Phases, ev.Phase) {
+			return false
+		}
+		if payloadNeedle != "" && !payloadLikeMatch(ev.PayloadJSON, payloadNeedle) {
+			return false
+		}
+		if args.RunID != "" && !payloadHasRunID(ev.PayloadJSON, args.RunID) {
+			return false
+		}
+		return true
+	}
+}
+
+// payloadLikeMatch implements the subset of SQL LIKE semantics that
+// store.EventFilter.PayloadLike uses: `%` matches any run, `_` matches
+// one char. Sufficient for matching against payload_json substrings;
+// the daemon never sees user-controlled LIKE patterns outside this
+// path so a hand-rolled matcher beats spinning up a regex.
+func payloadLikeMatch(payload, pattern string) bool {
+	return likeMatch(payload, pattern)
+}
+
+// likeMatch is the iterative LIKE matcher. Greedy on `%`, falling
+// back via a recorded-start index — the standard trick that gives
+// O(n*m) worst case for the rare nested-wildcard pattern without
+// recursion overhead.
+func likeMatch(s, p string) bool {
+	si, pi := 0, 0
+	starPi, matchSi := -1, 0
+	for si < len(s) {
+		switch {
+		case pi < len(p) && p[pi] == '%':
+			starPi = pi
+			matchSi = si
+			pi++
+		case pi < len(p) && (p[pi] == '_' || p[pi] == s[si]):
+			si++
+			pi++
+		case starPi != -1:
+			pi = starPi + 1
+			matchSi++
+			si = matchSi
+		default:
+			return false
+		}
+	}
+	for pi < len(p) && p[pi] == '%' {
+		pi++
+	}
+	return pi == len(p)
+}
+
+// containsCI reports whether needle is in haystack, case-insensitive.
+// Cheap because the filter slices are typically 1-3 entries.
+func containsCI(haystack []string, needle string) bool {
+	for _, h := range haystack {
+		if strings.EqualFold(h, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// payloadHasRunID reports whether the payload_json string carries
+// `"run_id":"<id>"`. Substring check is good enough — run_ids are
+// 8-char hex so collisions with other fields are vanishingly rare.
+func payloadHasRunID(payload, runID string) bool {
+	return strings.Contains(payload, `"run_id":"`+runID+`"`)
+}
+
+// toEnvelope flattens a store.Event onto the wire EventEnvelope shape.
+func toEnvelope(ev store.Event) rpc.EventEnvelope {
+	out := rpc.EventEnvelope{
+		ID:          ev.ID,
+		Ts:          ev.Ts,
+		Level:       ev.Level,
+		EventType:   ev.EventType,
+		Phase:       ev.Phase,
+		Message:     ev.Message,
+		PayloadJSON: ev.PayloadJSON,
+	}
+	if ev.RepoID.Valid {
+		out.RepoID = ev.RepoID.Int64
+	}
+	if ev.WorktreeID.Valid {
+		out.WorktreeID = ev.WorktreeID.Int64
+	}
+	if ev.DurationMs.Valid {
+		out.DurationMs = ev.DurationMs.Int64
+	}
+	return out
+}
+
+// handleDaemonState assembles a rich runtime view of the daemon's
+// in-memory state — watcher set, in-flight finalize/teardown work,
+// per-repo sync backoff timers. Used by MCP's daemon_state tool so an
+// agent can reason about "is the daemon already busy with X?" without
+// reading event logs.
+func handleDaemonState(st *State) rpc.Response {
+	now := time.Now()
+	watchers := st.ListWatchers()
+	repos := make([]rpc.WatcherSummary, len(watchers))
+	for i, w := range watchers {
+		repos[i] = rpc.WatcherSummary{Repo: w.Repo, WorktreeCount: w.WorktreeCount}
+	}
+	finalizes := st.SnapshotInFlightFinalizes()
+	inFlightFinalizes := make([]rpc.InFlightWork, 0, len(finalizes))
+	for p, startedAt := range finalizes {
+		inFlightFinalizes = append(inFlightFinalizes, rpc.InFlightWork{
+			WorktreePath:  p,
+			StartedAtUnix: startedAt.Unix(),
+			AgeSeconds:    int64(now.Sub(startedAt).Seconds()),
+		})
+	}
+	backoffs := st.SnapshotSyncBackoffs()
+	backoffList := make([]rpc.SyncBackoffEntry, 0, len(backoffs))
+	for repo, e := range backoffs {
+		backoffList = append(backoffList, rpc.SyncBackoffEntry{
+			RepoPath:       repo,
+			ConsecFailures: e.Failures,
+			NextRetryUnix:  e.NextRetryUnix,
+		})
+	}
+	return rpc.Response{
+		Kind: rpc.KindDaemonState,
+		State: &rpc.DaemonStateSnapshot{
+			WatcherCount:      st.WatcherCount(),
+			Watchers:          repos,
+			WorktreeWatchers:  st.ListWtWatcherPaths(),
+			LifecycleWatchers: st.ListLifecycleWatcherPaths(),
+			InFlightFinalizes: inFlightFinalizes,
+			InFlightTeardowns: st.SnapshotInFlightTeardowns(),
+			SyncBackoffs:      backoffList,
+			SyncLastSkips:     st.SnapshotSyncLastSkips(),
+		},
+	}
+}
+
+// handleSyncStatus returns a snapshot of per-repo sync state.
+func handleSyncStatus(ctx context.Context, st *State, req rpc.Request) rpc.Response {
+	filter := ""
+	if req.SyncStatus != nil {
+		filter = req.SyncStatus.RepoPath
+	}
+	statuses := SyncStatusSnapshot(ctx, st, filter)
+	return rpc.Response{
+		Kind:        rpc.KindSyncStatus,
+		SyncedRepos: statuses,
+	}
 }
 
 func errResp(msg string) rpc.Response {
@@ -201,7 +472,7 @@ func listWorktreePaths(ctx context.Context, st *State, repoPath string) ([]strin
 		rows interface {
 			Close() error
 			Next() bool
-			Scan(...any) error
+			Scan(dest ...any) error
 			Err() error
 		}
 		err error
@@ -219,7 +490,7 @@ func listWorktreePaths(ctx context.Context, st *State, repoPath string) ([]strin
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var p string
@@ -256,7 +527,7 @@ func ResumeWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath stri
 // the running set.
 func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 	if repoPath == "" {
-		return fmt.Errorf("watcher_start: empty repo_path")
+		return errors.New("watcher_start: empty repo_path")
 	}
 	if _, err := resolve.LoadResolved(repoPath); err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -302,7 +573,7 @@ func startRepoWatcher(ctx context.Context, st *State, repoPath string) error {
 // Idempotent — a second call for the same wtPath is a no-op.
 func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath string) error {
 	if wtPath == "" {
-		return fmt.Errorf("watcher_start: empty worktree_path")
+		return errors.New("watcher_start: empty worktree_path")
 	}
 	if st.HasWtWatcher(wtPath) {
 		return nil
@@ -334,8 +605,8 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 	hw, err := NewHeadWatcher(wtPath, 100*time.Millisecond, func(_ context.Context, newRef string) {
 		rid := runid.New()
 		evCtx := runid.With(st.BgCtx, rid)
-		_ = st.Store.WriteEvent(evCtx, "info", "head_changed",
-			fmt.Sprintf("HEAD → %s", newRef),
+		_ = st.Store.WriteEvent(evCtx, store.LevelInfo, store.EvtWatchHead,
+			"HEAD → "+newRef,
 			repoID, 0, "", 0, map[string]string{
 				"wt":  wtPath,
 				"ref": newRef,
@@ -344,14 +615,14 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		// `wt finalize` so PATH-sensitive scripts work in this
 		// daemon-driven re-run.
 		env, _ := st.Store.LoadInheritedEnvByPath(st.BgCtx, wtPath)
-		// Fire user-defined on-checkout actions in parallel with
+		// Fire user-defined checkout actions in parallel with
 		// the regular finalize re-run (no ordering — both react to
 		// the same event independently).
-		safeGo("head_actions:"+wtPath, func() {
-			fireTriggerActions(runid.With(st.BgCtx, rid), st, repoPath, wtPath, "on-checkout", env,
+		safeGo(lblHeadActions, wtPath, func() {
+			fireTriggerActions(runid.With(st.BgCtx, rid), st, repoPath, wtPath, "checkout", env,
 				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnCheckout })
 		})
-		safeGo("head_finalize:"+wtPath, func() {
+		safeGo(lblHeadFinalize, wtPath, func() {
 			if err := FinalizeWorktree(runid.With(st.BgCtx, rid), st, repoPath, wtPath, env); err != nil {
 				slog.Warn("head-triggered finalize", "wt", wtPath, "err", err)
 			}
@@ -360,7 +631,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		// stale branch otherwise leaves it stale until the next
 		// auto-fetch tick (up to 15 min). Respects per-repo opt-out
 		// the same way the periodic sweep does.
-		safeGo("head_sync:"+wtPath, func() {
+		safeGo(lblHeadSync, wtPath, func() {
 			cfg, err := resolve.LoadResolved(repoPath)
 			if err != nil || !cfg.AutoFetch.IsEnabled() {
 				return
@@ -372,7 +643,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		slog.Warn("head watcher init failed", "wt", wtPath, "err", err)
 	} else {
 		stoppers = append(stoppers, hw.Stop)
-		safeGo("wt_head_watcher:"+wtPath, func() {
+		safeGo(lblWatcherHead, wtPath, func() {
 			if err := hw.Start(wctx); err != nil {
 				slog.Warn("head watcher exit", "wt", wtPath, "err", err)
 			}
@@ -392,7 +663,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 			return fmt.Errorf("fsnotify watcher init: %w", err)
 		}
 		stoppers = append(stoppers, w.Stop)
-		safeGo("wt_fs_watcher:"+wtPath, func() {
+		safeGo(lblWatcherFS, wtPath, func() {
 			if err := w.Start(wctx); err != nil {
 				slog.Warn("fsnotify watcher exit", "wt", wtPath, "err", err)
 			}
@@ -451,28 +722,28 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 		if st.IsTeardownInFlight(wtPath) {
 			return nil
 		}
-		// One run_id covers the watcher_fired event + the actions and
+		// One run_id covers the watch:input event + the actions and
 		// finalize fan-out that descend from it. The two safeGos use
 		// st.BgCtx (so they outlive the dispatcher), so we explicitly
 		// re-attach the id there too.
 		rid := runid.New()
 		evCtx := runid.With(ctx, rid)
-		_ = st.Store.WriteEvent(evCtx, "info", "watcher_fired",
+		_ = st.Store.WriteEvent(evCtx, store.LevelInfo, store.EvtWatchInput,
 			fmt.Sprintf("%s (db_idx=%d label=%s)", ev.Path, ev.DBIndex, ev.Label),
 			repoID, 0, "", 0, map[string]string{
 				"path":   ev.Path,
-				"db_idx": fmt.Sprintf("%d", ev.DBIndex),
+				"db_idx": strconv.Itoa(ev.DBIndex),
 				"label":  ev.Label,
 				"wt":     wtPath,
 			})
 		dbIdx, path, label := ev.DBIndex, ev.Path, ev.Label
 		env, _ := st.Store.LoadInheritedEnvByPath(st.BgCtx, wtPath)
-		// Fire the on-file-change actions in parallel with the
+		// Fire the file-change actions in parallel with the
 		// re-prep — both react to the same event independently.
-		safeGo("watch_actions:"+wtPath, func() {
+		safeGo(lblWatchActions, wtPath, func() {
 			fireOnFileChange(runid.With(st.BgCtx, rid), st, repoPath, wtPath, dbIdx, path, label, env)
 		})
-		safeGo("watcher_finalize:"+wtPath, func() {
+		safeGo(lblWatchFinalize, wtPath, func() {
 			if err := FinalizeWorktreeForWatch(runid.With(st.BgCtx, rid), st, repoPath, wtPath, dbIdx, env); err != nil {
 				slog.Warn("watcher-triggered finalize", "wt", wtPath, "err", err)
 			}
@@ -481,7 +752,7 @@ func makeWtFSDispatcher(st *State, repoPath string, repoID int64, wtPath string)
 	}
 }
 
-// fireOnFileChange runs the global `hooks.on-file-change` actions,
+// fireOnFileChange runs the global `hooks.file-change` actions,
 // filtered by the watch event's label. Actions with an empty
 // `match:` fire for any watch event (any engine, any label);
 // actions with `match: <label>` only fire when the event's label
@@ -508,7 +779,7 @@ func fireOnFileChange(
 ) {
 	cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
 	if err != nil {
-		slog.Warn("on-file-change: load config", "wt", wtPath, "err", err)
+		slog.Warn("file-change: load config", "wt", wtPath, "err", err)
 		return
 	}
 	all := cfg.Hooks.OnFileChange
@@ -542,20 +813,27 @@ func fireOnFileChange(
 	if dbIdx >= 0 && dbIdx < len(cfg.Databases) {
 		d := cfg.Databases[dbIdx]
 		engine = d.Engine
-		if rendered, err := template.Render(d.NameTemplate, template.FromSlug(sl)); err == nil {
+		// Prefix-scoped engines (redis/elasticsearch) have no
+		// name_template — their per-worktree namespace is the
+		// key_prefix. Fall back to it so TREEMAN_WATCH_DB_NAME isn't
+		// empty for those engines (and so a main_worktree key_prefix
+		// overlay, already merged into cfg, reaches the hook).
+		tmpl := d.NameTemplate
+		if tmpl == "" {
+			tmpl = d.KeyPrefix
+		}
+		if rendered, err := template.Render(tmpl, template.FromSlug(sl)); err == nil {
 			dbName = rendered
 		}
 	}
 	// Layer the watch-context env on top of the user's cached env.
 	env := make(map[string]string, len(inheritedEnv)+4)
-	for k, v := range inheritedEnv {
-		env[k] = v
-	}
+	maps.Copy(env, inheritedEnv)
 	env["TREEMAN_WATCH_PATH"] = eventPath
 	env["TREEMAN_WATCH_LABEL"] = label
 	env["TREEMAN_WATCH_ENGINE"] = engine
 	env["TREEMAN_WATCH_DB_NAME"] = dbName
-	_ = runTriggerActions(ctx, st, "on-file-change", matched, repoPath, wtPath, sl.Value, isMain, repoID, wtID, env)
+	_ = runTriggerActions(ctx, st, "file-change", matched, repoPath, wtPath, sl.Value, isMain, repoID, wtID, env)
 }
 
 // fireTriggerActions loads the resolved config for a worktree and
@@ -597,7 +875,19 @@ func fireTriggerActions(
 			"trigger", trigger, "wt", wtPath, "err", err)
 		return
 	}
-	if err := runTriggerActions(ctx, st, trigger, actions, repoPath, wtPath, id.Slug.Value, id.IsMain, repoID, id.WtID, inheritedEnv); err != nil {
+	if err := runTriggerActions(
+		ctx,
+		st,
+		trigger,
+		actions,
+		repoPath,
+		wtPath,
+		id.Slug.Value,
+		id.IsMain,
+		repoID,
+		id.WtID,
+		inheritedEnv,
+	); err != nil {
 		slog.Warn("trigger actions: run",
 			"trigger", trigger, "wt", wtPath, "err", err)
 	}

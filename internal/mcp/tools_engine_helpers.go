@@ -2,23 +2,22 @@ package mcp
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
+	"github.com/klauspost/compress/gzip"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/engineconn"
 	dbes "github.com/stubbedev/treeman/internal/db/es"
-	dbmongo "github.com/stubbedev/treeman/internal/db/mongo"
-	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
-	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
-	dbredis "github.com/stubbedev/treeman/internal/db/redis"
-	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -26,7 +25,7 @@ import (
 // Alias so tools_engine.go can refer to the snapshot type without
 // pulling the store import into its own header — keeps the engine
 // tools file focused on MCP wiring.
-type store_SnapshotRecord = store.SnapshotRecord
+type storeSnapshotRecord = store.SnapshotRecord
 
 func snapshotLookupByFingerprint(ctx context.Context, st *store.Store, fp string) (*store.SnapshotRecord, error) {
 	return st.LookupSnapshot(ctx, fp)
@@ -43,8 +42,11 @@ func snapshotLookupByEngineSource(ctx context.Context, st *store.Store, engine, 
 		WHERE engine = ? AND source_db = ?
 		ORDER BY last_used_at DESC LIMIT 1
 	`, engine, sourceDB).Scan(&fp)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	return st.LookupSnapshot(ctx, fp)
 }
@@ -71,90 +73,25 @@ func snapshotRecordToMap(r *store.SnapshotRecord) map[string]any {
 // returns a size estimate where the engine exposes one. Errors are
 // silently dropped (exists=false) — the caller surfaces them via the
 // SQLite row's recorded state.
-func probeTemplate(ctx context.Context, cfg *config.Config, engine, template string) (bool, int64, string) {
-	switch engine {
-	case "mysql", "mariadb", "tidb":
-		if cfg.Connections.Mysql == nil {
-			return false, 0, ""
-		}
-		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-		if err != nil {
-			return false, 0, ""
-		}
-		defer drv.Close()
-		exists, _ := drv.DatabaseExists(ctx, template)
-		ver, _ := drv.EngineVersion(ctx)
-		if !exists {
-			return false, 0, ver
-		}
-		// SUM(data_length+index_length) — bytes-on-disk per
-		// information_schema.tables.
-		var size int64
-		_ = drv.DB.QueryRowContext(ctx, `
-			SELECT IFNULL(SUM(data_length + index_length), 0)
-			FROM information_schema.tables WHERE table_schema = ?
-		`, template).Scan(&size)
-		return true, size / 1024, ver
-	case "postgres", "postgresql":
-		if cfg.Connections.Postgres == nil {
-			return false, 0, ""
-		}
-		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-		if err != nil {
-			return false, 0, ""
-		}
-		defer drv.Close()
-		exists, _ := drv.DatabaseExists(ctx, template)
-		ver, _ := drv.EngineVersion(ctx)
-		if !exists {
-			return false, 0, ver
-		}
-		var size int64
-		_ = drv.DB.QueryRowContext(ctx, "SELECT pg_database_size($1)/1024", template).Scan(&size)
-		return true, size, ver
-	case "mongodb":
-		if cfg.Connections.Mongodb == nil {
-			return false, 0, ""
-		}
-		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-		if err != nil {
-			return false, 0, ""
-		}
-		defer drv.Close(ctx)
-		exists, _ := drv.DatabaseExists(ctx, template)
-		ver, _ := drv.EngineVersion(ctx)
-		return exists, 0, ver
-	case "redis":
-		if cfg.Connections.Redis == nil {
-			return false, 0, ""
-		}
-		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-		if err != nil {
-			return false, 0, ""
-		}
-		defer drv.Close()
-		ok, _ := drv.PrefixExists(ctx, template)
-		ver, _ := drv.EngineVersion(ctx)
-		return ok, 0, ver
-	case "elasticsearch", "opensearch":
-		if cfg.Connections.Elasticsearch == nil {
-			return false, 0, ""
-		}
-		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-		if err != nil {
-			return false, 0, ""
-		}
-		matches, _ := drv.ListMatching(ctx, template)
-		ver, _ := drv.EngineVersion(ctx)
-		return len(matches) > 0, 0, ver
+func probeTemplate(ctx context.Context, cfg *config.Config, eng, template string) (bool, int64, string) {
+	fam, _ := engine.Canonical(eng)
+	conn, configured, err := engineconn.Connect(ctx, cfg, fam)
+	if !configured || err != nil {
+		return false, 0, ""
 	}
-	return false, 0, ""
+	defer func() { _ = conn.Close() }()
+	exists, _ := conn.Exists(ctx, template)
+	ver, _ := conn.EngineVersion(ctx)
+	if !exists {
+		return false, 0, ver
+	}
+	return true, conn.SizeKB(ctx, template), ver
 }
 
 // reservedTemplatePrefixes are the namespace markers treeman owns:
 // cache templates (`_tm_<hex>` / `tm_<hex>` for ES) and branch-scoped
 // durable copies (`_tmbs_<hex>` / `tmbs_<hex>` for ES). MCP
-// snapshot_drop must refuse anything else so a hand-crafted or
+// snapshots_drop must refuse anything else so a hand-crafted or
 // typo'd template arg can't reach DropMatching's prefix LIKE and
 // reap unrelated app databases.
 var reservedTemplatePrefixes = []string{"_tm_", "_tmbs_", "tm_", "tmbs_"}
@@ -179,91 +116,42 @@ func isReservedTemplateName(name string) bool {
 // prefix.
 func dropTemplate(ctx context.Context, cfg *config.Config, eng, template string) error {
 	if !isReservedTemplateName(template) {
-		return fmt.Errorf("refusing to drop %q: not a treeman-reserved template name (expected one of %v)", template, reservedTemplatePrefixes)
+		return fmt.Errorf(
+			"refusing to drop %q: not a treeman-reserved template name (expected one of %v)",
+			template,
+			reservedTemplatePrefixes,
+		)
 	}
 	fam, ok := engine.Canonical(eng)
 	if !ok {
 		return fmt.Errorf("unknown engine %q (allowed: %s)", eng, engine.KnownList())
 	}
-	switch fam {
-	case engine.FamilyMySQL:
-		if cfg.Connections.Mysql == nil {
-			return fmt.Errorf("connections.mysql not configured")
-		}
-		drv, err := dbmysql.Connect(ctx, *cfg.Connections.Mysql)
-		if err != nil {
-			return err
-		}
-		defer drv.Close()
-		_, err = drv.DropMatching(ctx, template)
-		return err
-	case engine.FamilyPostgres:
-		if cfg.Connections.Postgres == nil {
-			return fmt.Errorf("connections.postgres not configured")
-		}
-		drv, err := dbpostgres.Connect(ctx, *cfg.Connections.Postgres)
-		if err != nil {
-			return err
-		}
-		defer drv.Close()
-		_, err = drv.DropMatching(ctx, template)
-		return err
-	case engine.FamilyMongo:
-		if cfg.Connections.Mongodb == nil {
-			return fmt.Errorf("connections.mongodb not configured")
-		}
-		drv, err := dbmongo.Connect(ctx, *cfg.Connections.Mongodb)
-		if err != nil {
-			return err
-		}
-		defer drv.Close(ctx)
-		_, err = drv.DropMatching(ctx, template)
-		return err
-	case engine.FamilyRedis:
-		if cfg.Connections.Redis == nil {
-			return fmt.Errorf("connections.redis not configured")
-		}
-		drv, err := dbredis.Connect(ctx, *cfg.Connections.Redis)
-		if err != nil {
-			return err
-		}
-		defer drv.Close()
-		_, err = drv.DropPrefix(ctx, template)
-		return err
-	case engine.FamilyES:
-		if cfg.Connections.Elasticsearch == nil {
-			return fmt.Errorf("connections.elasticsearch not configured")
-		}
-		drv, err := dbes.Connect(ctx, *cfg.Connections.Elasticsearch)
-		if err != nil {
-			return err
-		}
-		_, err = drv.DropMatching(ctx, template)
-		return err
-	case engine.FamilyS3:
-		if cfg.Connections.S3 == nil {
-			return fmt.Errorf("connections.s3 not configured")
-		}
-		drv, err := dbs3.Connect(ctx, *cfg.Connections.S3)
-		if err != nil {
-			return err
-		}
-		_, err = drv.DropMatching(ctx, template)
-		return err
-	default:
-		return fmt.Errorf("unsupported engine family %q", fam)
+	conn, configured, err := engineconn.Connect(ctx, cfg, fam)
+	if !configured {
+		return fmt.Errorf("connections.%s not configured", fam)
 	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	_, err = conn.DropMatching(ctx, template)
+	return err
 }
 
 // ─── dump generators ────────────────────────────────────────────────
 
-func runMysqldump(ctx context.Context, conn *config.MysqlConn, db, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
+func runMysqldump(
+	ctx context.Context,
+	conn *config.MysqlConn,
+	db, outPath string,
+	gzipOut bool,
+) (*mcpsdk.CallToolResult, dbDumpOut, error) {
 	if _, err := exec.LookPath("mysqldump"); err != nil {
 		return nil, dbDumpOut{}, fmt.Errorf("mysqldump not on PATH: %w", err)
 	}
 	args := []string{
 		"--host=" + conn.Host,
-		"--port=" + fmt.Sprintf("%d", coalescePort(conn.Port, 3306)),
+		"--port=" + strconv.Itoa(coalescePort(conn.Port, 3306)),
 		"--user=" + conn.User,
 		"--single-transaction", "--routines", "--triggers",
 		db,
@@ -273,13 +161,18 @@ func runMysqldump(ctx context.Context, conn *config.MysqlConn, db, outPath strin
 	return runDumpCmd(cmd, outPath, gzipOut)
 }
 
-func runPgDump(ctx context.Context, conn *config.PostgresConn, db, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
+func runPgDump(
+	ctx context.Context,
+	conn *config.PostgresConn,
+	db, outPath string,
+	gzipOut bool,
+) (*mcpsdk.CallToolResult, dbDumpOut, error) {
 	if _, err := exec.LookPath("pg_dump"); err != nil {
 		return nil, dbDumpOut{}, fmt.Errorf("pg_dump not on PATH: %w", err)
 	}
 	args := []string{
 		"--host=" + conn.Host,
-		"--port=" + fmt.Sprintf("%d", coalescePort(conn.Port, 5432)),
+		"--port=" + strconv.Itoa(coalescePort(conn.Port, 5432)),
 		"--username=" + conn.User,
 		"--no-password", "--format=plain", "--clean", "--if-exists", db,
 	}
@@ -294,7 +187,7 @@ func runPgDump(ctx context.Context, conn *config.PostgresConn, db, outPath strin
 // prefix at load time).
 func runESDump(ctx context.Context, conn *config.EsConn, prefix, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
 	if conn == nil {
-		return nil, dbDumpOut{}, fmt.Errorf("connections.elasticsearch not configured")
+		return nil, dbDumpOut{}, errors.New("connections.elasticsearch not configured")
 	}
 	drv, err := dbes.Connect(ctx, *conn)
 	if err != nil {
@@ -304,17 +197,27 @@ func runESDump(ctx context.Context, conn *config.EsConn, prefix, outPath string,
 	if err != nil {
 		return nil, dbDumpOut{}, err
 	}
-	defer f.Close()
 	var w io.WriteCloser = f
 	if gzipOut {
 		w = gzip.NewWriter(f)
-		defer w.Close()
 	}
 	if err := drv.Dump(ctx, prefix, w); err != nil {
+		if gzipOut {
+			_ = w.Close()
+		}
+		_ = f.Close()
 		return nil, dbDumpOut{}, fmt.Errorf("es dump: %w", err)
 	}
+	// Flush+close on the success path with the error checked: a
+	// failed gzip footer or final file write would otherwise leave a
+	// truncated dump that we'd report as a success.
 	if gzipOut {
-		_ = w.Close()
+		if err := w.Close(); err != nil {
+			return nil, dbDumpOut{}, fmt.Errorf("finalize gzip dump %s: %w", outPath, err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return nil, dbDumpOut{}, fmt.Errorf("finalize dump %s: %w", outPath, err)
 	}
 	info, err := os.Stat(outPath)
 	if err != nil {
@@ -323,7 +226,12 @@ func runESDump(ctx context.Context, conn *config.EsConn, prefix, outPath string,
 	return nil, dbDumpOut{Path: outPath, SizeBytes: info.Size()}, nil
 }
 
-func runMongoDump(ctx context.Context, conn *config.MongoConn, db, outPath string, gzipOut bool) (*mcpsdk.CallToolResult, dbDumpOut, error) {
+func runMongoDump(
+	ctx context.Context,
+	conn *config.MongoConn,
+	db, outPath string,
+	gzipOut bool,
+) (*mcpsdk.CallToolResult, dbDumpOut, error) {
 	if _, err := exec.LookPath("mongodump"); err != nil {
 		return nil, dbDumpOut{}, fmt.Errorf("mongodump not on PATH: %w", err)
 	}
@@ -354,20 +262,30 @@ func runDumpCmd(cmd *exec.Cmd, outPath string, gzipOut bool) (*mcpsdk.CallToolRe
 	if err != nil {
 		return nil, dbDumpOut{}, err
 	}
-	defer f.Close()
 	var w io.WriteCloser = f
 	if gzipOut {
 		w = gzip.NewWriter(f)
-		defer w.Close()
 	}
 	var stderr bytes.Buffer
 	cmd.Stdout = w
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, dbDumpOut{}, fmt.Errorf("%s: %v: %s", cmd.Path, err, stderr.String())
+		if gzipOut {
+			_ = w.Close()
+		}
+		_ = f.Close()
+		return nil, dbDumpOut{}, fmt.Errorf("%s: %w: %s", cmd.Path, err, stderr.String())
 	}
+	// Flush+close on the success path with the error checked: a
+	// failed gzip footer or final file write would otherwise leave a
+	// truncated dump that we'd report as a success.
 	if gzipOut {
-		_ = w.Close()
+		if err := w.Close(); err != nil {
+			return nil, dbDumpOut{}, fmt.Errorf("finalize gzip dump %s: %w", outPath, err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return nil, dbDumpOut{}, fmt.Errorf("finalize dump %s: %w", outPath, err)
 	}
 	info, err := os.Stat(outPath)
 	if err != nil {

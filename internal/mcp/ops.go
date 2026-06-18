@@ -3,11 +3,14 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/engine"
@@ -31,7 +34,9 @@ var secretPatterns = []*regexp.Regexp{
 	// URI userinfo: scheme://user:password@host
 	regexp.MustCompile(`([a-z][a-z0-9+.-]*://)([^:/@\s]+):([^@\s]+)@`),
 	// KEY=VALUE for common secret-bearing variable names
-	regexp.MustCompile(`(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth)[\s]*[:=][\s]*['"]?([^\s'"\n]+)`),
+	regexp.MustCompile(
+		`(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth)[\s]*[:=][\s]*['"]?([^\s'"\n]+)`,
+	),
 	// AWS access key id
 	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
 	// GitHub PATs
@@ -66,24 +71,57 @@ func resolveRepo(override string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return gitenv.MainRoot(abs)
+		// MainRoot is a fast local git probe; resolveRepo has ~37 callers
+		// across the mcp tool handlers, so Background avoids cascading a
+		// ctx param through all of them for what is a local lookup.
+		return gitenv.MainRoot(context.Background(), abs)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
-	return gitenv.MainRoot(cwd)
+	return gitenv.MainRoot(context.Background(), cwd)
 }
 
-// resolveWorktree expands "" → cwd, then canonicalises to an
-// absolute path. Branch is read from .git/HEAD when available.
+// resolveWorktree maps the MCP `worktree` argument to an absolute
+// worktree path plus its branch. The argument may be:
+//
+//   - ""                                 → the current working directory
+//   - a registered slug / branch / basename → that worktree's path
+//   - a filesystem path                  → canonicalised to absolute
+//
+// A registered name is resolved against the repo inferred from cwd and
+// wins over the raw-path interpretation, so a bare name like "develop"
+// resolves to the tracked worktree instead of being mis-read as
+// <cwd>/develop — a non-existent path that downstream registration
+// would otherwise persist as a phantom worktree row (plus per-branch
+// databases that no teardown reclaims). Branch is read from .git/HEAD.
 func resolveWorktree(path string) (wt, branch string) {
 	if path == "" {
 		path, _ = os.Getwd()
+		wt, _ = filepath.Abs(path)
+		return wt, detectBranch(wt)
 	}
 	wt, _ = filepath.Abs(path)
-	branch = detectBranch(wt)
-	return wt, branch
+	// An existing directory is an explicit path the caller chose —
+	// honour it verbatim.
+	if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
+		return wt, detectBranch(wt)
+	}
+	// Not an on-disk path: try resolving it as a registered worktree
+	// name (slug / branch / basename) against the repo inferred from
+	// cwd. Local-only lookup, so a Background context is fine.
+	if cwd, err := os.Getwd(); err == nil {
+		if repoRoot, err := gitenv.MainRoot(context.Background(), cwd); err == nil {
+			if p, ok := wtpkg.LookupWorktree(context.Background(), repoRoot, path, wtpkg.NoopSink{}); ok {
+				return p, detectBranch(p)
+			}
+		}
+	}
+	// Unresolved name and no such path: return the absolute form. The
+	// ResolveIdentity guard refuses to register a non-worktree path, so
+	// a typo surfaces as a clear error instead of a phantom row.
+	return wt, detectBranch(wt)
 }
 
 func detectBranch(worktree string) string {
@@ -102,8 +140,8 @@ func detectBranch(worktree string) string {
 	}
 	s := strings.TrimSpace(string(b))
 	const pfx = "ref: refs/heads/"
-	if strings.HasPrefix(s, pfx) {
-		return strings.TrimPrefix(s, pfx)
+	if after, ok := strings.CutPrefix(s, pfx); ok {
+		return after
 	}
 	return ""
 }
@@ -114,7 +152,7 @@ func captureEnv() map[string]string {
 	env := os.Environ()
 	out := make(map[string]string, len(env))
 	for _, kv := range env {
-		for i := 0; i < len(kv); i++ {
+		for i := range len(kv) {
 			if kv[i] == '=' {
 				out[kv[:i]] = kv[i+1:]
 				break
@@ -124,23 +162,23 @@ func captureEnv() map[string]string {
 	return out
 }
 
-// writeMCPEvent records that an MCP tool performed `action` against
-// `repoID` (optional). Best-effort: failures are swallowed so an
-// audit-log glitch doesn't fail the underlying operation. All
-// MCP-originated events share the `mcp_` event_type prefix and a
-// `mcp=true` payload key so `logs grep mcp_` produces a clean
-// audit trail.
-func writeMCPEvent(ctx context.Context, action, message string, repoID int64, payload map[string]string) {
+// writeMCPEvent records that an MCP tool emitted `eventType` (a
+// store.EvtMCP* constant) against `repoID` (optional). Best-effort:
+// failures are swallowed so an audit-log glitch doesn't fail the
+// underlying operation. All MCP-originated events share the `mcp:`
+// prefix and a `mcp=true` payload key so `logs grep mcp:` produces a
+// clean audit trail.
+func writeMCPEvent(ctx context.Context, eventType, message string, repoID int64, payload map[string]string) {
 	st, err := openStore(ctx)
 	if err != nil {
 		return
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	if payload == nil {
 		payload = map[string]string{}
 	}
 	payload["mcp"] = "true"
-	_ = st.WriteEvent(ctx, store.LevelInfo, "mcp_"+action, message, repoID, 0, "", 0, payload)
+	_ = st.WriteEvent(ctx, store.LevelInfo, eventType, message, repoID, 0, "", 0, payload)
 }
 
 // openStore opens the default SQLite event store. Caller closes.
@@ -159,7 +197,7 @@ func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.O
 	wt, branch := resolveWorktree(worktree)
 	repoRoot, err := resolveRepo(repoOverride)
 	if err != nil {
-		repoRoot, err = gitenv.MainRoot(wt)
+		repoRoot, err = gitenv.MainRoot(ctx, wt)
 		if err != nil {
 			return nil, err
 		}
@@ -172,7 +210,7 @@ func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.O
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	// Route through ResolveIdentity so MCP matches the daemon + CLI: the
 	// main-worktree overlay is applied (bare active DB name) and a linked
@@ -196,7 +234,7 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 	wt, branch := resolveWorktree(worktree)
 	repoRoot, err := resolveRepo(repoOverride)
 	if err != nil {
-		repoRoot, err = gitenv.MainRoot(wt)
+		repoRoot, err = gitenv.MainRoot(ctx, wt)
 		if err != nil {
 			return nil, err
 		}
@@ -209,7 +247,7 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	// Same identity routing as runPrepare — reset must operate on the very
 	// active namespace the swap lifecycle created (bare on the main worktree).
@@ -264,7 +302,7 @@ func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) (
 	wt, branch := resolveWorktree(worktree)
 	repoRoot, err := resolveRepo(repoOverride)
 	if err != nil {
-		repoRoot, err = gitenv.MainRoot(wt)
+		repoRoot, err = gitenv.MainRoot(ctx, wt)
 		if err != nil {
 			return nil, err
 		}
@@ -277,7 +315,7 @@ func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) (
 	if err != nil {
 		return nil, err
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 	id, err := wtpkg.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
 	if err != nil {
@@ -286,11 +324,58 @@ func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) (
 	return prepare.BranchScopedStatus(ctx, &cfg, repoRoot, wt, id.WtID, st)
 }
 
+// confirmDestructive asks the user via MCP elicitation before running
+// a destructive action. Returns (true, "") when the agent should
+// proceed: dry_run=true short-circuits to true, ack=true skips
+// elicitation, an elicitation error (client doesn't support it)
+// falls through to true, and an "accept" response returns true. Only
+// an explicit "decline"/"cancel" stops the action.
+//
+// The intent: clients that DO support elicitation (Claude Desktop,
+// etc.) get a confirmation pop-up; clients that don't are unchanged.
+// Agents that want to bypass confirmation entirely can pass ack=true.
+func confirmDestructive(
+	ctx context.Context,
+	req *mcpsdk.CallToolRequest,
+	dryRun, ack bool,
+	message string,
+) (bool, string) {
+	if dryRun || ack {
+		return true, ""
+	}
+	if req == nil || req.Session == nil {
+		return true, ""
+	}
+	res, err := req.Session.Elicit(ctx, &mcpsdk.ElicitParams{
+		Mode:    "confirmation",
+		Message: message,
+	})
+	if err != nil || res == nil {
+		// Client doesn't support elicitation (or it errored). Fall
+		// through — refusing would break non-interactive agents that
+		// can't even ask the question.
+		return true, ""
+	}
+	switch res.Action {
+	case "accept":
+		return true, ""
+	case "decline":
+		return false, "user declined"
+	case "cancel":
+		return false, "user cancelled"
+	default:
+		return false, "user action: " + res.Action
+	}
+}
+
 // runHookPhase synchronously executes one hook phase. Mirrors cmd's
-// RunHookPhase but with no CLI surface.
-func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome, error) {
+// RunHookPhase but with no CLI surface. envOverrides (when non-nil)
+// are merged on top of the captured os.Environ() so an MCP caller can
+// tweak one var (e.g. retry a flaky setup with `DEBUG=1`) without
+// editing .treeman.yaml.
+func runHookPhase(ctx context.Context, phase, worktree string, envOverrides map[string]string) (hooks.RunOutcome, error) {
 	wt, branch := resolveWorktree(worktree)
-	repoRoot, err := gitenv.MainRoot(wt)
+	repoRoot, err := gitenv.MainRoot(ctx, wt)
 	if err != nil {
 		return hooks.RunOutcome{}, err
 	}
@@ -299,13 +384,14 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 		return hooks.RunOutcome{}, err
 	}
 	env := captureEnv()
+	maps.Copy(env, envOverrides)
 
 	st, dbErr := openStore(ctx)
 	var repoID, wtID int64
 	var sl slug.Slug
 	var isMain bool
 	if dbErr == nil {
-		defer st.Close()
+		defer func() { _ = st.Close() }()
 		repoID, _ = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
 		id, idErr := wtpkg.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
 		if idErr != nil {
@@ -320,18 +406,21 @@ func runHookPhase(ctx context.Context, phase, worktree string) (hooks.RunOutcome
 
 	var entries []config.Action
 	switch phase {
-	case "on-create-before-engines":
+	case "create-before-engines":
 		entries = cfg.Hooks.OnCreateBeforeEngines
-	case "on-create-after-engines":
+	case "create-after-engines":
 		entries = cfg.Hooks.OnCreateAfterEngines
-	case "on-delete-before-engines":
+	case "delete-before-engines":
 		entries = cfg.Hooks.OnDeleteBeforeEngines
-	case "on-delete-after-engines":
+	case "delete-after-engines":
 		entries = cfg.Hooks.OnDeleteAfterEngines
-	case "on-checkout":
+	case "checkout":
 		entries = cfg.Hooks.OnCheckout
 	default:
-		return hooks.RunOutcome{}, fmt.Errorf("unknown phase %q (want on-create-before-engines|on-create-after-engines|on-delete-before-engines|on-delete-after-engines|on-checkout)", phase)
+		return hooks.RunOutcome{}, fmt.Errorf(
+			"unknown phase %q (want create-before-engines|create-after-engines|delete-before-engines|delete-after-engines|checkout)",
+			phase,
+		)
 	}
 
 	started := hooks.EmitHookStart(ctx, st, repoID, wtID, phase, len(entries))

@@ -157,6 +157,40 @@ func TestValidate(t *testing.T) {
 			want: "",
 		},
 		{
+			name: "prewarm on postgres is valid",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "postgres",
+					NameTemplate: "app_{slug}",
+					Prewarm:      2,
+				}},
+			},
+			want: "",
+		},
+		{
+			name: "prewarm rejects non-postgres engines",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "mysql",
+					NameTemplate: "app_{slug}",
+					Prewarm:      2,
+				}},
+			},
+			want: "prewarm is postgres-only",
+		},
+		{
+			name: "prewarm rejects branch_scoped",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "postgres",
+					NameTemplate: "app_{slug}",
+					BranchScoped: true,
+					Prewarm:      1,
+				}},
+			},
+			want: "branch_scoped and prewarm are mutually exclusive",
+		},
+		{
 			name: "branch_scoped + main_worktree.enabled with no overlay rejects slug-bearing main name",
 			cfg: Config{
 				Databases: []DatabaseConfig{{
@@ -230,7 +264,7 @@ func TestValidate(t *testing.T) {
 				Databases: []DatabaseConfig{{
 					Engine:    "s3",
 					KeyPrefix: "myapp-{slug}",
-					Dump:      &DumpSpec{Path: "dump.sql"},
+					Dump:      DumpList{{Path: "dump.sql"}},
 				}},
 			},
 			want: "engine \"s3\" does not support `dump:`",

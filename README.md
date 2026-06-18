@@ -1,81 +1,74 @@
 # treeman
 
 **Per-worktree development environment helper.** Spin up isolated
-databases, search indices, and parallel test clones per git
-worktree; tear them down on delete; keep them in sync as your
-migrations or fixtures change. Language- and framework-agnostic —
-runs the same way against a Laravel + MySQL repo, a Rails +
-Postgres repo, a Django + Postgres repo, a Go + golang-migrate
-service, or a Rust + sqlx workspace.
+databases, search indices, and parallel test clones for each git
+worktree — torn down on delete, kept in sync as your migrations and
+fixtures change. Language- and framework-agnostic.
 
 Pure wire-protocol DB access (Go `database/sql` for MySQL +
-PostgreSQL, the official Mongo / Redis / Elasticsearch SDKs); no
-shelling out to `mysql` / `psql` / `mongosh` / `redis-cli`.
-Single user-mode daemon, thin CLI client, SQLite-backed event log.
+PostgreSQL, the official Mongo / Redis / Elasticsearch SDKs) — no
+shelling out to `mysql` / `psql` / `mongosh` / `redis-cli`. A single
+user-mode daemon, a thin CLI client, and a SQLite-backed event log.
 
 ---
 
 ## Why treeman
 
-Git worktrees give every branch its own checkout — but the
-checkout alone isn't enough. A working tree needs:
+A git worktree gives every branch its own checkout — but a working
+tree also needs its own database, `N` test-runner clones fanning out
+from a cached template, migrations applied, `.env`-style config patched
+to the per-worktree DB names, install hooks run, and teardown that drops
+every namespace on delete. treeman owns that lifecycle:
+`treeman wt create FOO` and `treeman wt delete FOO` are the only
+commands you type.
 
-- a database scoped to that worktree (e.g. `myapp_test_proj_123`)
-  so parallel branches don't trample each other's data
-- `N` test-runner clones of that database fanning out from a
-  single cached template, so the project's parallel test runner
-  (paratest, pest, pytest-xdist, Jest workers, Go `-parallel`,
-  cargo nextest, …) gets a fresh DB per worker
-- the project's migrations applied to the source DB
-- `.env`-style config (or `phpunit.xml`, `pyproject.toml`, etc.)
-  patched to point at the per-worktree DB names
-- post-create install hooks (composer / yarn / pnpm / go mod /
-  cargo / bundler / pip …) running in parallel
-- pre-delete teardown that drops every per-worktree namespace
-  (DB, Redis index, ES index prefix) when you're done
+## Supported engines
 
-treeman owns that lifecycle. `treeman wt create FOO` /
-`treeman wt delete FOO` are the only commands you type; a SQLite
-event log records every step.
+| Engine | Variants | Per-worktree isolation |
+|---|---|---|
+| MySQL | MariaDB, TiDB | Separate database |
+| PostgreSQL | — | Separate database |
+| MongoDB | — | Separate database |
+| Redis | Valkey, DragonflyDB | Key-prefix in DB 0 (cluster-safe, no 16-DB cap) |
+| Elasticsearch | OpenSearch | Index-name prefix |
 
-## At a glance
+Variants are first-class aliases — declare `engine: mariadb`, `tidb`,
+`valkey`, `dragonfly`, or `opensearch` and treeman routes it to the
+parent engine's driver (Valkey/DragonflyDB ride the Redis wire
+protocol).
 
-- **Per-worktree namespaces** for MySQL / MariaDB / TiDB,
-  PostgreSQL, MongoDB, Redis (key-prefix in DB 0 — cluster-mode
-  safe, no 16-DB cap), Elasticsearch / OpenSearch (index-name
-  prefix).
-- **Snapshot cache** with LRU eviction — repeated `wt create` on
-  the same migrations + dump hits a cached template DB. Cap-per-
-  repo (default 8) keeps engine disk usage bounded.
-- **Hook lifecycle** — declarative `on-create-before-engines` /
-  `on-create-after-engines` / `on-delete-before-engines` /
-  `on-delete-after-engines` / `on-checkout` / `on-file-change`
-  trigger lists. Actions in one list run in parallel; the
-  `run:` steps inside one action chain sequentially with `&&`.
-- **Parallel test runner support** — `clones: auto` detects
-  worker counts from 19+ runners (paratest / pest / phpunit,
-  pytest-xdist, jest / vitest / playwright, parallel_tests,
-  cargo-nextest, etc.) by inspecting the repo's config files.
-- **File watcher** (fsnotify) for live updates — input edits
-  re-fingerprint each affected database; the dispatch picks
-  `auto | delta | rebuild` based on whether the new hash hits
-  a cached template, needs a partial migrate-up, or a full
-  cold-build.
-- **MCP server** — `treeman mcp` exposes treeman to Claude Code /
-  Claude Desktop / Cursor as a structured tool surface for
-  **configuration + diagnosis**: authoring/validating
-  `.treeman.yaml` (`config_get`, `config_validate`,
-  `config_schema`, `config_set`, `init_repo`, `schema_install`,
-  `fw_detect`), reading the event log + hook output
-  (`logs_query`, `logs_hooks`, `hook_log_read`), querying live
-  engine state (`db_query`, `db_schema_dump`, `engine_status`),
-  and inspecting the snapshot cache (`snapshots_list`,
-  `snapshot_inspect`).
-- **Single static binary** per platform — no CGo, no system
-  libraries; CI cross-builds `{linux,darwin}` × `{amd64,arm64}`.
+## Features
 
-See [docs/](docs/) for the deep dives — CLI reference,
-configuration schema, AI integration, internals.
+- **Snapshot cache** — repeated `wt create` on the same migrations +
+  dump hits a cached template DB; LRU eviction with a per-repo cap
+  (default 8), per-source retention, age + size sweeps bound disk use;
+  `treeman doctor` flags (and `--fix` reclaims) orphaned templates
+  left behind by crashes.
+- **Spare-clone pre-warming** — `databases[].prewarm: N` (Postgres)
+  keeps N clones pre-restored from the cached template; a cache-hit
+  `wt create` claims one via `ALTER DATABASE … RENAME` in milliseconds
+  regardless of database size, and the pool refills in the background.
+- **Hook lifecycle** — declarative create / delete / checkout /
+  file-change trigger lists; actions in a list run in parallel, the
+  `run:` steps within an action chain sequentially.
+- **Parallel test runner support** — `clones: auto` detects the test
+  framework (paratest, pytest-xdist, jest / vitest, cargo-nextest, …)
+  and pre-warms one clone per CPU when that runner parallelizes
+  per-worker, else one.
+- **File watcher** — fsnotify re-fingerprints affected databases on
+  input edits and picks `auto | delta | rebuild`.
+- **MCP server** — `treeman mcp` exposes config authoring/validation,
+  event-log + hook-output queries, live engine state, and snapshot
+  inspection to Claude Code / Desktop / Cursor.
+- **Desktop notifications** — opt-in `notifications:` block fires
+  `notify-send` (Linux) / native banners (macOS) when a worktree turns
+  ready, fails, or starts/finishes preparing; configurable per status
+  bucket, hot-reloaded without a restart.
+- **Single static binary** per platform — no CGo, no system libraries;
+  CI cross-builds `{linux,darwin}` × `{amd64,arm64}`.
+
+See [docs/](docs/) for the deep dives — CLI reference, configuration
+schema, AI integration, internals.
 
 ---
 
@@ -90,7 +83,7 @@ configuration schema, AI integration, internals.
   instances; it does not run them. Local server, remote server,
   or container-hosted server (auto-discovered via `docker
   inspect` / `compose ps`) all work.
-- **Go 1.23+** — only if building from source.
+- **Go 1.25+** — only if building from source.
 
 That's the whole dependency list. No Python, no Node, no
 language-specific tooling required.
@@ -119,7 +112,7 @@ install /tmp/treeman-*-linux-amd64/treeman  ~/.local/bin/
 install /tmp/treeman-*-linux-amd64/treemand ~/.local/bin/
 ```
 
-From source (Go 1.23+):
+From source (Go 1.25+):
 
 ```sh
 git clone https://github.com/stubbedev/treeman
@@ -156,18 +149,19 @@ treeman daemon start        # idempotent — uses systemctl/launchctl when insta
 
 # Sanity check whenever something feels off:
 treeman doctor              # probes daemon, config, schema, git ↔ registry drift
+treeman repos               # every enrolled repo: worktrees, snapshots, last activity
 
 # 3. Spin up a worktree end-to-end.
 treeman wt create proj-123
 #   ↳ git worktree add .worktrees/proj-123 -b proj-123 origin/HEAD
-#   ↳ symlinks .env (and any worktrees.links targets)
-#   ↳ patches env_scoping.files entries (.env.testing, settings.py,
+#   ↳ brings in worktrees.copies (e.g. .env) + worktrees.links (e.g. node_modules)
+#   ↳ patches `patches:` entries (.env.testing, settings.py,
 #     phpunit.xml, etc.) to point at per-worktree DB names
-#   ↳ runs postcreate hooks (parallel groups, detached)
+#   ↳ runs create hooks (parallel groups, detached)
 #   ↳ prepare: ensure_db → load dump → migrate → snapshot → N test clones
 
 # 4. Get the path of an existing worktree for `cd` integration:
-cd "$(treeman wt switch proj-123)"
+cd "$(treeman wt go proj-123)"
 
 # (CI flow: block on the daemon's finalize before running tests.)
 treeman wt wait proj-123                  # exits 0 on success, non-zero on failure
@@ -182,7 +176,7 @@ treeman wt delete proj-123
 cd "$(treeman wt back --remove)"
 ```
 
-A ready-to-source zsh shim that wraps `wt switch` / `wt back` for
+A ready-to-source zsh shim that wraps `wt go` / `wt back` for
 `cd`-into-worktree UX lives at `contrib/tm.zsh` (exposes a `tm`
 shell function):
 
@@ -206,9 +200,14 @@ tm list              # passthrough to `treeman wt list`
 | Page | What you'll find |
 |---|---|
 | [docs/cli.md](docs/cli.md) | Full command reference, log filters, completion, output/color/paging, env vars |
-| [docs/configuration.md](docs/configuration.md) | `.treeman.yaml` reference — every block, per-stack examples, templated names, hooks, credential resolution, container DBs + hooks |
+| [docs/configuration.md](docs/configuration.md) | `.treeman.yaml` guide — every block, per-stack examples, templated names, hooks, credential resolution, container DBs |
+| [docs/config-reference.md](docs/config-reference.md) | Generated field-by-field `.treeman.yaml` reference (from the Go types) |
 | [docs/advanced.md](docs/advanced.md) | Snapshot cache + GC, framework presets |
 | [docs/mcp.md](docs/mcp.md) | MCP / AI integration — Claude Code, Claude Desktop, Cursor, security model |
+| [docs/mcp-tools.md](docs/mcp-tools.md) | Generated MCP tool + prompt reference (from the registry) |
+| [docs/events.md](docs/events.md) | Generated event-type reference (from the `store.Evt*` constants) |
+| [docs/frameworks.md](docs/frameworks.md) | Generated migration-framework preset table (from the detector registry) |
+| [docs/rpc-reference.md](docs/rpc-reference.md) | Generated RPC method / task / kind reference (from `internal/rpc`) |
 | [docs/internals.md](docs/internals.md) | Storage layout, daemon model, init parity, RPC envelope, development |
 
 ---

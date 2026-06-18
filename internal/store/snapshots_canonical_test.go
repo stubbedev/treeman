@@ -18,7 +18,7 @@ func TestRecordSnapshotCanonicalisesEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := st.EnsureRepo(ctx, "/tmp/repo", "repo")
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestRecordSnapshotPreservesUnknownEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := st.EnsureRepo(ctx, "/tmp/repo", "repo")
 	if err != nil {
 		t.Fatal(err)

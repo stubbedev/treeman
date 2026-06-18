@@ -20,18 +20,21 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer raw.Close()
+	defer func() { _ = raw.Close() }()
 
 	got := dump(t, raw)
 	wantTables := []string{
 		"_treeman_migrations",
 		"active_branch_db",
+		"branch_db_migrated",
+		"branch_durables",
+		"config_generations",
 		"dir_hashes",
 		"events",
 		"file_hashes",
@@ -49,6 +52,9 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 	// filtered out — only user-declared CREATE INDEXes show up here.
 	wantIndexes := []string{
 		"idx_active_branch_db_repo",
+		"idx_branch_durables_branch",
+		"idx_branch_durables_repo",
+		"idx_config_generations_repo",
 		"idx_events_ts",
 		"idx_events_type",
 		"idx_events_worktree",
@@ -58,6 +64,7 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 		"idx_hook_runs_worktree",
 		"idx_repos_path_nocase",
 		"idx_snapshots_lru",
+		"idx_snapshots_migrations",
 		"idx_snapshots_repo_lru",
 		"idx_worktree_ports_one_per_port",
 		"idx_worktree_ports_one_per_slot",
@@ -98,7 +105,7 @@ func dump(t *testing.T, db *sql.DB) schemaSnapshot {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var s schemaSnapshot
 	for rows.Next() {
 		var typ, name string
@@ -109,6 +116,9 @@ func dump(t *testing.T, db *sql.DB) schemaSnapshot {
 		case "index":
 			s.indexes = append(s.indexes, name)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	sort.Strings(s.tables)
 	sort.Strings(s.indexes)

@@ -45,7 +45,11 @@ func TestMCPServerJSONRPC(t *testing.T) {
 	dbPath := filepath.Join(stateDir, "treeman.db")
 	srv.Env = append(os.Environ(),
 		"TREEMAN_DB_PATH="+dbPath,
+		"TREEMAN_SOCKET="+filepath.Join(filepath.Dir(dbPath), "tm.sock"),
 		"XDG_CONFIG_HOME="+t.TempDir(),
+		// Advertise every tool — these tests exercise tool behavior, not
+		// the lazy-disclosure gateway (unit-tested in internal/mcp).
+		"TREEMAN_MCP_ALL_TOOLS=1",
 	)
 	stdin, err := srv.StdinPipe()
 	if err != nil {

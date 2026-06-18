@@ -19,6 +19,8 @@ func TestCanonical(t *testing.T) {
 		"postgresql":    {FamilyPostgres, true},
 		"mongodb":       {FamilyMongo, true},
 		"redis":         {FamilyRedis, true},
+		"valkey":        {FamilyRedis, true},
+		"dragonfly":     {FamilyRedis, true},
 		"elasticsearch": {FamilyES, true},
 		"opensearch":    {FamilyES, true},
 		"s3":            {FamilyS3, true},

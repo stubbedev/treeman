@@ -27,7 +27,7 @@ import (
 //     by the `config_reload` RPC.
 //
 // Directories — not individual files — are added to the fsnotify
-// watcher. Most editors (vim's atomic rename, `yamlpatch.AtomicWriteWithBackup`)
+// watcher. Most editors (vim's atomic rename, `yamlpatch.AtomicWrite`)
 // replace `.treeman.yaml` via rename, which breaks file-level watches
 // because the new inode isn't the one being watched. Watching the
 // parent and filtering by basename catches every write pattern.
@@ -86,7 +86,7 @@ func NewConfigReloader(st *State) (*ConfigReloader, error) {
 // Start spawns the fsnotify drain loop. The loop exits when ctx is
 // cancelled — that closes the underlying watcher.
 func (cr *ConfigReloader) Start(ctx context.Context) {
-	safeGo("config_reloader", func() { cr.loop(ctx) })
+	safeGo(lblConfigReload, "", func() { cr.loop(ctx) })
 }
 
 // AddRepo begins watching `repoPath` for changes to `.treeman.yaml`
@@ -139,7 +139,7 @@ func (cr *ConfigReloader) removeDirLocked(dir string) {
 }
 
 func (cr *ConfigReloader) loop(ctx context.Context) {
-	defer cr.fsw.Close()
+	defer func() { _ = cr.fsw.Close() }()
 	for {
 		select {
 		case <-ctx.Done():
@@ -223,7 +223,13 @@ func (cr *ConfigReloader) ReloadAll(ctx context.Context) {
 	for _, p := range paths {
 		cr.reloadOne(ctx, p)
 	}
-	_ = cr.st.Store.WriteEvent(ctx, store.LevelInfo, "config_reloaded",
+	// Re-read the global `notifications:` block so toggling it on/off
+	// (or changing the bucket list / backend) in
+	// `~/.config/treeman/config.yaml` takes effect live, without a
+	// daemon restart. Lives here (not reloadOne) because notifications
+	// are global-only and ReloadAll is the global-config seam.
+	RegisterNotifier(cr.st)
+	_ = cr.st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtConfigReload,
 		"config reload restarted watchers (all repos)", 0, 0, "", 0,
 		map[string]string{"scope": "all"})
 }
@@ -233,7 +239,7 @@ func (cr *ConfigReloader) ReloadAll(ctx context.Context) {
 func (cr *ConfigReloader) ReloadRepo(ctx context.Context, repoPath string) {
 	resolve.InvalidateConfigCache()
 	cr.reloadOne(ctx, repoPath)
-	_ = cr.st.Store.WriteEvent(ctx, store.LevelInfo, "config_reloaded",
+	_ = cr.st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtConfigReload,
 		"config reload restarted watchers", 0, 0, "", 0,
 		map[string]string{"repo": repoPath})
 }

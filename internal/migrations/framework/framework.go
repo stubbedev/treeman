@@ -10,7 +10,10 @@ package framework
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"github.com/stubbedev/treeman/internal/config"
 )
 
 // Validator is an optional second-stage check a Spec can use when its
@@ -18,19 +21,6 @@ import (
 // repos that use golang-migrate). Returns true iff the repo really
 // looks like the framework in question.
 type Validator func(repoRoot string) bool
-
-// HashMode determines how migration files are fingerprinted.
-type HashMode string
-
-const (
-	// HashFilename — fingerprint the filename. Cheaper; fine when
-	// migrations are write-once-immutable (Laravel, Rails, Django,
-	// Knex, Drizzle, etc.).
-	HashFilename HashMode = "filename"
-	// HashChecksum — fingerprint the file contents. Needed for
-	// frameworks that mutate migrations in place (sqlx-cli, Flyway).
-	HashChecksum HashMode = "checksum"
-)
 
 // OnModify gates the watcher dispatch.
 type OnModify string
@@ -50,7 +40,6 @@ type Spec struct {
 	MigrationDirs []string // glob patterns relative to repo root
 	FileGlobs     []string // glob patterns for migration files in those dirs
 	Lockfiles     []string
-	HashMode      HashMode
 	OnModify      OnModify
 	EngineHint    string // "mysql", "postgres", "" if unknown
 	// MigrateRun is the shell command `treeman init` writes into the
@@ -63,6 +52,17 @@ type Spec struct {
 	// per-run template DB name. Empty for frameworks that read the
 	// target DB from their own config rather than env.
 	MigrateEnv map[string]string
+	// RollbackRun is the shell command `treeman init` writes into the
+	// optional `databases[].rollback.run` field — the framework's
+	// step-based "undo last N migrations" CLI. Treeman injects the step
+	// count via the TREEMAN_ROLLBACK_STEPS env var (Run is not template-
+	// rendered), so the command references it directly. Empty for
+	// frameworks without a clean relative-step rollback (those scaffold
+	// no rollback block and use cold rebuild on an edited migration).
+	RollbackRun string
+	// RollbackEnv is the env-var override map for the rollback command —
+	// the same DB-targeting env as MigrateEnv. Empty when RollbackRun is.
+	RollbackEnv map[string]string
 	// Validate, when non-nil, runs after the marker check and must
 	// also pass for Detect to return true. Used to disambiguate
 	// frameworks whose Markers are too coarse on their own (e.g.
@@ -85,7 +85,7 @@ func (s Spec) Detect(repoRoot string) bool {
 	}
 	for _, group := range s.Markers {
 		matched := false
-		for _, alt := range strings.Split(group, "|") {
+		for alt := range strings.SplitSeq(group, "|") {
 			alt = strings.TrimSpace(alt)
 			if alt == "" {
 				continue
@@ -131,6 +131,39 @@ func LookupBuiltin(name string) (Spec, bool) {
 		}
 	}
 	return Spec{}, false
+}
+
+// RegistryFor returns the built-in detectors PLUS any user-defined
+// frameworks from `cfg.Frameworks` (the `frameworks:` YAML block). A
+// custom entry detects when all its markers are present (Spec.Detect).
+// This is what makes the `frameworks:` block live — `treeman fw detect`
+// and the doctor consult it so a project on a framework treeman doesn't
+// ship a preset for is still recognised.
+func RegistryFor(cfg *config.Config) *Registry {
+	r := DefaultRegistry()
+	if cfg == nil || len(cfg.Frameworks) == 0 {
+		return r
+	}
+	names := make([]string, 0, len(cfg.Frameworks))
+	for n := range cfg.Frameworks {
+		names = append(names, n)
+	}
+	sort.Strings(names) // deterministic detection order
+	for _, name := range names {
+		cf := cfg.Frameworks[name]
+		spec := Spec{
+			Name:          name,
+			Markers:       cf.Markers,
+			MigrationDirs: cf.MigrationDirs,
+			Lockfiles:     cf.Lockfiles,
+			EngineHint:    cf.EngineHint,
+		}
+		if cf.FilePattern != "" {
+			spec.FileGlobs = []string{cf.FilePattern}
+		}
+		r.Specs = append(r.Specs, spec)
+	}
+	return r
 }
 
 // DetectAll returns every Spec whose markers match.
@@ -293,6 +326,13 @@ func flywayURLEnv() map[string]string {
 }
 
 func builtins() []Spec {
+	specs := builtinsClassic()
+	specs = append(specs, builtinsJSAndOther()...)
+	specs = append(specs, builtinsExtra()...)
+	return specs
+}
+
+func builtinsClassic() []Spec {
 	return []Spec{
 		{
 			Name:    "laravel",
@@ -306,11 +346,15 @@ func builtins() []Spec {
 			},
 			FileGlobs:  []string{"*.php"},
 			Lockfiles:  []string{"composer.lock"},
-			HashMode:   HashFilename,
 			OnModify:   OnRebuild,
 			EngineHint: "mysql",
 			MigrateRun: "php artisan migrate --force",
 			MigrateEnv: map[string]string{
+				"DB_DATABASE":      "{target_db}",
+				"DB_TEST_DATABASE": "{target_db}",
+			},
+			RollbackRun: "php artisan migrate:rollback --force --step=$TREEMAN_ROLLBACK_STEPS",
+			RollbackEnv: map[string]string{
 				"DB_DATABASE":      "{target_db}",
 				"DB_TEST_DATABASE": "{target_db}",
 			},
@@ -321,10 +365,11 @@ func builtins() []Spec {
 			MigrationDirs: []string{"db/migrate", "engines/*/db/migrate"},
 			FileGlobs:     []string{"*.rb"},
 			Lockfiles:     []string{"Gemfile.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "bin/rails db:migrate",
 			MigrateEnv:    dbNameEnv(),
+			RollbackRun:   "bin/rails db:rollback STEP=$TREEMAN_ROLLBACK_STEPS",
+			RollbackEnv:   dbNameEnv(),
 		},
 		{
 			Name:          "django",
@@ -332,7 +377,6 @@ func builtins() []Spec {
 			MigrationDirs: []string{"**/migrations"},
 			FileGlobs:     []string{"[0-9]*_*.py"},
 			Lockfiles:     []string{"Pipfile.lock", "poetry.lock", "uv.lock", "requirements.txt"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "python manage.py migrate --noinput",
 			MigrateEnv:    dbNameEnv(),
@@ -343,27 +387,32 @@ func builtins() []Spec {
 			MigrationDirs: []string{"**/migrations", "services/*/migrations", "cmd/*/migrations"},
 			FileGlobs:     []string{"*.up.sql"},
 			Lockfiles:     []string{"go.sum"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			// Bare `migrate up` is non-functional — the CLI requires
 			// -path/-source and -database flags or env. Scaffold a
 			// working form that picks up DATABASE_URL from the env
 			// treeman injects via MigrateEnv.
-			MigrateRun: `migrate -path migrations -database "$DATABASE_URL" up`,
-			MigrateEnv: dbURLEnv(),
+			MigrateRun:  `migrate -path migrations -database "$DATABASE_URL" up`,
+			MigrateEnv:  dbURLEnv(),
+			RollbackRun: `migrate -path migrations -database "$DATABASE_URL" down $TREEMAN_ROLLBACK_STEPS`,
+			RollbackEnv: dbURLEnv(),
 			// go.mod alone matches every Go repo, so require a second
 			// signal: either the golang-migrate module is imported, or
 			// the repo contains at least one *.up.sql file (the
 			// framework's distinctive naming convention).
 			Validate: hasGolangMigrateEvidence,
 		},
+	}
+}
+
+func builtinsJSAndOther() []Spec {
+	return []Spec{
 		{
 			Name:          "sqlx-cli",
 			Markers:       []string{"Cargo.toml", "migrations"},
 			MigrationDirs: []string{"migrations", "crates/*/migrations", "services/*/migrations"},
 			FileGlobs:     []string{"*.sql"},
 			Lockfiles:     []string{"Cargo.lock"},
-			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
 			MigrateRun:    "sqlx migrate run",
 			MigrateEnv:    dbURLEnv(),
@@ -374,7 +423,6 @@ func builtins() []Spec {
 			MigrationDirs: []string{"migrations", "crates/*/migrations"},
 			FileGlobs:     []string{"up.sql"},
 			Lockfiles:     []string{"Cargo.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "diesel migration run",
 			MigrateEnv:    dbURLEnv(),
@@ -389,7 +437,6 @@ func builtins() []Spec {
 			},
 			FileGlobs:  []string{"migration.sql"},
 			Lockfiles:  []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:   HashChecksum,
 			OnModify:   OnDelta,
 			MigrateRun: "npx prisma migrate deploy",
 			MigrateEnv: dbURLEnv(),
@@ -400,7 +447,6 @@ func builtins() []Spec {
 			MigrationDirs: []string{"migrations", "apps/*/migrations", "packages/*/migrations"},
 			FileGlobs:     []string{"*.js", "*.ts", "*.cjs", "*.mjs"},
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "npx knex migrate:latest",
 			MigrateEnv:    dbNameEnv(),
@@ -411,17 +457,17 @@ func builtins() []Spec {
 			MigrationDirs: []string{"**/versions"},
 			FileGlobs:     []string{"*.py"},
 			Lockfiles:     []string{"poetry.lock", "Pipfile.lock", "requirements.txt"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "alembic upgrade head",
 			MigrateEnv:    dbNameEnv(),
+			RollbackRun:   "alembic downgrade -$TREEMAN_ROLLBACK_STEPS",
+			RollbackEnv:   dbNameEnv(),
 		},
 		{
 			Name:          "flyway",
 			Markers:       []string{"flyway.conf|flyway.toml"},
 			MigrationDirs: []string{"**/db/migration", "sql"},
 			FileGlobs:     []string{"[VRU]*.sql"},
-			HashMode:      HashChecksum,
 			OnModify:      OnRebuild,
 			MigrateRun:    "flyway migrate",
 			MigrateEnv:    flywayURLEnv(),
@@ -439,7 +485,6 @@ func builtins() []Spec {
 			},
 			FileGlobs: []string{"*.ts", "*.js"},
 			Lockfiles: []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:  HashFilename,
 			OnModify:  OnRebuild,
 			// v0.3+ requires -d <data-source>; bare `migration:run`
 			// fails. typeorm-ts-node-commonjs handles .ts sources
@@ -455,32 +500,41 @@ func builtins() []Spec {
 			MigrationDirs: []string{"drizzle", "apps/*/drizzle", "packages/*/drizzle"},
 			FileGlobs:     []string{"*.sql"},
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
 			MigrateRun:    "npx drizzle-kit migrate",
 			MigrateEnv:    dbNameEnv(),
 		},
+	}
+}
+
+func builtinsExtra() []Spec {
+	return []Spec{
 		{
 			Name:          "sequelize",
 			Markers:       []string{".sequelizerc|.sequelizerc.js|.sequelizerc.cjs"},
 			MigrationDirs: []string{"migrations", "apps/*/migrations", "packages/*/migrations"},
 			FileGlobs:     []string{"*.js", "*.ts"},
 			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "npx sequelize-cli db:migrate",
 			MigrateEnv:    dbNameEnv(),
 		},
 		{
-			Name:          "mikro-orm",
-			Markers:       []string{"mikro-orm.config.ts|mikro-orm.config.js|mikro-orm.config.cjs"},
-			MigrationDirs: []string{"migrations", "src/migrations", "apps/*/migrations", "apps/*/src/migrations", "packages/*/migrations", "packages/*/src/migrations"},
-			FileGlobs:     []string{"Migration*.ts", "Migration*.js"},
-			Lockfiles:     []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
-			HashMode:      HashFilename,
-			OnModify:      OnRebuild,
-			MigrateRun:    "npx mikro-orm migration:up",
-			MigrateEnv:    dbNameEnv(),
+			Name:    "mikro-orm",
+			Markers: []string{"mikro-orm.config.ts|mikro-orm.config.js|mikro-orm.config.cjs"},
+			MigrationDirs: []string{
+				"migrations",
+				"src/migrations",
+				"apps/*/migrations",
+				"apps/*/src/migrations",
+				"packages/*/migrations",
+				"packages/*/src/migrations",
+			},
+			FileGlobs:  []string{"Migration*.ts", "Migration*.js"},
+			Lockfiles:  []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock"},
+			OnModify:   OnRebuild,
+			MigrateRun: "npx mikro-orm migration:up",
+			MigrateEnv: dbNameEnv(),
 		},
 		{
 			// Symfony bundle (the dominant Doctrine Migrations layout).
@@ -492,7 +546,6 @@ func builtins() []Spec {
 			MigrationDirs: []string{"migrations", "src/Migrations"},
 			FileGlobs:     []string{"Version[0-9]*.php"},
 			Lockfiles:     []string{"composer.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "php bin/console doctrine:migrations:migrate --no-interaction --all-or-nothing",
 			MigrateEnv:    dbURLEnv(),
@@ -508,7 +561,6 @@ func builtins() []Spec {
 			MigrationDirs: []string{"migrations", "db/migrations", "internal/db/migrations", "cmd/*/migrations"},
 			FileGlobs:     []string{"[0-9]*_*.sql", "[0-9]*_*.go"},
 			Lockfiles:     []string{"go.sum"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "goose -dir migrations up",
 			MigrateEnv:    gooseEnv(),
@@ -519,7 +571,6 @@ func builtins() []Spec {
 			Markers:       []string{"liquibase.properties|liquibase.yaml|liquibase.yml|liquibase.json"},
 			MigrationDirs: []string{"db/changelog", "src/main/resources/db/changelog", "changelog", "changelogs"},
 			FileGlobs:     []string{"*.xml", "*.yaml", "*.yml", "*.json", "*.sql"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "liquibase --changelog-file=db.changelog-master.xml update",
 			MigrateEnv:    liquibaseEnv(),
@@ -534,7 +585,6 @@ func builtins() []Spec {
 			MigrationDirs: []string{"Migrations", "*/Migrations", "src/*/Migrations"},
 			FileGlobs:     []string{"[0-9]*_*.cs"},
 			Lockfiles:     []string{"packages.lock.json", "global.json"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "dotnet ef database update",
 			MigrateEnv:    dbNameEnv(),
@@ -549,10 +599,11 @@ func builtins() []Spec {
 			MigrationDirs: []string{"priv/repo/migrations", "apps/*/priv/*/migrations"},
 			FileGlobs:     []string{"[0-9]*_*.exs"},
 			Lockfiles:     []string{"mix.lock"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "mix ecto.migrate",
 			MigrateEnv:    dbNameEnv(),
+			RollbackRun:   "mix ecto.rollback -n $TREEMAN_ROLLBACK_STEPS",
+			RollbackEnv:   dbNameEnv(),
 			Validate:      hasEctoEvidence,
 		},
 		{
@@ -563,7 +614,6 @@ func builtins() []Spec {
 			Markers:       []string{"db/migrations"},
 			MigrationDirs: []string{"db/migrations"},
 			FileGlobs:     []string{"[0-9]*_*.sql"},
-			HashMode:      HashFilename,
 			OnModify:      OnRebuild,
 			MigrateRun:    "dbmate up",
 			MigrateEnv:    dbURLEnv(),
@@ -577,7 +627,6 @@ func builtins() []Spec {
 			Markers:       []string{"atlas.hcl|migrations/atlas.sum"},
 			MigrationDirs: []string{"migrations"},
 			FileGlobs:     []string{"[0-9]*_*.sql"},
-			HashMode:      HashChecksum,
 			OnModify:      OnDelta,
 			MigrateRun:    `atlas migrate apply --url "$DATABASE_URL" --dir "file://migrations"`,
 			MigrateEnv:    dbURLEnv(),

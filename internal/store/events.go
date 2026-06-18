@@ -46,20 +46,12 @@ type EventFilter struct {
 	HydrateWT   bool     // LEFT JOIN worktrees to fill WorktreeSlug etc.
 }
 
-// QueryEvents returns events matching f. The default ordering is
-// newest-first; pass OldestFirst=true to stream chronologically (used
-// by --follow and oldest-first tail output).
-func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error) {
-	cols := `e.id, e.ts, e.level, e.repo_id, e.worktree_id, e.event_type,
-		COALESCE(e.phase,''), COALESCE(e.message,''), e.payload_json, e.duration_ms`
-	from := `FROM events e`
-	if f.HydrateWT {
-		cols += `, COALESCE(w.slug,''), COALESCE(w.branch,''), COALESCE(w.path,'')`
-		from += ` LEFT JOIN worktrees w ON w.id = e.worktree_id`
-	}
-	q := "SELECT " + cols + " " + from
-	where := []string{}
-	args := []any{}
+// queryEventsWhere builds the WHERE-clause fragments and their bound
+// args for QueryEvents. Split out so QueryEvents stays under the
+// cyclomatic-complexity gate; the predicate ordering is preserved.
+func queryEventsWhere(f EventFilter) (where []string, args []any) {
+	where = []string{}
+	args = []any{}
 	if f.WorktreeID > 0 {
 		where = append(where, "e.worktree_id = ?")
 		args = append(args, f.WorktreeID)
@@ -114,8 +106,24 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 		where = append(where, "e.id > ?")
 		args = append(args, f.AfterID)
 	}
+	return where, args
+}
+
+// QueryEvents returns events matching f. The default ordering is
+// newest-first; pass OldestFirst=true to stream chronologically (used
+// by --follow and oldest-first tail output).
+func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error) {
+	cols := `e.id, e.ts, e.level, e.repo_id, e.worktree_id, e.event_type,
+		COALESCE(e.phase,''), COALESCE(e.message,''), e.payload_json, e.duration_ms`
+	from := `FROM events e`
+	if f.HydrateWT {
+		cols += `, COALESCE(w.slug,''), COALESCE(w.branch,''), COALESCE(w.path,'')`
+		from += ` LEFT JOIN worktrees w ON w.id = e.worktree_id`
+	}
+	q := "SELECT " + cols + " " + from
+	where, args := queryEventsWhere(f)
 	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
+		q += " WHERE " + strings.Join(where, " AND ") //nolint:gosec // only placeholder fragments joined; values are parameterized
 	}
 	if f.OldestFirst {
 		q += " ORDER BY e.ts ASC, e.id ASC"
@@ -130,7 +138,7 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 	if err != nil {
 		return nil, fmt.Errorf("query events: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []Event
 	for rows.Next() {
 		var e Event
@@ -146,25 +154,114 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 	return out, rows.Err()
 }
 
-// LookupWorktreeID returns the worktree id whose basename, slug, or
-// branch matches `name` (or 0 if no match) for an optional repo
-// scope. Used by `logs tail --worktree NAME` to translate a user-
-// facing handle into a SQL filter.
+// WorktreeMatch is one candidate row returned by LookupWorktreeMatches.
+// Kind records WHICH column produced the hit so callers can apply
+// match-rank precedence (branch beats slug, slug beats path).
+type WorktreeMatch struct {
+	ID     int64
+	Slug   string
+	Branch string
+	Path   string
+	Kind   string // "slug" | "branch" | "basename"
+}
+
+// LookupWorktreeID returns the worktree id whose slug, branch, or
+// basename matches `name` (or 0 if no match). With ambiguous slugs
+// (two tickets, two worktrees, one slug) this surfaces a non-nil
+// error AND a zero id so callers can render the candidate list
+// instead of the historic misleading "no worktree matches".
+//
+// Match ranking: exact branch > exact slug > basename. Multiple
+// rows tying at the same rank produce an ambiguous-match error;
+// otherwise the top-ranked row wins regardless of how many rows
+// match at lower ranks (a branch hit beats N slug hits).
 func (s *Store) LookupWorktreeID(ctx context.Context, repoID int64, name string) (int64, error) {
-	q := `SELECT id FROM worktrees WHERE deleted_at IS NULL AND
+	matches, err := s.LookupWorktreeMatches(ctx, repoID, name)
+	if err != nil {
+		return 0, err
+	}
+	if len(matches) == 0 {
+		return 0, nil
+	}
+	winners := pickByRank(matches)
+	if len(winners) == 1 {
+		return winners[0].ID, nil
+	}
+	return 0, ambiguousMatchError(name, winners)
+}
+
+// LookupWorktreeMatches returns every active worktree row whose
+// slug, branch, or basename matches `name`. Rows are returned newest-
+// id first within each match kind; callers that want a single winner
+// should run them through `pickByRank` (see LookupWorktreeID).
+//
+// Used by the lookup paths that need to surface candidates on
+// ambiguity instead of silently picking one.
+func (s *Store) LookupWorktreeMatches(ctx context.Context, repoID int64, name string) ([]WorktreeMatch, error) {
+	q := `SELECT id, slug, COALESCE(branch,''), path,
+		     CASE
+		       WHEN branch = ?       THEN 'branch'
+		       WHEN slug = ?         THEN 'slug'
+		       ELSE                       'basename'
+		     END AS kind
+		FROM worktrees WHERE deleted_at IS NULL AND
 		(slug = ? OR branch = ? OR path LIKE ? COLLATE NOCASE)`
-	args := []any{name, name, "%/" + name}
+	args := []any{name, name, name, name, "%/" + name}
 	if repoID > 0 {
 		q += " AND repo_id = ?"
 		args = append(args, repoID)
 	}
-	q += " ORDER BY id DESC LIMIT 1"
-	var id int64
-	row := s.DB.QueryRowContext(ctx, q, args...)
-	if err := row.Scan(&id); err != nil {
-		return 0, nil
+	q += " ORDER BY id DESC"
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
 	}
-	return id, nil
+	defer func() { _ = rows.Close() }()
+	var out []WorktreeMatch
+	for rows.Next() {
+		var m WorktreeMatch
+		if err := rows.Scan(&m.ID, &m.Slug, &m.Branch, &m.Path, &m.Kind); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// pickByRank returns the subset of matches at the highest-priority
+// kind (branch > slug > basename). Ties at the top rank are returned
+// verbatim so callers can detect ambiguity.
+func pickByRank(matches []WorktreeMatch) []WorktreeMatch {
+	for _, kind := range []string{"branch", "slug", "basename"} {
+		var hit []WorktreeMatch
+		for _, m := range matches {
+			if m.Kind == kind {
+				hit = append(hit, m)
+			}
+		}
+		if len(hit) > 0 {
+			return hit
+		}
+	}
+	return nil
+}
+
+// ambiguousMatchError formats the "you asked for X, here are the
+// candidates" message used when the lookup ranking left more than
+// one row tied at the top. Worktree paths are included so the user
+// can disambiguate by typing a unique branch or path component.
+func ambiguousMatchError(name string, matches []WorktreeMatch) error {
+	var b strings.Builder
+	b.WriteString("ambiguous worktree ")
+	fmt.Fprintf(&b, "%q", name)
+	b.WriteString(" — ")
+	fmt.Fprintf(&b, "%d candidates:", len(matches))
+	for _, m := range matches {
+		b.WriteString("\n  ")
+		fmt.Fprintf(&b, "id=%d slug=%s branch=%s path=%s", m.ID, m.Slug, m.Branch, m.Path)
+	}
+	b.WriteString("\n(pass a more specific branch name or path to disambiguate)")
+	return fmt.Errorf("%s", b.String())
 }
 
 // HookRun is one row from the `hook_runs` table.
@@ -204,11 +301,23 @@ func (s *Store) QueryHookRuns(ctx context.Context, worktreeID int64, limit int) 
 	if err != nil {
 		return nil, fmt.Errorf("query hook_runs: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []HookRun
 	for rows.Next() {
 		var h HookRun
-		if err := rows.Scan(&h.ID, &h.WorktreeID, &h.WorktreeSlug, &h.Phase, &h.GroupIdx, &h.Command, &h.StartedAt, &h.FinishedAt, &h.ExitCode, &h.StdoutTail, &h.StderrTail); err != nil {
+		if err := rows.Scan(
+			&h.ID,
+			&h.WorktreeID,
+			&h.WorktreeSlug,
+			&h.Phase,
+			&h.GroupIdx,
+			&h.Command,
+			&h.StartedAt,
+			&h.FinishedAt,
+			&h.ExitCode,
+			&h.StdoutTail,
+			&h.StderrTail,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
@@ -296,7 +405,7 @@ func (s *Store) QueryHookLog(ctx context.Context, hookRunID int64) ([]HookLogChu
 	if err != nil {
 		return nil, fmt.Errorf("query hook_log_chunks: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []HookLogChunk
 	for rows.Next() {
 		var c HookLogChunk
@@ -335,6 +444,37 @@ func (s *Store) PruneOldLogs(ctx context.Context, cutoffMs int64) (int64, error)
 	return total, nil
 }
 
+// PruneStaleHashCaches removes file_hashes / dir_hashes rows whose
+// cached_at is older than cutoffMs. These caches are keyed by on-disk
+// path with no worktree/repo FK, so they can't be cascade-cleaned when
+// a worktree is torn down — and the bulk of rows accumulate under
+// deleted worktree paths that no longer exist on disk.
+//
+// Age is a reliable staleness proxy: a live path's row is touched
+// (cached_at refreshed) on every fingerprint scan, so anything older
+// than the retention window belongs to a path that's gone. The cost of
+// an over-eager prune is a single recompute on the next access — these
+// are pure caches. A cutoff <= 0 is a no-op (retention disabled).
+func (s *Store) PruneStaleHashCaches(ctx context.Context, cutoffMs int64) (int64, error) {
+	if cutoffMs <= 0 {
+		return 0, nil
+	}
+	var total int64
+	for _, stmt := range []string{
+		"DELETE FROM file_hashes WHERE cached_at < ?",
+		"DELETE FROM dir_hashes WHERE cached_at < ?",
+	} {
+		res, err := s.DB.ExecContext(ctx, stmt, cutoffMs)
+		if err != nil {
+			return total, fmt.Errorf("prune hash cache: %w", err)
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			total += n
+		}
+	}
+	return total, nil
+}
+
 // placeholders returns "?, ?, ?" repeated n times.
 // PurgeEvents deletes events matching the filter and returns the row
 // count removed. Only SinceMs / UntilMs / RepoID / WorktreeID /
@@ -343,8 +483,35 @@ func (s *Store) PruneOldLogs(ctx context.Context, cutoffMs int64) (int64, error)
 // expect (events accumulate, but a single repo rarely tops 100k rows).
 func (s *Store) PurgeEvents(ctx context.Context, f EventFilter) (int64, error) {
 	q := "DELETE FROM events"
-	where := []string{}
-	args := []any{}
+	where, args := purgeEventsWhere(f)
+	q = appendWhere(q, where)
+	res, err := s.DB.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// CountEvents reports how many event rows currently match f. Shares
+// the predicate set with PurgeEvents so a dry-run preview ("how many
+// rows would the same filter purge?") matches the destructive call
+// exactly. Returns 0 + nil on no-rows; the caller distinguishes via
+// the err return.
+func (s *Store) CountEvents(ctx context.Context, f EventFilter) (int64, error) {
+	q := "SELECT COUNT(*) FROM events"
+	where, args := purgeEventsWhere(f)
+	q = appendWhere(q, where)
+	var n int64
+	if err := s.DB.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// purgeEventsWhere is the shared WHERE-clause builder for PurgeEvents
+// + CountEvents. Mirrors the predicate set in queryEventsWhere but
+// without the joined-worktree filters that PurgeEvents doesn't apply.
+func purgeEventsWhere(f EventFilter) (where []string, args []any) {
 	if f.RepoID > 0 {
 		where = append(where, "repo_id = ?")
 		args = append(args, f.RepoID)
@@ -373,14 +540,19 @@ func (s *Store) PurgeEvents(ctx context.Context, f EventFilter) (int64, error) {
 			args = append(args, v)
 		}
 	}
-	if len(where) > 0 {
-		q += " WHERE " + strings.Join(where, " AND ")
+	return where, args
+}
+
+// appendWhere appends a WHERE clause to q when fragments is non-empty.
+// Centralised so PurgeEvents + CountEvents share the same concatenation
+// site (and the same single gosec exemption — every fragment is a
+// hard-coded predicate template; user input only flows through the
+// args slice).
+func appendWhere(q string, fragments []string) string {
+	if len(fragments) == 0 {
+		return q
 	}
-	res, err := s.DB.ExecContext(ctx, q, args...)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return q + " WHERE " + strings.Join(fragments, " AND ")
 }
 
 func placeholders(n int) string {

@@ -62,7 +62,7 @@ func Connect(ctx context.Context, cfg config.S3Conn) (*Driver, error) {
 			Network:        cfg.Network,
 			InternalPort:   containerip.URIPort(endpoint, 9000),
 		}
-		addr, err := containerip.ResolveAddr(opts)
+		addr, err := containerip.ResolveAddr(ctx, opts)
 		if err != nil {
 			return nil, fmt.Errorf("resolve container: %w", err)
 		}
@@ -86,7 +86,10 @@ func Connect(ctx context.Context, cfg config.S3Conn) (*Driver, error) {
 		if hasSK {
 			which = "access_key"
 		}
-		return nil, fmt.Errorf("s3: %s is empty but the other half is set — provide both, or neither (to use the SDK default credential chain)", which)
+		return nil, fmt.Errorf(
+			"s3: %s is empty but the other half is set — provide both, or neither (to use the SDK default credential chain)",
+			which,
+		)
 	}
 
 	loadOpts := []func(*awsconfig.LoadOptions) error{
@@ -193,8 +196,12 @@ func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, err
 // enforced here as a defense-in-depth guard.
 func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
 	if len(prefix) < MinDropPrefixLen {
-		return nil, fmt.Errorf("s3: refusing to drop with prefix %q: length %d < MinDropPrefixLen=%d (would risk reaping unrelated buckets in the account)",
-			prefix, len(prefix), MinDropPrefixLen)
+		return nil, fmt.Errorf(
+			"s3: refusing to drop with prefix %q: length %d < MinDropPrefixLen=%d (would risk reaping unrelated buckets in the account)",
+			prefix,
+			len(prefix),
+			MinDropPrefixLen,
+		)
 	}
 	matches, err := d.ListMatching(ctx, prefix)
 	if err != nil {
@@ -273,12 +280,9 @@ func (d *Driver) emptyBucket(ctx context.Context, name string) error {
 // errors.Join so the caller sees every failure in a single response,
 // not just the first.
 func (d *Driver) deleteBatch(ctx context.Context, bucket string, ids []s3types.ObjectIdentifier) error {
-	const max = 1000
+	const maxKeys = 1000
 	for len(ids) > 0 {
-		n := len(ids)
-		if n > max {
-			n = max
-		}
+		n := min(len(ids), maxKeys)
 		chunk := ids[:n]
 		ids = ids[n:]
 		out, err := d.Client.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
@@ -428,7 +432,10 @@ func ValidateBucketName(name string) error {
 		return fmt.Errorf("bucket name %q: length %d, must be 3-63 chars", name, n)
 	}
 	if !bucketNameRE.MatchString(name) {
-		return fmt.Errorf("bucket name %q: must be lowercase alphanumeric with hyphens, starting and ending alphanumeric (no dots, no uppercase, no underscores)", name)
+		return fmt.Errorf(
+			"bucket name %q: must be lowercase alphanumeric with hyphens, starting and ending alphanumeric (no dots, no uppercase, no underscores)",
+			name,
+		)
 	}
 	return nil
 }

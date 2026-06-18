@@ -1,11 +1,16 @@
 package wt
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/ports"
@@ -75,16 +80,45 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 	if sink == nil {
 		sink = NoopSink{}
 	}
+	dbPath, _ := store.DefaultDBPath()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return CreateResult{}, err
+	}
+	defer func() { _ = st.Close() }()
+
+	res, needsFinalize, err := CreateInStore(ctx, req, st, sink)
+	if err != nil || !needsFinalize {
+		return res, err
+	}
+	return finishCreate(ctx, req, res, sink)
+}
+
+// CreateInStore is the store-injected core of worktree creation: git
+// worktree add + SQLite registration + port allocation, against the
+// supplied store (which it does NOT close — the caller owns it). It does
+// NOT dispatch the hooks+prepare tail; instead it returns needsFinalize
+// to tell the caller whether to run FinalizeWorktree. This is the entry
+// point the daemon's worktree_create task uses with its warm store, so
+// the registration write lands on the single daemon writer.
+//
+// Terminal-status cases (noop, no_finalize) set res.Status and return
+// needsFinalize=false; the "caller should finalize" case leaves
+// res.Status empty and returns needsFinalize=true.
+func CreateInStore(ctx context.Context, req CreateRequest, st *store.Store, sink Sink) (CreateResult, bool, error) {
+	if sink == nil {
+		sink = NoopSink{}
+	}
 	if req.Branch == "" {
-		return CreateResult{}, fmt.Errorf("branch is required")
+		return CreateResult{}, false, errors.New("branch is required")
 	}
 	if req.RepoRoot == "" {
-		return CreateResult{}, fmt.Errorf("repo_root is required")
+		return CreateResult{}, false, errors.New("repo_root is required")
 	}
 
 	cfg, err := resolve.LoadResolved(req.RepoRoot)
 	if err != nil {
-		return CreateResult{}, err
+		return CreateResult{}, false, err
 	}
 
 	wtPath := req.Path
@@ -100,13 +134,118 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 	if _, err := os.Stat(wtPath); err == nil {
 		if IsMatchingExistingWorktree(ctx, req.RepoRoot, wtPath, req.Branch) {
 			sink.Info("worktree already exists at %s on %s — no-op", wtPath, req.Branch)
-			return CreateResult{WtPath: wtPath, Status: CreatedNoop}, nil
+			return CreateResult{WtPath: wtPath, Status: CreatedNoop}, false, nil
 		}
-		return CreateResult{}, fmt.Errorf("destination path already exists: %s", wtPath)
+		return CreateResult{}, false, fmt.Errorf("destination path already exists: %s", wtPath)
 	}
 	if err := os.MkdirAll(filepath.Dir(wtPath), 0o755); err != nil {
-		return CreateResult{}, err
+		return CreateResult{}, false, err
 	}
+
+	if err := addGitWorktree(ctx, req, &wtPath); err != nil {
+		return CreateResult{}, false, err
+	}
+
+	sl := slug.For(wtPath, req.Branch)
+
+	// Register the worktree row + allocate ports up front. File bring-in
+	// (worktrees.links / .copies) and patch render run in the daemon
+	// finalize tail so the CLI never blocks on a recursive copy; the row
+	// + ports must exist first because the daemon keys its work off them.
+	reg, err := registerAndAllocate(ctx, req, &cfg, wtPath, sl, st)
+	if err != nil {
+		return CreateResult{}, false, err
+	}
+	tplCtx := template.FromSlug(sl).WithPorts(reg.portMap)
+
+	sink.OK("created worktree #%d slug=%s path=%s", reg.wtID, sl.Value, wtPath)
+	if summary := ports.FormatSummary(reg.allocs); summary != "" {
+		sink.Info("%s", summary)
+	}
+
+	result := CreateResult{
+		WtPath:     wtPath,
+		Slug:       sl.Value,
+		RepoID:     reg.repoID,
+		WorktreeID: reg.wtID,
+		Ports:      reg.portMap,
+	}
+
+	return resolveCreateTail(ctx, &cfg, req, wtPath, tplCtx, result, sink)
+}
+
+// resolveCreateTail decides the terminal create outcome after the row +
+// ports exist: SkipHooks runs the bring-in + patch inline (no daemon
+// tail) and reports no_finalize; an otherwise-empty config reports
+// no_finalize too; anything that needs hooks/copies/patches/prepare
+// reports needsFinalize=true so the caller runs FinalizeWorktree.
+func resolveCreateTail(
+	ctx context.Context,
+	cfg *config.Config,
+	req CreateRequest,
+	wtPath string,
+	tplCtx template.Context,
+	result CreateResult,
+	sink Sink,
+) (CreateResult, bool, error) {
+	if req.SkipHooks {
+		if err := bringInAndPatch(ctx, cfg, req.RepoRoot, wtPath, tplCtx, sink); err != nil {
+			return result, false, err
+		}
+		result.Status = CreatedNoFinalize
+		return result, false, nil
+	}
+	if !createNeedsWork(cfg, req) {
+		result.Status = CreatedNoFinalize
+		return result, false, nil
+	}
+	return result, true, nil
+}
+
+// createNeedsWork reports whether a finalize tail has anything to do.
+func createNeedsWork(cfg *config.Config, req CreateRequest) bool {
+	return len(cfg.Hooks.OnCreateBeforeEngines) > 0 ||
+		len(cfg.Hooks.OnCreateAfterEngines) > 0 ||
+		len(cfg.Worktrees.Links) > 0 ||
+		len(cfg.Worktrees.Copies) > 0 ||
+		len(cfg.Patches) > 0 ||
+		(!req.SkipPrepare && len(cfg.Databases) > 0)
+}
+
+// bringInAndPatch materializes the per-worktree files `wt create` used to
+// handle inline: symlink worktrees.links, copy worktrees.copies, then
+// render patches against the allocated ports (tplCtx). Normally this work
+// is offloaded to the daemon (FinalizeWorktree) so the CLI never blocks
+// on a recursive copy; this inline variant backs the SkipHooks path,
+// which dispatches no daemon tail.
+func bringInAndPatch(
+	ctx context.Context,
+	cfg *config.Config,
+	repoRoot, wtPath string,
+	tplCtx template.Context,
+	sink Sink,
+) error {
+	if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Links, "link", sink); err != nil {
+		return err
+	}
+	if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Copies, "copy", sink); err != nil {
+		return err
+	}
+	return applyPatches(ctx, cfg.Patches, wtPath, tplCtx, sink)
+}
+
+// addGitWorktree decides the base ref (with an optional pre-fetch),
+// runs `git worktree add`, and resolves the worktree path to absolute.
+// Mutates *wtPath in place. Extracted from Create as a mechanical lift
+// of the git-creation phase.
+func addGitWorktree(ctx context.Context, req CreateRequest, wtPath *string) error {
+	// Clear stale worktree admin entries whose working dir was removed
+	// out-of-band — e.g. a prior create whose finalize failed and got
+	// reaped, leaving `.git/worktrees/<name>` behind. Without this,
+	// `git worktree add` aborts with "fatal: '<branch>' is already
+	// checked out at '<gone path>'" (exit 128) even though the dir no
+	// longer exists. Best-effort: a prune failure must not block create.
+	_ = gitcmd.RunPiped(ctx, req.RepoRoot, nil, nil, "worktree", "prune")
 
 	// Decide base ref + optional pre-fetch.
 	base := req.From
@@ -122,123 +261,81 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 	}
 	var gitArgs []string
 	if branchExists {
-		gitArgs = []string{"worktree", "add", wtPath, req.Branch}
+		gitArgs = []string{"worktree", "add", *wtPath, req.Branch}
 	} else {
-		gitArgs = []string{"worktree", "add", "-b", req.Branch, wtPath, base}
+		gitArgs = []string{"worktree", "add", "-b", req.Branch, *wtPath, base}
 	}
 	// Route git's output to stderr (not stdout) so the --print-path
 	// shell idiom — `cd "$(treeman wt create x --print-path)"` —
 	// doesn't ingest "Preparing worktree …" / "HEAD is now at …"
-	// lines that git emits on its stdout.
-	if err := gitcmd.RunPiped(ctx, req.RepoRoot, os.Stderr, os.Stderr, gitArgs...); err != nil {
-		return CreateResult{}, fmt.Errorf("git worktree add: %w", err)
+	// lines that git emits on its stdout. Tee stderr through a buffer
+	// too: RunPiped streams stderr to the writer and drops it from the
+	// returned error, so without this MCP / non-TTY callers see only a
+	// bare "exit status 128" instead of git's actual complaint (e.g.
+	// "'<branch>' is already checked out at '<path>'").
+	var errBuf bytes.Buffer
+	if err := gitcmd.RunPiped(ctx, req.RepoRoot, os.Stderr, io.MultiWriter(os.Stderr, &errBuf), gitArgs...); err != nil {
+		if tail := strings.TrimSpace(errBuf.String()); tail != "" {
+			return fmt.Errorf("git worktree add: %w: %s", err, tail)
+		}
+		return fmt.Errorf("git worktree add: %w", err)
 	}
-	abs, err := filepath.Abs(wtPath)
-	if err == nil {
-		wtPath = abs
+	if abs, err := filepath.Abs(*wtPath); err == nil {
+		*wtPath = abs
 	}
+	return nil
+}
 
-	// worktrees.links — read-only symlinks from main into the new
-	// worktree (vendor, node_modules, …). Glob meta-chars expand
-	// against repoRoot. Idempotent: existing dst is skipped.
-	if err := BringInFiles(req.RepoRoot, wtPath, cfg.Worktrees.Links, "link", sink); err != nil {
-		return CreateResult{}, err
-	}
-	// worktrees.copies — per-worktree copies so patches can mutate
-	// per-branch without affecting main.
-	if err := BringInFiles(req.RepoRoot, wtPath, cfg.Worktrees.Copies, "copy", sink); err != nil {
-		return CreateResult{}, err
-	}
+// registration bundles the derived ids/ports a Create call needs after
+// the worktree row is registered.
+type registration struct {
+	repoID  int64
+	wtID    int64
+	allocs  []ports.Allocation
+	portMap map[string]uint16
+}
 
-	sl := slug.For(wtPath, req.Branch)
-
-	// Open the store BEFORE patching so we can register the worktree
-	// row and allocate ports — the ports map has to flow into the
-	// template context before patch render so `{port_<name>}` tokens
-	// resolve to their freshly assigned values.
-	dbPath, _ := store.DefaultDBPath()
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return CreateResult{}, err
-	}
-	defer st.Close()
+// registerAndAllocate registers the repo + worktree rows and allocates
+// the configured ports against the supplied store (which it does NOT
+// own — no open/close here).
+func registerAndAllocate(
+	ctx context.Context,
+	req CreateRequest,
+	cfg *config.Config,
+	wtPath string,
+	sl slug.Slug,
+	st *store.Store,
+) (registration, error) {
 	repoID, err := st.EnsureRepo(ctx, req.RepoRoot, filepath.Base(req.RepoRoot))
 	if err != nil {
-		return CreateResult{}, err
+		return registration{}, err
 	}
 	wtID, err := st.EnsureWorktree(ctx, repoID, wtPath, sl.Value, req.Branch)
 	if err != nil {
-		return CreateResult{}, err
+		return registration{}, err
 	}
-
-	allocs, err := ports.New().Allocate(ctx, st, &cfg, repoID, wtID)
+	allocs, err := ports.New().Allocate(ctx, st, cfg, repoID, wtID)
 	if err != nil {
-		return CreateResult{}, fmt.Errorf("port allocation: %w", err)
+		return registration{}, fmt.Errorf("port allocation: %w", err)
 	}
 	portMap := map[string]uint16{}
 	for _, a := range allocs {
 		portMap[a.Name] = a.Port
 	}
-	tplCtx := template.FromSlug(sl).WithPorts(portMap)
+	return registration{repoID: repoID, wtID: wtID, allocs: allocs, portMap: portMap}, nil
+}
 
-	// Top-level patches: dotenv / phpunit.xml / yaml / json rewrites.
-	// Apply does the actual rewrite; EnsureFilter wires git's
-	// clean/smudge for the same files so `git pull` can overwrite
-	// them without tripping "would be overwritten by merge".
-	for _, p := range cfg.Patches {
-		res, err := patcher.Apply(p, wtPath, tplCtx)
-		if err != nil {
-			return CreateResult{}, err
-		}
-		if res.Outcome == patcher.Updated {
-			sink.Info("patched %s (%s)", filepath.Join(wtPath, res.File), res.Driver)
-		}
-	}
-	if len(cfg.Patches) > 0 {
-		files := make([]string, 0, len(cfg.Patches))
-		for _, p := range cfg.Patches {
-			files = append(files, p.File)
-		}
-		if err := patcher.EnsureFilter(ctx, wtPath, files); err != nil {
-			sink.Warn("install patch filter: %v", err)
-		}
-	}
-
-	sink.OK("created worktree #%d slug=%s path=%s", wtID, sl.Value, wtPath)
-	if summary := ports.FormatSummary(allocs); summary != "" {
-		sink.Info("%s", summary)
-	}
-
-	result := CreateResult{
-		WtPath:     wtPath,
-		Slug:       sl.Value,
-		RepoID:     repoID,
-		WorktreeID: wtID,
-		Ports:      portMap,
-	}
-
-	if req.SkipHooks {
-		result.Status = CreatedNoFinalize
-		return result, nil
-	}
-
-	needsWork := len(cfg.Hooks.OnCreateBeforeEngines) > 0 ||
-		len(cfg.Hooks.OnCreateAfterEngines) > 0 ||
-		(!req.SkipPrepare && len(cfg.Databases) > 0)
-	if !needsWork {
-		result.Status = CreatedNoFinalize
-		return result, nil
-	}
-
-	// Three dispatch paths in priority order:
-	//   1. Daemon RPC (the normal happy path).
-	//   2. Daemon RPC after ensureDaemon (cold-start).
-	//   3. Detach a setsid child running `treeman wt finalize --local`.
-	if queued := DispatchFinalize(ctx, req.RepoRoot, wtPath, req.Env, sink); queued {
+// finishCreate dispatches the hooks+prepare tail for the in-process
+// Create path (used by tests + any non-daemon caller): daemon RPC first,
+// then a detached setsid child when the daemon is unreachable. The daemon
+// itself never reaches here — its worktree_create task runs
+// FinalizeWorktree directly instead.
+func finishCreate(ctx context.Context, req CreateRequest, result CreateResult, sink Sink) (CreateResult, error) {
+	if queued := DispatchFinalize(ctx, req.RepoRoot, result.WtPath, req.Env, sink); queued {
 		result.Status = CreatedQueued
 		return result, nil
 	}
-	logPath, err := DetachFinalize(wtPath, req.RepoRoot)
+	logPath, err := DetachFinalize(result.WtPath, req.RepoRoot)
 	if err != nil {
 		return result, fmt.Errorf("detach finalize: %w", err)
 	}
@@ -246,4 +343,30 @@ func Create(ctx context.Context, req CreateRequest, sink Sink) (CreateResult, er
 	result.Status = CreatedDetached
 	result.LogPath = logPath
 	return result, nil
+}
+
+// applyPatches runs every configured top-level patch against the new
+// worktree, then wires git's clean/smudge filter for the same files so
+// `git pull` can overwrite them without tripping the merge guard.
+// Extracted from Create as a mechanical lift of the patch phase.
+func applyPatches(ctx context.Context, patches []config.Patch, wtPath string, tplCtx template.Context, sink Sink) error {
+	for _, p := range patches {
+		res, err := patcher.Apply(p, wtPath, tplCtx)
+		if err != nil {
+			return err
+		}
+		if res.Outcome == patcher.Updated {
+			sink.Info("patched %s (%s)", filepath.Join(wtPath, res.File), res.Driver)
+		}
+	}
+	if len(patches) > 0 {
+		files := make([]string, 0, len(patches))
+		for _, p := range patches {
+			files = append(files, p.File)
+		}
+		if err := patcher.EnsureFilter(ctx, wtPath, files); err != nil {
+			sink.Warn("install patch filter: %v", err)
+		}
+	}
+	return nil
 }

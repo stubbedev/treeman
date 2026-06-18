@@ -35,7 +35,7 @@ Examples:
 |---|---|
 | `--from` | base branch |
 | `--path` | explicit worktree path |
-| `--repo` | repo root override |
+| `-r`, `--repo` | repo root override |
 | `--skip-hooks` |  |
 | `--skip-prepare` |  |
 | `--no-fetch` | skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits) |
@@ -60,7 +60,7 @@ Examples:
 
 | Flag | Usage |
 |---|---|
-| `--repo` |  |
+| `-r`, `--repo` |  |
 | `-f`, `--force` |  |
 | `-y`, `--yes` | skip the confirmation prompt |
 | `--detached` |  |
@@ -72,7 +72,7 @@ register a worktree path (metadata only)
 | Flag | Usage |
 |---|---|
 | `-b`, `--branch` |  |
-| `--repo` |  |
+| `-r`, `--repo` |  |
 
 ### `treeman worktree unregister`
 
@@ -104,6 +104,7 @@ show details, recent events, and hook runs for a worktree (defaults to the workt
 | `--events` | number of recent events to show |
 | `--hooks` | number of recent hook runs to show |
 | `--no-pager` | disable the pager even when stdout is a TTY |
+| `--json` |  |
 
 ### `treeman worktree logs`
 
@@ -141,18 +142,8 @@ rerun setup + prepare for a worktree (default via daemon; --local runs inline)
 
 | Flag | Usage |
 |---|---|
-| `--repo` |  |
+| `-r`, `--repo` |  |
 | `--local` | run setup + prepare in this process instead of dispatching to the daemon |
-
-### `treeman worktree switch`
-
-print the path of a worktree (for shell `cd $(…)` use)
-
-| Flag | Usage |
-|---|---|
-| `--repo` | repo root override |
-| `--create` | create the worktree if no match |
-| `--from` | base branch (with --create) |
 
 ### `treeman worktree back`
 
@@ -162,14 +153,6 @@ print main repo path (with --remove, drop current worktree if clean)
 |---|---|
 | `--remove` | delete current worktree if clean + no unpushed commits |
 | `--force` | with --remove: pass --force to delete |
-
-### `treeman worktree resolve`
-
-print the worktree path holding <branch> (registry lookup; exit nonzero on miss)
-
-| Flag | Usage |
-|---|---|
-| `-r`, `--repo` |  |
 
 ### `treeman worktree prev`
 
@@ -181,14 +164,54 @@ print previously-visited worktree (registry-tracked; cross-shell)
 
 ### `treeman worktree go`
 
-switch/create branch with auto-routing (use as cd "$(treeman wt go …)")
+resolve/create/checkout a worktree by name or branch (use as cd "$(treeman wt go …)")
 
 | Flag | Usage |
 |---|---|
-| `--create` | treat <branch> as a new branch (falls back to checkout if it already exists) |
-| `--from` | base branch (with --create) |
+| `--create` | create the worktree if nothing matches |
+| `--checkout` | git checkout the branch (auto-routes main vs new worktree) instead of pure path resolution |
+| `--from` | base branch (with --create/--checkout) |
 | `-r`, `--repo` |  |
 | `--no-fetch` | skip the pre-checkout `git fetch origin <base>` |
+
+### `treeman repos`
+
+list repos enrolled in treeman
+
+```
+Reads the SQLite registry directly (no daemon round-trip), so it
+works while the daemon is down. A repo is enrolled the first time
+treeman touches it (wt create, prepare, or daemon watch); drop one
+with `treeman registry remove`.
+```
+
+| Flag | Usage |
+|---|---|
+| `--json` |  |
+
+### `treeman status`
+
+summarize worktree health across all repos (bar/waybar widget)
+
+```
+Aggregates every active worktree across all registered repos into
+four buckets — stable (ready), up (preparing), down (tearing down),
+failed (last finalize errored) — and renders them.
+
+Formats (--format):
+  icon    one-line counter (default), plain text
+  hover   per-repo grouped detail, plain text (the "cal-style" block)
+  waybar  {"text","tooltip","class"} JSON for a waybar custom module
+  json    the raw aggregated shape (counts + per-repo worktrees)
+  <name>  a custom single-line {key} format from status.formats
+
+Icons, labels, separators, the hover header/row templates, and custom
+formats are all configured under the global config's status: block.
+```
+
+| Flag | Usage |
+|---|---|
+| `-f`, `--format` | icon \| hover \| waybar \| json \| <name from status.formats> |
 
 ### `treeman main`
 
@@ -241,6 +264,7 @@ ensure → dump → migrate → snapshot → replicate (foreground)
 | `-w`, `--worktree` |  |
 | `-r`, `--repo` |  |
 | `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman db`
 
@@ -253,8 +277,9 @@ re-sync branch_scoped databases from the live base branch (defaults to the cwd's
 | Flag | Usage |
 |---|---|
 | `-r`, `--repo` |  |
-| `--engine` | restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql accepted) |
+| `--engine` | restrict the reset to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql/valkey/dragonfly accepted) |
 | `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman db status`
 
@@ -287,6 +312,7 @@ run a hook phase using the cwd's repo config
 |---|---|
 | `-w`, `--worktree` |  |
 | `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman logs`
 
@@ -304,7 +330,7 @@ Examples:
   treeman logs tail --follow
   treeman logs tail --worktree PROJ-1234 --level warn --level error
   treeman logs tail --since 5m --json | jq .
-  treeman logs tail --event-type wt_finalize_done --event-type wt_finalize_start
+  treeman logs tail --event-type worktree:create:end --event-type worktree:create:start
 
 When stdout is a terminal and --follow / --json are not used,
 output is paged through $PAGER (default: less -FRX). Set
@@ -446,6 +472,24 @@ Examples:
 | `-r`, `--repo` |  |
 | `--json` |  |
 
+### `treeman config history`
+
+list stored .treeman.yaml generations for this repo
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--json` |  |
+
+### `treeman config restore`
+
+write a stored generation back to .treeman.yaml
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--json` |  |
+
 ### `treeman schema`
 
 JSON schema helpers
@@ -455,6 +499,7 @@ JSON schema helpers
 | Flag | Usage |
 |---|---|
 | `--out` |  |
+| `--scope` | full (default, every key) \| global (~/.config/treeman/config.yaml keys) \| repo (.treeman.yaml keys) |
 
 ### `treeman schema install`
 
@@ -485,6 +530,14 @@ ask the daemon to re-read config + restart watchers (no process restart)
 |---|---|
 | `--json` |  |
 
+### `treeman daemon state`
+
+live runtime snapshot — watchers, in-flight finalizes/teardowns, auto-fetch backoffs (CLI twin of the MCP daemon_state tool)
+
+| Flag | Usage |
+|---|---|
+| `--json` |  |
+
 ### `treeman daemon install`
 
 ### `treeman daemon uninstall`
@@ -493,13 +546,13 @@ ask the daemon to re-read config + restart watchers (no process restart)
 |---|---|
 | `-y`, `--yes` | skip the confirmation prompt |
 
-### `treeman fw`
+### `treeman frameworks`
 
-Aliases: `frameworks`
+Aliases: `fw`
 
 framework detection
 
-### `treeman fw detect`
+### `treeman frameworks detect`
 
 | Flag | Usage |
 |---|---|
@@ -519,6 +572,7 @@ print the slug treeman derives for a worktree
 |---|---|
 | `--force` |  |
 | `--json` |  |
+| `--global` | scaffold the user-global ~/.config/treeman/config.yaml (machine-wide defaults) instead of a per-repo .treeman.yaml |
 
 ### `treeman doctor`
 
@@ -532,6 +586,23 @@ health-check the local treeman setup
 ### `treeman registry`
 
 SQLite worktree-registry maintenance
+
+### `treeman registry list`
+
+Aliases: `ls`
+
+list repos enrolled in the registry
+
+```
+Reads the SQLite registry directly (no daemon round-trip), so it
+works while the daemon is down. A repo is enrolled the first time
+treeman touches it (wt create, prepare, or daemon watch); drop one
+with `treeman registry remove`.
+```
+
+| Flag | Usage |
+|---|---|
+| `--json` |  |
 
 ### `treeman registry repair`
 
@@ -589,8 +660,31 @@ drop every cached snapshot for this repo and force the next prepare to rebuild
 |---|---|
 | `-r`, `--repo` |  |
 | `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman mcp`
 
 run the Model Context Protocol server (stdio transport)
+
+### `treeman notify`
+
+desktop notification helpers
+
+### `treeman notify test`
+
+send a sample desktop notification to verify the backend
+
+```
+Fires a single test banner through the configured (or
+auto-detected) notification backend, so you can confirm notify-send
+(Linux) / osascript (macOS) actually shows a notification before
+enabling notifications: in your config.
+
+Works regardless of notifications.enabled — it tests the transport, not
+the opt-in. Use --backend to probe a specific sender.
+```
+
+| Flag | Usage |
+|---|---|
+| `-b`, `--backend` | auto \| notify-send \| osascript \| none (default: notifications.backend, else auto) |
 

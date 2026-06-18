@@ -9,12 +9,21 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sync/errgroup"
 
+	// Registers the "mysql" driver with database/sql. Load-bearing: this
+	// package's Connect calls sql.Open("mysql", …), so the driver must be
+	// registered wherever the daemon imports this package — independent
+	// of any test file's own blank import.
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -27,6 +36,39 @@ import (
 type Driver struct {
 	DB  *sql.DB
 	cfg config.MysqlConn
+
+	// strategyMu guards lastCloneStrategy. Callers query via
+	// LastCloneStrategy after a SnapshotCreate to learn which path
+	// (physical / logical) actually ran for observability.
+	strategyMu        sync.Mutex
+	lastCloneStrategy CloneStrategy
+
+	// stagesMu guards stages. Keyed by template name, each entry holds
+	// a sync.Once that exports the (immutable) template's InnoDB
+	// tablespaces to a staging dir exactly once. SnapshotRestore then
+	// imports from staging without re-taking FLUSH TABLES … FOR EXPORT
+	// on the shared template, so a fan-out of N restores no longer
+	// serializes on that per-template export lock. See physical_stage.go.
+	stagesMu sync.Mutex
+	stages   map[string]*templateStage
+}
+
+// LastCloneStrategy returns the CloneStrategy used by the most recent
+// SnapshotCreate call on this driver. "" before any call. Used by the
+// prepare layer to emit a snapshot_clone_strategy event so users can
+// see whether the fast physical path or the logical fallback ran.
+func (d *Driver) LastCloneStrategy() CloneStrategy {
+	d.strategyMu.Lock()
+	defer d.strategyMu.Unlock()
+	return d.lastCloneStrategy
+}
+
+// setLastStrategy is the writer side of LastCloneStrategy. Called from
+// SnapshotCreate's dispatcher under strategyMu.
+func (d *Driver) setLastStrategy(s CloneStrategy) {
+	d.strategyMu.Lock()
+	d.lastCloneStrategy = s
+	d.strategyMu.Unlock()
 }
 
 // Connect opens a pooled mysql connection at the server level (no
@@ -80,7 +122,7 @@ func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
 	}
 	adapter.ConfigurePool(db, int(cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("ping mysql: %w", err)
 	}
 	return &Driver{DB: db, cfg: cfg}, nil
@@ -117,6 +159,7 @@ func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	//nolint:gosec // qname is validated/quoted via ident.QuoteMySQL; no user values concatenated
 	stmt := "CREATE DATABASE IF NOT EXISTS " + qname +
 		" DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
 	if _, err := d.DB.ExecContext(ctx, stmt); err != nil {
@@ -128,18 +171,19 @@ func (d *Driver) EnsureDB(ctx context.Context, name string) error {
 // DropMatching drops every database whose name starts with prefix.
 // Returns the names that were actually dropped.
 //
-// DROPs run in parallel (limit 6) because each `wt delete` typically
-// fans out across source + template + N paratest clones (1+1+8 = 10
-// databases on a default setup), and DROP DATABASE serializes only
-// on the pg_database-equivalent lock — independent names don't
-// contend.
+// DROPs run in parallel because each `wt delete` typically fans out
+// across source + template + N paratest clones (1+1+8 = 10 databases on
+// a default setup), and DROP DATABASE serializes only on the
+// pg_database-equivalent lock — independent names don't contend. The cap
+// (16) covers the whole default fan-out in one wave while still bounding
+// concurrency on a pathologically large match set.
 func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, error) {
 	matched, err := d.ListMatching(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
 	g, gctx := errgroup.WithContext(ctx)
-	limit := 6
+	limit := 16
 	if limit > len(matched) && len(matched) > 0 {
 		limit = len(matched)
 	}
@@ -148,7 +192,6 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	}
 	g.SetLimit(limit)
 	for _, n := range matched {
-		n := n
 		g.Go(func() error {
 			qn, err := ident.QuoteMySQL(n)
 			if err != nil {
@@ -179,7 +222,7 @@ func (d *Driver) ListMatching(ctx context.Context, prefix string) ([]string, err
 	if err != nil {
 		return nil, fmt.Errorf("list mysql databases: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var s string
@@ -216,7 +259,186 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 	return d.EnsureDB(ctx, name)
 }
 
-// SnapshotCreate clones `source` into `template` in two phases:
+// SnapshotCreate clones `source` into `template` using the fastest
+// available strategy:
+//
+//  1. PHYSICAL: InnoDB transferable tablespaces. Requires
+//     `connections.mysql.container` / `compose_service` to be set so
+//     treeman can `<container-engine> exec cp` the .ibd / .cfg files
+//     inside the container (preserving the mysql:mysql ownership the
+//     server needs to IMPORT them). Several times faster than the
+//     logical path on non-trivial schemas because it skips the
+//     INSERT ... SELECT round-trips entirely. See physical_clone.go.
+//
+//  2. LOGICAL: the serial-DDL + parallel-INSERT-SELECT loader (see
+//     logicalSnapshotCreate). Always available; picked when the
+//     physical preconditions aren't met OR when physical was
+//     attempted but failed (the warning is logged and the fall-back
+//     takes over).
+//
+// The strategy chosen for this call is recorded on the Driver and
+// retrievable via LastCloneStrategy(); the prepare layer reads it to
+// emit a snapshot_clone_strategy event.
+func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
+	if d.chooseStrategy(ctx, source) == CloneStrategyLogical {
+		d.setLastStrategy(CloneStrategyLogical)
+		return d.logicalSnapshotCreate(ctx, source, template)
+	}
+	if ok, perr := d.tryPhysicalSnapshotCreate(ctx, source, template); ok {
+		d.setLastStrategy(CloneStrategyPhysical)
+		return nil
+	} else if perr != nil {
+		var skip *physicalSkippedError
+		if errors.As(perr, &skip) {
+			slog.Debug("mysql physical clone preconditions not met; using logical fallback",
+				"source", source, "template", template, "reason", skip.reason)
+		} else {
+			slog.Warn("mysql physical clone failed; falling back to logical clone",
+				"source", source, "template", template, "error", perr)
+		}
+	}
+	d.setLastStrategy(CloneStrategyLogical)
+	return d.logicalSnapshotCreate(ctx, source, template)
+}
+
+// defaultPhysicalCloneMinBytes is the source-size floor at/above which
+// the clone path switches from the logical INSERT…SELECT loader to
+// InnoDB transferable tablespaces. Below it logical is faster: physical
+// pays a fixed per-table FLUSH/copy/IMPORT cost that dominates for the
+// common many-small-tables schema, while logical scales with row volume
+// (cheap when tables are small). 1 GiB is deliberately conservative.
+const defaultPhysicalCloneMinBytes int64 = 1 << 30
+
+// physicalCloneMinBytes returns the threshold, honoring an optional
+// TREEMAN_MYSQL_PHYSICAL_MIN_BYTES override. The env var is an internal
+// tuning/test hook (not a documented config knob) — e2e tests set it to
+// 0 to exercise the physical path on small fixtures.
+func physicalCloneMinBytes() int64 {
+	if v := os.Getenv("TREEMAN_MYSQL_PHYSICAL_MIN_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return defaultPhysicalCloneMinBytes
+}
+
+// PreferLogicalFor reports whether the auto strategy selector picks
+// logical for `db`. The prepare layer reads this to decide whether the
+// cold-build path can fan source → [template + clones] in one parallel
+// wave (logical clones don't share a per-source FLUSH lock); the
+// physical path keeps its 2-step snapshot-create + staged-restore flow
+// where the staging dir absorbs the lock contention.
+func (d *Driver) PreferLogicalFor(ctx context.Context, db string) bool {
+	return d.chooseStrategy(ctx, db) == CloneStrategyLogical
+}
+
+// chooseStrategy picks the optimal clone strategy for `db` by source
+// size: physical only once the data is large enough to amortize its
+// per-table overhead, logical otherwise. A size-probe error falls back
+// to logical (the always-correct path). No user knob — treeman always
+// takes the faster path for the data at hand.
+func (d *Driver) chooseStrategy(ctx context.Context, db string) CloneStrategy {
+	bytes, err := d.sourceDataBytes(ctx, db)
+	if err != nil || bytes < physicalCloneMinBytes() {
+		return CloneStrategyLogical
+	}
+	return CloneStrategyPhysical
+}
+
+// sourceDataBytes returns the on-disk size (data + index length) of
+// every table in `db`, summed. Used by the auto strategy selector.
+func (d *Driver) sourceDataBytes(ctx context.Context, db string) (int64, error) {
+	var n sql.NullInt64
+	err := d.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0)
+		 FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?`, db).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n.Int64, nil
+}
+
+// WriteWatermark returns a sound, monotonic write-counter token for `db`.
+// An unchanged token between two calls PROVES no row was written, so the
+// caller can safely skip a redundant capture; the counters only ever
+// increase, so a write can never hide behind an equal token (false-clean
+// is impossible — false-dirty only costs a needless capture).
+//
+// Two sources, in order:
+//
+//  1. PER-DATABASE: SUM(COUNT_WRITE) over `db`'s tables from
+//     performance_schema.table_io_waits_summary_by_table. Used ONLY when
+//     the relevant instrument + consumer are verified ENABLED — otherwise
+//     COUNT_WRITE pins at 0 and would falsely read "clean". This is the
+//     precise signal: a write to a sibling database does not move it.
+//  2. SERVER-WIDE fallback: Innodb_rows_{inserted,updated,deleted} from
+//     SHOW GLOBAL STATUS — always-on (not performance_schema-gated) and
+//     sound, but coarse (a sibling database's writes mark `db` dirty).
+//
+// The token is tagged with its source ("ps:<db>:" vs "ir:") so a runtime
+// flip between the two modes can never compare equal to a stale token.
+// An error returns "" so the caller declines to skip work.
+func (d *Driver) WriteWatermark(ctx context.Context, db string) (string, error) {
+	if tracked, _ := d.perfSchemaWritesTracked(ctx); tracked {
+		var sum sql.NullInt64
+		if err := d.DB.QueryRowContext(ctx,
+			`SELECT COALESCE(SUM(COUNT_WRITE), 0)
+			 FROM performance_schema.table_io_waits_summary_by_table
+			 WHERE OBJECT_SCHEMA = ?`, db).Scan(&sum); err == nil {
+			return "ps:" + db + ":" + strconv.FormatInt(sum.Int64, 10), nil
+		}
+		// Fall through to the global counter on any query error.
+	}
+	return d.globalRowWatermark(ctx)
+}
+
+// perfSchemaWritesTracked reports whether table-level write counts are
+// actually being recorded — i.e. the table-io instrument AND the global
+// instrumentation consumer are both ENABLED. If either is off (or
+// performance_schema is disabled entirely, surfacing as a query error),
+// COUNT_WRITE is untrustworthy and the caller must NOT use the per-db
+// path. Closing this hole is what makes the per-db watermark sound.
+func (d *Driver) perfSchemaWritesTracked(ctx context.Context) (bool, error) {
+	var inst, cons sql.NullString
+	if err := d.DB.QueryRowContext(ctx, `
+		SELECT
+			(SELECT ENABLED FROM performance_schema.setup_instruments
+			   WHERE NAME = 'wait/io/table/sql/handler' LIMIT 1),
+			(SELECT ENABLED FROM performance_schema.setup_consumers
+			   WHERE NAME = 'global_instrumentation' LIMIT 1)`).Scan(&inst, &cons); err != nil {
+		return false, err
+	}
+	return inst.Valid && inst.String == "YES" && cons.Valid && cons.String == "YES", nil
+}
+
+// globalRowWatermark is the always-available server-wide fallback: the
+// sum of the monotonic Innodb_rows_* counters from SHOW GLOBAL STATUS.
+func (d *Driver) globalRowWatermark(ctx context.Context) (string, error) {
+	rows, err := d.DB.QueryContext(ctx,
+		`SHOW GLOBAL STATUS WHERE Variable_name IN
+		 ('Innodb_rows_inserted','Innodb_rows_updated','Innodb_rows_deleted')`)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = rows.Close() }()
+	var sum int64
+	for rows.Next() {
+		var name string
+		var val sql.NullInt64
+		if err := rows.Scan(&name, &val); err != nil {
+			return "", err
+		}
+		sum += val.Int64
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return "ir:" + strconv.FormatInt(sum, 10), nil
+}
+
+// logicalSnapshotCreate is the pre-physical implementation kept as the
+// always-available fallback. Clones `source` into `template` in two
+// phases:
 //
 //  1. Serial DDL pass on a single connection — every base table's
 //     `CREATE TABLE` runs against the new template, and the
@@ -233,7 +455,7 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 // Views replay serially afterwards because views can reference
 // other views / tables and engines reject CREATE VIEW against a
 // missing dependency.
-func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
+func (d *Driver) logicalSnapshotCreate(ctx context.Context, source, template string) error {
 	qsource, err := ident.QuoteMySQL(source)
 	if err != nil {
 		return err
@@ -250,76 +472,16 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 		return err
 	}
 
-	rows, err := d.DB.QueryContext(ctx, `
-		SELECT
-			CONVERT(TABLE_NAME USING utf8mb4) AS TABLE_NAME,
-			CONVERT(TABLE_TYPE USING utf8mb4) AS TABLE_TYPE
-		FROM information_schema.TABLES
-		WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME
-	`, source)
+	tables, views, err := d.listTablesAndViews(ctx, source)
 	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	type t struct{ name, kind string }
-	var tables, views []t
-	for rows.Next() {
-		var n, k string
-		if err := rows.Scan(&n, &k); err != nil {
-			return err
-		}
-		row := t{name: n, kind: k}
-		if k == "VIEW" {
-			views = append(views, row)
-		} else {
-			tables = append(tables, row)
-		}
-	}
-	if err := rows.Err(); err != nil {
 		return err
 	}
 
 	// Phase 1 — serial DDL pass on a single connection. Captures
 	// each table's non-generated column list so Phase 2 can skip
 	// the per-worker column lookup.
-	type tableJob struct {
-		name string
-		cols []string // empty → all-generated, no data copy needed
-	}
-	jobs := make([]tableJob, 0, len(tables))
-	if err := func() error {
-		conn, err := d.DB.Conn(ctx)
-		if err != nil {
-			return fmt.Errorf("acquire DDL connection: %w", err)
-		}
-		defer conn.Close()
-		if err := applyCloneSession(ctx, conn); err != nil {
-			return err
-		}
-		if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
-			return fmt.Errorf("USE %s: %w", qtemplate, err)
-		}
-		for _, tbl := range tables {
-			qtbl, err := ident.QuoteMySQL(tbl.name)
-			if err != nil {
-				return err
-			}
-			row := conn.QueryRowContext(ctx, "SHOW CREATE TABLE "+qsource+"."+qtbl)
-			var gotName, createStmt string
-			if err := row.Scan(&gotName, &createStmt); err != nil {
-				return fmt.Errorf("SHOW CREATE TABLE %s.%s: %w", qsource, qtbl, err)
-			}
-			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-				return fmt.Errorf("recreate %s: %w", qtbl, err)
-			}
-			cols, err := nonGeneratedColumns(ctx, conn, source, tbl.name)
-			if err != nil {
-				return fmt.Errorf("list columns for %s: %w", qtbl, err)
-			}
-			jobs = append(jobs, tableJob{name: tbl.name, cols: cols})
-		}
-		return nil
-	}(); err != nil {
+	jobs, err := d.cloneTablesDDL(ctx, source, qsource, qtemplate, tables)
+	if err != nil {
 		return err
 	}
 
@@ -340,7 +502,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 			// the schema and there's nothing to copy.
 			continue
 		}
-		j := j
+
 		g.Go(func() error {
 			return copyOneTableData(gctx, d.DB, source, template, j.name, j.cols)
 		})
@@ -352,33 +514,153 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 	// Views need their dependencies in place — defer to a single
 	// serial pass after the parallel table copy finishes.
 	if len(views) > 0 {
-		conn, err := d.DB.Conn(ctx)
+		if err := d.cloneViews(ctx, qsource, qtemplate, views); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// schemaObject is one base table or view enumerated from
+// information_schema for the clone. kind is the raw TABLE_TYPE.
+type schemaObject struct{ name, kind string }
+
+// tableJob carries a base table's name plus its non-generated column
+// list (empty → all-generated, nothing to copy) from the serial DDL
+// pass to the parallel data copy.
+type tableJob struct {
+	name string
+	cols []string
+}
+
+// listTablesAndViews enumerates the base tables and views in `source`,
+// splitting them into separate slices so SnapshotCreate can run the
+// table DDL/data passes before replaying views (which may depend on
+// tables or other views).
+func (d *Driver) listTablesAndViews(ctx context.Context, source string) (tables, views []schemaObject, err error) {
+	rows, err := d.DB.QueryContext(ctx, `
+		SELECT
+			CONVERT(TABLE_NAME USING utf8mb4) AS TABLE_NAME,
+			CONVERT(TABLE_TYPE USING utf8mb4) AS TABLE_TYPE
+		FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME
+	`, source)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var n, k string
+		if err := rows.Scan(&n, &k); err != nil {
+			return nil, nil, err
+		}
+		row := schemaObject{name: n, kind: k}
+		if k == "VIEW" {
+			views = append(views, row)
+		} else {
+			tables = append(tables, row)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return tables, views, nil
+}
+
+// cloneTablesDDL runs SnapshotCreate's serial DDL pass on a single
+// connection: it recreates every base table in the template and
+// captures each table's non-generated column list for the parallel
+// data copy. Returns the per-table jobs in source order.
+func (d *Driver) cloneTablesDDL(ctx context.Context, source, qsource, qtemplate string, tables []schemaObject) ([]tableJob, error) {
+	jobs := make([]tableJob, 0, len(tables))
+	conn, err := d.DB.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire DDL connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := applyCloneSession(ctx, conn); err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
+		return nil, fmt.Errorf("USE %s: %w", qtemplate, err)
+	}
+	// One schema-wide column lookup instead of a per-table query in
+	// the loop: collapses N information_schema.COLUMNS round trips
+	// into one on the cold-build critical path. Same gating (EXTRA
+	// NOT LIKE '%GENERATED%') and ordinal ordering as the per-table
+	// form, so each table's column list is byte-identical.
+	colsByTable, err := nonGeneratedColumnsBySchema(ctx, conn, source)
+	if err != nil {
+		return nil, fmt.Errorf("list columns for %s: %w", qsource, err)
+	}
+	// Collect every table's CREATE statement, then run them in ONE
+	// multi-statement exec instead of a CREATE round trip per table —
+	// the same round-trip collapse applied to the physical restore
+	// path. The template was just DROP+CREATE DATABASE'd by the caller,
+	// so it's empty and the per-table 1050 stale-table retry can't fire
+	// (hence no need for it here); applyCloneSession disabled
+	// foreign_key_checks, so out-of-order CREATEs are fine.
+	var createBatch strings.Builder
+	for _, tbl := range tables {
+		stmt, err := showCreateTable(ctx, conn, qsource, tbl.name)
+		if err != nil {
+			return nil, err
+		}
+		createBatch.WriteString(stmt)
+		createBatch.WriteString(";\n")
+		jobs = append(jobs, tableJob{name: tbl.name, cols: colsByTable[tbl.name]})
+	}
+	if createBatch.Len() > 0 {
+		if _, err := conn.ExecContext(ctx, createBatch.String()); err != nil {
+			return nil, fmt.Errorf("batch create tables on %s: %w", qtemplate, err)
+		}
+	}
+	return jobs, nil
+}
+
+// showCreateTable returns the CREATE TABLE statement for qsource.name.
+func showCreateTable(ctx context.Context, conn *sql.Conn, qsource, name string) (string, error) {
+	qtbl, err := ident.QuoteMySQL(name)
+	if err != nil {
+		return "", err
+	}
+	var gotName, createStmt string
+	if err := conn.QueryRowContext(ctx, "SHOW CREATE TABLE "+qsource+"."+qtbl).Scan(&gotName, &createStmt); err != nil {
+		return "", fmt.Errorf("SHOW CREATE TABLE %s.%s: %w", qsource, qtbl, err)
+	}
+	return createStmt, nil
+}
+
+// cloneViews replays every view from source into the template on a
+// single connection after the table copy finishes, so each CREATE VIEW
+// sees its table / view dependencies already in place.
+func (d *Driver) cloneViews(ctx context.Context, qsource, qtemplate string, views []schemaObject) error {
+	conn, err := d.DB.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	if err := applyCloneSession(ctx, conn); err != nil {
+		return err
+	}
+	for _, v := range views {
+		qv, err := ident.QuoteMySQL(v.name)
 		if err != nil {
 			return err
 		}
-		defer conn.Close()
-		if err := applyCloneSession(ctx, conn); err != nil {
-			return err
+		row := conn.QueryRowContext(ctx, "SHOW CREATE VIEW "+qsource+"."+qv)
+		var name, createStmt string
+		// SHOW CREATE VIEW returns four columns; scan into
+		// dummies for the extras.
+		var charset, collation string
+		if err := row.Scan(&name, &createStmt, &charset, &collation); err != nil {
+			return fmt.Errorf("SHOW CREATE VIEW %s.%s: %w", qsource, qv, err)
 		}
-		for _, v := range views {
-			qv, err := ident.QuoteMySQL(v.name)
-			if err != nil {
-				return err
-			}
-			row := conn.QueryRowContext(ctx, "SHOW CREATE VIEW "+qsource+"."+qv)
-			var name, createStmt string
-			// SHOW CREATE VIEW returns four columns; scan into
-			// dummies for the extras.
-			var charset, collation string
-			if err := row.Scan(&name, &createStmt, &charset, &collation); err != nil {
-				return fmt.Errorf("SHOW CREATE VIEW %s.%s: %w", qsource, qv, err)
-			}
-			if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
-				return fmt.Errorf("USE %s: %w", qtemplate, err)
-			}
-			if _, err := conn.ExecContext(ctx, createStmt); err != nil {
-				return fmt.Errorf("recreate view %s: %w", qv, err)
-			}
+		if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
+			return fmt.Errorf("USE %s: %w", qtemplate, err)
+		}
+		if _, err := conn.ExecContext(ctx, createStmt); err != nil {
+			return fmt.Errorf("recreate view %s: %w", qv, err)
 		}
 	}
 	return nil
@@ -412,7 +694,10 @@ func applyCloneSession(ctx context.Context, conn *sql.Conn) error {
 		return fmt.Errorf("read back @@SESSION.sql_log_bin: %w", err)
 	}
 	if v != 0 {
-		return fmt.Errorf("SET SESSION sql_log_bin=0 was accepted but the session still reports %d; check user grants (need SESSION_VARIABLES_ADMIN or SUPER)", v)
+		return fmt.Errorf(
+			"SET SESSION sql_log_bin=0 was accepted but the session still reports %d; check user grants (need SESSION_VARIABLES_ADMIN or SUPER)",
+			v,
+		)
 	}
 	return nil
 }
@@ -442,10 +727,11 @@ func copyOneTableData(ctx context.Context, db *sql.DB, source, template, name st
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := applyCloneSession(ctx, conn); err != nil {
 		return err
 	}
+	//nolint:gosec // identifiers validated/quoted via ident.QuoteMySQL; no user values concatenated
 	copyStmt := "INSERT INTO " + qtemplate + "." + qname + " (" + colList +
 		") SELECT " + colList + " FROM " + qsource + "." + qname
 	if _, err := conn.ExecContext(ctx, copyStmt); err != nil {
@@ -454,28 +740,39 @@ func copyOneTableData(ctx context.Context, db *sql.DB, source, template, name st
 	return nil
 }
 
-// nonGeneratedColumns lists the columns of `<schema>.<table>` whose
-// EXTRA does not mark them as generated (STORED or VIRTUAL). Returned
-// in ordinal-position order so the INSERT column list matches the
-// SELECT projection one-to-one.
-func nonGeneratedColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]string, error) {
+// nonGeneratedColumnsBySchema lists, for every table in `schema`, the
+// columns whose EXTRA does not mark them generated (STORED or
+// VIRTUAL), keyed by table name. Each list is in ordinal-position
+// order so the INSERT column list matches the SELECT projection
+// one-to-one. One query for the whole schema replaces the former
+// per-table lookup in SnapshotCreate's serial DDL pass.
+func nonGeneratedColumnsBySchema(ctx context.Context, conn *sql.Conn, schema string) (map[string][]string, error) {
 	rows, err := conn.QueryContext(ctx, `
-		SELECT CONVERT(COLUMN_NAME USING utf8mb4)
+		SELECT CONVERT(TABLE_NAME USING utf8mb4), CONVERT(COLUMN_NAME USING utf8mb4)
 		FROM information_schema.COLUMNS
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		WHERE TABLE_SCHEMA = ?
 		  AND EXTRA NOT LIKE '%GENERATED%'
-		ORDER BY ORDINAL_POSITION`, schema, table)
+		ORDER BY TABLE_NAME, ORDINAL_POSITION`, schema)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []string
+	defer func() { _ = rows.Close() }()
+	return scanColumnsByTable(rows)
+}
+
+// scanColumnsByTable groups a (table_name, column_name) result set
+// into a per-table column slice, preserving the row order so each
+// table's list keeps the source's ordinal-position ordering (the
+// query's ORDER BY guarantees that order). Split out from the query so
+// the grouping is unit-testable without a live MySQL.
+func scanColumnsByTable(rows *sql.Rows) (map[string][]string, error) {
+	out := map[string][]string{}
 	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
+		var tbl, col string
+		if err := rows.Scan(&tbl, &col); err != nil {
 			return nil, err
 		}
-		out = append(out, c)
+		out[tbl] = append(out[tbl], col)
 	}
 	return out, rows.Err()
 }
@@ -496,8 +793,11 @@ func backtickJoin(cols []string) (string, error) {
 	return b.String(), nil
 }
 
-// SnapshotRestore re-creates `target` from `template`. Symmetric to
-// SnapshotCreate.
+// SnapshotRestore re-creates `target` from `template` with a single
+// direct clone. Symmetric to SnapshotCreate. Use this for one-shot
+// restores (incremental ancestor→source); for restoring one template
+// into many targets use SnapshotRestoreStaged, which amortizes the
+// export across the fan-out.
 func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
 	qtarget, err := ident.QuoteMySQL(target)
 	if err != nil {
@@ -512,13 +812,81 @@ func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) e
 	return d.SnapshotCreate(ctx, template, target)
 }
 
-// DropSnapshot drops a template DB. Idempotent.
+// SnapshotRestoreStaged re-creates `target` from `template`, importing
+// from a once-per-template export instead of cloning the template
+// directly. It is the fan-out path: one prepare clones a single
+// immutable template into N targets concurrently, and the direct
+// physical clone (SnapshotCreate) takes FLUSH TABLES <template>.* FOR
+// EXPORT on the shared template and holds it across the .ibd copy — so N
+// concurrent direct restores serialize on that one export lock.
+//
+// Staging exports the template's tablespaces to a staging dir exactly
+// once (ensureStage / stageTemplate, guarded by a per-template
+// sync.Once); every restore then imports plain file copies from staging
+// (physicalRestoreFromStage) and takes no lock on the template, so the
+// fan-out is bounded by disk + IMPORT rather than a serial export lock.
+//
+// Staging trades one extra file copy (template→staging) for that
+// parallelism, so it only pays off when the same template is restored
+// more than once — hence single restores use SnapshotRestore instead.
+//
+// Fallback chain matches the direct path: when staging is unavailable
+// (no ContainerRef, engine binary absent, empty secure_file_priv,
+// non-InnoDB tables, …) or fails, the restore falls back to the always-
+// available logical clone. logicalSnapshotCreate is called directly so
+// no redundant FLUSH-FOR-EXPORT probe runs per clone.
+func (d *Driver) SnapshotRestoreStaged(ctx context.Context, template, target string) error {
+	qtarget, err := ident.QuoteMySQL(target)
+	if err != nil {
+		return err
+	}
+	if err := ident.ValidateMySQL(template); err != nil {
+		return err
+	}
+	if _, err := d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
+		return err
+	}
+
+	// Honor the strategy selector: for small templates the logical
+	// restore beats staged physical (same per-table-overhead trade-off
+	// as SnapshotCreate), so don't stage at all.
+	if d.chooseStrategy(ctx, template) == CloneStrategyLogical {
+		d.setLastStrategy(CloneStrategyLogical)
+		return d.logicalSnapshotCreate(ctx, template, target)
+	}
+
+	st := d.ensureStage(ctx, template)
+	switch {
+	case st.skip != nil:
+		slog.Debug("mysql physical staging unavailable; using logical restore",
+			"template", template, "reason", st.skip.reason)
+	case st.err != nil:
+		slog.Warn("mysql physical staging failed; using logical restore",
+			"template", template, "error", st.err)
+	default:
+		rerr := d.physicalRestoreFromStage(ctx, st, target)
+		if rerr == nil {
+			d.setLastStrategy(CloneStrategyPhysical)
+			return nil
+		}
+		slog.Warn("mysql physical restore-from-stage failed; using logical restore",
+			"template", template, "target", target, "error", rerr)
+	}
+	d.setLastStrategy(CloneStrategyLogical)
+	return d.logicalSnapshotCreate(ctx, template, target)
+}
+
+// DropSnapshot drops a template DB. Idempotent. Also reaps any staging
+// dir holding that template's exported tablespaces (best-effort — a
+// fresh daemon that never staged this template still resolves the path
+// from secure_file_priv, so eviction across process restarts is clean).
 func (d *Driver) DropSnapshot(ctx context.Context, template string) error {
 	qtemplate, err := ident.QuoteMySQL(template)
 	if err != nil {
 		return err
 	}
 	_, err = d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtemplate)
+	d.dropStage(ctx, template)
 	return err
 }
 

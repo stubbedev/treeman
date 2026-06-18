@@ -1,0 +1,14 @@
+# Redis for the prefix-engine file-change watcher e2e. Distinct port
+# so it runs alongside the other redis suites.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: treeman-e2e-ofcr-redis
+    ports:
+      - "16395:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s

@@ -32,7 +32,7 @@ func LookupWorktree(ctx context.Context, repoRoot, name string, sink Sink) (stri
 	if err != nil {
 		return "", false
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT w.path, w.slug, COALESCE(w.branch,'')
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
@@ -40,7 +40,7 @@ func LookupWorktree(ctx context.Context, repoRoot, name string, sink Sink) (stri
 	if err != nil {
 		return "", false
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var exactBase, exactSlug, exactBranch string
 	var prefixHits []string
 	for rows.Next() {
@@ -100,7 +100,7 @@ func IsMatchingExistingWorktree(ctx context.Context, repoRoot, wtPath, branch st
 	if err != nil {
 		return false
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	var n int
 	_ = st.DB.QueryRowContext(ctx,
 		`SELECT 1 FROM worktrees w JOIN repos r ON r.id = w.repo_id

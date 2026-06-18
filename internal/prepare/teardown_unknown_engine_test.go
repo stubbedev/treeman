@@ -24,7 +24,7 @@ func TestTeardownDatabasesEmitsEventForUnknownEngine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	repoID, err := st.EnsureRepo(ctx, "/tmp/repo", "repo")
 	if err != nil {
 		t.Fatal(err)
@@ -44,7 +44,7 @@ func TestTeardownDatabasesEmitsEventForUnknownEngine(t *testing.T) {
 	}
 
 	events, err := st.QueryEvents(ctx, store.EventFilter{
-		EventTypes: []string{"db_teardown_skipped"},
+		EventTypes: []string{store.EvtDBTeardownSkip},
 		WorktreeID: wtID,
 		Limit:      10,
 	})

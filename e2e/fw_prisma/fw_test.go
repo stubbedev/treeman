@@ -77,7 +77,8 @@ func TestPrismaEndToEnd(t *testing.T) {
 					// (the internal port, not the published one).
 					Run: fmt.Sprintf(
 						`docker exec -w %s -e DATABASE_URL="postgres://postgres:pgpw@postgres:5432/${DB_NAME}?sslmode=disable" %s npx --no-install prisma db push --skip-generate --accept-data-loss`,
-						wt, nodeContainer,
+						wt,
+						nodeContainer,
 					),
 					Env: map[string]string{
 						"DB_NAME": "{target_db}",

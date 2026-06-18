@@ -23,7 +23,7 @@ func TestNew_DistinctAcrossCalls(t *testing.T) {
 	// Asserting 100 fresh ids are all unique is a reliable smoke test
 	// that crypto/rand is wired and didn't fall back to a constant.
 	seen := map[string]struct{}{}
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		id := New()
 		if _, dup := seen[id]; dup {
 			t.Fatalf("duplicate id %q in 100 generations", id)
@@ -39,7 +39,8 @@ func TestFrom_NoIDReturnsEmpty(t *testing.T) {
 }
 
 func TestFrom_NilCtxIsSafe(t *testing.T) {
-	if got := From(nil); got != "" {
+	var ctx context.Context // deliberately nil — From must not panic
+	if got := From(ctx); got != "" {
 		t.Fatalf("want empty for nil ctx, got %q", got)
 	}
 }

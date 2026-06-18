@@ -2,9 +2,12 @@ package prepare
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -18,18 +21,30 @@ import (
 // without a real engine.
 type fakeNS struct {
 	data map[string]map[string]string
+	// wm is a per-namespace monotonic write counter modelling a real
+	// engine's cumulative write stats. Watermark reads it; Restore/Empty
+	// and the test write() helper bump it. Capture is a read of the
+	// active slot, so it does NOT bump active's counter.
+	wm map[string]int
+	// wmUnsupported models mongo/redis: no sound cheap watermark, so
+	// Watermark returns "" and captures are never skipped.
+	wmUnsupported bool
+	// captureCalls / restoreCalls count primitive invocations so tests can
+	// assert a capture was (or was not) skipped.
+	captureCalls int
+	restoreCalls int
 	// restoreErr, when set, makes Restore fail without mutating — models
 	// a crash partway through filling the active namespace.
 	restoreErr error
 }
 
-func newFakeNS() *fakeNS { return &fakeNS{data: map[string]map[string]string{}} }
+func newFakeNS() *fakeNS {
+	return &fakeNS{data: map[string]map[string]string{}, wm: map[string]int{}}
+}
 
 func clone(src map[string]string) map[string]string {
 	out := make(map[string]string, len(src))
-	for k, v := range src {
-		out[k] = v
-	}
+	maps.Copy(out, src)
 	return out
 }
 
@@ -37,7 +52,9 @@ func (f *fakeNS) Exists(_ context.Context, ns string) (bool, error) {
 	_, ok := f.data[ns]
 	return ok, nil
 }
+
 func (f *fakeNS) Capture(_ context.Context, active, durable string) error {
+	f.captureCalls++
 	src, ok := f.data[active]
 	if !ok {
 		return fmt.Errorf("capture: active %q missing", active)
@@ -45,7 +62,9 @@ func (f *fakeNS) Capture(_ context.Context, active, durable string) error {
 	f.data[durable] = clone(src)
 	return nil
 }
+
 func (f *fakeNS) Restore(_ context.Context, durable, active string) error {
+	f.restoreCalls++
 	if f.restoreErr != nil {
 		return f.restoreErr
 	}
@@ -54,16 +73,50 @@ func (f *fakeNS) Restore(_ context.Context, durable, active string) error {
 		return fmt.Errorf("restore: durable %q missing", durable)
 	}
 	f.data[active] = clone(src) // drops active first, then copies
+	f.wm[active]++              // a fill is a write to the active slot
 	return nil
 }
+
+func (f *fakeNS) RestoreParent(_ context.Context, parent, active string, srcKeep func(string) bool) error {
+	f.restoreCalls++
+	if f.restoreErr != nil {
+		return f.restoreErr
+	}
+	src, ok := f.data[parent]
+	if !ok {
+		return fmt.Errorf("restore parent: source %q missing", parent)
+	}
+	dst := map[string]string{}
+	for k, v := range src {
+		if srcKeep == nil || srcKeep(k) {
+			dst[k] = v
+		}
+	}
+	f.data[active] = dst // drops active first, then copies the kept keys
+	f.wm[active]++       // a fill is a write to the active slot
+	return nil
+}
+
 func (f *fakeNS) Empty(_ context.Context, active string) error {
 	f.data[active] = map[string]string{}
+	f.wm[active]++
 	return nil
 }
+
+// Watermark returns the per-namespace write counter as an opaque token,
+// or "" when watermarks are unsupported (models mongo/redis).
+func (f *fakeNS) Watermark(_ context.Context, ns string) (string, error) {
+	if f.wmUnsupported {
+		return "", nil
+	}
+	return "wm:" + strconv.Itoa(f.wm[ns]), nil
+}
+
 func (f *fakeNS) Drop(_ context.Context, ns string) error {
 	delete(f.data, ns)
 	return nil
 }
+
 func (f *fakeNS) DropDurable(_ context.Context, durable string) error {
 	delete(f.data, durable)
 	return nil
@@ -83,6 +136,8 @@ type bsFixture struct {
 	worktreeID   int64
 	active       string
 	parent       func(branch string) (string, bool, error)
+	baseBranch   func(branch string) string
+	migrateFP    string
 }
 
 func newBSFixture(t *testing.T) *bsFixture {
@@ -131,10 +186,14 @@ func (f *bsFixture) run(branch string) Outcome {
 	if f.parent != nil {
 		rp = func(_ context.Context, b string) (string, bool, error) { return f.parent(b) }
 	}
+	var rbb func(ctx context.Context, branch string) string
+	if f.baseBranch != nil {
+		rbb = func(_ context.Context, b string) string { return f.baseBranch(b) }
+	}
 	out, err := runBranchScoped(ctx, branchScopedArgs{
 		cfg: f.cfg, d: f.d, dbIdx: 0, worktreePath: f.worktreePath,
 		st: f.st, repoID: f.repoID, worktreeID: f.worktreeID,
-		eng: f.eng, resolveParent: rp,
+		eng: f.eng, resolveParent: rp, resolveBaseBranchFn: rbb, migrateFP: f.migrateFP,
 	})
 	if err != nil {
 		f.t.Fatalf("runBranchScoped(%s): %v", branch, err)
@@ -145,6 +204,32 @@ func (f *bsFixture) run(branch string) Outcome {
 func (f *bsFixture) durable(branch string) string { return f.eng.durable(f.active, branch) }
 
 func (f *bsFixture) set(ns string, kv map[string]string) { f.fake.data[ns] = clone(kv) }
+
+// write models an external (app) write to a namespace: it mutates the
+// data AND bumps the watermark, the way a real engine's cumulative write
+// counter would advance. Use this — not a bare data-map poke — whenever a
+// test needs the swap lifecycle to observe that `active` got dirtied.
+func (f *bsFixture) write(ns, k, v string) {
+	if f.fake.data[ns] == nil {
+		f.fake.data[ns] = map[string]string{}
+	}
+	f.fake.data[ns][k] = v
+	f.fake.wm[ns]++
+}
+
+// eventCount returns how many events of `typ` were written for this
+// fixture's worktree — used to assert migrate/capture were skipped.
+func (f *bsFixture) eventCount(typ string) int {
+	f.t.Helper()
+	var n int
+	err := f.st.DB.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM events WHERE event_type = ? AND worktree_id = ?`,
+		typ, f.worktreeID).Scan(&n)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return n
+}
 
 func (f *bsFixture) assertActive(want ...string) {
 	f.t.Helper()
@@ -192,6 +277,76 @@ func TestBranchScopedSeedsFromParent(t *testing.T) {
 	f.run("develop")
 	f.assertActive("p")
 	f.assertMarker("develop")
+}
+
+// TestBranchScopedSeedsFromBaseDurable: no active, no own durable, and no
+// LIVE base-branch DB to copy — but a durable SNAPSHOT of the base branch
+// (develop) exists. The new feature branch must seed from that snapshot
+// instead of cold-building an empty schema.
+func TestBranchScopedSeedsFromBaseDurable(t *testing.T) {
+	f := newBSFixture(t)
+	ctx := context.Background()
+
+	// A develop durable snapshot exists for this logical DB, named the way
+	// branchEngine.durable derives it for this worktree's active namespace.
+	devDur := f.eng.durable(f.active, "develop")
+	f.set(devDur, map[string]string{"dev": "1"})
+	if err := f.st.RecordBranchDurable(ctx, store.BranchDurableRow{
+		RepoID: f.repoID, WorktreeID: f.worktreeID, Engine: "mysql",
+		DBKey: f.active, Branch: "develop", DurableName: devDur,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No LIVE parent DB to copy; base branch resolves to develop.
+	f.parent = func(string) (string, bool, error) { return "", false, nil }
+	f.baseBranch = func(string) string { return "develop" }
+
+	out := f.run("feature/x")
+	if out.Decision != "seed:parent-snapshot" {
+		t.Fatalf("decision = %q, want seed:parent-snapshot", out.Decision)
+	}
+	f.assertActive("dev") // seeded from develop's snapshot
+	f.assertMarker("feature/x")
+}
+
+// TestBranchScopedSeedsFromDeletedWorktreeDurable: the base branch's
+// durable was captured in a worktree that has since been torn down
+// (teardown keeps durables). The snapshot seed must still find it via
+// the deleted worktree row's stored path.
+func TestBranchScopedSeedsFromDeletedWorktreeDurable(t *testing.T) {
+	f := newBSFixture(t)
+	ctx := context.Background()
+
+	sibPath := t.TempDir()
+	sibID, err := f.st.EnsureWorktree(ctx, f.repoID, sibPath, "sibslug", "develop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibActive, err := activeNamespace(f.d, scopeName, sibPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sibDur := f.eng.durable(sibActive, "develop")
+	f.set(sibDur, map[string]string{"dev": "1"})
+	if err := f.st.RecordBranchDurable(ctx, store.BranchDurableRow{
+		RepoID: f.repoID, WorktreeID: sibID, Engine: "mysql",
+		DBKey: sibActive, Branch: "develop", DurableName: sibDur,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.MarkWorktreeDeleted(ctx, sibID); err != nil {
+		t.Fatal(err)
+	}
+
+	f.parent = func(string) (string, bool, error) { return "", false, nil }
+	f.baseBranch = func(string) string { return "develop" }
+
+	out := f.run("feature/x")
+	if out.Decision != "seed:parent-snapshot" {
+		t.Fatalf("decision = %q, want seed:parent-snapshot", out.Decision)
+	}
+	f.assertActive("dev")
 }
 
 // TestBranchScopedAdoptsExistingUnmarked: active present, no marker →
@@ -246,6 +401,172 @@ func TestBranchScopedSameBranchNoop(t *testing.T) {
 	f.assertActive("a", "b")
 }
 
+// ─── lever 2: migrate gate ──────────────────────────────────────────
+
+func TestMigrateNeeded(t *testing.T) {
+	cases := []struct {
+		name       string
+		builtEmpty bool
+		hasPrev    bool
+		prevFP     string
+		curFP      string
+		want       bool
+	}{
+		{"fresh empty build always migrates", true, false, "", "fp1", true},
+		{"empty build migrates even with stale prev", true, true, "fp1", "fp1", true},
+		{"no prior record migrates", false, false, "", "fp1", true},
+		{"empty current fingerprint migrates (untrustworthy)", false, true, "fp1", "", true},
+		{"changed fingerprint migrates", false, true, "fp1", "fp2", true},
+		{"unchanged fingerprint skips", false, true, "fp1", "fp1", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := migrateNeeded(c.builtEmpty, c.hasPrev, c.prevFP, c.curFP); got != c.want {
+				t.Fatalf("migrateNeeded(%t,%t,%q,%q) = %t, want %t",
+					c.builtEmpty, c.hasPrev, c.prevFP, c.curFP, got, c.want)
+			}
+		})
+	}
+}
+
+// TestMigrateSkippedOnUnchangedResume drives the full lifecycle with a
+// no-op migrate command: the first build migrates and records the
+// fingerprint; an unchanged re-run skips (emits migrate_skip); a changed
+// fingerprint migrates again.
+func TestMigrateSkippedOnUnchangedResume(t *testing.T) {
+	f := newBSFixture(t)
+	f.d.Migrate = &config.Step{Run: "true"}
+	f.migrateFP = "fp-A"
+
+	f.run("develop") // fresh → builtEmpty → migrate runs, records fp-A
+	if n := f.eventCount(store.EvtMigrateSkip); n != 0 {
+		t.Fatalf("first build must migrate, got %d skips", n)
+	}
+
+	f.run("develop") // noop, fp unchanged → skip
+	if n := f.eventCount(store.EvtMigrateSkip); n != 1 {
+		t.Fatalf("unchanged resume must skip migrate, got %d skips", n)
+	}
+
+	f.migrateFP = "fp-B" // a migration landed
+	f.run("develop")     // noop but fp changed → migrate runs again
+	if n := f.eventCount(store.EvtMigrateSkip); n != 1 {
+		t.Fatalf("changed fingerprint must re-migrate (no new skip), got %d skips", n)
+	}
+}
+
+// TestMigrateGateClearedOnReset: db reset drops the migrated-fingerprint
+// so the next prepare re-migrates rather than wrongly skipping.
+func TestMigrateGateClearedOnReset(t *testing.T) {
+	ctx := context.Background()
+	f := newBSFixture(t)
+	f.d.Migrate = &config.Step{Run: "true"}
+	f.migrateFP = "fp-A"
+
+	f.run("develop")
+	if _, ok, _ := f.st.GetBranchMigrated(ctx, f.worktreeID, f.active, "develop"); !ok {
+		t.Fatal("first build should record a migrated fingerprint")
+	}
+	if err := resetActiveNamespace(ctx, f.eng, f.st, f.repoID, f.worktreeID, f.active); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := f.st.GetBranchMigrated(ctx, f.worktreeID, f.active, "develop"); ok {
+		t.Fatal("reset must clear the migrated fingerprint so the next prepare re-migrates")
+	}
+}
+
+// ─── lever 1: capture gate ──────────────────────────────────────────
+
+func TestCaptureSkippable(t *testing.T) {
+	cases := []struct {
+		name          string
+		prevClean     bool
+		durableExists bool
+		prevWM, curWM string
+		want          bool
+	}{
+		{"clean + unchanged watermark skips", true, true, "wm:3", "wm:3", true},
+		{"dirty never skips", false, true, "wm:3", "wm:3", false},
+		{"missing durable never skips", true, false, "wm:3", "wm:3", false},
+		{"changed watermark never skips", true, true, "wm:3", "wm:4", false},
+		{"empty watermark (unsupported) never skips", true, true, "", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := captureSkippable(c.prevClean, c.durableExists, c.prevWM, c.curWM); got != c.want {
+				t.Fatalf("captureSkippable(%t,%t,%q,%q) = %t, want %t",
+					c.prevClean, c.durableExists, c.prevWM, c.curWM, got, c.want)
+			}
+		})
+	}
+}
+
+// TestCaptureSkippedOnCleanBounce is the headline lever-1 case: switching
+// away from a branch whose active slot is untouched since it was resumed
+// skips the (redundant) capture, but a write before the switch forces it.
+func TestCaptureSkippedOnCleanBounce(t *testing.T) {
+	f := newBSFixture(t)
+	f.parent = func(string) (string, bool, error) { return "parentdb", true, nil }
+	f.set("parentdb", map[string]string{"base": "1"})
+
+	// Adopt develop: captures a durable copy, marks active clean.
+	f.set(f.active, map[string]string{"d": "1"})
+	f.run("develop")
+	if _, ok := f.fake.data[f.durable("develop")]; !ok {
+		t.Fatal("adopt should create durable(develop)")
+	}
+	c0 := f.fake.captureCalls
+
+	// Switch to feature with NO write to active since the adopt → the
+	// capture of develop is redundant and must be skipped.
+	f.run("feature")
+	if f.fake.captureCalls != c0 {
+		t.Fatalf("clean bounce must skip capture: captureCalls %d → %d", c0, f.fake.captureCalls)
+	}
+	if f.eventCount(store.EvtBranchCaptureSkip) != 1 {
+		t.Fatalf("expected one capture_skip event, got %d", f.eventCount(store.EvtBranchCaptureSkip))
+	}
+	// durable(develop) still holds develop's data — the skip was safe.
+	if dd := f.fake.data[f.durable("develop")]; dd["d"] != "1" {
+		t.Fatalf("durable(develop) must remain intact after a skipped capture, got %v", dd)
+	}
+
+	// Back to develop (resume → clean again), then WRITE before switching.
+	f.run("develop")
+	c1 := f.fake.captureCalls
+	f.write(f.active, "x", "9") // app mutates the working DB
+	f.run("feature")
+	if f.fake.captureCalls != c1+1 {
+		t.Fatalf("a write before switch must force capture: captureCalls %d → %d (want +1)", c1, f.fake.captureCalls)
+	}
+	if dd := f.fake.data[f.durable("develop")]; dd["x"] != "9" {
+		t.Fatalf("forced capture must preserve the new write into durable(develop), got %v", dd)
+	}
+	// feature's durable copy was created when develop was swapped back in.
+	if _, ok := f.fake.data[f.durable("feature")]; !ok {
+		t.Fatal("durable(feature) should exist after feature was swapped out")
+	}
+}
+
+// TestCaptureNeverSkippedWithoutWatermark: an engine with no sound
+// watermark (Watermark→"") must always capture, even on an otherwise
+// clean bounce — soundness over speed.
+func TestCaptureNeverSkippedWithoutWatermark(t *testing.T) {
+	f := newBSFixture(t)
+	f.fake.wmUnsupported = true
+
+	f.set(f.active, map[string]string{"d": "1"})
+	f.run("develop") // adopt
+	c0 := f.fake.captureCalls
+	f.run("feature") // would-be clean bounce, but no watermark
+	if f.fake.captureCalls != c0+1 {
+		t.Fatalf("no-watermark engine must always capture: captureCalls %d → %d (want +1)", c0, f.fake.captureCalls)
+	}
+	if f.eventCount(store.EvtBranchCaptureSkip) != 0 {
+		t.Fatalf("no-watermark engine must never emit capture_skip, got %d", f.eventCount(store.EvtBranchCaptureSkip))
+	}
+}
+
 // TestConnectBranchEngineMissingConn locks the error message for the
 // "DB marked branch_scoped but connections.<engine> is unset" path —
 // the most common misconfiguration. Every swappable engine must
@@ -268,7 +589,7 @@ func TestConnectBranchEngineMissingConn(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.engine, func(t *testing.T) {
-			eng, closeFn, err := connectBranchEngine(ctx, &config.Config{}, c.engine)
+			eng, closeFn, err := connectBranchEngine(ctx, &config.Config{}, c.engine, nil)
 			if err == nil || err.Error() != c.want {
 				t.Fatalf("err = %v, want %q", err, c.want)
 			}
@@ -294,7 +615,7 @@ func TestConnectBranchEngineUnswappable(t *testing.T) {
 	ctx := context.Background()
 	for _, engine := range []string{"sqlite", "", "made-up"} {
 		t.Run(engine, func(t *testing.T) {
-			eng, closeFn, err := connectBranchEngine(ctx, &config.Config{}, engine)
+			eng, closeFn, err := connectBranchEngine(ctx, &config.Config{}, engine, nil)
 			if err != nil {
 				t.Fatalf("unswappable engine must not error, got %v", err)
 			}
@@ -325,7 +646,7 @@ func TestResetReseedsFromParent(t *testing.T) {
 	f.assertMarker("develop")
 
 	// reset: drop durable + active, clear marker.
-	if err := resetActiveNamespace(ctx, f.eng, f.st, f.worktreeID, f.active); err != nil {
+	if err := resetActiveNamespace(ctx, f.eng, f.st, f.repoID, f.worktreeID, f.active); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := f.fake.data[f.active]; ok {
@@ -370,7 +691,7 @@ func TestBranchScopedSwapAdvancesMarkerBeforeFill(t *testing.T) {
 	// Switch to feature, but fill fails partway (simulated crash).
 	f.set("parentdb", map[string]string{"base": "1"})
 	f.parent = func(string) (string, bool, error) { return "parentdb", true, nil }
-	f.fake.restoreErr = fmt.Errorf("simulated crash mid-fill")
+	f.fake.restoreErr = errors.New("simulated crash mid-fill")
 	if _, err := f.st.EnsureWorktree(ctx, f.repoID, f.worktreePath, "wtslug", "feature"); err != nil {
 		t.Fatal(err)
 	}

@@ -1,0 +1,1070 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Action": {
+      "properties": {
+        "run": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single shell command executed via `sh -c`."
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "description": "Ordered list of shell commands chained with `\u0026\u0026`."
+            }
+          ],
+          "description": "Shell work for this action. String = single step; list = sequenced steps chained with `\u0026\u0026`. Required."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory for every step in this action. Relative paths resolve against the worktree root (host) or container WORKDIR (when wrapped)."
+        },
+        "container": {
+          "type": "string",
+          "description": "Container name or ID. When set, every step is wrapped in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
+        },
+        "compose_service": {
+          "type": "string",
+          "description": "Docker Compose service name. Resolves the container via compose labels and wraps every step in `\u003cengine\u003e exec`. Mutually exclusive with `container`."
+        },
+        "compose_project": {
+          "type": "string",
+          "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or parent dir name. Only meaningful with `compose_service`."
+        },
+        "container_engine": {
+          "type": "string",
+          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "description": "One action: a `run` (string or list of strings) plus optional cwd + container wrapping."
+    },
+    "AutoFetchConfig": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled toggles the loop. Default true. A pointer would let the\nschema distinguish \"unset\" from \"explicit false\", but defaults\nare applied centrally in applyDefaults and there is no\ninheritance subtlety — a missing key means \"use default\"."
+        },
+        "interval_minutes": {
+          "type": "integer",
+          "description": "Cadence in minutes. Default 15. Minimum 1 (values below are\nclamped at use-site to avoid a runaway tight loop on a typo)."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "ff",
+            "rebase"
+          ],
+          "description": "Mode controls how a worktree's HEAD is advanced after fetch.\n  - \"ff\" (default): `git merge --ff-only @{u}`. Refuses on\n    divergence; user's unpushed commits are never touched.\n  - \"rebase\": `git rebase --autostash @{u}`. Replays local\n    commits on top of upstream. Auto-aborts on conflict so the\n    working tree never lands in a half-rebased state.\nOpt-in only — keep the safe ff path as the default."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "AutoFetchConfig — `auto_fetch:` block. Periodic daemon-side\n`git fetch --all --prune` per registered repo, followed by a best-\neffort `git merge --ff-only @{u}` per active worktree. Pull is\nsafe: it skips when the working tree is dirty, when the branch\nhas no upstream, or when the merge would not be a fast-forward.\nEach failure logs a warning and the loop continues.\n\nUse `enabled: false` (per-repo `.treeman.yaml` override) to opt a\nrepo out, e.g. when a separate scheduler already pulls or when\nnetwork policy forbids unsolicited fetches."
+    },
+    "ClonesSetting": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "auto"
+          ],
+          "description": "Detect the test framework and pre-warm one clone per CPU when it parallelizes per-worker (else 1)."
+        },
+        {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Explicit clone count. 0 disables pre-warming entirely."
+        }
+      ],
+      "description": "Number of test-clone databases to pre-warm. Either the literal string `auto` (treeman detects the test framework and uses the CPU count for per-worker runners) or a non-negative integer (0 disables pre-warming)."
+    },
+    "ConnectionsConfig": {
+      "properties": {
+        "mysql": {
+          "$ref": "#/$defs/MysqlConn",
+          "description": "MySQL / MariaDB / TiDB connection. Set when any `databases:`\nentry uses one of those engines. Treeman dials this server to\ncreate clones, dump templates."
+        },
+        "postgres": {
+          "$ref": "#/$defs/PostgresConn",
+          "description": "PostgreSQL connection. Required when any `databases:` entry\nuses `engine: postgres` (or the `postgresql` alias)."
+        },
+        "mongodb": {
+          "$ref": "#/$defs/MongoConn",
+          "description": "MongoDB connection. URI form (`mongodb://...`); host/port get\nrewritten at dial time when a `container` ref is set."
+        },
+        "redis": {
+          "$ref": "#/$defs/RedisConn",
+          "description": "Redis connection. URL form (`redis://...`); ContainerRef\nsemantics match MongoDB."
+        },
+        "elasticsearch": {
+          "$ref": "#/$defs/EsConn",
+          "description": "Elasticsearch / OpenSearch connection. HTTP URL form."
+        },
+        "s3": {
+          "$ref": "#/$defs/S3Conn",
+          "description": "S3-compatible object storage connection (AWS S3, MinIO, Garage,\nCeph RGW, Backblaze B2, Cloudflare R2, ...). Required when any\n`databases:` entry uses `engine: s3`. One connection serves many\nper-worktree buckets named via the entry's `key_prefix`."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "ConnectionsConfig — `connections:` block."
+    },
+    "CustomFramework": {
+      "properties": {
+        "markers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Files (relative to repo root) whose presence indicates this\nframework is in use. All markers must be present for `treeman\nfw detect` / `treeman doctor` to recognise the framework.\nExample: `[\"alembic.ini\", \"migrations/env.py\"]`."
+        },
+        "migration_dirs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Glob patterns for the directories holding migration files.\nCarried on the detection Spec reported by `treeman fw detect` /\n`treeman doctor`; not emitted into `inputs[]` by `treeman init`\n(init scaffolds only from built-in frameworks)."
+        },
+        "file_pattern": {
+          "type": "string",
+          "description": "Glob pattern for individual migration files within\n`migration_dirs`. Example: `[0-9]*_*.py` (alembic) or\n`V*__*.sql` (flyway)."
+        },
+        "lockfiles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Lockfiles (e.g. `requirements.txt`, `pyproject.toml`,\n`composer.lock`) carried on the detection Spec. To fold a\nlockfile into the snapshot hash, declare it under\n`databases[].inputs[]`."
+        },
+        "engine_hint": {
+          "type": "string",
+          "description": "Optional hint about the database engine this framework\ntargets — `mysql`, `postgres`, etc. Carried on the detection\nSpec; not used by `treeman init` (which scaffolds only from\nbuilt-in frameworks)."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "markers",
+        "migration_dirs",
+        "file_pattern"
+      ],
+      "description": "CustomFramework — `frameworks:` entry, lets users declare\nmigration frameworks treeman doesn't know about natively. Added to\nthe detector registry (via RegistryFor) consulted by `treeman fw\ndetect` and `treeman doctor`; `treeman init` and the MCP\n`fw_detect` tool use only the built-in registry and ignore these\nentries. At runtime treeman watches `databases[].inputs[]` directly."
+    },
+    "DaemonConfig": {
+      "properties": {
+        "log_level": {
+          "type": "string",
+          "description": "Log level for daemon stderr: `debug`, `info` (default),\n`warn`, `error`. Read once at startup; reload by restarting\nthe daemon. Hook output is always captured regardless."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "DaemonConfig — `daemon:` block. Only `log_level` is user-tunable;\nthe socket path and event-log location are derived from\n$XDG_RUNTIME_DIR / $XDG_STATE_HOME respectively and are not\nconfigurable through YAML (one source of truth — the runtime\ndirs the OS already manages)."
+    },
+    "DatabaseConfig": {
+      "properties": {
+        "engine": {
+          "type": "string",
+          "enum": [
+            "mysql",
+            "mariadb",
+            "tidb",
+            "postgres",
+            "postgresql",
+            "mongodb",
+            "redis",
+            "valkey",
+            "dragonfly",
+            "elasticsearch",
+            "opensearch",
+            "s3"
+          ],
+          "description": "Engine discriminator. Gates which connection block is dialed\nand which sub-fields (dump, migrations, namespaces) are valid.\n`postgresql` is an alias for `postgres`; `opensearch` is an\nalias for `elasticsearch`; `valkey` and `dragonfly` are aliases\nfor `redis` (same wire protocol, same key-prefix scoping)."
+        },
+        "name_template": {
+          "type": "string",
+          "description": "Template for the per-worktree database/index name. Supports\n`{slug}`, `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`\n(see the `template` package for definitions). Example:\n`app_{slug}` → `app_feature-x`. Required for engines that\nscope by database name (MySQL, Postgres, Mongo). Validated at\nconfig-load time — typos fail loud."
+        },
+        "dump": {
+          "$ref": "#/$defs/DumpList",
+          "description": "Source dump(s) used to seed the source DB before migrate/seed\nrun. Each path is relative to the repo root. Treeman hashes\nevery dump into the snapshot key, so changes invalidate the\ncache. Three shapes:\n\n  dump: seed.sql                       # bare string\n  dump: { path: seed.sql, optional: true }  # mapping\n  dump:                                # sequence\n    - base.sql\n    - { path: extras.sql, optional: true }\n\nSequence entries load in declared ORDER, so a base schema dump\nfollowed by per-feature patches is supported without splicing\nthem into one file. Order matters for the fingerprint too —\nreordering reproducible dumps is a content change."
+        },
+        "migrate": {
+          "$ref": "#/$defs/Step",
+          "description": "Migrate is the shell command that brings a freshly-loaded\nsource DB up to the current schema. Required when any input\nglob matches migration files; optional otherwise (e.g. a DB\nthat's purely seed-driven)."
+        },
+        "rollback": {
+          "$ref": "#/$defs/Step",
+          "description": "Rollback is the OPTIONAL shell command that unwinds the most\nrecently applied migrations, used to keep templates correct when\nan *already-applied* migration's content is edited. Treeman runs\nit against a clone of the prior template, then re-runs Migrate\nforward — the only path that re-applies an edit to a migration\nwhose ledger row is baked into the source dump.\n\nTreeman injects the number of migrations to unwind as the env var\nTREEMAN_ROLLBACK_STEPS; reference it in Run, e.g.\n  rollback: { run: \"php artisan migrate:rollback --step=$TREEMAN_ROLLBACK_STEPS\" }\n(Run is passed verbatim to `sh -c`; only Env values are\n`{placeholder}`-rendered, so use the shell env var, not a brace\nplaceholder.)\n\nWARNING: rollback runs the migration's CURRENT down() — the edited\nfile on disk — not the original down() that matched the applied\nschema. For edits that change down(), or for lossy/irreversible\ndown()s, this can produce a wrong or failing schema. Treeman\nhard-falls-back to a full cold rebuild on ANY rollback or migrate\nerror, so a broken down() degrades to \"slow but correct\", never\n\"fast but wrong\"-at-the-engine — but a down() that *succeeds* while\nnot faithfully inverting up() is the user's responsibility. Leave\nthis unset to disable the rollback path entirely (cold rebuild\nonly)."
+        },
+        "seed": {
+          "$ref": "#/$defs/Step",
+          "description": "Seed is the shell command that populates non-migration data\n(fixtures, ES mappings, Redis warm-cache keys, etc.). Runs\nAFTER dump-load + migrate as the final cold-build step,\nbefore treeman snapshots the populated state into the\ntemplate DB."
+        },
+        "inputs": {
+          "items": {
+            "$ref": "#/$defs/Input"
+          },
+          "type": "array",
+          "description": "Inputs declare every file that determines this database's\ntemplate state. Each entry:\n  1. Contributes a hash to the snapshot fingerprint (so any\n     change auto-invalidates the cached template).\n  2. Subscribes fsnotify so changes trigger a re-prep.\n  3. Carries an optional `label:` that `hooks.file-change`\n     actions can match against.\n\nGlob patterns are repo-root-relative. Every matched file is\ncontent-hashed (BLAKE3); a content, add, or remove moves the\nfingerprint.\n\nCache-hit vs cold-build is derived purely from the input\nhashes — there's no separate `on: rebuild` knob. If you want\nto force a rebuild, change an input."
+        },
+        "test_clones": {
+          "$ref": "#/$defs/TestClonesSpec",
+          "description": "Test-clone fanout: how many parallel database clones to\npre-warm for paratest/pytest-xdist/Jest workers/etc."
+        },
+        "key_prefix": {
+          "type": "string",
+          "description": "KeyPrefix scopes every key/index a worktree creates under a\nper-worktree prefix. Used by engines that don't scope by\ndatabase name — Redis (key prefix in DB 0) and Elasticsearch\n/ OpenSearch (index-name prefix). Example: `{slug}:` →\n`feature-x:`. The app must honour the prefix — Laravel's\n`CACHE_PREFIX`, Rails `Rails.cache.options[:namespace]`,\nioredis `keyPrefix`, etc.\n\nSupports the same placeholders as `name_template`: `{slug}`,\n`{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`.\nValidated at config-load time."
+        },
+        "fanout": {
+          "type": "integer",
+          "maximum": 64,
+          "minimum": 0,
+          "description": "Outer concurrency cap for clone restore + DropMatching.\nDefaults to the per-engine safe value from internal/prepare.\nRange 0–64. Raise only if the server is provisioned\n(max_connections, PG pg_database lock contention, etc.)."
+        },
+        "prewarm": {
+          "type": "integer",
+          "maximum": 16,
+          "minimum": 0,
+          "description": "Prewarm keeps N spare clones pre-restored from this database's\ncached template (Postgres only — other engines have no\nconstant-time whole-database rename, so the knob is rejected at\nconfig load). A cache-hit prepare claims a spare via\n`ALTER DATABASE … RENAME` (milliseconds, size-independent)\ninstead of paying `CREATE DATABASE … TEMPLATE` per restore; a\ndetached replenisher then tops the pool back up. Spares are\nnamed `\u003ctemplate\u003e_spare\u003cn\u003e`, survive worktree teardown (they\nbelong to the template cache, not a worktree), and are dropped\nwith their template on snapshot eviction. Range 0–16; default\n0 (off). Mutually exclusive with `branch_scoped`."
+        },
+        "branch_scoped": {
+          "type": "boolean",
+          "description": "BranchScoped turns this database into a git-for-databases\nworking copy: the app always talks to one stable ACTIVE\nnamespace, while treeman keeps a DURABLE per-branch copy of its\ncontents and swaps them in/out as the branch changes. One flag,\nthe whole lifecycle — no per-feature sub-fields, no\nuser-configured durable names (treeman derives them internally).\n\nThe active namespace is fixed per checkout, so the app's\nconnection string (`.env`) is patched once and never churns:\n  - main worktree → the `main_worktree.databases[].name_template`\n    overlay (typically a bare, unprefixed name the repo-root app\n    already points at, e.g. `kontainer`).\n  - linked worktree → `name_template` (or `key_prefix` for\n    prefix-scoped engines) rendered against the worktree's\n    branch-independent slug, so switching branches inside the\n    worktree doesn't rename its DB.\n\nLifecycle, driven by HEAD changes + create/delete:\n  - create / first switch onto a branch → seed the active\n    namespace from the branch's own durable copy (resume) or,\n    failing that, from its parent branch's data (tracked\n    upstream, via the main overlay or a sibling worktree), or\n    `dump.path`, or empty.\n  - switch off a branch → capture the active namespace into that\n    branch's durable copy first (manual data changes live on).\n  - switch back → restore that durable copy. `treeman db reset`\n    drops the durable copy + re-seeds from the live parent.\n\nEngine-agnostic: name-scoped engines (MySQL, Postgres, MongoDB)\nswap whole databases; prefix-scoped engines (Redis,\nElasticsearch/OpenSearch) swap the key/index namespace under the\nrendered `key_prefix`. All five participate.\n\nMutually exclusive with `test_clones` / `fanout`: a branch_scoped\ndatabase is a stateful per-branch snapshot the app mutates in\nplace, not a reproducible source for throwaway parallel-test\nclones. Config-load rejects the combination.\n\nPostgres caveats (both stem from `CREATE DATABASE … TEMPLATE`,\nwhich needs exclusive access to its source):\n  - Capturing a branch on a switch briefly force-disconnects every\n    session on the active database (the swap fences it and\n    terminates backends), so the app momentarily loses its DB\n    connections and must reconnect. Expected; not data loss.\n  - Seeding a branch from its parent branch's LIVE database fails\n    while other sessions are connected to the parent (treeman does\n    NOT force-terminate another worktree's connections). Close\n    those connections, or set `dump.path` to seed from the dump.\nMySQL/MongoDB copy logically and have neither constraint."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "engine"
+      ],
+      "description": "DatabaseConfig — one `databases:` entry. The `engine` discriminator\ngates which sub-fields are valid.\n\n`Fanout` is the optional override for the outer concurrency cap\nduring clone restore + DropMatching. Leave unset (omitempty / 0)\nto use the safe per-engine default from internal/prepare. Raise\nonly if the server is provisioned for it (max_connections raised,\nPG pg_database lock contention acceptable, etc.)."
+    },
+    "DatabaseOverlay": {
+      "properties": {
+        "name_template": {
+          "type": "string"
+        },
+        "key_prefix": {
+          "type": "string"
+        },
+        "test_clones": {
+          "$ref": "#/$defs/TestClonesSpec"
+        },
+        "fanout": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "DatabaseOverlay holds the subset of `DatabaseConfig` fields that\ncan be tweaked per-context (main wt vs linked wt). Engine + Dump\nare intentionally absent — changing engines per-context produces\nschema chaos, and main / linked worktrees should always share the\nsame seed dump for snapshot-cache coherence.\n\nField semantics:\n\n  - Strings: empty value means \"inherit\". Setting to a non-empty\n    value replaces the base template.\n  - TestClones: nil pointer means \"inherit\". A non-nil value\n    replaces the entire spec (Clones + NameTemplate).\n  - Fanout: nil pointer means \"inherit\". A non-nil value (including\n    0) replaces the base — necessary because uint32(0) is a valid\n    \"use per-engine default\" sentinel that's distinct from \"no\n    override\"."
+    },
+    "DumpList": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Bare path string. Equivalent to `{path: \u003cthis string\u003e}`."
+        },
+        {
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Dump file path, relative to the worktree checkout root. Required."
+            },
+            "optional": {
+              "type": "boolean",
+              "description": "When true, missing dump is not an error."
+            },
+            "source_db": {
+              "type": "string",
+              "description": "MongoDB only: the database the archive was dumped from; remapped into the per-worktree target DB via mongorestore --nsFrom/--nsTo. Ignored by other engines."
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "path"
+          ],
+          "description": "Full dump mapping with optional `optional` + `source_db`."
+        },
+        {
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "Bare path string. Equivalent to `{path: \u003cthis string\u003e}`."
+              },
+              {
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "Dump file path, relative to the worktree checkout root. Required."
+                  },
+                  "optional": {
+                    "type": "boolean",
+                    "description": "When true, missing dump is not an error."
+                  },
+                  "source_db": {
+                    "type": "string",
+                    "description": "MongoDB only: the database the archive was dumped from; remapped into the per-worktree target DB via mongorestore --nsFrom/--nsTo. Ignored by other engines."
+                  }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "path"
+                ],
+                "description": "Full dump mapping with optional `optional` + `source_db`."
+              }
+            ],
+            "description": "Source dump file. Bare string OR `{path, optional, source_db}` mapping."
+          },
+          "type": "array",
+          "description": "Ordered list of dumps (each a string or mapping); loaded in declared order. Order is part of the snapshot fingerprint."
+        }
+      ],
+      "description": "Source dump(s). Accepts a bare path string, a single mapping, or an ordered array of either."
+    },
+    "EsConn": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Bare URL/URI. Equivalent to `{url: \u003cthis string\u003e}`."
+        },
+        {
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "pool_max": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency."
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "url"
+          ]
+        }
+      ],
+      "description": "elasticsearch connection — bare URL string OR structured object."
+    },
+    "FilteredAction": {
+      "properties": {
+        "run": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single shell command executed via `sh -c`."
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "description": "Ordered list of shell commands chained with `\u0026\u0026`."
+            }
+          ],
+          "description": "Shell work for this action. String = single step; list = sequenced steps chained with `\u0026\u0026`. Required."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory for every step in this action. Relative paths resolve against the worktree root (host) or container WORKDIR (when wrapped)."
+        },
+        "container": {
+          "type": "string",
+          "description": "Container name or ID. When set, every step is wrapped in `\u003cengine\u003e exec`. Mutually exclusive with `compose_service`."
+        },
+        "compose_service": {
+          "type": "string",
+          "description": "Docker Compose service name. Resolves the container via compose labels and wraps every step in `\u003cengine\u003e exec`. Mutually exclusive with `container`."
+        },
+        "compose_project": {
+          "type": "string",
+          "description": "Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or parent dir name. Only meaningful with `compose_service`."
+        },
+        "container_engine": {
+          "type": "string",
+          "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`."
+        },
+        "match": {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single watch label to match."
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "description": "Set of watch labels; the action fires when any of them matches."
+            }
+          ],
+          "description": "Restrict this action to watch events carrying one of the named labels. Omit to fire for every event."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "description": "On-file-change action with optional label filter. Same shape as a hook Action plus a `match:` field (string or list)."
+    },
+    "HooksConfig": {
+      "properties": {
+        "create-before-engines": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnCreateBeforeEngines — actions fire after worktree create +\npatches + bring-in, before engine prepare."
+        },
+        "create-after-engines": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnCreateAfterEngines — actions fire after engine prepare completes."
+        },
+        "delete-before-engines": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnDeleteBeforeEngines — actions fire before DB drop on delete."
+        },
+        "delete-after-engines": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnDeleteAfterEngines — actions fire after DB drop + worktree\nremove on delete."
+        },
+        "checkout": {
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "type": "array",
+          "description": "OnCheckout — actions fire when the HEAD watcher detects a\nbranch switch inside an existing worktree."
+        },
+        "file-change": {
+          "items": {
+            "$ref": "#/$defs/FilteredAction"
+          },
+          "type": "array",
+          "description": "OnFileChange — actions fire when any `databases[].inputs[]`\nglob matches a filesystem event. Each action can optionally\n`match: \u003clabel\u003e` to fire only when the matched input entry\ncarries that label; actions without `match:` fire for every\ninput event (any engine, any label).\n\nThe subprocess receives extra env vars naming the trigger:\n  TREEMAN_WATCH_PATH   — absolute path that fired\n  TREEMAN_WATCH_LABEL  — the label on the matched watch entry (or \"\")\n  TREEMAN_WATCH_ENGINE — engine of the owning database (mysql, postgres, …)\n  TREEMAN_WATCH_DB_NAME — rendered name_template of the owning database"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "HooksConfig — `hooks:` block. A flat set of trigger-keyed action\nlists. Each key's value is a list of Actions that fire when that\ntrigger happens. Actions in the same list run in parallel; the\ntrigger key itself encodes BOTH the lifecycle phase AND the timing\npoint, so there's no separate `when:` field anywhere.\n\nTriggers (all optional — omit any you don't need):\n\n  - create-before-engines — during `wt create`, after patches +\n    bring-in (copies/links), BEFORE engine prepare. Standard\n    home of dependency installs (composer/yarn/pip) so migrate\n    can find vendor/.\n  - create-after-engines — during `wt create`, after engine\n    prepare. Use when actions need a populated database\n    (cache warming, seed verification).\n  - delete-before-engines — during `wt delete`, BEFORE DB\n    drop. Graceful shutdown: drain queues, docker compose stop.\n  - delete-after-engines — during `wt delete`, AFTER DB drop +\n    git worktree remove. External notifications (Slack, CDN\n    purge) that should announce only once the data is gone.\n  - checkout — fires when the HEAD watcher sees a branch\n    switch inside an existing worktree. Re-runs in addition to\n    the regular finalize-on-HEAD-change behaviour.\n  - file-change — fires when any `databases[].inputs[]` glob\n    matches a filesystem event. Each action can optionally\n    `match: \u003clabel\u003e` to filter by the input entry's label.\n\nDaemon execution is always non-blocking from the CLI's\nperspective — each list of actions dispatches in parallel."
+    },
+    "Input": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Bare glob string. Equivalent to `{glob: \u003cthis string\u003e}`."
+        },
+        {
+          "properties": {
+            "glob": {
+              "type": "string",
+              "description": "Glob pattern (repo-root-relative). Required."
+            },
+            "label": {
+              "type": "string",
+              "description": "Optional label for `hooks.file-change` matchers."
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "glob"
+          ],
+          "description": "Full input mapping with optional label."
+        }
+      ],
+      "description": "One source of file state for the template fingerprint. Bare string OR full mapping."
+    },
+    "LogsConfig": {
+      "properties": {
+        "keep_days": {
+          "type": "integer",
+          "description": "KeepDays sets the retention window in days. Rows older than\n`now - keep_days * 24h` are removed on each daemon prune tick.\n0 disables pruning (keep forever). Default 14."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "LogsConfig — `logs:` block. One knob: how long to keep events +\nhook_runs + their attached log chunks. The daemon's prune loop\napplies the cutoff per table; chunks cascade via FK so dropping\na hook_runs row also drops its captured stdout/stderr."
+    },
+    "MainWorktreeConfig": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled toggles main-wt enrollment for this repo. Default false\n— every existing install sees zero behaviour change until the\nflag is set. Once true, the daemon ensures a worktrees row with\nis_main=1 exists for the repo, spawns the per-wt HEAD + file\nwatchers against the repo root, and re-runs prepare on every\nbranch switch."
+        },
+        "databases": {
+          "items": {
+            "$ref": "#/$defs/DatabaseOverlay"
+          },
+          "type": "array",
+          "description": "Databases is a sparse, index-aligned overlay over `databases:`.\nEach entry's set fields replace the same field on the main-\nindexed database when finalize runs against the main worktree;\nunset fields inherit the top-level value. Linked worktrees are\nuntouched.\n\nCommon uses: a different `name_template` so the main wt's app\nDB lives at `app_dev_{slug}` while linked wts use `app_{slug}`;\ndisabling test-clone fanout in main (`test_clones.clones: 0`)\nbecause the main checkout doesn't run parallel test workers.\n\nOverlay length must be \u003c= len(databases). Entries beyond the\ndeclared count are a config error caught at load time."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "MainWorktreeConfig — `main_worktree:` block. Opt-in handle that\npromotes the repo root into a first-class worktree so the daemon's\nHEAD watcher, file watcher, and prepare orchestration treat it the\nsame as a `.worktrees/\u003cslug\u003e` linked checkout. Off by default; flip\n`enabled: true` to start producing per-branch databases at the\nrepo root.\n\nOne knob today (Enabled). The branch-switch policy is implicit:\nFinalizeWorktree re-runs against the new branch's slug, which uses\nthe snapshot cache so a re-visit of any previously-seen branch is\na near-instant clone. Drop/keep policies will land as additional\nfields once their teardown plumbing exists — premature wiring of\n`on_branch_switch` would have shipped a config surface no code\nconsumed."
+    },
+    "MongoConn": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Bare URL/URI. Equivalent to `{uri: \u003cthis string\u003e}`."
+        },
+        {
+          "properties": {
+            "uri": {
+              "type": "string"
+            },
+            "pool_max": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency."
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "uri"
+          ]
+        }
+      ],
+      "description": "mongodb connection — bare URL string OR structured object."
+    },
+    "MysqlConn": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "DSN: `mysql://user:pass@host:port/dbname`. Equivalent to the structured form below."
+        },
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "user": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "pool_max": {
+              "type": "integer"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "user"
+          ]
+        }
+      ],
+      "description": "MySQL connection — bare DSN string OR structured object."
+    },
+    "NotificationsConfig": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled toggles the whole feature. Off by default — every\nexisting install sees zero behaviour change until it's set."
+        },
+        "events": {
+          "items": {
+            "type": "string",
+            "enum": [
+              "stable",
+              "up",
+              "down",
+              "failed"
+            ]
+          },
+          "type": "array",
+          "description": "Events is the set of status buckets that fire a notification.\nAllowed values: stable, up, down, failed. When unset (nil) the\ndefault of [stable, failed] applies (see applyDefaults). An\nexplicit empty list (`events: []`) disables every bucket while\nleaving the feature otherwise \"enabled\" — useful as a base for a\nper-repo override that re-adds buckets."
+        },
+        "backend": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "notify-send",
+            "osascript",
+            "none"
+          ],
+          "description": "Backend forces a specific sender instead of OS auto-detection.\nAllowed values: auto (default), notify-send, osascript, none.\n`none` disables sending without unsetting `enabled` — handy to\nmute notifications on one host while keeping the shared config."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "NotificationsConfig — `notifications:` block. Opt-in desktop\nnotifications fired by the daemon when a worktree crosses a lifecycle\nstatus boundary. Backend is auto-detected per OS (notify-send on\nLinux, `osascript -e 'display notification'` on macOS); platforms\nwithout a known sender silently no-op.\n\nEach notification is keyed to one of the four `treeman status`\nbuckets:\n  - stable: a worktree finished preparing and is ready (finalize done)\n  - up:     a worktree began preparing (finalize started)\n  - down:   a worktree began tearing down\n  - failed: a worktree's finalize errored\n\n`up` and `down` are transient and chatty, so the default\n(`events:` unset) only notifies on `stable` + `failed` — ready and\nerrored, the two resting states worth surfacing. Set `events:`\nexplicitly to opt into the transient ones, or to a subset."
+    },
+    "Patch": {
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "File path relative to the worktree root. Required."
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "dotenv",
+            "phpunit",
+            "yaml",
+            "json",
+            "toml",
+            "ini"
+          ],
+          "description": "Driver name. Optional — leave unset to auto-detect from the\nfile extension. Explicit when the extension is ambiguous\n(e.g. `phpunit` for a `.xml` that isn't standard XML)."
+        },
+        "set": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Key → value-template map. Path syntax depends on the driver\n(see the type doc-comment)."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "file"
+      ],
+      "description": "Patch — one entry in the top-level `patches:` block. Each entry\ntargets one file under the worktree root and rewrites it with\nper-worktree values via the `set:` map. Values are template\nstrings that accept `{slug}`, `{slug_dash}`,\n`{slug_redis_queue}`, `{slug_redis_cache}`. Validated at\nconfig-load time — unknown keys fail loud.\n\nThe driver is picked from `format:` when set, otherwise auto-\ndetected from the file extension:\n\n\tdotenv  — `.env`, `.env.*`\n\tphpunit — `.xml`, `.xml.dist` (phpunit.xml `\u003cenv\u003e` blocks)\n\tyaml    — `.yaml`, `.yml`\n\tjson    — `.json`\n\ttoml    — `.toml`\n\tini     — `.ini`, `.cfg`\n\nPath syntax inside `set:` is uniform across drivers:\n\n\tdotenv / phpunit  — flat key (e.g. `DB_DATABASE`)\n\tini               — `section.key` (top-level keys allowed too)\n\tyaml / json / toml — dotted path, optionally with `[N]` indices\n\t                    (e.g. `services[0].host`)\n\nEach patched file is wired through git's clean/smudge filter so\nthe rewrite is hidden from `git status` while still letting\n`git pull` / `git checkout` overwrite the file on incoming\nchanges — the daemon's HEAD watcher (or the smudge filter itself)\nre-applies the patch after. The file must be tracked by git for\nthe filter to engage; gitignored files are patched in-place\nwithout any git interaction."
+    },
+    "PortSpec": {
+      "oneOf": [
+        {
+          "items": {
+            "type": "integer",
+            "maximum": 65535,
+            "minimum": 1
+          },
+          "type": "array",
+          "maxItems": 2,
+          "minItems": 2,
+          "description": "Inclusive [min, max] TCP port range."
+        },
+        {
+          "properties": {
+            "range": {
+              "items": {
+                "type": "integer",
+                "maximum": 65535,
+                "minimum": 1
+              },
+              "type": "array",
+              "maxItems": 2,
+              "minItems": 2,
+              "description": "Inclusive [min, max] TCP port range."
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "range"
+          ],
+          "description": "Structured port-spec mapping."
+        }
+      ],
+      "description": "Per-worktree port slot: an inclusive [min, max] range. Shorthand `[min, max]` is accepted; the long form is `{range: [min, max]}`."
+    },
+    "PostgresConn": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "DSN: `postgres://user:pass@host:port/dbname?sslmode=disable`. Equivalent to the structured form below."
+        },
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "user": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "pool_max": {
+              "type": "integer"
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "user"
+          ]
+        }
+      ],
+      "description": "Postgres connection — bare DSN string OR structured object."
+    },
+    "RedisConn": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Bare URL/URI. Equivalent to `{url: \u003cthis string\u003e}`."
+        },
+        {
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "pool_max": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Max connections in the driver's pool. Optional override; unset lets the driver default + the server-aware clone fanout govern concurrency."
+            },
+            "container": {
+              "type": "string"
+            },
+            "compose_service": {
+              "type": "string"
+            },
+            "compose_project": {
+              "type": "string"
+            },
+            "container_engine": {
+              "type": "string"
+            },
+            "container_network": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "url"
+          ]
+        }
+      ],
+      "description": "redis connection — bare URL string OR structured object."
+    },
+    "S3Conn": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "endpoint": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "access_key": {
+          "type": "string"
+        },
+        "secret_key": {
+          "type": "string"
+        },
+        "use_path_style": {
+          "type": "boolean"
+        },
+        "container": {
+          "type": "string"
+        },
+        "compose_service": {
+          "type": "string"
+        },
+        "compose_project": {
+          "type": "string"
+        },
+        "container_engine": {
+          "type": "string"
+        },
+        "container_network": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "SnapshotsConfig": {
+      "properties": {
+        "cap_per_repo": {
+          "type": "integer",
+          "description": "Hard cap on cached snapshots per repository. Eviction runs\ninline on every `RecordSnapshot`: rows above the cap (LRU\norder) are dropped immediately in a background goroutine.\nDefault 8. Set to 0 to disable the inline cap (rely on the\nperiodic sweep only)."
+        },
+        "keep_per_source": {
+          "type": "integer",
+          "description": "Periodic-sweep policy: keep at most N snapshots per `source`\n(a stable key derived from migration content). Default 500."
+        },
+        "max_age_days": {
+          "type": "integer",
+          "description": "Periodic-sweep policy: drop snapshots older than N days.\nDefault 30."
+        },
+        "max_total_gb": {
+          "type": "integer",
+          "description": "Periodic-sweep policy: drop oldest snapshots once the cache\ndir exceeds N gigabytes on disk. Default 50."
+        },
+        "gc_interval_minutes": {
+          "type": "integer",
+          "description": "Cadence (minutes) of the daemon's periodic snapshot-sweep\ngoroutine. Default 60."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "SnapshotsConfig — `snapshots:` block. Carries the retention /\neviction policies for cached engine templates. Snapshot state\nlives entirely in SQLite + the engines themselves (template DBs);\nno on-disk cache directory needs configuring.\n\n`CapPerRepo` is the hard cap that triggers eviction on every\n`RecordSnapshot`. LRU rows above the cap are dropped immediately\n(in a background goroutine) so a busy worktree workflow never\naccumulates unbounded cached templates per repo.\n\n`KeepPerSource`, `MaxAgeDays`, `MaxTotalGb`, `GcIntervalMinutes`\ndrive the periodic daemon-side sweep; they're not consulted by\nthe inline-on-write eviction path."
+    },
+    "StatusBuckets": {
+      "properties": {
+        "stable": {
+          "type": "string"
+        },
+        "up": {
+          "type": "string"
+        },
+        "down": {
+          "type": "string"
+        },
+        "failed": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "StatusBuckets carries one string per worktree bucket. Reused for\nboth the `icons` and `labels` maps so the four bucket names stay in\nlockstep across the schema."
+    },
+    "StatusConfig": {
+      "properties": {
+        "icons": {
+          "$ref": "#/$defs/StatusBuckets",
+          "description": "Icons holds the glyph for each bucket. Exposed to format\ntemplates as `{icon_stable}` / `{icon_up}` / `{icon_down}` /\n`{icon_failed}`, plus `{icon}` for the worst non-empty bucket.\nDefaults to Nerd Font glyphs; set an icon to a single space to\nsuppress it (an empty string falls back to the default)."
+        },
+        "labels": {
+          "$ref": "#/$defs/StatusBuckets",
+          "description": "Labels holds the text label for each bucket. Exposed as\n`{label_stable}` etc. Defaults to the bucket name."
+        },
+        "separator": {
+          "type": "string",
+          "description": "Separator joins the segments of the built-in `icon` line and is\nexposed to templates as `{sep}`. Default \" | \"."
+        },
+        "header": {
+          "type": "string",
+          "description": "Header is the `{key}` template for each repo heading in the\nbuilt-in `hover` format. Tokens: `{repo}`, `{total}`,\n`{stable}`, `{up}`, `{down}`, `{failed}` (repo-scoped counts).\nDefault \"{repo}  ({total})\"."
+        },
+        "row": {
+          "type": "string",
+          "description": "Row is the `{key}` template for each worktree line in the\nbuilt-in `hover` format. Tokens: `{branch}`, `{slug}`,\n`{state}`, `{bucket}`, `{main}`, `{state_suffix}`, `{path}`,\n`{icon}`. Default \"  {main}{branch}{state_suffix}\"."
+        },
+        "main_marker": {
+          "type": "string",
+          "description": "MainMarker is substituted for `{main}` on a repo's main-worktree\nrow (empty string on linked worktrees). Default \"★ \"."
+        },
+        "formats": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Formats declares named single-line `{key}` templates selectable\nwith `treeman status --format \u003cname\u003e`. A name matching the\nbuilt-in `icon` line overrides it; the structured built-ins\n`hover`/`waybar`/`json` are reserved and cannot be overridden.\nAvailable tokens match\nthe `icon` line: `{total}`, `{stable}`, `{up}`, `{down}`,\n`{failed}`, `{icon_*}`, `{icon}`, `{label_*}`, `{class}`,\n`{sep}`. A flat template cannot express the multi-line hover\nbody — customize that with `header` / `row` instead."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "StatusConfig configures `treeman status` — the bar/waybar widget\nthat aggregates worktree health across every registered repo. Each\nactive worktree falls into one of four buckets:\n\n\tstable  — ready (last finalize succeeded, or never ran)\n\tup      — being prepared (finalize in progress)\n\tdown    — being torn down (teardown in progress)\n\tfailed  — last finalize errored\n\nAll knobs below feed the `{key}` template syntax used elsewhere in\n`.treeman.yaml` (no separate templating engine). The built-in\n`--format` values are `icon`, `hover`, `waybar`, and `json`; entries\nin `formats` add or override named single-line formats."
+    },
+    "Step": {
+      "properties": {
+        "run": {
+          "type": "string",
+          "description": "Run is the shell command treeman invokes via `sh -c`.\nRequired; an empty Run aborts `prepare` with a clear error."
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Env is a map of env-var names to value templates. Each entry\nis set on the subprocess (overriding the framework's config\nfile). See the type doc-comment for the full list of supported\n`{placeholder}` keys; literal values pass through unchanged."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "run"
+      ],
+      "description": "Step is one user-declared shell command executed against a target\ndatabase. Used by both `databases[].migrate:` and\n`databases[].seed:` — the same shape, different lifecycle slots.\n\nThe framework's CLI reads its target DB from its own config — for\nmost stacks that's a connection string the user already keeps in\n`.env` (or wires up in `config/database.yml`, `data-source.ts`,\netc.). Treeman builds per-worktree template databases with names\nlike `myapp_template_feature-x` and needs to redirect the command\nat *that* DB, not the one the committed `.env` references. The\n`Env` map says which env-var names to override; values are\nrendered through the same `template` pass that produces the\nper-run DB name. The scaffold convention is to set `DB_NAME`\n(Laravel's preset uses the framework-native `DB_DATABASE`); the\nuser weaves `${DB_NAME}` into the relevant slot of their Run\ncommand (typically inside a DSN) or wires their config to read\nit. Supported substitutions:\n\n\t{target_db}         — resolved per-run database name / key prefix\n\t{slug}              — the slug value\n\t{slug_dash}         — slug with underscores → hyphens\n\t{slug_redis_queue}  — slug-derived Redis queue DB index (6..15)\n\t{slug_redis_cache}  — slug-derived Redis cache DB index (6..15)\n\nUnknown keys fail loud at config-load time. Treeman also exports\n`TREEMAN_TARGET_DB` to the subprocess unconditionally as a safety\nnet for tooling that wants the resolved name without a custom env\nmapping."
+    },
+    "TestClonesSpec": {
+      "properties": {
+        "clones": {
+          "$ref": "#/$defs/ClonesSetting",
+          "description": "Number of test-clone databases to pre-warm. `auto` detects the\nproject's test framework and pre-warms one clone per CPU\n(`runtime.NumCPU`) when that framework clones per-worker,\notherwise 1 (falling back to the CPU count when no framework is\ndetected). Explicit integer overrides; 0 disables pre-warming\nentirely."
+        },
+        "name_template": {
+          "type": "string",
+          "description": "Template for clone database names. Supports the same\nplaceholders as `databases[].name_template` plus `{n}` —\nthe 1-based clone index (only valid here). Required.\nExample: `app_{slug}_test_{n}`."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name_template"
+      ],
+      "description": "TestClonesSpec — `test_clones:` sub-block. Used by every parallel\ntest runner (paratest, pest, pytest-xdist, Jest workers, Go\n`-parallel`, cargo nextest, …). `clones` is either `auto` (treeman\ndetects the test framework and uses the CPU count for per-worker\nrunners) or an explicit integer."
+    },
+    "WorktreesConfig": {
+      "properties": {
+        "root": {
+          "type": "string",
+          "description": "Path (relative to the main worktree) where new worktrees are\ncreated. Defaults to `.worktrees`. Override with e.g.\n`../foo-worktrees` for the sibling-dir convention."
+        },
+        "links": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Paths (relative to the main worktree) to *symlink* into each\nnew worktree on create. Use for committed-in-main-only caches\nthat the worktree should read but never mutate per-branch —\ne.g. `node_modules`, `vendor`. The symlink points at the main\nworktree's copy so all worktrees share one on-disk cache.\nGlob meta-characters expand against the main worktree root."
+        },
+        "copies": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Paths (relative to the main worktree) to *copy* into each new\nworktree on create. Use for gitignored files that the worktree\nneeds in its own copy so it can be patched per-branch without\naffecting the main worktree's copy — e.g. `.env`, `.env.local`.\nGlob meta-characters expand against the main worktree root.\nDirectories are recursed; existing destinations are left alone\n(idempotent re-runs)."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "WorktreesConfig — `worktrees:` block."
+    }
+  },
+  "properties": {
+    "daemon": {
+      "$ref": "#/$defs/DaemonConfig",
+      "description": "Daemon process settings: stderr log level. Typically lives in\nthe user-global config."
+    },
+    "connections": {
+      "$ref": "#/$defs/ConnectionsConfig",
+      "description": "Connection blocks per supported engine (MySQL, Postgres,\nMongoDB, Redis, Elasticsearch). Treeman dials these to create\nper-worktree clone databases, run migrations."
+    },
+    "snapshots": {
+      "$ref": "#/$defs/SnapshotsConfig",
+      "description": "Snapshot retention/eviction policy for cached post-migration\ntemplate snapshots: per-repo cap, per-source keep, max age,\nmax total size, GC cadence."
+    },
+    "worktrees": {
+      "$ref": "#/$defs/WorktreesConfig",
+      "description": "Worktree creation behaviour: root path, symlinked mirrors\n(links), and copied files (copies)."
+    },
+    "debounce_ms": {
+      "type": "integer",
+      "description": "DebounceMs is the file-watcher debounce window in\nmilliseconds. Coalesces editor save bursts into one re-prep\ndispatch. Default 500."
+    },
+    "frameworks": {
+      "additionalProperties": {
+        "$ref": "#/$defs/CustomFramework"
+      },
+      "type": "object",
+      "description": "User-defined migration frameworks keyed by name. Use this when\nthe built-in framework presets don't cover your tool — declare\nthe markers, migration dirs, file pattern, lockfiles, and\nengine hint explicitly."
+    },
+    "logs": {
+      "$ref": "#/$defs/LogsConfig",
+      "description": "Logs retention. Daemon-side prune drops rows older than\n`keep_days` from the events, hook_runs, and hook_log_chunks\ntables on a fixed interval. Set 0 to keep forever (no prune)."
+    },
+    "auto_fetch": {
+      "$ref": "#/$defs/AutoFetchConfig",
+      "description": "AutoFetch policy. Daemon-side periodic `git fetch --all --prune`\nper registered repo, followed by a fast-forward (`merge\n--ff-only @{u}`) or rebase per active worktree, per\n`auto_fetch.mode`. Skips dirty trees, non-ff branches, and\nupstreamless branches. Enabled by default at a 15-minute cadence."
+    },
+    "ports": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PortSpec"
+      },
+      "type": "object",
+      "description": "Ports declares per-worktree port slots. Each entry is a named\nslot with a port range; treeman allocates a free port per slot\nat `wt create` time and exposes it via the `{port_\u003cname\u003e}`\ntemplate token (usable in `patches[].set[*]` values).\nPersisted in SQLite so the assignment survives across daemon\nrestarts; freed on `wt delete`.\n\nUse slot names that match the role they fill in your app (e.g.\n`octane`, `webpack`, `reverb`) — the name shows up in every\n`{port_\u003cname\u003e}` reference and in `wt show` output."
+    },
+    "status": {
+      "$ref": "#/$defs/StatusConfig",
+      "description": "Status configures the `treeman status` widget output (icons,\nlabels, hover lines, custom bar formats). Lives in the global\nconfig since the widget aggregates worktrees across every repo."
+    },
+    "notifications": {
+      "$ref": "#/$defs/NotificationsConfig",
+      "description": "Notifications opts into desktop notifications (notify-send on\nLinux, the native banner via osascript on macOS) when a worktree\nchanges lifecycle state. Off by default. Lives in the global\nconfig since the daemon that emits them is a single cross-repo\nprocess."
+    }
+  },
+  "additionalProperties": false,
+  "type": "object",
+  "description": "Config is the top-level structure of a `.treeman.yaml` plus the\nglobal `~/.config/treeman/config.yaml`."
+}

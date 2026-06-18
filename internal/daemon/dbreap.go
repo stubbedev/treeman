@@ -25,7 +25,7 @@ func ScheduleDBDrop(st *State, repoPath string, job DBDropJob) {
 		// Queue saturated (64 pending drops on one repo is well
 		// beyond normal). Fire a one-shot goroutine so we never
 		// lose the drop entirely.
-		safeGo("db_drop_overflow:"+repoPath, func() {
+		safeGo(lblDBDropOverflow, repoPath, func() {
 			runDBDrop(st, job)
 		})
 	}
@@ -39,7 +39,7 @@ func (st *State) dropQueueFor(repoPath string) chan DBDropJob {
 	}
 	q := make(chan DBDropJob, 64)
 	st.dropQueues[repoPath] = q
-	safeGo("db_drop_drain:"+repoPath, func() {
+	safeGo(lblDBDropDrain, repoPath, func() {
 		for {
 			select {
 			case <-st.BgCtx.Done():

@@ -43,7 +43,9 @@ func main() {
 }
 
 func renderCommand(b *strings.Builder, c *cli.Command, parents []string) {
-	full := append(parents, c.Name)
+	full := make([]string, 0, len(parents)+1)
+	full = append(full, parents...)
+	full = append(full, c.Name)
 	path := strings.Join(full, " ")
 
 	fmt.Fprintf(b, "### `%s`\n\n", path)
@@ -64,16 +66,18 @@ func renderCommand(b *strings.Builder, c *cli.Command, parents []string) {
 			names := f.Names()
 			sort.Slice(names, func(i, j int) bool { return len(names[i]) < len(names[j]) })
 			label := ""
+			var labelSb67 strings.Builder
 			for i, n := range names {
 				if i > 0 {
-					label += ", "
+					labelSb67.WriteString(", ")
 				}
 				if len(n) == 1 {
-					label += "`-" + n + "`"
+					labelSb67.WriteString("`-" + n + "`")
 				} else {
-					label += "`--" + n + "`"
+					labelSb67.WriteString("`--" + n + "`")
 				}
 			}
+			label += labelSb67.String()
 			usage := flagUsage(f)
 			fmt.Fprintf(b, "| %s | %s |\n", label, escapePipes(usage))
 		}

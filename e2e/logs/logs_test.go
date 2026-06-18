@@ -137,16 +137,26 @@ func setup(t *testing.T) *fixture {
 		durMs     int64
 	}
 	events := []seedEv{
-		{mins(120), "debug", repo1ID, wt1aID, "prepare_start", "precreate", "wt1a old debug", `{"engine":"mysql"}`, 0},
-		{mins(90), "info", repo1ID, wt1aID, "prepare_done", "postcreate", "wt1a info hit alpha", `{"engine":"mysql","cache":"hit"}`, 1200},
-		{mins(45), "warn", repo1ID, wt1aID, "fanout_done", "postcreate", "wt1a warn fanout slow", `{"slowest_ms":7000}`, 7000},
-		{mins(5), "error", repo1ID, wt1aID, "wt_finalize_done", "postcreate", "wt1a recent error needle", `{"err":"boom"}`, 0},
+		{mins(120), "debug", repo1ID, wt1aID, "prepare:start", "precreate", "wt1a old debug", `{"engine":"mysql"}`, 0},
+		{mins(90), "info", repo1ID, wt1aID, "prepare:end", "postcreate", "wt1a info hit alpha", `{"engine":"mysql","cache":"hit"}`, 1200},
+		{mins(45), "warn", repo1ID, wt1aID, "clones:end", "postcreate", "wt1a warn fanout slow", `{"slowest_ms":7000}`, 7000},
+		{mins(5), "error", repo1ID, wt1aID, "worktree:create:end", "postcreate", "wt1a recent error needle", `{"err":"boom"}`, 0},
 
-		{mins(80), "info", repo1ID, wt1bID, "prepare_start", "precreate", "wt1b info bravo", `{"engine":"postgres"}`, 0},
-		{mins(20), "info", repo1ID, wt1bID, "prepare_done", "postcreate", "wt1b info bravo done", `{"engine":"postgres","cache":"miss"}`, 800},
+		{mins(80), "info", repo1ID, wt1bID, "prepare:start", "precreate", "wt1b info bravo", `{"engine":"postgres"}`, 0},
+		{
+			mins(20),
+			"info",
+			repo1ID,
+			wt1bID,
+			"prepare:end",
+			"postcreate",
+			"wt1b info bravo done",
+			`{"engine":"postgres","cache":"miss"}`,
+			800,
+		},
 
 		{mins(70), "warn", repo2ID, wt2aID, "snapshot_create", "precreate", "wt2a snapshot warn", `{"size":12345}`, 4500},
-		{mins(15), "info", repo2ID, wt2aID, "wt_finalize_done", "postcreate", "wt2a finalize done", `{"final":true}`, 0},
+		{mins(15), "info", repo2ID, wt2aID, "worktree:create:end", "postcreate", "wt2a finalize done", `{"final":true}`, 0},
 	}
 	for _, e := range events {
 		var dur any
@@ -171,10 +181,10 @@ func setup(t *testing.T) *fixture {
 		exit     int
 	}
 	hooks := []seedHook{
-		{wt1aID, "on-create-before-engines", 0, "echo a", mins(100), mins(100) + 250, 0},
-		{wt1aID, "on-create-after-engines", 1, "echo b", mins(60), mins(60) + 500, 0},
-		{wt1bID, "on-create-before-engines", 0, "echo c", mins(40), mins(40) + 100, 0},
-		{wt2aID, "on-create-before-engines", 0, "echo d", mins(10), mins(10) + 80, 1},
+		{wt1aID, "create-before-engines", 0, "echo a", mins(100), mins(100) + 250, 0},
+		{wt1aID, "create-after-engines", 1, "echo b", mins(60), mins(60) + 500, 0},
+		{wt1bID, "create-before-engines", 0, "echo c", mins(40), mins(40) + 100, 0},
+		{wt2aID, "create-before-engines", 0, "echo d", mins(10), mins(10) + 80, 1},
 	}
 	var hookRunIDs []int64
 	for _, h := range hooks {
@@ -229,6 +239,7 @@ func runCLI(t *testing.T, fx *fixture, cwd string, args ...string) cliResult {
 	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(),
 		"TREEMAN_DB_PATH="+fx.dbPath,
+		"TREEMAN_SOCKET="+filepath.Join(filepath.Dir(fx.dbPath), "tm.sock"),
 		"HOME="+fx.homeDir,
 		"XDG_DATA_HOME="+fx.homeDir,
 		"XDG_STATE_HOME="+fx.homeDir,
@@ -343,9 +354,19 @@ func TestLogsCLI(t *testing.T) {
 			notStdout:  []string{"wt1a info hit alpha"},
 		},
 		{
-			name:       "tail/--event-type repeats",
-			cwd:        outsideDir,
-			args:       []string{"logs", "tail", "-n", "50", "--all", "--event-type", "snapshot_create", "--event-type", "wt_finalize_done"},
+			name: "tail/--event-type repeats",
+			cwd:  outsideDir,
+			args: []string{
+				"logs",
+				"tail",
+				"-n",
+				"50",
+				"--all",
+				"--event-type",
+				"snapshot_create",
+				"--event-type",
+				"worktree:create:end",
+			},
 			wantStdout: []string{"wt1a recent error needle", "wt2a snapshot warn", "wt2a finalize done"},
 			notStdout:  []string{"wt1a info hit alpha", "wt1b info bravo"},
 		},
@@ -391,9 +412,9 @@ func TestLogsCLI(t *testing.T) {
 			name: "tail/--json emits NDJSON without scope preamble",
 			cwd:  fx.wt1aPath,
 			args: []string{"logs", "tail", "-n", "50", "--json"},
-			// Field names are PascalCase because store.Event has no json
-			// tags — the test pins that contract.
-			wantStdout: []string{`"EventType"`, `"Level"`, `"WorktreeSlug":"wt1a"`},
+			// Field names are snake_case via store.Event's MarshalJSON
+			// (events_json.go) — the test pins that contract.
+			wantStdout: []string{`"event_type"`, `"level"`, `"worktree_slug":"wt1a"`},
 			notStderr:  []string{"# scope:"},
 		},
 		{
@@ -451,7 +472,7 @@ func TestLogsCLI(t *testing.T) {
 			name:       "hooks/cwd auto-resolves to enclosing worktree",
 			cwd:        fx.wt1aPath,
 			args:       []string{"logs", "hooks", "-n", "10"},
-			wantStdout: []string{"on-create-before-engines", "on-create-after-engines"},
+			wantStdout: []string{"create-before-engines", "create-after-engines"},
 			notStdout:  []string{"echo c", "echo d"},
 			wantStderr: []string{"# scope: worktree=wt1a"},
 		},
@@ -479,7 +500,7 @@ func TestLogsCLI(t *testing.T) {
 			name:       "hooks/--all --json emits NDJSON hook rows",
 			cwd:        outsideDir,
 			args:       []string{"logs", "hooks", "-n", "20", "--all", "--json"},
-			wantStdout: []string{`"WorktreeSlug":"wt1a"`, `"WorktreeSlug":"wt2a"`},
+			wantStdout: []string{`"worktree_slug":"wt1a"`, `"worktree_slug":"wt2a"`},
 		},
 		{
 			name:        "hooks/unknown worktree name errors",
@@ -507,7 +528,7 @@ func TestLogsCLI(t *testing.T) {
 			name:       "hooks/--show --json emits chunk envelopes",
 			cwd:        outsideDir,
 			args:       []string{"logs", "hooks", "--all", "--show", "1", "--json"},
-			wantStdout: []string{`"Stream":"merged"`, `"HookRunID":1`},
+			wantStdout: []string{`"stream":"merged"`, `"hook_run_id":1`},
 		},
 
 		// ── purge ────────────────────────────────────────────────
@@ -618,6 +639,7 @@ func TestLogsTailFollow(t *testing.T) {
 	cmd.Dir = t.TempDir()
 	cmd.Env = append(os.Environ(),
 		"TREEMAN_DB_PATH="+fx.dbPath,
+		"TREEMAN_SOCKET="+filepath.Join(filepath.Dir(fx.dbPath), "tm.sock"),
 		"HOME="+fx.homeDir,
 		"XDG_DATA_HOME="+fx.homeDir,
 		"XDG_STATE_HOME="+fx.homeDir,

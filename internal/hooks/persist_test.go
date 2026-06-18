@@ -17,7 +17,7 @@ func TestPersistOutcomeWritesRowsAndEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/foo", "foo")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/r/foo/.wt/a", "a", "main")
 
@@ -36,7 +36,7 @@ func TestPersistOutcomeWritesRowsAndEvent(t *testing.T) {
 	if len(runs) != 2 {
 		t.Fatalf("got %d rows want 2", len(runs))
 	}
-	events, err := s.QueryEvents(ctx, store.EventFilter{WorktreeID: wtID, EventTypes: []string{"hook_done"}})
+	events, err := s.QueryEvents(ctx, store.EventFilter{WorktreeID: wtID, EventTypes: []string{store.EvtHooksEnd}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,13 +68,13 @@ func TestPersistOutcomeAllZerosWritesInfoLevel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, "/r/bar", "bar")
 	wtID, _ := s.EnsureWorktree(ctx, repoID, "/r/bar/.wt/a", "a", "main")
 	PersistOutcome(ctx, s, repoID, wtID, "setup", 0, 10,
 		RunOutcome{Groups: []GroupOutcome{{Command: "ok", ExitCode: 0}}})
 
-	events, err := s.QueryEvents(ctx, store.EventFilter{WorktreeID: wtID, EventTypes: []string{"hook_done"}})
+	events, err := s.QueryEvents(ctx, store.EventFilter{WorktreeID: wtID, EventTypes: []string{store.EvtHooksEnd}})
 	if err != nil {
 		t.Fatal(err)
 	}

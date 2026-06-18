@@ -60,7 +60,7 @@ func (p *Pager) Start() error {
 	if bin == "" {
 		return os.ErrNotExist
 	}
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, args...) //nolint:noctx // interactive pager; lifetime managed by Close, not request ctx
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()

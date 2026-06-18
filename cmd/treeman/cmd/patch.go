@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -43,7 +44,7 @@ func PatchFilterCmd() *cli.Command {
 		ArgsUsage: "<clean|smudge> <relative-path>",
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 2 {
-				return fmt.Errorf("patch-filter: usage: treeman patch-filter <clean|smudge> <relative-path>")
+				return errors.New("patch-filter: usage: treeman patch-filter <clean|smudge> <relative-path>")
 			}
 			mode := c.Args().Get(0)
 			relPath := c.Args().Get(1)
@@ -169,7 +170,7 @@ func buildTemplateContext(ctx context.Context, repoRoot, worktreePath string) (t
 		// renders deterministically; ports unavailable.
 		return template.FromSlug(slug.For(worktreePath, "")), nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 
 	repoID, err := st.LookupRepoID(ctx, repoRoot)
 	if err != nil || repoID == 0 {

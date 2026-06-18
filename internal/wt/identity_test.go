@@ -18,18 +18,23 @@ import (
 func TestResolveIdentityLinkedWtPath(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	mkRepoOnBranch(t, repo, "main")
+	feat := filepath.Join(tmp, "feat")
+	addLinkedWorktree(t, repo, feat, "feat")
+
 	s, err := store.Open(ctx, filepath.Join(tmp, "tm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-	repoID, err := s.EnsureRepo(ctx, "/repo", "repo")
+	defer func() { _ = s.Close() }()
+	repoID, err := s.EnsureRepo(ctx, repo, "repo")
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := &config.Config{}
 
-	id, err := ResolveIdentity(ctx, s, cfg, "/repo", "/repo/.worktrees/feat", "feat", repoID)
+	id, err := ResolveIdentity(ctx, s, cfg, repo, feat, "feat", repoID)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -42,6 +47,37 @@ func TestResolveIdentityLinkedWtPath(t *testing.T) {
 	row, _ := s.LookupMainWorktree(ctx, repoID)
 	if row.ID != 0 {
 		t.Errorf("linked-wt should not produce a main row, got %+v", row)
+	}
+}
+
+// TestResolveIdentityRejectsPhantom guards the invariant that a path
+// which is neither the repo root nor a real git-linked worktree is
+// refused — never silently registered. Regression for the phantom
+// worktree rows a mistyped MCP `worktree` argument used to create
+// (e.g. resolving "develop" to <cwd>/develop).
+func TestResolveIdentityRejectsPhantom(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	mkRepoOnBranch(t, repo, "main")
+
+	s, err := store.Open(ctx, filepath.Join(tmp, "tm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	repoID, _ := s.EnsureRepo(ctx, repo, "repo")
+	cfg := &config.Config{}
+
+	phantom := filepath.Join(repo, "develop") // no such linked worktree
+	if _, err := ResolveIdentity(ctx, s, cfg, repo, phantom, "develop", repoID); err == nil {
+		t.Fatal("expected error registering a non-worktree path, got nil")
+	}
+	var n int
+	_ = s.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM worktrees WHERE repo_id = ? AND path = ?`, repoID, phantom).Scan(&n)
+	if n != 0 {
+		t.Errorf("phantom path was registered (%d rows); guard must prevent any row", n)
 	}
 }
 
@@ -60,7 +96,7 @@ func TestResolveIdentityMainWtNoOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, repo, "repo")
 	cfg := &config.Config{
 		MainWorktree: config.MainWorktreeConfig{Enabled: true},
@@ -102,7 +138,7 @@ func TestResolveIdentityMainWtPartialOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, repo, "repo")
 	cfg := &config.Config{
 		MainWorktree: config.MainWorktreeConfig{
@@ -148,7 +184,7 @@ func TestResolveIdentityMainWtFullOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, repo, "repo")
 	zero := uint32(0)
 	cfg := &config.Config{
@@ -211,7 +247,7 @@ func TestResolveIdentityRowFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	repoID, _ := s.EnsureRepo(ctx, repo, "repo")
 	if _, err := s.EnsureMainWorktree(ctx, repoID, repo, "main_old", "main"); err != nil {
 		t.Fatal(err)
@@ -233,6 +269,18 @@ func TestResolveIdentityRowFallback(t *testing.T) {
 	row, _ := s.LookupMainWorktree(ctx, repoID)
 	if row.Slug != "main_main" {
 		t.Errorf("row slug = %q, want main_main (path-hash leaked through)", row.Slug)
+	}
+}
+
+// addLinkedWorktree runs `git worktree add -b <branch> <wtPath>` from
+// repo so wtPath is a real linked worktree (its `.git` is a file, which
+// gitenv.IsLinkedWorktree requires).
+func addLinkedWorktree(t *testing.T, repo, wtPath, branch string) {
+	t.Helper()
+	c := exec.Command("git", "-C", repo, "worktree", "add", "-b", branch, wtPath)
+	c.Stderr = os.Stderr
+	if err := c.Run(); err != nil {
+		t.Fatalf("git worktree add: %v", err)
 	}
 }
 

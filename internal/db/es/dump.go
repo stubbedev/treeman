@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Dump streams every document under indices matching `prefix*` as
@@ -23,7 +25,7 @@ import (
 // path so a crashing client doesn't leak ES heap.
 func (d *Driver) Dump(ctx context.Context, prefix string, w io.Writer) error {
 	if prefix == "" {
-		return fmt.Errorf("es dump: empty prefix would scan the entire cluster")
+		return errors.New("es dump: empty prefix would scan the entire cluster")
 	}
 	scrollID, hits, err := d.openScroll(ctx, prefix)
 	if err != nil {
@@ -66,8 +68,8 @@ type scrollResp struct {
 
 func (d *Driver) openScroll(ctx context.Context, prefix string) (string, []scrollHit, error) {
 	body := `{"size":1000,"query":{"match_all":{}}}`
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		d.Base+"/"+prefix+"*/_search?scroll=5m", strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		d.Base+"/"+escSeg(prefix)+"*/_search?scroll=5m", strings.NewReader(body))
 	if err != nil {
 		return "", nil, err
 	}
@@ -76,11 +78,14 @@ func (d *Driver) openScroll(ctx context.Context, prefix string) (string, []scrol
 }
 
 func (d *Driver) continueScroll(ctx context.Context, scrollID string) (string, []scrollHit, error) {
-	body, _ := json.Marshal(map[string]string{
+	body, err := json.Marshal(map[string]string{
 		"scroll":    "5m",
 		"scroll_id": scrollID,
 	})
-	req, err := http.NewRequestWithContext(ctx, "POST",
+	if err != nil {
+		return "", nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		d.Base+"/_search/scroll", bytes.NewReader(body))
 	if err != nil {
 		return "", nil, err
@@ -94,7 +99,7 @@ func (d *Driver) doScroll(req *http.Request) (string, []scrollHit, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", nil, err
@@ -115,8 +120,15 @@ func (d *Driver) releaseScroll(scrollID string) {
 	if scrollID == "" {
 		return
 	}
-	body, _ := json.Marshal(map[string]string{"scroll_id": scrollID})
-	req, err := http.NewRequest("DELETE", d.Base+"/_search/scroll", bytes.NewReader(body))
+	body, err := json.Marshal(map[string]string{"scroll_id": scrollID})
+	if err != nil {
+		return
+	}
+	// Fresh, short-lived context so cleanup runs even when the
+	// caller's ctx was cancelled on the exit path we're invoked from.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, d.Base+"/_search/scroll", bytes.NewReader(body))
 	if err != nil {
 		return
 	}

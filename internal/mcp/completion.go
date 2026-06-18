@@ -94,14 +94,14 @@ func worktreeSlugCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT slug FROM worktrees WHERE deleted_at IS NULL AND slug IS NOT NULL
 		ORDER BY slug`)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var s string
@@ -111,6 +111,11 @@ func worktreeSlugCompletions(ctx context.Context) []string {
 		if s != "" {
 			out = append(out, s)
 		}
+	}
+	// Best-effort: a mid-iteration DB error just truncates the
+	// completion list rather than failing the whole call.
+	if err := rows.Err(); err != nil {
+		return out
 	}
 	return out
 }
@@ -124,7 +129,7 @@ func branchCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT DISTINCT branch FROM worktrees
 		WHERE deleted_at IS NULL AND branch IS NOT NULL AND branch != ''
@@ -132,14 +137,19 @@ func branchCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var b string
-		_ = rows.Scan(&b)
+		if err := rows.Scan(&b); err != nil {
+			break
+		}
 		if b != "" {
 			out = append(out, b)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil
 	}
 	return out
 }
@@ -152,7 +162,7 @@ func recentRunIDCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	// run_id lives inside payload_json; pull it out via a string-scan
 	// pattern. Cheap because payload_json is small (kilobytes) and
 	// we limit to the 200 most recent rows.
@@ -163,12 +173,14 @@ func recentRunIDCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	seen := map[string]struct{}{}
 	var out []string
 	for rows.Next() {
 		var p string
-		_ = rows.Scan(&p)
+		if err := rows.Scan(&p); err != nil {
+			break
+		}
 		if id := extractRunID(p); id != "" {
 			if _, dup := seen[id]; dup {
 				continue
@@ -179,6 +191,9 @@ func recentRunIDCompletions(ctx context.Context) []string {
 				break
 			}
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil
 	}
 	return out
 }
@@ -205,20 +220,25 @@ func snapshotFingerprintCompletions(ctx context.Context) []string {
 	if err != nil {
 		return nil
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT fingerprint FROM snapshots ORDER BY last_used_at DESC LIMIT 100`)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []string
 	for rows.Next() {
 		var f string
-		_ = rows.Scan(&f)
+		if err := rows.Scan(&f); err != nil {
+			break
+		}
 		if f != "" {
 			out = append(out, f)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil
 	}
 	return out
 }

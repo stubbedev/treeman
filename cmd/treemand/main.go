@@ -19,8 +19,24 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/rpc"
+	"github.com/stubbedev/treeman/internal/safego"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/version"
+)
+
+// Goroutine labels for the daemon's process-lifetime loops + RPC
+// plumbing, in the same colon-hierarchy convention as event types and
+// the internal daemon labels. Passed to safego.Go for panic recovery.
+const (
+	lblWatchdog      = "loop:watchdog"
+	lblSnapshotGC    = "loop:snapshot-gc"
+	lblWALCheckpoint = "loop:wal-checkpoint"
+	lblLogPrune      = "loop:log-prune"
+	lblAutoFetch     = "loop:auto-fetch"
+	lblHUPReload     = "loop:hup-reload"
+	lblAccept        = "rpc:accept"
+	lblConn          = "rpc:conn"
+	lblBoot          = "boot"
 )
 
 // slogLevel parses a daemon.log_level YAML value into a slog.Level.
@@ -80,7 +96,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	s.StartEventBatcher(ctx)
 	slog.Info("treemand starting", "db", dbPath)
 
@@ -94,7 +110,7 @@ func run() error {
 			return fmt.Errorf("mkdir %s: %w", dir, err)
 		}
 	}
-	ln, err := net.Listen("unix", sockPath)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "unix", sockPath)
 	if err != nil {
 		return fmt.Errorf("bind %s: %w", sockPath, err)
 	}
@@ -105,11 +121,19 @@ func run() error {
 
 	st := daemon.NewState(ctx, s)
 	slog.Info("treemand listening",
-		"event_type", "daemon_started",
+		"event_type", store.EvtDaemonStart,
 		"socket", sockPath,
 		"pid", os.Getpid())
-	_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_started", "treemand listening",
+	_ = s.WriteEvent(ctx, store.LevelInfo, store.EvtDaemonStart, "treemand listening",
 		0, 0, "", 0, map[string]string{"socket": sockPath})
+
+	// Desktop notifications (opt-in via the global `notifications:`
+	// block). Registered after the store + batcher are up so the hook
+	// can fan lifecycle events out to notify-send / osascript.
+	// ConfigReloader.ReloadAll re-registers it on every global-config
+	// reload (fsnotify edit, SIGHUP, or config_reload RPC), so changes
+	// take effect live without a restart.
+	daemon.RegisterNotifier(st)
 
 	// Config reloader. Subscribes to the global config dir
 	// `~/.config/treeman/` immediately; per-repo dirs are added below
@@ -123,6 +147,15 @@ func run() error {
 		cr.Start(ctx)
 	}
 
+	// Reconcile any finalize that was in flight when the previous
+	// daemon died — the goroutine is gone, so the row would otherwise
+	// stay at derived state=preparing forever. SweepStalePreparing
+	// emits a synthetic worktree:create:error error so the user sees the wedge
+	// and can rerun `treeman wt finalize`. Runs BEFORE watchers come
+	// up so the stale event is visible regardless of whether a fresh
+	// finalize is about to fire.
+	daemon.SweepStalePreparing(ctx, st)
+
 	// Auto-resume per-repo watchers on boot. Each known repo gets
 	// its watchers re-spawned via the same path the
 	// watcher_start RPC takes. Failures per-repo are logged + skipped
@@ -133,7 +166,96 @@ func run() error {
 	// both of which dominate boot time on hosts with many registered
 	// repos. 8 concurrent resumes keeps the host responsive while
 	// cutting boot wall-time roughly proportionally.
+	// Reap registry rows for repos whose root has vanished from disk
+	// (ephemeral /tmp e2e checkouts, scratch clones) BEFORE listing
+	// repos for watcher resume, so dead repos neither get watchers nor
+	// drag their events / hook_runs / snapshots rows forever.
+	daemon.ReapDeadRepos(ctx, st)
+
 	repoPaths, _ := s.ListRepoPaths(ctx)
+	resumeRepoWatchers(ctx, st, repoPaths)
+
+	// Reap any `.treeman-trash/` leftovers from a previously crashed
+	// daemon. The background reaper runs on st.BgCtx so it survives
+	// the originating RPC but dies with the daemon — meaning a hard
+	// host crash mid-reap orphans the trash entries until next boot.
+	// Sweep on startup so they don't accumulate indefinitely.
+	daemon.SweepTrashDirs(ctx, st, repoPaths)
+
+	// Reap port reservations orphaned by an interrupted teardown or a
+	// pre-release binary that soft-deleted a worktree without releasing
+	// its ports. Leaked rows are invisible to ListUsedPorts but still
+	// blocked by the (repo_id, name, port) unique index, so without this
+	// the allocator climbs out of the configured range over time.
+	daemon.SweepOrphanWorktreePorts(ctx, st)
+
+	// Enroll opt-in main worktrees BEFORE listing active worktrees so
+	// the boot resume below spawns watchers against the repo root for
+	// every repo where `main_worktree.enabled: true`. Idempotent —
+	// flips a row's is_main + slug to match the current branch.
+	enrollMainWorktrees(ctx, st, repoPaths)
+
+	// Auto-resume per-worktree fsnotify watchers. Migrations and
+	// dumps live in the worktree (each linked worktree has its own
+	// branch checkout), so the file watcher is rooted there.
+	resumeWorktreeWatchers(ctx, s, st)
+
+	// Auto-resume lifecycle watchers for every registered repo. The
+	// lifecycle watcher tails `<common-dir>/worktrees/` so
+	// `git worktree add`/`remove` runs outside the treeman CLI still
+	// fire setup / teardown. Unconditional — worktree
+	// lifecycle is infrastructure, not user policy.
+	resumeLifecycleWatchers(ctx, s, st)
+
+	// Watchdog for in-flight FinalizeWorktree goroutines: cancels +
+	// flags any that exceed the prepare timeout. Catches the
+	// daemon-alive-but-child-wedged variant of issue #9 that
+	// SweepStalePreparing (boot-only) can't cover.
+	safego.Go(lblWatchdog, "", func() { daemon.FinalizeWatchdogLoop(st.BgCtx, st) })
+
+	// Periodic snapshot GC sweep. Runs at the cadence declared by
+	// `snapshots.retention.gc_interval_minutes` (default 60); each
+	// tick walks every registered repo and evicts cached templates
+	// above `cap_per_repo`. Bare-bones for now — age/size sweeps
+	// (MaxAgeDays, MaxTotalGb) land here later.
+	safego.Go(lblSnapshotGC, "", func() { daemon.SnapshotGCLoop(ctx, st) })
+	safego.Go(lblWALCheckpoint, "", func() { daemon.WALCheckpointLoop(ctx, st) })
+	// Daemon-side retention sweep — drops events / hook_runs (and
+	// cascaded hook_log_chunks) older than `logs.keep_days`.
+	safego.Go(lblLogPrune, "", func() { daemon.LogPruneLoop(ctx, st) })
+	// Periodic `git fetch --all --prune` + best-effort
+	// `git merge --ff-only @{u}` per registered repo's worktrees.
+	// Returns immediately when `auto_fetch.enabled: false` in the
+	// global config.
+	safego.Go(lblAutoFetch, "", func() { daemon.AutoFetchLoop(ctx, st) })
+
+	// SIGHUP → full reload. Independent of the shutdown signal set so
+	// `kill -HUP $(pgrep treemand)` is a deterministic operator knob
+	// and matches Unix daemon convention.
+	if cr != nil {
+		safego.Go(lblHUPReload, "", func() { hupReloadLoop(ctx, st, cr, hupCh) })
+	}
+
+	shutdown := make(chan struct{}, 1)
+	safego.Go(lblAccept, "", func() { acceptLoop(ctx, ln, st, shutdown) })
+
+	select {
+	case <-ctx.Done():
+		slog.Info("daemon_stopped — signal received")
+		_ = s.WriteEvent(ctx, store.LevelInfo, store.EvtDaemonStop, "SIGTERM/SIGINT received", 0, 0, "", 0, nil)
+	case <-shutdown:
+		slog.Info("daemon_stopped — shutdown rpc")
+		_ = s.WriteEvent(ctx, store.LevelInfo, store.EvtDaemonStop, "shutdown requested", 0, 0, "", 0, nil)
+	}
+	_ = ln.Close()
+	_ = os.Remove(sockPath)
+	return nil
+}
+
+// resumeRepoWatchers re-spawns per-repo watchers on boot via the same
+// path the watcher_start RPC takes. Failures per-repo are logged +
+// skipped — a missing or moved repo dir shouldn't abort startup.
+func resumeRepoWatchers(ctx context.Context, st *daemon.State, repoPaths []string) {
 	parallelFor(repoPaths, 8, func(p string) {
 		if _, err := os.Stat(p); err != nil {
 			slog.Warn("resume watcher skipped (path missing)", "repo", p, "err", err)
@@ -145,18 +267,11 @@ func run() error {
 		}
 		slog.Info("resumed watcher", "repo", p)
 	})
+}
 
-	// Reap any `.treeman-trash/` leftovers from a previously crashed
-	// daemon. The background reaper runs on st.BgCtx so it survives
-	// the originating RPC but dies with the daemon — meaning a hard
-	// host crash mid-reap orphans the trash entries until next boot.
-	// Sweep on startup so they don't accumulate indefinitely.
-	daemon.SweepTrashDirs(ctx, st, repoPaths)
-
-	// Enroll opt-in main worktrees BEFORE listing active worktrees so
-	// the boot resume below spawns watchers against the repo root for
-	// every repo where `main_worktree.enabled: true`. Idempotent —
-	// flips a row's is_main + slug to match the current branch.
+// enrollMainWorktrees flips each repo's main worktree row to match the
+// current branch where `main_worktree.enabled: true`. Idempotent.
+func enrollMainWorktrees(ctx context.Context, st *daemon.State, repoPaths []string) {
 	for _, p := range repoPaths {
 		if _, err := os.Stat(p); err != nil {
 			continue
@@ -165,93 +280,69 @@ func run() error {
 			slog.Warn("main worktree enroll skipped", "repo", p, "err", err)
 		}
 	}
+}
 
-	// Auto-resume per-worktree fsnotify watchers. Migrations and
-	// dumps live in the worktree (each linked worktree has its own
-	// branch checkout), so the file watcher is rooted there.
-	if wts, err := s.ListActiveWorktrees(ctx); err == nil {
-		parallelFor(wts, 8, func(w store.ActiveWorktree) {
-			if _, err := os.Stat(w.WorktreePath); err != nil {
-				slog.Warn("resume wt watcher skipped (path missing)",
-					"wt", w.WorktreePath, "err", err)
-				return
-			}
-			if err := daemon.ResumeWorktreeWatcher(ctx, st, w.RepoPath, w.WorktreePath); err != nil {
-				slog.Warn("resume wt watcher failed",
-					"wt", w.WorktreePath, "err", err)
-				return
-			}
-			slog.Info("resumed wt watcher", "wt", w.WorktreePath)
-		})
+// resumeWorktreeWatchers re-spawns per-worktree fsnotify watchers on
+// boot. Migrations and dumps live in the worktree, so the file watcher
+// is rooted there.
+func resumeWorktreeWatchers(ctx context.Context, s *store.Store, st *daemon.State) {
+	wts, err := s.ListActiveWorktrees(ctx)
+	if err != nil {
+		return
 	}
+	parallelFor(wts, 8, func(w store.ActiveWorktree) {
+		if _, err := os.Stat(w.WorktreePath); err != nil {
+			slog.Warn("resume wt watcher skipped (path missing)",
+				"wt", w.WorktreePath, "err", err)
+			return
+		}
+		if err := daemon.ResumeWorktreeWatcher(ctx, st, w.RepoPath, w.WorktreePath); err != nil {
+			slog.Warn("resume wt watcher failed",
+				"wt", w.WorktreePath, "err", err)
+			return
+		}
+		slog.Info("resumed wt watcher", "wt", w.WorktreePath)
+	})
+}
 
-	// Auto-resume lifecycle watchers for every registered repo. The
-	// lifecycle watcher tails `<common-dir>/worktrees/` so
-	// `git worktree add`/`remove` runs outside the treeman CLI still
-	// fire setup / teardown. Unconditional — worktree
-	// lifecycle is infrastructure, not user policy.
-	if repos, err := s.ListRepoRefs(ctx); err == nil {
-		for _, r := range repos {
-			if _, err := os.Stat(r.Path); err != nil {
-				slog.Warn("resume lifecycle watcher skipped (path missing)",
-					"repo", r.Path, "err", err)
-				continue
-			}
-			if _, err := daemon.StartLifecycleWatcher(ctx, st, r.ID, r.Path); err != nil {
-				slog.Warn("resume lifecycle watcher failed",
-					"repo", r.Path, "err", err)
-				continue
-			}
+// resumeLifecycleWatchers re-spawns lifecycle watchers for every
+// registered repo so `git worktree add`/`remove` outside the treeman
+// CLI still fire setup / teardown.
+func resumeLifecycleWatchers(ctx context.Context, s *store.Store, st *daemon.State) {
+	repos, err := s.ListRepoRefs(ctx)
+	if err != nil {
+		return
+	}
+	for _, r := range repos {
+		if _, err := os.Stat(r.Path); err != nil {
+			slog.Warn("resume lifecycle watcher skipped (path missing)",
+				"repo", r.Path, "err", err)
+			continue
+		}
+		if _, err := daemon.StartLifecycleWatcher(ctx, st, r.ID, r.Path); err != nil {
+			slog.Warn("resume lifecycle watcher failed",
+				"repo", r.Path, "err", err)
+			continue
 		}
 	}
+}
 
-	// Periodic snapshot GC sweep. Runs at the cadence declared by
-	// `snapshots.retention.gc_interval_minutes` (default 60); each
-	// tick walks every registered repo and evicts cached templates
-	// above `cap_per_repo`. Bare-bones for now — age/size sweeps
-	// (MaxAgeDays, MaxTotalGb) land here later.
-	go daemon.SnapshotGCLoop(ctx, st)
-	go daemon.WALCheckpointLoop(ctx, st)
-	// Daemon-side retention sweep — drops events / hook_runs (and
-	// cascaded hook_log_chunks) older than `logs.keep_days`.
-	go daemon.LogPruneLoop(ctx, st)
-	// Periodic `git fetch --all --prune` + best-effort
-	// `git merge --ff-only @{u}` per registered repo's worktrees.
-	// Returns immediately when `auto_fetch.enabled: false` in the
-	// global config.
-	go daemon.AutoFetchLoop(ctx, st)
-
-	// SIGHUP → full reload. Independent of the shutdown signal set so
-	// `kill -HUP $(pgrep treemand)` is a deterministic operator knob
-	// and matches Unix daemon convention.
-	if cr != nil {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-hupCh:
-					slog.Info("SIGHUP received — reloading config")
-					cr.ReloadAll(st.BgCtx)
-				}
-			}
-		}()
+// hupReloadLoop routes SIGHUP to a full config reload until ctx is
+// cancelled. Independent of the shutdown signal set so
+// `kill -HUP $(pgrep treemand)` is a deterministic operator knob.
+func hupReloadLoop(ctx context.Context, st *daemon.State, cr *daemon.ConfigReloader, hupCh <-chan os.Signal) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hupCh:
+			slog.Info("SIGHUP received — reloading config")
+			// ReloadAll re-registers the desktop notifier from the
+			// refreshed global config, so SIGHUP picks up
+			// `notifications:` edits too.
+			cr.ReloadAll(st.BgCtx)
+		}
 	}
-
-	shutdown := make(chan struct{}, 1)
-	go acceptLoop(ctx, ln, st, shutdown)
-
-	select {
-	case <-ctx.Done():
-		slog.Info("daemon_stopped — signal received")
-		_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_stopped", "SIGTERM/SIGINT received", 0, 0, "", 0, nil)
-	case <-shutdown:
-		slog.Info("daemon_stopped — shutdown rpc")
-		_ = s.WriteEvent(ctx, store.LevelInfo, "daemon_stopped", "shutdown requested", 0, 0, "", 0, nil)
-	}
-	_ = ln.Close()
-	_ = os.Remove(sockPath)
-	return nil
 }
 
 func acceptLoop(ctx context.Context, ln net.Listener, st *daemon.State, shutdown chan struct{}) {
@@ -266,20 +357,28 @@ func acceptLoop(ctx context.Context, ln net.Listener, st *daemon.State, shutdown
 		}
 		if err := daemon.CheckPeerUID(conn); err != nil {
 			slog.Warn("rejecting peer", "err", err)
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
-		go handleConn(ctx, conn, st, shutdown)
+		safego.Go(lblConn, "", func() { handleConn(ctx, conn, st, shutdown) })
 	}
 }
 
 func handleConn(ctx context.Context, conn net.Conn, st *daemon.State, shutdown chan struct{}) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	dec := json.NewDecoder(conn)
 	enc := json.NewEncoder(conn)
 	for {
 		var req rpc.Request
 		if err := dec.Decode(&req); err != nil {
+			return
+		}
+		if daemon.IsStreamingMethod(req.Method) {
+			// Streaming methods own the connection for the duration of
+			// the subscription. Caller closing the socket (or our ctx
+			// cancelling) ends the stream; we don't loop for more
+			// requests on the same conn.
+			daemon.DispatchStreaming(ctx, st, enc, req)
 			return
 		}
 		resp := daemon.Dispatch(ctx, st, shutdown, req)
@@ -307,11 +406,12 @@ func parallelFor[T any](items []T, workers int, fn func(T)) {
 	for _, it := range items {
 		sem <- struct{}{}
 		wg.Add(1)
-		go func(v T) {
+		v := it
+		safego.Go(lblBoot, "", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			fn(v)
-		}(it)
+		})
 	}
 	wg.Wait()
 }
