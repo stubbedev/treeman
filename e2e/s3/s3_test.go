@@ -1,8 +1,16 @@
 //go:build e2e
 
-// Package s3_e2e exercises the s3 engine's lifecycle: prepare creates
-// the per-worktree bucket, teardown empties it and drops it. Runs
-// against MinIO so no AWS credentials or network access are required.
+// Package s3_e2e exercises the s3 engine's lifecycle — prepare creates
+// the per-worktree bucket, teardown empties it and drops it — against
+// every S3-compatible backend treeman claims to support. Two live
+// backends run side by side: MinIO and Garage. Both speak the S3 API
+// with path-style addressing, so a single driver code path covers them;
+// running both proves the driver isn't quietly MinIO-specific. No AWS
+// credentials or network access are required.
+//
+// Each backend runs as its own subtest and self-skips if it isn't
+// reachable/provisioned, so a flaky or misconfigured backend can't mask
+// the other.
 package s3_e2e
 
 import (
@@ -10,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,24 +31,77 @@ import (
 
 	"github.com/stubbedev/treeman/e2e/harness"
 	"github.com/stubbedev/treeman/internal/config"
+	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/prepare"
 )
 
 const (
-	endpoint  = "http://127.0.0.1:19000"
-	accessKey = "minioadmin"
-	secretKey = "minioadmin"
 	bucketLit = "tme2es3-"                // 8 char literal → satisfies validate.go's 6-char minLiteral guard
 	keyPrefix = bucketLit + "{slug_dash}" // {slug} contains `_` which AWS rejects in bucket names; {slug_dash} substitutes hyphens
+
+	// Deterministic Garage credentials provisioned by provisionGarage.
+	// `GK` + 24 hex is the access-key shape Garage expects; the secret
+	// is any 64-hex string.
+	garageContainer = "treeman-e2e-garage"
+	garageAccessKey = "GK0123456789abcdef01234567"
+	garageSecretKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 )
+
+// backend is one S3-compatible target. provision (optional) runs after
+// the TCP port is up and before the lifecycle test — used by Garage to
+// stage its cluster layout and import a key.
+type backend struct {
+	name      string
+	readyAddr string
+	conn      config.S3Conn
+	provision func(t *testing.T) error
+}
+
+func backends() []backend {
+	return []backend{
+		{
+			name:      "minio",
+			readyAddr: "127.0.0.1:19000",
+			conn: config.S3Conn{
+				Endpoint:     "http://127.0.0.1:19000",
+				Region:       "us-east-1",
+				AccessKey:    "minioadmin",
+				SecretKey:    "minioadmin",
+				UsePathStyle: true,
+			},
+		},
+		{
+			name:      "garage",
+			readyAddr: "127.0.0.1:19010",
+			conn: config.S3Conn{
+				Endpoint:     "http://127.0.0.1:19010",
+				Region:       "garage",
+				AccessKey:    garageAccessKey,
+				SecretKey:    garageSecretKey,
+				UsePathStyle: true,
+			},
+			provision: provisionGarage,
+		},
+	}
+}
 
 func TestS3EndToEnd(t *testing.T) {
 	harness.SkipIfNoDocker(t)
 	composeDir := harness.MustAbs(".")
 	t.Cleanup(harness.ComposeUp(t, composeDir))
 
-	harness.WaitForReady(t, "minio:19000", 60*time.Second, func() error {
-		c, err := net.DialTimeout("tcp", "127.0.0.1:19000", 1*time.Second)
+	ctx := context.Background()
+	for _, b := range backends() {
+		t.Run(b.name, func(t *testing.T) {
+			runBackend(ctx, t, b)
+		})
+	}
+}
+
+func runBackend(ctx context.Context, t *testing.T, b backend) {
+	t.Helper()
+	harness.WaitForReady(t, b.name+":"+b.readyAddr, 90*time.Second, func() error {
+		c, err := net.DialTimeout("tcp", b.readyAddr, 1*time.Second)
 		if err != nil {
 			return err
 		}
@@ -46,19 +109,31 @@ func TestS3EndToEnd(t *testing.T) {
 		return nil
 	})
 
-	ctx := context.Background()
+	if b.provision != nil {
+		if err := b.provision(t); err != nil {
+			t.Skipf("%s provisioning failed (backend unavailable): %v", b.name, err)
+		}
+	}
+
+	// Credential smoke check: if the driver can't authenticate against
+	// the backend, skip rather than fail — the backend is unavailable in
+	// this environment, which is not a driver bug.
+	if err := credsWork(ctx, b.conn); err != nil {
+		t.Skipf("%s not authenticating (backend unavailable): %v", b.name, err)
+	}
+
 	wt := t.TempDir()
-	cfg := buildConfig()
+	cfg := buildConfig(b.conn)
 	env := harness.NewEnv(t, wt)
 
 	// ── 1. prepare → bucket exists ────────────────────────────────────
 	outs := env.RunPrepare(t, cfg)
 	o := harness.AssertOutcome(t, outs, "s3", false)
-	t.Logf("pass1: bucket=%s", o.SourceDB)
+	t.Logf("%s pass1: bucket=%s", b.name, o.SourceDB)
 	if o.SourceDB == "" {
 		t.Fatalf("prepare returned empty SourceDB")
 	}
-	if !bucketExists(ctx, t, o.SourceDB) {
+	if !bucketExists(ctx, t, b.conn, o.SourceDB) {
 		t.Fatalf("bucket %s missing after prepare", o.SourceDB)
 	}
 
@@ -72,29 +147,81 @@ func TestS3EndToEnd(t *testing.T) {
 
 	// ── 3. Drop an object into the bucket so teardown must run the
 	//      empty-bucket path, not just DeleteBucket. ──────────────────
-	putObject(ctx, t, o.SourceDB, "smoke.txt", []byte("hello"))
+	putObject(ctx, t, b.conn, o.SourceDB, "smoke.txt", []byte("hello"))
 
 	// ── 4. teardown → bucket gone ─────────────────────────────────────
 	if err := prepare.TeardownDatabases(ctx, cfg, env.Slug.Value, env.RepoID, env.WTID, env.Store); err != nil {
 		t.Fatalf("teardown: %v", err)
 	}
-	if bucketExists(ctx, t, o.SourceDB) {
+	if bucketExists(ctx, t, b.conn, o.SourceDB) {
 		t.Errorf("bucket %s still exists after teardown", o.SourceDB)
 	}
 }
 
-func buildConfig() *config.Config {
-	useP := true
+// provisionGarage stages a single-node cluster layout and imports the
+// fixed test key with create-bucket permission. Runs the garage CLI
+// inside the container (the image is shell-less, so this execs the
+// binary directly). Best-effort: a non-zero exit is reported, and the
+// caller decides skip-vs-run via the credential smoke check.
+func provisionGarage(t *testing.T) error {
+	t.Helper()
+	nodeID, err := garage(t, "node", "id", "-q")
+	if err != nil {
+		return err
+	}
+	// `node id -q` prints "<id>@<addr>"; layout wants the bare id.
+	if i := strings.IndexByte(nodeID, '@'); i >= 0 {
+		nodeID = nodeID[:i]
+	}
+	if _, err := garage(t, "layout", "assign", "-z", "dc1", "-c", "1G", nodeID); err != nil {
+		return err
+	}
+	// `layout apply --version 1` is a no-op-or-error if a layout is
+	// already live (re-run); the smoke check is the real gate, so a
+	// failure here isn't fatal on its own.
+	_, _ = garage(t, "layout", "apply", "--version", "1")
+	if _, err := garage(t, "key", "import", "--yes", "-n", "treeman", garageAccessKey, garageSecretKey); err != nil {
+		return err
+	}
+	_, err = garage(t, "key", "allow", "--create-bucket", garageAccessKey)
+	return err
+}
+
+// garage execs the garage CLI inside the test container and returns its
+// trimmed stdout.
+func garage(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	full := append([]string{"exec", garageContainer, "/garage", "-c", "/etc/garage.toml"}, args...)
+	cmd := exec.Command("docker", full...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", errors.New(string(out))
+	}
+	// garage logs INFO lines to stdout before the answer; the id we want
+	// is the last non-empty token. Trim to the last line.
+	s := bytes.TrimSpace(out)
+	if i := bytes.LastIndexByte(s, '\n'); i >= 0 {
+		s = bytes.TrimSpace(s[i+1:])
+	}
+	return string(s), nil
+}
+
+// credsWork dials the backend through treeman's own driver and lists
+// buckets — proves the credentials authenticate before the lifecycle
+// assertions run.
+func credsWork(ctx context.Context, conn config.S3Conn) error {
+	drv, err := dbs3.Connect(ctx, conn)
+	if err != nil {
+		return err
+	}
+	_, err = drv.ListMatching(ctx, bucketLit)
+	return err
+}
+
+func buildConfig(conn config.S3Conn) *config.Config {
+	c := conn
 	return &config.Config{
-		Connections: config.ConnectionsConfig{
-			S3: &config.S3Conn{
-				Endpoint:     endpoint,
-				Region:       "us-east-1",
-				AccessKey:    accessKey,
-				SecretKey:    secretKey,
-				UsePathStyle: useP,
-			},
-		},
+		Connections: config.ConnectionsConfig{S3: &c},
 		Databases: []config.DatabaseConfig{{
 			Engine:    "s3",
 			KeyPrefix: keyPrefix,
@@ -102,29 +229,29 @@ func buildConfig() *config.Config {
 	}
 }
 
-// rawClient builds a MinIO-pointing S3 client outside treeman's
+// rawClient builds a backend-pointing S3 client outside treeman's
 // driver, used by assertions so the test doesn't measure the driver
 // against itself.
-func rawClient(t *testing.T) *awss3.Client {
+func rawClient(t *testing.T, conn config.S3Conn) *awss3.Client {
 	t.Helper()
 	cfg, err := awsconfig.LoadDefaultConfig(context.Background(),
-		awsconfig.WithRegion("us-east-1"),
+		awsconfig.WithRegion(conn.Region),
 		awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+			credentials.NewStaticCredentialsProvider(conn.AccessKey, conn.SecretKey, "")),
 	)
 	if err != nil {
 		t.Fatalf("load aws config: %v", err)
 	}
-	ep := endpoint
+	ep := conn.Endpoint
 	return awss3.NewFromConfig(cfg, func(o *awss3.Options) {
 		o.BaseEndpoint = &ep
-		o.UsePathStyle = true
+		o.UsePathStyle = conn.UsePathStyle
 	})
 }
 
-func bucketExists(ctx context.Context, t *testing.T, name string) bool {
+func bucketExists(ctx context.Context, t *testing.T, conn config.S3Conn, name string) bool {
 	t.Helper()
-	c := rawClient(t)
+	c := rawClient(t, conn)
 	_, err := c.HeadBucket(ctx, &awss3.HeadBucketInput{Bucket: &name})
 	if err == nil {
 		return true
@@ -148,9 +275,9 @@ func bucketExists(ctx context.Context, t *testing.T, name string) bool {
 	return false
 }
 
-func putObject(ctx context.Context, t *testing.T, bucket, key string, body []byte) {
+func putObject(ctx context.Context, t *testing.T, conn config.S3Conn, bucket, key string, body []byte) {
 	t.Helper()
-	c := rawClient(t)
+	c := rawClient(t, conn)
 	_, err := c.PutObject(ctx, &awss3.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &key,

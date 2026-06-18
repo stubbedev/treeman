@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -225,43 +226,41 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	return dropped, nil
 }
 
-// emptyBucket lists every object + every object version + every
-// in-progress multipart upload in `name` and deletes them in
-// 1000-key batches (the S3 limit). Both versioned and unversioned
-// buckets are handled — `ListObjectVersions` returns the current
-// (only) version for unversioned buckets, so one code path covers
-// both.
+// emptyBucket deletes every object (and every object version + every
+// in-progress multipart upload) in `name`.
+//
+// The version-aware walk via ListObjectVersions covers both versioned
+// and unversioned buckets on AWS and MinIO. Garage (and some other
+// S3-compatible stores) don't implement ListObjectVersions and answer
+// 501 NotImplemented — those are unversioned, so we fall back to the
+// universally-supported ListObjectsV2 walk. abortMultiparts is
+// best-effort for the same reason: a backend without multipart-upload
+// listing has none to abort.
 func (d *Driver) emptyBucket(ctx context.Context, name string) error {
-	if err := d.abortMultiparts(ctx, name); err != nil {
+	if err := d.abortMultiparts(ctx, name); err != nil && !isNotImplemented(err) {
 		return err
 	}
-	// Pipeline the listing and the deletes: page N+1 lists while page N
-	// deletes, instead of stalling each round-trip behind the other. The
-	// errgroup limit bounds both in-flight DeleteObjects requests and the
-	// number of buffered pages held in memory (g.Go blocks once the limit
-	// is reached), so a bucket with millions of objects can't balloon the
-	// heap. A delete failure cancels gctx, which aborts the list loop on
-	// its next call.
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(emptyDeleteConcurrency)
-	var (
-		keyMarker     *string
-		versionMarker *string
-		listErr       error
-	)
-	for {
+	err := d.emptyVersioned(ctx, name)
+	if isNotImplemented(err) {
+		return d.emptyUnversioned(ctx, name)
+	}
+	return err
+}
+
+// emptyVersioned drains the bucket via ListObjectVersions (deletes
+// every version + delete-marker). Used on backends that support
+// versioning APIs (AWS, MinIO).
+func (d *Driver) emptyVersioned(ctx context.Context, name string) error {
+	var keyMarker, versionMarker *string
+	return d.drainBucket(ctx, name, func(gctx context.Context) ([]s3types.ObjectIdentifier, bool, error) {
 		out, err := d.Client.ListObjectVersions(gctx, &awss3.ListObjectVersionsInput{
 			Bucket:          &name,
 			KeyMarker:       keyMarker,
 			VersionIdMarker: versionMarker,
 		})
 		if err != nil {
-			if !isNotFound(err) {
-				listErr = fmt.Errorf("s3: list versions %q: %w", name, err)
-			}
-			break
+			return nil, false, fmt.Errorf("s3: list versions %q: %w", name, err)
 		}
-
 		batch := make([]s3types.ObjectIdentifier, 0, len(out.Versions)+len(out.DeleteMarkers))
 		for _, v := range out.Versions {
 			batch = append(batch, s3types.ObjectIdentifier{Key: v.Key, VersionId: v.VersionId})
@@ -269,25 +268,86 @@ func (d *Driver) emptyBucket(ctx context.Context, name string) error {
 		for _, m := range out.DeleteMarkers {
 			batch = append(batch, s3types.ObjectIdentifier{Key: m.Key, VersionId: m.VersionId})
 		}
-		if len(batch) > 0 {
-			g.Go(func() error { return d.deleteBatch(gctx, name, batch) })
-		}
-
 		if out.IsTruncated == nil || !*out.IsTruncated {
-			break
+			return batch, false, nil
 		}
-		// Defense against non-conforming impls that report truncated
-		// without advancing the markers — would otherwise loop forever.
 		if eqStrPtr(out.NextKeyMarker, keyMarker) && eqStrPtr(out.NextVersionIdMarker, versionMarker) {
-			listErr = fmt.Errorf("s3: list versions %q: pagination stuck (IsTruncated=true but markers unchanged)", name)
-			break
+			return nil, false, fmt.Errorf("s3: list versions %q: pagination stuck (IsTruncated=true but markers unchanged)", name)
 		}
 		keyMarker = out.NextKeyMarker
 		versionMarker = out.NextVersionIdMarker
+		return batch, true, nil
+	})
+}
+
+// emptyUnversioned drains the bucket via ListObjectsV2 (current objects
+// only). The fallback for backends that don't implement
+// ListObjectVersions, which are unversioned, so there are no historical
+// versions to miss.
+func (d *Driver) emptyUnversioned(ctx context.Context, name string) error {
+	var token *string
+	return d.drainBucket(ctx, name, func(gctx context.Context) ([]s3types.ObjectIdentifier, bool, error) {
+		out, err := d.Client.ListObjectsV2(gctx, &awss3.ListObjectsV2Input{
+			Bucket:            &name,
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, false, fmt.Errorf("s3: list objects %q: %w", name, err)
+		}
+		batch := make([]s3types.ObjectIdentifier, 0, len(out.Contents))
+		for _, o := range out.Contents {
+			batch = append(batch, s3types.ObjectIdentifier{Key: o.Key})
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return batch, false, nil
+		}
+		if eqStrPtr(out.NextContinuationToken, token) || out.NextContinuationToken == nil {
+			return nil, false, fmt.Errorf("s3: list objects %q: pagination stuck (IsTruncated=true but token unchanged)", name)
+		}
+		token = out.NextContinuationToken
+		return batch, true, nil
+	})
+}
+
+// drainBucket runs a list/delete pipeline: `page` is called repeatedly
+// to fetch the next batch of object identifiers (and report whether more
+// pages remain), while deletes for already-listed pages run
+// concurrently. Page N+1 lists while page N deletes, instead of stalling
+// each round-trip behind the other. The errgroup limit bounds both
+// in-flight DeleteObjects requests and the number of buffered pages held
+// in memory (g.Go blocks once the limit is hit), so a million-object
+// bucket can't balloon the heap. A delete failure cancels gctx, which
+// aborts the next page() call.
+//
+// A NotFound from page() (bucket vanished mid-drain) ends the walk
+// cleanly; any other list error is returned after in-flight deletes
+// drain. A delete error is preferred over the list error, since a delete
+// failure cancels gctx and the list error is then the downstream
+// "context canceled" symptom.
+func (d *Driver) drainBucket(
+	ctx context.Context,
+	name string,
+	page func(ctx context.Context) ([]s3types.ObjectIdentifier, bool, error),
+) error {
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(emptyDeleteConcurrency)
+	var listErr error
+	for {
+		ids, more, err := page(gctx)
+		if err != nil {
+			if !isNotFound(err) {
+				listErr = err
+			}
+			break
+		}
+		if len(ids) > 0 {
+			batch := ids
+			g.Go(func() error { return d.deleteBatch(gctx, name, batch) })
+		}
+		if !more {
+			break
+		}
 	}
-	// Drain in-flight deletes. Prefer a delete error over the list error:
-	// a delete failure cancels gctx, so listErr is usually the downstream
-	// "context canceled" symptom, not the root cause.
 	if werr := g.Wait(); werr != nil {
 		return werr
 	}
@@ -384,6 +444,25 @@ func isNotFound(err error) bool {
 		case "NoSuchBucket", "NoSuchKey", "NotFound":
 			return true
 		}
+	}
+	return false
+}
+
+// isNotImplemented reports whether the backend answered an S3 action
+// with 501 NotImplemented — e.g. Garage rejecting ListObjectVersions
+// because it has no versioning support. Used to pick the unversioned
+// fallback path rather than treating it as a hard failure.
+func isNotImplemented(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ae smithy.APIError
+	if errors.As(err, &ae) && ae.ErrorCode() == "NotImplemented" {
+		return true
+	}
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotImplemented {
+		return true
 	}
 	return false
 }

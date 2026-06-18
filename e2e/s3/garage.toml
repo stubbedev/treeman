@@ -1,0 +1,21 @@
+# Single-node Garage config for the s3 e2e. Ephemeral: data/meta live
+# in the container and are dropped with `compose down -v`. The fixed
+# rpc_secret / admin_token are fine here — the node is throwaway and
+# only reachable on the test's published port.
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "e2eadmintoken"

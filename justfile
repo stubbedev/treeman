@@ -85,7 +85,7 @@ test-e2e batch="all" parallel="4":
     set -euo pipefail
 
     declare -A BATCHES
-    BATCHES[engines]="mysql postgres mongo redis elasticsearch"
+    BATCHES[engines]="mysql postgres mongo redis elasticsearch s3"
     BATCHES[fw1]="fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
     BATCHES[fw2]="fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
     BATCHES[matrix]="matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
@@ -157,7 +157,7 @@ e2e-prepull batch:
     set -euo pipefail
 
     declare -A BATCHES
-    BATCHES[engines]="mysql postgres mongo redis elasticsearch"
+    BATCHES[engines]="mysql postgres mongo redis elasticsearch s3"
     BATCHES[fw1]="fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
     BATCHES[fw2]="fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
     BATCHES[matrix]="matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
@@ -194,7 +194,7 @@ e2e-prepull batch:
 test-e2e-list:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "engines  : mysql postgres mongo redis elasticsearch"
+    echo "engines  : mysql postgres mongo redis elasticsearch s3"
     echo "fw1      : fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
     echo "fw2      : fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
     echo "matrix   : matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases"
