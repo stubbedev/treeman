@@ -183,3 +183,21 @@ func TestConnectMissingCredHalf(t *testing.T) {
 		})
 	}
 }
+
+func TestCopySource(t *testing.T) {
+	cases := []struct {
+		name, bucket, key, want string
+	}{
+		{"simple", "src", "a.txt", "src/a.txt"},
+		{"nested", "src", "dir/sub/a.txt", "src/dir/sub/a.txt"},
+		{"space", "src", "a b.txt", "src/a%20b.txt"},
+		{"nested space", "src", "assets/nested file.bin", "src/assets/nested%20file.bin"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := copySource(c.bucket, c.key); got != c.want {
+				t.Fatalf("copySource(%q,%q) = %q, want %q", c.bucket, c.key, got, c.want)
+			}
+		})
+	}
+}

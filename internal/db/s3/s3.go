@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -211,15 +212,8 @@ func (d *Driver) DropMatching(ctx context.Context, prefix string) ([]string, err
 	}
 	var dropped []string
 	for _, name := range matches {
-		if err := d.emptyBucket(ctx, name); err != nil {
+		if err := d.DropBucket(ctx, name); err != nil {
 			return dropped, err
-		}
-		if _, err := d.Client.DeleteBucket(ctx, &awss3.DeleteBucketInput{Bucket: &name}); err != nil {
-			if isNotFound(err) {
-				dropped = append(dropped, name)
-				continue
-			}
-			return dropped, fmt.Errorf("s3: delete bucket %q: %w", name, err)
 		}
 		dropped = append(dropped, name)
 	}
@@ -429,6 +423,185 @@ func (d *Driver) abortMultiparts(ctx context.Context, name string) error {
 	}
 }
 
+// ─── branch-scoped (durable copy) primitives ────────────────────────
+//
+// These back the engine-agnostic swap lifecycle (internal/prepare
+// branchstate): the active worktree bucket and a per-branch durable
+// bucket are independent buckets, and Capture/Restore copy the whole
+// object set between them server-side. There is no name-vs-prefix
+// filtering — a bucket is the atomic unit, so S3 behaves like the
+// name-scoped engines (mysql/postgres/mongo), not the prefix engines.
+
+// Empty resets `name` to an empty, present bucket — creates it if
+// missing, then deletes every object. The branch-swap layer's
+// "Empty(active)" primitive.
+func (d *Driver) Empty(ctx context.Context, name string) error {
+	if err := d.EnsureBucket(ctx, name); err != nil {
+		return err
+	}
+	return d.emptyBucket(ctx, name)
+}
+
+// DropBucket removes EXACTLY `name` (empty it first — S3 forbids
+// DeleteBucket on a non-empty bucket). Idempotent: a bucket that's
+// already gone is success. This is the exact-name counterpart to
+// DropMatching's prefix reap, used for active + durable bucket teardown.
+func (d *Driver) DropBucket(ctx context.Context, name string) error {
+	if err := d.emptyBucket(ctx, name); err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if _, err := d.Client.DeleteBucket(ctx, &awss3.DeleteBucketInput{Bucket: &name}); err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("s3: delete bucket %q: %w", name, err)
+	}
+	return nil
+}
+
+// CopyBucket makes `dst` a content copy of `src`: ensures dst exists,
+// empties it (so a Restore never leaves stale objects from a prior
+// branch), then server-side-copies every current object from src.
+//
+// Copies are server-side (CopyObject / UploadPartCopy) — object bytes
+// never round-trip through this process — and run through a bounded
+// concurrent pipeline: page src via ListObjectsV2 while copies for
+// already-listed objects run concurrently. Objects larger than the
+// 5 GiB single-PUT-copy limit use a multipart copy. This is the
+// most-performant whole-bucket copy the S3 API offers.
+func (d *Driver) CopyBucket(ctx context.Context, src, dst string) error {
+	if err := d.EnsureBucket(ctx, dst); err != nil {
+		return err
+	}
+	if err := d.emptyBucket(ctx, dst); err != nil {
+		return err
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(copyConcurrency)
+	var token *string
+	var listErr error
+	for {
+		out, err := d.Client.ListObjectsV2(gctx, &awss3.ListObjectsV2Input{
+			Bucket:            &src,
+			ContinuationToken: token,
+		})
+		if err != nil {
+			if !isNotFound(err) {
+				listErr = fmt.Errorf("s3: list objects %q: %w", src, err)
+			}
+			break
+		}
+		for _, o := range out.Contents {
+			key := aws.ToString(o.Key)
+			size := aws.ToInt64(o.Size)
+			g.Go(func() error { return d.copyObject(gctx, src, dst, key, size) })
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		if eqStrPtr(out.NextContinuationToken, token) || out.NextContinuationToken == nil {
+			listErr = fmt.Errorf("s3: list objects %q: pagination stuck (IsTruncated=true but token unchanged)", src)
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	if werr := g.Wait(); werr != nil {
+		return werr
+	}
+	return listErr
+}
+
+// copyObject server-side-copies one object src/key → dst/key. Objects
+// at or above maxSingleCopyBytes (the 5 GiB CopyObject ceiling) are
+// copied via multipart UploadPartCopy; smaller ones via a single
+// CopyObject.
+func (d *Driver) copyObject(ctx context.Context, src, dst, key string, size int64) error {
+	if size >= maxSingleCopyBytes {
+		return d.copyObjectMultipart(ctx, src, dst, key, size)
+	}
+	_, err := d.Client.CopyObject(ctx, &awss3.CopyObjectInput{
+		Bucket:     &dst,
+		Key:        &key,
+		CopySource: aws.String(copySource(src, key)),
+	})
+	if err != nil {
+		return fmt.Errorf("s3: copy %s/%s → %s: %w", src, key, dst, err)
+	}
+	return nil
+}
+
+// copyObjectMultipart copies a large object (≥5 GiB) using multipart
+// UploadPartCopy with a byte-range per part. Parts copy concurrently
+// under the same global copy limit via a nested bounded group.
+func (d *Driver) copyObjectMultipart(ctx context.Context, src, dst, key string, size int64) error {
+	create, err := d.Client.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{
+		Bucket: &dst,
+		Key:    &key,
+	})
+	if err != nil {
+		return fmt.Errorf("s3: create multipart copy %s/%s: %w", dst, key, err)
+	}
+	uploadID := create.UploadId
+	cs := copySource(src, key)
+
+	nParts := int((size + copyPartBytes - 1) / copyPartBytes)
+	parts := make([]s3types.CompletedPart, nParts)
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(copyPartConcurrency)
+	for i := range nParts {
+		partNum := int32(i + 1)
+		start := int64(i) * copyPartBytes
+		end := min(start+copyPartBytes-1, size-1)
+		g.Go(func() error {
+			out, perr := d.Client.UploadPartCopy(gctx, &awss3.UploadPartCopyInput{
+				Bucket:          &dst,
+				Key:             &key,
+				UploadId:        uploadID,
+				PartNumber:      aws.Int32(partNum),
+				CopySource:      aws.String(cs),
+				CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+			})
+			if perr != nil {
+				return fmt.Errorf("s3: copy part %d of %s/%s: %w", partNum, dst, key, perr)
+			}
+			parts[partNum-1] = s3types.CompletedPart{
+				ETag:       out.CopyPartResult.ETag,
+				PartNumber: aws.Int32(partNum),
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		_, _ = d.Client.AbortMultipartUpload(ctx, &awss3.AbortMultipartUploadInput{
+			Bucket: &dst, Key: &key, UploadId: uploadID,
+		})
+		return err
+	}
+	_, err = d.Client.CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{
+		Bucket:          &dst,
+		Key:             &key,
+		UploadId:        uploadID,
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: parts},
+	})
+	if err != nil {
+		return fmt.Errorf("s3: complete multipart copy %s/%s: %w", dst, key, err)
+	}
+	return nil
+}
+
+// copySource builds the CopySource header value for CopyObject /
+// UploadPartCopy: "<bucket>/<key>" with the key path-escaped (spaces,
+// unicode, etc.) while keeping "/" separators intact. Using url.URL's
+// EscapedPath avoids both under-escaping (breaks on spaces) and
+// over-escaping the slashes in nested keys.
+func copySource(bucket, key string) string {
+	u := url.URL{Path: "/" + bucket + "/" + key}
+	return strings.TrimPrefix(u.EscapedPath(), "/")
+}
+
 func isNotFound(err error) bool {
 	var nsk *s3types.NoSuchBucket
 	if errors.As(err, &nsk) {
@@ -509,6 +682,28 @@ const MinDropPrefixLen = 6
 // the connection without overwhelming a small self-hosted MinIO/Garage
 // node or tripping AWS request-rate throttling.
 const emptyDeleteConcurrency = 8
+
+// Branch-scoped whole-bucket copy tuning.
+const (
+	// copyConcurrency bounds in-flight CopyObject calls (and buffered
+	// list pages) while copying a bucket. Server-side copies are cheap
+	// on the client but each is a request, so this rides a bit higher
+	// than the delete path.
+	copyConcurrency = 16
+
+	// maxSingleCopyBytes is the S3 ceiling for a single CopyObject
+	// (5 GiB). Objects at or above it must use multipart UploadPartCopy.
+	maxSingleCopyBytes = 5 * 1024 * 1024 * 1024
+
+	// copyPartBytes is the per-part range size for multipart copies.
+	// 1 GiB keeps part counts low (10k-part cap → 10 TiB max object)
+	// while staying well under the 5 GiB part ceiling.
+	copyPartBytes = 1 * 1024 * 1024 * 1024
+
+	// copyPartConcurrency bounds concurrent part-copies within one large
+	// object's multipart copy.
+	copyPartConcurrency = 8
+)
 
 var (
 	quietTrue = aws.Bool(true)

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"net"
 	"os/exec"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/slug"
 )
 
 const (
@@ -155,6 +157,102 @@ func runBackend(ctx context.Context, t *testing.T, b backend) {
 	}
 	if bucketExists(ctx, t, b.conn, o.SourceDB) {
 		t.Errorf("bucket %s still exists after teardown", o.SourceDB)
+	}
+
+	// ── 5. branch_scoped: per-branch durable bucket copy ──────────────
+	branchScopedSwap(ctx, t, b)
+}
+
+// branchScopedSwap drives the full branch-scoped swap lifecycle on `b`:
+// each branch keeps its own durable bucket, captured on switch-away and
+// restored on switch-back via server-side whole-bucket copy. Uses a
+// nested + space-bearing object key to prove copySource escaping holds
+// on this backend.
+func branchScopedSwap(ctx context.Context, t *testing.T, b backend) {
+	t.Helper()
+	wt := t.TempDir()
+	env := harness.NewEnv(t, wt)
+	conn := b.conn
+	cfg := &config.Config{
+		Connections: config.ConnectionsConfig{S3: &conn},
+		Databases: []config.DatabaseConfig{{
+			Engine:       "s3",
+			KeyPrefix:    keyPrefix,
+			BranchScoped: true,
+		}},
+	}
+
+	const devKey = "assets/nested file.bin" // nested + space → copySource escaping
+	const featKey = "feature.txt"
+
+	// develop: empty active, add the develop object.
+	active := driveS3Prepare(t, env, cfg, "develop")
+	putObject(ctx, t, conn, active, devKey, []byte("develop"))
+	assertKeys(ctx, t, conn, active, devKey)
+
+	// switch to feature → develop captured; new branch starts from the
+	// branch point (develop's data).
+	if got := driveS3Prepare(t, env, cfg, "feature"); got != active {
+		t.Fatalf("active bucket drifted: %s → %s", active, got)
+	}
+	assertKeys(ctx, t, conn, active, devKey)
+	putObject(ctx, t, conn, active, featKey, []byte("feature"))
+	assertKeys(ctx, t, conn, active, devKey, featKey)
+
+	// back to develop → feature captured, develop restored (isolated).
+	driveS3Prepare(t, env, cfg, "develop")
+	assertKeys(ctx, t, conn, active, devKey)
+
+	// back to feature → resumed from its durable copy.
+	driveS3Prepare(t, env, cfg, "feature")
+	assertKeys(ctx, t, conn, active, devKey, featKey)
+}
+
+// driveS3Prepare points the worktree at `branch` and runs a full
+// prepare, returning the active bucket name.
+func driveS3Prepare(t *testing.T, env *harness.Env, cfg *config.Config, branch string) string {
+	t.Helper()
+	ctx := context.Background()
+	sl := slug.For(env.WTPath, "")
+	if _, err := env.Store.EnsureWorktree(ctx, env.RepoID, env.WTPath, sl.Value, branch); err != nil {
+		t.Fatalf("ensure worktree %s: %v", branch, err)
+	}
+	outs, err := prepare.Run(ctx, cfg, env.WTPath, sl, env.Store, env.RepoID, env.WTID, nil)
+	if err != nil {
+		t.Fatalf("prepare.Run(%s): %v", branch, err)
+	}
+	for _, o := range outs {
+		if o.SourceDB != "" {
+			return o.SourceDB
+		}
+	}
+	t.Fatalf("prepare.Run(%s): no active bucket in outcomes", branch)
+	return ""
+}
+
+// assertKeys checks the bucket holds exactly `want` object keys.
+func assertKeys(ctx context.Context, t *testing.T, conn config.S3Conn, bucket string, want ...string) {
+	t.Helper()
+	c := rawClient(t, conn)
+	var got []string
+	var token *string
+	for {
+		out, err := c.ListObjectsV2(ctx, &awss3.ListObjectsV2Input{Bucket: &bucket, ContinuationToken: token})
+		if err != nil {
+			t.Fatalf("list objects %s: %v", bucket, err)
+		}
+		for _, o := range out.Contents {
+			got = append(got, *o.Key)
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("bucket %s keys = %v, want %v", bucket, got, want)
 	}
 }
 

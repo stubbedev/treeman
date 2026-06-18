@@ -18,6 +18,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
@@ -91,6 +92,11 @@ func (b *branchEngine) durable(active, branch string) string {
 	switch {
 	case b.scope == scopePrefix && b.engine == "redis":
 		return "_tmbs:" + h + ":"
+	case b.scope == scopePrefix && b.engine == "s3":
+		// Durable is a sibling bucket. Bucket names are dns-safe: no `_`,
+		// no leading/trailing hyphen — `tmbs-<16hex>` (21 chars) fits the
+		// 3-63 lowercase rule.
+		return "tmbs-" + h
 	case b.scope == scopePrefix: // elasticsearch — index names can't start with `_`
 		return "tmbs_" + h + "_"
 	default:
@@ -358,6 +364,52 @@ func (a esNS) Watermark(ctx context.Context, ns string) (string, error) {
 	return a.d.WriteWatermarkFiltered(ctx, ns, a.keep)
 }
 
+// s3NS adapts the S3 driver. Unlike redis/es, S3 branch ops act on
+// EXACT buckets (the active worktree bucket and a per-branch durable
+// bucket are independent buckets), so there is no sibling-prefix
+// nesting and no `keep` filter — S3 behaves like the name-scoped
+// engines. Capture/Restore/RestoreParent all reduce to a whole-bucket
+// server-side copy.
+type s3NS struct{ d *dbs3.Driver }
+
+func (a s3NS) Exists(ctx context.Context, ns string) (bool, error) {
+	return a.d.BucketExists(ctx, ns)
+}
+
+func (a s3NS) Capture(ctx context.Context, active, durable string) error {
+	return a.d.CopyBucket(ctx, active, durable)
+}
+
+func (a s3NS) Restore(ctx context.Context, durable, active string) error {
+	return a.d.CopyBucket(ctx, durable, active)
+}
+
+func (a s3NS) RestoreParent(ctx context.Context, parent, active string, _ func(string) bool) error {
+	return a.d.CopyBucket(ctx, parent, active)
+}
+
+func (a s3NS) Empty(ctx context.Context, active string) error {
+	return a.d.Empty(ctx, active)
+}
+
+func (a s3NS) Drop(ctx context.Context, ns string) error {
+	// EXACT bucket drop, not the prefix reap — a branch-scoped active
+	// bucket name can be a prefix of sibling worktrees' buckets.
+	return a.d.DropBucket(ctx, ns)
+}
+
+func (a s3NS) DropDurable(ctx context.Context, durable string) error {
+	return a.d.DropBucket(ctx, durable)
+}
+
+func (a s3NS) Watermark(ctx context.Context, ns string) (string, error) {
+	// S3 exposes no sound, cheap per-bucket write counter (object count
+	// nets to zero across offsetting put/delete; LastModified scans the
+	// whole bucket). Decline to skip captures — correctness over a
+	// micro-optimisation.
+	return "", nil
+}
+
 // branchScopeFor reports the scope + canonical engine label for a
 // configured engine, ok=false for unrecognised engines.
 func branchScopeFor(eng string) (bsScope, string, bool) {
@@ -456,9 +508,26 @@ func connectBranchEngine(ctx context.Context, cfg *config.Config, eng string, si
 			return nil, func() {}, err
 		}
 		return &branchEngine{drv: esNS{d: drv, keep: siblingKeep(siblings)}, scope: scope, engine: label}, func() {}, nil
+	case "s3":
+		return connectS3Branch(ctx, cfg, scope, label)
 	default:
 		return nil, func() {}, nil
 	}
+}
+
+// connectS3Branch dials S3 for the branch-swap lifecycle. Extracted from
+// connectBranchEngine's switch to keep that function under the
+// complexity gate. S3 ops are exact-bucket, so no sibling-keep filter
+// (see s3NS).
+func connectS3Branch(ctx context.Context, cfg *config.Config, scope bsScope, label string) (*branchEngine, func(), error) {
+	if cfg.Connections.S3 == nil {
+		return nil, func() {}, errors.New("connections.s3 not configured")
+	}
+	drv, err := dbs3.Connect(ctx, *cfg.Connections.S3)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return &branchEngine{drv: s3NS{drv}, scope: scope, engine: label}, func() {}, nil
 }
 
 // activeNamespace renders the branch-INDEPENDENT active namespace for a

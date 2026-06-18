@@ -270,7 +270,7 @@ func TestValidate(t *testing.T) {
 			want: "engine \"s3\" does not support `dump:`",
 		},
 		{
-			name: "s3 rejects branch_scoped",
+			name: "s3 accepts branch_scoped",
 			cfg: Config{
 				Databases: []DatabaseConfig{{
 					Engine:       "s3",
@@ -278,7 +278,7 @@ func TestValidate(t *testing.T) {
 					BranchScoped: true,
 				}},
 			},
-			want: "engine \"s3\" does not support `branch_scoped: true`",
+			want: "", // branch_scoped is supported (per-branch durable bucket copy)
 		},
 		{
 			name: "s3 rejects test_clones",

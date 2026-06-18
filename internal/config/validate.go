@@ -234,10 +234,11 @@ func (r ContainerRef) validate(path string) error {
 // typos (`{target-db}`, `{slag}`, `{n}` outside test_clones) at
 // load time instead of at the first prepare run.
 // validateS3 enforces the object-store constraints for an `engine: s3`
-// database. S3 support is prefix-scoped and lifecycle-only: key_prefix
-// renders the per-worktree bucket name; snapshot/restore, schema, and
-// seeding are not implemented, so dump/branch_scoped/test_clones/
-// migrate/seed are all rejected with a pointer at the alternative.
+// database. key_prefix renders the per-worktree bucket name. The object
+// store has no schema, so dump/migrate/seed are rejected (use a
+// postcreate hook to populate). branch_scoped IS supported — each branch
+// keeps its own durable bucket copied server-side — but test_clones
+// (fingerprint-cached snapshot fan-out) is not.
 func (d DatabaseConfig) validateS3(path string) error {
 	if d.KeyPrefix == "" {
 		return fmt.Errorf(
@@ -265,10 +266,10 @@ func (d DatabaseConfig) validateS3(path string) error {
 		)
 	}
 	if d.Dump != nil {
-		return fmt.Errorf("%s: engine \"s3\" does not support `dump:` yet (bucket lifecycle only)", path)
-	}
-	if d.BranchScoped {
-		return fmt.Errorf("%s: engine \"s3\" does not support `branch_scoped: true` yet (bucket lifecycle only — no object copy)", path)
+		return fmt.Errorf(
+			"%s: engine \"s3\" does not support `dump:` (object store has no dump format; use a postcreate hook to populate)",
+			path,
+		)
 	}
 	if d.TestClones != nil {
 		return fmt.Errorf("%s: engine \"s3\" does not support `test_clones:` (no snapshot fan-out)", path)
