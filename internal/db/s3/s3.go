@@ -25,6 +25,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
@@ -234,45 +235,63 @@ func (d *Driver) emptyBucket(ctx context.Context, name string) error {
 	if err := d.abortMultiparts(ctx, name); err != nil {
 		return err
 	}
+	// Pipeline the listing and the deletes: page N+1 lists while page N
+	// deletes, instead of stalling each round-trip behind the other. The
+	// errgroup limit bounds both in-flight DeleteObjects requests and the
+	// number of buffered pages held in memory (g.Go blocks once the limit
+	// is reached), so a bucket with millions of objects can't balloon the
+	// heap. A delete failure cancels gctx, which aborts the list loop on
+	// its next call.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(emptyDeleteConcurrency)
 	var (
 		keyMarker     *string
 		versionMarker *string
+		listErr       error
 	)
 	for {
-		out, err := d.Client.ListObjectVersions(ctx, &awss3.ListObjectVersionsInput{
+		out, err := d.Client.ListObjectVersions(gctx, &awss3.ListObjectVersionsInput{
 			Bucket:          &name,
 			KeyMarker:       keyMarker,
 			VersionIdMarker: versionMarker,
 		})
 		if err != nil {
-			if isNotFound(err) {
-				return nil
+			if !isNotFound(err) {
+				listErr = fmt.Errorf("s3: list versions %q: %w", name, err)
 			}
-			return fmt.Errorf("s3: list versions %q: %w", name, err)
+			break
 		}
 
-		var batch []s3types.ObjectIdentifier
+		batch := make([]s3types.ObjectIdentifier, 0, len(out.Versions)+len(out.DeleteMarkers))
 		for _, v := range out.Versions {
 			batch = append(batch, s3types.ObjectIdentifier{Key: v.Key, VersionId: v.VersionId})
 		}
 		for _, m := range out.DeleteMarkers {
 			batch = append(batch, s3types.ObjectIdentifier{Key: m.Key, VersionId: m.VersionId})
 		}
-		if err := d.deleteBatch(ctx, name, batch); err != nil {
-			return err
+		if len(batch) > 0 {
+			g.Go(func() error { return d.deleteBatch(gctx, name, batch) })
 		}
 
 		if out.IsTruncated == nil || !*out.IsTruncated {
-			return nil
+			break
 		}
 		// Defense against non-conforming impls that report truncated
 		// without advancing the markers — would otherwise loop forever.
 		if eqStrPtr(out.NextKeyMarker, keyMarker) && eqStrPtr(out.NextVersionIdMarker, versionMarker) {
-			return fmt.Errorf("s3: list versions %q: pagination stuck (IsTruncated=true but markers unchanged)", name)
+			listErr = fmt.Errorf("s3: list versions %q: pagination stuck (IsTruncated=true but markers unchanged)", name)
+			break
 		}
 		keyMarker = out.NextKeyMarker
 		versionMarker = out.NextVersionIdMarker
 	}
+	// Drain in-flight deletes. Prefer a delete error over the list error:
+	// a delete failure cancels gctx, so listErr is usually the downstream
+	// "context canceled" symptom, not the root cause.
+	if werr := g.Wait(); werr != nil {
+		return werr
+	}
+	return listErr
 }
 
 // deleteBatch issues one DeleteObjects call per 1000-key chunk (the
@@ -404,6 +423,13 @@ func eqStrPtr(a, b *string) bool {
 // also enforce this at config-load time on the literal portion of
 // `key_prefix` (everything before the first template token).
 const MinDropPrefixLen = 6
+
+// emptyDeleteConcurrency bounds the in-flight DeleteObjects requests
+// (and, via errgroup backpressure, the number of buffered list pages)
+// while emptying a bucket. 8 keeps a single large teardown saturating
+// the connection without overwhelming a small self-hosted MinIO/Garage
+// node or tripping AWS request-rate throttling.
+const emptyDeleteConcurrency = 8
 
 var (
 	quietTrue = aws.Bool(true)
