@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -241,36 +242,27 @@ func (d *Driver) emptyBucket(ctx context.Context, name string) error {
 	return err
 }
 
+// objRef is one object surfaced by a sharded walk — a deletable
+// version reference and/or a copyable key+size.
+type objRef struct {
+	key       string
+	versionID *string // versioned delete only; nil otherwise
+	size      int64   // copy only (multipart threshold)
+}
+
+// pageLister lists ONE page under (prefix, token) with Delimiter="/",
+// returning this page's objects, the child common-prefixes to recurse
+// into, and the opaque next-page token (nil = this prefix exhausted).
+// The token type is private to each lister (continuation string for V2,
+// key+version markers for Versions); walkShards treats it opaquely.
+type pageLister func(ctx context.Context, prefix string, token any) (objs []objRef, children []string, next any, err error)
+
 // emptyVersioned drains the bucket via ListObjectVersions (deletes
 // every version + delete-marker). Used on backends that support
 // versioning APIs (AWS, MinIO).
 func (d *Driver) emptyVersioned(ctx context.Context, name string) error {
-	var keyMarker, versionMarker *string
-	return d.drainBucket(ctx, name, func(gctx context.Context) ([]s3types.ObjectIdentifier, bool, error) {
-		out, err := d.Client.ListObjectVersions(gctx, &awss3.ListObjectVersionsInput{
-			Bucket:          &name,
-			KeyMarker:       keyMarker,
-			VersionIdMarker: versionMarker,
-		})
-		if err != nil {
-			return nil, false, fmt.Errorf("s3: list versions %q: %w", name, err)
-		}
-		batch := make([]s3types.ObjectIdentifier, 0, len(out.Versions)+len(out.DeleteMarkers))
-		for _, v := range out.Versions {
-			batch = append(batch, s3types.ObjectIdentifier{Key: v.Key, VersionId: v.VersionId})
-		}
-		for _, m := range out.DeleteMarkers {
-			batch = append(batch, s3types.ObjectIdentifier{Key: m.Key, VersionId: m.VersionId})
-		}
-		if out.IsTruncated == nil || !*out.IsTruncated {
-			return batch, false, nil
-		}
-		if eqStrPtr(out.NextKeyMarker, keyMarker) && eqStrPtr(out.NextVersionIdMarker, versionMarker) {
-			return nil, false, fmt.Errorf("s3: list versions %q: pagination stuck (IsTruncated=true but markers unchanged)", name)
-		}
-		keyMarker = out.NextKeyMarker
-		versionMarker = out.NextVersionIdMarker
-		return batch, true, nil
+	return d.walkShards(ctx, d.listVersionsPage(name), func(gctx context.Context, page []objRef) error {
+		return d.deleteBatch(gctx, name, page)
 	})
 }
 
@@ -279,80 +271,209 @@ func (d *Driver) emptyVersioned(ctx context.Context, name string) error {
 // ListObjectVersions, which are unversioned, so there are no historical
 // versions to miss.
 func (d *Driver) emptyUnversioned(ctx context.Context, name string) error {
-	var token *string
-	return d.drainBucket(ctx, name, func(gctx context.Context) ([]s3types.ObjectIdentifier, bool, error) {
-		out, err := d.Client.ListObjectsV2(gctx, &awss3.ListObjectsV2Input{
-			Bucket:            &name,
-			ContinuationToken: token,
-		})
-		if err != nil {
-			return nil, false, fmt.Errorf("s3: list objects %q: %w", name, err)
-		}
-		batch := make([]s3types.ObjectIdentifier, 0, len(out.Contents))
-		for _, o := range out.Contents {
-			batch = append(batch, s3types.ObjectIdentifier{Key: o.Key})
-		}
-		if out.IsTruncated == nil || !*out.IsTruncated {
-			return batch, false, nil
-		}
-		if eqStrPtr(out.NextContinuationToken, token) || out.NextContinuationToken == nil {
-			return nil, false, fmt.Errorf("s3: list objects %q: pagination stuck (IsTruncated=true but token unchanged)", name)
-		}
-		token = out.NextContinuationToken
-		return batch, true, nil
+	return d.walkShards(ctx, d.listV2Page(name), func(gctx context.Context, page []objRef) error {
+		return d.deleteBatch(gctx, name, page)
 	})
 }
 
-// drainBucket runs a list/delete pipeline: `page` is called repeatedly
-// to fetch the next batch of object identifiers (and report whether more
-// pages remain), while deletes for already-listed pages run
-// concurrently. Page N+1 lists while page N deletes, instead of stalling
-// each round-trip behind the other. The errgroup limit bounds both
-// in-flight DeleteObjects requests and the number of buffered pages held
-// in memory (g.Go blocks once the limit is hit), so a million-object
-// bucket can't balloon the heap. A delete failure cancels gctx, which
-// aborts the next page() call.
-//
-// A NotFound from page() (bucket vanished mid-drain) ends the walk
-// cleanly; any other list error is returned after in-flight deletes
-// drain. A delete error is preferred over the list error, since a delete
-// failure cancels gctx and the list error is then the downstream
-// "context canceled" symptom.
-func (d *Driver) drainBucket(
-	ctx context.Context,
-	name string,
-	page func(ctx context.Context) ([]s3types.ObjectIdentifier, bool, error),
-) error {
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(emptyDeleteConcurrency)
-	var listErr error
-	for {
-		ids, more, err := page(gctx)
+// listV2Page returns a pageLister over ListObjectsV2 (current objects),
+// sharded by "/" delimiter so walkShards can recurse into each
+// "directory" concurrently. token is a *string continuation token.
+func (d *Driver) listV2Page(bucket string) pageLister {
+	return func(ctx context.Context, prefix string, token any) ([]objRef, []string, any, error) {
+		var ct *string
+		if token != nil {
+			ct, _ = token.(*string)
+		}
+		out, err := d.Client.ListObjectsV2(ctx, &awss3.ListObjectsV2Input{
+			Bucket:            &bucket,
+			Prefix:            strPtrOrNil(prefix),
+			Delimiter:         aws.String("/"),
+			ContinuationToken: ct,
+		})
 		if err != nil {
-			if !isNotFound(err) {
-				listErr = err
+			return nil, nil, nil, fmt.Errorf("s3: list objects %q: %w", bucket, err)
+		}
+		objs := make([]objRef, 0, len(out.Contents))
+		for _, o := range out.Contents {
+			objs = append(objs, objRef{key: aws.ToString(o.Key), size: aws.ToInt64(o.Size)})
+		}
+		children := commonPrefixes(out.CommonPrefixes)
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return objs, children, nil, nil
+		}
+		if out.NextContinuationToken == nil || eqStrPtr(out.NextContinuationToken, ct) {
+			return nil, nil, nil, fmt.Errorf("s3: list objects %q: pagination stuck (IsTruncated=true but token unchanged)", bucket)
+		}
+		return objs, children, out.NextContinuationToken, nil
+	}
+}
+
+// verMarker is the ListObjectVersions pagination cursor (a key +
+// version-id marker pair), carried opaquely through walkShards.
+type verMarker struct{ key, ver *string }
+
+// listVersionsPage returns a pageLister over ListObjectVersions,
+// sharded by "/" delimiter. token is a verMarker.
+func (d *Driver) listVersionsPage(bucket string) pageLister {
+	return func(ctx context.Context, prefix string, token any) ([]objRef, []string, any, error) {
+		var m verMarker
+		if token != nil {
+			m, _ = token.(verMarker)
+		}
+		out, err := d.Client.ListObjectVersions(ctx, &awss3.ListObjectVersionsInput{
+			Bucket:          &bucket,
+			Prefix:          strPtrOrNil(prefix),
+			Delimiter:       aws.String("/"),
+			KeyMarker:       m.key,
+			VersionIdMarker: m.ver,
+		})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("s3: list versions %q: %w", bucket, err)
+		}
+		objs := make([]objRef, 0, len(out.Versions)+len(out.DeleteMarkers))
+		for _, v := range out.Versions {
+			objs = append(objs, objRef{key: aws.ToString(v.Key), versionID: v.VersionId})
+		}
+		for _, dm := range out.DeleteMarkers {
+			objs = append(objs, objRef{key: aws.ToString(dm.Key), versionID: dm.VersionId})
+		}
+		children := commonPrefixes(out.CommonPrefixes)
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return objs, children, nil, nil
+		}
+		if eqStrPtr(out.NextKeyMarker, m.key) && eqStrPtr(out.NextVersionIdMarker, m.ver) {
+			return nil, nil, nil, fmt.Errorf("s3: list versions %q: pagination stuck (IsTruncated=true but markers unchanged)", bucket)
+		}
+		return objs, children, verMarker{out.NextKeyMarker, out.NextVersionIdMarker}, nil
+	}
+}
+
+// walkShards enumerates every object in a bucket using delimiter-sharded
+// PARALLEL listing: each common-prefix ("directory") is walked by its
+// own bounded worker, so listing throughput isn't capped by serial
+// pagination — the previous bottleneck that left the concurrent
+// deleters/copiers starved waiting one page at a time. Within a single
+// prefix, pagination stays serial (token-chained); across prefixes it's
+// concurrent up to listConcurrency workers. Each discovered page is
+// handed to `handle` inline by the worker that listed it.
+//
+// Resource-bounded: a fixed worker pool (no goroutine-per-object) and a
+// LIFO prefix queue whose depth is the key-tree breadth. A flat bucket
+// (no "/" in keys) yields no children and degrades to a single serial
+// walk — no worse than before.
+//
+// A NotFound mid-walk (bucket vanished) ends that branch cleanly; any
+// other list/handle error stops every worker and is returned.
+func (d *Driver) walkShards(ctx context.Context, list pageLister, handle func(context.Context, []objRef) error) error {
+	g, gctx := errgroup.WithContext(ctx)
+
+	var (
+		mu          sync.Mutex
+		cond        = sync.NewCond(&mu)
+		queue       []string
+		outstanding int  // prefixes pushed but not yet finished
+		stopped     bool // an error/cancel woke everyone to exit
+	)
+	push := func(p string) {
+		mu.Lock()
+		if !stopped {
+			queue = append(queue, p)
+			outstanding++
+			cond.Signal()
+		}
+		mu.Unlock()
+	}
+	pop := func() (string, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		for len(queue) == 0 && outstanding > 0 && !stopped {
+			cond.Wait()
+		}
+		if stopped || outstanding == 0 {
+			return "", false
+		}
+		p := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		return p, true
+	}
+	finish := func() {
+		mu.Lock()
+		outstanding--
+		if outstanding == 0 {
+			cond.Broadcast() // wake idle workers so they exit
+		}
+		mu.Unlock()
+	}
+	stopAll := func() {
+		mu.Lock()
+		stopped = true
+		cond.Broadcast()
+		mu.Unlock()
+	}
+
+	push("") // root prefix
+	for range listConcurrency {
+		g.Go(func() error {
+			for {
+				prefix, ok := pop()
+				if !ok {
+					return nil
+				}
+				err := d.walkPrefix(gctx, prefix, list, handle, push)
+				finish()
+				if err != nil {
+					stopAll()
+					return err
+				}
 			}
-			break
-		}
-		if len(ids) > 0 {
-			batch := ids
-			g.Go(func() error { return d.deleteBatch(gctx, name, batch) })
-		}
-		if !more {
-			break
-		}
+		})
 	}
-	if werr := g.Wait(); werr != nil {
-		return werr
+	return g.Wait()
+}
+
+// walkPrefix paginates one prefix serially, pushing discovered child
+// prefixes back onto the shared queue and handling each page inline.
+func (d *Driver) walkPrefix(
+	ctx context.Context,
+	prefix string,
+	list pageLister,
+	handle func(context.Context, []objRef) error,
+	push func(string),
+) error {
+	var token any
+	for {
+		objs, children, next, err := list(ctx, prefix, token)
+		if err != nil {
+			if isNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		for _, c := range children {
+			push(c)
+		}
+		if len(objs) > 0 {
+			if err := handle(ctx, objs); err != nil {
+				return err
+			}
+		}
+		if next == nil {
+			return nil
+		}
+		token = next
 	}
-	return listErr
 }
 
 // deleteBatch issues one DeleteObjects call per 1000-key chunk (the
-// S3 limit). Per-key errors within a chunk are aggregated via
-// errors.Join so the caller sees every failure in a single response,
-// not just the first.
-func (d *Driver) deleteBatch(ctx context.Context, bucket string, ids []s3types.ObjectIdentifier) error {
+// S3 limit) for one listed page. Per-key errors within a chunk are
+// aggregated via errors.Join so the caller sees every failure in a
+// single response, not just the first.
+func (d *Driver) deleteBatch(ctx context.Context, bucket string, page []objRef) error {
+	ids := make([]s3types.ObjectIdentifier, len(page))
+	for i, o := range page {
+		ids[i] = s3types.ObjectIdentifier{Key: aws.String(o.key), VersionId: o.versionID}
+	}
 	const maxKeys = 1000
 	for len(ids) > 0 {
 		n := min(len(ids), maxKeys)
@@ -386,8 +507,12 @@ func (d *Driver) deleteBatch(ctx context.Context, bucket string, ids []s3types.O
 	return nil
 }
 
+// abortMultiparts aborts every in-progress multipart upload in `name`.
+// Listing paginates serially (uploads are typically few); the aborts
+// themselves run concurrently under a bounded group.
 func (d *Driver) abortMultiparts(ctx context.Context, name string) error {
 	var (
+		uploads        []s3types.MultipartUpload
 		keyMarker      *string
 		uploadIDMarker *string
 	)
@@ -403,17 +528,9 @@ func (d *Driver) abortMultiparts(ctx context.Context, name string) error {
 			}
 			return fmt.Errorf("s3: list multipart uploads %q: %w", name, err)
 		}
-		for _, u := range out.Uploads {
-			if _, abErr := d.Client.AbortMultipartUpload(ctx, &awss3.AbortMultipartUploadInput{
-				Bucket:   &name,
-				Key:      u.Key,
-				UploadId: u.UploadId,
-			}); abErr != nil {
-				return fmt.Errorf("s3: abort multipart in %q: %w", name, abErr)
-			}
-		}
+		uploads = append(uploads, out.Uploads...)
 		if out.IsTruncated == nil || !*out.IsTruncated {
-			return nil
+			break
 		}
 		if eqStrPtr(out.NextKeyMarker, keyMarker) && eqStrPtr(out.NextUploadIdMarker, uploadIDMarker) {
 			return fmt.Errorf("s3: list multipart uploads %q: pagination stuck (IsTruncated=true but markers unchanged)", name)
@@ -421,6 +538,45 @@ func (d *Driver) abortMultiparts(ctx context.Context, name string) error {
 		keyMarker = out.NextKeyMarker
 		uploadIDMarker = out.NextUploadIdMarker
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(copyConcurrency)
+	for _, u := range uploads {
+		g.Go(func() error {
+			if _, err := d.Client.AbortMultipartUpload(gctx, &awss3.AbortMultipartUploadInput{
+				Bucket:   &name,
+				Key:      u.Key,
+				UploadId: u.UploadId,
+			}); err != nil {
+				return fmt.Errorf("s3: abort multipart in %q: %w", name, err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+// commonPrefixes extracts the non-nil Prefix strings from a
+// ListObjects*/ListObjectVersions CommonPrefixes slice.
+func commonPrefixes(cps []s3types.CommonPrefix) []string {
+	if len(cps) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(cps))
+	for _, cp := range cps {
+		if cp.Prefix != nil {
+			out = append(out, *cp.Prefix)
+		}
+	}
+	return out
+}
+
+// strPtrOrNil returns nil for "" (the root prefix) so the SDK omits the
+// Prefix param, else a pointer to s.
+func strPtrOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // ─── branch-scoped (durable copy) primitives ────────────────────────
@@ -467,10 +623,11 @@ func (d *Driver) DropBucket(ctx context.Context, name string) error {
 // branch), then server-side-copies every current object from src.
 //
 // Copies are server-side (CopyObject / UploadPartCopy) — object bytes
-// never round-trip through this process — and run through a bounded
-// concurrent pipeline: page src via ListObjectsV2 while copies for
-// already-listed objects run concurrently. Objects larger than the
-// 5 GiB single-PUT-copy limit use a multipart copy. This is the
+// never round-trip through this process. Listing is delimiter-sharded
+// and parallel (walkShards) so the copiers aren't starved one page at a
+// time; each listed page fans its objects out across a shared semaphore
+// that caps total in-flight copies (and bounds copy goroutines) at
+// copyConcurrency. Objects ≥5 GiB use a multipart copy. This is the
 // most-performant whole-bucket copy the S3 API offers.
 func (d *Driver) CopyBucket(ctx context.Context, src, dst string) error {
 	if err := d.EnsureBucket(ctx, dst); err != nil {
@@ -479,45 +636,32 @@ func (d *Driver) CopyBucket(ctx context.Context, src, dst string) error {
 	if err := d.emptyBucket(ctx, dst); err != nil {
 		return err
 	}
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(copyConcurrency)
-	var token *string
-	var listErr error
-	for {
-		out, err := d.Client.ListObjectsV2(gctx, &awss3.ListObjectsV2Input{
-			Bucket:            &src,
-			ContinuationToken: token,
-		})
-		if err != nil {
-			if !isNotFound(err) {
-				listErr = fmt.Errorf("s3: list objects %q: %w", src, err)
+	sem := make(chan struct{}, copyConcurrency)
+	return d.walkShards(ctx, d.listV2Page(src), func(gctx context.Context, page []objRef) error {
+		cg, cgctx := errgroup.WithContext(gctx)
+		for _, o := range page {
+			// Acquire BEFORE spawning so at most copyConcurrency copy
+			// goroutines exist at once — a huge page can't spawn a
+			// goroutine per object.
+			select {
+			case sem <- struct{}{}:
+			case <-cgctx.Done():
+				return cgctx.Err()
 			}
-			break
+			cg.Go(func() error {
+				defer func() { <-sem }()
+				return d.copyObject(cgctx, src, dst, o.key, o.size)
+			})
 		}
-		for _, o := range out.Contents {
-			key := aws.ToString(o.Key)
-			size := aws.ToInt64(o.Size)
-			g.Go(func() error { return d.copyObject(gctx, src, dst, key, size) })
-		}
-		if out.IsTruncated == nil || !*out.IsTruncated {
-			break
-		}
-		if eqStrPtr(out.NextContinuationToken, token) || out.NextContinuationToken == nil {
-			listErr = fmt.Errorf("s3: list objects %q: pagination stuck (IsTruncated=true but token unchanged)", src)
-			break
-		}
-		token = out.NextContinuationToken
-	}
-	if werr := g.Wait(); werr != nil {
-		return werr
-	}
-	return listErr
+		return cg.Wait()
+	})
 }
 
 // copyObject server-side-copies one object src/key → dst/key. Objects
 // at or above maxSingleCopyBytes (the 5 GiB CopyObject ceiling) are
 // copied via multipart UploadPartCopy; smaller ones via a single
-// CopyObject.
+// CopyObject. The caller holds the copy-concurrency slot for this whole
+// object.
 func (d *Driver) copyObject(ctx context.Context, src, dst, key string, size int64) error {
 	if size >= maxSingleCopyBytes {
 		return d.copyObjectMultipart(ctx, src, dst, key, size)
@@ -534,8 +678,10 @@ func (d *Driver) copyObject(ctx context.Context, src, dst, key string, size int6
 }
 
 // copyObjectMultipart copies a large object (≥5 GiB) using multipart
-// UploadPartCopy with a byte-range per part. Parts copy concurrently
-// under the same global copy limit via a nested bounded group.
+// UploadPartCopy with a byte-range per part. The caller holds the
+// object's copy-concurrency slot; parts copy concurrently under their
+// own bounded group (copyPartConcurrency) so a single huge object can't
+// monopolise the global copy semaphore by holding it per-part.
 func (d *Driver) copyObjectMultipart(ctx context.Context, src, dst, key string, size int64) error {
 	create, err := d.Client.CreateMultipartUpload(ctx, &awss3.CreateMultipartUploadInput{
 		Bucket: &dst,
@@ -676,19 +822,22 @@ func eqStrPtr(a, b *string) bool {
 // `key_prefix` (everything before the first template token).
 const MinDropPrefixLen = 6
 
-// emptyDeleteConcurrency bounds the in-flight DeleteObjects requests
-// (and, via errgroup backpressure, the number of buffered list pages)
-// while emptying a bucket. 8 keeps a single large teardown saturating
-// the connection without overwhelming a small self-hosted MinIO/Garage
-// node or tripping AWS request-rate throttling.
-const emptyDeleteConcurrency = 8
+// listConcurrency is the number of prefix-shard workers walkShards runs
+// in parallel — each lists one "/"-delimited prefix at a time and
+// handles its pages inline (bulk delete, or copy fan-out). 8 keeps a
+// large sharded teardown/copy saturating the connection without
+// overwhelming a small self-hosted MinIO/Garage node or tripping AWS
+// request-rate throttling. Flat buckets (no "/" keys) use a single
+// worker — there's nothing to shard.
+const listConcurrency = 8
 
 // Branch-scoped whole-bucket copy tuning.
 const (
-	// copyConcurrency bounds in-flight CopyObject calls (and buffered
-	// list pages) while copying a bucket. Server-side copies are cheap
-	// on the client but each is a request, so this rides a bit higher
-	// than the delete path.
+	// copyConcurrency caps total in-flight server-side copies during a
+	// CopyBucket (and bounds copy goroutines — the fan-out acquires a
+	// slot before spawning). Server-side copies are cheap on the client
+	// but each is a request, so this rides a bit higher than the
+	// per-prefix list workers.
 	copyConcurrency = 16
 
 	// maxSingleCopyBytes is the S3 ceiling for a single CopyObject

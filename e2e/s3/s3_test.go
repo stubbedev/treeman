@@ -147,9 +147,11 @@ func runBackend(ctx context.Context, t *testing.T, b backend) {
 		t.Errorf("bucket name drift: pass1=%s pass2=%s", o.SourceDB, o2.SourceDB)
 	}
 
-	// ── 3. Drop an object into the bucket so teardown must run the
-	//      empty-bucket path, not just DeleteBucket. ──────────────────
-	putObject(ctx, t, b.conn, o.SourceDB, "smoke.txt", []byte("hello"))
+	// ── 3. Drop objects across nested prefixes so teardown must run the
+	//      sharded empty-bucket walk, not just DeleteBucket. ───────────
+	for _, k := range []string{"smoke.txt", "a/b/c.txt", "a/d.txt", "x/y nested.bin"} {
+		putObject(ctx, t, b.conn, o.SourceDB, k, []byte("hello"))
+	}
 
 	// ── 4. teardown → bucket gone ─────────────────────────────────────
 	if err := prepare.TeardownDatabases(ctx, cfg, env.Slug.Value, env.RepoID, env.WTID, env.Store); err != nil {
@@ -182,30 +184,42 @@ func branchScopedSwap(ctx context.Context, t *testing.T, b backend) {
 		}},
 	}
 
-	const devKey = "assets/nested file.bin" // nested + space → copySource escaping
-	const featKey = "feature.txt"
+	// Spread objects across several nested prefixes (+ a flat key and a
+	// space-bearing key) so the sharded parallel walker has real
+	// common-prefixes to recurse into and copySource escaping is
+	// exercised end-to-end through capture+restore.
+	devKeys := []string{
+		"top.txt",
+		"assets/img/a.png",
+		"assets/doc/b.txt",
+		"assets/nested file.bin",
+		"data/2024/c.bin",
+	}
+	const featKey = "feature/new.txt"
 
-	// develop: empty active, add the develop object.
+	// develop: empty active, add the develop objects.
 	active := driveS3Prepare(t, env, cfg, "develop")
-	putObject(ctx, t, conn, active, devKey, []byte("develop"))
-	assertKeys(ctx, t, conn, active, devKey)
+	for _, k := range devKeys {
+		putObject(ctx, t, conn, active, k, []byte("develop"))
+	}
+	assertKeys(ctx, t, conn, active, devKeys...)
 
 	// switch to feature → develop captured; new branch starts from the
-	// branch point (develop's data).
+	// branch point (develop's data, copied across all prefixes).
 	if got := driveS3Prepare(t, env, cfg, "feature"); got != active {
 		t.Fatalf("active bucket drifted: %s → %s", active, got)
 	}
-	assertKeys(ctx, t, conn, active, devKey)
+	assertKeys(ctx, t, conn, active, devKeys...)
 	putObject(ctx, t, conn, active, featKey, []byte("feature"))
-	assertKeys(ctx, t, conn, active, devKey, featKey)
+	assertKeys(ctx, t, conn, active, append(append([]string{}, devKeys...), featKey)...)
 
 	// back to develop → feature captured, develop restored (isolated).
 	driveS3Prepare(t, env, cfg, "develop")
-	assertKeys(ctx, t, conn, active, devKey)
+	assertKeys(ctx, t, conn, active, devKeys...)
 
 	// back to feature → resumed from its durable copy.
 	driveS3Prepare(t, env, cfg, "feature")
-	assertKeys(ctx, t, conn, active, devKey, featKey)
+	assertKeys(ctx, t, conn, active, append(append([]string{}, devKeys...), featKey)...)
 }
 
 // driveS3Prepare points the worktree at `branch` and runs a full
