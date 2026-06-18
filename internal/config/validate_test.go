@@ -245,6 +245,85 @@ func TestValidate(t *testing.T) {
 			want: "key_prefix",
 		},
 		{
+			name: "s3 missing key_prefix",
+			cfg: Config{
+				Databases: []DatabaseConfig{{Engine: "s3"}},
+			},
+			want: "key_prefix is required for engine \"s3\"",
+		},
+		{
+			name: "s3 key_prefix literal too short",
+			cfg: Config{
+				Databases: []DatabaseConfig{{Engine: "s3", KeyPrefix: "dev-{slug}"}},
+			},
+			want: "literal portion",
+		},
+		{
+			name: "s3 rejects dump",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:    "s3",
+					KeyPrefix: "myapp-{slug}",
+					Dump:      DumpList{{Path: "dump.sql"}},
+				}},
+			},
+			want: "engine \"s3\" does not support `dump:`",
+		},
+		{
+			name: "s3 accepts branch_scoped",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "s3",
+					KeyPrefix:    "myapp-{slug}",
+					BranchScoped: true,
+				}},
+			},
+			want: "", // branch_scoped is supported (per-branch durable bucket copy)
+		},
+		{
+			name: "s3 rejects test_clones",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:     "s3",
+					KeyPrefix:  "myapp-{slug}",
+					TestClones: &TestClonesSpec{NameTemplate: "x"},
+				}},
+			},
+			want: "engine \"s3\" does not support `test_clones:`",
+		},
+		{
+			name: "s3 rejects migrate",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:    "s3",
+					KeyPrefix: "myapp-{slug}",
+					Migrate:   &Step{Run: "./mig.sh"},
+				}},
+			},
+			want: "engine \"s3\" does not support `migrate:`",
+		},
+		{
+			name: "s3 rejects seed",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:    "s3",
+					KeyPrefix: "myapp-{slug}",
+					Seed:      &Step{Run: "./seed.sh"},
+				}},
+			},
+			want: "engine \"s3\" does not support `seed:`",
+		},
+		{
+			name: "s3 with long literal prefix is valid",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:    "s3",
+					KeyPrefix: "myapp-{slug}",
+				}},
+			},
+			want: "",
+		},
+		{
 			name: "non-branch_scoped slug name on main worktree is fine",
 			cfg: Config{
 				Databases: []DatabaseConfig{{

@@ -65,6 +65,7 @@ type Resolved struct {
 	Mongodb       *resolvedConn[config.MongoConn]
 	Redis         *resolvedConn[config.RedisConn]
 	Elasticsearch *resolvedConn[config.EsConn]
+	S3            *resolvedConn[config.S3Conn]
 }
 
 type resolvedConn[T any] struct {
@@ -84,6 +85,7 @@ func Resolve(cfg *config.Config, repoRoot string) Resolved {
 		Mongodb:       resolveMongodb(cfg, env),
 		Redis:         resolveRedis(cfg, env),
 		Elasticsearch: resolveElasticsearch(cfg, env),
+		S3:            resolveS3(cfg, env),
 	}
 }
 
@@ -118,6 +120,10 @@ func ApplyEnvCredentials(cfg *config.Config, repoRoot string) {
 	if r.Elasticsearch != nil {
 		v := r.Elasticsearch.Conn
 		cfg.Connections.Elasticsearch = &v
+	}
+	if r.S3 != nil {
+		v := r.S3.Conn
+		cfg.Connections.S3 = &v
 	}
 	fillFromContainerEnv(cfg)
 }
@@ -154,6 +160,40 @@ func fillFromContainerEnv(cfg *config.Config) {
 		for _, k := range []string{"POSTGRES_PASSWORD", "POSTGRESQL_PASSWORD"} {
 			if v, ok := env[k]; ok && nonEmpty(v) {
 				p.Password = v
+				break
+			}
+		}
+	}
+	fillS3FromContainerEnv(cfg.Connections.S3)
+}
+
+// fillS3FromContainerEnv back-fills S3 access/secret keys from the
+// container's own environment when they weren't supplied in config —
+// MinIO/Garage publish their root creds as well-known env vars
+// (MINIO_ROOT_USER/PASSWORD, AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY), so a
+// container-referenced block can authenticate with zero secret wiring.
+func fillS3FromContainerEnv(s *config.S3Conn) {
+	if s == nil || (s.Container == "" && s.ComposeService == "") {
+		return
+	}
+	env, _ := containerip.EnvLookup(context.Background(), containerip.Opts{
+		Container:      s.Container,
+		ComposeService: s.ComposeService,
+		ComposeProject: s.ComposeProject,
+		Engine:         s.ContainerEngine,
+	})
+	if s.AccessKey == "" {
+		for _, k := range []string{"MINIO_ROOT_USER", "MINIO_ACCESS_KEY", "AWS_ACCESS_KEY_ID"} {
+			if v, ok := env[k]; ok && nonEmpty(v) {
+				s.AccessKey = v
+				break
+			}
+		}
+	}
+	if s.SecretKey == "" {
+		for _, k := range []string{"MINIO_ROOT_PASSWORD", "MINIO_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"} {
+			if v, ok := env[k]; ok && nonEmpty(v) {
+				s.SecretKey = v
 				break
 			}
 		}
@@ -504,6 +544,21 @@ func resolveElasticsearch(cfg *config.Config, env envfile.EnvFile) *resolvedConn
 		}
 	}
 	return nil
+}
+
+// ─────────────────────────── s3 ───────────────────────────
+
+// resolveS3 returns the configured S3 connection with the secret key
+// substituted from env when written as a `$NAME` / `${NAME}` ref.
+// Unlike the SQL engines, S3 has no widely-used env-derived DSN
+// convention (`S3_URL` etc.) — the connection is YAML-only.
+func resolveS3(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.S3Conn] {
+	if cfg.Connections.S3 == nil {
+		return nil
+	}
+	s := *cfg.Connections.S3
+	s.SecretKey = resolvePasswordValue(env, s.SecretKey)
+	return &resolvedConn[config.S3Conn]{Conn: s, Source: Source{Kind: SourceYaml}}
 }
 
 // ─────────────────────────── url helpers ───────────────────────────

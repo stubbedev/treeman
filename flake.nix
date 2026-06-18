@@ -20,8 +20,8 @@
           # hash so the sandboxed build is reproducible. Bump after
           # any `go get` / `go mod tidy` that changes go.sum — `nix
           # build` will print the expected hash on mismatch.
-          # go-sum: 5a2c569b6f9dfd63aaf53174820b7dedc2e1a2088868cdad78cac7a6172632b8
-          vendorHash = "sha256-hrhUEM7PP1qgiC2kwOlaVzLbBn0/rJsz2by464xXHDo=";
+          # go-sum: 5765e9c9443e442a0733edbf4744b3b91479f378635aa01a6dd686c56bf61139
+          vendorHash = "sha256-St7aUAOGD7ah+DHG4tne9QQ+O+siHiVd1yjMnovXhxI=";
           # subPackages also scopes the default checkPhase — `go test`
           # only runs against these two paths (neither has test files),
           # so `nix build` / `nix profile install` finishes the check

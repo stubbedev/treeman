@@ -103,6 +103,10 @@ func recoverTestClone(
 		return recoverTestCloneRedis(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
 	case engine.FamilyES:
 		return recoverTestCloneES(ctx, cfg, d, tplCtx, repoID, worktreeID, st)
+	case engine.FamilyS3:
+		// S3 has no test-clone family (validate.go rejects test_clones
+		// for object stores) — nothing to recover.
+		return nil
 	}
 	return nil
 }

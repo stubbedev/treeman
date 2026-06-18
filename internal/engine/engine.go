@@ -21,6 +21,7 @@ const (
 	FamilyMongo    Family = "mongodb"       // mongodb
 	FamilyRedis    Family = "redis"         // redis / valkey / dragonfly
 	FamilyES       Family = "elasticsearch" // elasticsearch / opensearch
+	FamilyS3       Family = "s3"            // s3 (object storage — lifecycle only)
 )
 
 // Known is every engine string treeman accepts under
@@ -34,6 +35,7 @@ var Known = []string{
 	"mongodb",
 	"redis", "valkey", "dragonfly",
 	"elasticsearch", "opensearch",
+	"s3",
 }
 
 // KnownList returns the engine alias list joined as ", " — used in
@@ -57,6 +59,8 @@ func Canonical(eng string) (Family, bool) {
 		return FamilyRedis, true
 	case "elasticsearch", "opensearch":
 		return FamilyES, true
+	case "s3":
+		return FamilyS3, true
 	default:
 		return "", false
 	}
@@ -75,7 +79,7 @@ const (
 // Scope returns whether the family scopes by name or by prefix.
 func (f Family) Scope() Scope {
 	switch f {
-	case FamilyRedis, FamilyES:
+	case FamilyRedis, FamilyES, FamilyS3:
 		return ScopePrefix
 	default:
 		return ScopeName

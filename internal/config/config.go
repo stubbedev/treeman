@@ -408,6 +408,12 @@ type ConnectionsConfig struct {
 
 	// Elasticsearch / OpenSearch connection. HTTP URL form.
 	Elasticsearch *EsConn `yaml:"elasticsearch,omitempty"`
+
+	// S3-compatible object storage connection (AWS S3, MinIO, Garage,
+	// Ceph RGW, Backblaze B2, Cloudflare R2, ...). Required when any
+	// `databases:` entry uses `engine: s3`. One connection serves many
+	// per-worktree buckets named via the entry's `key_prefix`.
+	S3 *S3Conn `yaml:"s3,omitempty"`
 }
 
 // ContainerRef points a connection at a running container or compose
@@ -771,6 +777,65 @@ func (c *EsConn) UnmarshalYAML(node *yaml.Node) error {
 }
 
 func (EsConn) JSONSchema() *jsonschema.Schema { return uriOrMap("elasticsearch", "url") }
+
+// S3Conn — connection to an S3-compatible object store. Covers AWS
+// S3, MinIO, Garage, Ceph RGW, Backblaze B2, Cloudflare R2, and any
+// service that speaks the S3 API.
+//
+// `Endpoint` is the base URL the SDK dials (e.g. `http://localhost:9000`
+// for a local MinIO/Garage; leave empty for AWS S3 — the SDK picks the
+// regional endpoint). When a ContainerRef is set, host/port in the
+// endpoint URL are rewritten at dial time using the container's
+// published port (or bridge IP).
+//
+// `UsePathStyle` toggles path-style addressing (`endpoint/bucket/key`)
+// vs virtual-host-style (`bucket.endpoint/key`). MinIO and Garage
+// require path-style; AWS S3 supports either but virtual-host is the
+// default. Set true for any non-AWS endpoint.
+//
+// Credentials: `AccessKey` is literal; `SecretKey` accepts `$NAME` /
+// `${NAME}` env-var refs (same resolution chain as MysqlConn.Password).
+type S3Conn struct {
+	// Endpoint URL the SDK dials (e.g. `http://localhost:9000`). Leave
+	// empty to use the AWS-SDK default endpoint for `Region`.
+	Endpoint string `yaml:"endpoint,omitempty"`
+
+	// Region. Defaults to `us-east-1` (the AWS-SDK default that MinIO
+	// and Garage also accept). Required for AWS S3 outside us-east-1.
+	Region string `yaml:"region,omitempty"`
+
+	// Access key id. Literal.
+	AccessKey string `yaml:"access_key,omitempty"`
+
+	// Secret access key. Literal or `$NAME` / `${NAME}` env-var ref.
+	SecretKey string `yaml:"secret_key,omitempty"`
+
+	// Use path-style addressing (`endpoint/bucket/key`). Required for
+	// MinIO and Garage; optional for AWS S3.
+	UsePathStyle bool `yaml:"use_path_style,omitempty"`
+
+	ContainerRef `yaml:",inline"`
+}
+
+func (c *S3Conn) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("s3 connection (line %d): want a mapping", node.Line)
+	}
+	type alias S3Conn
+	return node.Decode((*alias)(c))
+}
+
+func (S3Conn) JSONSchema() *jsonschema.Schema {
+	r := &jsonschema.Reflector{Anonymous: true, ExpandedStruct: true, FieldNameTag: "yaml"}
+	return r.Reflect(&struct {
+		Endpoint     string       `yaml:"endpoint,omitempty"`
+		Region       string       `yaml:"region,omitempty"`
+		AccessKey    string       `yaml:"access_key,omitempty"`
+		SecretKey    string       `yaml:"secret_key,omitempty"`
+		UsePathStyle bool         `yaml:"use_path_style,omitempty"`
+		ContainerRef ContainerRef `yaml:",inline"`
+	}{})
+}
 
 // uriOrMap builds a polymorphic schema for the Mongo/Redis/ES
 // connection blocks: scalar URI string OR a structured object that
@@ -1232,7 +1297,7 @@ type DatabaseConfig struct {
 	// `postgresql` is an alias for `postgres`; `opensearch` is an
 	// alias for `elasticsearch`; `valkey` and `dragonfly` are aliases
 	// for `redis` (same wire protocol, same key-prefix scoping).
-	Engine string `yaml:"engine" jsonschema:"enum=mysql,enum=mariadb,enum=tidb,enum=postgres,enum=postgresql,enum=mongodb,enum=redis,enum=valkey,enum=dragonfly,enum=elasticsearch,enum=opensearch"`
+	Engine string `yaml:"engine" jsonschema:"enum=mysql,enum=mariadb,enum=tidb,enum=postgres,enum=postgresql,enum=mongodb,enum=redis,enum=valkey,enum=dragonfly,enum=elasticsearch,enum=opensearch,enum=s3"`
 
 	// Template for the per-worktree database/index name. Supports
 	// `{slug}`, `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`

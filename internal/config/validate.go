@@ -38,6 +38,9 @@ func (c *Config) Validate() error {
 	if c.Connections.Elasticsearch != nil {
 		errs = appendIfErr(errs, c.Connections.Elasticsearch.validate("connections.elasticsearch"))
 	}
+	if c.Connections.S3 != nil {
+		errs = appendIfErr(errs, c.Connections.S3.validate("connections.s3"))
+	}
 
 	for i := range c.Databases {
 		errs = appendIfErr(errs, c.Databases[i].validate(fmt.Sprintf("databases[%d]", i)))
@@ -230,6 +233,59 @@ func (r ContainerRef) validate(path string) error {
 // rendering stage actually populates. The template checks catch
 // typos (`{target-db}`, `{slag}`, `{n}` outside test_clones) at
 // load time instead of at the first prepare run.
+// validateS3 enforces the object-store constraints for an `engine: s3`
+// database. key_prefix renders the per-worktree bucket name. The object
+// store has no schema, so dump/migrate/seed are rejected (use a
+// postcreate hook to populate). branch_scoped IS supported — each branch
+// keeps its own durable bucket copied server-side — but test_clones
+// (fingerprint-cached snapshot fan-out) is not.
+func (d DatabaseConfig) validateS3(path string) error {
+	if d.KeyPrefix == "" {
+		return fmt.Errorf(
+			"%s: key_prefix is required for engine \"s3\" (renders the per-worktree bucket name; AWS bucket-naming rules apply)",
+			path,
+		)
+	}
+	// Enforce a non-trivial literal prefix (everything before the first
+	// `{` template token). Teardown matches buckets by literal prefix
+	// across the whole AWS account, so a generic "dev" / "test" would
+	// reap unrelated buckets. Mirrors the runtime guard in
+	// s3.Driver.DropMatching.
+	literal := d.KeyPrefix
+	if i := strings.Index(literal, "{"); i >= 0 {
+		literal = literal[:i]
+	}
+	const minLiteral = 6
+	if len(literal) < minLiteral {
+		return fmt.Errorf(
+			"%s: key_prefix literal portion %q is too short (%d < %d) — S3 buckets share an account-wide namespace; use a project-specific literal like \"myapp-{slug}\" so teardown can't reap unrelated buckets",
+			path,
+			literal,
+			len(literal),
+			minLiteral,
+		)
+	}
+	if d.Dump != nil {
+		return fmt.Errorf(
+			"%s: engine \"s3\" does not support `dump:` (object store has no dump format; use a postcreate hook to populate)",
+			path,
+		)
+	}
+	if d.TestClones != nil {
+		return fmt.Errorf("%s: engine \"s3\" does not support `test_clones:` (no snapshot fan-out)", path)
+	}
+	if d.Migrate != nil {
+		return fmt.Errorf(
+			"%s: engine \"s3\" does not support `migrate:` (object stores have no schema; use a postcreate hook to populate)",
+			path,
+		)
+	}
+	if d.Seed != nil {
+		return fmt.Errorf("%s: engine \"s3\" does not support `seed:` (use a postcreate hook to populate the bucket with fixtures)", path)
+	}
+	return nil
+}
+
 func (d DatabaseConfig) validate(path string) error {
 	var errs []error
 	if d.Engine == "" {
@@ -241,6 +297,11 @@ func (d DatabaseConfig) validate(path string) error {
 	}
 	if fam.Scope() == engine.ScopeName && d.NameTemplate == "" {
 		return fmt.Errorf("%s: name_template is required for engine %q (used to compute the per-worktree database name)", path, d.Engine)
+	}
+	if fam == engine.FamilyS3 {
+		if err := d.validateS3(path); err != nil {
+			return err
+		}
 	}
 
 	if d.NameTemplate != "" {

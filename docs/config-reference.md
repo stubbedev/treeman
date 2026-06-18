@@ -56,6 +56,17 @@ connections:
     mongodb: '...'
     redis: '...'
     elasticsearch: '...'
+    s3:
+        endpoint: '...'
+        region: '...'
+        access_key: '...'
+        secret_key: '...'
+        use_path_style: false
+        container: '...'
+        compose_service: '...'
+        compose_project: '...'
+        container_engine: '...'
+        container_network: '...'
 # Snapshot retention/eviction policy for cached post-migration
 snapshots:
     cap_per_repo: 0
@@ -131,6 +142,17 @@ connections:
     mongodb: '...'
     redis: '...'
     elasticsearch: '...'
+    s3:
+        endpoint: '...'
+        region: '...'
+        access_key: '...'
+        secret_key: '...'
+        use_path_style: false
+        container: '...'
+        compose_service: '...'
+        compose_project: '...'
+        container_engine: '...'
+        container_network: '...'
 # Worktree creation behaviour: root path, symlinked mirrors
 worktrees:
     root: '...'
@@ -480,6 +502,13 @@ semantics match MongoDB.
 
 Elasticsearch / OpenSearch connection. HTTP URL form.
 
+#### `s3` *([S3Conn](#s3conn))*
+
+S3-compatible object storage connection (AWS S3, MinIO, Garage,
+Ceph RGW, Backblaze B2, Cloudflare R2, ...). Required when any
+`databases:` entry uses `engine: s3`. One connection serves many
+per-worktree buckets named via the entry's `key_prefix`.
+
 ### CustomFramework
 
 CustomFramework — `frameworks:` entry, lets users declare
@@ -556,7 +585,7 @@ and which sub-fields (dump, migrations, namespaces) are valid.
 alias for `elasticsearch`; `valkey` and `dragonfly` are aliases
 for `redis` (same wire protocol, same key-prefix scoping).
 
-_Allowed: `mysql`, `mariadb`, `tidb`, `postgres`, `postgresql`, `mongodb`, `redis`, `valkey`, `dragonfly`, `elasticsearch`, `opensearch`_
+_Allowed: `mysql`, `mariadb`, `tidb`, `postgres`, `postgresql`, `mongodb`, `redis`, `valkey`, `dragonfly`, `elasticsearch`, `opensearch`, `s3`_
 
 #### `name_template` *(string)*
 
@@ -1049,6 +1078,28 @@ Postgres connection — bare DSN string OR structured object.
 ### RedisConn
 
 redis connection — bare URL string OR structured object.
+
+### S3Conn
+
+#### `endpoint` *(string)*
+
+#### `region` *(string)*
+
+#### `access_key` *(string)*
+
+#### `secret_key` *(string)*
+
+#### `use_path_style` *(boolean)*
+
+#### `container` *(string)*
+
+#### `compose_service` *(string)*
+
+#### `compose_project` *(string)*
+
+#### `container_engine` *(string)*
+
+#### `container_network` *(string)*
 
 ### SnapshotsConfig
 

@@ -22,6 +22,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/engine"
 )
 
@@ -187,6 +188,37 @@ func (c esConn) SizeKB(ctx context.Context, n string) int64 {
 	return b / 1024
 }
 
+// s3Conn — bucket-scoped object store. The aws-sdk client holds no
+// closable handle, so Close is a no-op (like esConn). S3 carries no
+// snapshots (validate.go rejects branch_scoped/test_clones/dump), so
+// DropSnapshot is a no-op and SizeKB is 0 (ListBuckets exposes no cheap
+// per-bucket byte count). Exists/DropMatching/ListMatching map straight
+// onto the bucket-lifecycle driver.
+type s3Conn struct{ d *dbs3.Driver }
+
+func (s3Conn) Close() error                                        { return nil }
+func (c s3Conn) EngineVersion(ctx context.Context) (string, error) { return c.d.EngineVersion(ctx) }
+func (c s3Conn) Exists(ctx context.Context, n string) (bool, error) {
+	return c.d.BucketExists(ctx, n)
+}
+
+func (c s3Conn) DropMatching(ctx context.Context, n string) (int, error) {
+	dropped, err := c.d.DropMatching(ctx, n)
+	return len(dropped), err
+}
+
+// DropSnapshot is a no-op: S3 persists no template (no object-level
+// snapshot model), so the GC sweep never hands us a real template name.
+func (s3Conn) DropSnapshot(context.Context, string) error { return nil }
+
+func (c s3Conn) ListMatching(ctx context.Context, p string) ([]string, error) {
+	return c.d.ListMatching(ctx, p)
+}
+
+// SizeKB is 0 for S3: ListBuckets exposes no per-bucket byte count and a
+// full object walk is too expensive for an inspection probe.
+func (s3Conn) SizeKB(context.Context, string) int64 { return 0 }
+
 // Configured reports whether `fam` has a connection block in cfg —
 // i.e. whether Connect would return configured=true. Lets callers cheaply
 // skip an engine that was never wired up without opening a connection.
@@ -202,6 +234,8 @@ func Configured(cfg *config.Config, fam engine.Family) bool {
 		return cfg.Connections.Redis != nil
 	case engine.FamilyES:
 		return cfg.Connections.Elasticsearch != nil
+	case engine.FamilyS3:
+		return cfg.Connections.S3 != nil
 	}
 	return false
 }
@@ -257,6 +291,15 @@ func Connect(ctx context.Context, cfg *config.Config, fam engine.Family) (conn C
 			return nil, true, e
 		}
 		return esConn{d}, true, nil
+	case engine.FamilyS3:
+		if cfg.Connections.S3 == nil {
+			return nil, false, nil
+		}
+		d, e := dbs3.Connect(ctx, *cfg.Connections.S3)
+		if e != nil {
+			return nil, true, e
+		}
+		return s3Conn{d}, true, nil
 	}
 	return nil, false, nil
 }

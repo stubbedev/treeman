@@ -530,6 +530,7 @@ func ConfigCmd() *cli.Command {
 						printResolved("mongodb", r.Mongodb)
 						printResolved("redis", r.Redis)
 						printResolved("elasticsearch", r.Elasticsearch)
+						printResolved("s3", r.S3)
 					}
 					return nil
 				},

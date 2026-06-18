@@ -38,6 +38,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
@@ -644,6 +645,8 @@ func RunFiltered(
 				o, err = prepareRedis(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			case engine.FamilyES:
 				o, err = prepareES(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+			case engine.FamilyS3:
+				o, err = prepareS3(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			}
 			if err != nil {
 				return err
@@ -2774,6 +2777,91 @@ func prepareES(
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
+}
+
+// prepareS3 prepares the per-worktree S3 bucket.
+//
+// Two modes, gated by `branch_scoped`:
+//   - default (lifecycle-only): EnsureBucket(rendered key_prefix). The
+//     rendered prefix IS the bucket name (bucket-per-worktree model).
+//   - branch_scoped: the bucket's object set is swapped per branch via
+//     the engine-agnostic durable-copy lifecycle (runBranchScoped) —
+//     each branch keeps its own `tmbs-<hash>` durable bucket, captured
+//     on switch-away and restored on switch-back with a server-side
+//     whole-bucket copy. This is the S3 analogue of the mysql/postgres
+//     branch-scoped durable database.
+//
+// `dbs3.ValidateBucketName` enforces AWS naming rules (3-63 chars,
+// lowercase, dns-safe) on the rendered name before hitting the API so a
+// misconfigured template surfaces with a clear treeman-side error, not a
+// downstream `InvalidBucketName` from CreateBucket.
+func prepareS3(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	dbIdx int,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	inheritedEnv map[string]string,
+) (Outcome, error) {
+	if cfg.Connections.S3 == nil {
+		return Outcome{}, errors.New("connections.s3 not configured")
+	}
+	if d.KeyPrefix == "" {
+		return Outcome{}, errors.New("s3: key_prefix required (renders the bucket name)")
+	}
+	drv, err := dbs3.Connect(ctx, *cfg.Connections.S3)
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	if d.BranchScoped {
+		return runBranchScoped(ctx, branchScopedArgs{
+			cfg:          cfg,
+			d:            d,
+			dbIdx:        dbIdx,
+			tplCtx:       tplCtx,
+			worktreePath: worktreePath,
+			st:           st,
+			repoID:       repoID,
+			worktreeID:   worktreeID,
+			inheritedEnv: inheritedEnv,
+			eng: &branchEngine{
+				drv:    s3NS{drv},
+				scope:  scopePrefix,
+				engine: "s3",
+			},
+		})
+	}
+
+	started := time.Now()
+	bucket, err := template.Render(d.KeyPrefix, tplCtx)
+	if err != nil {
+		return Outcome{}, fmt.Errorf("render key_prefix: %w", err)
+	}
+	if err := dbs3.ValidateBucketName(bucket); err != nil {
+		return Outcome{}, fmt.Errorf("s3: rendered key_prefix produced invalid %w (check the template in databases[].key_prefix)", err)
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareStart,
+		"engine=s3 bucket="+bucket,
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine":    "s3",
+			"source_db": bucket,
+		})
+	if err := drv.EnsureBucket(ctx, bucket); err != nil {
+		return Outcome{}, err
+	}
+	ms := time.Since(started).Milliseconds()
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
+		fmt.Sprintf("s3 bucket=%s duration=%dms", bucket, ms),
+		repoID, worktreeID, "", ms, map[string]string{
+			"engine":      "s3",
+			"source_db":   bucket,
+			"duration_ms": strconv.FormatInt(ms, 10),
+		})
+	return Outcome{Engine: "s3", SourceDB: bucket}, nil
 }
 
 // esColdBuildSteps runs the Elasticsearch cold-build populate phase:

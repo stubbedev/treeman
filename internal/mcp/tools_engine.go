@@ -31,6 +31,7 @@ import (
 	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
 	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
+	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/store"
@@ -131,7 +132,7 @@ func engineStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in engineS
 	// written to distinct slice indices (no shared mutation) and the
 	// fixed order is preserved.
 	probes := []func(context.Context, *config.Config) engineProbeResult{
-		probeMySQL, probePostgres, probeMongo, probeRedis, probeES,
+		probeMySQL, probePostgres, probeMongo, probeRedis, probeES, probeS3,
 	}
 	results := make([]engineProbeResult, len(probes))
 	var wg sync.WaitGroup
@@ -255,6 +256,69 @@ func probeES(ctx context.Context, cfg *config.Config) engineProbeResult {
 	return r
 }
 
+func probeS3(ctx context.Context, cfg *config.Config) engineProbeResult {
+	r := engineProbeResult{Engine: "s3"}
+	if cfg.Connections.S3 == nil {
+		return r
+	}
+	r.Configured = true
+	drv, err := dbs3.Connect(ctx, *cfg.Connections.S3)
+	if err != nil {
+		r.Error = err.Error()
+		return r
+	}
+	r.Reachable = true
+	r.Version, _ = drv.EngineVersion(ctx)
+
+	// Restrict the listing to the literal prefix(es) carried by the
+	// configured s3 databases. ListBuckets returns the whole AWS
+	// account, so listing under "" would leak every unrelated bucket
+	// the credentials can see into the MCP response.
+	prefixes := s3LiteralPrefixes(cfg)
+	seen := map[string]bool{}
+	var buckets []string
+	for _, p := range prefixes {
+		matches, err := drv.ListMatching(ctx, p)
+		if err != nil {
+			r.Error = err.Error()
+			return r
+		}
+		for _, b := range matches {
+			if seen[b] {
+				continue
+			}
+			seen[b] = true
+			buckets = append(buckets, b)
+		}
+	}
+	r.Detail = map[string]any{"buckets": buckets, "scanned_prefixes": prefixes}
+	return r
+}
+
+// s3LiteralPrefixes returns the deduplicated literal portion (text
+// before the first `{`) of every `engine: s3` entry's key_prefix.
+// Used by probeS3 to scope ListBuckets so unrelated buckets in the
+// same AWS account don't leak into MCP responses.
+func s3LiteralPrefixes(cfg *config.Config) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, d := range cfg.Databases {
+		if d.Engine != "s3" || d.KeyPrefix == "" {
+			continue
+		}
+		lit := d.KeyPrefix
+		if i := strings.Index(lit, "{"); i >= 0 {
+			lit = lit[:i]
+		}
+		if lit == "" || seen[lit] {
+			continue
+		}
+		seen[lit] = true
+		out = append(out, lit)
+	}
+	return out
+}
+
 // ─── db_schema_dump ─────────────────────────────────────────────────
 
 type dbSchemaIn struct {
@@ -292,6 +356,8 @@ func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchem
 		schema, err = dbSchemaES(ctx, cfg, in.DB)
 	case engine.FamilyRedis:
 		schema, err = dbSchemaRedis(ctx, cfg, in.DB)
+	case engine.FamilyS3:
+		err = fmt.Errorf("engine %q is an object store — it has no schema to dump", in.Engine)
 	}
 	if err != nil {
 		return nil, out, err
@@ -459,6 +525,8 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 		rows, err = dbQueryES(ctx, cfg, in)
 	case engine.FamilyRedis:
 		rows, err = dbQueryRedis(ctx, cfg, in)
+	case engine.FamilyS3:
+		err = fmt.Errorf("engine %q is an object store — it is not queryable; use engine_status to inspect buckets", in.Engine)
 	}
 	if err != nil {
 		return nil, out, err
@@ -1492,6 +1560,11 @@ func probeConnection(ctx context.Context, fam engine.Family, dsn, repo string) (
 		return probeRedisConn(ctx, dsn, repo)
 	case engine.FamilyES:
 		return probeESConn(ctx, dsn, repo)
+	case engine.FamilyS3:
+		// S3 carries no DSN scalar; its reachability is reported by the
+		// engine_status probe (probeS3), which dials via the configured
+		// connection block. Redirect rather than pretend support.
+		return false, "", errors.New("s3 connectivity is reported via engine_status, not db_connect")
 	}
 	return false, "", fmt.Errorf("no probe handler for family %s", fam)
 }
@@ -1732,6 +1805,11 @@ func containerRefForEngine(cfg *config.Config, eng string) (*config.ContainerRef
 			return nil, errors.New("connections.elasticsearch not configured")
 		}
 		ref = &cfg.Connections.Elasticsearch.ContainerRef
+	case engine.FamilyS3:
+		if cfg.Connections.S3 == nil {
+			return nil, errors.New("connections.s3 not configured")
+		}
+		ref = &cfg.Connections.S3.ContainerRef
 	}
 	if ref == nil || (ref.Container == "" && ref.ComposeService == "") {
 		return nil, fmt.Errorf("engine %s has no container/compose ref — check the host engine logs directly", eng)

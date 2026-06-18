@@ -23,6 +23,7 @@ func TestCanonical(t *testing.T) {
 		"dragonfly":     {FamilyRedis, true},
 		"elasticsearch": {FamilyES, true},
 		"opensearch":    {FamilyES, true},
+		"s3":            {FamilyS3, true},
 		"sqlite":        {"", false},
 		"":              {"", false},
 	}
@@ -44,6 +45,7 @@ func TestFamilyScope(t *testing.T) {
 		FamilyMongo:    ScopeName,
 		FamilyRedis:    ScopePrefix,
 		FamilyES:       ScopePrefix,
+		FamilyS3:       ScopePrefix,
 	}
 	for fam, want := range cases {
 		if got := fam.Scope(); got != want {
