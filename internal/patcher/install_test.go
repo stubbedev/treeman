@@ -63,7 +63,7 @@ func TestEnsureFilter_LinkedWorktreeAttributesVisible(t *testing.T) {
 	// The headline assertion: `git check-attr` inside the linked
 	// worktree reports the filter attribute. Pre-fix this returned
 	// "unspecified" because git couldn't see the per-worktree file.
-	out := runCapture(t, linked, "git", "check-attr", "filter", ".env.testing")
+	out := runCapture(t, linked, "check-attr", "filter", ".env.testing")
 	if !strings.Contains(out, "filter: "+FilterName) {
 		t.Fatalf("linked worktree must see filter attribute, got: %q", out)
 	}
@@ -72,7 +72,7 @@ func TestEnsureFilter_LinkedWorktreeAttributesVisible(t *testing.T) {
 	// design; filter falls through to pass-through when the cwd's
 	// config doesn't patch the file). Pin that as well so the next
 	// person who tries to "fix" the bleed knows it's load-bearing.
-	out = runCapture(t, main, "git", "check-attr", "filter", ".env.testing")
+	out = runCapture(t, main, "check-attr", "filter", ".env.testing")
 	if !strings.Contains(out, "filter: "+FilterName) {
 		t.Fatalf("main worktree also sees filter attribute (shared common dir), got: %q", out)
 	}
@@ -132,7 +132,7 @@ func TestEnsureFilter_StripsLegacyPerWorktreeAttributes(t *testing.T) {
 	}
 
 	// Common-dir attrs has the live wiring.
-	out := runCapture(t, linked, "git", "check-attr", "filter", ".env.testing")
+	out := runCapture(t, linked, "check-attr", "filter", ".env.testing")
 	if !strings.Contains(out, "filter: "+FilterName) {
 		t.Fatalf("filter not wired in common dir, got: %q", out)
 	}
@@ -228,6 +228,78 @@ func TestEnsureFilter_ReplacesTreemanBlock(t *testing.T) {
 	}
 }
 
+// TestEnsureFilter_DegradedFilterDoesNotPoisonIndex pins KON-11617:
+// when the clean filter is degraded (treeman not resolvable on the
+// git subprocess PATH), git's `filter.required=false` fallback runs
+// the file through IDENTITY, so `git add --renormalize` would stage
+// the *patched* per-worktree bytes — leaving per-branch DB names
+// commit-ready in the index. EnsureFilter must detect that (staged
+// blob != HEAD), unstage to keep the index at HEAD, and report it
+// instead of silently poisoning the index.
+//
+// The degraded filter is simulated with a fake `treeman` on PATH that
+// echoes stdin verbatim — exactly what git's identity fallback does.
+func TestEnsureFilter_DegradedFilterDoesNotPoisonIndex(t *testing.T) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	tmp := t.TempDir()
+
+	// Fake `treeman`: ignores its `patch-filter clean %f` args and cats
+	// stdin → stdout (identity), reproducing the required=false
+	// passthrough. Keep git resolvable by also putting its dir on PATH.
+	fakeBin := filepath.Join(tmp, "fakebin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "treeman"), []byte("#!/bin/sh\nexec cat\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+filepath.Dir(gitPath))
+
+	repo := filepath.Join(tmp, "repo")
+	mustRun(t, tmp, "init", "-q", "-b", "master", repo)
+	mustRun(t, repo, "config", "user.email", "t@t")
+	mustRun(t, repo, "config", "user.name", "t")
+	const canonical = "DB=app_testing\n"
+	if err := os.WriteFile(filepath.Join(repo, ".env.testing"), []byte(canonical), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, repo, "add", ".env.testing")
+	mustRun(t, repo, "commit", "-q", "-m", "v1")
+
+	// Simulate patcher.Apply having written the per-worktree value.
+	const patched = "DB=app_testing_kon_99\n"
+	if err := os.WriteFile(filepath.Join(repo, ".env.testing"), []byte(patched), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ferr := EnsureFilter(context.Background(), repo, []string{".env.testing"})
+	if ferr == nil {
+		t.Fatal("EnsureFilter must report the degraded filter, got nil")
+	}
+	if !strings.Contains(ferr.Error(), ".env.testing") {
+		t.Errorf("error should name the offending file, got: %v", ferr)
+	}
+
+	// Headline assertion: the index equals HEAD, not the patched
+	// working-tree bytes. Pre-guard this staged "DB=app_testing_kon_99".
+	staged := runCapture(t, repo, "cat-file", "-p", ":.env.testing")
+	if strings.TrimSpace(staged) != strings.TrimSpace(canonical) {
+		t.Fatalf("index poisoned: staged %q, want HEAD %q", staged, canonical)
+	}
+
+	// Degradation is cosmetic: the working tree keeps the patched value.
+	wt, err := os.ReadFile(filepath.Join(repo, ".env.testing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(wt) != patched {
+		t.Errorf("working tree should keep patched content, got %q", wt)
+	}
+}
+
 func mustRun(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -237,13 +309,13 @@ func mustRun(t *testing.T, dir string, args ...string) {
 	}
 }
 
-func runCapture(t *testing.T, dir, name string, args ...string) string {
+func runCapture(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(name, args...)
+	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
 }

@@ -102,11 +102,47 @@ func EnsureFilter(ctx context.Context, worktreePath string, files []string) erro
 	// patched keys. Without this step the stat-cache stays primed
 	// with the patched form and `git pull` refuses with "Your local
 	// changes would be overwritten by merge" — defeating the whole
-	// point of the switch. Errors are non-fatal (e.g. filter program
-	// unreachable, file gitignored) — caller logs and continues.
+	// point of the switch.
+	//
+	// CRITICAL guard against index poisoning: `git add --renormalize`
+	// re-runs the clean filter. When the filter is DEGRADED — `treeman`
+	// not resolvable on the git subprocess PATH (dev-build daemon whose
+	// exe dir has no sibling `treeman`, or a unit with a stock PATH and
+	// no inherited override), or clean errored — git falls back to
+	// IDENTITY (filter.required=false) and the renormalize stages the
+	// *patched* working-tree bytes verbatim: the exact per-worktree
+	// values the filter exists to keep OUT of the index, now sitting
+	// commit-ready. The old code swallowed the add error and never
+	// looked at the result, so this surfaced as per-branch DB names
+	// staged for commit on a fresh worktree (KON-11617) — the failure
+	// the `required=false` comment wrongly called "cosmetic".
+	//
+	// So after each add, diff the freshly-staged blob against HEAD:
+	// `git diff --cached --quiet HEAD -- f` compares index blob to HEAD
+	// blob directly (no working tree, no filter), so the verdict is
+	// reliable even when the filter itself is broken. Exit 0 means the
+	// filter cleaned correctly (staged == HEAD). Non-zero means it
+	// passed patched bytes through — so reset that path's index entry
+	// back to HEAD, keeping the degradation genuinely cosmetic
+	// (working-tree-only), and report it rather than poisoning the
+	// index.
+	var poisoned []string
 	for _, f := range tracked {
-		args := []string{"add", "--renormalize", "--", f}
-		_, _ = gitcmd.OutputRW(ctx, worktreePath, false, args...)
+		if _, err := gitcmd.OutputRW(ctx, worktreePath, false, "add", "--renormalize", "--", f); err != nil {
+			continue // best-effort: gitignored / filter unreachable — nothing staged
+		}
+		if err := gitcmd.RunOptional(ctx, worktreePath, "diff", "--cached", "--quiet", "HEAD", "--", f); err != nil {
+			// Staged content differs from HEAD: the clean filter is not
+			// projecting patched keys back. Unstage so the index never
+			// carries per-worktree values.
+			_, _ = gitcmd.OutputRW(ctx, worktreePath, false, "reset", "-q", "HEAD", "--", f)
+			poisoned = append(poisoned, f)
+		}
+	}
+	if len(poisoned) > 0 {
+		return fmt.Errorf("patch filter degraded: clean produced non-HEAD content for %s "+
+			"(is `treeman` resolvable on the daemon's PATH?); unstaged to keep the index at HEAD",
+			strings.Join(poisoned, ", "))
 	}
 	return nil
 }
