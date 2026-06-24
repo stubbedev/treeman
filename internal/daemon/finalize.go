@@ -136,13 +136,26 @@ func FinalizeWorktree(
 	// where the CLI captured os.Environ() and shipped it via RPC —
 	// that's the canonical source for the worktree's env going
 	// forward.
-	if len(inheritedEnv) > 0 {
-		// A failed save is worth a warning: watcher-driven re-runs
-		// rehydrate PATH etc. from this row, and an empty env quietly
-		// breaks git/hook execution on every later re-prepare.
-		if err := st.Store.SaveInheritedEnv(ctx, wtID, inheritedEnv); err != nil {
-			slog.Warn("save inherited env (watcher re-runs will lack PATH)", "wt", wtRoot, "err", err)
+	saveInheritedEnv(ctx, st, wtID, wtRoot, inheritedEnv)
+
+	// Defer while a conflict-prone git operation is in progress: the
+	// working tree carries conflict markers, so running prepare now
+	// fails against half-merged migration / input files and pins the
+	// worktree to `failed`. Checked BEFORE create:start so status
+	// derives `deferred`, not `failed`/`preparing`. The HEAD watcher
+	// re-fires finalize when the op clears.
+	if deferIfGitOp(ctx, st, "finalize deferred", repoRoot, wtRoot, repoID, wtID) {
+		// Start the HEAD watcher even though we're bailing early —
+		// otherwise a worktree whose FIRST finalize lands mid-merge
+		// (external `git worktree add` during a merge, or daemon
+		// reconcile at boot) would have no watcher to fire the recovery
+		// re-run when the op clears, and stay deferred forever. The
+		// regular path starts it near the end; here it's the only thing
+		// that keeps recovery alive. Idempotent.
+		if err := startWorktreeWatcher(ctx, st, repoRoot, wtRoot); err != nil {
+			slog.Warn("start worktree watcher (deferred)", "wt", wtRoot, "err", err)
 		}
+		return nil
 	}
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateStart,
@@ -241,6 +254,45 @@ func FinalizeWorktree(
 		"daemon-detached setup + prepare complete",
 		repoID, wtID, "", 0, nil)
 	return nil
+}
+
+// saveInheritedEnv caches the user's shell env per-worktree so
+// daemon-driven re-runs (HEAD watcher, file watcher) can rehydrate PATH
+// etc. A failed save is worth a warning: watcher-driven re-runs
+// rehydrate from this row, and an empty env quietly breaks git/hook
+// execution on every later re-prepare. No-op when the env is empty.
+func saveInheritedEnv(ctx context.Context, st *State, wtID int64, wtRoot string, inheritedEnv map[string]string) {
+	if len(inheritedEnv) == 0 {
+		return
+	}
+	if err := st.Store.SaveInheritedEnv(ctx, wtID, inheritedEnv); err != nil {
+		slog.Warn("save inherited env (watcher re-runs will lack PATH)", "wt", wtRoot, "err", err)
+	}
+}
+
+// deferIfGitOp reports whether a conflict-prone git operation
+// (merge / rebase / cherry-pick / revert) is in progress in wtRoot. When
+// one is, it records a worktree:create:deferred marker — info level, NOT
+// an error — and returns true so the caller bails before prepare touches
+// the conflicted tree. Returning a deferred marker (rather than letting
+// prepare fail) is what keeps the worktree out of the `failed` bucket;
+// the HEAD watcher re-runs finalize when the op clears. `reason`
+// distinguishes the initial-create vs watch-trigger call sites in the
+// event message.
+func deferIfGitOp(ctx context.Context, st *State, reason, repoRoot, wtRoot string, repoID, wtID int64) bool {
+	op := worktreeGitOp(wtRoot)
+	if op == "" {
+		return false
+	}
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateDeferred,
+		reason+": git "+op+" in progress",
+		repoID, wtID, "", 0, map[string]string{
+			"op":            op,
+			"repo_path":     repoRoot,
+			"worktree_path": wtRoot,
+		})
+	slog.Info(reason+" (git op in progress)", "wt", wtRoot, "op", op)
+	return true
 }
 
 // bringInWithEvents runs the link + copy bring-in passes for a non-main
@@ -488,6 +540,15 @@ func FinalizeWorktreeForWatch(
 		return err
 	}
 	sl, wtID := id.Slug, id.WtID
+
+	// Same defer guard as FinalizeWorktree: a merge/rebase writes
+	// conflict markers into tracked input files, which trips this
+	// watcher path. Re-preparing against `<<<<<<<`-laced migrations
+	// fails and pins the worktree to `failed`. Skip; the HEAD watcher
+	// re-runs the full finalize once the op clears.
+	if deferIfGitOp(ctx, st, "watch re-prepare deferred", repoRoot, wtRoot, repoID, wtID) {
+		return nil
+	}
 
 	// Re-apply patches. Cheap; idempotent for unchanged content.
 	// Skipped for the main worktree — see FinalizeWorktree for why

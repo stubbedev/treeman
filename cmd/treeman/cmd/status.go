@@ -191,6 +191,7 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 		WorktreeID: wtID,
 		EventTypes: []string{
 			store.EvtWorktreeCreateStart, store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError,
+			store.EvtWorktreeCreateDeferred,
 			store.EvtWorktreeDeleteStart, store.EvtWorktreeDeleteEnd,
 			store.EvtWorktreeReapStart, store.EvtWorktreeReapEnd,
 			// A standalone prepare_run (manual or via repair) emits
@@ -208,6 +209,10 @@ func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state
 	switch last := rows[0]; last.EventType {
 	case store.EvtWorktreeCreateStart:
 		return "preparing", bucketUp
+	case store.EvtWorktreeCreateDeferred:
+		// Prepare on hold for an in-progress merge/rebase — healthy,
+		// not failed. Distinct state, stable bucket.
+		return "deferred", bucketStable
 	case store.EvtWorktreeCreateError, store.EvtPrepareError:
 		if last.Level == store.LevelError {
 			return "error", bucketFailed

@@ -34,6 +34,7 @@ type HeadWatcher struct {
 	debounce time.Duration
 	mu       sync.Mutex
 	lastSeen string
+	lastOp   string // last observed in-progress git op (merge/rebase/…), "" when clean
 	pending  *time.Timer
 	fsw      *fsnotify.Watcher
 }
@@ -105,12 +106,18 @@ func (h *HeadWatcher) Start(ctx context.Context) error {
 	}
 
 	// Seed lastSeen with the initial HEAD so the first real edit is
-	// the first dispatched change.
+	// the first dispatched change. Seed lastOp too (h.headDir IS the
+	// per-worktree git dir, where the op markers live) so a merge
+	// already in progress at boot is recognised as the "busy" baseline
+	// — its later clear then dispatches the recovery re-run.
 	if v, err := os.ReadFile(h.headPath); err == nil {
 		h.mu.Lock()
 		h.lastSeen = strings.TrimSpace(string(v))
 		h.mu.Unlock()
 	}
+	h.mu.Lock()
+	h.lastOp = gitOpInProgress(h.headDir)
+	h.mu.Unlock()
 
 	for {
 		select {
@@ -120,14 +127,20 @@ func (h *HeadWatcher) Start(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			// Only events touching HEAD are interesting. fsnotify
-			// reports the post-rename name on macOS / Linux when git
-			// does its tmp + rename dance, so basename matching is
-			// reliable in practice.
-			if filepath.Base(ev.Name) != h.headName {
+			// HEAD edits AND git-op markers (MERGE_HEAD, rebase-*/,
+			// CHERRY_PICK_HEAD, REVERT_HEAD) are interesting — the
+			// markers live in this same dir and signal the start/clear
+			// of a merge/rebase. fsnotify reports the post-rename name
+			// on macOS / Linux when git does its tmp + rename dance, so
+			// basename matching is reliable in practice.
+			base := filepath.Base(ev.Name)
+			if base != h.headName && !isGitOpMarker(base) {
 				continue
 			}
-			if ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) == 0 {
+			// Remove matters here: a `git merge --abort` (or the commit
+			// that finishes a merge) deletes MERGE_HEAD, and that clear
+			// is the trigger for the recovery re-run.
+			if ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename|fsnotify.Remove) == 0 {
 				continue
 			}
 			h.schedule(ctx)
@@ -155,19 +168,40 @@ func (h *HeadWatcher) schedule(ctx context.Context) {
 }
 
 func (h *HeadWatcher) fire(ctx context.Context) {
-	v, err := os.ReadFile(h.headPath)
-	if err != nil {
-		return
+	cur := ""
+	if v, err := os.ReadFile(h.headPath); err == nil {
+		cur = strings.TrimSpace(string(v))
 	}
-	cur := strings.TrimSpace(string(v))
+	curOp := gitOpInProgress(h.headDir)
+
 	h.mu.Lock()
-	if cur == h.lastSeen {
-		h.mu.Unlock()
-		return
+	prev, prevOp := h.lastSeen, h.lastOp
+	headChanged := cur != "" && cur != prev
+	if cur != "" {
+		h.lastSeen = cur
 	}
-	prev := h.lastSeen
-	h.lastSeen = cur
+	h.lastOp = curOp
 	h.mu.Unlock()
-	slog.Info("head changed", "wt", h.worktreePath, "from", prev, "to", cur)
-	h.onChange(ctx, cur)
+
+	switch {
+	case curOp != "":
+		// A merge/rebase is now in progress. Suppress the dispatch —
+		// finalize would defer against the conflicted tree anyway, and
+		// the recovery comes when the op clears. Tracking lastOp here is
+		// what makes that later clear observable.
+		slog.Info("head watcher: git op in progress, deferring re-run",
+			"wt", h.worktreePath, "op", curOp)
+	case prevOp != "":
+		// Op just cleared (curOp == "" here). `git merge --abort`
+		// restores the original commit so HEAD never moves — without
+		// this branch a deferred/failed worktree would stay stuck. A
+		// resolve+commit moves HEAD too, but firing once on the clear
+		// is correct either way (finalize is idempotent).
+		slog.Info("head watcher: git op cleared, re-running finalize",
+			"wt", h.worktreePath, "from_op", prevOp, "head", cur)
+		h.onChange(ctx, cur)
+	case headChanged:
+		slog.Info("head changed", "wt", h.worktreePath, "from", prev, "to", cur)
+		h.onChange(ctx, cur)
+	}
 }

@@ -109,6 +109,60 @@ func TestHeadWatcherDebouncesRapidChanges(t *testing.T) {
 	}
 }
 
+// TestHeadWatcherDefersAndRecoversOnGitOp simulates a conflicted merge:
+// while MERGE_HEAD exists the watcher must NOT dispatch (finalize would
+// only fail against the conflicted tree), and when MERGE_HEAD clears —
+// without HEAD ever moving, as in `git merge --abort` — it must fire
+// exactly once so the worktree re-prepares and recovers.
+func TestHeadWatcherDefersAndRecoversOnGitOp(t *testing.T) {
+	requireGitHW(t)
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	run("commit", "--allow-empty", "-m", "init")
+	gitDir := filepath.Join(repo, ".git")
+	mergeHead := filepath.Join(gitDir, "MERGE_HEAD")
+
+	var fired atomic.Int32
+	hw, err := NewHeadWatcher(repo, 50*time.Millisecond, func(_ context.Context, _ string) {
+		fired.Add(1)
+	})
+	if err != nil {
+		t.Fatalf("NewHeadWatcher: %v", err)
+	}
+	ctx := t.Context()
+	defer hw.Stop()
+	go func() { _ = hw.Start(ctx) }()
+	// Let Start subscribe + seed the clean baseline (lastSeen + lastOp).
+	time.Sleep(100 * time.Millisecond)
+
+	// Merge in progress — HEAD unchanged, MERGE_HEAD appears.
+	if err := os.WriteFile(mergeHead, []byte("deadbeef\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if n := fired.Load(); n != 0 {
+		t.Fatalf("fired = %d while merge in progress, want 0 (deferred)", n)
+	}
+
+	// Abort/resolve — MERGE_HEAD removed, HEAD still unchanged.
+	if err := os.Remove(mergeHead); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if n := fired.Load(); n != 1 {
+		t.Errorf("fired = %d after merge cleared, want 1 (recovery re-run)", n)
+	}
+}
+
 func contains(haystack, needle string) bool {
 	for i := 0; i+len(needle) <= len(haystack); i++ {
 		if haystack[i:i+len(needle)] == needle {

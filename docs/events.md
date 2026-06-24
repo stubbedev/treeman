@@ -138,6 +138,7 @@ that emits it.
 | `worktree:create:end` | `store.EvtWorktreeCreateEnd` |
 | `worktree:create:error` | `store.EvtWorktreeCreateError` |
 | `worktree:create:cancel` | `store.EvtWorktreeCreateCancel` |
+| `worktree:create:deferred` | `store.EvtWorktreeCreateDeferred` |
 | `worktree:delete:start` | `store.EvtWorktreeDeleteStart` |
 | `worktree:delete:end` | `store.EvtWorktreeDeleteEnd` |
 | `worktree:delete:error` | `store.EvtWorktreeDeleteError` |

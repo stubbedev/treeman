@@ -512,8 +512,13 @@ func finalizeStateShort(ctx context.Context, st *store.Store, wtID int64) string
 func finalizeState(ctx context.Context, st *store.Store, wtID int64) (state, detail string) {
 	rows, _ := st.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{store.EvtWorktreeCreateStart, store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError},
-		Limit:      1,
+		EventTypes: []string{
+			store.EvtWorktreeCreateStart,
+			store.EvtWorktreeCreateEnd,
+			store.EvtWorktreeCreateError,
+			store.EvtWorktreeCreateDeferred,
+		},
+		Limit: 1,
 	})
 	if len(rows) == 0 {
 		return ui.Status("ready"), ""
@@ -524,6 +529,8 @@ func finalizeState(ctx context.Context, st *store.Store, wtID int64) (state, det
 		return ui.Status("ready"), "(last finalize " + formatTs(last.Ts) + ")"
 	case store.EvtWorktreeCreateStart:
 		return ui.Status("preparing"), "(started " + formatTs(last.Ts) + ")"
+	case store.EvtWorktreeCreateDeferred:
+		return ui.Status("deferred"), "— " + last.Message
 	case store.EvtWorktreeCreateError:
 		if last.Level == store.LevelError {
 			return ui.Status("error"), "— " + last.Message

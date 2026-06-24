@@ -132,7 +132,7 @@ func Status(s string) string {
 		return Green(s)
 	case "stopped", "deleted", "gone":
 		return Gray(s)
-	case "preparing", "pending", "queued":
+	case "preparing", "pending", "queued", "deferred":
 		return Yellow(s)
 	case "error", "broken", "failed":
 		return Red(s)

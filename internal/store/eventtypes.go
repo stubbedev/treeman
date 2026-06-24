@@ -100,6 +100,7 @@ const (
 	EvtWorktreeCreateEnd      = "worktree:create:end"
 	EvtWorktreeCreateError    = "worktree:create:error"
 	EvtWorktreeCreateCancel   = "worktree:create:cancel"
+	EvtWorktreeCreateDeferred = "worktree:create:deferred"
 	EvtWorktreeDeleteStart    = "worktree:delete:start"
 	EvtWorktreeDeleteEnd      = "worktree:delete:end"
 	EvtWorktreeDeleteError    = "worktree:delete:error"
