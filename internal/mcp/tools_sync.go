@@ -71,7 +71,7 @@ type syncStatusOut struct {
 func syncStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in syncStatusIn) (*mcpsdk.CallToolResult, syncStatusOut, error) {
 	repoRoot := ""
 	if in.Repo != "" {
-		root, err := resolveRepo(in.Repo)
+		root, err := resolveRepo(ctx, in.Repo)
 		if err != nil {
 			return nil, syncStatusOut{}, err
 		}

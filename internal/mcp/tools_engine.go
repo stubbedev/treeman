@@ -122,7 +122,7 @@ type engineProbeResult struct {
 }
 
 func engineStatusTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in engineStatusIn) (*mcpsdk.CallToolResult, engineStatusOut, error) {
-	cfg, err := loadCfgForRepo(in.Repo)
+	cfg, err := loadCfgForRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, engineStatusOut{}, err
 	}
@@ -335,7 +335,7 @@ type dbSchemaOut struct {
 }
 
 func dbSchemaDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSchemaIn) (*mcpsdk.CallToolResult, dbSchemaOut, error) {
-	cfg, err := loadCfgForRepo(in.Repo)
+	cfg, err := loadCfgForRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, dbSchemaOut{}, err
 	}
@@ -502,7 +502,7 @@ func dbQueryTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbQueryIn) (
 	if in.Write && !in.Ack {
 		return nil, dbQueryOut{}, errors.New("write=true requires ack=true (you are about to mutate live engine data)")
 	}
-	cfg, err := loadCfgForRepo(in.Repo)
+	cfg, err := loadCfgForRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, dbQueryOut{}, err
 	}
@@ -819,7 +819,7 @@ func esRequestTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in esRequestI
 			return nil, esRequestOut{}, errors.New("write=true requires ack=true (you are about to mutate the live cluster)")
 		}
 	}
-	cfg, err := loadCfgForRepo(in.Repo)
+	cfg, err := loadCfgForRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, esRequestOut{}, err
 	}
@@ -932,7 +932,7 @@ func snapshotInspectTool(
 	}
 	out := snapshotInspectOut{Record: snapshotRecordToMap(rec)}
 
-	cfg, err := loadCfgForRepo(in.Repo)
+	cfg, err := loadCfgForRepo(ctx, in.Repo)
 	if err == nil {
 		out.TemplateExists, out.TemplateSizeKB, out.EngineVersionNow = probeTemplate(ctx, cfg, rec.Engine, rec.TemplateName)
 	}
@@ -1002,7 +1002,7 @@ func snapshotDropTool(
 		return nil, out, nil
 	}
 
-	cfg, cfgErr := loadCfgForRepo(in.Repo)
+	cfg, cfgErr := loadCfgForRepo(ctx, in.Repo)
 	if cfgErr != nil {
 		out.EngineDropErr = "load config: " + cfgErr.Error()
 		return nil, out, fmt.Errorf("load config: %w", cfgErr)
@@ -1084,13 +1084,13 @@ type dbDumpOut struct {
 }
 
 func dbDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbDumpIn) (*mcpsdk.CallToolResult, dbDumpOut, error) {
-	cfg, err := loadCfgForRepo(in.Repo)
+	cfg, err := loadCfgForRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, dbDumpOut{}, err
 	}
 	outDir := in.OutputDir
 	if outDir == "" {
-		repoRoot, _ := resolveRepo(in.Repo)
+		repoRoot, _ := resolveRepo(ctx, in.Repo)
 		outDir = filepath.Join(repoRoot, "storage", "dumps")
 	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
@@ -1137,8 +1137,8 @@ func dbDumpTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbDumpIn) (*m
 
 // ─── helpers ────────────────────────────────────────────────────────
 
-func loadCfgForRepo(repo string) (*config.Config, error) {
-	repoRoot, err := resolveRepo(repo)
+func loadCfgForRepo(ctx context.Context, repo string) (*config.Config, error) {
+	repoRoot, err := resolveRepo(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -1576,7 +1576,7 @@ func probeMySQLConn(ctx context.Context, dsn, repo string) (bool, string, error)
 			return false, "", err
 		}
 	} else {
-		c, err := loadCfgForRepo(repo)
+		c, err := loadCfgForRepo(ctx, repo)
 		if err != nil {
 			return false, "", err
 		}
@@ -1601,7 +1601,7 @@ func probePostgresConn(ctx context.Context, dsn, repo string) (bool, string, err
 			return false, "", err
 		}
 	} else {
-		c, err := loadCfgForRepo(repo)
+		c, err := loadCfgForRepo(ctx, repo)
 		if err != nil {
 			return false, "", err
 		}
@@ -1624,7 +1624,7 @@ func probeMongoConn(ctx context.Context, dsn, repo string) (bool, string, error)
 	if dsn != "" {
 		cfg.URI = dsn
 	} else {
-		c, err := loadCfgForRepo(repo)
+		c, err := loadCfgForRepo(ctx, repo)
 		if err != nil {
 			return false, "", err
 		}
@@ -1647,7 +1647,7 @@ func probeRedisConn(ctx context.Context, dsn, repo string) (bool, string, error)
 	if dsn != "" {
 		cfg.URL = dsn
 	} else {
-		c, err := loadCfgForRepo(repo)
+		c, err := loadCfgForRepo(ctx, repo)
 		if err != nil {
 			return false, "", err
 		}
@@ -1670,7 +1670,7 @@ func probeESConn(ctx context.Context, dsn, repo string) (bool, string, error) {
 	if dsn != "" {
 		cfg.URL = dsn
 	} else {
-		c, err := loadCfgForRepo(repo)
+		c, err := loadCfgForRepo(ctx, repo)
 		if err != nil {
 			return false, "", err
 		}
@@ -1715,7 +1715,7 @@ func engineLogsTool(
 	_ *mcpsdk.CallToolRequest,
 	in engineLogsIn,
 ) (*mcpsdk.CallToolResult, engineLogsOut, error) {
-	cfg, err := loadCfgForRepo(in.Repo)
+	cfg, err := loadCfgForRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, engineLogsOut{}, err
 	}

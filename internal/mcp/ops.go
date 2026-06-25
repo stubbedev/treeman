@@ -62,25 +62,53 @@ func redactSecrets(s string) string {
 	return out
 }
 
-// resolveRepo returns the absolute repo root inferred from an
-// explicit override or the cwd. Mirrors cmd's resolveRepo so this
-// package can run without importing the cmd tree.
-func resolveRepo(override string) (string, error) {
+// resolveRepo returns the absolute repo root for the current request.
+// The source is chosen by precedence (highest first):
+//
+//   - explicit override (a tool's `repo` param)
+//   - the request's workspace root (HTTP header or MCP roots/list),
+//     carried on ctx by installContextMiddleware
+//   - the process cwd (the stdio transport's single-client default)
+//
+// The header/roots step is what lets one HTTP server instance serve many
+// concurrent clients, each pinned to its own checkout, without a shared
+// process cwd. Over stdio no resolver is set, so this falls through to
+// os.Getwd() exactly as before.
+func resolveRepo(ctx context.Context, override string) (string, error) {
 	if override != "" {
 		abs, err := filepath.Abs(override)
 		if err != nil {
 			return "", err
 		}
-		// MainRoot is a fast local git probe; resolveRepo has ~37 callers
-		// across the mcp tool handlers, so Background avoids cascading a
-		// ctx param through all of them for what is a local lookup.
-		return gitenv.MainRoot(context.Background(), abs)
+		return gitenv.MainRoot(ctx, abs)
 	}
-	cwd, err := os.Getwd()
+	dir, err := requestCwd(ctx)
 	if err != nil {
 		return "", err
 	}
-	return gitenv.MainRoot(context.Background(), cwd)
+	return gitenv.MainRoot(ctx, dir)
+}
+
+// requestCwd is the directory a bare (override-less) worktree/repo lookup
+// resolves against for this request: the request's workspace root when one
+// was supplied (HTTP header or MCP roots), else the process cwd.
+//
+// Over HTTP there is no meaningful process cwd — it would be wherever the
+// shared daemon was launched (e.g. a systemd WorkingDirectory), which has
+// nothing to do with the requesting client. So when no root was supplied
+// over HTTP this errors rather than silently resolving against the daemon's
+// directory. Over stdio (one client per process) os.Getwd() is the right
+// default, as before.
+func requestCwd(ctx context.Context) (string, error) {
+	if root := rootDirFromCtx(ctx); root != "" {
+		return filepath.Abs(root)
+	}
+	if r := resolverFrom(ctx); r != nil && r.httpMode {
+		return "", fmt.Errorf(
+			"no workspace root for this request: pass a repo/worktree argument, set the X-Repo-Root header, or expose an MCP root",
+		)
+	}
+	return os.Getwd()
 }
 
 // resolveWorktree maps the MCP `worktree` argument to an absolute
@@ -96,9 +124,11 @@ func resolveRepo(override string) (string, error) {
 // <cwd>/develop — a non-existent path that downstream registration
 // would otherwise persist as a phantom worktree row (plus per-branch
 // databases that no teardown reclaims). Branch is read from .git/HEAD.
-func resolveWorktree(path string) (wt, branch string) {
+func resolveWorktree(ctx context.Context, path string) (wt, branch string) {
 	if path == "" {
-		path, _ = os.Getwd()
+		// Default to the request's workspace root (HTTP header / MCP
+		// roots) and only then the process cwd — see resolveRepo.
+		path, _ = requestCwd(ctx)
 		wt, _ = filepath.Abs(path)
 		return wt, detectBranch(wt)
 	}
@@ -110,10 +140,10 @@ func resolveWorktree(path string) (wt, branch string) {
 	}
 	// Not an on-disk path: try resolving it as a registered worktree
 	// name (slug / branch / basename) against the repo inferred from
-	// cwd. Local-only lookup, so a Background context is fine.
-	if cwd, err := os.Getwd(); err == nil {
-		if repoRoot, err := gitenv.MainRoot(context.Background(), cwd); err == nil {
-			if p, ok := wtpkg.LookupWorktree(context.Background(), repoRoot, path, wtpkg.NoopSink{}); ok {
+	// the request's workspace root (or cwd over stdio).
+	if cwd, err := requestCwd(ctx); err == nil {
+		if repoRoot, err := gitenv.MainRoot(ctx, cwd); err == nil {
+			if p, ok := wtpkg.LookupWorktree(ctx, repoRoot, path, wtpkg.NoopSink{}); ok {
 				return p, detectBranch(p)
 			}
 		}
@@ -194,8 +224,8 @@ func openStore(ctx context.Context) (*store.Store, error) {
 // RunPrepareOnWorktree. Discovers repo + cfg, opens the store,
 // dispatches prepare.Run.
 func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.Outcome, error) {
-	wt, branch := resolveWorktree(worktree)
-	repoRoot, err := resolveRepo(repoOverride)
+	wt, branch := resolveWorktree(ctx, worktree)
+	repoRoot, err := resolveRepo(ctx, repoOverride)
 	if err != nil {
 		repoRoot, err = gitenv.MainRoot(ctx, wt)
 		if err != nil {
@@ -231,8 +261,8 @@ func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.O
 // restricts the reset to one engine family when non-empty. Returns only
 // the branch_scoped outcomes the reset actually re-seeded.
 func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.Outcome, error) {
-	wt, branch := resolveWorktree(worktree)
-	repoRoot, err := resolveRepo(repoOverride)
+	wt, branch := resolveWorktree(ctx, worktree)
+	repoRoot, err := resolveRepo(ctx, repoOverride)
 	if err != nil {
 		repoRoot, err = gitenv.MainRoot(ctx, wt)
 		if err != nil {
@@ -299,8 +329,8 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 // namespace renders the same name the swap lifecycle uses (bare on the
 // main worktree).
 func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) ([]prepare.BranchScopedDB, error) {
-	wt, branch := resolveWorktree(worktree)
-	repoRoot, err := resolveRepo(repoOverride)
+	wt, branch := resolveWorktree(ctx, worktree)
+	repoRoot, err := resolveRepo(ctx, repoOverride)
 	if err != nil {
 		repoRoot, err = gitenv.MainRoot(ctx, wt)
 		if err != nil {
@@ -374,7 +404,7 @@ func confirmDestructive(
 // tweak one var (e.g. retry a flaky setup with `DEBUG=1`) without
 // editing .treeman.yaml.
 func runHookPhase(ctx context.Context, phase, worktree string, envOverrides map[string]string) (hooks.RunOutcome, error) {
-	wt, branch := resolveWorktree(worktree)
+	wt, branch := resolveWorktree(ctx, worktree)
 	repoRoot, err := gitenv.MainRoot(ctx, wt)
 	if err != nil {
 		return hooks.RunOutcome{}, err

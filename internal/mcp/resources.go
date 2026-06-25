@@ -84,8 +84,8 @@ func registerResources(srv *mcpsdk.Server) {
 	}, repoBranchesResource)
 }
 
-func rawConfigResource(_ context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
-	repoRoot, err := resolveRepo("")
+func rawConfigResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+	repoRoot, err := resolveRepo(ctx, "")
 	if err != nil {
 		return nil, mcpsdk.ResourceNotFoundError(req.Params.URI)
 	}
@@ -99,8 +99,8 @@ func rawConfigResource(_ context.Context, req *mcpsdk.ReadResourceRequest) (*mcp
 	}, nil
 }
 
-func resolvedConfigResource(_ context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
-	repoRoot, err := resolveRepo("")
+func resolvedConfigResource(ctx context.Context, req *mcpsdk.ReadResourceRequest) (*mcpsdk.ReadResourceResult, error) {
+	repoRoot, err := resolveRepo(ctx, "")
 	if err != nil {
 		return nil, mcpsdk.ResourceNotFoundError(req.Params.URI)
 	}

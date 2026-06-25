@@ -123,11 +123,11 @@ func worktreeFinalizeTool(
 	_ *mcpsdk.CallToolRequest,
 	in worktreeFinalizeIn,
 ) (*mcpsdk.CallToolResult, worktreeFinalizeOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, worktreeFinalizeOut{}, err
 	}
-	wtPath, _ := resolveWorktree(in.Worktree)
+	wtPath, _ := resolveWorktree(ctx, in.Worktree)
 	if wtPath == "" {
 		wtPath = repoRoot
 	}
@@ -164,7 +164,7 @@ type mainWorktreeOut struct {
 }
 
 func mainWorktreeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in mainWorktreeIn) (*mcpsdk.CallToolResult, mainWorktreeOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, mainWorktreeOut{}, err
 	}

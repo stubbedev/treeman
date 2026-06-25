@@ -265,11 +265,11 @@ type configWriteOut struct {
 	Bytes int    `json:"bytes"`
 }
 
-func configWriteTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configWriteIn) (*mcpsdk.CallToolResult, configWriteOut, error) {
+func configWriteTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configWriteIn) (*mcpsdk.CallToolResult, configWriteOut, error) {
 	if in.Body == "" {
 		return nil, configWriteOut{}, errors.New("body is required")
 	}
-	target, histRoot, layer, err := resolveConfigTarget(in.Scope, in.Repo)
+	target, histRoot, layer, err := resolveConfigTarget(ctx, in.Scope, in.Repo)
 	if err != nil {
 		return nil, configWriteOut{}, err
 	}
@@ -333,7 +333,7 @@ type initOut struct {
 	Detected []string `json:"detected,omitempty"`
 }
 
-func initRepoTool(_ context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*mcpsdk.CallToolResult, initOut, error) {
+func initRepoTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*mcpsdk.CallToolResult, initOut, error) {
 	if in.Global {
 		target, created, body, err := initgen.WriteGlobalYAML(in.Force)
 		if err != nil {
@@ -352,7 +352,7 @@ func initRepoTool(_ context.Context, _ *mcpsdk.CallToolRequest, in initIn) (*mcp
 		}
 		return nil, out, nil
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, initOut{}, fmt.Errorf("resolve repo: %w", err)
 	}
@@ -386,8 +386,12 @@ type schemaInstallOut struct {
 	WroteFile       bool   `json:"wrote_file"`
 }
 
-func schemaInstallTool(_ context.Context, _ *mcpsdk.CallToolRequest, in schemaInstallIn) (*mcpsdk.CallToolResult, schemaInstallOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+func schemaInstallTool(
+	ctx context.Context,
+	_ *mcpsdk.CallToolRequest,
+	in schemaInstallIn,
+) (*mcpsdk.CallToolResult, schemaInstallOut, error) {
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, schemaInstallOut{}, err
 	}
@@ -446,7 +450,7 @@ func registryRegisterTool(
 	if err != nil {
 		return nil, registryRegisterOut{}, fmt.Errorf("abs %s: %w", in.Path, err)
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, registryRegisterOut{}, err
 	}
@@ -503,7 +507,7 @@ func registryUnregisterTool(
 	if in.Name == "" {
 		return nil, registryUnregisterOut{}, errors.New("name is required")
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, registryUnregisterOut{}, err
 	}
@@ -575,7 +579,7 @@ func repoRemoveTool(
 	req *mcpsdk.CallToolRequest,
 	in repoRemoveIn,
 ) (*mcpsdk.CallToolResult, repoRemoveOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, repoRemoveOut{}, err
 	}
@@ -651,7 +655,7 @@ func registryRepairTool(
 	_ *mcpsdk.CallToolRequest,
 	in registryRepairIn,
 ) (*mcpsdk.CallToolResult, wtreg.RepairResult, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, wtreg.RepairResult{}, err
 	}
@@ -691,7 +695,7 @@ func snapshotsPurgeTool(
 	req *mcpsdk.CallToolRequest,
 	in snapshotsPurgeIn,
 ) (*mcpsdk.CallToolResult, snapshotsPurgeOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, snapshotsPurgeOut{}, err
 	}
@@ -844,7 +848,7 @@ func worktreeCreateTool(
 	if in.Branch == "" {
 		return nil, wt.CreateResult{}, errors.New("branch is required")
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, wt.CreateResult{}, fmt.Errorf("resolve repo: %w", err)
 	}
@@ -925,7 +929,7 @@ func worktreeDeleteTool(
 	if in.Name == "" {
 		return nil, worktreeDeleteResult{}, errors.New("name is required")
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, worktreeDeleteResult{}, fmt.Errorf("resolve repo: %w", err)
 	}
@@ -1066,11 +1070,11 @@ func decodePrevJSON(prev *yaml.Node) string {
 	return string(b)
 }
 
-func configSetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configSetIn) (*mcpsdk.CallToolResult, configSetOut, error) {
+func configSetTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configSetIn) (*mcpsdk.CallToolResult, configSetOut, error) {
 	if in.Path == "" {
 		return nil, configSetOut{}, errors.New("path is required")
 	}
-	p, histRoot, layer, err := resolveConfigTarget(in.Scope, in.Repo)
+	p, histRoot, layer, err := resolveConfigTarget(ctx, in.Scope, in.Repo)
 	if err != nil {
 		return nil, configSetOut{}, err
 	}
@@ -1150,7 +1154,7 @@ func configRestoreTool(
 	_ *mcpsdk.CallToolRequest,
 	in configRestoreIn,
 ) (*mcpsdk.CallToolResult, configRestoreOut, error) {
-	p, histRoot, layer, err := resolveConfigTarget(in.Scope, in.Repo)
+	p, histRoot, layer, err := resolveConfigTarget(ctx, in.Scope, in.Repo)
 	if err != nil {
 		return nil, configRestoreOut{}, err
 	}
@@ -1217,8 +1221,8 @@ func worktreeRepairTool(
 	_ *mcpsdk.CallToolRequest,
 	in worktreeRepairIn,
 ) (*mcpsdk.CallToolResult, worktreeRepairOut, error) {
-	wtPath, _ := resolveWorktree(in.Worktree)
-	repoRoot, err := resolveRepo(in.Repo)
+	wtPath, _ := resolveWorktree(ctx, in.Worktree)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, worktreeRepairOut{}, err
 	}

@@ -58,6 +58,14 @@ func buildServer() (*mcpsdk.Server, []*toolEntry) {
 	defer buildMu.Unlock()
 	pendingTools = nil
 
+	// Per-request workspace-root resolution. Derives repo/worktree
+	// context from HTTP headers or the client's MCP roots so a single
+	// server instance can serve many concurrent clients over HTTP
+	// without a shared process cwd. Over stdio there are no headers; a
+	// roots-capable client (e.g. Claude Code) still pins context via
+	// roots/list, otherwise resolution falls back to os.Getwd().
+	installContextMiddleware(srv)
+
 	registerReadTools(srv)
 	registerResources(srv)
 	registerWriteTools(srv)

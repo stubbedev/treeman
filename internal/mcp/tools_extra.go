@@ -225,7 +225,7 @@ func subscribePushPath(
 	timeout time.Duration,
 	progressToken any,
 ) (logsSubscribeOut, bool) {
-	resolvedRepo, _ := resolveRepo(in.Repo)
+	resolvedRepo, _ := resolveRepo(ctx, in.Repo)
 	resolvedWT, _ := resolveWorktreePath(ctx, resolvedRepo, in.Worktree)
 
 	// Compute the same Anchor poll mode reports. Required so agents
@@ -532,7 +532,7 @@ func branchesListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in branche
 // branches_list tool and the treeman://repos/{repo}/branches
 // resource. limit≤0 → default 200, capped at 1000.
 func collectRepoBranches(ctx context.Context, repo string, limit int) (branchesListOut, error) {
-	repoRoot, err := resolveRepo(repo)
+	repoRoot, err := resolveRepo(ctx, repo)
 	if err != nil {
 		return branchesListOut{}, err
 	}
@@ -654,7 +654,7 @@ func configDiffTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configDif
 		if in.Scope != "" && !strings.EqualFold(in.Scope, "repo") {
 			return nil, configDiffOut{}, fmt.Errorf("invalid scope %q (want repo|global)", in.Scope)
 		}
-		repoRoot, err := resolveRepo(in.Repo)
+		repoRoot, err := resolveRepo(ctx, in.Repo)
 		if err != nil {
 			return nil, configDiffOut{}, err
 		}
@@ -781,7 +781,7 @@ func inputsFingerprintTool(
 	_ *mcpsdk.CallToolRequest,
 	in inputsFingerprintIn,
 ) (*mcpsdk.CallToolResult, inputsFingerprintOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, inputsFingerprintOut{}, err
 	}
@@ -898,8 +898,8 @@ func prepareDryRunTool(
 	_ *mcpsdk.CallToolRequest,
 	in prepareDryRunIn,
 ) (*mcpsdk.CallToolResult, prepareDryRunOut, error) {
-	wt, _ := resolveWorktree(in.Worktree)
-	repoRoot, err := resolveRepo(in.Repo)
+	wt, _ := resolveWorktree(ctx, in.Worktree)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, prepareDryRunOut{}, err
 	}

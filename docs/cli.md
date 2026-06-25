@@ -664,7 +664,7 @@ drop every cached snapshot for this repo and force the next prepare to rebuild
 
 ### `treeman mcp`
 
-run the Model Context Protocol server (stdio transport)
+run the Model Context Protocol server (stdio, or --http for a shared HTTP daemon)
 
 ### `treeman notify`
 

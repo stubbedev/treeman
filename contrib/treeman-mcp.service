@@ -1,0 +1,33 @@
+# treeman MCP server — shared HTTP transport (systemd --user unit).
+#
+# Install:
+#   cp contrib/treeman-mcp.service ~/.config/systemd/user/treeman-mcp.service
+#   systemctl --user enable --now treeman-mcp
+#   curl -s http://127.0.0.1:8787/healthz
+#
+# One shared server backs every MCP client (e.g. all Claude Code
+# instances); each request is scoped to its own worktree via the client's
+# MCP roots or an X-Repo-Root header. See docs/mcp.md.
+#
+# SECURITY: no auth on the endpoint, and treeman tools run shell/DB
+# commands — keep the bind on loopback. A non-loopback bind disables the
+# SDK's DNS-rebinding protection and exposes an unauthenticated RCE
+# surface; only do that behind an authenticating reverse proxy.
+
+[Unit]
+Description=treeman MCP server (shared HTTP)
+After=network.target
+
+[Service]
+# Adjust the path if treeman is not in ~/.local/bin.
+ExecStart=%h/.local/bin/treeman mcp --http
+Environment=TREEMAN_MCP_HTTP_ADDR=127.0.0.1:8787
+# Advertise every tool up front: the `tools` gateway's enable-state is
+# shared across clients on one server, so deferring would churn
+# tools/list_changed for all clients when any one enables a tool.
+Environment=TREEMAN_MCP_ALL_TOOLS=1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

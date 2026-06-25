@@ -34,10 +34,10 @@ import (
 // This is the single chokepoint that lets config_get/set/write/unset/
 // diff/history/restore/delete operate on either the per-repo or the
 // user-global config without each tool re-deriving the path rules.
-func resolveConfigTarget(scope, repo string) (path, histRoot, layer string, err error) {
+func resolveConfigTarget(ctx context.Context, scope, repo string) (path, histRoot, layer string, err error) {
 	switch strings.ToLower(scope) {
 	case "", "repo":
-		repoRoot, rerr := resolveRepo(repo)
+		repoRoot, rerr := resolveRepo(ctx, repo)
 		if rerr != nil {
 			return "", "", "", rerr
 		}
@@ -74,7 +74,7 @@ type configLocateOut struct {
 // its size. The layered loader merges them global → repo → repo-local;
 // this tool is the "where do I edit X" map an agent consults before
 // touching anything.
-func configLocateTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configLocateIn) (*mcpsdk.CallToolResult, configLocateOut, error) {
+func configLocateTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configLocateIn) (*mcpsdk.CallToolResult, configLocateOut, error) {
 	out := configLocateOut{}
 	if gp, ok := config.GlobalConfigPath(); ok {
 		out.Files = append(out.Files, statConfigFile("global", gp))
@@ -82,7 +82,7 @@ func configLocateTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configLoc
 	// Repo paths are best-effort: a cwd that isn't a git repo still gets
 	// the global entry, so locate never hard-fails just because there's
 	// no repo in scope.
-	if repoRoot, err := resolveRepo(in.Repo); err == nil {
+	if repoRoot, err := resolveRepo(ctx, in.Repo); err == nil {
 		out.Files = append(out.Files,
 			statConfigFile("repo", filepath.Join(repoRoot, ".treeman.yaml")),
 			statConfigFile("repo-local", filepath.Join(repoRoot, ".treeman.local.yaml")),
@@ -126,11 +126,11 @@ type configUnsetOut struct {
 // removal is always safe regardless of layer, and refusing to drop a
 // misplaced key (e.g. a repo-only `databases:` that ended up in the
 // global file) would block the very cleanup the user is trying to do.
-func configUnsetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configUnsetIn) (*mcpsdk.CallToolResult, configUnsetOut, error) {
+func configUnsetTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configUnsetIn) (*mcpsdk.CallToolResult, configUnsetOut, error) {
 	if in.Path == "" {
 		return nil, configUnsetOut{}, errors.New("path is required")
 	}
-	target, histRoot, _, err := resolveConfigTarget(in.Scope, in.Repo)
+	target, histRoot, _, err := resolveConfigTarget(ctx, in.Scope, in.Repo)
 	if err != nil {
 		return nil, configUnsetOut{}, err
 	}
@@ -213,7 +213,7 @@ type configDeleteOut struct {
 // repo `.treeman.yaml` un-enrolls the repo's per-repo overrides;
 // deleting the global config reverts every repo to built-in defaults.
 func configDeleteTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configDeleteIn) (*mcpsdk.CallToolResult, configDeleteOut, error) {
-	target, histRoot, _, err := resolveConfigTarget(in.Scope, in.Repo)
+	target, histRoot, _, err := resolveConfigTarget(ctx, in.Scope, in.Repo)
 	if err != nil {
 		return nil, configDeleteOut{}, err
 	}

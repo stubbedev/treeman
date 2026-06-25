@@ -226,7 +226,7 @@ func doctorTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in doctorIn) (*m
 // → reinstall, registry → repair) and re-probes each so the returned
 // status reflects the post-fix state. Mirrors the CLI's `doctor --fix`.
 func applyDoctorFixes(ctx context.Context, results []doctorResult) []doctorResult {
-	repoRoot, _ := resolveRepo("")
+	repoRoot, _ := resolveRepo(ctx, "")
 	if repoRoot == "" {
 		return results
 	}
@@ -282,7 +282,7 @@ func applyDoctorFixes(ctx context.Context, results []doctorResult) []doctorResul
 }
 
 func runDoctorChecks(ctx context.Context) []doctorResult {
-	repoRoot, _ := resolveRepo("")
+	repoRoot, _ := resolveRepo(ctx, "")
 	out := []doctorResult{checkDaemon(ctx)}
 	if repoRoot == "" {
 		return append(out, doctorResult{Name: "repo", Status: "skip", Detail: "not inside a git repo — repo-scoped checks skipped"})
@@ -496,7 +496,7 @@ type configGetIn struct {
 // `mysql://user:pw@host` style userinfo and `password: "..."` key/
 // value pairs are scrubbed. LLM clients see structure + which
 // secrets exist, never the literal values.
-func configGetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configGetIn) (*mcpsdk.CallToolResult, map[string]any, error) {
+func configGetTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in configGetIn) (*mcpsdk.CallToolResult, map[string]any, error) {
 	// Global scope reads the user-global config alone (no repo/env-file
 	// overlay) — `resolved` and connection-string substitution are
 	// repo-only and silently ignored here.
@@ -514,7 +514,7 @@ func configGetTool(_ context.Context, _ *mcpsdk.CallToolRequest, in configGetIn)
 	if in.Scope != "" && !strings.EqualFold(in.Scope, "repo") {
 		return nil, nil, fmt.Errorf("invalid scope %q (want repo|global)", in.Scope)
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -566,7 +566,7 @@ func configHistoryTool(
 	_ *mcpsdk.CallToolRequest,
 	in configHistoryIn,
 ) (*mcpsdk.CallToolResult, configHistoryOut, error) {
-	p, histRoot, _, err := resolveConfigTarget(in.Scope, in.Repo)
+	p, histRoot, _, err := resolveConfigTarget(ctx, in.Scope, in.Repo)
 	if err != nil {
 		return nil, configHistoryOut{}, err
 	}
@@ -604,7 +604,7 @@ type configValidateOut struct {
 }
 
 func configValidateTool(
-	_ context.Context,
+	ctx context.Context,
 	_ *mcpsdk.CallToolRequest,
 	in configValidateIn,
 ) (*mcpsdk.CallToolResult, configValidateOut, error) {
@@ -630,7 +630,7 @@ func configValidateTool(
 	if in.Scope != "" && !strings.EqualFold(in.Scope, "repo") {
 		return nil, configValidateOut{OK: false, Error: fmt.Sprintf("invalid scope %q (want repo|global)", in.Scope)}, nil
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		out := configValidateOut{OK: false, Error: err.Error()}
 		return nil, out, nil //nolint:nilerr // validation failure is tool output, not a transport error
@@ -704,7 +704,7 @@ func worktreeListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 		WHERE w.deleted_at IS NULL`
 	args := []any{}
 	if in.Repo != "" {
-		repo, err := resolveRepo(in.Repo)
+		repo, err := resolveRepo(ctx, in.Repo)
 		if err != nil {
 			return nil, worktreeListOut{}, err
 		}
@@ -768,7 +768,7 @@ func worktreeShowTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 		id = row.ID
 		w = row
 	} else {
-		repoRoot, rerr := resolveRepo(in.Repo)
+		repoRoot, rerr := resolveRepo(ctx, in.Repo)
 		if rerr != nil {
 			return nil, worktreeShowOut{}, rerr
 		}
@@ -822,7 +822,9 @@ func branchScopedStatusTool(
 // working directory by walking parent dirs. Mirrors the CLI's
 // argument-free `wt show`.
 func worktreeRowFromCwd(ctx context.Context, st *store.Store) (worktreeRow, error) {
-	cwd, err := os.Getwd()
+	// requestCwd, not os.Getwd: over the shared HTTP transport the "current"
+	// directory is the requesting client's workspace root, not the daemon's.
+	cwd, err := requestCwd(ctx)
 	if err != nil {
 		return worktreeRow{}, err
 	}
@@ -886,7 +888,7 @@ func applyLogRepoScope(ctx context.Context, st *store.Store, in logsQueryIn, f *
 	if in.Repo == "" && in.Worktree == "" {
 		return nil
 	}
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err == nil && repoRoot != "" {
 		if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil {
 			f.RepoID = rid
@@ -1016,7 +1018,7 @@ func applyRepoWorktreeFilter(ctx context.Context, st *store.Store, f *store.Even
 	if repo == "" && worktree == "" {
 		return nil
 	}
-	if repoRoot, err := resolveRepo(repo); err == nil && repoRoot != "" {
+	if repoRoot, err := resolveRepo(ctx, repo); err == nil && repoRoot != "" {
 		if rid, err := lookupRepoID(ctx, st, repoRoot); err == nil && rid > 0 {
 			f.RepoID = rid
 		}
@@ -1056,7 +1058,7 @@ func logsHooksTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in logsHooksI
 		return nil, logsHooksOut{}, err
 	}
 	defer func() { _ = st.Close() }()
-	repoRoot, err := resolveRepo(in.Repo)
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, logsHooksOut{}, err
 	}
@@ -1091,8 +1093,8 @@ type fwDetectOut struct {
 	AutoCloneTarget uint32           `json:"auto_clone_target"`
 }
 
-func fwDetectTool(_ context.Context, _ *mcpsdk.CallToolRequest, in fwDetectIn) (*mcpsdk.CallToolResult, fwDetectOut, error) {
-	repoRoot, err := resolveRepo(in.Repo)
+func fwDetectTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in fwDetectIn) (*mcpsdk.CallToolResult, fwDetectOut, error) {
+	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, fwDetectOut{}, err
 	}
@@ -1115,8 +1117,8 @@ type slugComputeOut struct {
 	RedisCacheIndex int    `json:"redis_cache_index"`
 }
 
-func slugComputeTool(_ context.Context, _ *mcpsdk.CallToolRequest, in slugComputeIn) (*mcpsdk.CallToolResult, slugComputeOut, error) {
-	wt, branch := resolveWorktree(in.Path)
+func slugComputeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in slugComputeIn) (*mcpsdk.CallToolResult, slugComputeOut, error) {
+	wt, branch := resolveWorktree(ctx, in.Path)
 	sl := slug.For(wt, branch)
 	q, ca := sl.RedisIndices()
 	return nil, slugComputeOut{
@@ -1176,7 +1178,7 @@ func snapshotsListTool(
 // snapshots_list tool and the treeman://repos/{repo}/snapshots
 // resource. limit≤0 → default 100, capped at 500.
 func collectRepoSnapshots(ctx context.Context, repo string, limit int) (snapshotsListOut, error) {
-	repoRoot, err := resolveRepo(repo)
+	repoRoot, err := resolveRepo(ctx, repo)
 	if err != nil {
 		return snapshotsListOut{}, err
 	}

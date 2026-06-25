@@ -5,11 +5,18 @@
 treeman ships an MCP (Model Context Protocol) server so AI agents
 — Claude Code, Claude Desktop, Cursor, Continue, anything that
 speaks MCP — get a structured tool surface onto treeman's state.
-Transport is stdio; no extra processes, no network surface.
 
 ```sh
-treeman mcp                                    # core tools + `tools` gateway (lazy disclosure)
+treeman mcp                                    # stdio (default): one server per client
+treeman mcp --http                             # shared HTTP daemon on 127.0.0.1:8787
 ```
+
+The default **stdio** transport spawns one server per client, scoped
+to that client's working directory — no extra processes, no network
+surface. The **HTTP** transport (`--http`) runs a single shared server
+that every client (e.g. all your Claude Code instances) connects to,
+each request scoped to its own worktree via the client's MCP roots or
+an `X-Repo-Root` header. See [Shared HTTP server](#shared-http-server).
 
 ## What is this actually for
 
@@ -152,6 +159,107 @@ claude mcp add treeman -- treeman mcp
 Confirm it registered with `claude mcp list`. Inside a session,
 the tools appear as `mcp__treeman__<tool-name>` (e.g.
 `mcp__treeman__worktree_list`).
+
+## Shared HTTP server
+
+Instead of stdio (one `treeman mcp` process per client), run a single
+shared server over HTTP and point every client at it. One daemon backs
+all your Claude Code instances; each request is scoped to its own
+worktree, so there is no per-process working directory.
+
+```sh
+treeman mcp --http                       # 127.0.0.1:8787, path /mcp
+treeman mcp --http=127.0.0.1:9000        # custom bind
+treeman mcp --http --http-path=/treeman  # custom endpoint path
+```
+
+Equivalent env vars (handy for a service unit): `TREEMAN_MCP_HTTP_ADDR`,
+`TREEMAN_MCP_HTTP_PATH`, or `TREEMAN_MCP_HTTP=1` for the loopback default.
+A `/healthz` endpoint returns `{"status":"ok"}` for liveness probes.
+
+Wire Claude Code to it as an HTTP server — no per-instance config needed,
+the client's MCP roots scope each request automatically:
+
+```sh
+claude mcp add --scope user --transport http treeman http://127.0.0.1:8787/mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "treeman": { "type": "http", "url": "http://127.0.0.1:8787/mcp" }
+  }
+}
+```
+
+### How a request is scoped
+
+Each request resolves its repo/worktree by precedence (highest first):
+
+1. an explicit tool argument (`repo` / `worktree`),
+2. the `X-Repo-Root` request header (also `X-Mcp-Root(s)` / `Mcp-Root(s)`;
+   `file://` URI or absolute path; comma-separated for multiple),
+3. the client's MCP **roots** (`roots/list`) — Claude Code exposes its
+   workspace this way, fetched once per request and only when the client
+   advertised the capability.
+
+Over HTTP there is **no** working-directory fallback: a request that
+supplies none of the above gets a clear error rather than resolving
+against wherever the daemon happens to have been launched. (Over stdio,
+the process cwd remains the default, as before.)
+
+To pin a client to a fixed worktree regardless of its roots, set a header:
+
+```json
+{
+  "mcpServers": {
+    "treeman": {
+      "type": "http",
+      "url": "http://127.0.0.1:8787/mcp",
+      "headers": { "X-Repo-Root": "/abs/path/to/worktree" }
+    }
+  }
+}
+```
+
+### Running it as a service (Linux, systemd --user)
+
+Run all tools up front (`TREEMAN_MCP_ALL_TOOLS=1`) so the `tools` gateway's
+enable-state — which is shared across clients on one server — doesn't churn
+`tools/list_changed` for everyone when one client enables a tool.
+
+`~/.config/systemd/user/treeman-mcp.service` (see also
+[contrib/treeman-mcp.service](../contrib/treeman-mcp.service)):
+
+```ini
+[Unit]
+Description=treeman MCP server (shared HTTP)
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/treeman mcp --http
+Environment=TREEMAN_MCP_HTTP_ADDR=127.0.0.1:8787
+Environment=TREEMAN_MCP_ALL_TOOLS=1
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user enable --now treeman-mcp
+systemctl --user status treeman-mcp
+curl -s http://127.0.0.1:8787/healthz
+```
+
+> **Security.** The endpoint has **no authentication**, and treeman's tools
+> run shell hooks, prepare scripts and arbitrary DB queries — reaching the
+> port is equivalent to local code execution. Keep the bind on loopback
+> (the default), where DNS-rebinding protection is active. Binding a
+> non-loopback address disables that protection and exposes the surface
+> unauthenticated; only do so behind a reverse proxy that terminates TLS
+> and authenticates, on a trusted network. The server logs a warning when
+> bound non-loopback.
 
 ## Claude Desktop
 
