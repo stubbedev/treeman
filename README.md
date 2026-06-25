@@ -59,7 +59,9 @@ protocol).
   input edits and picks `auto | delta | rebuild`.
 - **MCP server** — `treeman mcp` exposes config authoring/validation,
   event-log + hook-output queries, live engine state, and snapshot
-  inspection to Claude Code / Desktop / Cursor.
+  inspection to Claude Code / Desktop / Cursor. Runs over stdio
+  (per-client) or, with `--http`, as one shared daemon every client
+  connects to, each request scoped to its own worktree.
 - **Desktop notifications** — opt-in `notifications:` block fires
   `notify-send` (Linux) / native banners (macOS) when a worktree turns
   ready, fails, or starts/finishes preparing; configurable per status
