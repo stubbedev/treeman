@@ -115,7 +115,7 @@ func parseRootHeaders(h http.Header) []string {
 	var roots []string
 	for _, name := range rootHeaders {
 		for _, v := range h.Values(name) {
-			for _, part := range strings.Split(v, ",") {
+			for part := range strings.SplitSeq(v, ",") {
 				if p := rootPath(part); p != "" {
 					roots = append(roots, p)
 				}

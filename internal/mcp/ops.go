@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -104,7 +105,7 @@ func requestCwd(ctx context.Context) (string, error) {
 		return filepath.Abs(root)
 	}
 	if r := resolverFrom(ctx); r != nil && r.httpMode {
-		return "", fmt.Errorf(
+		return "", errors.New(
 			"no workspace root for this request: pass a repo/worktree argument, set the X-Repo-Root header, or expose an MCP root",
 		)
 	}
