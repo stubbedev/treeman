@@ -170,12 +170,14 @@ func (d *Driver) DropSnapshot(ctx context.Context, templatePrefix string) error 
 }
 
 // cloneIndices fans out the per-index clone, with parallelism
-// capped at 4 — ES _clone is server-side fast but uses the
-// destination shard's primary, so flooding the management thread
-// pool with concurrent clones is wasteful.
+// capped at 8. Each clone is now an async dispatch
+// (wait_for_active_shards=0) so each goroutine spends almost no time
+// holding an HTTP connection — it fires the POST, then polls _recovery
+// with short-lived 500ms probes. 8 lets a typical multi-index template
+// clone in one wave without overwhelming the ES management thread pool.
 func (d *Driver) cloneIndices(ctx context.Context, srcIndices []string, srcPrefix, dstPrefix string) error {
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(4)
+	g.SetLimit(8)
 	for _, src := range srcIndices {
 		// Map `<srcPrefix><rest>` → `<dstPrefix><rest>`.
 		rest := strings.TrimPrefix(src, srcPrefix)

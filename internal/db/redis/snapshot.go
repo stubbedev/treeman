@@ -315,7 +315,7 @@ func (d *Driver) copyByPrefixCOPY(ctx context.Context, srcPrefix, dstPrefix stri
 		// bare form is accepted by Redis 6.2+, Valkey, and DragonflyDB.
 		pipe.Do(ctx, "COPY", src, dst, "REPLACE") // REPLACE so re-runs are idempotent
 		pending++
-		if pending >= 100 {
+		if pending >= 1000 {
 			if err := flush(); err != nil {
 				return err
 			}
