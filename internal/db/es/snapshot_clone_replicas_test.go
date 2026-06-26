@@ -18,11 +18,15 @@ import (
 func TestCloneForcesZeroReplicas(t *testing.T) {
 	var cloneBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/_recovery") {
+			_, _ = w.Write([]byte(`{"dst_idx":{"shards":[{"stage":"DONE"}]}}`))
+			return
+		}
 		if strings.Contains(r.URL.Path, "/_clone/") {
 			b, _ := io.ReadAll(r.Body)
 			cloneBody = string(b)
 		}
-		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"acknowledged":true}`))
 	}))
 	defer srv.Close()
