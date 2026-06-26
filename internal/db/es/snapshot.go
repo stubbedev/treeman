@@ -317,8 +317,14 @@ func (d *Driver) cloneAPICall(ctx context.Context, src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("POST /%s/_clone/%s: marshal body: %w", src, dst, err)
 	}
+	// wait_for_active_shards=0: dispatch the clone and return immediately
+	// without blocking until shards are active. Large indices can take
+	// longer than the HTTP client's read timeout to clone server-side; the
+	// async dispatch keeps each HTTP round-trip short. We poll _recovery
+	// below until all shards reach DONE, with the caller's context deadline
+	// (finalizeTimeout) as the safety net.
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-		fmt.Sprintf("%s/%s/_clone/%s", d.Base, src, dst),
+		fmt.Sprintf("%s/%s/_clone/%s?wait_for_active_shards=0", d.Base, src, dst),
 		bytes.NewReader(cloneBody))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := d.HTTP.Do(req)
@@ -333,7 +339,72 @@ func (d *Driver) cloneAPICall(ctx context.Context, src, dst string) error {
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("POST /%s/_clone/%s → HTTP %d: %s", src, dst, resp.StatusCode, body)
 	}
-	return nil
+	return d.waitForRecovery(ctx, dst)
+}
+
+// waitForRecovery polls /_recovery for index until all shards report DONE,
+// sleeping 500 ms between probes. Each probe is a short HTTP call that
+// comfortably fits within the driver's client timeout; the caller's context
+// deadline is the overall safety net for a clone that never completes.
+func (d *Driver) waitForRecovery(ctx context.Context, index string) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+		done, err := d.recoveryDone(ctx, index)
+		if err != nil {
+			return fmt.Errorf("recovery poll %s: %w", index, err)
+		}
+		if done {
+			return nil
+		}
+	}
+}
+
+// recoveryDone fetches /_recovery for index and reports whether every shard
+// is in the DONE stage. Returns (false, nil) on HTTP 404 — the index may
+// not be visible immediately after the async clone POST.
+func (d *Driver) recoveryDone(ctx context.Context, index string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		d.Base+"/"+escSeg(index)+"/_recovery?human=false", nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := d.HTTP.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil // index not yet visible; keep polling
+	}
+	if resp.StatusCode >= 400 {
+		return false, fmt.Errorf("GET /%s/_recovery → HTTP %d: %s", index, resp.StatusCode, body)
+	}
+	var parsed map[string]struct {
+		Shards []struct {
+			Stage string `json:"stage"`
+		} `json:"shards"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false, fmt.Errorf("parse recovery response: %w", err)
+	}
+	total := 0
+	for _, idx := range parsed {
+		for _, shard := range idx.Shards {
+			total++
+			if shard.Stage != "DONE" {
+				return false, nil
+			}
+		}
+	}
+	return total > 0, nil // total == 0: recovery not yet started
 }
 
 // setIndexBlock toggles `index.blocks.write` on the given index.
