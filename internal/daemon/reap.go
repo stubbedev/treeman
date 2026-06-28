@@ -6,12 +6,34 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/wt"
 )
+
+// reapWorkers is how many top-level trash entries parallelRemoveAll
+// removes concurrently. Reaping is `rm -rf` under chrt/ionice/nice — it
+// is I/O-bound on the deleting filesystem, not CPU-bound, so we scale
+// with core count (a rough proxy for the host's I/O parallelism: more
+// cores ≈ faster NVMe / more spindles) but cap it: past ~8 concurrent
+// rm -rf the disk, not the scheduler, is the bottleneck and extra
+// workers just add contention. Floor of 4 keeps the prior behaviour on
+// small hosts. Each rm already runs at SCHED_IDLE so foreground work is
+// never starved regardless.
+func reapWorkers() int {
+	n := runtime.NumCPU()
+	switch {
+	case n < 4:
+		return 4
+	case n > 8:
+		return 8
+	default:
+		return n
+	}
+}
 
 // trashDirName is the subdirectory under worktreesRoot where deleted
 // working trees are renamed for background reaping. Chosen to (a) be
@@ -100,7 +122,7 @@ func scheduleBackgroundReap(st *State, repoPath, trashPath string) {
 		// Queue full (highly unlikely with a 64-slot buffer): fall
 		// back to a one-shot reaper so we never lose the trash entry.
 		safeGo(lblWorktreeReap, trashPath, func() {
-			if err := parallelRemoveAll(st.BgCtx, trashPath, 4); err != nil {
+			if err := parallelRemoveAll(st.BgCtx, trashPath, reapWorkers()); err != nil {
 				slog.Warn("background reap", "trash", trashPath, "err", err)
 			}
 		})
@@ -127,7 +149,7 @@ func (st *State) reapQueueFor(repoPath string) chan string {
 				if !ok {
 					return
 				}
-				if err := parallelRemoveAll(st.BgCtx, trash, 4); err != nil {
+				if err := parallelRemoveAll(st.BgCtx, trash, reapWorkers()); err != nil {
 					slog.Warn("background reap", "trash", trash, "err", err)
 				}
 			}
