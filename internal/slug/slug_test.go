@@ -5,20 +5,63 @@ import (
 	"testing"
 )
 
-func TestTicketInBranchWins(t *testing.T) {
+// The branch is ignored: a ticket living only in the branch name does
+// NOT name the slug. Keying on branch would make the slug churn across
+// an in-worktree `git checkout` and is exactly what the collision fix
+// removes — the directory name is the sole readable source.
+func TestBranchIsIgnored(t *testing.T) {
 	s := For("/tmp/random-dir", "feature/PROJ-1234-foo")
-	if s.Value != "proj_1234" {
-		t.Fatalf("want proj_1234, got %s", s.Value)
+	if s.Source != SourcePathHash {
+		t.Fatalf("branch ticket must not name the slug; want path-hash, got %q (%v)", s.Value, s.Source)
 	}
-	if s.Source != SourceTicket {
-		t.Fatalf("want SourceTicket, got %v", s.Source)
+	if !strings.HasPrefix(s.Value, "wt_") {
+		t.Fatalf("want wt_ prefix, got %s", s.Value)
+	}
+	// Passing the branch or not must yield the identical slug.
+	if other := For("/tmp/random-dir", ""); other.Value != s.Value {
+		t.Fatalf("slug must not depend on branch: %q vs %q", s.Value, other.Value)
 	}
 }
 
 func TestTicketInPathBasename(t *testing.T) {
 	s := For("/tmp/PROJ-9001-bar", "")
-	if s.Value != "proj_9001" {
-		t.Fatalf("want proj_9001, got %s", s.Value)
+	if s.Source != SourceTicket {
+		t.Fatalf("want SourceTicket, got %v", s.Source)
+	}
+	// Readable ticket prefix, always disambiguated by an 8-hex path tag.
+	if !strings.HasPrefix(s.Value, "proj_9001_") {
+		t.Fatalf("want proj_9001_<hash> prefix, got %s", s.Value)
+	}
+	if len(s.Value) != len("proj_9001_")+8 {
+		t.Fatalf("want proj_9001_ + 8 hex, got %q (len=%d)", s.Value, len(s.Value))
+	}
+}
+
+// The core collision fix: two distinct worktree directories whose names
+// embed the SAME ticket must never share a slug (previously both were a
+// bare `proj_1234`, silently overlapping their storage).
+func TestSameTicketDistinctPathsDoNotCollide(t *testing.T) {
+	a := For("/work/alpha/PROJ-1234-foo", "")
+	b := For("/work/beta/PROJ-1234-bar", "")
+	if a.Value == b.Value {
+		t.Fatalf("two worktrees sharing ticket PROJ-1234 collided on slug %q", a.Value)
+	}
+	// Same path is deterministic across calls (branch-stable).
+	if again := For("/work/alpha/PROJ-1234-foo", "other-branch"); again.Value != a.Value {
+		t.Fatalf("slug not stable for a fixed path: %q vs %q", a.Value, again.Value)
+	}
+}
+
+// An over-long ticket prefix is trimmed to fit the 32-char budget, but
+// the path tag still keeps two such worktrees distinct.
+func TestLongTicketStaysWithinBudgetAndUnique(t *testing.T) {
+	a := For("/x/SUPERLONGPROJECTKEY-1234567890", "")
+	b := For("/y/SUPERLONGPROJECTKEY-1234567890", "")
+	if len(a.Value) > 32 {
+		t.Fatalf("slug exceeds 32 chars: %q (len=%d)", a.Value, len(a.Value))
+	}
+	if a.Value == b.Value {
+		t.Fatalf("long-ticket slugs collided across paths: %q", a.Value)
 	}
 }
 

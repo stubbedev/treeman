@@ -58,28 +58,65 @@ func (s Slug) RedisIndices() (queueDB, cacheDB uint8) {
 
 var ticketRe = regexp.MustCompile(`([A-Z]+)-([0-9]+)`)
 
-// For consults `branch` first (a ticket-named branch wins even when
-// the worktree directory was named generically). Then the worktree's
-// own basename. Falls back to hashing the canonical path so two
-// worktrees that happen to share a last path component still get
-// distinct slugs.
-func For(worktreePath string, branch string) Slug {
-	if branch != "" {
-		if s, ok := extractTicket(branch); ok {
-			return Slug{Value: s, Source: SourceTicket}
-		}
+// For derives a linked worktree's slug purely from its filesystem
+// PATH. The `branch` parameter is accepted for signature compatibility
+// with the call sites that happen to know the branch, but is
+// deliberately IGNORED — folding the branch into the slug is what the
+// two failure modes this function guards against both come down to.
+//
+// Two properties fall out of keying strictly on the canonical path:
+//
+//   - Branch-stable. The directory is fixed for a worktree's lifetime,
+//     so the slug — and with it the worktree's DB names, patched
+//     `.env`, ports, redis indices — does NOT churn when the branch
+//     swaps underneath it via an in-worktree `git checkout`. This is
+//     the foundation `branch_scoped` swapping relies on, and the reason
+//     ResolveIdentity has always called us with an empty branch.
+//
+//   - Collision-free across a shared ticket. Two worktrees whose names
+//     embed the SAME Jira ticket (`PROJ-1234` checked out in two
+//     different directories, or two branches of one ticket) get
+//     DISTINCT slugs, because the path hash always disambiguates. The
+//     previous derivation returned a bare `proj_1234` for both and
+//     silently overlapped their storage — same DB names, same redis
+//     DBs, same patched `.env`.
+//
+// A ticket-named directory keeps a readable prefix for ergonomics
+// (`proj_1234_<pathhash>`); a generic directory is `wt_<pathhash>`. The
+// path hash is the sole carrier of uniqueness in both shapes.
+func For(worktreePath string, _ string) Slug {
+	tag := pathTag(worktreePath)
+	if ticket, ok := extractTicket(filepath.Base(worktreePath)); ok {
+		return Slug{Value: composeTicket(ticket, tag), Source: SourceTicket}
 	}
-	base := filepath.Base(worktreePath)
-	if s, ok := extractTicket(base); ok {
-		return Slug{Value: s, Source: SourceTicket}
-	}
+	return Slug{Value: "wt_" + tag, Source: SourcePathHash}
+}
+
+// pathTag is a stable 8-hex-char blake3 digest of the worktree's
+// canonical absolute path — the collision-proof component of every
+// linked-worktree slug. Falls back to the raw path when Abs fails
+// (e.g. the cwd was removed) so a slug is still produced.
+func pathTag(worktreePath string) string {
 	canonical, err := filepath.Abs(worktreePath)
 	if err != nil {
 		canonical = worktreePath
 	}
 	sum := blake3.Sum256([]byte(canonical))
-	hex := hexEncode(sum[:])
-	return Slug{Value: "wt_" + hex[:8], Source: SourcePathHash}
+	return hexEncode(sum[:])[:8]
+}
+
+// composeTicket joins a readable ticket prefix with the path tag inside
+// the 32-char identifier budget every engine's name template must fit.
+// Uniqueness lives in the tag, never the prefix, so truncating an
+// over-long prefix can't collide two distinct paths — their tags still
+// differ.
+func composeTicket(ticket, tag string) string {
+	out := ticket + "_" + tag
+	if len(out) <= 32 {
+		return out
+	}
+	keep := max(32-1-len(tag), 1)
+	return ticket[:keep] + "_" + tag
 }
 
 // ForMain derives the slug for a repo's main worktree (the repo root
@@ -139,24 +176,16 @@ func sanitiseBranch(branch string) string {
 	return strings.Trim(b.String(), "_")
 }
 
+// extractTicket pulls a Jira-style `[A-Z]+-\d+` ticket out of s and
+// renders it `prefix_num` (lowercased). Length budgeting and the
+// path-hash suffix are composeTicket's job, so no truncation or hashing
+// happens here.
 func extractTicket(s string) (string, bool) {
 	caps := ticketRe.FindStringSubmatch(s)
 	if caps == nil {
 		return "", false
 	}
-	prefix := strings.ToLower(caps[1])
-	num := caps[2]
-	out := prefix + "_" + num
-	if len(out) > 32 {
-		// Naive truncation can collide two distinct tickets
-		// (proj_looong_12345 vs proj_looong_12346). Append a short
-		// hash of the full ticket so the 32-char budget still
-		// distinguishes them.
-		sum := blake3.Sum256([]byte(out))
-		tag := hexEncode(sum[:])[:6]
-		out = out[:32-1-len(tag)] + "_" + tag
-	}
-	return out, true
+	return strings.ToLower(caps[1]) + "_" + caps[2], true
 }
 
 // sysvCksum reproduces the POSIX `cksum` (SysV) algorithm. CRC-32
