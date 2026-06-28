@@ -40,9 +40,13 @@ func FinalizeWorktree(
 	// Captured by the terminal-event defer below. Populated once the
 	// row identity is known so a hook/prepare error after that point
 	// always produces a worktree:create:error event scoped to the right row.
+	// cfg is hoisted here (rather than `:=` at load time) so the defer's
+	// recovery branch can reach it.
 	var (
+		cfg        config.Config
 		termRepoID int64
 		termWtID   int64
+		termSlug   string
 	)
 	defer func() {
 		if err == nil {
@@ -55,12 +59,38 @@ func FinalizeWorktree(
 			// dispatch.go log a global worktree:create:error error instead.
 			return
 		}
+		// Reset the per-worktree primary namespace so the documented
+		// `treeman wt finalize` retry cold-rebuilds end-to-end instead
+		// of tripping on the half-applied migrations a mid-prepare
+		// failure leaves behind (duplicate-column / table-exists). This
+		// unifies the direct-failure path with SweepStalePreparing and
+		// FinalizeWatchdogLoop, which already recover before their retry.
+		//
+		// Reaching this defer with err != nil already means a GENUINE
+		// failure: the pipeline converts every cancellation/timeout into
+		// `done=true, err=nil` at its phase boundaries (see
+		// runFinalizeSetupPipeline), so a teardown preempt or watchdog
+		// timeout never lands here — those are cleaned by TeardownWorktree
+		// / FinalizeWatchdogLoop respectively. No ctx-liveness gate is
+		// possible anyway: the `defer cancel()` below runs first under
+		// LIFO, so `ctx` is already cancelled here.
+		//
+		// Both the recovery drops AND the terminal error event therefore
+		// run on a FRESH context: the engine drops must dial, and the
+		// non-batched WriteEvent path executes its INSERT against the
+		// ctx — on the cancelled finalize ctx the very event that flips
+		// the row to `failed` would be silently dropped.
+		termCtx, termCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)
+		defer termCancel()
+		// Best-effort: drops surface as their own `worktree:recover:*`
+		// events and never mask the failure event written below.
+		prepare.RecoverStaleWorktree(termCtx, &cfg, termSlug, wtRoot, termRepoID, termWtID, st.Store)
 		// Terminal event for `finalizeState` — without this, a
 		// prepare/hook failure leaves the row derived as preparing
 		// forever (see #11). Swallow the returned error afterwards so
 		// dispatch doesn't double-log the same failure as a second
 		// (row-less) worktree:create:error event.
-		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError, err.Error(),
+		_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, err.Error(),
 			termRepoID, termWtID, "", 0, map[string]string{
 				"repo_path":     repoRoot,
 				"worktree_path": wtRoot,
@@ -105,7 +135,7 @@ func FinalizeWorktree(
 	}
 	defer st.UnmarkFinalizeInFlight(wtRoot)
 
-	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
+	cfg, err = resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
 	if err != nil {
 		return err
 	}
@@ -128,7 +158,7 @@ func FinalizeWorktree(
 		return err
 	}
 	sl, wtID, isMain := id.Slug, id.WtID, id.IsMain
-	termRepoID, termWtID = repoID, wtID
+	termRepoID, termWtID, termSlug = repoID, wtID, sl.Value
 
 	// Cache the user's shell env per-worktree so daemon-driven re-
 	// runs (HEAD watcher, file watcher) can rehydrate PATH etc.
