@@ -148,6 +148,7 @@ func TestRegistryForMapsCustomFrameworkFields(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("custom framework 'acme-migrate' not present in registry")
+		return
 	}
 	if !reflect.DeepEqual(got.Markers, []string{"acme.config"}) {
 		t.Errorf("Markers = %v, want [acme.config]", got.Markers)

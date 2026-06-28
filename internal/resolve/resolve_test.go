@@ -25,6 +25,7 @@ func TestLaravelDbTestOverridesWin(t *testing.T) {
 	r := resolveMysql(cfg, env)
 	if r == nil {
 		t.Fatal("nil")
+		return
 	}
 	if r.Conn.Host != "test-host" || r.Conn.Port != 3307 {
 		t.Errorf("got host=%s port=%d", r.Conn.Host, r.Conn.Port)
@@ -56,6 +57,7 @@ func TestSpringBootJDBCMysqlURL(t *testing.T) {
 	r := resolveMysql(&config.Config{}, env)
 	if r == nil {
 		t.Fatal("nil")
+		return
 	}
 	if r.Conn.Host != "db.internal" || r.Conn.Port != 3307 || r.Conn.User != "spring" || r.Conn.Password != "letmein" {
 		t.Errorf("got %+v", r.Conn)
@@ -71,6 +73,7 @@ func TestSpringBootJDBCPostgresURL(t *testing.T) {
 	r := resolvePostgres(&config.Config{}, env)
 	if r == nil {
 		t.Fatal("nil")
+		return
 	}
 	if r.Conn.Host != "pg.internal" || r.Conn.User != "pg" || r.Conn.Password != "pgsecret" {
 		t.Errorf("got %+v", r.Conn)
