@@ -4,10 +4,25 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/gitcmd"
 )
+
+// maxSquashScanCommits caps how far back of defRef history the squash-detection
+// scan will reach. A suspect whose fork point sits more than this many commits
+// behind defRef is skipped (the branch is kept, never force-deleted): the only
+// way to "prove" such a branch squash-merged is to `log -p | patch-id` the
+// entire range since its fork, which on a busy monorepo means materializing a
+// year of diffs (40k+ commits → multi-GB RSS, minutes of CPU) — and because a
+// gone-but-unmergeable ancient branch never resolves, that scan re-fired every
+// auto-fetch tick. A branch that old is not a realistic recent-merge candidate;
+// declining to auto-reap it is the cheap, safe call.
+// ponytail: flat ceiling; make it config-driven if a repo legitimately merges
+// branches forked >this many commits back and wants them auto-pruned. var (not
+// const) only so tests can lower it without building thousands of commits.
+var maxSquashScanCommits = 5000
 
 // pruneGoneLocals deletes local branches whose remote upstream was deleted
 // ([gone]) AND which are provably integrated into the default branch. The
@@ -162,6 +177,17 @@ func squashMergedSuspects(ctx context.Context, repoRoot, defRef string, suspects
 		if err != nil || base == "" {
 			continue
 		}
+		// Skip branches whose fork point is far behind defRef. Their squash
+		// (if any) sits anywhere in that whole range, so proving it would
+		// require scanning all of it — the cost that pinned a core and 2GB+
+		// every tick on a year-stale gone branch. One ancient suspect must
+		// not drag the shared scan (bounded by the oldest base) back with it.
+		dist, ok := commitsBehind(ctx, repoRoot, base, defRef)
+		if !ok || dist > maxSquashScanCommits {
+			slog.Debug("branch_prune skip far-forked suspect",
+				"repo", repoRoot, "branch", name, "commits_behind", dist)
+			continue
+		}
 		pid := cumulativeDiffPatchID(ctx, repoRoot, base, name)
 		if pid == "" {
 			continue
@@ -237,6 +263,23 @@ func defRefPatchIDIndex(ctx context.Context, repoRoot, defRef string, bases []st
 		}
 	}
 	return ids
+}
+
+// commitsBehind returns how many commits defRef has past base (base..defRef) —
+// the size of the history the squash scan would have to walk for this suspect.
+// Counts commits only (no diffs/trees), so it's cheap even over a year of
+// history. ok=false when it can't be computed, which the caller treats as
+// "don't risk the scan" and keeps the branch.
+func commitsBehind(ctx context.Context, repoRoot, base, defRef string) (int, bool) {
+	s, err := gitcmd.String(ctx, repoRoot, "rev-list", "--count", base+".."+defRef)
+	if err != nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // oldestCommonAncestor returns the merge-base of all `commits` — their common

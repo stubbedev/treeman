@@ -218,6 +218,40 @@ func TestPruneGoneLocals_BatchedMultiSuspect(t *testing.T) {
 	}
 }
 
+// A squash-merged-gone branch whose fork point is farther behind defRef than
+// maxSquashScanCommits is KEPT, not reaped: the bounded scan must refuse the
+// far-forked range that ballooned memory/CPU every tick. Same fixture as the
+// squash-deletes test, only the ceiling is lowered to 0 so the one squash
+// commit on main counts as "too far behind".
+func TestPruneGoneLocals_SkipsFarForkedSuspect(t *testing.T) {
+	requireGitAutofetch(t)
+	ctx := context.Background()
+	work := makeFeatureGone(t, "squash", false)
+
+	saved := maxSquashScanCommits
+	maxSquashScanCommits = 0
+	t.Cleanup(func() { maxSquashScanCommits = saved })
+
+	requireKept(t, work, pruneGoneLocals(ctx, work))
+}
+
+// commitsBehind counts defRef commits past base (base..defRef) and nothing else.
+func TestCommitsBehind(t *testing.T) {
+	ctx := context.Background()
+	work, _ := makeClone(t)
+	base := gitOut(t, work, "rev-parse", "HEAD")
+	for i := 0; i < 3; i++ {
+		if err := os.WriteFile(filepath.Join(work, "c.txt"), []byte{byte('a' + i)}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(t, work, "add", "c.txt")
+		gitRun(t, work, "commit", "-q", "-m", "c")
+	}
+	if n, ok := commitsBehind(ctx, work, base, "HEAD"); !ok || n != 3 {
+		t.Errorf("commitsBehind = %d, %v; want 3, true", n, ok)
+	}
+}
+
 // A branch whose upstream is gone but whose work was NOT integrated is kept —
 // this is the data-safety guarantee.
 func TestPruneGoneLocals_KeepsUnmergedGone(t *testing.T) {
