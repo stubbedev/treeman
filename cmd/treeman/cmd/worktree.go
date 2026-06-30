@@ -302,6 +302,7 @@ func wtList() *cli.Command {
 		Usage:   "list active worktrees",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "json"},
+			&cli.BoolFlag{Name: "tsv", Usage: "machine output: one <path>\\t<branch> line per active worktree (for shell consumption)"},
 			&cli.BoolFlag{Name: "with-state", Usage: "include a STATE column derived from the most recent finalize event"},
 			&cli.BoolFlag{
 				Name:  "with-status",
@@ -363,6 +364,22 @@ func wtList() *cli.Command {
 				return err
 			}
 
+			// Drop worktrees whose teardown is in flight. The daemon
+			// writes delete:start the instant teardown begins but only
+			// flips deleted_at when the final git-remove lands at the
+			// very end, so without this a tearing-down worktree lingers
+			// in the list — and in the gwtd picker — for the whole
+			// DB-drop + hooks window. Self-healing: a failed teardown
+			// lands delete:error and the worktree reappears.
+			kept := all[:0]
+			for _, r := range all {
+				if isTearingDown(ctx, st, r.ID) {
+					continue
+				}
+				kept = append(kept, r)
+			}
+			all = kept
+
 			withStatus := c.Bool("with-status")
 			withState := c.Bool("with-state")
 			sortMode := c.String("sort")
@@ -372,6 +389,12 @@ func wtList() *cli.Command {
 				sort.SliceStable(all, func(i, j int) bool { return all[i].HeadTs > all[j].HeadTs })
 			}
 
+			if c.Bool("tsv") {
+				for _, r := range all {
+					fmt.Fprintf(ui.Out, "%s\t%s\n", r.Path, r.Branch)
+				}
+				return nil
+			}
 			if c.Bool("json") {
 				return jsonStream(all)
 			}

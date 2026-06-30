@@ -500,6 +500,27 @@ func finalizeStatusLine(ctx context.Context, st *store.Store, wtID int64) string
 	return state + ui.Dim(" "+detail)
 }
 
+// isTearingDown reports whether a teardown is currently in flight for
+// the worktree — its latest delete-lifecycle event is delete:start
+// with no following delete:end / delete:error. The daemon writes
+// delete:start the moment teardown begins but only flips deleted_at
+// when the final git-remove lands, so this is the signal that hides a
+// worktree from `treeman wt list` (and the gwtd picker) for the whole
+// DB-drop + hooks window in between. Self-healing: a failed teardown
+// lands delete:error and the worktree reappears in the list.
+func isTearingDown(ctx context.Context, st *store.Store, wtID int64) bool {
+	rows, _ := st.QueryEvents(ctx, store.EventFilter{
+		WorktreeID: wtID,
+		EventTypes: []string{
+			store.EvtWorktreeDeleteStart,
+			store.EvtWorktreeDeleteEnd,
+			store.EvtWorktreeDeleteError,
+		},
+		Limit: 1,
+	})
+	return len(rows) > 0 && rows[0].EventType == store.EvtWorktreeDeleteStart
+}
+
 // finalizeStateShort returns just the colored state token, for use
 // in tables where a long parenthetical would overflow the column.
 func finalizeStateShort(ctx context.Context, st *store.Store, wtID int64) string {
