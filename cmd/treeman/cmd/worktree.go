@@ -391,7 +391,7 @@ func wtList() *cli.Command {
 
 			if c.Bool("tsv") {
 				for _, r := range all {
-					fmt.Fprintf(ui.Out, "%s\t%s\n", r.Path, r.Branch)
+					_, _ = fmt.Fprintf(ui.Out, "%s\t%s\n", r.Path, r.Branch)
 				}
 				return nil
 			}

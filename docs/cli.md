@@ -87,6 +87,7 @@ list active worktrees
 | Flag | Usage |
 |---|---|
 | `--json` |  |
+| `--tsv` | machine output: one <path>\t<branch> line per active worktree (for shell consumption) |
 | `--with-state` | include a STATE column derived from the most recent finalize event |
 | `--with-status` | include a STATUS column (clean/dirty/unpushed; forks git status + rev-list per row) |
 | `--sort` | id \| mtime (HEAD commit ts) \| visited (last_visited_at) |
