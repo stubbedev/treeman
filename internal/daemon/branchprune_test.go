@@ -240,7 +240,7 @@ func TestCommitsBehind(t *testing.T) {
 	ctx := context.Background()
 	work, _ := makeClone(t)
 	base := gitOut(t, work, "rev-parse", "HEAD")
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := os.WriteFile(filepath.Join(work, "c.txt"), []byte{byte('a' + i)}, 0o644); err != nil {
 			t.Fatal(err)
 		}
