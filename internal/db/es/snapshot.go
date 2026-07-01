@@ -27,10 +27,110 @@ import (
 	"maps"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 )
+
+// srcBlockRegistry refcounts `index.blocks.write` per (cluster, index)
+// process-wide. `_clone` requires its SOURCE index read-only, but treeman
+// clones the SHARED live parent (`dev_*`) indices concurrently from multiple
+// worktree seeds (and each Driver is a fresh instance, so an instance field
+// wouldn't serialize them). Without coordination, one clone's deferred unblock
+// clears the read-only flag another clone still depends on and ES rejects the
+// in-flight resize with "must be read-only to resize index". Refcounting keeps
+// the block on until the LAST concurrent clone of that source releases it.
+//
+// The entry is retired from the registry when its count returns to zero, so
+// the map stays bounded by the number of IN-FLIGHT source blocks, not by every
+// index name ever cloned. `dead` closes the retire/lookup race: a goroutine
+// that fetched a ref just before it was retired sees the flag after locking and
+// re-looks-up a fresh entry rather than resurrecting the retired one.
+type srcBlockRef struct {
+	mu    sync.Mutex // held across the block/unblock HTTP call for this index
+	count int
+	dead  bool // set under mu just before the entry leaves the registry
+}
+
+var (
+	srcBlockRegMu sync.Mutex
+	srcBlockReg   = map[string]*srcBlockRef{}
+)
+
+// errSourceNotReadOnly tags a _clone rejection caused by the source index
+// losing its write-block mid-clone (a racing external writer, or slow
+// cluster-state propagation). cloneOneIndex re-asserts the block and retries.
+var errSourceNotReadOnly = errors.New("clone source lost its write-block")
+
+func srcBlockKey(base, index string) string { return base + "\x00" + index }
+
+// srcBlockRefFor returns the live ref for (base, index), creating it if absent.
+func srcBlockRefFor(base, index string) *srcBlockRef {
+	srcBlockRegMu.Lock()
+	defer srcBlockRegMu.Unlock()
+	key := srcBlockKey(base, index)
+	ref := srcBlockReg[key]
+	if ref == nil {
+		ref = &srcBlockRef{}
+		srcBlockReg[key] = ref
+	}
+	return ref
+}
+
+// acquireSourceReadOnly ensures `index` is read-only, refcounted process-wide.
+// The first acquirer runs `set`; later concurrent acquirers just increment. On
+// `set` failure the count is NOT incremented, so the caller must not release.
+func acquireSourceReadOnly(ctx context.Context, base, index string, set func(context.Context) error) error {
+	for {
+		ref := srcBlockRefFor(base, index)
+		ref.mu.Lock()
+		if ref.dead {
+			// Retired between lookup and lock — a fresh entry now owns the key.
+			ref.mu.Unlock()
+			continue
+		}
+		if ref.count == 0 {
+			if err := set(ctx); err != nil {
+				ref.mu.Unlock()
+				return err
+			}
+		}
+		ref.count++
+		ref.mu.Unlock()
+		return nil
+	}
+}
+
+// releaseSourceReadOnly decrements the refcount; the last releaser runs `clear`
+// to flip the source writable again and retires the registry entry. Each
+// release pairs with a prior successful acquire whose +1 keeps the entry alive
+// until now, so the lookup below always finds this exact ref (a lookup miss
+// means an unpaired release — treated as a no-op).
+func releaseSourceReadOnly(ctx context.Context, base, index string, clear func(context.Context) error) {
+	srcBlockRegMu.Lock()
+	key := srcBlockKey(base, index)
+	ref := srcBlockReg[key]
+	srcBlockRegMu.Unlock()
+	if ref == nil {
+		return
+	}
+	ref.mu.Lock()
+	defer ref.mu.Unlock()
+	if ref.count == 0 {
+		return
+	}
+	ref.count--
+	if ref.count == 0 {
+		_ = clear(ctx)
+		ref.dead = true
+		srcBlockRegMu.Lock()
+		if srcBlockReg[key] == ref {
+			delete(srcBlockReg, key)
+		}
+		srcBlockRegMu.Unlock()
+	}
+}
 
 // IndexExists reports whether `name` is a live index in the cluster.
 // Uses HEAD /<name> which returns 200 / 404.
@@ -194,24 +294,47 @@ func (d *Driver) cloneIndices(ctx context.Context, srcIndices []string, srcPrefi
 // we don't drop it here (the caller's `DropMatching` already cleared
 // the prefix).
 func (d *Driver) cloneOneIndex(ctx context.Context, src, dst, srcPrefix, dstPrefix string) error {
-	// 1. Mark src read-only.
-	if err := d.setIndexBlock(ctx, src, true); err != nil {
+	// 1. Mark src read-only — refcounted process-wide so concurrent clones of
+	// the SAME shared source (sibling worktrees seeding off the live `dev_*`
+	// parent) don't clear each other's block mid-clone. First acquirer flips
+	// it on; last releaser flips it off.
+	if err := acquireSourceReadOnly(ctx, d.Base, src, func(c context.Context) error {
+		return d.setIndexBlock(c, src, true)
+	}); err != nil {
 		return fmt.Errorf("set read-only on %s: %w", src, err)
 	}
 	defer func() {
-		// Always flip back — even on clone failure — or the app
-		// can't write to its data after a transient ES hiccup.
-		// Use a fresh, short-lived context so the unblock runs
-		// even when ctx has been cancelled mid-clone; otherwise
-		// the source index could stay read-only indefinitely.
+		// Always release — even on clone failure — or the app can't write to
+		// its data after a transient ES hiccup. The last releaser flips back on
+		// a fresh, short-lived context so the unblock runs even when ctx was
+		// cancelled mid-clone; otherwise the source could stay read-only
+		// indefinitely.
 		bgctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = d.setIndexBlock(bgctx, src, false)
+		releaseSourceReadOnly(bgctx, d.Base, src, func(c context.Context) error {
+			return d.setIndexBlock(c, src, false)
+		})
 	}()
 
-	// 2. POST /<src>/_clone/<dst>
-	if err := d.cloneAPICall(ctx, src, dst); err != nil {
-		return err
+	// 2. POST /<src>/_clone/<dst>. The source must stay read-only for the whole
+	// resize. If the block is cleared out from under us mid-clone — a racing
+	// external writer, or slow cluster-state propagation after our PUT — ES
+	// 500s with "must be read-only to resize index". Re-assert the block and
+	// retry a bounded number of times. (The refcount stops treeman itself from
+	// clearing it; this covers everyone else.) A rejected _clone never creates
+	// dst, so no cleanup is needed between attempts.
+	const maxCloneRetries = 3
+	for attempt := 0; ; attempt++ {
+		err := d.cloneAPICall(ctx, src, dst)
+		if err == nil {
+			break
+		}
+		if attempt >= maxCloneRetries || !errors.Is(err, errSourceNotReadOnly) {
+			return err
+		}
+		if berr := d.setIndexBlock(ctx, src, true); berr != nil {
+			return fmt.Errorf("re-assert read-only on %s: %w", src, berr)
+		}
 	}
 
 	// 3. Make the clone writable. ES inherits index.blocks.write
@@ -339,6 +462,13 @@ func (d *Driver) cloneAPICall(ctx context.Context, src, dst string) error {
 		return fmt.Errorf("POST /%s/_clone/%s: read body: %w", src, dst, err)
 	}
 	if resp.StatusCode >= 400 {
+		// ES rejects the resize when the source lost its write-block between
+		// our PUT and this _clone — a racing external writer or slow
+		// cluster-state propagation. Tag it so the caller can re-assert + retry.
+		if bytes.Contains(body, []byte("must be read-only to resize")) {
+			return fmt.Errorf("POST /%s/_clone/%s → HTTP %d: %s: %w",
+				src, dst, resp.StatusCode, body, errSourceNotReadOnly)
+		}
 		return fmt.Errorf("POST /%s/_clone/%s → HTTP %d: %s", src, dst, resp.StatusCode, body)
 	}
 	return d.waitForRecovery(ctx, dst)
