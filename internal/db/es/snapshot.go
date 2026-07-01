@@ -107,7 +107,7 @@ func acquireSourceReadOnly(ctx context.Context, base, index string, set func(con
 // release pairs with a prior successful acquire whose +1 keeps the entry alive
 // until now, so the lookup below always finds this exact ref (a lookup miss
 // means an unpaired release — treated as a no-op).
-func releaseSourceReadOnly(ctx context.Context, base, index string, clear func(context.Context) error) {
+func releaseSourceReadOnly(ctx context.Context, base, index string, clearFn func(context.Context) error) {
 	srcBlockRegMu.Lock()
 	key := srcBlockKey(base, index)
 	ref := srcBlockReg[key]
@@ -122,7 +122,7 @@ func releaseSourceReadOnly(ctx context.Context, base, index string, clear func(c
 	}
 	ref.count--
 	if ref.count == 0 {
-		_ = clear(ctx)
+		_ = clearFn(ctx)
 		ref.dead = true
 		srcBlockRegMu.Lock()
 		if srcBlockReg[key] == ref {

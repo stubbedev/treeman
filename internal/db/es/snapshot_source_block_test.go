@@ -43,8 +43,9 @@ func TestConcurrentCloneSharedSource(t *testing.T) {
 			mu.Unlock()
 			if !ok {
 				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(`{"error":{"reason":"index ` + src +
-					` must be read-only to resize index. use \"index.blocks.write=true\""},"status":500}`))
+				_, _ = w.Write(
+					[]byte(`{"error":{"reason":"index must be read-only to resize index. use \"index.blocks.write=true\""},"status":500}`),
+				)
 				return
 			}
 			_, _ = w.Write([]byte(`{"acknowledged":true}`))
@@ -65,13 +66,11 @@ func TestConcurrentCloneSharedSource(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, n)
 	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			dstPrefix := fmt.Sprintf("kho_%d_", i)
 			dst := dstPrefix + strings.TrimPrefix(src, "dev_")
 			errs[i] = d.cloneOneIndex(context.Background(), src, dst, "dev_", dstPrefix)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -96,7 +95,7 @@ func TestSourceBlockRefcount(t *testing.T) {
 	const idx = "TestSourceBlockRefcount_idx"
 	var sets, clears int
 	set := func(context.Context) error { sets++; return nil }
-	clear := func(context.Context) error { clears++; return nil }
+	clearFn := func(context.Context) error { clears++; return nil }
 	ctx := context.Background()
 
 	for range 5 {
@@ -108,7 +107,7 @@ func TestSourceBlockRefcount(t *testing.T) {
 		t.Errorf("set called %d times, want 1", sets)
 	}
 	for i := range 5 {
-		releaseSourceReadOnly(ctx, "base", idx, clear)
+		releaseSourceReadOnly(ctx, "base", idx, clearFn)
 		want := 0
 		if i == 4 {
 			want = 1
@@ -163,8 +162,7 @@ func TestCloneRetriesWhenSourceBlockCleared(t *testing.T) {
 			// ran the resize → 500. Retry #2 only succeeds if it re-asserted.
 			if attempt == 1 || !reasserted {
 				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(`{"error":{"reason":"index ` + src +
-					` must be read-only to resize index."},"status":500}`))
+				_, _ = w.Write([]byte(`{"error":{"reason":"index must be read-only to resize index."},"status":500}`))
 				return
 			}
 			_, _ = w.Write([]byte(`{"acknowledged":true}`))
@@ -263,15 +261,13 @@ func TestSourceBlockConcurrentChurn(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 200 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := acquireSourceReadOnly(ctx, "base", idx, noop); err != nil {
 				t.Error(err)
 				return
 			}
 			releaseSourceReadOnly(ctx, "base", idx, noop)
-		}()
+		})
 	}
 	wg.Wait()
 
