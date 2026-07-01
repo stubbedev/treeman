@@ -862,7 +862,7 @@ func (a branchScopedArgs) recordClean(ctx context.Context, active, branch, decis
 func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool, string, error) {
 	dur := a.eng.durable(active, branch)
 	if ok, _ := a.eng.drv.Exists(ctx, dur); ok {
-		if err := a.eng.drv.Restore(ctx, dur, active); err != nil {
+		if err := retryTransient(ctx, func() error { return a.eng.drv.Restore(ctx, dur, active) }); err != nil {
 			return false, "", fmt.Errorf("restore durable copy for %q: %w", branch, err)
 		}
 		return true, "resume", nil
@@ -873,7 +873,8 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 	}
 	if ok && parent != "" && parent != active {
 		if pe, _ := a.eng.drv.Exists(ctx, parent); pe {
-			if err := a.eng.drv.RestoreParent(ctx, parent, active, a.parentSourceKeep(ctx, parent)); err != nil {
+			keep := a.parentSourceKeep(ctx, parent)
+			if err := retryTransient(ctx, func() error { return a.eng.drv.RestoreParent(ctx, parent, active, keep) }); err != nil {
 				return false, "", fmt.Errorf("seed %q from parent branch's live db %q: %w%s",
 					active, parent, err, parentSeedHint(a.eng.engine, err))
 			}

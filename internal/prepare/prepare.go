@@ -409,9 +409,16 @@ func fanOutClones(
 	for _, c := range clones {
 		g.Go(func() error {
 			cloneStart := time.Now()
-			err := restore(gctx, template, c)
+			err := retryTransient(gctx, func() error { return restore(gctx, template, c) })
 			dur := time.Since(cloneStart).Milliseconds()
 			if err != nil {
+				if isCancellation(err) {
+					// A peer clone/engine failed and cancelled the shared
+					// errgroup ctx; this clone was aborted, not failed.
+					// Keep the collateral out of the failure count + warn
+					// log — errgroup already carries the real cause.
+					return err
+				}
 				failCount.Add(1)
 				if st != nil {
 					_ = st.WriteEvent(gctx, store.LevelWarn, store.EvtClonesRestoreError,
@@ -536,7 +543,10 @@ func cacheHitRestoreAndFanout(
 		}
 	}
 	if err := fanOutClones(ctx, st, repoID, worktreeID, restore, template, targets, d.Engine, d.Fanout, maxConns); err != nil {
-		if st != nil {
+		// A cancellation is peer-collateral, not a suspect snapshot: don't
+		// warn a bogus cold-build fallback and don't evict a good cached
+		// template just because another engine failed mid-run.
+		if st != nil && !isCancellation(err) {
 			_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtSnapshotsCacheFallback,
 				fmt.Sprintf("restore/fanout failed, falling back to cold build: %v", err),
 				repoID, worktreeID, "", 0, map[string]string{
