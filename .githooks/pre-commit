@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# Pre-commit format gate. Mirrors the strict read-only check CI runs
-# (.github/workflows/ci.yml → "lint" job) so format drift never lands
-# on master.
+# Pre-commit format hook. AUTO-FIXES the staged Go files with
+# `golangci-lint fmt` (gofumpt + goimports + golines, configured in
+# .golangci.yml) and re-stages them, so format drift never lands on
+# master (CI's read-only lint job stays the backstop).
 #
-# The formatter stack is `golangci-lint fmt` (gofumpt + goimports +
-# golines), configured in .golangci.yml. Auto-fix locally with:
-#   just fmt
+# The one case it refuses to fix: a PARTIALLY-staged Go file. Formatting
+# the worktree copy and re-adding it would silently sweep the unstaged
+# hunks into the commit — abort and let the user decide instead.
 #
 # Enable once per clone:
 #   just install-hooks
 #
-# Skip in an emergency (CI will still block):
+# Skip in an emergency (CI will still block on drift):
 #   git commit --no-verify
 
 set -euo pipefail
+
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR -- '*.go')
+((${#staged[@]})) || exit 0
 
 if ! command -v golangci-lint >/dev/null 2>&1; then
     echo "✗ golangci-lint not found on PATH." >&2
@@ -21,17 +25,13 @@ if ! command -v golangci-lint >/dev/null 2>&1; then
     exit 1
 fi
 
-# `golangci-lint fmt --diff` prints the changes it *would* make; empty
-# output means everything is already formatted.
-drift=$(golangci-lint fmt --diff ./... 2>/dev/null)
-if [ -z "$drift" ]; then
-    exit 0
+mapfile -t partial < <(git diff --name-only -- "${staged[@]}")
+if ((${#partial[@]})); then
+    echo "✗ partially-staged Go files — auto-formatting would commit their unstaged hunks:" >&2
+    printf '    %s\n' "${partial[@]}" >&2
+    echo "Stage or stash the remaining edits, then retry. Bypass: git commit --no-verify" >&2
+    exit 1
 fi
 
-echo "✗ formatting drift — golangci-lint fmt would rewrite some files:" >&2
-echo >&2
-printf '%s\n' "$drift" >&2
-echo >&2
-echo "Fix with:  just fmt" >&2
-echo "Bypass:    git commit --no-verify" >&2
-exit 1
+golangci-lint fmt "${staged[@]}"
+git add -- "${staged[@]}"
