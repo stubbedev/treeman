@@ -141,6 +141,7 @@ type taskRunner func(context.Context, *State, rpc.Task) (json.RawMessage, error)
 var taskRunners = map[string]taskRunner{
 	rpc.TaskPrepare:            runTaskPrepare,
 	rpc.TaskDBReset:            runTaskDBReset,
+	rpc.TaskDBSave:             runTaskDBSave,
 	rpc.TaskHookRun:            runTaskHookRun,
 	rpc.TaskSnapshotsPurge:     runTaskSnapshotsPurge,
 	rpc.TaskMainPurgeDBs:       runTaskMainPurgeDBs,
@@ -232,6 +233,26 @@ func runTaskDBReset(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 		return nil, err
 	}
 	return json.Marshal(map[string]any{"outcomes": seededOutcomes(outs, &id.cfg, engineFilter)})
+}
+
+func runTaskDBSave(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
+	id, err := resolveTaskIdentity(ctx, st, task.RepoPath, task.WorktreePath)
+	if err != nil {
+		return nil, err
+	}
+	saves, err := prepare.SaveBranchScoped(
+		ctx,
+		&id.cfg,
+		task.WorktreePath,
+		id.repoID,
+		id.wtID,
+		st.Store,
+		task.Params[rpc.ParamEngineFilter],
+	)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{"saved": saves})
 }
 
 // seededOutcomes filters prepare outcomes to the branch-scoped databases

@@ -667,6 +667,45 @@ func TestResetReseedsFromParent(t *testing.T) {
 	f.assertMarker("develop")
 }
 
+// TestSaveCapturesWithoutSwitch locks `treeman db save`: capture the
+// active namespace into the CURRENT branch's durable copy in place —
+// no drop, no marker change — and skip when nothing changed since the
+// last capture (same watermark lever as swapBranch).
+func TestSaveCapturesWithoutSwitch(t *testing.T) {
+	ctx := context.Background()
+	f := newBSFixture(t)
+
+	// develop adopted with data; the adopt captured a durable copy.
+	f.set(f.active, map[string]string{"develop": "1"})
+	f.run("develop")
+
+	// App writes after the adopt — the durable copy is now stale.
+	f.write(f.active, "extra", "1")
+
+	out, err := saveActiveNamespace(ctx, f.eng, f.st, f.repoID, f.worktreeID, f.active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Skipped != "" {
+		t.Fatalf("save must capture after a write, skipped: %s", out.Skipped)
+	}
+	if _, ok := f.fake.data[f.durable("develop")]["extra"]; !ok {
+		t.Fatalf("durable copy not refreshed: %v", f.fake.data[f.durable("develop")])
+	}
+	f.assertActive("develop", "extra") // active untouched
+	f.assertMarker("develop")          // marker untouched
+
+	// No writes since the save → the second save must skip via watermark.
+	before := f.fake.captureCalls
+	out2, err := saveActiveNamespace(ctx, f.eng, f.st, f.repoID, f.worktreeID, f.active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out2.Skipped == "" || f.fake.captureCalls != before {
+		t.Fatalf("unchanged save must skip capture (skipped=%q calls=%d→%d)", out2.Skipped, before, f.fake.captureCalls)
+	}
+}
+
 // TestBranchScopedSwapAdvancesMarkerBeforeFill locks the crash-safety
 // ordering: on a branch switch the active-branch marker must advance to
 // the NEW branch the moment the OLD branch's data is safe in its durable

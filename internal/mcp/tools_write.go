@@ -51,6 +51,12 @@ func registerWriteTools(srv *mcpsdk.Server) {
 	}, dbResetTool)
 
 	addTool(srv, &mcpsdk.Tool{
+		Name:        "db_save",
+		Description: "Capture a worktree's branch_scoped active namespaces into the CURRENT branch's durable copies without switching branches — a manual checkpoint of the swap lifecycle's capture half. Only this branch's own durable copies are overwritten; other branches' copies untouched. Engines whose active provably mirrors the durable (unchanged watermark) are skipped. No-op when no DBs are branch_scoped.",
+		Annotations: writeAnno("Save branch_scoped durable copies", false, true, true),
+	}, dbSaveTool)
+
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "hook_run",
 		Description: "Re-run one configured hook phase synchronously for a worktree. Optional env_overrides lets you tweak a var (e.g. DEBUG=1) for THIS run without editing .treeman.yaml. Returns per-group exit codes + stdout/stderr tails.",
 		Annotations: writeAnno("Run hook phase", true, false, true),
@@ -230,6 +236,25 @@ func dbResetTool(ctx context.Context, req *mcpsdk.CallToolRequest, in dbResetIn)
 		return nil, dbResetOut{}, err
 	}
 	return nil, dbResetOut{Outcomes: outs}, nil
+}
+
+// ─── db_save ──────────────────────────────────────────────────────
+
+type dbSaveIn struct {
+	Worktree string `json:"worktree,omitempty" jsonschema:"defaults to cwd's worktree"`
+	Repo     string `json:"repo,omitempty"`
+	Engine   string `json:"engine,omitempty"   jsonschema:"restrict to one engine family: mysql|postgres|mongodb|redis|elasticsearch (aliases like mariadb/postgresql/valkey/dragonfly accepted); omit to save all branch_scoped databases"`
+}
+type dbSaveOut struct {
+	Saved []prepare.BranchScopedSave `json:"saved" jsonschema:"per-database result; a non-empty skipped field explains why no capture ran (no marker, missing active, or unchanged watermark)"`
+}
+
+func dbSaveTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in dbSaveIn) (*mcpsdk.CallToolResult, dbSaveOut, error) {
+	saves, err := runDbSave(ctx, in.Worktree, in.Repo, strings.ToLower(in.Engine))
+	if err != nil {
+		return nil, dbSaveOut{}, err
+	}
+	return nil, dbSaveOut{Saved: saves}, nil
 }
 
 // ─── hook_run ─────────────────────────────────────────────────────

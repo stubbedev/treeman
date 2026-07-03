@@ -48,6 +48,7 @@ const (
 	// databases — db operations
 	EvtDBDrop          = "db:drop"
 	EvtDBReset         = "db:reset"
+	EvtDBSave          = "db:save"
 	EvtDBTeardownSkip  = "db:teardown:skip"
 	EvtDBTeardownError = "db:teardown:error"
 

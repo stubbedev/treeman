@@ -110,6 +110,7 @@ type Request struct {
 const (
 	TaskPrepare            = "prepare"             // prepare.Run
 	TaskDBReset            = "db_reset"            // drop branch-scoped + re-prepare
+	TaskDBSave             = "db_save"             // capture branch-scoped → durable copy
 	TaskHookRun            = "hook_run"            // run one hook phase
 	TaskSnapshotsPurge     = "snapshots_purge"     // drop every cached template DB
 	TaskMainPurgeDBs       = "main_purge_dbs"      // drop main_<branch> DBs across branches

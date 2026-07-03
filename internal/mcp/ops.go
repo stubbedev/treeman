@@ -325,6 +325,35 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 	return seeded, nil
 }
 
+// runDbSave captures a worktree's branch_scoped active namespaces into
+// the current branch's durable copies without switching branches. Same
+// identity routing as runDbReset.
+func runDbSave(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.BranchScopedSave, error) {
+	wt, branch := resolveWorktree(ctx, worktree)
+	repoRoot, err := resolveRepo(ctx, repoOverride)
+	if err != nil {
+		repoRoot, err = gitenv.MainRoot(ctx, wt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = st.Close() }()
+	repoID, _ := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	id, err := wtpkg.ResolveIdentity(ctx, st, &cfg, repoRoot, wt, branch, repoID)
+	if err != nil {
+		return nil, err
+	}
+	return prepare.SaveBranchScoped(ctx, &cfg, wt, repoID, id.WtID, st, engineFilter)
+}
+
 // runBranchScopedStatus reports the swap state of a worktree's
 // branch_scoped databases. Routes through ResolveIdentity so the active
 // namespace renders the same name the swap lifecycle uses (bare on the

@@ -58,6 +58,7 @@ State mutations the daemon performs; submitted as a plan via the `run_plan` meth
 |-------|----------|-------|
 | `prepare` | `rpc.TaskPrepare` | prepare.Run |
 | `db_reset` | `rpc.TaskDBReset` | drop branch-scoped + re-prepare |
+| `db_save` | `rpc.TaskDBSave` | capture branch-scoped → durable copy |
 | `hook_run` | `rpc.TaskHookRun` | run one hook phase |
 | `snapshots_purge` | `rpc.TaskSnapshotsPurge` | drop every cached template DB |
 | `main_purge_dbs` | `rpc.TaskMainPurgeDBs` | drop main_<branch> DBs across branches |

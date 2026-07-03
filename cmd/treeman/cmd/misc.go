@@ -271,7 +271,9 @@ func resolveWtRepo(worktree, repoOverride string) (wtPath, repoRoot string, err 
 // DbCmd — `treeman db reset` re-syncs a worktree's branch_scoped
 // databases from the live base branch. Drops the current branch's
 // durable copy + the active namespace, then re-runs prepare so each
-// is repopulated from the live parent branch.
+// is repopulated from the live parent branch. `treeman db save`
+// captures the active namespaces into the current branch's durable
+// copies without switching branches.
 func DbCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "db",
@@ -308,6 +310,39 @@ func DbCmd() *cli.Command {
 						return runResultJSON(ctx, task)
 					}
 					return dispatchTask(ctx, task, c.Bool("foreground"), "db reset")
+				},
+			},
+			{
+				Name:      "save",
+				Usage:     "capture branch_scoped databases into the current branch's durable copies without switching (defaults to the cwd's worktree)",
+				ArgsUsage: "[worktree]",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+					&cli.StringFlag{
+						Name:  "engine",
+						Usage: "restrict the save to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql/valkey/dragonfly accepted)",
+					},
+					&cli.BoolFlag{Name: "json"},
+					&cli.BoolFlag{
+						Name:    "foreground",
+						Aliases: []string{"wait", "f"},
+						Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+					},
+				},
+				Action: func(ctx context.Context, c *cli.Command) error {
+					wtPath, repoRoot, err := resolveWtRepo(c.Args().First(), c.String("repo"))
+					if err != nil {
+						return err
+					}
+					task := rpc.Task{
+						Type: rpc.TaskDBSave, RepoPath: repoRoot, WorktreePath: wtPath,
+						Params:       map[string]string{rpc.ParamEngineFilter: strings.ToLower(c.String("engine"))},
+						InheritedEnv: CaptureInheritedEnv(),
+					}
+					if c.Bool("json") {
+						return runResultJSON(ctx, task)
+					}
+					return dispatchTask(ctx, task, c.Bool("foreground"), "db save")
 				},
 			},
 			{

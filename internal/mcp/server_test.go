@@ -24,7 +24,7 @@ var allTools = []string{
 	"hook_log_read", "snapshots_drop", "db_dump", "connection_probe",
 	"engine_logs", "es_request",
 	// write
-	"prepare_run", "db_reset", "hook_run", "config_write", "config_set",
+	"prepare_run", "db_reset", "db_save", "hook_run", "config_write", "config_set",
 	"config_unset", "config_delete", "config_restore",
 	"registry_register", "registry_unregister", "registry_repair",
 	"repo_remove", "worktree_repair",

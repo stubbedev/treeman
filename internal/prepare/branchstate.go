@@ -1244,6 +1244,134 @@ func resetActiveNamespace(ctx context.Context, eng *branchEngine, st *store.Stor
 	return st.ClearActiveBranch(ctx, worktreeID, active)
 }
 
+// BranchScopedSave reports one database handled by SaveBranchScoped.
+type BranchScopedSave struct {
+	Engine string `json:"engine"`
+	Active string `json:"active"`
+	// Branch is the branch whose durable copy was refreshed (the marker
+	// owner). Empty when the save was skipped before marker resolution.
+	Branch  string `json:"branch,omitempty"`
+	Durable string `json:"durable,omitempty"`
+	// Skipped carries the reason when no capture ran (no marker, active
+	// missing, or provably unchanged since the last capture).
+	Skipped string `json:"skipped,omitempty"`
+}
+
+// SaveBranchScoped captures every branch_scoped active namespace into the
+// CURRENT branch's durable copy without a branch switch — the capture
+// half of swapBranch as a manual checkpoint. Backs `treeman db save`.
+// Other branches' durable copies are untouched. `engineFilter`
+// (lowercased) restricts the save to one engine family when non-empty.
+func SaveBranchScoped(
+	ctx context.Context,
+	cfg *config.Config,
+	worktreePath string,
+	repoID, worktreeID int64,
+	st *store.Store,
+	engineFilter string,
+) ([]BranchScopedSave, error) {
+	filterLabel := engineFilter
+	if engineFilter != "" {
+		if fam, ok := engine.Canonical(engineFilter); ok {
+			filterLabel = string(fam)
+		}
+	}
+	var saves []BranchScopedSave
+	for _, d := range cfg.Databases {
+		if !d.BranchScoped {
+			continue
+		}
+		scope, label, ok := branchScopeFor(d.Engine)
+		if !ok {
+			continue
+		}
+		if filterLabel != "" && label != filterLabel {
+			continue
+		}
+		active, err := activeNamespace(d, scope, worktreePath)
+		if err != nil {
+			return saves, fmt.Errorf("render active namespace for %s: %w", d.Engine, err)
+		}
+		eng, closeEng, cerr := connectBranchEngine(ctx, cfg, d.Engine, siblingSlugs(ctx, st, repoID, worktreeID))
+		if cerr != nil {
+			return saves, cerr
+		}
+		if eng == nil {
+			continue
+		}
+		s, serr := saveActiveNamespace(ctx, eng, st, repoID, worktreeID, active)
+		closeEng()
+		if serr != nil {
+			return saves, serr
+		}
+		saves = append(saves, s)
+		if s.Skipped == "" {
+			_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtDBSave,
+				fmt.Sprintf("%s: captured active %s into durable copy for %s", d.Engine, active, s.Branch),
+				repoID, worktreeID, "", 0,
+				map[string]string{"engine": d.Engine, "active": active, "branch": s.Branch, "durable": s.Durable})
+		}
+	}
+	return saves, nil
+}
+
+// saveActiveNamespace captures one active namespace into its marker
+// branch's durable copy. Reuses swapBranch's capture-skip lever: when the
+// active provably still mirrors the durable (unchanged watermark), the
+// capture is skipped rather than re-copied.
+func saveActiveNamespace(
+	ctx context.Context,
+	eng *branchEngine,
+	st *store.Store,
+	repoID, worktreeID int64,
+	active string,
+) (BranchScopedSave, error) {
+	out := BranchScopedSave{Engine: eng.engine, Active: active}
+	branch, ok, err := st.GetActiveBranch(ctx, worktreeID, active)
+	if err != nil {
+		return out, err
+	}
+	if !ok || branch == "" {
+		out.Skipped = "no active-branch marker — nothing owns this namespace yet (run prepare first)"
+		return out, nil
+	}
+	out.Branch = branch
+	exists, err := eng.drv.Exists(ctx, active)
+	if err != nil {
+		return out, err
+	}
+	if !exists {
+		out.Skipped = "active namespace does not exist"
+		return out, nil
+	}
+	dur := eng.durable(active, branch)
+	out.Durable = dur
+	prevClean, prevWM, hasClean, cerr := st.GetActiveBranchClean(ctx, worktreeID, active)
+	if cerr == nil && hasClean {
+		durExists, _ := eng.drv.Exists(ctx, dur)
+		if w, werr := eng.drv.Watermark(ctx, active); werr == nil && captureSkippable(prevClean, durExists, prevWM, w) {
+			out.Skipped = "unchanged since last capture (watermark match)"
+			return out, nil
+		}
+	}
+	if err := eng.drv.Capture(ctx, active, dur); err != nil {
+		return out, fmt.Errorf("capture %s into durable copy for %q: %w", active, branch, err)
+	}
+	_ = st.RecordBranchDurable(ctx, store.BranchDurableRow{
+		RepoID:      repoID,
+		WorktreeID:  worktreeID,
+		Engine:      eng.engine,
+		DBKey:       active,
+		Branch:      branch,
+		DurableName: dur,
+	})
+	// Mark clean so the next swap (or save) can skip a redundant capture.
+	if w, werr := eng.drv.Watermark(ctx, active); werr == nil && w != "" {
+		_ = st.SetActiveBranchClean(ctx, repoID, worktreeID, active, branch, eng.engine, true, w)
+	}
+	return out, nil
+}
+
 // BranchScopedDB reports the swap state of one branch_scoped database.
 type BranchScopedDB struct {
 	Engine string `json:"engine"`

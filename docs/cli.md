@@ -282,6 +282,17 @@ re-sync branch_scoped databases from the live base branch (defaults to the cwd's
 | `--json` |  |
 | `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
+### `treeman db save`
+
+capture branch_scoped databases into the current branch's durable copies without switching (defaults to the cwd's worktree)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--engine` | restrict the save to one engine family (mysql, postgres, mongodb, redis, elasticsearch; aliases like mariadb/postgresql/valkey/dragonfly accepted) |
+| `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
+
 ### `treeman db status`
 
 show branch_scoped state: active namespace, current branch, and resumable branches (defaults to the cwd's worktree)

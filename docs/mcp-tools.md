@@ -56,6 +56,7 @@ through the `tools` gateway (`action=list` / `action=enable`).
 | `db_dump` |  | Refresh the seed dump used for cold builds — runs mysqldump / pg_dump / mongodump / ES scroll-bulk. |
 | `db_query` |  | Read OR write a configured engine directly — no shelling out to mysql/psql/mongosh/redis-cli. |
 | `db_reset` |  | Reset a worktree's branch_scoped DBs to the base branch's data — drops the active namespace + current branch's durable copy, then re-seeds from the parent. |
+| `db_save` |  | Capture a worktree's branch_scoped active namespaces into the CURRENT branch's durable copies without switching branches — a manual checkpoint of the swap lifecycle's capture half. |
 | `db_schema_dump` |  | Dump the live schema for ONE database — mysql/postgres: CREATE TABLEs, mongo: collection list + samples, ES: index mapping, redis: SCAN-driven key summary. |
 
 ## doctor
