@@ -548,16 +548,20 @@ func resolveElasticsearch(cfg *config.Config, env envfile.EnvFile) *resolvedConn
 
 // ─────────────────────────── s3 ───────────────────────────
 
-// resolveS3 returns the configured S3 connection with the secret key
-// substituted from env when written as a `$NAME` / `${NAME}` ref.
-// Unlike the SQL engines, S3 has no widely-used env-derived DSN
-// convention (`S3_URL` etc.) — the connection is YAML-only.
+// resolveS3 returns the configured S3 connection with the access key,
+// secret key, region, and endpoint substituted from env when written
+// as `$NAME` / `${NAME}` refs. Unlike the SQL engines, S3 has no
+// widely-used env-derived DSN convention (`S3_URL` etc.) — the
+// connection is YAML-only.
 func resolveS3(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.S3Conn] {
 	if cfg.Connections.S3 == nil {
 		return nil
 	}
 	s := *cfg.Connections.S3
+	s.AccessKey = resolvePasswordValue(env, s.AccessKey)
 	s.SecretKey = resolvePasswordValue(env, s.SecretKey)
+	s.Region = resolvePasswordValue(env, s.Region)
+	s.Endpoint = resolvePasswordValue(env, s.Endpoint)
 	return &resolvedConn[config.S3Conn]{Conn: s, Source: Source{Kind: SourceYaml}}
 }
 

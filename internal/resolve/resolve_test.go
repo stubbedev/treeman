@@ -141,3 +141,34 @@ func TestNullPasswordInEnvYieldsNoPassword(t *testing.T) {
 		t.Errorf("password should be empty, got %q", r.Conn.Password)
 	}
 }
+
+func TestS3FieldsPickUpEnvRefs(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Connections.S3 = &config.S3Conn{
+		Endpoint:  "$STORAGE_ENDPOINT",
+		Region:    "${STORAGE_REGION}",
+		AccessKey: "$STORAGE_KEY",
+		SecretKey: "$STORAGE_SECRET",
+	}
+	env := envfile.Parse("STORAGE_ENDPOINT=http://127.0.0.1:9000\nSTORAGE_REGION=garage\nSTORAGE_KEY=GKabc\nSTORAGE_SECRET=shh\n")
+	r := resolveS3(cfg, env)
+	if r.Conn.Endpoint != "http://127.0.0.1:9000" || r.Conn.Region != "garage" ||
+		r.Conn.AccessKey != "GKabc" || r.Conn.SecretKey != "shh" {
+		t.Errorf("got %+v", r.Conn)
+	}
+}
+
+func TestS3LiteralFieldsPassThrough(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Connections.S3 = &config.S3Conn{
+		Endpoint:  "http://127.0.0.1:9000",
+		Region:    "garage",
+		AccessKey: "GKabc",
+		SecretKey: "shh",
+	}
+	r := resolveS3(cfg, envfile.Parse(""))
+	if r.Conn.Endpoint != "http://127.0.0.1:9000" || r.Conn.Region != "garage" ||
+		r.Conn.AccessKey != "GKabc" || r.Conn.SecretKey != "shh" {
+		t.Errorf("got %+v", r.Conn)
+	}
+}

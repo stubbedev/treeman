@@ -793,18 +793,22 @@ func (EsConn) JSONSchema() *jsonschema.Schema { return uriOrMap("elasticsearch",
 // require path-style; AWS S3 supports either but virtual-host is the
 // default. Set true for any non-AWS endpoint.
 //
-// Credentials: `AccessKey` is literal; `SecretKey` accepts `$NAME` /
-// `${NAME}` env-var refs (same resolution chain as MysqlConn.Password).
+// Every string field (`Endpoint`, `Region`, `AccessKey`, `SecretKey`)
+// accepts either a literal or a `$NAME` / `${NAME}` env-var ref (same
+// resolution chain as MysqlConn.Password — resolved from the repo's
+// `env_sources` files).
 type S3Conn struct {
 	// Endpoint URL the SDK dials (e.g. `http://localhost:9000`). Leave
-	// empty to use the AWS-SDK default endpoint for `Region`.
+	// empty to use the AWS-SDK default endpoint for `Region`. Literal
+	// or `$NAME` / `${NAME}` env-var ref.
 	Endpoint string `yaml:"endpoint,omitempty"`
 
 	// Region. Defaults to `us-east-1` (the AWS-SDK default that MinIO
 	// and Garage also accept). Required for AWS S3 outside us-east-1.
+	// Literal or `$NAME` / `${NAME}` env-var ref.
 	Region string `yaml:"region,omitempty"`
 
-	// Access key id. Literal.
+	// Access key id. Literal or `$NAME` / `${NAME}` env-var ref.
 	AccessKey string `yaml:"access_key,omitempty"`
 
 	// Secret access key. Literal or `$NAME` / `${NAME}` env-var ref.
