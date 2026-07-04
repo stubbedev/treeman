@@ -44,9 +44,11 @@ func TestProtectedPush(t *testing.T) {
 	if ProtectedPush("hotfix/x", nil) == "" {
 		t.Error("hotfix/x should match hotfix/*")
 	}
-	// release/* must not match a nested path (path.Match semantics).
-	if ProtectedPush("release/a/b", nil) != "" {
-		t.Error("release/a/b should not match release/* (nested)")
+	// zsh string-glob semantics: `*` crosses `/`, so nested release
+	// paths are protected too — matching the old shell behavior the
+	// repo `gp.protected` patterns were written against.
+	if ProtectedPush("release/a/b", nil) == "" {
+		t.Error("release/a/b should match release/* (zsh glob semantics)")
 	}
 	if ProtectedPush("qa", []string{"qa"}) == "" {
 		t.Error("extra glob 'qa' should protect qa")

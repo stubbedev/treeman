@@ -8,7 +8,6 @@
 package gitx
 
 import (
-	"path"
 	"regexp"
 	"strings"
 )
@@ -57,13 +56,33 @@ func ProtectedPush(branch string, extraGlobs []string) string {
 		if pat == "" {
 			continue
 		}
-		// path.Match treats `/` specially, which is exactly what we
-		// want for `release/*` (matches `release/1.2.3`, not nested).
-		if ok, _ := path.Match(pat, branch); ok {
+		if globMatch(pat, branch) {
 			return "branch '" + branch + "' matches '" + pat + "'"
 		}
 	}
 	return ""
+}
+
+// globMatch matches with zsh string-glob semantics — `*` and `?` cross
+// `/` (zsh `[[ release/a/b == release/* ]]` is true), unlike
+// path.Match. That's the contract the repo-configured `gp.protected`
+// patterns were written against.
+func globMatch(pat, s string) bool {
+	var re strings.Builder
+	re.WriteString("^")
+	for _, r := range pat {
+		switch r {
+		case '*':
+			re.WriteString(".*")
+		case '?':
+			re.WriteString(".")
+		default:
+			re.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	re.WriteString("$")
+	matched, err := regexp.MatchString(re.String(), s)
+	return err == nil && matched
 }
 
 // handleKeyRe splits a pasted ticket reference from its description:

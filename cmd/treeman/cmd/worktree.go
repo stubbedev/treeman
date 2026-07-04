@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -134,7 +135,7 @@ func wtSwitch() *cli.Command {
 			&cli.BoolFlag{Name: "no-fetch", Usage: "skip the pre-checkout fetch"},
 		},
 		ShellComplete: branchArgComplete,
-		Action:        switchAction,
+		Action:        wtSwitchAction,
 	}
 }
 
@@ -322,11 +323,36 @@ Examples:
 				wtPath = p
 			}
 
+			// Refuse to tear down the worktree the shell is standing in —
+			// the daemon would rm -rf it under the user's feet and leave
+			// the shell in a deleted directory. `worktree back --remove`
+			// is the leave-and-drop flow.
+			if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+				if top, topErr := gitWorktreeRoot(cwd); topErr == nil && top == wtPath {
+					return errors.New(
+						"refusing to delete the worktree you're in — use `cd \"$(treeman worktree back --remove)\"`")
+				}
+			}
+
+			// Prompt policy (zsh gwtd parity): a clean, fully-pushed
+			// worktree deletes without ceremony — its state is
+			// regenerable. Only uncommitted changes / unpushed commits
+			// warrant a stop, and then as a default-yes warning naming
+			// the reason.
 			if !c.Bool("yes") {
-				q := fmt.Sprintf("delete worktree %s and drop its databases?", wtPath)
-				if !ui.Confirm(q) {
-					PrintInfo("aborted: worktree %s left intact", wtPath)
-					return nil
+				var reasons []string
+				if clean, _ := gitenv.IsWorktreeClean(ctx, wtPath); !clean {
+					reasons = append(reasons, "uncommitted changes")
+				}
+				if unpushed, _ := gitenv.HasUnpushedCommits(ctx, wtPath); unpushed {
+					reasons = append(reasons, "unpushed commits")
+				}
+				if len(reasons) > 0 {
+					q := fmt.Sprintf("Worktree %s has %s — destroy?", wtPath, strings.Join(reasons, ", "))
+					if !ui.ConfirmYes(q) {
+						PrintInfo("aborted: worktree %s left intact", wtPath)
+						return nil
+					}
 				}
 			}
 
@@ -872,20 +898,26 @@ func wtBack() *cli.Command {
 				return err
 			}
 
+			// The dirty/unpushed gate is NOT bypassable — `--remove` must
+			// never destroy work (the zsh `gwtc` contract; the claude
+			// wrapper runs this automatically on exit). `--force` only
+			// forwards to the git-level removal below, where it exists to
+			// get past gitignored build artifacts (vendor/, node_modules/),
+			// not past uncommitted changes. Explicitly nuking a dirty
+			// worktree is `treeman worktree delete --force`'s job.
 			clean, err := gitenv.IsWorktreeClean(ctx, wtRoot)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "git status failed: %v; --remove aborted\n", err)
 				fmt.Println(repoRoot)
 				return nil
 			}
-			if !clean && !c.Bool("force") {
-				fmt.Fprintln(os.Stderr, "worktree has uncommitted changes; refusing --remove (pass --force to override)")
+			if !clean {
+				fmt.Fprintln(os.Stderr, "keeping worktree (uncommitted changes)")
 				fmt.Println(repoRoot)
 				return nil
 			}
-			unpushed, _ := gitenv.HasUnpushedCommits(ctx, wtRoot)
-			if unpushed && !c.Bool("force") {
-				fmt.Fprintln(os.Stderr, "worktree has commits ahead of upstream; refusing --remove (pass --force to override)")
+			if unpushed, _ := gitenv.HasUnpushedCommits(ctx, wtRoot); unpushed {
+				fmt.Fprintln(os.Stderr, "keeping worktree (commits ahead of upstream)")
 				fmt.Println(repoRoot)
 				return nil
 			}
@@ -1130,7 +1162,7 @@ func goCheckout(ctx context.Context, repoRoot, branch, from string, create, noFe
 	}
 
 	// (3) main dirty → spawn a fresh worktree.
-	return goSpawnWorktree(ctx, repoRoot, branch, from)
+	return goSpawnWorktree(ctx, repoRoot, branch, from, noFetch)
 }
 
 // resolveGoMode decides whether `wt go` checks out an existing branch or
@@ -1160,12 +1192,15 @@ func resolveGoMode(ctx context.Context, repoRoot, branch, from string, create, n
 	return mode, base
 }
 
-// goSpawnWorktree creates a fresh worktree for <branch> (the main-dirty
-// path) and prints its resolved path on stdout.
-func goSpawnWorktree(ctx context.Context, repoRoot, branch, from string) error {
+// goSpawnWorktree creates a fresh worktree for <branch> and prints its
+// resolved path on stdout (create status/ports stream to stderr).
+func goSpawnWorktree(ctx context.Context, repoRoot, branch, from string, noFetch bool) error {
 	argv := []string{"create", branch, "--repo", repoRoot}
 	if from != "" {
 		argv = append(argv, "--from", from)
+	}
+	if noFetch {
+		argv = append(argv, "--no-fetch")
 	}
 	// Silence create's status lines on stdout — wt go reserves stdout
 	// for the resolved path (cd "$(treeman worktree go …)").

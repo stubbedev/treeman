@@ -92,6 +92,7 @@ func gitDiscard() *cli.Command {
 				ui.Info("Nothing to discard.")
 				return nil
 			}
+			sortStageRows(rows)
 			items := make([]string, len(rows))
 			for i, r := range rows {
 				items[i] = r.Kind.String() + "  " + r.Path

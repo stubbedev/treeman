@@ -41,3 +41,24 @@ func Confirm(question string) bool {
 	}
 	return false
 }
+
+// ConfirmYes is Confirm with a YES default: Enter (or anything that
+// isn't n/N) proceeds, only an explicit no cancels. This is the
+// warn-but-don't-obstruct contract of the old zsh _confirm_destructive
+// prompts (push guard, stash clear, wipe) — the user is being warned,
+// not gatekept. Same non-TTY auto-proceed as Confirm.
+func ConfirmYes(question string) bool {
+	if !isatty.IsTerminal(os.Stdin.Fd()) && !isatty.IsCygwinTerminal(os.Stdin.Fd()) {
+		return true
+	}
+	_, _ = fmt.Fprint(Err, Yellow(SymWarn)+" "+question+" ["+Green("Y")+"/"+Red("n")+"]: ")
+	line, err := bufio.NewReader(In).ReadString('\n')
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "n", "no":
+		return false
+	}
+	return true
+}

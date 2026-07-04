@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -160,13 +161,13 @@ func gitPush() *cli.Command {
 				return errors.New("detached HEAD; nothing to push")
 			}
 			if reason := gitx.ProtectedPush(branch, gpProtectedGlobs(ctx, dir)); reason != "" {
-				if !ui.Confirm("Push: " + reason + " — continue?") {
+				if !ui.ConfirmYes("Push: " + reason + " — continue?") {
 					return nil
 				}
 			}
 			// Divergence: upstream ahead → push will be rejected without --force.
 			if n, _ := gitcmd.String(ctx, dir, "rev-list", "--count", "HEAD..@{u}"); n != "" && n != "0" {
-				if !ui.Confirm(fmt.Sprintf("Push: upstream is ahead by %s commit(s) — continue?", n)) {
+				if !ui.ConfirmYes(fmt.Sprintf("Push: upstream is ahead by %s commit(s) — continue?", n)) {
 					return nil
 				}
 			}
@@ -222,6 +223,7 @@ func gitAdd() *cli.Command {
 				ui.Info("Nothing to stage.")
 				return nil
 			}
+			sortStageRows(rows)
 			items := make([]string, len(rows))
 			for i, r := range rows {
 				items[i] = r.Kind.String() + "  " + r.Path
@@ -252,6 +254,17 @@ func gitAdd() *cli.Command {
 			return runGit(ctx, dir, "status", "--short")
 		},
 	}
+}
+
+// sortStageRows orders rows by kind marker then path — the stable
+// A/D/M grouping the zsh stager showed.
+func sortStageRows(rows []gitx.StageRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Kind != rows[j].Kind {
+			return rows[i].Kind < rows[j].Kind
+		}
+		return rows[i].Path < rows[j].Path
+	})
 }
 
 // expandStageRows walks untracked directories into their contained
@@ -466,7 +479,7 @@ func gitStash() *cli.Command {
 						return nil
 					}
 					n := len(strings.Split(list, "\n"))
-					if !ui.Confirm(fmt.Sprintf("Drop all %d stash(es)?", n)) {
+					if !ui.ConfirmYes(fmt.Sprintf("Drop all %d stash(es)?", n)) {
 						return nil
 					}
 					return runGit(ctx, dir, "stash", "clear")
@@ -499,7 +512,7 @@ func gitWipe() *cli.Command {
 				return err
 			}
 			if c.Bool("all") {
-				if !ui.Confirm("Wipe working changes + entire stash stack?") {
+				if !ui.ConfirmYes("Wipe working changes + entire stash stack?") {
 					return nil
 				}
 				_ = gitcmd.Run(ctx, dir, "stash", "push", "-u")
@@ -508,7 +521,7 @@ func gitWipe() *cli.Command {
 			if clean, _ := gitenv.IsWorktreeClean(ctx, dir); clean {
 				return nil
 			}
-			if !ui.Confirm("Wipe non-pushed changes on local branch?") {
+			if !ui.ConfirmYes("Wipe non-pushed changes on local branch?") {
 				return nil
 			}
 			if err := gitcmd.Run(ctx, dir, "stash", "push", "-u"); err != nil {
@@ -549,6 +562,7 @@ func gitLog() *cli.Command {
 			lines := strings.Split(out, "\n")
 			res, err := tui.MultiSelect(lines, tui.Options{
 				Prompt: "show",
+				Query:  strings.Join(c.Args().Slice(), " "), // zsh gl prefilled the filter
 				Actions: []tui.Action{
 					{Key: "ctrl+x", Name: "cherry-pick", Hint: "ctrl+x cherry-pick", NeedsSelection: true},
 					{Key: "ctrl+r", Name: "revert", Hint: "ctrl+r revert", NeedsSelection: true},
