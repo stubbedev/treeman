@@ -178,8 +178,41 @@ treeman worktree delete proj-123
 cd "$(treeman worktree back --remove)"
 ```
 
-A ready-to-source zsh shim that wraps `wt go` / `wt back` for
-`cd`-into-worktree UX lives at `contrib/tm.zsh` (exposes a `tm`
+## Git workflow
+
+`treeman git` bundles the daily git verbs with a built-in interactive
+picker (no fzf needed), worktree-aware branch routing, and shell
+completions. Everything renders to stderr, so the `cd "$(…)"` shims
+stay clean.
+
+```sh
+treeman git commit            # message prompt, auto ticket prefix from the branch
+treeman git commit fix login  # same, prompt pre-filled (or commits directly when scripted)
+treeman git push              # guards protected branches + upstream divergence
+treeman git add               # multi-select stage: M → add -p, D/A → add
+treeman git switch            # picker: live worktrees first (* dirty, ! unpushed), then branches
+treeman git switch KON-1234   # checkout-or-create, worktree-aware; prints dest path for cd
+treeman git log               # interactive log: show / cherry-pick / revert / copy hash
+treeman git diff --pick       # three-dot diff vs a picked branch (--patch writes a .diff file)
+treeman git stash pop         # pick a stash
+treeman git amend|undo|discard|branch-delete|sync-branch|fixup
+```
+
+Picker keys: type to filter, Enter accepts, Tab marks (multi), Ctrl+C
+cancels the step (opens the branch wizard in `switch`), **Esc always
+quits the whole command with no action**. List height:
+`TREEMAN_PICKER_HEIGHT` (default 10); colors respect `NO_COLOR`.
+
+Worktree navigation pairs with a 2-line shell shim, since a child
+process can't `cd` its parent shell:
+
+```sh
+gwt() { local p; p=$(treeman worktree switch "$@") && [ -n "$p" ] && cd "$p"; }
+gcb() { local p; p=$(treeman git switch      "$@") && [ -n "$p" ] && cd "$p"; }
+```
+
+A ready-to-source zsh shim that wraps `worktree go` / `worktree back`
+for `cd`-into-worktree UX lives at `contrib/tm.zsh` (exposes a `tm`
 shell function):
 
 ```sh
