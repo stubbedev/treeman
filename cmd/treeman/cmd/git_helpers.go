@@ -214,11 +214,16 @@ var prefixChoices = []string{"feature", "bugfix", "hotfix"}
 func branchWizard(ctx context.Context, repoRoot, initial string) (name, base string, err error) {
 	if initial == "" {
 		initial, err = tui.Input(tui.InputOptions{Prompt: "branch name [Ticket: ABC-1234 | Tag: 4.3.21]"})
-		if errors.Is(err, tui.ErrCanceled) || initial == "" {
+		if errors.Is(err, tui.ErrCanceled) {
 			return "", "", nil
 		}
+		// Real failures (e.g. no TTY) must surface — checking the empty
+		// string first used to swallow them into a silent no-op exit 0.
 		if err != nil {
 			return "", "", err
+		}
+		if initial == "" {
+			return "", "", nil
 		}
 	}
 

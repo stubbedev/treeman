@@ -22,7 +22,7 @@ type InputOptions struct {
 // Ctrl+C / Esc returns ErrCanceled. UI renders to stderr, keys from
 // stdin, matching the pickers.
 func Input(opts InputOptions) (string, error) {
-	if !interactive() {
+	if !Interactive() {
 		return "", ErrNotTTY
 	}
 	ui.EnableColorForStderr()

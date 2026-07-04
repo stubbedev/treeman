@@ -36,7 +36,7 @@ var ErrAborted = fmt.Errorf("esc: %w", ErrCanceled)
 
 // ErrNotTTY is returned when there's no terminal to drive the picker.
 // Callers fall back to non-interactive behaviour or abort with a hint.
-var ErrNotTTY = errors.New("tui: not a terminal")
+var ErrNotTTY = errors.New("interactive picker needs a terminal (pass arguments instead when scripting)")
 
 // Action is an extra key binding on a picker (e.g. Ctrl+X in the log
 // view). When its key is pressed the picker exits with Result.Action
@@ -81,9 +81,11 @@ func pickerHeight() int {
 	return defaultHeight
 }
 
-// interactive reports whether we can drive a picker: stdin readable as
-// a TTY (for keys) and stderr a TTY (for rendering).
-func interactive() bool {
+// Interactive reports whether a picker can run: stdin readable as a
+// TTY (for keys) and stderr a TTY (for rendering). Commands use it to
+// pick a non-interactive degradation up front (e.g. `git commit` with
+// the message passed as args).
+func Interactive() bool {
 	return isTTY(os.Stdin) && isTTY(os.Stderr)
 }
 
@@ -108,7 +110,7 @@ func MultiSelect(items []string, opts Options) (Result, error) {
 
 // run drives the bubbletea program. UI on stderr, input from stdin.
 func run(items []string, opts Options) (Result, error) {
-	if !interactive() {
+	if !Interactive() {
 		return Result{Canceled: true}, ErrNotTTY
 	}
 	// Styling keys off stdout by default, but the picker renders to

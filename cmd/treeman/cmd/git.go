@@ -97,6 +97,17 @@ func gitCommit() *cli.Command {
 				return err
 			}
 			prefix := gitx.TicketPrefix(currentBranch(ctx, dir))
+
+			// No terminal (script / agent): the args ARE the message —
+			// commit directly, same ticket-prefix treatment, no TUI.
+			if !tui.Interactive() {
+				msg := strings.Join(c.Args().Slice(), " ")
+				if msg == "" {
+					return errors.New("no terminal for the message prompt — pass the message as arguments")
+				}
+				return runGit(ctx, dir, "commit", "-m", gitx.ApplyTicketPrefix(msg, prefix))
+			}
+
 			label := "commit message"
 			if prefix != "" {
 				label = "commit message [" + prefix + "]"
