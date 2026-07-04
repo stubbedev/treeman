@@ -52,7 +52,8 @@ func CallWithStart(ctx context.Context, req rpc.Request) (rpc.Response, error) {
 // dispatchToDaemon submits a queued plan, emits okMsg via sink, and
 // returns true when the daemon accepted it (KindPlanQueued). Returns
 // false on error so the caller can decide how to handle an unreachable
-// daemon (create/delete surface a hard error).
+// daemon (delete falls back to an in-process teardown; create
+// surfaces a hard error).
 func dispatchToDaemon(ctx context.Context, req rpc.Request, okMsg string, sink Sink) bool {
 	if sink == nil {
 		sink = NoopSink{}

@@ -50,5 +50,6 @@ func daemonDebugHint() string {
 // Note: teardown/finalize are dispatched to the daemon over the RPC
 // socket (see dispatch.go + CallWithStart). There is deliberately no
 // "detach a CLI child to do the work" fallback — when the daemon can't
-// be reached even after an autostart attempt, create/delete surface a
-// hard error instead of forking a `treeman worktree …` subprocess.
+// be reached even after an autostart attempt, delete runs the teardown
+// in-process and create surfaces a hard error; nothing forks a
+// `treeman worktree …` subprocess.

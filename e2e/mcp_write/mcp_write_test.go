@@ -155,10 +155,10 @@ databases:
 		t.Errorf("missing slug in result: %+v", res)
 	}
 	status, _ := res["status"].(string)
-	// Either daemon dispatch (queued) or detached child — both are
-	// acceptable terminal states when hooks/databases are present.
-	if status != "queued" && status != "detached" {
-		t.Errorf("unexpected status %q, want queued or detached", status)
+	// queued = daemon (or in-process plan runner) accepted the finalize
+	// dispatch. The detached-child spawn no longer exists.
+	if status != "queued" {
+		t.Errorf("unexpected status %q, want queued", status)
 	}
 	if _, err := os.Stat(wtPath); err != nil {
 		t.Errorf("worktree path %q does not exist on disk: %v", wtPath, err)
@@ -217,8 +217,11 @@ databases:
 	}
 	res = decodeStructuredResult(t, resp)
 	delStatus, _ := res["status"].(string)
-	if delStatus != "queued" && delStatus != "detached" {
-		t.Errorf("delete status = %q, want queued or detached", delStatus)
+	// queued = daemon dispatch; inline = daemon unreachable and the
+	// teardown ran synchronously in-process (the daemon-less fallback —
+	// the detached-child spawn no longer exists).
+	if delStatus != "queued" && delStatus != "inline" {
+		t.Errorf("delete status = %q, want queued or inline", delStatus)
 	}
 
 	// Poll for the source DB to vanish — teardown runs async.

@@ -267,8 +267,8 @@ func wtDelete() *cli.Command {
 		Description: `Runs teardown hooks + DB teardown + git worktree remove, then
 removes the registry row. The teardown is dispatched to the daemon
 over the RPC socket — the CLI returns immediately. If the daemon
-can't be reached (even after autostart), the command fails rather
-than doing the work inline.
+can't be reached (even after autostart), the teardown runs
+in-process instead (blocks until done).
 
 Examples:
   treeman worktree delete PROJ-1234
@@ -326,8 +326,10 @@ Examples:
 			// Refuse to tear down the worktree the shell is standing in —
 			// the daemon would rm -rf it under the user's feet and leave
 			// the shell in a deleted directory. `worktree back --remove`
-			// is the leave-and-drop flow.
-			if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+			// is the leave-and-drop flow. The main repo root is exempt
+			// here: wt.Delete has its own dedicated main-worktree
+			// refusal and that error message must win.
+			if cwd, cwdErr := os.Getwd(); cwdErr == nil && !strings.EqualFold(filepath.Clean(wtPath), filepath.Clean(repoRoot)) {
 				if top, topErr := gitWorktreeRoot(cwd); topErr == nil && top == wtPath {
 					return errors.New(
 						"refusing to delete the worktree you're in — use `cd \"$(treeman worktree back --remove)\"`")

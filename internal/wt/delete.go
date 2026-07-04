@@ -57,8 +57,9 @@ type DeleteResult struct {
 }
 
 // Delete resolves the target worktree and either dispatches the
-// teardown to the daemon over the socket (hard-failing if it's
-// unreachable) or runs it inline when req.Detached is set.
+// teardown to the daemon over the socket (falling back to an
+// in-process teardown when it's unreachable) or runs it inline when
+// req.Detached is set.
 //
 // Confirmation is the caller's responsibility — Delete itself is
 // non-interactive.
@@ -117,12 +118,16 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 	if queued := DispatchTeardown(ctx, req.RepoRoot, wtPath, req.Force, req.Env, sink); queued {
 		return DeleteResult{WtPath: wtPath, Status: DeleteQueued}, nil
 	}
-	// Daemon is the async teardown worker and could not be reached even
-	// after an autostart attempt (see CallWithStart/EnsureDaemon). We do
-	// not fork a CLI child to do the work — surface the failure so the
-	// user can bring the daemon up and retry.
-	return DeleteResult{WtPath: wtPath}, fmt.Errorf(
-		"daemon unreachable — cannot tear down worktree %q; %s", wtPath, daemonDebugHint())
+	// Daemon unreachable even after an autostart attempt (see
+	// CallWithStart/EnsureDaemon). Run the teardown in THIS process —
+	// the same daemon-less fallback every other command uses via
+	// submitPlan. Blocks until done (rm -rf + DB drops run foreground),
+	// but never forks a CLI child and never strands the worktree.
+	sink.Warn("daemon unreachable — running teardown in-process (blocks until done; `treeman daemon start` restores detached dispatch)")
+	if err := inlineTeardown(ctx, req.RepoRoot, wtPath, req.Force, req.Env, sink); err != nil {
+		return DeleteResult{WtPath: wtPath}, err
+	}
+	return DeleteResult{WtPath: wtPath, Status: DeleteInline}, nil
 }
 
 // pathsEqual reports whether two paths point at the same directory.
@@ -133,9 +138,8 @@ func pathsEqual(a, b string) bool {
 }
 
 // inlineTeardown runs the full teardown sequence locally without
-// dispatching to the daemon. Only used by the `--detached` child
-// path; the user-facing wt-delete always returns immediately after
-// dispatch.
+// dispatching to the daemon. Used by the explicit `--detached` mode
+// and as the automatic fallback when the daemon is unreachable.
 func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, env map[string]string, sink Sink) error {
 	cfg, err := resolve.LoadResolved(repoRoot)
 	if err != nil {
