@@ -1033,7 +1033,7 @@
         "$ref": "#/$defs/Patch"
       },
       "type": "array",
-      "description": "Files to rewrite inside each worktree with per-worktree values\n(slug-substituted DB names, cache prefixes, etc.). Supports\ndotenv key=value files, phpunit.xml `\u003cenv\u003e` blocks, generic\nYAML, JSON, TOML, and INI. Each patched file is wired through\ngit's clean/smudge filter so the rewrite is hidden from\n`git status` while still letting `git pull` / `git checkout`\noverwrite the file on incoming changes (the smudge filter\nre-applies the per-worktree value on the way back to the\nworking tree).\n\nRe-applied on every `treeman wt finalize` so a branch switch\ninside an existing worktree re-evaluates each patch against\nthe new HEAD's slug."
+      "description": "Files to rewrite inside each worktree with per-worktree values\n(slug-substituted DB names, cache prefixes, etc.). Supports\ndotenv key=value files, phpunit.xml `\u003cenv\u003e` blocks, generic\nYAML, JSON, TOML, and INI. Each patched file is wired through\ngit's clean/smudge filter so the rewrite is hidden from\n`git status` while still letting `git pull` / `git checkout`\noverwrite the file on incoming changes (the smudge filter\nre-applies the per-worktree value on the way back to the\nworking tree).\n\nRe-applied on every `treeman worktree finalize` so a branch switch\ninside an existing worktree re-evaluates each patch against\nthe new HEAD's slug."
     },
     "databases": {
       "items": {
