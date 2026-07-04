@@ -22,12 +22,11 @@ import (
 	"github.com/stubbedev/treeman/internal/wt"
 )
 
-// WorktreeCmd — `treeman wt {create,delete,register,unregister,list,finalize}`.
+// WorktreeCmd — `treeman worktree {create,delete,register,unregister,list,finalize}`.
 func WorktreeCmd() *cli.Command {
 	return &cli.Command{
-		Name:    "worktree",
-		Aliases: []string{"wt"},
-		Usage:   "worktree lifecycle",
+		Name:  "worktree",
+		Usage: "worktree lifecycle",
 		Commands: []*cli.Command{
 			wtCreate(),
 			wtDelete(),
@@ -41,14 +40,34 @@ func WorktreeCmd() *cli.Command {
 			wtBack(),
 			wtPrev(),
 			wtGo(),
+			wtSwitch(),
 		},
+	}
+}
+
+// wtSwitch — `treeman worktree switch [branch]` (was the zsh `gwt`). Switches
+// to or creates a branch's worktree, routing through the same
+// checkout policy as `wt go --checkout`. With no branch it opens the
+// interactive picker + branch wizard. Prints the destination path on
+// stdout for the shell shim: `cd "$(treeman worktree switch …)"`.
+func wtSwitch() *cli.Command {
+	return &cli.Command{
+		Name:      "switch",
+		Usage:     "switch to or create a branch's worktree (prints dest path for cd)",
+		ArgsUsage: "[branch]",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+			&cli.StringFlag{Name: "from", Usage: "base branch when creating"},
+			&cli.BoolFlag{Name: "no-fetch", Usage: "skip the pre-checkout fetch"},
+		},
+		ShellComplete: branchArgComplete,
+		Action:        switchAction,
 	}
 }
 
 func wtCreate() *cli.Command {
 	return &cli.Command{
 		Name:      "create",
-		Aliases:   []string{"new"},
 		Usage:     "create a worktree end-to-end",
 		ArgsUsage: "<branch>",
 		Description: `Creates a linked worktree, patches the env files, registers it
@@ -57,9 +76,9 @@ CLI always returns immediately — follow progress with
 'treeman logs tail --follow'.
 
 Examples:
-  treeman wt create PROJ-1234
-  treeman wt create feature/x --from origin/develop
-  cd "$(treeman wt create feat --print-path)"`,
+  treeman worktree create PROJ-1234
+  treeman worktree create feature/x --from origin/develop
+  cd "$(treeman worktree create feat --print-path)"`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "from", Usage: "base branch"},
 			&cli.StringFlag{Name: "path", Usage: "explicit worktree path"},
@@ -72,17 +91,17 @@ Examples:
 			},
 			&cli.BoolFlag{
 				Name:  "print-path",
-				Usage: "print only the new worktree path on stdout; status lines redirect to stderr (enables `cd \"$(treeman wt create …)\"`)",
+				Usage: "print only the new worktree path on stdout; status lines redirect to stderr (enables `cd \"$(treeman worktree create …)\"`)",
 			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return errors.New("usage: treeman wt create <branch>")
+				return errors.New("usage: treeman worktree create <branch>")
 			}
 			branch := c.Args().First()
 
 			// When --print-path is set the shell idiom is
-			// `cd "$(treeman wt create …)"`; the new path is the
+			// `cd "$(treeman worktree create …)"`; the new path is the
 			// LAST line on stdout. Redirect all status output (Print*,
 			// ui.Success, etc.) to stderr for the rest of this call
 			// so the cd substitution can't pick up an OK marker.
@@ -169,7 +188,6 @@ func printCreateResult(res wt.CreateResult) {
 func wtDelete() *cli.Command {
 	return &cli.Command{
 		Name:      "delete",
-		Aliases:   []string{"rm"},
 		Usage:     "delete a worktree end-to-end",
 		ArgsUsage: "<path-or-branch>",
 		Description: `Runs teardown hooks + DB teardown + git worktree remove, then
@@ -178,23 +196,20 @@ removes the registry row. The teardown is dispatched to the daemon
 always returns immediately.
 
 Examples:
-  treeman wt delete PROJ-1234
-  treeman wt delete /path/to/wt --force      # remove stale registry entry`,
+  treeman worktree delete PROJ-1234
+  treeman worktree delete /path/to/wt --force      # remove stale registry entry`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "force", Aliases: []string{"f"}},
 			&cli.BoolFlag{Name: "yes", Aliases: []string{"y"}, Usage: "skip the confirmation prompt"},
-			// `--detached` is the internal flag set by detachLocalDelete
-			// when the daemon RPC is unreachable. Tells this process
-			// "you ARE the detached worker; run the teardown inline
-			// instead of trying to dispatch back to the daemon".
-			// Not documented in help.
+			// `--detached` runs the teardown inline in this process
+			// instead of dispatching it to the daemon over the socket.
+			// Kept as a manual escape hatch (debugging / daemon-less
+			// teardown); nothing sets it automatically. Not in help.
 			&cli.BoolFlag{Name: "detached", Hidden: true},
 		},
+		ShellComplete: worktreeArgComplete,
 		Action: func(ctx context.Context, c *cli.Command) error {
-			if c.NArg() < 1 {
-				return errors.New("usage: treeman wt delete <path-or-branch>")
-			}
 			target := c.Args().First()
 
 			// Resolve the repo root first (--repo flag > cwd walk-up >
@@ -202,10 +217,25 @@ Examples:
 			// slug lookup so the SQLite query is scoped correctly.
 			repoRoot, err := resolveRepo(c.String("repo"))
 			if err != nil {
+				if target == "" {
+					return err
+				}
 				repoRoot, err = DiscoverRepoRoot(MustAbs(target))
 				if err != nil {
 					return err
 				}
+			}
+
+			// No target → interactive picker over the repo's worktrees.
+			if target == "" {
+				picked, perr := pickWorktree(ctx, repoRoot, "select worktree to remove")
+				if perr != nil {
+					return perr
+				}
+				if picked == "" {
+					return nil
+				}
+				target = picked
 			}
 
 			// Confirmation lives in the CLI — wt.Delete itself is
@@ -297,9 +327,8 @@ func wtUnregister() *cli.Command {
 
 func wtList() *cli.Command {
 	return &cli.Command{
-		Name:    "list",
-		Aliases: []string{"ls"},
-		Usage:   "list active worktrees",
+		Name:  "list",
+		Usage: "list active worktrees",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "json"},
 			&cli.BoolFlag{Name: "tsv", Usage: "machine output: one <path>\\t<branch> line per active worktree (for shell consumption)"},
@@ -400,7 +429,7 @@ func wtList() *cli.Command {
 			}
 			if len(all) == 0 {
 				ui.Info("no active worktrees")
-				ui.Hint("%s", "create one with: treeman wt create <branch>")
+				ui.Hint("%s", "create one with: treeman worktree create <branch>")
 				return nil
 			}
 
@@ -410,7 +439,7 @@ func wtList() *cli.Command {
 	}
 }
 
-// wtRow is one row of `treeman wt list` output.
+// wtRow is one row of `treeman worktree list` output.
 type wtRow struct {
 	ID          int64  `json:"id"`
 	Slug        string `json:"slug"`
@@ -457,7 +486,7 @@ func enrichWtRows(ctx context.Context, st *store.Store, all []wtRow, withStatus,
 	}
 }
 
-// renderWtTable prints the human-readable `treeman wt list` table.
+// renderWtTable prints the human-readable `treeman worktree list` table.
 func renderWtTable(all []wtRow, anyMain, withStatus, withState bool) {
 	// MAIN column only shows up when at least one row is the
 	// main wt — keeps the dominant linked-only output narrow.
@@ -724,13 +753,13 @@ func resolveRepo(override string) (string, error) {
 	return DiscoverRepoRoot(cwd)
 }
 
-// wtBack — `treeman wt back`. Prints the main repo root for the
+// wtBack — `treeman worktree back`. Prints the main repo root for the
 // current cwd. With `--remove`, also deletes the current linked
 // worktree if it is clean (`git status --porcelain` empty) and has
 // no commits ahead of upstream.
 //
-// Used by the zsh shim: `cd "$(treeman wt back)"`. The remove path
-// shells out to `treeman wt delete` so the standard teardown +
+// Used by the zsh shim: `cd "$(treeman worktree back)"`. The remove path
+// shells out to `treeman worktree delete` so the standard teardown +
 // daemon RPC flow runs.
 func wtBack() *cli.Command {
 	return &cli.Command{
@@ -827,7 +856,7 @@ func gitWorktreeRoot(start string) (string, error) {
 	return out, nil
 }
 
-// wtPrev — `treeman wt prev`. Prints the path of the previously-
+// wtPrev — `treeman worktree prev`. Prints the path of the previously-
 // visited worktree for the current repo (most recent
 // last_visited_at, excluding cwd). The timestamp lives in SQLite so
 // toggling works across shells.
@@ -866,7 +895,7 @@ func wtPrev() *cli.Command {
 	}
 }
 
-// wtGo — `treeman wt go <name-or-branch>`. The single navigation verb;
+// wtGo — `treeman worktree go <name-or-branch>`. The single navigation verb;
 // absorbs the former `wt switch` and `wt resolve`.
 //
 // Default (pure resolve, no git side effects): fuzzy-match an existing
@@ -890,7 +919,7 @@ func wtPrev() *cli.Command {
 func wtGo() *cli.Command {
 	return &cli.Command{
 		Name:      "go",
-		Usage:     "resolve/create/checkout a worktree by name or branch (use as cd \"$(treeman wt go …)\")",
+		Usage:     "resolve/create/checkout a worktree by name or branch (use as cd \"$(treeman worktree go …)\")",
 		ArgsUsage: "<name-or-branch>",
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "create", Usage: "create the worktree if nothing matches"},
@@ -904,7 +933,7 @@ func wtGo() *cli.Command {
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return errors.New("usage: treeman wt go <name-or-branch>")
+				return errors.New("usage: treeman worktree go <name-or-branch>")
 			}
 			target := c.Args().First()
 			repoRoot, err := resolveRepo(c.String("repo"))
@@ -940,7 +969,7 @@ func wtGo() *cli.Command {
 
 			if !c.Bool("create") {
 				return fmt.Errorf(
-					"no worktree matches %q (try `treeman wt go %s --create`, or --checkout to switch branches)",
+					"no worktree matches %q (try `treeman worktree go %s --create`, or --checkout to switch branches)",
 					target,
 					target,
 				)
@@ -954,7 +983,7 @@ func wtGo() *cli.Command {
 			}
 			argv = append(argv, "--repo", repoRoot)
 			// Silence create's status lines on stdout — wt go reserves
-			// stdout for the resolved path (cd "$(treeman wt go …)").
+			// stdout for the resolved path (cd "$(treeman worktree go …)").
 			prevOut := ui.Out
 			ui.Out = os.Stderr
 			err = createCmd.Run(ctx, argv)
@@ -1000,7 +1029,7 @@ func goCheckout(ctx context.Context, repoRoot, branch, from string, create, noFe
 			args = append(args, branch)
 		}
 		// stdout goes to stderr — `wt go` reserves stdout for
-		// the worktree path (consumed by `cd $(treeman wt go …)`).
+		// the worktree path (consumed by `cd $(treeman worktree go …)`).
 		return gitcmd.RunPiped(ctx, dir, os.Stderr, os.Stderr, args...)
 	}
 
@@ -1064,7 +1093,7 @@ func goSpawnWorktree(ctx context.Context, repoRoot, branch, from string) error {
 		argv = append(argv, "--from", from)
 	}
 	// Silence create's status lines on stdout — wt go reserves stdout
-	// for the resolved path (cd "$(treeman wt go …)").
+	// for the resolved path (cd "$(treeman worktree go …)").
 	prevOut := ui.Out
 	ui.Out = os.Stderr
 	err := wtCreate().Run(ctx, argv)

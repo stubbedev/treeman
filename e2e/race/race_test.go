@@ -134,7 +134,7 @@ databases:
 	mustGit(t, mainRepo, "commit", "-q", "-m", "init")
 
 	branch := "feature/raceme"
-	out := runTreeman(t, binDir, mainRepo, "wt", "create", branch)
+	out := runTreeman(t, binDir, mainRepo, "worktree", "create", branch)
 	t.Logf("wt create stdout:\n%s", out)
 	wtPath := filepath.Join(mainRepo, ".worktrees", "feature/raceme")
 	if _, err := os.Stat(wtPath); err != nil {
@@ -146,7 +146,7 @@ databases:
 	// so the teardown lands DURING setup, not before it began. Then
 	// dispatch delete and measure end-state.
 	time.Sleep(500 * time.Millisecond)
-	out = runTreeman(t, binDir, mainRepo, "wt", "delete", "--yes", branch)
+	out = runTreeman(t, binDir, mainRepo, "worktree", "delete", "--yes", branch)
 	t.Logf("wt delete stdout:\n%s", out)
 
 	// Both operations are daemon-dispatched and run concurrently.
@@ -277,14 +277,14 @@ databases:
 	mustGit(t, mainRepo, "commit", "-q", "-m", "init")
 
 	branch := "feature/raceimm"
-	out := runTreeman(t, binDir, mainRepo, "wt", "create", branch)
+	out := runTreeman(t, binDir, mainRepo, "worktree", "create", branch)
 	t.Logf("wt create stdout:\n%s", out)
 	wtPath := filepath.Join(mainRepo, ".worktrees", "feature/raceimm")
 
 	// No sleep — fire delete immediately. Cancellation may catch
 	// finalize before EnsureWorktree, mid-prepare, or after prepare.
 	// In all three cases the eventual end-state must be clean.
-	out = runTreeman(t, binDir, mainRepo, "wt", "delete", "--yes", branch)
+	out = runTreeman(t, binDir, mainRepo, "worktree", "delete", "--yes", branch)
 	t.Logf("wt delete stdout:\n%s", out)
 
 	deadline := time.Now().Add(60 * time.Second)
@@ -318,7 +318,7 @@ func assertFullyCleaned(t *testing.T, binDir, mainRepo, wtPath, dbPrefix string)
 	if _, err := os.Stat(wtPath); err == nil {
 		return fmt.Errorf("worktree dir still exists: %s", wtPath)
 	}
-	out := runTreemanCapture(t, binDir, mainRepo, "wt", "list", "--json")
+	out := runTreemanCapture(t, binDir, mainRepo, "worktree", "list", "--json")
 	if strings.Contains(out, wtPath) {
 		return fmt.Errorf("registry still lists worktree path:\n%s", out)
 	}

@@ -173,6 +173,22 @@ func RunPiped(ctx context.Context, dir string, stdout, stderr io.Writer, args ..
 	return nil
 }
 
+// RunInteractive runs `git args...` with all three standard streams
+// wired to the supplied files (typically os.Stdin/Stdout/Stderr). Use
+// it for git commands that need the terminal: `commit -e` (spawns
+// $EDITOR) and `add -p` (reads y/n/s hunk answers from stdin). RunPiped
+// can't serve these — it forces Stdin to /dev/null.
+func RunInteractive(ctx context.Context, dir string, stdin io.Reader, stdout, stderr io.Writer, args ...string) error {
+	cmd := command(ctx, dir, false, args...)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		return wrap(args, err, "")
+	}
+	return nil
+}
+
 // Exists returns true when `git rev-parse --verify --quiet <ref>`
 // succeeds in `dir`. Used by branch / remote-ref existence probes.
 func Exists(ctx context.Context, dir, ref string) bool {

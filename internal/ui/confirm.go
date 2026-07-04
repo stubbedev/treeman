@@ -24,7 +24,7 @@ var In io.Reader = os.Stdin
 // call entirely when set, so script users never see this path.
 //
 // The prompt is written to stderr so stdout (often consumed by
-// shell integrations: `cd "$(treeman wt go foo)"`) stays
+// shell integrations: `cd "$(treeman worktree go foo)"`) stays
 // clean.
 func Confirm(question string) bool {
 	if !isatty.IsTerminal(os.Stdin.Fd()) && !isatty.IsCygwinTerminal(os.Stdin.Fd()) {

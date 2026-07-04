@@ -17,14 +17,13 @@ import (
 	"github.com/stubbedev/treeman/internal/ui"
 )
 
-// wtShow — `treeman wt show <name>` prints a per-worktree dossier:
+// wtShow — `treeman worktree show <name>` prints a per-worktree dossier:
 // metadata, current finalize state, recent events, recent hook runs.
 // Single-page output designed to answer "what's going on with this
 // worktree?" without forcing the operator to compose three queries.
 func wtShow() *cli.Command {
 	return &cli.Command{
 		Name:      "show",
-		Aliases:   []string{"info"},
 		Usage:     "show details, recent events, and hook runs for a worktree (defaults to the worktree containing the current directory)",
 		ArgsUsage: "[worktree]",
 		Flags: []cli.Flag{
@@ -101,7 +100,7 @@ func wtShow() *cli.Command {
 			runs, _ := st.QueryHookRuns(ctx, wt.ID, c.Int("hooks"))
 			printWtHookRuns(runs)
 
-			ui.Hint("follow live events: treeman wt logs %s --follow", wt.Slug)
+			ui.Hint("follow live events: treeman worktree logs %s --follow", wt.Slug)
 			return nil
 		},
 	}
@@ -260,7 +259,7 @@ func printWtHookRuns(runs []store.HookRun) {
 	_, _ = fmt.Fprintln(ui.Out)
 }
 
-// wtLogs — `treeman wt logs <name>` is a convenience wrapper around
+// wtLogs — `treeman worktree logs <name>` is a convenience wrapper around
 // `treeman logs tail --worktree <name>` so users don't need to know
 // the filter exists.
 func wtLogs() *cli.Command {
@@ -274,7 +273,7 @@ func wtLogs() *cli.Command {
 		),
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return errors.New("usage: treeman wt logs <worktree>")
+				return errors.New("usage: treeman worktree logs <worktree>")
 			}
 			name := c.Args().First()
 			// Delegate to the logs command's argv shape so the
@@ -322,11 +321,11 @@ func wtLogs() *cli.Command {
 	}
 }
 
-// wtWait — `treeman wt wait <name>` blocks until the most-recent
+// wtWait — `treeman worktree wait <name>` blocks until the most-recent
 // daemon-detached finalize for that worktree has either succeeded
 // (`worktree:create:end`) or failed (level=error, event_type=worktree:create:error).
 // Exit code reflects the outcome — 0 on success, non-zero on failure
-// or timeout — so CI scripts can `treeman wt create FOO && treeman
+// or timeout — so CI scripts can `treeman worktree create FOO && treeman
 // wt wait FOO`.
 func wtWait() *cli.Command {
 	return &cli.Command{
@@ -340,7 +339,7 @@ func wtWait() *cli.Command {
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() < 1 {
-				return errors.New("usage: treeman wt wait <worktree>")
+				return errors.New("usage: treeman worktree wait <worktree>")
 			}
 			name := c.Args().First()
 			st, closer, err := openLogStore(ctx)
@@ -431,7 +430,7 @@ type worktreeRow struct {
 // worktreeFromCwd resolves the worktree row whose path contains the
 // current working directory. Walks parent directories from cwd up to
 // the filesystem root, returning the first that matches an active
-// worktree row. Lets `treeman wt show` (and friends) run argument-
+// worktree row. Lets `treeman worktree show` (and friends) run argument-
 // free from anywhere inside a worktree.
 func worktreeFromCwd(ctx context.Context, st *store.Store) (worktreeRow, error) {
 	cwd, err := os.Getwd()
@@ -458,7 +457,9 @@ func worktreeFromCwd(ctx context.Context, st *store.Store) (worktreeRow, error) 
 		}
 		dir = parent
 	}
-	return worktreeRow{}, errors.New("not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)")
+	return worktreeRow{}, errors.New(
+		"not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman worktree list`)",
+	)
 }
 
 // formatPortMap renders a slot→port map as "name=port name=port" in
@@ -479,7 +480,7 @@ func loadWorktreeRow(ctx context.Context, st *store.Store, repoID int64, name st
 		return wt, err
 	}
 	if id == 0 {
-		return wt, fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
+		return wt, fmt.Errorf("no worktree matches %q (try `treeman worktree list`)", name)
 	}
 	row := st.DB.QueryRowContext(ctx, `SELECT id, slug, COALESCE(branch,''), path, created_at
 		FROM worktrees WHERE id = ?`, id)
@@ -505,7 +506,7 @@ func finalizeStatusLine(ctx context.Context, st *store.Store, wtID int64) string
 // with no following delete:end / delete:error. The daemon writes
 // delete:start the moment teardown begins but only flips deleted_at
 // when the final git-remove lands, so this is the signal that hides a
-// worktree from `treeman wt list` (and the gwtd picker) for the whole
+// worktree from `treeman worktree list` (and the gwtd picker) for the whole
 // DB-drop + hooks window in between. Self-healing: a failed teardown
 // lands delete:error and the worktree reappears in the list.
 func isTearingDown(ctx context.Context, st *store.Store, wtID int64) bool {

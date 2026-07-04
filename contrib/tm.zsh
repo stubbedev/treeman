@@ -1,6 +1,6 @@
 # treeman zsh shim — `tm` shell wrapper around `treeman wt`.
 #
-# `treeman wt go` + `treeman wt back` print resolved paths on
+# `treeman worktree go` + `treeman worktree back` print resolved paths on
 # stdout; this function wraps them so `tm foo` and `tm -` change
 # directory in the parent shell.
 #
@@ -14,16 +14,16 @@
 #     tm PROJ-1234 -c      # create + cd to a new worktree
 #     tm -                 # cd back to main repo
 #     tm - --remove        # cd back + drop current wt (if clean)
-#     tm list              # passthrough to `treeman wt list`
+#     tm list              # passthrough to `treeman worktree list`
 #     tm new FOO           # passthrough; useful when --create needs flags
 #
 # All flags after the target name are forwarded to the underlying
-# `treeman wt go`/`treeman wt back` invocation.
+# `treeman worktree go`/`treeman worktree back` invocation.
 
 tm() {
   emulate -L zsh
   if (( $# == 0 )); then
-    treeman wt list
+    treeman worktree list
     return $?
   fi
 
@@ -31,7 +31,7 @@ tm() {
     -|back)
       shift
       local main
-      if ! main=$(treeman wt back "$@"); then
+      if ! main=$(treeman worktree back "$@"); then
         return $?
       fi
       [[ -n $main ]] && builtin cd -- "$main"
@@ -39,7 +39,7 @@ tm() {
       ;;
     list|ls)
       shift
-      treeman wt list "$@"
+      treeman worktree list "$@"
       return $?
       ;;
     new|create)
@@ -50,7 +50,7 @@ tm() {
       local branch="$1"
       shift || true
       local target
-      if ! target=$(treeman wt go "$branch" --create "$@"); then
+      if ! target=$(treeman worktree go "$branch" --create "$@"); then
         return $?
       fi
       [[ -n $target ]] && builtin cd -- "$target"
@@ -87,17 +87,17 @@ USAGE
   fi
 
   local target
-  if ! target=$(treeman wt go "$name" "${args[@]}"); then
+  if ! target=$(treeman worktree go "$name" "${args[@]}"); then
     return $?
   fi
   [[ -n $target ]] && builtin cd -- "$target"
 }
 
-# Completion: complete worktree names from `treeman wt list`.
+# Completion: complete worktree names from `treeman worktree list`.
 # NO_COLOR=1 suppresses ANSI escapes so the SLUG column parses cleanly.
 _tm_complete() {
   local -a names
-  names=("${(@f)$(NO_COLOR=1 treeman wt list 2>/dev/null | awk 'NR>1 {print $2}')}")
+  names=("${(@f)$(NO_COLOR=1 treeman worktree list 2>/dev/null | awk 'NR>1 {print $2}')}")
   _describe 'worktree' names
 }
 compdef _tm_complete tm 2>/dev/null || true

@@ -319,7 +319,7 @@ overwrite the file on incoming changes (the smudge filter
 re-applies the per-worktree value on the way back to the
 working tree).
 
-Re-applied on every `treeman wt finalize` so a branch switch
+Re-applied on every `treeman worktree finalize` so a branch switch
 inside an existing worktree re-evaluates each patch against
 the new HEAD's slug.
 

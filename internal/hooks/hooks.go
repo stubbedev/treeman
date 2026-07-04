@@ -409,7 +409,7 @@ func spawnDetached(
 //     `composer install` fail because they refuse to run when HOME is
 //     unset, even though every interactive shell on the host has HOME.
 //  2. Overlay the user's CLI-captured env (`inheritedEnv`, ultimately
-//     os.Environ() at `treeman wt create` time). The user's PATH,
+//     os.Environ() at `treeman worktree create` time). The user's PATH,
 //     language version manager shims (asdf, nvm, mise, rbenv, …),
 //     and any session-specific overrides take precedence over the
 //     daemon's floor.

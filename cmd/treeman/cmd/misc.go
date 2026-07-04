@@ -1088,9 +1088,8 @@ func daemonAutoStartInstalled() bool {
 // frameworks.
 func FwCmd() *cli.Command {
 	return &cli.Command{
-		Name:    "frameworks",
-		Aliases: []string{"fw"},
-		Usage:   "framework detection",
+		Name:  "frameworks",
+		Usage: "framework detection",
 		Commands: []*cli.Command{{
 			Name:  "detect",
 			Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
@@ -1236,7 +1235,7 @@ func InitCmd() *cli.Command {
 			if !daemonAutoStartInstalled() {
 				PrintHint("install the daemon (one-time): treeman daemon install")
 			}
-			PrintHint("create a worktree:               treeman wt create <branch>")
+			PrintHint("create a worktree:               treeman worktree create <branch>")
 			PrintHint("install JSON Schema (editors):   treeman schema install")
 			return nil
 		},

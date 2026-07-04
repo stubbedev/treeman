@@ -172,7 +172,7 @@ func (lw *LifecycleWatcher) onCreate(ctx context.Context, adminDir string) {
 	lw.seen[adminDir] = wtPath
 	lw.mu.Unlock()
 
-	// CLI coexistence guards. `treeman wt create` shells out to
+	// CLI coexistence guards. `treeman worktree create` shells out to
 	// `git worktree add` which fires the same fsnotify CREATE event
 	// we're handling here — without these checks the CLI flow and
 	// the lifecycle flow both register the worktree and both run
@@ -239,7 +239,7 @@ func (lw *LifecycleWatcher) onRemove(ctx context.Context, adminDir string) {
 		}
 		wtPath = row.Path
 	}
-	// `treeman wt delete` removes the admin dir via `git worktree
+	// `treeman worktree delete` removes the admin dir via `git worktree
 	// remove` near the end of its teardown — that REMOVE fsnotify
 	// event lands here. The primary teardown already runs teardown
 	// + DB teardown + marks the row deleted; spawning an orphan

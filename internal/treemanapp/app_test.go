@@ -24,7 +24,7 @@ func TestCommandTree(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"wt", "status", "prepare", "logs", "config", "schema", "daemon",
+		"worktree", "git", "status", "prepare", "logs", "config", "schema", "daemon",
 		"init", "doctor", "registry", "snapshots", "mcp",
 	} {
 		if _, ok := seen[want]; !ok {

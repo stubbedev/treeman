@@ -153,7 +153,7 @@ Examples:
 					return err
 				}
 				if n > 0 {
-					return fmt.Errorf("repo has %d active worktree(s); run `treeman wt delete` first or re-run with --force", n)
+					return fmt.Errorf("repo has %d active worktree(s); run `treeman worktree delete` first or re-run with --force", n)
 				}
 			}
 			if err := st.RemoveRepo(ctx, repoID); err != nil {
@@ -185,9 +185,8 @@ func rpcCall(ctx context.Context, repoPath string, force bool) (rpc.Response, er
 // force-purge it on demand.
 func SnapshotsCmd() *cli.Command {
 	return &cli.Command{
-		Name:    "snapshots",
-		Aliases: []string{"snap"},
-		Usage:   "snapshot cache visibility + purge",
+		Name:  "snapshots",
+		Usage: "snapshot cache visibility + purge",
 		Commands: []*cli.Command{
 			{
 				Name:  "list",

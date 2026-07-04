@@ -363,7 +363,7 @@ func (s *Store) flushEventsFallback(ctx context.Context, batch []pendingEvent) {
 // CheckpointWAL forces a TRUNCATE checkpoint on the SQLite WAL. The
 // daemon calls this on a cron to keep `~/.local/share/treeman/
 // treeman.db-wal` from growing without bound under sustained write
-// churn (every `treeman wt finalize`/`teardown` writes several
+// churn (every `treeman worktree finalize`/`teardown` writes several
 // events plus a `MarkWorktreeDeleted`/`MarkVisited`). With WAL on
 // + synchronous=NORMAL, automatic passive checkpoints only fire
 // when the WAL hits ~1000 pages; TRUNCATE on a fixed schedule
@@ -697,7 +697,7 @@ func (s *Store) CountActiveWorktreesForRepo(ctx context.Context, repoID int64) (
 // External resources (per-worktree databases, on-disk git worktree
 // dirs, dump caches under `.treeman-snapshots/`, advisory hash caches
 // keyed by path) are NOT touched — callers that want a destructive
-// clean-up must tear down the worktrees first via `treeman wt delete`.
+// clean-up must tear down the worktrees first via `treeman worktree delete`.
 func (s *Store) RemoveRepo(ctx context.Context, repoID int64) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {

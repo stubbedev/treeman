@@ -4,10 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"runtime"
-	"syscall"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/daemonctl"
@@ -50,59 +47,8 @@ func daemonDebugHint() string {
 	}
 }
 
-// DetachFinalize spawns `treeman wt finalize --local <wtPath>` in a
-// new session via setsid so it survives the parent's exit.
-// stdout + stderr stream to <wtPath>/.treeman-hooks/fg-finalize.log.
-// Returns the log path for the success message.
-func DetachFinalize(wtPath, repoRoot string) (string, error) {
-	return detachChild(
-		filepath.Join(wtPath, ".treeman-hooks", "fg-finalize.log"),
-		"wt", "finalize", "--local", "--repo", repoRoot, wtPath,
-	)
-}
-
-// DetachDelete spawns `treeman wt delete --detached <wtPath>` (with
-// --force / --yes when needed) in a fresh session.
-func DetachDelete(wtPath, repoRoot string, force bool) (string, error) {
-	args := []string{"wt", "delete", "--detached", "--yes", "--repo", repoRoot}
-	if force {
-		args = append(args, "--force")
-	}
-	args = append(args, wtPath)
-	return detachChild(
-		filepath.Join(repoRoot, ".treeman-hooks", "fg-delete-"+filepath.Base(wtPath)+".log"),
-		args...,
-	)
-}
-
-// detachChild runs `treeman <args>` in a fresh session. Stdin is
-// detached, stdout+stderr point at logPath. Returns the log path so
-// the caller can surface it to the user.
-func detachChild(logPath string, args ...string) (string, error) {
-	bin, err := os.Executable()
-	if err != nil || bin == "" {
-		bin, err = exec.LookPath("treeman")
-		if err != nil {
-			return "", fmt.Errorf("locate treeman binary: %w", err)
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return "", err
-	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return "", err
-	}
-	cmd := exec.Command(bin, args...) //nolint:noctx // detached setsid child; must outlive caller ctx
-	cmd.Stdin = nil
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		_ = logFile.Close()
-		return "", err
-	}
-	_ = logFile.Close()
-	_ = cmd.Process.Release()
-	return logPath, nil
-}
+// Note: teardown/finalize are dispatched to the daemon over the RPC
+// socket (see dispatch.go + CallWithStart). There is deliberately no
+// "detach a CLI child to do the work" fallback — when the daemon can't
+// be reached even after an autostart attempt, create/delete surface a
+// hard error instead of forking a `treeman worktree …` subprocess.

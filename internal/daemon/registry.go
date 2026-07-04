@@ -17,7 +17,7 @@ import (
 // External resources (per-worktree databases, on-disk worktree dirs,
 // dump caches) are deliberately untouched — `registry remove` is the
 // "stop tracking" operation, not the destructive teardown. Callers
-// who want everything purged run `treeman wt delete --all` first.
+// who want everything purged run `treeman worktree delete --all` first.
 //
 // When `force` is false and any worktree row still has `deleted_at IS
 // NULL`, the call fails with an explanatory error so a routine
@@ -40,7 +40,7 @@ func removeRepoFromRegistry(ctx context.Context, st *State, repoPath string, for
 			return fmt.Errorf("count active worktrees: %w", err)
 		}
 		if n > 0 {
-			return fmt.Errorf("repo has %d active worktree(s); run `treeman wt delete` first or re-run with --force", n)
+			return fmt.Errorf("repo has %d active worktree(s); run `treeman worktree delete` first or re-run with --force", n)
 		}
 	}
 

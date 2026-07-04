@@ -42,9 +42,6 @@ type DeleteStatus string
 const (
 	// DeleteQueued — daemon accepted the teardown dispatch.
 	DeleteQueued DeleteStatus = "queued"
-	// DeleteDetached — daemon was unreachable; teardown is running
-	// in a setsid child whose log path is LogPath.
-	DeleteDetached DeleteStatus = "detached"
 	// DeleteInline — caller asked for inline mode (Detached=true);
 	// the teardown ran fully in this process and is now complete.
 	DeleteInline DeleteStatus = "inline"
@@ -120,12 +117,12 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 	if queued := DispatchTeardown(ctx, req.RepoRoot, wtPath, req.Force, req.Env, sink); queued {
 		return DeleteResult{WtPath: wtPath, Status: DeleteQueued}, nil
 	}
-	logPath, err := DetachDelete(wtPath, req.RepoRoot, req.Force)
-	if err != nil {
-		return DeleteResult{WtPath: wtPath}, fmt.Errorf("detach teardown: %w", err)
-	}
-	sink.OK("queued: teardown + DB drop + git remove detached (daemon unreachable — log: %s)", logPath)
-	return DeleteResult{WtPath: wtPath, Status: DeleteDetached, LogPath: logPath}, nil
+	// Daemon is the async teardown worker and could not be reached even
+	// after an autostart attempt (see CallWithStart/EnsureDaemon). We do
+	// not fork a CLI child to do the work — surface the failure so the
+	// user can bring the daemon up and retry.
+	return DeleteResult{WtPath: wtPath}, fmt.Errorf(
+		"daemon unreachable — cannot tear down worktree %q; %s", wtPath, daemonDebugHint())
 }
 
 // pathsEqual reports whether two paths point at the same directory.

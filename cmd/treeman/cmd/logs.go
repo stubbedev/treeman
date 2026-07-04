@@ -23,9 +23,8 @@ import (
 // `grep`.
 func LogsCmd() *cli.Command {
 	return &cli.Command{
-		Name:    "logs",
-		Aliases: []string{"log"},
-		Usage:   "query the SQLite event log",
+		Name:  "logs",
+		Usage: "query the SQLite event log",
 		Commands: []*cli.Command{
 			logsTail(),
 			logsGrep(),
@@ -299,7 +298,7 @@ func resolveHooksScope(ctx context.Context, st *store.Store, c *cli.Command, all
 			return 0, "", lookupErr
 		}
 		if wtID == 0 {
-			return 0, "", fmt.Errorf("no worktree matches %q (try `treeman wt list`)", name)
+			return 0, "", fmt.Errorf("no worktree matches %q (try `treeman worktree list`)", name)
 		}
 		return wtID, name, nil
 	}
@@ -465,7 +464,7 @@ func buildFilterWithScope(ctx context.Context, c *cli.Command) (filterScope, err
 			return scope, err
 		}
 		if id == 0 {
-			return scope, fmt.Errorf("no worktree matches %q (try `treeman wt list`)", wantWT)
+			return scope, fmt.Errorf("no worktree matches %q (try `treeman worktree list`)", wantWT)
 		}
 		scope.Filter.WorktreeID = id
 		scope.WorktreeName = wantWT

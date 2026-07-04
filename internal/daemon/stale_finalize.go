@@ -43,7 +43,7 @@ const watchdogInterval = 2 * time.Minute
 // `worktree:create:error` error event so the derived state flips to `error`
 // with a clear message. We don't auto-requeue — silently re-running
 // setup hooks + cold builds on a fresh daemon would be surprising,
-// and the user already has `treeman wt finalize` to retry. They get a
+// and the user already has `treeman worktree finalize` to retry. They get a
 // visible signal instead of an invisible wedge.
 //
 // Idempotent: the sweep emits at most one stale event per row per
@@ -81,7 +81,7 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 			continue
 		}
 		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError,
-			"stale finalize: daemon restarted while prepare was in flight — rerun `treeman wt finalize` to retry",
+			"stale finalize: daemon restarted while prepare was in flight — rerun `treeman worktree finalize` to retry",
 			row.RepoID, row.ID, "", 0, map[string]any{
 				"reason":         "daemon_restart",
 				"start_event_ts": last.Ts,
@@ -93,7 +93,7 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 		// leaves the active DB (branch_scoped) or the source DB
 		// (test-clone) half-migrated; a manual rerun without recovery
 		// trips on duplicate-column / table-exists errors. Drop the
-		// primary namespace now so the next `treeman wt finalize`
+		// primary namespace now so the next `treeman worktree finalize`
 		// re-runs cold-build / branch_scoped seed end-to-end. Durable
 		// per-branch copies are preserved (see prepare.RecoverStale-
 		// Worktree). Best-effort — config load / engine connect
@@ -169,7 +169,7 @@ func sweepExpiredFinalizes(ctx context.Context, st *State) {
 		}
 		age := time.Since(startedAt).Round(time.Second)
 		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError,
-			"prepare timed out after "+age.String()+" — child wedged; rerun `treeman wt finalize` once unstuck",
+			"prepare timed out after "+age.String()+" — child wedged; rerun `treeman worktree finalize` once unstuck",
 			row.RepoID, row.ID, "", 0, map[string]any{
 				"reason":     "prepare_timeout",
 				"started_ms": startedAt.UnixMilli(),

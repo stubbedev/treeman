@@ -68,7 +68,7 @@ func TestWtList(t *testing.T) {
 	t.Run("empty registry prints info line, exits 0", func(t *testing.T) {
 		repo := newGitRepo(t)
 		e := newEnv(t)
-		res := e.run(t, repo, "wt", "list")
+		res := e.run(t, repo, "worktree", "list")
 		if res.err != nil {
 			t.Fatalf("wt list: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -85,7 +85,7 @@ func TestWtList(t *testing.T) {
 	t.Run("populated registry prints rows", func(t *testing.T) {
 		e := newEnv(t)
 		repo, _, _ := makeWorktreeFixture(t, e)
-		res := e.run(t, repo, "wt", "list")
+		res := e.run(t, repo, "worktree", "list")
 		if res.err != nil {
 			t.Fatalf("wt list: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -99,7 +99,7 @@ func TestWtList(t *testing.T) {
 	t.Run("--json shape", func(t *testing.T) {
 		e := newEnv(t)
 		repo, _, _ := makeWorktreeFixture(t, e)
-		res := e.run(t, repo, "wt", "list", "--json")
+		res := e.run(t, repo, "worktree", "list", "--json")
 		if res.err != nil {
 			t.Fatalf("wt list --json: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -115,7 +115,7 @@ func TestWtList(t *testing.T) {
 	t.Run("--with-state adds STATE column", func(t *testing.T) {
 		e := newEnv(t)
 		repo, _, _ := makeWorktreeFixture(t, e)
-		res := e.run(t, repo, "wt", "list", "--with-state")
+		res := e.run(t, repo, "worktree", "list", "--with-state")
 		if res.err != nil {
 			t.Fatalf("wt list --with-state: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -127,7 +127,7 @@ func TestWtList(t *testing.T) {
 	t.Run("--sort visited is accepted", func(t *testing.T) {
 		e := newEnv(t)
 		repo, _, _ := makeWorktreeFixture(t, e)
-		res := e.run(t, repo, "wt", "list", "--sort", "visited")
+		res := e.run(t, repo, "worktree", "list", "--sort", "visited")
 		if res.err != nil {
 			t.Errorf("wt list --sort visited: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -137,7 +137,7 @@ func TestWtList(t *testing.T) {
 		e := newEnv(t)
 		repo, _, _ := makeWorktreeFixture(t, e)
 		other := newGitRepo(t)
-		res := e.run(t, other, "wt", "list", "--repo", repo)
+		res := e.run(t, other, "worktree", "list", "--repo", repo)
 		if res.err != nil {
 			t.Fatalf("wt list --repo: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -154,7 +154,7 @@ func TestWtShow(t *testing.T) {
 	repo, _, _ := makeWorktreeFixture(t, e)
 
 	t.Run("by slug surfaces seeded event", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "show", "feat_a")
+		res := e.run(t, repo, "worktree", "show", "feat_a")
 		if res.err != nil {
 			t.Fatalf("wt show: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -166,7 +166,7 @@ func TestWtShow(t *testing.T) {
 	})
 
 	t.Run("by branch", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "show", "feature/b")
+		res := e.run(t, repo, "worktree", "show", "feature/b")
 		if res.err != nil {
 			t.Fatalf("wt show feature/b: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -176,14 +176,14 @@ func TestWtShow(t *testing.T) {
 	})
 
 	t.Run("unknown name errors", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "show", "ghost")
+		res := e.run(t, repo, "worktree", "show", "ghost")
 		if res.err == nil {
 			t.Errorf("expected error for unknown worktree, got stdout:\n%s", res.stdout)
 		}
 	})
 
 	t.Run("--events / --hooks caps", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "show", "feat_a", "--events", "1", "--hooks", "1")
+		res := e.run(t, repo, "worktree", "show", "feat_a", "--events", "1", "--hooks", "1")
 		if res.err != nil {
 			t.Errorf("wt show with caps: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -197,7 +197,7 @@ func TestWtGoAndBack(t *testing.T) {
 	repo, wtA, _ := makeWorktreeFixture(t, e)
 
 	t.Run("wt go by name prints path on stdout", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "go", "feat_a")
+		res := e.run(t, repo, "worktree", "go", "feat_a")
 		if res.err != nil {
 			t.Fatalf("wt go: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -207,14 +207,14 @@ func TestWtGoAndBack(t *testing.T) {
 	})
 
 	t.Run("wt go unknown name errors", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "go", "ghost")
+		res := e.run(t, repo, "worktree", "go", "ghost")
 		if res.err == nil {
 			t.Errorf("expected error for unknown name, got stdout:\n%s", res.stdout)
 		}
 	})
 
 	t.Run("wt back from worktree prints main repo path", func(t *testing.T) {
-		res := e.run(t, wtA, "wt", "back")
+		res := e.run(t, wtA, "worktree", "back")
 		if res.err != nil {
 			t.Fatalf("wt back: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -233,7 +233,7 @@ func TestWtGoResolveByBranch(t *testing.T) {
 	repo, wtA, _ := makeWorktreeFixture(t, e)
 
 	t.Run("by branch returns worktree path", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "go", "feature/a")
+		res := e.run(t, repo, "worktree", "go", "feature/a")
 		if res.err != nil {
 			t.Fatalf("wt go: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -243,7 +243,7 @@ func TestWtGoResolveByBranch(t *testing.T) {
 	})
 
 	t.Run("unknown branch exits nonzero", func(t *testing.T) {
-		res := e.run(t, repo, "wt", "go", "no/such/branch")
+		res := e.run(t, repo, "worktree", "go", "no/such/branch")
 		if res.err == nil {
 			t.Errorf("expected nonzero exit, got stdout:\n%s", res.stdout)
 		}
@@ -257,7 +257,7 @@ func TestWtPrev(t *testing.T) {
 	// With no prior visits there's no "previous" worktree; the command
 	// should exit non-zero rather than print a blank path the shell
 	// would `cd` into.
-	res := e.run(t, repo, "wt", "prev")
+	res := e.run(t, repo, "worktree", "prev")
 	if res.err == nil && strings.TrimSpace(res.stdout) != "" {
 		t.Errorf("expected nonzero exit when no prev worktree, got stdout %q", res.stdout)
 	}
@@ -275,12 +275,12 @@ func TestWtRegisterUnregister(t *testing.T) {
 	}
 
 	t.Run("register adds a row to the registry", func(t *testing.T) {
-		res := e.run(t, wtPath, "wt", "register", "--branch", "manual-branch")
+		res := e.run(t, wtPath, "worktree", "register", "--branch", "manual-branch")
 		if res.err != nil {
 			t.Fatalf("wt register: %v\nstderr:\n%s", res.err, res.stderr)
 		}
 		// Confirm via wt list.
-		res = e.run(t, repo, "wt", "list", "--json")
+		res = e.run(t, repo, "worktree", "list", "--json")
 		if res.err != nil {
 			t.Fatalf("wt list: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -290,7 +290,7 @@ func TestWtRegisterUnregister(t *testing.T) {
 	})
 
 	t.Run("unregister marks deleted without touching filesystem", func(t *testing.T) {
-		res := e.run(t, wtPath, "wt", "unregister")
+		res := e.run(t, wtPath, "worktree", "unregister")
 		if res.err != nil {
 			t.Fatalf("wt unregister: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -298,7 +298,7 @@ func TestWtRegisterUnregister(t *testing.T) {
 			t.Errorf("wt unregister should leave fs alone, but path is gone: %v", err)
 		}
 		// Active list should no longer show it.
-		res = e.run(t, repo, "wt", "list", "--json")
+		res = e.run(t, repo, "worktree", "list", "--json")
 		if strings.Contains(res.stdout, `"manual"`) {
 			t.Errorf("expected unregistered worktree to drop from active list:\n%s", res.stdout)
 		}
@@ -310,7 +310,7 @@ func TestWtRegisterUnregister(t *testing.T) {
 func TestWtLogsShorthand(t *testing.T) {
 	e := newEnv(t)
 	repo, _, _ := makeWorktreeFixture(t, e)
-	res := e.run(t, repo, "wt", "logs", "feat_a")
+	res := e.run(t, repo, "worktree", "logs", "feat_a")
 	if res.err != nil {
 		t.Fatalf("wt logs: %v\nstderr:\n%s", res.err, res.stderr)
 	}
@@ -327,7 +327,7 @@ func TestWtWait(t *testing.T) {
 	// 1s timeout is plenty to confirm exit-nonzero behavior without
 	// blocking the test suite. A missing finalize event = the wait
 	// should NOT find one in the registry and should report so.
-	res := e.run(t, repo, "wt", "wait", "feat_a", "--timeout", "1s", "--quiet")
+	res := e.run(t, repo, "worktree", "wait", "feat_a", "--timeout", "1s", "--quiet")
 	if res.err == nil {
 		t.Errorf("expected wt wait to error when no finalize event present, got stdout:\n%s", res.stdout)
 	}
@@ -343,7 +343,7 @@ func TestWtDeleteDispatch(t *testing.T) {
 	// shell shim depends on for the early-return contract.
 	e := newEnv(t)
 	repo, _, _ := makeWorktreeFixture(t, e)
-	res := e.run(t, repo, "wt", "delete", "--force", "feat_a")
+	res := e.run(t, repo, "worktree", "delete", "--force", "feat_a")
 	combined := res.stdout + res.stderr
 	if !strings.Contains(combined, "queued") && !strings.Contains(combined, "teardown") &&
 		!strings.Contains(combined, "daemon") {

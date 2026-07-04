@@ -116,7 +116,7 @@ func TestFwDetect(t *testing.T) {
 	t.Run("plain-text on empty repo reports no frameworks", func(t *testing.T) {
 		repo := newGitRepo(t)
 		e := newEnv(t)
-		res := e.run(t, repo, "fw", "detect")
+		res := e.run(t, repo, "frameworks", "detect")
 		if res.err != nil {
 			t.Fatalf("fw detect: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -132,7 +132,7 @@ func TestFwDetect(t *testing.T) {
 	t.Run("--json shape", func(t *testing.T) {
 		repo := newGitRepo(t)
 		e := newEnv(t)
-		res := e.run(t, repo, "fw", "detect", "--json")
+		res := e.run(t, repo, "frameworks", "detect", "--json")
 		if res.err != nil {
 			t.Fatalf("fw detect --json: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -154,7 +154,7 @@ func TestFwDetect(t *testing.T) {
 			t.Fatal(err)
 		}
 		e := newEnv(t)
-		res := e.run(t, repo, "fw", "detect")
+		res := e.run(t, repo, "frameworks", "detect")
 		if res.err != nil {
 			t.Fatalf("fw detect: %v\nstderr:\n%s", res.err, res.stderr)
 		}
@@ -183,7 +183,7 @@ func TestFwDetect(t *testing.T) {
 			t.Fatal(err)
 		}
 		e := newEnv(t)
-		res := e.run(t, repo, "fw", "detect")
+		res := e.run(t, repo, "frameworks", "detect")
 		if res.err != nil {
 			t.Fatalf("fw detect: %v\nstderr:\n%s", res.err, res.stderr)
 		}

@@ -41,9 +41,6 @@ const (
 	// accepted the finalize dispatch. Status lines for the heavy
 	// tail will appear in the daemon log.
 	CreatedQueued CreateStatus = "queued"
-	// CreatedDetached — daemon was unreachable; the heavy tail is
-	// running in a setsid child whose log path is LogPath.
-	CreatedDetached CreateStatus = "detached"
 	// CreatedNoop — destination already existed and matches an
 	// active registry row on the requested branch. No work done.
 	CreatedNoop CreateStatus = "noop"
@@ -53,7 +50,8 @@ const (
 )
 
 // CreateResult is the structured outcome of a Create call. Status
-// is always set; LogPath is populated only when Status==CreatedDetached.
+// is always set; LogPath is retained for the MCP surface but is unused
+// now that the daemon is the sole finalize worker.
 //
 // JSON tags are snake_case to match the rest of the MCP tool surface
 // (callers parse this directly off MCP's structuredContent).
@@ -266,7 +264,7 @@ func addGitWorktree(ctx context.Context, req CreateRequest, wtPath *string) erro
 		gitArgs = []string{"worktree", "add", "-b", req.Branch, *wtPath, base}
 	}
 	// Route git's output to stderr (not stdout) so the --print-path
-	// shell idiom — `cd "$(treeman wt create x --print-path)"` —
+	// shell idiom — `cd "$(treeman worktree create x --print-path)"` —
 	// doesn't ingest "Preparing worktree …" / "HEAD is now at …"
 	// lines that git emits on its stdout. Tee stderr through a buffer
 	// too: RunPiped streams stderr to the writer and drops it from the
@@ -335,14 +333,15 @@ func finishCreate(ctx context.Context, req CreateRequest, result CreateResult, s
 		result.Status = CreatedQueued
 		return result, nil
 	}
-	logPath, err := DetachFinalize(result.WtPath, req.RepoRoot)
-	if err != nil {
-		return result, fmt.Errorf("detach finalize: %w", err)
-	}
-	sink.OK("queued: setup + prepare detached (daemon unreachable — log: %s)", logPath)
-	result.Status = CreatedDetached
-	result.LogPath = logPath
-	return result, nil
+	// The worktree + registry row exist, but the daemon — the async
+	// finalize worker — could not be reached even after an autostart
+	// attempt (see CallWithStart/EnsureDaemon). We do not fork a CLI
+	// child to run the tail; report it so the user can start the daemon
+	// and re-run finalize.
+	return result, fmt.Errorf(
+		"daemon unreachable — worktree %q created but setup + prepare did not run; "+
+			"start the daemon and run `treeman worktree finalize %s`; %s",
+		result.WtPath, result.WtPath, daemonDebugHint())
 }
 
 // applyPatches runs every configured top-level patch against the new

@@ -12,7 +12,7 @@ import (
 )
 
 // TestIsTearingDown asserts the delete-lifecycle filter behind
-// `treeman wt list`: a worktree is hidden only while its latest
+// `treeman worktree list`: a worktree is hidden only while its latest
 // delete event is delete:start, and reappears once teardown ends or
 // fails (self-healing).
 func TestIsTearingDown(t *testing.T) {

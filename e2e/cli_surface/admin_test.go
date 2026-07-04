@@ -45,7 +45,7 @@ func TestRegistryRemove(t *testing.T) {
 			t.Fatalf("registry remove --force --yes: %v\nstderr:\n%s", res.err, res.stderr)
 		}
 		// `wt list` now finds no rows under that repo.
-		res = e.run(t, repo, "wt", "list", "--json")
+		res = e.run(t, repo, "worktree", "list", "--json")
 		if strings.Contains(res.stdout, `"feat_a"`) {
 			t.Errorf("expected worktree rows to drop after registry remove:\n%s", res.stdout)
 		}
@@ -141,7 +141,7 @@ func TestHookRun(t *testing.T) {
 	mustGit(t, repo, "branch", "manual")
 	mustGit(t, repo, "worktree", "add", "-q", ".worktrees/manual", "manual")
 	wtPath := repo + "/.worktrees/manual"
-	res := e.run(t, wtPath, "wt", "register", "--branch", "manual")
+	res := e.run(t, wtPath, "worktree", "register", "--branch", "manual")
 	if res.err != nil {
 		t.Fatalf("register: %v\nstderr:\n%s", res.err, res.stderr)
 	}
@@ -343,7 +343,7 @@ func TestTopLevelFlags(t *testing.T) {
 		if res.err == nil {
 			t.Errorf("expected error for typo'd command")
 		}
-		// Levenshtein suggester should propose "wt" / "worktree".
+		// Levenshtein suggester should propose "worktree".
 		if !strings.Contains(res.stderr, "did you mean") {
 			t.Errorf("expected 'did you mean' suggestion:\n%s", res.stderr)
 		}

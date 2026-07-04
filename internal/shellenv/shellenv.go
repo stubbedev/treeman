@@ -13,7 +13,7 @@
 //     XDG_*, the OS essentials every process its user owns receives.
 //     Tools like composer refuse to run without HOME.
 //  2. The user's CLI-captured env (inheritedEnv, ultimately os.Environ()
-//     at `treeman wt create` time): their PATH, version-manager shims
+//     at `treeman worktree create` time): their PATH, version-manager shims
 //     (asdf, nvm, mise, rbenv, …), session overrides. Wins over floor.
 //  3. The login-shell PATH (LoginShellPATH) is always merged into PATH.
 //     Under `systemd --user` both the floor and an externally-created

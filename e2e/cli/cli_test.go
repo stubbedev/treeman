@@ -174,7 +174,7 @@ databases:
 
 	// `treeman wt create <branch>` — full pipeline.
 	wtBranch := "feature/test"
-	out := runTreeman(t, binDir, mainRepo, "wt", "create", wtBranch)
+	out := runTreeman(t, binDir, mainRepo, "worktree", "create", wtBranch)
 	t.Logf("wt create output:\n%s", out)
 
 	wtPath := filepath.Join(mainRepo, ".worktrees", "feature/test")
@@ -186,7 +186,7 @@ databases:
 	// to the daemon and returns immediately. Block on the daemon finishing
 	// before asserting on the materialized files (this is the real
 	// dispatch + async-finalize path end-to-end).
-	runTreeman(t, binDir, mainRepo, "wt", "wait", wtBranch)
+	runTreeman(t, binDir, mainRepo, "worktree", "wait", wtBranch)
 
 	// ── Links ──: vendor should be a symlink to main repo's vendor.
 	vendor := filepath.Join(wtPath, "vendor")
@@ -253,7 +253,7 @@ databases:
 	assertCount(t, sourceDB, "widgets", 2)
 
 	// ── wt delete ──: should drop the DB AND remove the worktree.
-	out = runTreeman(t, binDir, mainRepo, "wt", "delete", "--yes", wtBranch)
+	out = runTreeman(t, binDir, mainRepo, "worktree", "delete", "--yes", wtBranch)
 	t.Logf("wt delete output:\n%s", out)
 
 	harness.WaitForReady(t, "drop-source-db", 30*time.Second, func() error {
@@ -314,7 +314,7 @@ func TestCLIPrintPathStreamDiscipline(t *testing.T) {
 
 	// Capture stdout + stderr separately so we can assert the split.
 	cmd := exec.Command(filepath.Join(binDir, "treeman"),
-		"wt", "create", "feature/printpath", "--skip-hooks", "--print-path")
+		"worktree", "create", "feature/printpath", "--skip-hooks", "--print-path")
 	cmd.Dir = mainRepo
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout

@@ -19,7 +19,7 @@ tree also needs its own database, `N` test-runner clones fanning out
 from a cached template, migrations applied, `.env`-style config patched
 to the per-worktree DB names, install hooks run, and teardown that drops
 every namespace on delete. treeman owns that lifecycle:
-`treeman wt create FOO` and `treeman wt delete FOO` are the only
+`treeman worktree create FOO` and `treeman worktree delete FOO` are the only
 commands you type.
 
 ## Supported engines
@@ -154,7 +154,7 @@ treeman doctor              # probes daemon, config, schema, git ↔ registry dr
 treeman repos               # every enrolled repo: worktrees, snapshots, last activity
 
 # 3. Spin up a worktree end-to-end.
-treeman wt create proj-123
+treeman worktree create proj-123
 #   ↳ git worktree add .worktrees/proj-123 -b proj-123 origin/HEAD
 #   ↳ brings in worktrees.copies (e.g. .env) + worktrees.links (e.g. node_modules)
 #   ↳ patches `patches:` entries (.env.testing, settings.py,
@@ -163,19 +163,19 @@ treeman wt create proj-123
 #   ↳ prepare: ensure_db → load dump → migrate → snapshot → N test clones
 
 # 4. Get the path of an existing worktree for `cd` integration:
-cd "$(treeman wt go proj-123)"
+cd "$(treeman worktree go proj-123)"
 
 # (CI flow: block on the daemon's finalize before running tests.)
-treeman wt wait proj-123                  # exits 0 on success, non-zero on failure
-treeman wt show proj-123                  # dossier + recent events + hook runs
+treeman worktree wait proj-123                  # exits 0 on success, non-zero on failure
+treeman worktree show proj-123                  # dossier + recent events + hook runs
 
 # 5. Done with the branch:
-treeman wt delete proj-123
+treeman worktree delete proj-123
 #   ↳ runs predelete hook (DB drops, FLUSHDB, ES index delete)
 #   ↳ git worktree remove
 
 # 6. Cd back to the main checkout (with optional auto-remove if clean):
-cd "$(treeman wt back --remove)"
+cd "$(treeman worktree back --remove)"
 ```
 
 A ready-to-source zsh shim that wraps `wt go` / `wt back` for
@@ -192,7 +192,7 @@ tm proj-123 -c       # create + cd to new worktree
 tm new proj-123      # same as `tm proj-123 -c`
 tm -                 # cd back to main repo
 tm - --remove        # cd back + drop current worktree if clean
-tm list              # passthrough to `treeman wt list`
+tm list              # passthrough to `treeman worktree list`
 ```
 
 ---

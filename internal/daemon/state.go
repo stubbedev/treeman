@@ -271,7 +271,7 @@ func (st *State) IsTeardownInFlight(wtPath string) bool {
 // invoke UnmarkFinalizeInFlight on exit.
 //
 // Why this exists: when the lifecycle watcher is enabled, the
-// `git worktree add` shelled out by `treeman wt create` itself
+// `git worktree add` shelled out by `treeman worktree create` itself
 // generates an fsnotify CREATE event that the watcher debounces
 // and then dispatches FinalizeWorktree against. Without dedup, the
 // CLI-initiated finalize and the watcher-initiated finalize run in

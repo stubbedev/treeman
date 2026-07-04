@@ -26,7 +26,7 @@ import (
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
-// goroutine) tail of `treeman wt create`: it runs the create
+// goroutine) tail of `treeman worktree create`: it runs the create
 // hook pipeline + engine prepare against the main repo root,
 // detached from the CLI invocation.
 func FinalizeWorktree(
@@ -60,7 +60,7 @@ func FinalizeWorktree(
 			return
 		}
 		// Reset the per-worktree primary namespace so the documented
-		// `treeman wt finalize` retry cold-rebuilds end-to-end instead
+		// `treeman worktree finalize` retry cold-rebuilds end-to-end instead
 		// of tripping on the half-applied migrations a mid-prepare
 		// failure leaves behind (duplicate-column / table-exists). This
 		// unifies the direct-failure path with SweepStalePreparing and
@@ -127,7 +127,7 @@ func FinalizeWorktree(
 	// can race to call this for the same worktree when the watcher
 	// is enabled. The watcher already gates on the active-row check,
 	// but this is the belt to that braces: even if a second caller
-	// slips through (e.g. an explicit `treeman wt finalize` while
+	// slips through (e.g. an explicit `treeman worktree finalize` while
 	// one is still running), it returns immediately instead of
 	// re-running setup hooks in parallel.
 	if !st.MarkFinalizeInFlight(wtRoot, cancel) {
@@ -527,7 +527,7 @@ func cancelledBefore(ctx context.Context, st *State, phase string, repoID, wtID 
 //
 // Setup hooks are NOT re-run by this path — they're for
 // initial worktree setup, not edit-driven re-prep. Use the regular
-// `FinalizeWorktree` (e.g. `treeman wt finalize`) when hooks need
+// `FinalizeWorktree` (e.g. `treeman worktree finalize`) when hooks need
 // to fire.
 func FinalizeWorktreeForWatch(
 	ctx context.Context,
@@ -616,7 +616,7 @@ func FinalizeWorktreeForWatch(
 	return nil
 }
 
-// TeardownWorktree mirrors FinalizeWorktree for `treeman wt delete`.
+// TeardownWorktree mirrors FinalizeWorktree for `treeman worktree delete`.
 // Runs teardown hooks + DB teardown + worktree removal. All in the
 // daemon's runtime so the CLI returns immediately.
 //

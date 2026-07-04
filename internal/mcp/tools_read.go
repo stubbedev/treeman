@@ -472,7 +472,7 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 	if len(onlyInDB) > 0 {
 		parts = append(parts, fmt.Sprintf("%d registered but missing from git: %s", len(onlyInDB), strings.Join(onlyInDB, ", ")))
 	}
-	return doctorResult{Name: "registry", Status: "warn", Detail: strings.Join(parts, "; "), Hint: "treeman wt register|unregister"}
+	return doctorResult{Name: "registry", Status: "warn", Detail: strings.Join(parts, "; "), Hint: "treeman worktree register|unregister"}
 }
 
 func gitWorktreePaths(ctx context.Context, repoRoot string) ([]string, error) {
@@ -848,7 +848,7 @@ func worktreeRowFromCwd(ctx context.Context, st *store.Store) (worktreeRow, erro
 		parent := filepath.Dir(dir)
 		if parent == dir {
 			return worktreeRow{}, errors.New(
-				"not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman wt list`)",
+				"not inside a tracked worktree (run from inside one, or pass a worktree name — see `treeman worktree list`)",
 			)
 		}
 		dir = parent

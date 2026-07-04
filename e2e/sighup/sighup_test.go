@@ -120,7 +120,7 @@ hooks:
 	// per-worktree fsnotify watcher on `wt create` — it only does
 	// so at startup or via config-reload. SIGHUP once to bring the
 	// watcher up against the initial config.
-	out := runTreeman(t, binDir, mainRepo, "wt", "create", "feature/sighup")
+	out := runTreeman(t, binDir, mainRepo, "worktree", "create", "feature/sighup")
 	t.Logf("wt create output:\n%s", out)
 	wtPath := filepath.Join(mainRepo, ".worktrees", "feature/sighup")
 	harness.WaitForReady(t, "wt-created", 15*time.Second, func() error {

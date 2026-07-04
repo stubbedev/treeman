@@ -256,7 +256,7 @@ type EventEnvelope struct {
 // every watcher attached to the repo first. Force=false refuses the
 // removal when active (`deleted_at IS NULL`) worktrees still exist.
 // External resources (databases, on-disk worktree dirs) are never
-// touched — callers wanting a destructive purge run `treeman wt delete`
+// touched — callers wanting a destructive purge run `treeman worktree delete`
 // first.
 type RepoRemoveArgs struct {
 	RepoPath string `json:"repo_path"`

@@ -85,7 +85,7 @@ func TestPortsAllocateAndRenderAndShow(t *testing.T) {
 	binDir, repoRoot := setupPortsRepo(t)
 
 	const branch = "octane-wt"
-	out := runTreeman(t, binDir, repoRoot, "wt", "create", branch, "--skip-hooks")
+	out := runTreeman(t, binDir, repoRoot, "worktree", "create", branch, "--skip-hooks")
 	t.Logf("wt create:\n%s", out)
 
 	wtPath := filepath.Join(repoRoot, ".worktrees", branch)
@@ -105,13 +105,13 @@ func TestPortsAllocateAndRenderAndShow(t *testing.T) {
 	}
 
 	// `wt show <branch>` reports the ports.
-	show := runTreeman(t, binDir, repoRoot, "wt", "show", branch)
+	show := runTreeman(t, binDir, repoRoot, "worktree", "show", branch)
 	if !strings.Contains(show, "octane="+strconv.Itoa(octane)) {
 		t.Errorf("wt show missing octane port:\n%s", show)
 	}
 
 	// Argument-free `wt show` from inside the worktree resolves via cwd.
-	showCwd := runTreeman(t, binDir, wtPath, "wt", "show")
+	showCwd := runTreeman(t, binDir, wtPath, "worktree", "show")
 	if !strings.Contains(showCwd, "octane="+strconv.Itoa(octane)) {
 		t.Errorf("cwd-aware wt show missing octane port:\n%s", showCwd)
 	}
@@ -123,7 +123,7 @@ func TestPortsAllocateAndRenderAndShow(t *testing.T) {
 func TestDeleteRefusesMainWorktreeCLI(t *testing.T) {
 	binDir, repoRoot := setupPortsRepo(t)
 
-	cmd := exec.Command(filepath.Join(binDir, "treeman"), "wt", "delete", "--yes", ".")
+	cmd := exec.Command(filepath.Join(binDir, "treeman"), "worktree", "delete", "--yes", ".")
 	cmd.Dir = repoRoot
 	out, err := cmd.CombinedOutput()
 	if err == nil {

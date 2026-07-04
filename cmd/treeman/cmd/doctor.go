@@ -481,7 +481,7 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 		Name:   "registry",
 		Status: "warn",
 		Detail: strings.Join(parts, "; "),
-		Hint:   "reconcile via `treeman wt register <path>` or `treeman wt unregister <path>`",
+		Hint:   "reconcile via `treeman worktree register <path>` or `treeman worktree unregister <path>`",
 	}
 }
 

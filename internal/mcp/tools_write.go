@@ -33,7 +33,7 @@ import (
 )
 
 // registerWriteTools binds every tool that mutates state, including
-// the shell-spawning `treeman wt create` / `wt delete` wrappers.
+// the shell-spawning `treeman worktree create` / `wt delete` wrappers.
 // No flag-gating: the MCP surface is the fully-qualified link to
 // treeman's functionality; clients restrict at the agent-policy
 // layer.
@@ -148,7 +148,7 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 // registerRegistryWriteTools binds in-process registry mutations. No
 // shell-out, no daemon dependency — agents can reconcile drift the same
-// way `treeman wt register|unregister` would.
+// way `treeman worktree register|unregister` would.
 func registerRegistryWriteTools(srv *mcpsdk.Server) {
 	addTool(srv, &mcpsdk.Tool{
 		Name:        "registry_register",

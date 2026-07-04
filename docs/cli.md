@@ -9,13 +9,9 @@ Run `just sync-docs` after touching any subcommand to refresh.
 
 ### `treeman worktree`
 
-Aliases: `wt`
-
 worktree lifecycle
 
 ### `treeman worktree create`
-
-Aliases: `new`
 
 create a worktree end-to-end
 
@@ -26,9 +22,9 @@ CLI always returns immediately — follow progress with
 'treeman logs tail --follow'.
 
 Examples:
-  treeman wt create PROJ-1234
-  treeman wt create feature/x --from origin/develop
-  cd "$(treeman wt create feat --print-path)"
+  treeman worktree create PROJ-1234
+  treeman worktree create feature/x --from origin/develop
+  cd "$(treeman worktree create feat --print-path)"
 ```
 
 | Flag | Usage |
@@ -39,11 +35,9 @@ Examples:
 | `--skip-hooks` |  |
 | `--skip-prepare` |  |
 | `--no-fetch` | skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits) |
-| `--print-path` | print only the new worktree path on stdout; status lines redirect to stderr (enables `cd "$(treeman wt create …)"`) |
+| `--print-path` | print only the new worktree path on stdout; status lines redirect to stderr (enables `cd "$(treeman worktree create …)"`) |
 
 ### `treeman worktree delete`
-
-Aliases: `rm`
 
 delete a worktree end-to-end
 
@@ -54,8 +48,8 @@ removes the registry row. The teardown is dispatched to the daemon
 always returns immediately.
 
 Examples:
-  treeman wt delete PROJ-1234
-  treeman wt delete /path/to/wt --force      # remove stale registry entry
+  treeman worktree delete PROJ-1234
+  treeman worktree delete /path/to/wt --force      # remove stale registry entry
 ```
 
 | Flag | Usage |
@@ -80,8 +74,6 @@ mark a worktree deleted in SQLite without touching git
 
 ### `treeman worktree list`
 
-Aliases: `ls`
-
 list active worktrees
 
 | Flag | Usage |
@@ -94,8 +86,6 @@ list active worktrees
 | `-r`, `--repo` | scope to one repo (path) |
 
 ### `treeman worktree show`
-
-Aliases: `info`
 
 show details, recent events, and hook runs for a worktree (defaults to the worktree containing the current directory)
 
@@ -165,7 +155,7 @@ print previously-visited worktree (registry-tracked; cross-shell)
 
 ### `treeman worktree go`
 
-resolve/create/checkout a worktree by name or branch (use as cd "$(treeman wt go …)")
+resolve/create/checkout a worktree by name or branch (use as cd "$(treeman worktree go …)")
 
 | Flag | Usage |
 |---|---|
@@ -174,6 +164,132 @@ resolve/create/checkout a worktree by name or branch (use as cd "$(treeman wt go
 | `--from` | base branch (with --create/--checkout) |
 | `-r`, `--repo` |  |
 | `--no-fetch` | skip the pre-checkout `git fetch origin <base>` |
+
+### `treeman worktree switch`
+
+switch to or create a branch's worktree (prints dest path for cd)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--from` | base branch when creating |
+| `--no-fetch` | skip the pre-checkout fetch |
+
+### `treeman git`
+
+git workflow helpers (commit, push, add, diff, log, stash, switch)
+
+### `treeman git commit`
+
+commit with auto ticket prefix (trailing \ opens editor)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git push`
+
+push -u origin <branch> (guards protected branches + divergence)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git add`
+
+interactively stage files (M→patch, D→removal, A→untracked)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git diff`
+
+working-tree diff, or three-dot diff vs a branch (--pick, --patch)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+| `--pick` | pick the comparison branch interactively |
+| `--patch` | write the diff to <cur>--<target>.diff instead of paging |
+
+### `treeman git status`
+
+short status
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git pull`
+
+pull current branch (--all, or --pick an origin branch)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+| `-a`, `--all` | pull all branches |
+| `--pick` | pull a selected origin branch |
+
+### `treeman git fetch`
+
+fetch (--all for all remotes)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+| `-a`, `--all` |  |
+
+### `treeman git stash`
+
+stash all local changes
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git stash pop`
+
+pop a selected stash
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git stash clear`
+
+drop the entire stash stack (with confirmation)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git wipe`
+
+wipe local changes (stash + drop; --all also clears the stash stack)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+| `-a`, `--all` |  |
+
+### `treeman git log`
+
+interactive log (Enter: show, Ctrl+X: cherry-pick, Ctrl+R: revert, Ctrl+Y: copy hash)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git switch`
+
+checkout or create a branch, worktree-aware (prints dest path for cd)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--from` | base branch when creating |
+| `--no-fetch` | skip the pre-checkout fetch |
 
 ### `treeman repos`
 
@@ -327,8 +443,6 @@ run a hook phase using the cwd's repo config
 | `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman logs`
-
-Aliases: `log`
 
 query the SQLite event log
 
@@ -560,8 +674,6 @@ live runtime snapshot — watchers, in-flight finalizes/teardowns, auto-fetch ba
 
 ### `treeman frameworks`
 
-Aliases: `fw`
-
 framework detection
 
 ### `treeman frameworks detect`
@@ -650,8 +762,6 @@ Examples:
 | `--json` |  |
 
 ### `treeman snapshots`
-
-Aliases: `snap`
 
 snapshot cache visibility + purge
 

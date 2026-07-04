@@ -151,7 +151,7 @@ func run() error {
 	// daemon died — the goroutine is gone, so the row would otherwise
 	// stay at derived state=preparing forever. SweepStalePreparing
 	// emits a synthetic worktree:create:error error so the user sees the wedge
-	// and can rerun `treeman wt finalize`. Runs BEFORE watchers come
+	// and can rerun `treeman worktree finalize`. Runs BEFORE watchers come
 	// up so the stale event is visible regardless of whether a fresh
 	// finalize is about to fire.
 	daemon.SweepStalePreparing(ctx, st)
