@@ -252,7 +252,39 @@ func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.O
 	if err != nil {
 		return nil, err
 	}
-	return prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, captureEnv())
+	outs, err := prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, captureEnv())
+	if err != nil {
+		return outs, err
+	}
+	if err := runPostEngineHooks(ctx, st, &cfg, repoRoot, wt, id.Slug.Value, id.IsMain, repoID, id.WtID); err != nil {
+		return outs, err
+	}
+	return outs, nil
+}
+
+// runPostEngineHooks fires create-after-engines after an MCP-driven
+// prepare/db_reset, mirroring the daemon pipeline's post-hook step —
+// these paths mutate engine content just like finalize, so hooks that
+// react to fresh data (cache flushes) must run here too.
+func runPostEngineHooks(
+	ctx context.Context,
+	st *store.Store,
+	cfg *config.Config,
+	repoRoot, wtRoot, slugVal string,
+	isMain bool,
+	repoID, wtID int64,
+) error {
+	actions := cfg.Hooks.OnCreateAfterEngines
+	if len(actions) == 0 {
+		return nil
+	}
+	started := hooks.EmitHookStart(ctx, st, repoID, wtID, "create-after-engines", len(actions))
+	out, err := hooks.RunHooks(ctx, "create-after-engines", actions, repoRoot, wtRoot, slugVal, isMain, captureEnv(), true)
+	runIDs := hooks.PersistOutcome(ctx, st, repoID, wtID, "create-after-engines", started, time.Now().UnixMilli(), out)
+	if err != nil {
+		return fmt.Errorf("create-after-engines: %w", err)
+	}
+	return hooks.FirstFailureError("create-after-engines", out, runIDs)
 }
 
 // runDbReset is the self-contained equivalent of cmd's
@@ -291,6 +323,9 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 	}
 	outs, err := prepare.Run(ctx, &cfg, wt, id.Slug, st, repoID, id.WtID, captureEnv())
 	if err != nil {
+		return outs, err
+	}
+	if err := runPostEngineHooks(ctx, st, &cfg, repoRoot, wt, id.Slug.Value, id.IsMain, repoID, id.WtID); err != nil {
 		return outs, err
 	}
 	// Surface only the branch_scoped databases the reset touched, matched on

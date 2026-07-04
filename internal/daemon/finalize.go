@@ -613,6 +613,18 @@ func FinalizeWorktreeForWatch(
 		}
 		return fmt.Errorf("prepare (watch-trigger): %w", err)
 	}
+	// Post-engine hooks fire on this path too: a watcher-driven
+	// re-prepare mutates DB content just like the full finalize, so
+	// hooks that react to fresh data (cache flushes etc.) must run —
+	// this was the one prepare path that skipped them.
+	if ctx.Err() != nil {
+		return nil
+	}
+	if err := runTriggerActions(ctx, st, "create-after-engines",
+		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
+		id.IsMain, repoID, wtID, inheritedEnv); err != nil {
+		return fmt.Errorf("post-hooks (watch-trigger): %w", err)
+	}
 	return nil
 }
 
