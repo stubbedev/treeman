@@ -107,6 +107,12 @@ func registerWriteTools(srv *mcpsdk.Server) {
 	}, snapshotsPurgeTool)
 
 	addTool(srv, &mcpsdk.Tool{
+		Name:        "snapshots_prune",
+		Description: "Delete snapshot rows whose engine-side template no longer exists (orphans from out-of-band deletions or died captures). Live templates are never touched — safe any time, unlike snapshots_purge. Pass dry_run=true to list the orphans without deleting.",
+		Annotations: writeAnno("Prune orphan snapshots", true, true, true),
+	}, snapshotsPruneTool)
+
+	addTool(srv, &mcpsdk.Tool{
 		Name:        "logs_purge",
 		Description: "Delete event-log rows. Filters AND-combine; pass older_than=24h to drop anything older. At least one filter is REQUIRED to prevent a full wipe. Pass dry_run=true to preview the matched-row count; ack=true to skip confirmation.",
 		Annotations: writeAnno("Purge events", true, false, false),
@@ -760,6 +766,67 @@ func snapshotsPurgeTool(
 		fmt.Sprintf("purged %d snapshot(s)", dropped), repoID,
 		map[string]string{"repo": repoRoot, "dropped": strconv.Itoa(dropped)})
 	out := snapshotsPurgeOut{Repo: repoRoot, Dropped: dropped}
+	for _, e := range errs {
+		out.Errors = append(out.Errors, e.Error())
+	}
+	return nil, out, nil
+}
+
+// ─── snapshots_prune ─────────────────────────────────────────────
+
+type snapshotsPruneIn struct {
+	Repo   string `json:"repo,omitempty"`
+	DryRun bool   `json:"dry_run,omitempty" jsonschema:"plan only — list the orphan rows that WOULD be deleted without mutating SQLite"`
+	Ack    bool   `json:"ack,omitempty"     jsonschema:"skip the elicitation confirmation prompt"`
+}
+type snapshotsPruneOut struct {
+	Repo    string                 `json:"repo"`
+	Pruned  []snapshot.PruneResult `json:"pruned,omitempty"`
+	Count   int                    `json:"count"`
+	Errors  []string               `json:"errors,omitempty"`
+	DryRun  bool                   `json:"dry_run,omitempty"`
+	Refused string                 `json:"refused,omitempty"`
+}
+
+// snapshotsPruneTool deletes SQLite snapshot rows whose engine-side
+// template is gone. Existence is probed per row; unreachable or
+// unconfigured engines keep their rows (unknown is not orphan).
+func snapshotsPruneTool(
+	ctx context.Context,
+	req *mcpsdk.CallToolRequest,
+	in snapshotsPruneIn,
+) (*mcpsdk.CallToolResult, snapshotsPruneOut, error) {
+	repoRoot, err := resolveRepo(ctx, in.Repo)
+	if err != nil {
+		return nil, snapshotsPruneOut{}, err
+	}
+	cfg, err := resolve.LoadResolved(repoRoot)
+	if err != nil {
+		return nil, snapshotsPruneOut{}, fmt.Errorf("load config: %w", err)
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return nil, snapshotsPruneOut{}, err
+	}
+	defer func() { _ = st.Close() }()
+	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+	if err != nil {
+		return nil, snapshotsPruneOut{}, fmt.Errorf("ensure repo: %w", err)
+	}
+	if in.DryRun {
+		orphans, errs := snapshot.FindRowOrphans(ctx, &cfg, st, repoID)
+		out := snapshotsPruneOut{Repo: repoRoot, Pruned: orphans, Count: len(orphans), DryRun: true}
+		for _, e := range errs {
+			out.Errors = append(out.Errors, e.Error())
+		}
+		return nil, out, nil
+	}
+	if ok, reason := confirmDestructive(ctx, req, false, in.Ack,
+		"Prune orphan snapshot rows for "+repoRoot+"? Rows whose engine template is gone will be deleted (engines untouched)."); !ok {
+		return nil, snapshotsPruneOut{Repo: repoRoot, Refused: reason}, nil
+	}
+	pruned, errs := snapshot.PruneRowOrphans(ctx, &cfg, st, repoID)
+	out := snapshotsPruneOut{Repo: repoRoot, Pruned: pruned, Count: len(pruned)}
 	for _, e := range errs {
 		out.Errors = append(out.Errors, e.Error())
 	}

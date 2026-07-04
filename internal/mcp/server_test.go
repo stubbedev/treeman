@@ -28,7 +28,7 @@ var allTools = []string{
 	"config_unset", "config_delete", "config_restore",
 	"registry_register", "registry_unregister", "registry_repair",
 	"repo_remove", "worktree_repair",
-	"snapshots_purge", "logs_purge",
+	"snapshots_purge", "snapshots_prune", "logs_purge",
 	"schema_install", "init_repo", "daemon_control",
 	"worktree_create", "worktree_delete",
 	"worktree_finalize", "main_worktree", "status_overview", "notify_test",

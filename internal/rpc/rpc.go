@@ -113,6 +113,7 @@ const (
 	TaskDBSave             = "db_save"             // capture branch-scoped → durable copy
 	TaskHookRun            = "hook_run"            // run one hook phase
 	TaskSnapshotsPurge     = "snapshots_purge"     // drop every cached template DB
+	TaskSnapshotsPrune     = "snapshots_prune"     // delete rows whose engine template is gone
 	TaskMainPurgeDBs       = "main_purge_dbs"      // drop main_<branch> DBs across branches
 	TaskWorktreeRegister   = "worktree_register"   // EnsureRepo + EnsureWorktree row
 	TaskWorktreeUnregister = "worktree_unregister" // mark a worktree row deleted

@@ -236,3 +236,80 @@ func SweepBySize(ctx context.Context, cfg *config.Config, st *store.Store) {
 			})
 	}
 }
+
+// PruneResult reports one PruneOrphans outcome per orphan row.
+type PruneResult struct {
+	Engine      string `json:"engine"`
+	Template    string `json:"template"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+// FindRowOrphans returns the SQLite snapshot rows whose engine-side
+// template no longer exists — the leftovers of templates removed
+// out-of-band (manual index/database deletion, engine wipe, a died
+// capture). An engine that is unconfigured or unreachable contributes
+// nothing (probe errors mean "unknown", not "orphan"), and pinned
+// fingerprints (in-flight prepare) are skipped.
+func FindRowOrphans(ctx context.Context, cfg *config.Config, st *store.Store, repoID int64) ([]PruneResult, []error) {
+	cands, err := st.ListSnapshotsForRepo(ctx, repoID)
+	if err != nil {
+		return nil, []error{fmt.Errorf("list snapshots: %w", err)}
+	}
+	var orphans []PruneResult
+	conns := map[engine.Family]engineconn.Conn{}
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+	for _, c := range cands {
+		if IsPinned(c.Fingerprint) {
+			continue
+		}
+		fam, ok := engine.Canonical(c.Engine)
+		if !ok {
+			continue
+		}
+		conn, cached := conns[fam]
+		if !cached {
+			cn, configured, cerr := engineconn.Connect(ctx, cfg, fam)
+			if !configured || cerr != nil {
+				// Unknown state — keep the rows rather than guess.
+				continue
+			}
+			conns[fam] = cn
+			conn = cn
+		}
+		exists, perr := conn.Exists(ctx, c.TemplateName)
+		if perr != nil || exists {
+			continue
+		}
+		orphans = append(orphans, PruneResult{Engine: c.Engine, Template: c.TemplateName, Fingerprint: c.Fingerprint})
+	}
+	return orphans, nil
+}
+
+// PruneRowOrphans deletes the rows FindRowOrphans reports. The
+// inverse cleanup of DropOrphans (engine template with no row): here
+// the row exists and the template is gone. Live templates
+// are never touched, so this is safe to run any time, unlike
+// PurgeRepo. Returns the pruned rows.
+func PruneRowOrphans(ctx context.Context, cfg *config.Config, st *store.Store, repoID int64) ([]PruneResult, []error) {
+	orphans, errs := FindRowOrphans(ctx, cfg, st, repoID)
+	pruned := make([]PruneResult, 0, len(orphans))
+	for _, o := range orphans {
+		if derr := st.DeleteSnapshot(ctx, o.Fingerprint); derr != nil {
+			errs = append(errs, fmt.Errorf("delete row %s: %w", o.Fingerprint, derr))
+			continue
+		}
+		pruned = append(pruned, o)
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsPruneOrphan,
+			fmt.Sprintf("pruned orphan snapshot row %s (%s: template gone)", o.Template, o.Engine),
+			repoID, 0, "", 0, map[string]string{
+				"engine":      o.Engine,
+				"template":    o.Template,
+				"fingerprint": o.Fingerprint,
+			})
+	}
+	return pruned, errs
+}

@@ -70,6 +70,7 @@ const (
 	EvtSnapshotsEvictSource   = "snapshots:evict:source"
 	EvtSnapshotsEvictAge      = "snapshots:evict:age"
 	EvtSnapshotsEvictSize     = "snapshots:evict:size"
+	EvtSnapshotsPruneOrphan   = "snapshots:prune:orphan"
 	EvtSnapshotsPurge         = "snapshots:purge"
 	EvtSnapshotsPurgeEnd      = "snapshots:purge:end"
 	EvtSnapshotsPrewarm       = "snapshots:prewarm"

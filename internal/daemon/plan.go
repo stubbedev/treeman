@@ -144,6 +144,7 @@ var taskRunners = map[string]taskRunner{
 	rpc.TaskDBSave:             runTaskDBSave,
 	rpc.TaskHookRun:            runTaskHookRun,
 	rpc.TaskSnapshotsPurge:     runTaskSnapshotsPurge,
+	rpc.TaskSnapshotsPrune:     runTaskSnapshotsPrune,
 	rpc.TaskMainPurgeDBs:       runTaskMainPurgeDBs,
 	rpc.TaskWorktreeRegister:   runTaskWorktreeRegister,
 	rpc.TaskWorktreeUnregister: runTaskWorktreeUnregister,
@@ -216,6 +217,13 @@ func runTaskPrepare(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	if err != nil {
 		return nil, err
 	}
+	// Same post-hook contract as finalize: prepare mutated engine
+	// content, so hooks that react to fresh data (cache flushes) fire.
+	if err := runTriggerActions(ctx, st, "create-after-engines",
+		id.cfg.Hooks.OnCreateAfterEngines, task.RepoPath, task.WorktreePath,
+		id.sl.Value, id.isMain, id.repoID, id.wtID, task.InheritedEnv); err != nil {
+		return nil, err
+	}
 	return json.Marshal(map[string]any{"outcomes": outs})
 }
 
@@ -230,6 +238,12 @@ func runTaskDBReset(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	}
 	outs, err := prepare.Run(ctx, &id.cfg, task.WorktreePath, id.sl, st.Store, id.repoID, id.wtID, task.InheritedEnv)
 	if err != nil {
+		return nil, err
+	}
+	// db_reset re-seeded content — post-hooks fire like any prepare.
+	if err := runTriggerActions(ctx, st, "create-after-engines",
+		id.cfg.Hooks.OnCreateAfterEngines, task.RepoPath, task.WorktreePath,
+		id.sl.Value, id.isMain, id.repoID, id.wtID, task.InheritedEnv); err != nil {
 		return nil, err
 	}
 	return json.Marshal(map[string]any{"outcomes": seededOutcomes(outs, &id.cfg, engineFilter)})
@@ -345,6 +359,27 @@ func runTaskSnapshotsPurge(ctx context.Context, st *State, task rpc.Task) (json.
 		msgs = append(msgs, e.Error())
 	}
 	payload, mErr := json.Marshal(map[string]any{"repo": task.RepoPath, "dropped": dropped, "errors": msgs})
+	if mErr != nil {
+		return nil, mErr
+	}
+	if len(errs) > 0 {
+		return payload, errs[0]
+	}
+	return payload, nil
+}
+
+func runTaskSnapshotsPrune(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
+	cfg, repoID, err := resolveRepoTask(ctx, st, task.RepoPath)
+	if err != nil {
+		return nil, err
+	}
+	pruned, errs := snapshot.PruneRowOrphans(ctx, &cfg, st.Store, repoID)
+	msgs := make([]string, 0, len(errs))
+	for _, e := range errs {
+		slog.Warn("snapshots prune", "repo", task.RepoPath, "err", e)
+		msgs = append(msgs, e.Error())
+	}
+	payload, mErr := json.Marshal(map[string]any{"repo": task.RepoPath, "pruned": pruned, "count": len(pruned), "errors": msgs})
 	if mErr != nil {
 		return nil, mErr
 	}

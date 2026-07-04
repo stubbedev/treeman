@@ -145,7 +145,7 @@ const toolGuide = `Entry points (enable the named tool first if it isn't loaded)
 - "enroll repo root for per-branch DBs" → main_worktree action=enable|disable|status.
 - "read/write engine data" → db_query (SQL/Mongo/Redis) or es_request (Elasticsearch); reads free, writes need write=true+ack=true.
 - prompts (guided multi-step flows): diagnose-prepare-failure, scaffold-from-framework, cache-cleanup, worktree-setup, migration-trial, edit-config, bootstrap-new-repo — list them with prompts_list.
-Destructive tools (worktree_delete, snapshots_purge, snapshots_drop, db_reset, repo_remove, registry_unregister, logs_purge, config_delete, config_unset) take dry_run=true — preview before committing.`
+Destructive tools (worktree_delete, snapshots_purge, snapshots_prune, snapshots_drop, db_reset, repo_remove, registry_unregister, logs_purge, config_delete, config_unset) take dry_run=true — preview before committing.`
 
 // registerToolGateway installs the always-on `tools` tool that discovers
 // and loads the deferred tools. It closes over the build catalog.
