@@ -2,12 +2,14 @@
 // (AWS S3, MinIO, Garage, Ceph RGW, Backblaze B2, Cloudflare R2,
 // anything that speaks the S3 API).
 //
-// Scope is intentionally narrow: per-worktree BUCKET lifecycle —
-// create on prepare, drop (with all keys) on teardown. No object-level
-// snapshot/restore, no branch-scoped swap, no dump/load. The
-// "namespace" for a treeman s3 entry is a BUCKET NAME RENDERED FROM
-// `key_prefix`; this driver's prefix operations match buckets whose
-// names begin with that string.
+// Scope: per-worktree BUCKET lifecycle — create on prepare, drop
+// (with all keys) on teardown — plus whole-bucket branch_scoped
+// support: Capture/Restore/RestoreParent reduce to CopyBucket, a
+// server-side copy into/from a sibling durable bucket (see
+// prepare.s3NS). No object-level snapshot/restore, no dump/load. The
+// "namespace" for a treeman s3 entry is a SINGLE BUCKET NAME RENDERED
+// FROM `key_prefix` (no set fan-out); this driver's prefix operations
+// match buckets whose names begin with that string.
 package s3
 
 import (

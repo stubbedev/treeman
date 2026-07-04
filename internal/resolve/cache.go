@@ -9,12 +9,17 @@ import (
 )
 
 // cacheEntry holds a previously-loaded resolved config plus the
-// mtime fingerprints of every YAML file that contributed. A cache
-// hit only fires when every file's mtime matches; any mismatch
-// invalidates the entry and forces a reparse.
+// mtime fingerprints of every YAML file AND every env_sources file
+// that contributed. A cache hit only fires when every file's mtime
+// matches; any mismatch invalidates the entry and forces a reparse.
+// Env files are stamped from the loaded config (their set isn't
+// known before parsing), so an edited or newly-appearing `.env`
+// invalidates on the next lookup instead of serving stale
+// credentials until a YAML touch or daemon restart.
 type cacheEntry struct {
-	cfg    config.Config
-	stamps map[string]int64
+	cfg       config.Config
+	stamps    map[string]int64
+	envStamps map[string]int64
 }
 
 // configCache memoises LoadResolved / LoadResolvedForWorktree by
@@ -99,7 +104,8 @@ func loadResolvedCached(mainRoot, wtRoot string, loader func() (config.Config, e
 	configCacheMu.RLock()
 	entry, ok := configCache[key]
 	configCacheMu.RUnlock()
-	if ok && stampsEqual(entry.stamps, current) {
+	if ok && stampsEqual(entry.stamps, current) &&
+		stampsEqual(entry.envStamps, stampYAMLFiles(mapKeys(entry.envStamps))) {
 		return entry.cfg, nil
 	}
 
@@ -107,10 +113,35 @@ func loadResolvedCached(mainRoot, wtRoot string, loader func() (config.Config, e
 	if err != nil {
 		return cfg, err
 	}
+	envPaths := envSourcePaths(envRootsFor(mainRoot, wtRoot), cfg.EnvSources)
 	configCacheMu.Lock()
-	configCache[key] = &cacheEntry{cfg: cfg, stamps: current}
+	configCache[key] = &cacheEntry{
+		cfg:       cfg,
+		stamps:    current,
+		envStamps: stampYAMLFiles(envPaths),
+	}
 	configCacheMu.Unlock()
 	return cfg, nil
+}
+
+// envRootsFor mirrors the root layering the loaders pass to
+// ApplyEnvCredentials — keep the two in sync or the cache
+// fingerprints the wrong files.
+func envRootsFor(mainRoot, wtRoot string) []string {
+	if wtRoot != "" && wtRoot != mainRoot {
+		return []string{mainRoot, wtRoot}
+	}
+	return []string{mainRoot}
+}
+
+// mapKeys returns the key set of a stamp map, for re-stamping a
+// cached entry's env files at lookup time.
+func mapKeys(m map[string]int64) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // InvalidateConfigCache drops every cached resolved config. Tests

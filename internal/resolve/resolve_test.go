@@ -1,6 +1,8 @@
 package resolve
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/config"
@@ -170,5 +172,48 @@ func TestS3LiteralFieldsPassThrough(t *testing.T) {
 	if r.Conn.Endpoint != "http://127.0.0.1:9000" || r.Conn.Region != "garage" ||
 		r.Conn.AccessKey != "GKabc" || r.Conn.SecretKey != "shh" {
 		t.Errorf("got %+v", r.Conn)
+	}
+}
+
+func TestEnvRootsWorktreeFallsBackToMain(t *testing.T) {
+	main, wt := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(main, ".env"), []byte("STORAGE_SECRET=frommain\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := loadRepoEnvRoots([]string{main, wt}, []string{".env"})
+	if v, _ := env.Get("STORAGE_SECRET"); v != "frommain" {
+		t.Errorf("missing wt .env should fall back to main, got %q", v)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ".env"), []byte("STORAGE_SECRET=fromwt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env = loadRepoEnvRoots([]string{main, wt}, []string{".env"})
+	if v, _ := env.Get("STORAGE_SECRET"); v != "fromwt" {
+		t.Errorf("wt .env should override main, got %q", v)
+	}
+}
+
+func TestYamlURIFieldsPickUpEnvRefs(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Connections.Mongodb = &config.MongoConn{URI: "$MONGO_REF"}
+	cfg.Connections.Redis = &config.RedisConn{URL: "${REDIS_REF}"}
+	cfg.Connections.Elasticsearch = &config.EsConn{URL: "$ES_REF"}
+	env := envfile.Parse("MONGO_REF=mongodb://h:27017\nREDIS_REF=redis://h:6379\nES_REF=http://h:9200\n")
+	if r := resolveMongodb(cfg, env); r.Conn.URI != "mongodb://h:27017" {
+		t.Errorf("mongo: %q", r.Conn.URI)
+	}
+	if r := resolveRedis(cfg, env); r.Conn.URL != "redis://h:6379" {
+		t.Errorf("redis: %q", r.Conn.URL)
+	}
+	if r := resolveElasticsearch(cfg, env); r.Conn.URL != "http://h:9200" {
+		t.Errorf("es: %q", r.Conn.URL)
+	}
+}
+
+func TestYamlURILiteralsPassThrough(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Connections.Mongodb = &config.MongoConn{URI: "mongodb://lit:27017"}
+	if r := resolveMongodb(cfg, envfile.Parse("")); r.Conn.URI != "mongodb://lit:27017" {
+		t.Errorf("mongo literal: %q", r.Conn.URI)
 	}
 }

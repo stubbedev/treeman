@@ -40,8 +40,12 @@ func LoadResolvedForWorktree(mainRoot, wtRoot string) (config.Config, error) {
 		if err != nil {
 			return cfg, err
 		}
-		if wtRoot != "" {
-			ApplyEnvCredentials(&cfg, wtRoot)
+		if wtRoot != "" && wtRoot != mainRoot {
+			// Main root as base layer, worktree overrides: a fresh
+			// worktree's env copies land only mid-finalize
+			// (worktrees.copies), so its files may not exist yet —
+			// the main checkout's fill any gap.
+			ApplyEnvCredentials(&cfg, mainRoot, wtRoot)
 		} else {
 			ApplyEnvCredentials(&cfg, mainRoot)
 		}

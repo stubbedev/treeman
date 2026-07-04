@@ -78,7 +78,18 @@ type resolvedConn[T any] struct {
 // read in order (last wins); otherwise the default search order is
 // used.
 func Resolve(cfg *config.Config, repoRoot string) Resolved {
-	env := loadRepoEnv(repoRoot, cfg.EnvSources)
+	return resolveRoots(cfg, repoRoot)
+}
+
+// resolveRoots resolves against env_sources layered across several
+// roots: earlier roots are the base, later roots override (per-file
+// last-wins, see envfile.ReadLayered). Lets a worktree's own env files
+// shadow the main checkout's while the main files fill any gap — a
+// fresh worktree's `.env` copy only lands mid-finalize
+// (worktrees.copies), so resolving against the worktree root alone
+// would read nothing and `$NAME` refs would go empty.
+func resolveRoots(cfg *config.Config, roots ...string) Resolved {
+	env := loadRepoEnvRoots(roots, cfg.EnvSources)
 	return Resolved{
 		Mysql:         resolveMysql(cfg, env),
 		Postgres:      resolvePostgres(cfg, env),
@@ -99,8 +110,8 @@ func Resolve(cfg *config.Config, repoRoot string) Resolved {
 // pick the conventional image variable (MYSQL_ROOT_PASSWORD,
 // POSTGRES_PASSWORD, ...). Saves users from duplicating
 // container secrets into a separate .env.
-func ApplyEnvCredentials(cfg *config.Config, repoRoot string) {
-	r := Resolve(cfg, repoRoot)
+func ApplyEnvCredentials(cfg *config.Config, roots ...string) {
+	r := resolveRoots(cfg, roots...)
 	if r.Mysql != nil {
 		v := r.Mysql.Conn
 		cfg.Connections.Mysql = &v
@@ -208,18 +219,43 @@ func fillS3FromContainerEnv(s *config.S3Conn) {
 // to suit. Relative entries resolve against `repoRoot`; absolute
 // entries are honoured as-is.
 func loadRepoEnv(repoRoot string, sources []string) envfile.EnvFile {
-	if repoRoot == "" || len(sources) == 0 {
-		return envfile.EnvFile{Vars: map[string]string{}}
+	return loadRepoEnvRoots([]string{repoRoot}, sources)
+}
+
+// loadRepoEnvRoots layers the source list across every root in order:
+// all of root[0]'s files first, then root[1]'s, … — so with per-file
+// last-wins semantics a later root overrides an earlier one. Absolute
+// sources are read once regardless of root count.
+func loadRepoEnvRoots(roots []string, sources []string) envfile.EnvFile {
+	return envfile.ReadLayered(envSourcePaths(roots, sources))
+}
+
+// envSourcePaths expands the env_sources list across every root in
+// order (see loadRepoEnvRoots). Also consumed by the resolve cache to
+// fingerprint the env files that fed a cached resolution.
+func envSourcePaths(roots []string, sources []string) []string {
+	if len(sources) == 0 {
+		return nil
 	}
-	paths := make([]string, 0, len(sources))
-	for _, s := range sources {
-		if filepath.IsAbs(s) {
-			paths = append(paths, s)
-		} else {
-			paths = append(paths, filepath.Join(repoRoot, s))
+	paths := make([]string, 0, len(sources)*len(roots))
+	seen := map[string]bool{}
+	for _, root := range roots {
+		for _, s := range sources {
+			p := s
+			if !filepath.IsAbs(s) {
+				if root == "" {
+					continue
+				}
+				p = filepath.Join(root, s)
+			}
+			if seen[p] {
+				continue
+			}
+			seen[p] = true
+			paths = append(paths, p)
 		}
 	}
-	return envfile.ReadLayered(paths)
+	return paths
 }
 
 // ─────────────────────────── mysql ───────────────────────────
@@ -437,7 +473,10 @@ func isIdent(s string) bool {
 
 func resolveMongodb(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.MongoConn] {
 	if cfg.Connections.Mongodb != nil {
-		return &resolvedConn[config.MongoConn]{Conn: *cfg.Connections.Mongodb, Source: Source{Kind: SourceYaml}}
+		m := *cfg.Connections.Mongodb
+		// Whole-field `$NAME` ref, same contract as S3 fields.
+		m.URI = resolvePasswordValue(env, m.URI)
+		return &resolvedConn[config.MongoConn]{Conn: m, Source: Source{Kind: SourceYaml}}
 	}
 	for _, k := range []string{"MONGODB_URI", "MONGO_URL", "MONGO_URI", "MONGODB_URL", "SPRING_DATA_MONGODB_URI"} {
 		if v, ok := env.Get(k); ok {
@@ -477,7 +516,9 @@ func resolveMongodb(cfg *config.Config, env envfile.EnvFile) *resolvedConn[confi
 
 func resolveRedis(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.RedisConn] {
 	if cfg.Connections.Redis != nil {
-		return &resolvedConn[config.RedisConn]{Conn: *cfg.Connections.Redis, Source: Source{Kind: SourceYaml}}
+		r := *cfg.Connections.Redis
+		r.URL = resolvePasswordValue(env, r.URL)
+		return &resolvedConn[config.RedisConn]{Conn: r, Source: Source{Kind: SourceYaml}}
 	}
 	if v, ok := env.Get("REDIS_URL"); ok {
 		return &resolvedConn[config.RedisConn]{Conn: config.RedisConn{URL: v}, Source: repoSrc(env)}
@@ -515,7 +556,9 @@ func resolveRedis(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.
 
 func resolveElasticsearch(cfg *config.Config, env envfile.EnvFile) *resolvedConn[config.EsConn] {
 	if cfg.Connections.Elasticsearch != nil {
-		return &resolvedConn[config.EsConn]{Conn: *cfg.Connections.Elasticsearch, Source: Source{Kind: SourceYaml}}
+		e := *cfg.Connections.Elasticsearch
+		e.URL = resolvePasswordValue(env, e.URL)
+		return &resolvedConn[config.EsConn]{Conn: e, Source: Source{Kind: SourceYaml}}
 	}
 	for _, k := range []string{"ELASTICSEARCH_URL", "ELASTIC_URL", "OPENSEARCH_URL", "SPRING_ELASTICSEARCH_URIS"} {
 		if v, ok := env.Get(k); ok {

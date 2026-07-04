@@ -706,7 +706,8 @@ func parsePostgresDSN(dsn string, cfg *PostgresConn) error {
 // URI's host/port are rewritten at dial time.
 type MongoConn struct {
 	// MongoDB connection URI (`mongodb://[user:pass@]host:port/[...]`).
-	// Required. When a ContainerRef is set, host/port are rewritten
+	// Required. Literal or a whole-field `$NAME` / `${NAME}` env-var
+	// ref. When a ContainerRef is set, host/port are rewritten
 	// at dial time using the container's published mapping or IP.
 	URI string `yaml:"uri"`
 
@@ -731,7 +732,8 @@ func (MongoConn) JSONSchema() *jsonschema.Schema { return uriOrMap("mongodb", "u
 // RedisConn — `redis://…` URL. Same ContainerRef semantics as MongoConn.
 type RedisConn struct {
 	// Redis connection URL (`redis://[:pass@]host:port[/db]`).
-	// Required. ContainerRef rewrites host/port at dial time.
+	// Required. Literal or a whole-field `$NAME` / `${NAME}` env-var
+	// ref. ContainerRef rewrites host/port at dial time.
 	URL string `yaml:"url"`
 
 	// Maximum connections in the driver's pool (PoolSize). Defaults to
@@ -756,7 +758,8 @@ func (RedisConn) JSONSchema() *jsonschema.Schema { return uriOrMap("redis", "url
 // semantics as MongoConn.
 type EsConn struct {
 	// Elasticsearch / OpenSearch HTTP URL
-	// (`http://host:9200` or `https://...`). Required.
+	// (`http://host:9200` or `https://...`). Required. Literal or a
+	// whole-field `$NAME` / `${NAME}` env-var ref.
 	// ContainerRef rewrites host/port at dial time.
 	URL string `yaml:"url"`
 
