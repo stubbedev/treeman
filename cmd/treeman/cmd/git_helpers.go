@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/urfave/cli/v3"
 
@@ -276,22 +277,38 @@ func buildSwitchMenu(ctx context.Context, repoRoot string) (items, targets []str
 		label, branch string
 		ts            int64
 	}
-	var wrows []wtRow
+	// Per-worktree state (HEAD timestamp + dirty/unpushed markers) costs
+	// ~3 git forks each, and `git status` on a big tree is the slow one.
+	// Scan all worktrees CONCURRENTLY — the menu opens after the slowest
+	// single worktree instead of the sum (this was the 12s `gwt`).
+	var (
+		mu    sync.Mutex
+		wg    sync.WaitGroup
+		wrows []wtRow
+	)
 	for branch, path := range occ {
 		if path == cwdTop || branch == curBranch {
 			continue // already here — nothing to switch to
 		}
-		ts := int64(0)
-		if s, err := gitcmd.String(ctx, path, "log", "-1", "--format=%ct", "HEAD"); err == nil {
-			ts, _ = strconv.ParseInt(s, 10, 64)
-		}
-		// Existing worktrees are cyan (live — switching is an instant cd);
-		// branch rows below stay default (checkout, maybe create a worktree).
-		wrows = append(wrows, wtRow{
-			label:  ui.Cyan("[worktree] "+branch+worktreeMarkers(ctx, path)) + "  " + ui.SymArrow + "  " + ui.Dim(path),
-			branch: branch, ts: ts,
-		})
+		wg.Add(1)
+		go func(branch, path string) {
+			defer wg.Done()
+			ts := int64(0)
+			if s, err := gitcmd.String(ctx, path, "log", "-1", "--format=%ct", "HEAD"); err == nil {
+				ts, _ = strconv.ParseInt(s, 10, 64)
+			}
+			// Existing worktrees are cyan (live — switching is an instant
+			// cd); branch rows below stay default (checkout/create).
+			row := wtRow{
+				label:  ui.Cyan("[worktree] "+branch+worktreeMarkers(ctx, path)) + "  " + ui.SymArrow + "  " + ui.Dim(path),
+				branch: branch, ts: ts,
+			}
+			mu.Lock()
+			wrows = append(wrows, row)
+			mu.Unlock()
+		}(branch, path)
 	}
+	wg.Wait()
 	sort.Slice(wrows, func(i, j int) bool { return wrows[i].ts > wrows[j].ts })
 	for _, r := range wrows {
 		items = append(items, r.label)
@@ -411,13 +428,27 @@ func pickWorktree(ctx context.Context, repoRoot, prompt string) (string, error) 
 		cwdTop, _ = gitWorktreeRoot(cwd)
 	}
 	type row struct{ label, path string }
-	var rows []row
+	// Markers cost a `git status` per worktree — scan concurrently,
+	// same as buildSwitchMenu.
+	var (
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+		rows []row
+	)
 	for branch, p := range occ {
 		if p == repoRoot || p == cwdTop {
 			continue // skip the main worktree and the one we're standing in
 		}
-		rows = append(rows, row{branch + worktreeMarkers(ctx, p) + "  " + ui.SymArrow + "  " + p, p})
+		wg.Add(1)
+		go func(branch, p string) {
+			defer wg.Done()
+			r := row{branch + worktreeMarkers(ctx, p) + "  " + ui.SymArrow + "  " + p, p}
+			mu.Lock()
+			rows = append(rows, r)
+			mu.Unlock()
+		}(branch, p)
 	}
+	wg.Wait()
 	if len(rows) == 0 {
 		ui.Info("No linked worktrees found.")
 		return "", nil
