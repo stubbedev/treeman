@@ -450,6 +450,11 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 		return doctorResult{Name: "registry", Status: "fail", Detail: err.Error()}
 	}
 	gitSet := map[string]bool{}
+	// GitWorktreePaths lists LINKED worktrees only; the repo root is a
+	// valid checkout too, and main-worktree enrollment registers it —
+	// without this exemption an enrolled main is a permanent false
+	// "registered but missing from git" warning.
+	gitSet[repoRoot] = true
 	var onlyInGit, onlyInDB []string
 	for _, p := range gitPaths {
 		gitSet[p] = true

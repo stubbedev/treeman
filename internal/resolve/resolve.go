@@ -211,21 +211,14 @@ func fillS3FromContainerEnv(s *config.S3Conn) {
 	}
 }
 
-// loadRepoEnv reads exactly the env files declared in
-// `env_scoping.sources` (last layer wins). When `sources` is empty
-// the resolver reads nothing — no hidden default. `treeman init`
-// emits a `sources:` list tailored to the detected framework so a
-// fresh repo gets the conventional `.env*` lineup; modify the list
-// to suit. Relative entries resolve against `repoRoot`; absolute
-// entries are honoured as-is.
-func loadRepoEnv(repoRoot string, sources []string) envfile.EnvFile {
-	return loadRepoEnvRoots([]string{repoRoot}, sources)
-}
-
-// loadRepoEnvRoots layers the source list across every root in order:
-// all of root[0]'s files first, then root[1]'s, … — so with per-file
-// last-wins semantics a later root overrides an earlier one. Absolute
-// sources are read once regardless of root count.
+// loadRepoEnvRoots reads exactly the env files declared in
+// `env_sources` (last layer wins), layered across every root in
+// order: all of root[0]'s files first, then root[1]'s, … — so a later
+// root overrides an earlier one. When `sources` is empty the resolver
+// reads nothing — no hidden default; `treeman init` emits a list
+// tailored to the detected framework. Relative entries resolve
+// against each root; absolute entries are honoured as-is and read
+// once regardless of root count.
 func loadRepoEnvRoots(roots []string, sources []string) envfile.EnvFile {
 	return envfile.ReadLayered(envSourcePaths(roots, sources))
 }

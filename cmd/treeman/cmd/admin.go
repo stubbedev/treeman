@@ -254,33 +254,7 @@ func SnapshotsCmd() *cli.Command {
 					return nil
 				},
 			},
-			{
-				Name:  "prune",
-				Usage: "delete snapshot rows whose engine-side template no longer exists (orphans); live templates untouched",
-				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
-					&cli.BoolFlag{Name: "json"},
-					&cli.BoolFlag{
-						Name:    "foreground",
-						Aliases: []string{"wait", "f"},
-						Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
-					},
-				},
-				Action: func(ctx context.Context, c *cli.Command) error {
-					repoRoot, err := resolveRepo(c.String("repo"))
-					if err != nil {
-						return err
-					}
-					task := rpc.Task{
-						Type: rpc.TaskSnapshotsPrune, RepoPath: repoRoot,
-						InheritedEnv: CaptureInheritedEnv(),
-					}
-					if c.Bool("json") {
-						return runResultJSON(ctx, task)
-					}
-					return dispatchTask(ctx, task, c.Bool("foreground"), "snapshots prune")
-				},
-			},
+			snapshotsPruneCmd(),
 			{
 				Name:  "purge",
 				Usage: "drop every cached snapshot for this repo and force the next prepare to rebuild",
@@ -308,6 +282,38 @@ func SnapshotsCmd() *cli.Command {
 					return dispatchTask(ctx, task, c.Bool("foreground"), "snapshots purge")
 				},
 			},
+		},
+	}
+}
+
+// snapshotsPruneCmd is registered as a subcommand of `treeman
+// snapshots`. Extracted so SnapshotsCmd stays readable.
+func snapshotsPruneCmd() *cli.Command {
+	return &cli.Command{
+		Name:  "prune",
+		Usage: "delete snapshot rows whose engine-side template no longer exists (orphans); live templates untouched",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
+			&cli.BoolFlag{Name: "json"},
+			&cli.BoolFlag{
+				Name:    "foreground",
+				Aliases: []string{"wait", "f"},
+				Usage:   "stream the daemon's live progress and block until done (default: dispatch and return)",
+			},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			repoRoot, err := resolveRepo(c.String("repo"))
+			if err != nil {
+				return err
+			}
+			task := rpc.Task{
+				Type: rpc.TaskSnapshotsPrune, RepoPath: repoRoot,
+				InheritedEnv: CaptureInheritedEnv(),
+			}
+			if c.Bool("json") {
+				return runResultJSON(ctx, task)
+			}
+			return dispatchTask(ctx, task, c.Bool("foreground"), "snapshots prune")
 		},
 	}
 }
