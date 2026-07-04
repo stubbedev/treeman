@@ -45,8 +45,8 @@ delete a worktree end-to-end
 Runs teardown hooks + DB teardown + git worktree remove, then
 removes the registry row. The teardown is dispatched to the daemon
 over the RPC socket — the CLI returns immediately. If the daemon
-can't be reached (even after autostart), the command fails rather
-than doing the work inline.
+can't be reached (even after autostart), the teardown runs
+in-process instead (blocks until done).
 
 Examples:
   treeman worktree delete PROJ-1234
