@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -107,7 +109,7 @@ func checkoutRoute(ctx context.Context, repoRoot, branch, from string, noFetch b
 // stderr; stdout stays the bare path for the cd shim). Never checks
 // out in the main repo.
 func worktreeRoute(ctx context.Context, repoRoot, branch, from string, noFetch bool) error {
-	if path, ok := registryWorktreeForBranch(ctx, repoRoot, branch); ok {
+	if path, ok := liveWorktreeForBranch(ctx, repoRoot, branch); ok {
 		touchVisitedByPath(ctx, path)
 		fmt.Println(path)
 		return nil
@@ -118,6 +120,73 @@ func worktreeRoute(ctx context.Context, repoRoot, branch, from string, noFetch b
 		from = branch
 	}
 	return goSpawnWorktree(ctx, repoRoot, branch, from, noFetch)
+}
+
+// liveWorktreeForBranch finds the worktree holding `branch`, preferring
+// the registry but falling back to `git worktree list` — a worktree
+// added outside treeman still exists and must win over a create
+// attempt (git would refuse anyway: "already used by worktree"). A
+// registry row whose directory is gone (manual rm -rf) is ignored so
+// switch never hands the shell a dead path; the create flow self-heals
+// the stale row.
+func liveWorktreeForBranch(ctx context.Context, repoRoot, branch string) (string, bool) {
+	if path, ok := registryWorktreeForBranch(ctx, repoRoot, branch); ok {
+		if _, err := os.Stat(path); err == nil {
+			return path, true
+		}
+	}
+	if path, ok := gitWorktrees(ctx, repoRoot)[branch]; ok {
+		if _, err := os.Stat(path); err == nil {
+			return path, true
+		}
+	}
+	return "", false
+}
+
+// occupiedWorktrees merges the registry occupancy map with git's own
+// worktree list (union; registry wins on conflicts) and drops entries
+// whose directory no longer exists. This is the source for the switch
+// menu + delete picker, so foreign worktrees show up and dead registry
+// rows never surface a cd-able path.
+func occupiedWorktrees(ctx context.Context, repoRoot string) map[string]string {
+	occ := gitWorktrees(ctx, repoRoot)
+	if occ == nil {
+		occ = map[string]string{}
+	}
+	maps.Copy(occ, branchOccupancy(ctx, repoRoot))
+	for branch, path := range occ {
+		if _, err := os.Stat(path); err != nil {
+			delete(occ, branch)
+		}
+	}
+	return occ
+}
+
+// gitWorktrees parses `git worktree list --porcelain` into
+// branch → path for the LINKED worktrees (main checkout and detached
+// entries are skipped). The git view catches worktrees created outside
+// treeman that the registry doesn't know about.
+func gitWorktrees(ctx context.Context, repoRoot string) map[string]string {
+	out, err := gitcmd.Output(ctx, repoRoot, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil
+	}
+	worktrees := map[string]string{}
+	var path string
+	for line := range strings.SplitSeq(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			path = strings.TrimPrefix(line, "worktree ")
+		case strings.HasPrefix(line, "branch refs/heads/"):
+			branch := strings.TrimPrefix(line, "branch refs/heads/")
+			if path != "" && !strings.EqualFold(filepath.Clean(path), filepath.Clean(repoRoot)) {
+				worktrees[branch] = path
+			}
+		case line == "":
+			path = ""
+		}
+	}
+	return worktrees
 }
 
 // switchAction is the `git switch` handler; wtSwitchAction is the
@@ -195,7 +264,7 @@ func switchInteractive(ctx context.Context, repoRoot, from string, noFetch bool,
 // `[branch]   <name>` rows for branches not occupying a worktree. Each
 // target is the branch name goCheckout should route on.
 func buildSwitchMenu(ctx context.Context, repoRoot string) (items, targets []string) {
-	occ := branchOccupancy(ctx, repoRoot)
+	occ := occupiedWorktrees(ctx, repoRoot)
 	cwdTop := ""
 	if cwd, err := os.Getwd(); err == nil {
 		cwdTop, _ = gitWorktreeRoot(cwd)
@@ -336,7 +405,7 @@ func branchWizard(ctx context.Context, repoRoot, initial string) (name, base str
 // (excluding main) and returns the selected worktree path, or "" on
 // cancel / empty list.
 func pickWorktree(ctx context.Context, repoRoot, prompt string) (string, error) {
-	occ := branchOccupancy(ctx, repoRoot)
+	occ := occupiedWorktrees(ctx, repoRoot)
 	cwdTop := ""
 	if cwd, err := os.Getwd(); err == nil {
 		cwdTop, _ = gitWorktreeRoot(cwd)

@@ -1120,8 +1120,9 @@ func wtGo() *cli.Command {
 // Prints exactly one line (the destination directory) on stdout; status
 // goes to stderr.
 func goCheckout(ctx context.Context, repoRoot, branch, from string, create, noFetch bool) error {
-	// (1) Already live in some worktree (other than cwd)?
-	if path, ok := registryWorktreeForBranch(ctx, repoRoot, branch); ok {
+	// (1) Already live in some worktree (other than cwd)? Registry
+	// first, then git's own view (worktrees added outside treeman).
+	if path, ok := liveWorktreeForBranch(ctx, repoRoot, branch); ok {
 		cwd, _ := os.Getwd()
 		cwdTop, _ := gitWorktreeRoot(cwd)
 		if path != cwdTop {
