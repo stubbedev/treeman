@@ -451,6 +451,12 @@ func checkRegistry(ctx context.Context, repoRoot string) doctorResult {
 
 	var onlyInGit, onlyInDB []string
 	gitSet := map[string]bool{}
+	// gitWorktreePaths lists LINKED worktrees only; the repo root is a
+	// valid checkout too, and main-worktree enrollment registers it —
+	// without this exemption an enrolled main is a permanent false
+	// "registered but missing from git" warning. Mirrors the MCP
+	// doctor probe (internal/mcp/tools_read.go).
+	gitSet[repoRoot] = true
 	for _, p := range gitPaths {
 		gitSet[p] = true
 		if !dbPaths[p] {
