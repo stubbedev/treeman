@@ -122,8 +122,12 @@ func cleanRef(ref string) string {
 	return strings.ReplaceAll(ref, "/", "-")
 }
 
-// StageKind is the type-aware action for a StageRow.
+// StageKind is the type-aware action for a StageRow. Its value is the
+// status letter (M/D/A) so String renders it directly.
 type StageKind rune
+
+// String renders the one-letter status marker (e.g. "M").
+func (k StageKind) String() string { return string(rune(k)) }
 
 const (
 	// StageModified — a worktree-modified tracked file (`git add -p`).

@@ -94,7 +94,7 @@ func gitDiscard() *cli.Command {
 			}
 			items := make([]string, len(rows))
 			for i, r := range rows {
-				items[i] = string(rune(r.Kind)) + "  " + r.Path
+				items[i] = r.Kind.String() + "  " + r.Path
 			}
 			res, err := tui.MultiSelect(items, tui.Options{
 				Prompt: "discard",

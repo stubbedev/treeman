@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -37,10 +38,14 @@ func allBranches(dir string) []string {
 	set := map[string]struct{}{}
 	var names []string
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		b := strings.TrimPrefix(strings.TrimSpace(line), "origin/")
-		if b == "" || b == "HEAD" {
+		b := strings.TrimSpace(line)
+		// `refs/remotes/origin/HEAD` short-forms to bare "origin" — the
+		// default-branch symref, not a real branch. Drop it (and its
+		// long form) before stripping the remote prefix.
+		if b == "" || b == "origin" || b == "origin/HEAD" {
 			continue
 		}
+		b = strings.TrimPrefix(b, "origin/")
 		if _, dup := set[b]; dup {
 			continue
 		}
@@ -132,6 +137,8 @@ func buildSwitchMenu(ctx context.Context, repoRoot string) (items, targets []str
 	if cwd, err := os.Getwd(); err == nil {
 		cwdTop, _ = gitWorktreeRoot(cwd)
 	}
+	// The branch we're already on has nothing to switch to.
+	curBranch := currentBranch(ctx, cmp.Or(cwdTop, repoRoot))
 
 	type wtRow struct {
 		label, branch string
@@ -139,7 +146,7 @@ func buildSwitchMenu(ctx context.Context, repoRoot string) (items, targets []str
 	}
 	var wrows []wtRow
 	for branch, path := range occ {
-		if path == cwdTop {
+		if path == cwdTop || branch == curBranch {
 			continue // already here — nothing to switch to
 		}
 		ts := int64(0)
@@ -160,7 +167,7 @@ func buildSwitchMenu(ctx context.Context, repoRoot string) (items, targets []str
 	}
 
 	for _, b := range allBranches(repoRoot) {
-		if _, taken := occ[b]; taken {
+		if _, taken := occ[b]; taken || b == curBranch {
 			continue
 		}
 		items = append(items, "[branch]   "+b)
@@ -258,11 +265,15 @@ func branchWizard(ctx context.Context, repoRoot, initial string) (name, base str
 // cancel / empty list.
 func pickWorktree(ctx context.Context, repoRoot, prompt string) (string, error) {
 	occ := branchOccupancy(ctx, repoRoot)
+	cwdTop := ""
+	if cwd, err := os.Getwd(); err == nil {
+		cwdTop, _ = gitWorktreeRoot(cwd)
+	}
 	type row struct{ label, path string }
 	var rows []row
 	for branch, p := range occ {
-		if p == repoRoot {
-			continue // skip the main worktree
+		if p == repoRoot || p == cwdTop {
+			continue // skip the main worktree and the one we're standing in
 		}
 		rows = append(rows, row{branch + worktreeMarkers(ctx, p) + "  " + ui.SymArrow + "  " + p, p})
 	}
