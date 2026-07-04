@@ -836,6 +836,16 @@ list cached snapshots (template DBs) for this repo
 | `-r`, `--repo` |  |
 | `--json` |  |
 
+### `treeman snapshots prune`
+
+delete snapshot rows whose engine-side template no longer exists (orphans); live templates untouched
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+| `--json` |  |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
+
 ### `treeman snapshots purge`
 
 drop every cached snapshot for this repo and force the next prepare to rebuild

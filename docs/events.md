@@ -96,6 +96,7 @@ that emits it.
 | `snapshots:evict:source` | `store.EvtSnapshotsEvictSource` |
 | `snapshots:evict:age` | `store.EvtSnapshotsEvictAge` |
 | `snapshots:evict:size` | `store.EvtSnapshotsEvictSize` |
+| `snapshots:prune:orphan` | `store.EvtSnapshotsPruneOrphan` |
 | `snapshots:purge` | `store.EvtSnapshotsPurge` |
 | `snapshots:purge:end` | `store.EvtSnapshotsPurgeEnd` |
 | `snapshots:prewarm` | `store.EvtSnapshotsPrewarm` |

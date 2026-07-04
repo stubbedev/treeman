@@ -61,6 +61,7 @@ State mutations the daemon performs; submitted as a plan via the `run_plan` meth
 | `db_save` | `rpc.TaskDBSave` | capture branch-scoped → durable copy |
 | `hook_run` | `rpc.TaskHookRun` | run one hook phase |
 | `snapshots_purge` | `rpc.TaskSnapshotsPurge` | drop every cached template DB |
+| `snapshots_prune` | `rpc.TaskSnapshotsPrune` | delete rows whose engine template is gone |
 | `main_purge_dbs` | `rpc.TaskMainPurgeDBs` | drop main_<branch> DBs across branches |
 | `worktree_register` | `rpc.TaskWorktreeRegister` | EnsureRepo + EnsureWorktree row |
 | `worktree_unregister` | `rpc.TaskWorktreeUnregister` | mark a worktree row deleted |

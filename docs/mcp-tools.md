@@ -171,6 +171,7 @@ through the `tools` gateway (`action=list` / `action=enable`).
 | `snapshots_drop` |  | Evict ONE snapshot by fingerprint (engine-side template + SQLite row). |
 | `snapshots_inspect` |  | Inspect ONE snapshot (by fingerprint, or engine+source_db) — SQLite row + does the engine-side template still exist + size + engine version. |
 | `snapshots_list` |  | List cached snapshots (template DBs) for the repo. |
+| `snapshots_prune` |  | Delete snapshot rows whose engine-side template no longer exists (orphans from out-of-band deletions or died captures). |
 | `snapshots_purge` |  | DELETE every cached snapshot for a repo — forces every prepare to cold-build. |
 
 ## status
