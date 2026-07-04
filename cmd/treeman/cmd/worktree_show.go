@@ -23,9 +23,10 @@ import (
 // worktree?" without forcing the operator to compose three queries.
 func wtShow() *cli.Command {
 	return &cli.Command{
-		Name:      "show",
-		Usage:     "show details, recent events, and hook runs for a worktree (defaults to the worktree containing the current directory)",
-		ArgsUsage: "[worktree]",
+		Name:          "show",
+		Usage:         "show details, recent events, and hook runs for a worktree (defaults to the worktree containing the current directory)",
+		ArgsUsage:     "[worktree]",
+		ShellComplete: worktreeArgComplete,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.IntFlag{Name: "events", Value: 10, Usage: "number of recent events to show"},
@@ -264,9 +265,10 @@ func printWtHookRuns(runs []store.HookRun) {
 // the filter exists.
 func wtLogs() *cli.Command {
 	return &cli.Command{
-		Name:      "logs",
-		Usage:     "tail events scoped to a worktree (shorthand for `logs tail --worktree`)",
-		ArgsUsage: "<worktree>",
+		Name:          "logs",
+		Usage:         "tail events scoped to a worktree (shorthand for `logs tail --worktree`)",
+		ArgsUsage:     "<worktree>",
+		ShellComplete: worktreeArgComplete,
 		Flags: append(filterFlags(),
 			&cli.BoolFlag{Name: "hooks", Usage: "show recent hook_runs rows instead of events"},
 			&cli.BoolFlag{Name: "no-pager", Usage: "disable the pager even when stdout is a TTY"},
@@ -329,9 +331,10 @@ func wtLogs() *cli.Command {
 // wt wait FOO`.
 func wtWait() *cli.Command {
 	return &cli.Command{
-		Name:      "wait",
-		Usage:     "block until the daemon's finalize for a worktree completes",
-		ArgsUsage: "<worktree>",
+		Name:          "wait",
+		Usage:         "block until the daemon's finalize for a worktree completes",
+		ArgsUsage:     "<worktree>",
+		ShellComplete: worktreeArgComplete,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.DurationFlag{Name: "timeout", Value: 10 * time.Minute, Usage: "give up after this duration"},

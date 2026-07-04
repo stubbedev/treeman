@@ -41,8 +41,81 @@ func WorktreeCmd() *cli.Command {
 			wtPrev(),
 			wtGo(),
 			wtSwitch(),
+			wtPrune(),
 		},
 	}
+}
+
+// wtPrune — `treeman worktree prune`. Runs `git worktree prune` to drop
+// stale git admin entries, then reconciles the registry: any live row
+// whose worktree directory no longer exists on disk gets a full
+// teardown (DB drop + registry row removal). Cleans up after a manual
+// `rm -rf` of a worktree.
+func wtPrune() *cli.Command {
+	return &cli.Command{
+		Name:  "prune",
+		Usage: "prune worktrees whose directory is gone (git worktree prune + registry reconcile)",
+		Flags: []cli.Flag{&cli.StringFlag{Name: "repo", Aliases: []string{"r"}}},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			repoRoot, err := resolveRepo(c.String("repo"))
+			if err != nil {
+				return err
+			}
+			if err := gitcmd.Run(ctx, repoRoot, "worktree", "prune"); err != nil {
+				return err
+			}
+			pruned := 0
+			for _, p := range liveWorktreePaths(ctx, repoRoot) {
+				if p == repoRoot {
+					continue
+				}
+				if _, statErr := os.Stat(p); statErr == nil {
+					continue // directory still present
+				}
+				if _, delErr := wt.Delete(ctx, wt.DeleteRequest{
+					RepoRoot: repoRoot, Target: p, Force: true, Env: CaptureInheritedEnv(),
+				}, cliSink{}); delErr != nil {
+					PrintWarn("prune %s: %v", p, delErr)
+					continue
+				}
+				PrintOK("pruned %s (directory gone)", p)
+				pruned++
+			}
+			if pruned == 0 {
+				PrintInfo("nothing to prune — all registered worktrees present on disk")
+			}
+			return nil
+		},
+	}
+}
+
+// liveWorktreePaths returns the paths of every non-deleted worktree row
+// for repoRoot.
+func liveWorktreePaths(ctx context.Context, repoRoot string) []string {
+	dbPath, err := store.DefaultDBPath()
+	if err != nil {
+		return nil
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = st.Close() }()
+	rows, err := st.DB.QueryContext(ctx, `
+		SELECT w.path FROM worktrees w JOIN repos r ON r.id = w.repo_id
+		WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL`, repoRoot)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err == nil {
+			paths = append(paths, p)
+		}
+	}
+	return paths
 }
 
 // wtSwitch — `treeman worktree switch [branch]` (was the zsh `gwt`). Switches
@@ -192,8 +265,9 @@ func wtDelete() *cli.Command {
 		ArgsUsage: "<path-or-branch>",
 		Description: `Runs teardown hooks + DB teardown + git worktree remove, then
 removes the registry row. The teardown is dispatched to the daemon
-(or a setsid child when the daemon is unreachable) — the CLI
-always returns immediately.
+over the RPC socket — the CLI returns immediately. If the daemon
+can't be reached (even after autostart), the command fails rather
+than doing the work inline.
 
 Examples:
   treeman worktree delete PROJ-1234
@@ -701,8 +775,8 @@ func resolveFinalizeTarget(ctx context.Context, arg, repoRoot string, repoErr er
 	return wtPath, repoRoot, nil
 }
 
-// runLocalFinalizeFlow runs setup + prepare inline (used by the
-// wt-create fallback path's detached child). Loads its own resolved
+// runLocalFinalizeFlow runs setup + prepare inline (used by `wt
+// finalize --local`). Loads its own resolved
 // config + store handle since the parent has already exited by the time
 // this runs. Routes through wt.ResolveIdentity so `wt finalize . --local`
 // at the repo root picks up the main-wt overlay/slug instead of producing
@@ -918,9 +992,10 @@ func wtPrev() *cli.Command {
 // last_visited_at on every successful resolution so `wt prev` works.
 func wtGo() *cli.Command {
 	return &cli.Command{
-		Name:      "go",
-		Usage:     "resolve/create/checkout a worktree by name or branch (use as cd \"$(treeman worktree go …)\")",
-		ArgsUsage: "<name-or-branch>",
+		Name:          "go",
+		Usage:         "resolve/create/checkout a worktree by name or branch (use as cd \"$(treeman worktree go …)\")",
+		ArgsUsage:     "<name-or-branch>",
+		ShellComplete: worktreeArgComplete,
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "create", Usage: "create the worktree if nothing matches"},
 			&cli.BoolFlag{

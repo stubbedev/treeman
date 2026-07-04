@@ -179,7 +179,23 @@ func RunPiped(ctx context.Context, dir string, stdout, stderr io.Writer, args ..
 // $EDITOR) and `add -p` (reads y/n/s hunk answers from stdin). RunPiped
 // can't serve these — it forces Stdin to /dev/null.
 func RunInteractive(ctx context.Context, dir string, stdin io.Reader, stdout, stderr io.Writer, args ...string) error {
+	return RunInteractiveEnv(ctx, dir, nil, stdin, stdout, stderr, args...)
+}
+
+// RunInteractiveEnv is RunInteractive with extra environment entries
+// appended (e.g. GIT_SEQUENCE_EDITOR for a non-interactive autosquash
+// rebase). The standard env hygiene (GIT_TERMINAL_PROMPT, self-on-PATH
+// for the patch filter) still applies.
+func RunInteractiveEnv(
+	ctx context.Context,
+	dir string,
+	extraEnv []string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	args ...string,
+) error {
 	cmd := command(ctx, dir, false, args...)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr

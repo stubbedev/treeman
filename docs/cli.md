@@ -44,8 +44,9 @@ delete a worktree end-to-end
 ```
 Runs teardown hooks + DB teardown + git worktree remove, then
 removes the registry row. The teardown is dispatched to the daemon
-(or a setsid child when the daemon is unreachable) — the CLI
-always returns immediately.
+over the RPC socket — the CLI returns immediately. If the daemon
+can't be reached (even after autostart), the command fails rather
+than doing the work inline.
 
 Examples:
   treeman worktree delete PROJ-1234
@@ -175,6 +176,14 @@ switch to or create a branch's worktree (prints dest path for cd)
 | `--from` | base branch when creating |
 | `--no-fetch` | skip the pre-checkout fetch |
 
+### `treeman worktree prune`
+
+prune worktrees whose directory is gone (git worktree prune + registry reconcile)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` |  |
+
 ### `treeman git`
 
 git workflow helpers (commit, push, add, diff, log, stash, switch)
@@ -290,6 +299,58 @@ checkout or create a branch, worktree-aware (prints dest path for cd)
 | `-r`, `--repo` |  |
 | `--from` | base branch when creating |
 | `--no-fetch` | skip the pre-checkout fetch |
+
+### `treeman git amend`
+
+amend the last commit (--no-edit keeps its message)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+| `--no-edit` | keep the existing message; just fold in staged changes |
+
+### `treeman git undo`
+
+uncommit the last commit, keeping its changes staged (reset --soft HEAD~1)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git discard`
+
+discard working-tree changes on selected files (irreversible)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git branch-delete`
+
+delete local branches (picker; merged branches marked)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+
+### `treeman git sync-branch`
+
+update the current branch from its base (fetch + merge/rebase base in)
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+| `--base` | base branch (default: repo default branch) |
+| `--rebase` | rebase onto the base instead of merging |
+
+### `treeman git fixup`
+
+commit staged changes as a fixup! of a picked commit, then autosquash
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | worktree/repo dir (default: cwd) |
+| `--no-rebase` | create the fixup! commit but skip the autosquash rebase |
 
 ### `treeman repos`
 

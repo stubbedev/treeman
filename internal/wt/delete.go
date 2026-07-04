@@ -31,8 +31,8 @@ type DeleteRequest struct {
 
 	// Detached is the internal mode used by the CLI's
 	// `wt delete --detached` subcommand: skip daemon dispatch and
-	// run the teardown inline in this process. Set by the
-	// detached-child path; MCP and the user-facing CLI never set it.
+	// run the teardown inline in this process. A manual escape hatch
+	// (debugging / daemon-less teardown); nothing sets it automatically.
 	Detached bool
 }
 
@@ -57,8 +57,8 @@ type DeleteResult struct {
 }
 
 // Delete resolves the target worktree and either dispatches the
-// teardown to the daemon (with detached-child fallback) or runs it
-// inline when req.Detached is set.
+// teardown to the daemon over the socket (hard-failing if it's
+// unreachable) or runs it inline when req.Detached is set.
 //
 // Confirmation is the caller's responsibility — Delete itself is
 // non-interactive.

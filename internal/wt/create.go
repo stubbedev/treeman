@@ -67,7 +67,8 @@ type CreateResult struct {
 
 // Create runs the full worktree-create lifecycle: git worktree add,
 // patch application, sqlite registration, and dispatch of the
-// hooks+prepare tail to the daemon (with detached-child fallback).
+// hooks+prepare tail to the daemon (hard-fails if the daemon is
+// unreachable — there is no shell-spawn fallback).
 //
 // Output (status lines) is routed through sink so the CLI can color
 // + redirect them while MCP receives only the structured result.
@@ -324,10 +325,10 @@ func registerAndAllocate(
 }
 
 // finishCreate dispatches the hooks+prepare tail for the in-process
-// Create path (used by tests + any non-daemon caller): daemon RPC first,
-// then a detached setsid child when the daemon is unreachable. The daemon
-// itself never reaches here — its worktree_create task runs
-// FinalizeWorktree directly instead.
+// Create path (used by tests + any non-daemon caller): daemon RPC over
+// the socket, and a hard error when the daemon is unreachable (no
+// shell-spawn fallback). The daemon itself never reaches here — its
+// worktree_create task runs FinalizeWorktree directly instead.
 func finishCreate(ctx context.Context, req CreateRequest, result CreateResult, sink Sink) (CreateResult, error) {
 	if queued := DispatchFinalize(ctx, req.RepoRoot, result.WtPath, req.Env, sink); queued {
 		result.Status = CreatedQueued

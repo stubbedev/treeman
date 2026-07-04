@@ -42,22 +42,26 @@ func GitCmd() *cli.Command {
 			gitWipe(),
 			gitLog(),
 			gitSwitch(),
+			gitAmend(),
+			gitUndo(),
+			gitDiscard(),
+			gitBranchDelete(),
+			gitSyncBranch(),
+			gitFixup(),
 		},
 	}
 }
 
 // gitWorkdir resolves the directory git commands run in: the explicit
-// --repo override, else the current worktree's toplevel (so a call
-// from a subdir still acts on the whole worktree).
+// --repo override, else cwd. git resolves the enclosing repo itself and
+// these verbs are repo-wide, so we don't pay a `rev-parse --show-toplevel`
+// fork here — only gitAdd needs the toplevel (its porcelain paths are
+// repo-root-relative) and resolves it directly.
 func gitWorkdir(c *cli.Command) (string, error) {
 	if r := c.String("repo"); r != "" {
 		return MustAbs(r), nil
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	return gitWorktreeRoot(cwd)
+	return os.Getwd()
 }
 
 // repoFlag is the shared --repo/-r flag for git verbs.
@@ -184,7 +188,14 @@ func gitAdd() *cli.Command {
 		ArgsUsage: "[paths to pre-stage...]",
 		Flags:     []cli.Flag{repoFlag()},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			dir, err := gitWorkdir(c)
+			base, err := gitWorkdir(c)
+			if err != nil {
+				return err
+			}
+			// Stage from the worktree root: `git status --porcelain` paths
+			// are repo-root-relative, so `git add` must run there to resolve
+			// them (a subdir cwd would misinterpret them).
+			dir, err := gitWorktreeRoot(base)
 			if err != nil {
 				return err
 			}

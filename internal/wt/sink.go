@@ -5,8 +5,8 @@
 //
 //   - git worktree add + patch application + sqlite registration,
 //   - dispatching the heavy tail (hooks + db prepare) to the
-//     daemon, with a setsid-child detached fallback when the
-//     daemon is unreachable,
+//     daemon over the socket, hard-failing when the daemon is
+//     unreachable,
 //   - resolving + teardown of an existing worktree.
 //
 // Callers pass a Sink so the CLI can render status lines through

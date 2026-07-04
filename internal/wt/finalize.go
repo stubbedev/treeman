@@ -13,8 +13,8 @@ import (
 )
 
 // RunLocalFinalize executes the setup + prepare tail in the calling
-// process. Shared by wt create's last-resort foreground fallback
-// (the detached child path) and by `wt finalize --local`.
+// process. Used by `wt finalize --local` (the manual retry path when
+// the daemon didn't run the create tail).
 //
 // The daemon has its own canonical FinalizeWorktree; this is the
 // "daemon-less" mirror that runs when the daemon is unreachable.
