@@ -930,6 +930,16 @@ func wtBack() *cli.Command {
 			// for that call to keep stdout path-only.
 			fmt.Println(repoRoot)
 
+			// Leave the worktree BEFORE delegating: wt delete refuses to
+			// tear down the worktree the process is standing in (its
+			// cwd-guard), and here removing the current worktree is the
+			// whole point — the shell cd's to the path we just printed.
+			// Mirrors the old zsh gwtd, which cd'd to the root first.
+			if chdirErr := os.Chdir(repoRoot); chdirErr != nil {
+				fmt.Fprintf(os.Stderr, "chdir %s failed: %v; skipping --remove\n", repoRoot, chdirErr)
+				return nil
+			}
+
 			// Delegate to wt delete to keep teardown logic in one
 			// place. Errors are surfaced on stderr; we don't exit
 			// non-zero because the caller already changed directory.
