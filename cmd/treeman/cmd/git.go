@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/urfave/cli/v3"
@@ -287,7 +288,7 @@ func gitDiff() *cli.Command {
 			}
 			target := c.Args().First()
 			if target == "" && c.Bool("pick") {
-				target, err = pickBranch(dir, "select comparison branch")
+				target, err = pickBranch(dir, "diff against")
 				if err != nil {
 					return err
 				}
@@ -295,8 +296,21 @@ func gitDiff() *cli.Command {
 					return nil
 				}
 			}
-			if target == "" { // plain working-tree diff; git pages itself
+			if target == "" {
+				if c.Bool("patch") {
+					return errors.New("--patch needs a comparison branch (pass one or use --pick)")
+				}
+				// plain working-tree diff; git pages itself
 				return runGit(ctx, dir, "diff")
+			}
+			// A typed-new picker entry (or a typo) isn't a ref — catch it
+			// here instead of surfacing git's raw revision error. Prefer
+			// the local ref; fall back to origin/<target> (remote-only).
+			if !gitcmd.Exists(ctx, dir, target) {
+				if !gitcmd.Exists(ctx, dir, "origin/"+target) {
+					return fmt.Errorf("no branch %q", target)
+				}
+				target = "origin/" + target
 			}
 			cur := currentBranch(ctx, dir)
 			spec := cur + "..." + target
@@ -501,13 +515,19 @@ func gitLog() *cli.Command {
 	return &cli.Command{
 		Name:  "log",
 		Usage: "interactive log (Enter: show, Ctrl+X: cherry-pick, Ctrl+R: revert, Ctrl+Y: copy hash)",
-		Flags: []cli.Flag{repoFlag()},
+		Flags: []cli.Flag{
+			repoFlag(),
+			// The picker holds the whole list in memory (fzf streamed;
+			// we don't) — cap it so huge histories stay instant.
+			&cli.IntFlag{Name: "limit", Aliases: []string{"n"}, Value: 300, Usage: "number of commits to load"},
+		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			dir, err := gitWorkdir(c)
 			if err != nil {
 				return err
 			}
-			out, err := gitcmd.String(ctx, dir, "log", "--oneline", "--no-color")
+			out, err := gitcmd.String(ctx, dir, "log", "--oneline", "--no-color",
+				"-n", strconv.Itoa(c.Int("limit")))
 			if err != nil {
 				return err
 			}
@@ -519,9 +539,9 @@ func gitLog() *cli.Command {
 			res, err := tui.MultiSelect(lines, tui.Options{
 				Prompt: "show",
 				Actions: []tui.Action{
-					{Key: "ctrl+x", Name: "cherry-pick", Hint: "Ctrl+X: cherry-pick", NeedsSelection: true},
-					{Key: "ctrl+r", Name: "revert", Hint: "Ctrl+R: revert", NeedsSelection: true},
-					{Key: "ctrl+y", Name: "copy", Hint: "Ctrl+Y: copy hash"},
+					{Key: "ctrl+x", Name: "cherry-pick", Hint: "ctrl+x cherry-pick", NeedsSelection: true},
+					{Key: "ctrl+r", Name: "revert", Hint: "ctrl+r revert", NeedsSelection: true},
+					{Key: "ctrl+y", Name: "copy", Hint: "ctrl+y copy hash"},
 				},
 			})
 			if errors.Is(err, tui.ErrCanceled) {

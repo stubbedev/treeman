@@ -25,36 +25,38 @@ func Input(opts InputOptions) (string, error) {
 	if !interactive() {
 		return "", ErrNotTTY
 	}
+	ui.EnableColorForStderr()
 	ti := textinput.New()
-	ti.Prompt = ui.Cyan("(" + hintFor(opts.Prompt) + ")> ")
+	ti.Prompt = ui.Cyan(ui.SymPointer + " ")
 	ti.Placeholder = opts.Placeholder
 	ti.SetValue(opts.Initial)
 	ti.CursorEnd()
 	ti.Focus()
 
-	m := &inputModel{ti: ti}
+	m := &inputModel{ti: ti, label: opts.Prompt}
 	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
 	final, err := p.Run()
 	if err != nil {
 		return "", err
 	}
 	fm, ok := final.(*inputModel)
-	if !ok || fm.canceled {
+	if !ok {
+		return "", ErrCanceled
+	}
+	if fm.aborted {
+		return "", ErrAborted
+	}
+	if fm.canceled {
 		return "", ErrCanceled
 	}
 	return strings.TrimRight(fm.ti.Value(), " "), nil
 }
 
-func hintFor(prompt string) string {
-	if prompt == "" {
-		prompt = "input"
-	}
-	return "Enter: " + prompt + ", Ctrl+C: cancel"
-}
-
 type inputModel struct {
 	ti       textinput.Model
-	canceled bool
+	label    string
+	canceled bool // Ctrl+C — cancel this step
+	aborted  bool // Esc — quit the whole command
 	done     bool
 }
 
@@ -63,7 +65,10 @@ func (m *inputModel) Init() tea.Cmd { return textinput.Blink }
 func (m *inputModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if key, ok := msg.(tea.KeyMsg); ok {
 		switch key.String() {
-		case "ctrl+c", "esc":
+		case "esc":
+			m.aborted = true
+			return m, tea.Quit
+		case "ctrl+c":
 			m.canceled = true
 			return m, tea.Quit
 		case "enter":
@@ -80,5 +85,10 @@ func (m *inputModel) View() string {
 	if m.done || m.canceled {
 		return ""
 	}
-	return m.ti.View() + "\n"
+	label := m.label
+	if label == "" {
+		label = "input"
+	}
+	hint := "  " + ui.Dim(label+" "+ui.SymDot+" enter accept "+ui.SymDot+" esc cancel")
+	return m.ti.View() + "\n" + hint + "\n"
 }

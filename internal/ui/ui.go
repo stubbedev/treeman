@@ -42,6 +42,11 @@ var (
 	SymInfo    = "•"
 	SymArrow   = "→"
 	SymDot     = "·"
+
+	// picker glyphs (internal/tui).
+	SymPointer = "❯"
+	SymMarkOn  = "●"
+	SymMarkOff = "○"
 )
 
 // ColorEnabled reports whether ANSI sequences should be emitted.
@@ -71,6 +76,22 @@ func detectColor() {
 	lang := strings.ToLower(os.Getenv("LANG") + os.Getenv("LC_ALL") + os.Getenv("LC_CTYPE"))
 	if !strings.Contains(lang, "utf") && os.Getenv("TERM_PROGRAM") == "" {
 		SymSuccess, SymError, SymWarn, SymInfo, SymArrow, SymDot = "[ok]", "[x]", "[!]", "*", "->", "."
+		SymPointer, SymMarkOn, SymMarkOff = ">", "[x]", "[ ]"
+	}
+}
+
+// EnableColorForStderr turns styling on when stderr is a terminal, for
+// interactive TUIs that render to stderr while stdout is captured by a
+// shell substitution (`cd "$(treeman worktree switch)"`). The default
+// detection keys off stdout, which is a pipe in exactly that case.
+// NO_COLOR and TERM=dumb still win.
+func EnableColorForStderr() {
+	colorOnce.Do(detectColor)
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return
+	}
+	if isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd()) {
+		colorEnable = true
 	}
 }
 

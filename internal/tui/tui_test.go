@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -22,6 +24,8 @@ func key(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyDown}
 	case "ctrl+c":
 		return tea.KeyMsg{Type: tea.KeyCtrlC}
+	case "esc":
+		return tea.KeyMsg{Type: tea.KeyEsc}
 	case "ctrl+x":
 		return tea.KeyMsg{Type: tea.KeyCtrlX}
 	case "backspace":
@@ -106,11 +110,62 @@ func TestAction(t *testing.T) {
 	}
 }
 
+func TestMultiEnterNoMarksFallsBackToCursor(t *testing.T) {
+	m := newModel([]string{"a", "b", "c"}, Options{Height: 10, Multi: true})
+	feed(m, "down", "enter") // nothing marked; cursor on b
+	r := m.result()
+	if len(r.Indices) != 1 || r.Indices[0] != 1 {
+		t.Errorf("indices = %v, want [1] (highlighted fallback)", r.Indices)
+	}
+}
+
+func TestFooterSingleCancelHint(t *testing.T) {
+	m := newModel([]string{"a"}, Options{Height: 10, Prompt: "switch/create", CancelHint: "wizard"})
+	f := m.footer()
+	if got := strings.Count(f, "ctrl+c"); got != 1 {
+		t.Errorf("footer mentions ctrl+c %d times, want 1: %q", got, f)
+	}
+	if !strings.Contains(f, "ctrl+c wizard") {
+		t.Errorf("footer missing cancel override: %q", f)
+	}
+}
+
+func TestHighlightMatchSkipsStyledItems(t *testing.T) {
+	styled := "\x1b[36m[worktree] foo\x1b[0m"
+	if got := highlightMatch(styled, "foo"); got != styled {
+		t.Errorf("styled item mutated: %q", got)
+	}
+}
+
+func TestPickerHeightEnv(t *testing.T) {
+	t.Setenv("TREEMAN_PICKER_HEIGHT", "5")
+	if h := pickerHeight(); h != 5 {
+		t.Errorf("height = %d, want 5", h)
+	}
+	t.Setenv("TREEMAN_PICKER_HEIGHT", "nonsense")
+	if h := pickerHeight(); h != defaultHeight {
+		t.Errorf("height = %d, want default on junk", h)
+	}
+}
+
 func TestCancel(t *testing.T) {
 	m := newModel([]string{"a"}, Options{Height: 10})
 	feed(m, "ctrl+c")
-	if !m.canceled {
-		t.Error("expected canceled")
+	if !m.canceled || m.aborted {
+		t.Errorf("ctrl+c: canceled=%v aborted=%v, want canceled only", m.canceled, m.aborted)
+	}
+}
+
+func TestEscAbortsWholeCommand(t *testing.T) {
+	m := newModel([]string{"a"}, Options{Height: 10})
+	feed(m, "esc")
+	if !m.aborted || m.canceled {
+		t.Errorf("esc: canceled=%v aborted=%v, want aborted only", m.canceled, m.aborted)
+	}
+	// ErrAborted must satisfy ErrCanceled checks so single-step
+	// commands quit without every call site special-casing Esc.
+	if !errors.Is(ErrAborted, ErrCanceled) {
+		t.Error("ErrAborted should wrap ErrCanceled")
 	}
 }
 

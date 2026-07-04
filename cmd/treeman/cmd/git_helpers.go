@@ -115,9 +115,11 @@ func switchInteractive(ctx context.Context, repoRoot, from string, noFetch bool)
 	if len(items) == 0 {
 		return wizardThenCheckout(ctx, repoRoot, "", noFetch)
 	}
-	res, err := tui.Select(items, tui.Options{Prompt: "switch/create, Ctrl+C: wizard"})
+	res, err := tui.Select(items, tui.Options{Prompt: "switch/create", CancelHint: "wizard"})
 	switch {
-	case errors.Is(err, tui.ErrCanceled), res.Index < 0:
+	case errors.Is(err, tui.ErrAborted):
+		return nil // Esc — quit the whole command, no wizard
+	case errors.Is(err, tui.ErrCanceled), err == nil && res.Index < 0:
 		return wizardThenCheckout(ctx, repoRoot, res.Query, noFetch)
 	case err != nil:
 		return err
@@ -244,10 +246,14 @@ func branchWizard(ctx context.Context, repoRoot, initial string) (name, base str
 	}
 
 	nm := gitx.Handleize(initial)
-	suffix, serr := tui.Input(tui.InputOptions{Prompt: "suffix (optional)"})
-	if serr != nil && !errors.Is(serr, tui.ErrCanceled) {
+	suffix, serr := tui.Input(tui.InputOptions{Prompt: "suffix (optional, ctrl+c skips)"})
+	switch {
+	case errors.Is(serr, tui.ErrAborted):
+		return "", "", nil // Esc — abort the whole wizard
+	case serr != nil && !errors.Is(serr, tui.ErrCanceled):
 		return "", "", serr
 	}
+	// Ctrl+C = no suffix; carry on.
 	suffix = gitx.Handleize(suffix)
 
 	final := prefix + "/" + nm

@@ -289,6 +289,7 @@ interactive log (Enter: show, Ctrl+X: cherry-pick, Ctrl+R: revert, Ctrl+Y: copy 
 | Flag | Usage |
 |---|---|
 | `-r`, `--repo` | worktree/repo dir (default: cwd) |
+| `-n`, `--limit` | number of commits to load |
 
 ### `treeman git switch`
 
