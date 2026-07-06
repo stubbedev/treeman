@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -32,6 +33,9 @@ func Input(opts InputOptions) (string, error) {
 	ti.SetValue(opts.Initial)
 	ti.CursorEnd()
 	ti.Focus()
+	// ponytail: bubbles' own reverse-video blink cursor is hidden here — View()
+	// draws the same static "▌" half-block cursor as the fuzzy picker instead.
+	ti.Cursor.SetMode(cursor.CursorHide)
 
 	m := &inputModel{ti: ti, label: opts.Prompt}
 	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
@@ -60,7 +64,7 @@ type inputModel struct {
 	done     bool
 }
 
-func (m *inputModel) Init() tea.Cmd { return textinput.Blink }
+func (m *inputModel) Init() tea.Cmd { return nil }
 
 func (m *inputModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if key, ok := msg.(tea.KeyMsg); ok {
@@ -90,5 +94,18 @@ func (m *inputModel) View() string {
 		label = "input"
 	}
 	hint := "  " + ui.Dim(label+" "+ui.SymDot+" enter accept "+ui.SymDot+" esc cancel")
-	return m.ti.View() + "\n" + hint + "\n"
+
+	value := []rune(m.ti.Value())
+	pos := m.ti.Position()
+	var line strings.Builder
+	line.WriteString(m.ti.Prompt)
+	if len(value) == 0 && m.ti.Placeholder != "" {
+		line.WriteString(ui.Dim("▌"))
+		line.WriteString(ui.Dim(m.ti.Placeholder))
+	} else {
+		line.WriteString(string(value[:pos]))
+		line.WriteString(ui.Dim("▌"))
+		line.WriteString(string(value[pos:]))
+	}
+	return line.String() + "\n" + hint + "\n"
 }
