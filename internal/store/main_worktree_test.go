@@ -54,6 +54,32 @@ func TestEnsureMainWorktreeInsertsAndResurrects(t *testing.T) {
 	}
 }
 
+// TestEnsureWorktreeIdempotentByPath confirms a repeat create at the
+// same path converges to one row instead of erroring on the UNIQUE
+// path constraint — the guarantee the create-race recovery relies on
+// (daemon + in-process fallback both registering the same path).
+func TestEnsureWorktreeIdempotentByPath(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	repoID, _ := s.EnsureRepo(ctx, "/repos/x", "x")
+	id1, err := s.EnsureWorktree(ctx, repoID, "/repos/x/wt/a", "wt_a", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, err := s.EnsureWorktree(ctx, repoID, "/repos/x/wt/a", "wt_a", "a")
+	if err != nil {
+		t.Fatalf("repeat create must not error: %v", err)
+	}
+	if id2 != id1 {
+		t.Errorf("repeat create should reuse row id: got %d want %d", id2, id1)
+	}
+}
+
 // TestEnsureMainWorktreeUniquePerRepo confirms the partial unique
 // index refuses a second active main row for the same repo. Inserting
 // a *separate* path with is_main=1 should fail — the schema treats

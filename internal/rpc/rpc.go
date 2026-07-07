@@ -8,6 +8,7 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -16,6 +17,14 @@ import (
 
 	"github.com/stubbedev/treeman/internal/safego"
 )
+
+// ErrDaemonUnreachable wraps a dial failure — the daemon socket could
+// not be connected to at all. Callers use errors.Is to distinguish
+// "daemon absent" (safe to fall back to in-process execution) from a
+// post-dial I/O failure (encode/decode/timeout), where the daemon MAY
+// already be running the plan and re-running it in-process would race
+// the daemon's writer. Only the former is safe to retry locally.
+var ErrDaemonUnreachable = errors.New("daemon unreachable")
 
 // ProtocolVersion is bumped when an incompatible RPC change ships.
 // v2: nested-args envelope ({"method":m,"<m>":{...}}) replacing the old
@@ -491,7 +500,7 @@ func Call(ctx context.Context, req Request) (Response, error) {
 	d := net.Dialer{Timeout: 1500 * time.Millisecond}
 	conn, err := d.DialContext(ctx, "unix", path)
 	if err != nil {
-		return Response{}, fmt.Errorf("dial %s — is treemand running? %w", path, err)
+		return Response{}, fmt.Errorf("dial %s — is treemand running? %w: %w", path, ErrDaemonUnreachable, err)
 	}
 	defer func() { _ = conn.Close() }()
 

@@ -477,24 +477,22 @@ func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path,
 	// COLLATE NOCASE so an APFS case-insensitive FS on macOS matches
 	// `/Users/jane/Repo/.worktrees/x` with a later `/users/jane/repo/.worktrees/X`.
 	// Backed by idx_worktrees_path_nocase (migration 0003).
-	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
-	var id int64
-	if err := row.Scan(&id); err == nil {
-		// Resurrect: when a worktree is re-created at the path of a
-		// previously-deleted row we MUST clear deleted_at and refresh
-		// slug/branch. Without this the row stays marked deleted, and
-		// the next TeardownWorktree short-circuits on the
-		// `row.Deleted` check so predelete + db drop + git remove
-		// never run and the working tree lingers on disk forever.
-		// Also keep admin_dir current.
-		var br any
-		if branch != "" {
-			br = branch
-		}
-		var ad any
-		if adminDir != "" {
-			ad = adminDir
-		}
+	var br any
+	if branch != "" {
+		br = branch
+	}
+	var ad any
+	if adminDir != "" {
+		ad = adminDir
+	}
+	// Resurrect/refresh an existing row (active or soft-deleted) at this
+	// path. When a worktree is re-created at the path of a previously-
+	// deleted row we MUST clear deleted_at and refresh slug/branch.
+	// Without this the row stays marked deleted, and the next
+	// TeardownWorktree short-circuits on the `row.Deleted` check so
+	// predelete + db drop + git remove never run and the working tree
+	// lingers on disk forever. Also keep admin_dir current.
+	refresh := func(id int64) (int64, error) {
 		if _, err := s.DB.ExecContext(ctx, `
 			UPDATE worktrees
 			SET slug = ?,
@@ -505,21 +503,29 @@ func (s *Store) EnsureWorktreeWithAdmin(ctx context.Context, repoID int64, path,
 			return 0, err
 		}
 		return id, nil
+	}
+
+	row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
+	var id int64
+	if err := row.Scan(&id); err == nil {
+		return refresh(id)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
-	}
-	var br any
-	if branch != "" {
-		br = branch
-	}
-	var ad any
-	if adminDir != "" {
-		ad = adminDir
 	}
 	res, err := s.DB.ExecContext(ctx,
 		"INSERT INTO worktrees(repo_id, path, slug, branch, admin_dir, created_at) VALUES (?, ?, ?, ?, ?, ?)",
 		repoID, path, slug, br, ad, nowMillis())
 	if err != nil {
+		// Lost a create race: the daemon (or a concurrent in-process
+		// fallback — see submitPlan) inserted this path between our
+		// SELECT and INSERT. Create is idempotent by path, so re-select
+		// the winner's row and refresh it instead of failing loud.
+		if isUniqueConflict(err) {
+			row := s.DB.QueryRowContext(ctx, "SELECT id FROM worktrees WHERE path = ? COLLATE NOCASE", path)
+			if serr := row.Scan(&id); serr == nil {
+				return refresh(id)
+			}
+		}
 		return 0, err
 	}
 	return res.LastInsertId()

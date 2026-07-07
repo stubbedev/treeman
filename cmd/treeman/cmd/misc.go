@@ -194,14 +194,23 @@ func writeConfig(ctx context.Context, repoRoot, path string, body []byte) error 
 // requirement. Always yields a response: KindPlanQueued from a live
 // daemon, KindPlanResult from in-process, or KindError.
 func submitPlan(ctx context.Context, req rpc.Request) rpc.Response {
-	if resp, err := rpc.Call(ctx, req); err == nil {
+	resp, err := rpc.Call(ctx, req)
+	if err == nil {
 		return resp
+	}
+	// Only fall back in-process when the DIAL failed (daemon genuinely
+	// absent). A post-dial failure — encode/decode/timeout — means the
+	// daemon is reachable and MAY already be running this plan; re-running
+	// it in-process would put a second writer on the same rows and race
+	// the daemon (e.g. UNIQUE constraint on worktrees.path). Surface it.
+	if !errors.Is(err, rpc.ErrDaemonUnreachable) {
+		return rpc.Response{Kind: rpc.KindError, Message: err.Error()}
 	}
 	// Say so BEFORE running: without this line a task the user expects
 	// to queue detached silently blocks the terminal for the whole
 	// prepare instead.
 	PrintWarn("daemon unreachable — running in-process (blocks until done; `treeman daemon start` restores detached dispatch)")
-	resp, err := daemon.RunPlanInProcess(ctx, *req.RunPlan)
+	resp, err = daemon.RunPlanInProcess(ctx, *req.RunPlan)
 	if err != nil {
 		return rpc.Response{Kind: rpc.KindError, Message: err.Error()}
 	}
