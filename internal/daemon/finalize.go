@@ -25,6 +25,18 @@ import (
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
+// withRetryHint surfaces the recovery path on a terminal create:error so a
+// `failed` worktree isn't a dead end (#18): RecoverStaleWorktree already
+// reset the namespaces, so `treeman worktree finalize` cold-rebuilds
+// clean. Skips the append when the wrapped error already spells it out
+// (the create-before-engines path names both the contract and the retry).
+func withRetryHint(msg string) string {
+	if strings.Contains(msg, "treeman worktree finalize") {
+		return msg
+	}
+	return msg + "\nhint: retry this worktree with `treeman worktree finalize`"
+}
+
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
 // goroutine) tail of `treeman worktree create`: it runs the create
 // hook pipeline + engine prepare against the main repo root,
@@ -90,7 +102,7 @@ func FinalizeWorktree(
 		// forever (see #11). Swallow the returned error afterwards so
 		// dispatch doesn't double-log the same failure as a second
 		// (row-less) worktree:create:error event.
-		_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, err.Error(),
+		_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, withRetryHint(err.Error()),
 			termRepoID, termWtID, "", 0, map[string]string{
 				"repo_path":     repoRoot,
 				"worktree_path": wtRoot,
@@ -470,7 +482,14 @@ func runFinalizeSetupPipeline(
 	if err := runTriggerActions(ctx, st, "create-before-engines",
 		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
 		isMain, repoID, wtID, inheritedEnv); err != nil {
-		return false, err
+		// create-before-engines runs BEFORE the engine databases exist
+		// (deps must install so migrate can find them) — a hook that boots
+		// the app and queries the DB here hits "Unknown database" (#18).
+		// Name the contract + the recovery so the failure isn't a dead end.
+		return false, fmt.Errorf(
+			"%w\nhint: create-before-engines hooks run before this worktree's databases exist; move any app-boot / DB-touching step to create-after-engines. Retry this worktree with `treeman worktree finalize`",
+			err,
+		)
 	}
 	if cancelledBefore(ctx, st, "prepare", repoID, wtID) {
 		return true, nil

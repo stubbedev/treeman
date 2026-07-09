@@ -1087,7 +1087,11 @@ type Patch struct {
 //   - create-before-engines — during `wt create`, after patches +
 //     bring-in (copies/links), BEFORE engine prepare. Standard
 //     home of dependency installs (composer/yarn/pip) so migrate
-//     can find vendor/.
+//     can find vendor/. The engine databases do NOT exist yet in
+//     this phase, so a hook that BOOTS THE APP and queries the DB
+//     (e.g. a Laravel `composer install` whose post-autoload-dump
+//     runs a framework command) fails with "Unknown database". Keep
+//     DB-touching work in create-after-engines.
 //   - create-after-engines — during `wt create`, after engine
 //     prepare. Use when actions need a populated database
 //     (cache warming, seed verification).
@@ -1107,7 +1111,10 @@ type Patch struct {
 // perspective — each list of actions dispatches in parallel.
 type HooksConfig struct {
 	// OnCreateBeforeEngines — actions fire after worktree create +
-	// patches + bring-in, before engine prepare.
+	// patches + bring-in, before engine prepare. The engine databases
+	// do not exist yet: a hook that boots the app and touches the DB
+	// here fails with "Unknown database" — put DB-touching work in
+	// create-after-engines.
 	OnCreateBeforeEngines []Action `yaml:"create-before-engines,omitempty"`
 
 	// OnCreateAfterEngines — actions fire after engine prepare completes.

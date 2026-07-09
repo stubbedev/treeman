@@ -88,6 +88,11 @@ hooks:
   # list run in PARALLEL. `run:` itself takes a string (one step) or
   # a list (steps chain sequentially with `&&` — failure short-circuits).
   create-before-engines:                # fires after patches + bring-in, BEFORE engine prepare
+    # NB: engine DBs don't exist yet in this phase. Dependency installs
+    # belong here (so migrate finds vendor/), but anything that BOOTS the
+    # app and queries the DB will fail with "Unknown database" — move that
+    # to create-after-engines. A failure here leaves the worktree in
+    # `failed`; recover with `treeman worktree finalize`.
     - run: "git pull --ff-only"
   create-after-engines:                 # fires after engine prepare
     - run: composer install --no-interaction --prefer-dist
