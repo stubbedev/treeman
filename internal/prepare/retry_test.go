@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -88,5 +89,31 @@ func TestRetryTransientNonTransientNoRetry(t *testing.T) {
 	err := retryTransient(context.Background(), func() error { calls++; return want })
 	if !errors.Is(err, want) || calls != 1 {
 		t.Fatalf("non-transient must not retry: err=%v calls=%d", err, calls)
+	}
+}
+
+func TestRetryTransientExhaustedAnnotatesEngineDeath(t *testing.T) {
+	err := retryTransient(context.Background(), func() error { return io.EOF })
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("want wrapped io.EOF, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "died or restarted") {
+		t.Fatalf("exhausted transient should hint engine death, got %q", err.Error())
+	}
+}
+
+func TestAnnotateEngineDeath(t *testing.T) {
+	// Non-transient and nil pass through unwrapped (no hint appended).
+	plain := errors.New("index not found")
+	if got := annotateEngineDeath(plain); strings.Contains(got.Error(), "died or restarted") {
+		t.Fatalf("non-transient must pass through unannotated, got %v", got)
+	}
+	if annotateEngineDeath(nil) != nil {
+		t.Fatal("nil must stay nil")
+	}
+	// Transient gains the hint but still unwraps to the original.
+	got := annotateEngineDeath(io.EOF)
+	if !errors.Is(got, io.EOF) || !strings.Contains(got.Error(), "died or restarted") {
+		t.Fatalf("transient should be annotated + unwrappable, got %v", got)
 	}
 }

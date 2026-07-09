@@ -3,6 +3,7 @@ package prepare
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -37,7 +38,7 @@ func retryTransient(ctx context.Context, fn func() error) error {
 			return err
 		}
 		if attempt >= transientRetries {
-			return err
+			return annotateEngineDeath(err)
 		}
 		select {
 		case <-ctx.Done():
@@ -45,6 +46,30 @@ func retryTransient(ctx context.Context, fn func() error) error {
 		case <-time.After(transientBackoff[min(attempt, len(transientBackoff)-1)]):
 		}
 	}
+}
+
+// captureRetrying wraps drv.Capture in retryTransient so a mid-capture
+// engine restart — an EOF on createIndexes, the crash-loop signature
+// from #16 — retries instead of aborting the whole worktree create.
+// Symmetry with the restore path (branchstate.go / prepare.go), which
+// already retries; capture was the one bare call site left.
+func captureRetrying(ctx context.Context, drv nsDriver, active, durable string) error {
+	return retryTransient(ctx, func() error { return drv.Capture(ctx, active, durable) })
+}
+
+// annotateEngineDeath appends an actionable hint when err is a transient
+// connection drop that survived every retry — the signature of an engine
+// process that died or restarted mid-op. Turns a bare "EOF" / "incomplete
+// read" into a pointer at the real culprit (a crash-looping / OOM-killed
+// container) instead of leaving the user staring at a raw socket error.
+func annotateEngineDeath(err error) error {
+	if err == nil || !isTransientConn(err) {
+		return err
+	}
+	return fmt.Errorf(
+		"%w — the engine connection dropped mid-operation, so the engine process likely died or restarted (check `treeman doctor` and the container's `docker logs`/`docker inspect` for a crash loop or OOM kill)",
+		err,
+	)
 }
 
 // isCancellation reports whether err is (or wraps) a context

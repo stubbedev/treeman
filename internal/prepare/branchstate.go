@@ -1060,7 +1060,7 @@ func (a branchScopedArgs) event(ctx context.Context, typ, msg string, extra map[
 // branches deleted while their worktree is live.
 func (a branchScopedArgs) captureDurable(ctx context.Context, active, branch string) error {
 	dur := a.eng.durable(active, branch)
-	if err := a.eng.drv.Capture(ctx, active, dur); err != nil {
+	if err := captureRetrying(ctx, a.eng.drv, active, dur); err != nil {
 		return err
 	}
 	_ = a.st.RecordBranchDurable(ctx, store.BranchDurableRow{
@@ -1090,7 +1090,7 @@ func captureBranchScopedOnTeardown(ctx context.Context, eng *branchEngine, st *s
 		return err
 	}
 	dur := eng.durable(active, branch)
-	if err := eng.drv.Capture(ctx, active, dur); err != nil {
+	if err := captureRetrying(ctx, eng.drv, active, dur); err != nil {
 		return err
 	}
 	// Record so the orphan sweep can reclaim this durable once `branch` is
@@ -1354,7 +1354,7 @@ func saveActiveNamespace(
 			return out, nil
 		}
 	}
-	if err := eng.drv.Capture(ctx, active, dur); err != nil {
+	if err := captureRetrying(ctx, eng.drv, active, dur); err != nil {
 		return out, fmt.Errorf("capture %s into durable copy for %q: %w", active, branch, err)
 	}
 	_ = st.RecordBranchDurable(ctx, store.BranchDurableRow{

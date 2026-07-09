@@ -289,6 +289,14 @@ type inspectInfo struct {
 	Config struct {
 		Env []string `json:"Env"`
 	} `json:"Config"`
+	// RestartCount is a top-level docker-inspect field (sibling of
+	// State/Config) — how many times the daemon has restarted the
+	// container. A rising value is the fingerprint of a crash loop.
+	RestartCount int `json:"RestartCount"`
+	State        struct {
+		Running   bool   `json:"Running"`
+		StartedAt string `json:"StartedAt"` // RFC3339Nano
+	} `json:"State"`
 }
 
 func inspectContainer(ctx context.Context, engine, id string) (*inspectInfo, error) {
@@ -393,6 +401,43 @@ func EnvLookup(ctx context.Context, opts Opts) (map[string]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// Health is a container's liveness snapshot from `<engine> inspect`.
+// Found is false when opts names no container/service ref (nothing to
+// inspect) — callers treat that as "not containerised", not a failure.
+type Health struct {
+	Found        bool
+	Running      bool
+	RestartCount int
+	Uptime       time.Duration // since State.StartedAt; 0 when not running/unparseable
+}
+
+// ContainerHealth resolves opts' container and reports its liveness —
+// running state, restart count, and uptime. Uptime under a minute with a
+// non-zero restart count is the crash-loop signature `treeman doctor`
+// flags (see #16, where a mongod dying every ~29s slipped past every
+// check). Returns Health{Found:false},nil when opts has no container ref.
+func ContainerHealth(ctx context.Context, opts Opts) (Health, error) {
+	if opts.empty() {
+		return Health{}, nil
+	}
+	engine := opts.normEngine()
+	id, err := resolveContainerID(ctx, opts)
+	if err != nil {
+		return Health{}, err
+	}
+	info, err := inspectContainer(ctx, engine, id)
+	if err != nil {
+		return Health{}, err
+	}
+	h := Health{Found: true, Running: info.State.Running, RestartCount: info.RestartCount}
+	if info.State.Running && info.State.StartedAt != "" {
+		if t, perr := time.Parse(time.RFC3339Nano, info.State.StartedAt); perr == nil {
+			h.Uptime = time.Since(t)
+		}
+	}
+	return h, nil
 }
 
 // hostLoopbackReachable probes host.docker.internal:port quickly

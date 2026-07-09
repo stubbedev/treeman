@@ -30,6 +30,7 @@ import (
 //   - schemas/treeman.schema.json presence (yaml-language-server hint)
 //   - migration framework detection (non-empty)
 //   - git worktree list ↔ SQLite registry consistency
+//   - engine reachability + container liveness (crash-loop / restart)
 //
 // Non-zero exit when any blocking probe fails so CI can gate.
 func DoctorCmd() *cli.Command {
@@ -209,6 +210,7 @@ func RunDoctorChecks(ctx context.Context) []DoctorResult {
 		results = append(results, checkFrameworks(repoRoot))
 		results = append(results, checkRegistry(ctx, repoRoot))
 		results = append(results, checkSnapshots(ctx, repoRoot))
+		results = append(results, checkEngines(ctx, repoRoot))
 	} else {
 		results = append(results, doctorResult{
 			Name:   "repo",
