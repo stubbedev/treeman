@@ -42,6 +42,8 @@ func TestTestClonesFanout(t *testing.T) {
 	wt := t.TempDir()
 	if err := os.WriteFile(filepath.Join(wt, "seed.sql"),
 		[]byte(`CREATE TABLE widgets (id INT PRIMARY KEY, name VARCHAR(64));
+CREATE TABLE widget_audit (id INT PRIMARY KEY AUTO_INCREMENT, widget_id INT NOT NULL);
+CREATE TRIGGER widgets_ai AFTER INSERT ON widgets FOR EACH ROW INSERT INTO widget_audit (widget_id) VALUES (NEW.id);
 INSERT INTO widgets VALUES (1, 'one'), (2, 'two'), (3, 'three');`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +78,7 @@ INSERT INTO widgets VALUES (1, 'one'), (2, 'two'), (3, 'three');`), 0o644); err 
 
 	sort.Strings(o.Clones)
 	// Confirm each clone exists in MySQL and has the expected rows.
-	for _, name := range o.Clones {
+	for i, name := range o.Clones {
 		db := openMySQL(t, name)
 		defer db.Close()
 		var n int
@@ -85,6 +87,30 @@ INSERT INTO widgets VALUES (1, 'one'), (2, 'two'), (3, 'three');`), 0o644); err 
 		}
 		if n != 3 {
 			t.Errorf("clone %s: widgets rows = %d, want 3", name, n)
+		}
+		// Issue #20: the clone must carry the source's triggers, not
+		// just its tables — trigger-dependent tests pass serially and
+		// fail under --parallel when the worker clones drop them.
+		// Assert both presence and that the trigger actually fires.
+		var trg int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()").Scan(&trg); err != nil {
+			t.Fatalf("clone %s: count triggers: %v", name, err)
+		}
+		if trg != 1 {
+			t.Errorf("clone %s: trigger count = %d, want 1 (clone dropped triggers)", name, trg)
+		}
+		probeID := 100 + i
+		if _, err := db.Exec("INSERT INTO widgets VALUES (?, 'probe')", probeID); err != nil {
+			t.Fatalf("clone %s: insert probe row: %v", name, err)
+		}
+		var fired int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM widget_audit WHERE widget_id = ?", probeID).Scan(&fired); err != nil {
+			t.Fatalf("clone %s: count audit rows: %v", name, err)
+		}
+		if fired != 1 {
+			t.Errorf("clone %s: trigger did not fire (audit rows = %d, want 1)", name, fired)
 		}
 	}
 

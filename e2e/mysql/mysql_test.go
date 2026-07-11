@@ -393,6 +393,10 @@ func TestPhysicalCloneViaContainerExec(t *testing.T) {
 	// the .ibd files; if the IMPORT ran cleanly the rows are present.
 	assertTablesPresent(t, "127.0.0.1:13306", o.TemplateName, []string{"products", "orders"})
 	assertRowCount(t, "127.0.0.1:13306", o.TemplateName, "products", 3)
+	// Triggers live in the data dictionary, not the .ibd files the
+	// physical clone copies — the template must carry the replayed
+	// trigger too (issue #20).
+	assertTriggerCount(t, "127.0.0.1:13306", o.TemplateName, 1)
 }
 
 // TestStagedFanoutRestoreParallel proves the physical fan-out no longer
@@ -458,6 +462,10 @@ func TestStagedFanoutRestoreParallel(t *testing.T) {
 		if got := rowCount(t, "127.0.0.1:13306", name, "orders"); got != srcOrders {
 			t.Errorf("clone %s orders = %d, want %d", name, got, srcOrders)
 		}
+		// Issue #20's exact repro: per-worker paratest clones dropped
+		// MySQL triggers, so trigger-dependent tests passed serially
+		// and failed under --parallel.
+		assertTriggerCount(t, "127.0.0.1:13306", name, 1)
 	}
 
 	// The staging dir is created only by the physical staged-restore
@@ -637,6 +645,24 @@ func assertTablesPresent(t *testing.T, addr, dbName string, want []string) {
 		if !got[w] {
 			t.Errorf("table %q missing from %s (have: %v)", w, dbName, keysOf(got))
 		}
+	}
+}
+
+// assertTriggerCount fails unless dbName carries exactly `want`
+// triggers. Guards issue #20: every clone path must replay the
+// source's triggers, which live in the data dictionary and are not
+// carried by either the logical or the physical table copy.
+func assertTriggerCount(t *testing.T, addr, dbName string, want int) {
+	t.Helper()
+	db := openMySQL(t, addr, dbName)
+	defer db.Close()
+	var n int
+	if err := db.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = ?", dbName).Scan(&n); err != nil {
+		t.Fatalf("count triggers(%s): %v", dbName, err)
+	}
+	if n != want {
+		t.Errorf("%s trigger count = %d, want %d (clone dropped triggers)", dbName, n, want)
 	}
 }
 

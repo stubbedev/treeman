@@ -286,7 +286,7 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) er
 	}
 	if ok, perr := d.tryPhysicalSnapshotCreate(ctx, source, template); ok {
 		d.setLastStrategy(CloneStrategyPhysical)
-		return nil
+		return d.cloneTriggers(ctx, source, template)
 	} else if perr != nil {
 		var skip *physicalSkippedError
 		if errors.As(perr, &skip) {
@@ -518,7 +518,7 @@ func (d *Driver) logicalSnapshotCreate(ctx context.Context, source, template str
 			return err
 		}
 	}
-	return nil
+	return d.cloneTriggers(ctx, source, template)
 }
 
 // schemaObject is one base table or view enumerated from
@@ -664,6 +664,129 @@ func (d *Driver) cloneViews(ctx context.Context, qsource, qtemplate string, view
 		}
 	}
 	return nil
+}
+
+// cloneTriggers replays every trigger from `source` onto `template`.
+// Triggers live in the server's data dictionary — not in table rows or
+// InnoDB tablespaces — so no clone path carries them implicitly: the
+// logical path copies CREATE TABLE + INSERT…SELECT and the physical
+// path copies .ibd files. Without this replay every clone silently
+// loses its triggers (issue #20: trigger-dependent tests pass serially
+// against the source and fail on the paratest worker clones — same bug
+// class as the ES clone dropping aliases). Runs after every successful
+// clone, on all three paths.
+//
+// Replay follows ACTION_ORDER so multi-trigger chains declared with
+// FOLLOWS/PRECEDES land in the same firing order without needing the
+// clause itself, and each trigger is created under its original
+// sql_mode (as mysqldump does) so body semantics don't shift.
+func (d *Driver) cloneTriggers(ctx context.Context, source, template string) error {
+	qsource, err := ident.QuoteMySQL(source)
+	if err != nil {
+		return err
+	}
+	qtemplate, err := ident.QuoteMySQL(template)
+	if err != nil {
+		return err
+	}
+	rows, err := d.DB.QueryContext(ctx, `
+		SELECT CONVERT(TRIGGER_NAME USING utf8mb4)
+		FROM information_schema.TRIGGERS
+		WHERE TRIGGER_SCHEMA = ?
+		ORDER BY EVENT_OBJECT_TABLE, EVENT_MANIPULATION, ACTION_TIMING, ACTION_ORDER`, source)
+	if err != nil {
+		return fmt.Errorf("list triggers for %s: %w", qsource, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return err
+		}
+		names = append(names, n)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		return nil
+	}
+
+	conn, err := d.DB.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
+		return fmt.Errorf("USE %s: %w", qtemplate, err)
+	}
+	for _, name := range names {
+		mode, stmt, err := showCreateTrigger(ctx, conn, qsource, name)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, "SET SESSION sql_mode = ?", mode); err != nil {
+			return fmt.Errorf("set sql_mode for trigger %s: %w", name, err)
+		}
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("recreate trigger %s on %s: %w", name, qtemplate, err)
+		}
+	}
+	return nil
+}
+
+// showCreateTrigger returns (sql_mode, original CREATE statement) for
+// qsource.name. Scans SHOW CREATE TRIGGER by column position — column 2
+// is sql_mode, column 3 the statement — discarding the rest, so the
+// 6-vs-7 column difference across server versions doesn't matter. The
+// statement references its table unqualified, so the caller must have
+// USE'd the destination database before executing it.
+func showCreateTrigger(ctx context.Context, conn *sql.Conn, qsource, name string) (mode, stmt string, err error) {
+	qt, err := ident.QuoteMySQL(name)
+	if err != nil {
+		return "", "", err
+	}
+	rows, err := conn.QueryContext(ctx, "SHOW CREATE TRIGGER "+qsource+"."+qt)
+	if err != nil {
+		return "", "", fmt.Errorf("SHOW CREATE TRIGGER %s.%s: %w", qsource, qt, err)
+	}
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		return "", "", err
+	}
+	if len(cols) < 3 {
+		return "", "", fmt.Errorf("SHOW CREATE TRIGGER %s.%s: %d columns, want >= 3", qsource, qt, len(cols))
+	}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", "", err
+		}
+		return "", "", fmt.Errorf("SHOW CREATE TRIGGER %s.%s: empty result", qsource, qt)
+	}
+	vals := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return "", "", err
+	}
+	return rawString(vals[1]), rawString(vals[2]), nil
+}
+
+// rawString renders a Scan-into-any value (string or []byte from the
+// text protocol) as a string.
+func rawString(v any) string {
+	switch s := v.(type) {
+	case string:
+		return s
+	case []byte:
+		return string(s)
+	default:
+		return fmt.Sprint(s)
+	}
 }
 
 // mysqlCloneFanout caps how many table copies run in parallel inside
@@ -867,7 +990,7 @@ func (d *Driver) SnapshotRestoreStaged(ctx context.Context, template, target str
 		rerr := d.physicalRestoreFromStage(ctx, st, target)
 		if rerr == nil {
 			d.setLastStrategy(CloneStrategyPhysical)
-			return nil
+			return d.cloneTriggers(ctx, template, target)
 		}
 		slog.Warn("mysql physical restore-from-stage failed; using logical restore",
 			"template", template, "target", target, "error", rerr)

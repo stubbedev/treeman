@@ -8,6 +8,16 @@ CREATE TABLE products (
   price DECIMAL(10, 2) NOT NULL
 ) ENGINE=InnoDB;
 
+-- Audit table + trigger: clones must replay triggers, not just copy
+-- tables/tablespaces (issue #20).
+CREATE TABLE product_audit (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  product_id INT NOT NULL
+) ENGINE=InnoDB;
+
+CREATE TRIGGER products_ai AFTER INSERT ON products
+FOR EACH ROW INSERT INTO product_audit (product_id) VALUES (NEW.id);
+
 INSERT INTO products (name, price) VALUES
   ('Widget', 9.99),
   ('Gadget', 19.99),
