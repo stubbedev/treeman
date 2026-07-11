@@ -15,5 +15,8 @@
   "mikro-orm": {
     "useTsNode": true,
     "configPaths": ["./mikro-orm.config.ts"]
+  },
+  "overrides": {
+    "figlet": "1.11.0"
   }
 }
