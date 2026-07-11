@@ -151,29 +151,30 @@ jobs:
 
       - run: nix flake check --print-build-logs
 
-      # Push the built package closure to the self-hosted attic cache on
+      # Push the built package closure to the self-hosted xilo cache on
       # master pushes, so `nix run`/flake consumers tracking HEAD pull a
       # prebuilt binary instead of recompiling. Release tags push the same
       # way from release.yml's `cache` job. Best-effort: a cache-push
       # failure (e.g. a transient 504 from the single-vCPU cache box on a
       # large closure) must not redden CI. Retry with backoff, then give
       # up softly.
-      - name: push nix build to attic (master)
+      - name: push nix build to xilo (master)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         continue-on-error: true
         env:
-          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+          XILO_URL: https://nix.stubbe.dev
+          XILO_TOKEN: ${{ secrets.XILO_TOKEN }}
         run: |
           OUT=$(nix build .#treeman --no-link --print-out-paths)
-          nix run nixpkgs#attic-client -- login stubbe https://nix.stubbe.dev "$ATTIC_TOKEN"
+          curl -fsSL https://github.com/stubbedev/xilo/releases/latest/download/xilo-linux-amd64.tar.gz | tar -xz
           for attempt in 1 2 3; do
-            if nix run nixpkgs#attic-client -- push treeman $OUT; then
+            if ./xilo push treeman $OUT; then
               exit 0
             fi
-            echo "::warning::attic push attempt $attempt failed; retrying in $((attempt * 30))s"
+            echo "::warning::xilo push attempt $attempt failed; retrying in $((attempt * 30))s"
             sleep $((attempt * 30))
           done
-          echo "::warning::attic push failed after 3 attempts; cache push is best-effort, continuing"
+          echo "::warning::xilo push failed after 3 attempts; cache push is best-effort, continuing"
 
   schema:
     name: regenerate JSON schema
