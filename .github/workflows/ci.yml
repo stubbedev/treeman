@@ -158,17 +158,21 @@ jobs:
       # failure (e.g. a transient 504 from the single-vCPU cache box on a
       # large closure) must not redden CI. Retry with backoff, then give
       # up softly.
+      - name: setup xilo
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: stubbedev/xilo@v0
+        with:
+          url: https://nix.stubbe.dev
+          cache: treeman
+          token: ${{ secrets.XILO_TOKEN }}
+
       - name: push nix build to xilo (master)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         continue-on-error: true
-        env:
-          XILO_URL: https://nix.stubbe.dev
-          XILO_TOKEN: ${{ secrets.XILO_TOKEN }}
         run: |
           OUT=$(nix build .#treeman --no-link --print-out-paths)
-          curl -fsSL https://github.com/stubbedev/xilo/releases/latest/download/xilo-linux-amd64.tar.gz | tar -xz
           for attempt in 1 2 3; do
-            if ./xilo push treeman $OUT; then
+            if xilo push treeman $OUT; then
               exit 0
             fi
             echo "::warning::xilo push attempt $attempt failed; retrying in $((attempt * 30))s"
