@@ -160,10 +160,10 @@ jobs:
       # up softly.
       - name: setup xilo
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        uses: stubbedev/xilo@v0
+        uses: stubbedev/xilo@v1
         with:
           url: https://nix.stubbe.dev
-          cache: treeman
+          cache: default
           token: ${{ secrets.XILO_TOKEN }}
 
       - name: push nix build to xilo (master)
@@ -172,7 +172,7 @@ jobs:
         run: |
           OUT=$(nix build .#treeman --no-link --print-out-paths)
           for attempt in 1 2 3; do
-            if xilo push treeman $OUT; then
+            if xilo push default $OUT; then
               exit 0
             fi
             echo "::warning::xilo push attempt $attempt failed; retrying in $((attempt * 30))s"
