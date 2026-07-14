@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 // completionHandler dispatches MCP `completion/complete` requests to
@@ -95,9 +97,12 @@ func worktreeSlugCompletions(ctx context.Context) []string {
 		return nil
 	}
 	defer func() { _ = st.Close() }()
+	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	rows, err := st.DB.QueryContext(ctx, `
-		SELECT slug FROM worktrees WHERE deleted_at IS NULL AND slug IS NOT NULL
-		ORDER BY slug`)
+		SELECT w.slug FROM worktrees w
+		WHERE w.deleted_at IS NULL AND w.slug IS NOT NULL
+		AND `+store.WorktreeNotTearingDown+`
+		ORDER BY w.slug`)
 	if err != nil {
 		return nil
 	}
@@ -130,10 +135,12 @@ func branchCompletions(ctx context.Context) []string {
 		return nil
 	}
 	defer func() { _ = st.Close() }()
+	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	rows, err := st.DB.QueryContext(ctx, `
-		SELECT DISTINCT branch FROM worktrees
-		WHERE deleted_at IS NULL AND branch IS NOT NULL AND branch != ''
-		ORDER BY branch`)
+		SELECT DISTINCT w.branch FROM worktrees w
+		WHERE w.deleted_at IS NULL AND w.branch IS NOT NULL AND w.branch != ''
+		AND `+store.WorktreeNotTearingDown+`
+		ORDER BY w.branch`)
 	if err != nil {
 		return nil
 	}

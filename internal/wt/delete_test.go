@@ -2,9 +2,12 @@ package wt
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stubbedev/treeman/internal/store"
 )
 
 func TestDeleteValidation(t *testing.T) {
@@ -53,5 +56,42 @@ func TestDeleteRefusesMainWorktree(t *testing.T) {
 	}, NoopSink{})
 	if err == nil || !strings.Contains(err.Error(), "main worktree") {
 		t.Fatalf("deleting the repo root must be refused, got %v", err)
+	}
+}
+
+// TestDeleteRefusesTeardownInFlight — the double-delete guard: a
+// second delete against a worktree whose teardown is already running
+// (delete:start with no end/error) must be refused; Force stays as
+// the escape hatch for a hung teardown.
+func TestDeleteRefusesTeardownInFlight(t *testing.T) {
+	ctx := context.Background()
+	st := withTempStore(t)
+	repoRoot := t.TempDir()
+	wtPath := filepath.Join(repoRoot, ".worktrees", "feature-x")
+	repoID, err := st.EnsureRepo(ctx, repoRoot, "myapp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtID, err := st.EnsureWorktree(ctx, repoID, wtPath, "app_feature-x", "feature/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteStart, "start", repoID, wtID, "", 0, nil)
+
+	// By slug: LookupWorktree skips tearing-down rows, so the target
+	// resolves to nothing — no second teardown fires.
+	_, err = Delete(ctx, DeleteRequest{RepoRoot: repoRoot, Target: "app_feature-x"}, NoopSink{})
+	if err == nil || !strings.Contains(err.Error(), "no worktree matches") {
+		t.Fatalf("slug of tearing-down worktree must not resolve, got %v", err)
+	}
+
+	// By explicit path: bypasses the lookup, so the path guard must
+	// catch it.
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Delete(ctx, DeleteRequest{RepoRoot: repoRoot, Target: wtPath}, NoopSink{})
+	if err == nil || !strings.Contains(err.Error(), "teardown already in progress") {
+		t.Fatalf("path of tearing-down worktree must be refused, got %v", err)
 	}
 }

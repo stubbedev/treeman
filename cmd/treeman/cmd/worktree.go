@@ -451,8 +451,15 @@ func wtList() *cli.Command {
 			defer func() { _ = st.Close() }()
 
 			var (
-				args    []any
-				where   = "deleted_at IS NULL"
+				args []any
+				// Tearing-down worktrees are excluded in SQL: the daemon
+				// writes delete:start the instant teardown begins but only
+				// flips deleted_at when the final git-remove lands, so
+				// without the predicate a tearing-down worktree lingers in
+				// the list for the whole DB-drop + hooks window.
+				// Self-healing: a failed teardown lands delete:error and
+				// the worktree reappears.
+				where   = "w.deleted_at IS NULL AND " + store.WorktreeNotTearingDown
 				orderBy string
 			)
 			if r := c.String("repo"); r != "" {
@@ -460,20 +467,20 @@ func wtList() *cli.Command {
 				if repoID == 0 {
 					return fmt.Errorf("no repo registered at %s", r)
 				}
-				where += " AND repo_id = ?"
+				where += " AND w.repo_id = ?"
 				args = append(args, repoID)
 			}
 			switch c.String("sort") {
 			case "visited":
-				orderBy = "ORDER BY IFNULL(last_visited_at, 0) DESC, id"
+				orderBy = "ORDER BY IFNULL(w.last_visited_at, 0) DESC, w.id"
 			case "mtime", "id", "":
-				orderBy = "ORDER BY id"
+				orderBy = "ORDER BY w.id"
 			default:
 				return fmt.Errorf("unknown --sort %q (id|mtime|visited)", c.String("sort"))
 			}
 			//nolint:gosec // where/orderBy are fixed fragments; values are parameterized via args
-			q := `SELECT id, slug, COALESCE(branch,'-'), path, COALESCE(last_visited_at, 0), is_main
-				FROM worktrees WHERE ` + where + ` ` + orderBy
+			q := `SELECT w.id, w.slug, COALESCE(w.branch,'-'), w.path, COALESCE(w.last_visited_at, 0), w.is_main
+				FROM worktrees w WHERE ` + where + ` ` + orderBy
 			rows, err := st.DB.QueryContext(ctx, q, args...)
 			if err != nil {
 				return err
@@ -494,22 +501,6 @@ func wtList() *cli.Command {
 			if err := rows.Err(); err != nil {
 				return err
 			}
-
-			// Drop worktrees whose teardown is in flight. The daemon
-			// writes delete:start the instant teardown begins but only
-			// flips deleted_at when the final git-remove lands at the
-			// very end, so without this a tearing-down worktree lingers
-			// in the list — and in the gwtd picker — for the whole
-			// DB-drop + hooks window. Self-healing: a failed teardown
-			// lands delete:error and the worktree reappears.
-			kept := all[:0]
-			for _, r := range all {
-				if isTearingDown(ctx, st, r.ID) {
-					continue
-				}
-				kept = append(kept, r)
-			}
-			all = kept
 
 			withStatus := c.Bool("with-status")
 			withState := c.Bool("with-state")
@@ -1252,9 +1243,11 @@ func registryWorktreeForBranch(ctx context.Context, repoRoot, branch string) (st
 		return "", false
 	}
 	defer func() { _ = st.Close() }()
+	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	row := st.DB.QueryRowContext(ctx, `
 		SELECT w.path FROM worktrees w JOIN repos r ON r.id = w.repo_id
 		WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL AND w.branch = ?
+		AND `+store.WorktreeNotTearingDown+`
 		ORDER BY w.id DESC LIMIT 1`, repoRoot, branch)
 	var p string
 	if err := row.Scan(&p); err != nil {

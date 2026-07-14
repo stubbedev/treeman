@@ -108,6 +108,17 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 		)
 	}
 
+	// Double-delete guard: a teardown already in flight for this path
+	// means the daemon is mid DB-drop/hooks — dispatching a second one
+	// would race it. LookupWorktree above already skips tearing-down
+	// rows, but an explicit path target bypasses the lookup, so check
+	// the path directly. Force stays as the escape hatch for a
+	// teardown that hung without landing delete:end / delete:error.
+	if !req.Force && teardownInFlight(ctx, req.RepoRoot, wtPath) {
+		return DeleteResult{}, fmt.Errorf(
+			"teardown already in progress for %s (use --force to run it again)", wtPath)
+	}
+
 	if req.Detached {
 		if err := inlineTeardown(ctx, req.RepoRoot, wtPath, req.Force, req.Env, sink); err != nil {
 			return DeleteResult{WtPath: wtPath}, err
@@ -128,6 +139,28 @@ func Delete(ctx context.Context, req DeleteRequest, sink Sink) (DeleteResult, er
 		return DeleteResult{WtPath: wtPath}, err
 	}
 	return DeleteResult{WtPath: wtPath, Status: DeleteInline}, nil
+}
+
+// teardownInFlight reports whether the live registry row at wtPath is
+// mid-teardown (latest delete event is delete:start). Best-effort: an
+// unreadable store answers false and the delete proceeds.
+func teardownInFlight(ctx context.Context, repoRoot, wtPath string) bool {
+	dbPath, err := store.DefaultDBPath()
+	if err != nil {
+		return false
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = st.Close() }()
+	var one int
+	qErr := st.DB.QueryRowContext(ctx, `
+		SELECT 1 FROM worktrees w JOIN repos r ON r.id = w.repo_id
+		WHERE r.path = ? COLLATE NOCASE AND w.path = ? COLLATE NOCASE
+		AND w.deleted_at IS NULL AND NOT (`+store.WorktreeNotTearingDown+`)`,
+		repoRoot, wtPath).Scan(&one)
+	return qErr == nil
 }
 
 // pathsEqual reports whether two paths point at the same directory.

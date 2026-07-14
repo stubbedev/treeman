@@ -33,10 +33,15 @@ func LookupWorktree(ctx context.Context, repoRoot, name string, sink Sink) (stri
 		return "", false
 	}
 	defer func() { _ = st.Close() }()
+	// Worktrees mid-teardown are excluded: resolving one would hand out
+	// a path that's about to disappear (switch/go) or re-enter a
+	// teardown already in flight (delete).
+	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT w.path, w.slug, COALESCE(w.branch,'')
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		WHERE w.deleted_at IS NULL AND r.path = ?`, repoRoot)
+		WHERE w.deleted_at IS NULL AND r.path = ?
+		AND `+store.WorktreeNotTearingDown, repoRoot)
 	if err != nil {
 		return "", false
 	}

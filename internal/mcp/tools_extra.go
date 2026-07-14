@@ -988,10 +988,12 @@ func branchOccupancyFromStore(ctx context.Context, repoRoot string) (map[string]
 		return nil, err
 	}
 	defer func() { _ = st.Close() }()
+	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT COALESCE(w.branch, ''), w.path
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		WHERE r.path = ? AND w.deleted_at IS NULL AND w.branch IS NOT NULL`, repoRoot)
+		WHERE r.path = ? AND w.deleted_at IS NULL AND w.branch IS NOT NULL
+		AND `+store.WorktreeNotTearingDown, repoRoot)
 	if err != nil {
 		return nil, err
 	}

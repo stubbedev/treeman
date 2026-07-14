@@ -154,6 +154,37 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 	return out, rows.Err()
 }
 
+// WorktreeNotTearingDown is a SQL predicate fragment (over a worktrees
+// alias `w`) that excludes worktrees whose teardown is in flight: the
+// latest delete-lifecycle event is delete:start with no later
+// delete:end / delete:error. The daemon writes delete:start the moment
+// teardown begins but flips deleted_at only when the final git-remove
+// lands, so `deleted_at IS NULL` alone keeps a tearing-down worktree
+// "live" for the whole DB-drop + hooks window. Every user-facing
+// surface (list, pickers, completion, name resolution) appends this so
+// a worktree mid-teardown can't be switched to or deleted twice.
+// Self-healing: a failed teardown lands delete:error and the worktree
+// reappears. Built purely from compile-time constants — safe to
+// concatenate into queries.
+const WorktreeNotTearingDown = `NOT EXISTS (
+	SELECT 1 FROM events e
+	WHERE e.worktree_id = w.id AND e.event_type = '` + EvtWorktreeDeleteStart + `'
+	AND e.id > COALESCE((
+		SELECT MAX(e2.id) FROM events e2
+		WHERE e2.worktree_id = w.id
+		AND e2.event_type IN ('` + EvtWorktreeDeleteEnd + `','` + EvtWorktreeDeleteError + `')), 0))`
+
+// IsWorktreeTearingDown reports whether a teardown is currently in
+// flight for the worktree — the programmatic form of (the inverse of)
+// WorktreeNotTearingDown, for guards that hold an id rather than a
+// query to extend.
+func (s *Store) IsWorktreeTearingDown(ctx context.Context, wtID int64) bool {
+	var one int
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT 1 FROM worktrees w WHERE w.id = ? AND NOT (`+WorktreeNotTearingDown+`)`, wtID).Scan(&one)
+	return err == nil
+}
+
 // WorktreeMatch is one candidate row returned by LookupWorktreeMatches.
 // Kind records WHICH column produced the hit so callers can apply
 // match-rank precedence (branch beats slug, slug beats path).

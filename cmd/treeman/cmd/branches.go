@@ -178,7 +178,9 @@ func listGitBranches(repoRoot string, remote bool) []string {
 
 // branchOccupancy returns branch → worktree-path for every live
 // worktree of `repoRoot`. One SQLite round-trip — cheaper than a
-// per-worktree `git worktree list --porcelain` parse.
+// per-worktree `git worktree list --porcelain` parse. Worktrees
+// mid-teardown are excluded — they feed completion and the pickers,
+// and must never surface a path that's about to disappear.
 func branchOccupancy(ctx context.Context, repoRoot string) map[string]string {
 	dbPath, err := store.DefaultDBPath()
 	if err != nil {
@@ -189,10 +191,12 @@ func branchOccupancy(ctx context.Context, repoRoot string) map[string]string {
 		return nil
 	}
 	defer func() { _ = st.Close() }()
+	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT COALESCE(w.branch, ''), w.path
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL AND w.branch IS NOT NULL`, repoRoot)
+		WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL AND w.branch IS NOT NULL
+		AND `+store.WorktreeNotTearingDown, repoRoot)
 	if err != nil {
 		return nil
 	}

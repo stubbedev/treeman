@@ -704,9 +704,13 @@ func worktreeListTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in worktre
 		return nil, worktreeListOut{}, err
 	}
 	defer func() { _ = st.Close() }()
+	// Worktrees mid-teardown are excluded — same contract as the CLI's
+	// `worktree list`, so an agent never acts on a path that's about to
+	// disappear.
+	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	q := `SELECT w.id, r.path, w.path, w.slug, COALESCE(w.branch,''), w.created_at
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		WHERE w.deleted_at IS NULL`
+		WHERE w.deleted_at IS NULL AND ` + store.WorktreeNotTearingDown
 	args := []any{}
 	if in.Repo != "" {
 		repo, err := resolveRepo(ctx, in.Repo)

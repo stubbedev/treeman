@@ -19,6 +19,7 @@ import (
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/gitx"
+	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/tui"
 	"github.com/stubbedev/treeman/internal/ui"
 	"github.com/stubbedev/treeman/internal/wt"
@@ -129,7 +130,10 @@ func worktreeRoute(ctx context.Context, repoRoot, branch, from string, noFetch b
 // attempt (git would refuse anyway: "already used by worktree"). A
 // registry row whose directory is gone (manual rm -rf) is ignored so
 // switch never hands the shell a dead path; the create flow self-heals
-// the stale row.
+// the stale row. The git fallback also skips paths mid-teardown —
+// git still lists them until the final git-remove lands, and handing
+// the shell a directory that's about to disappear is worse than a
+// create that git refuses.
 func liveWorktreeForBranch(ctx context.Context, repoRoot, branch string) (string, bool) {
 	if path, ok := registryWorktreeForBranch(ctx, repoRoot, branch); ok {
 		if _, err := os.Stat(path); err == nil {
@@ -137,7 +141,7 @@ func liveWorktreeForBranch(ctx context.Context, repoRoot, branch string) (string
 		}
 	}
 	if path, ok := gitWorktrees(ctx, repoRoot)[branch]; ok {
-		if _, err := os.Stat(path); err == nil {
+		if _, err := os.Stat(path); err == nil && !tearingDownPaths(ctx, repoRoot)[filepath.Clean(path)] {
 			return path, true
 		}
 	}
@@ -146,21 +150,57 @@ func liveWorktreeForBranch(ctx context.Context, repoRoot, branch string) (string
 
 // occupiedWorktrees merges the registry occupancy map with git's own
 // worktree list (union; registry wins on conflicts) and drops entries
-// whose directory no longer exists. This is the source for the switch
-// menu + delete picker, so foreign worktrees show up and dead registry
-// rows never surface a cd-able path.
+// whose directory no longer exists or whose teardown is in flight.
+// This is the source for the switch menu + delete picker, so foreign
+// worktrees show up, dead registry rows never surface a cd-able path,
+// and a worktree mid-teardown never offers itself as a destination.
 func occupiedWorktrees(ctx context.Context, repoRoot string) map[string]string {
 	occ := gitWorktrees(ctx, repoRoot)
 	if occ == nil {
 		occ = map[string]string{}
 	}
 	maps.Copy(occ, branchOccupancy(ctx, repoRoot))
+	tearing := tearingDownPaths(ctx, repoRoot)
 	for branch, path := range occ {
-		if _, err := os.Stat(path); err != nil {
+		if _, err := os.Stat(path); err != nil || tearing[filepath.Clean(path)] {
 			delete(occ, branch)
 		}
 	}
 	return occ
+}
+
+// tearingDownPaths returns the (cleaned) paths of worktrees whose
+// teardown is in flight (store.WorktreeNotTearingDown inverted), for
+// callers whose data comes from OUTSIDE the registry — git porcelain
+// entries in occupiedWorktrees / liveWorktreeForBranch, where the SQL
+// predicate can't be applied at query time.
+func tearingDownPaths(ctx context.Context, repoRoot string) map[string]bool {
+	dbPath, err := store.DefaultDBPath()
+	if err != nil {
+		return nil
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = st.Close() }()
+	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
+	rows, err := st.DB.QueryContext(ctx, `
+		SELECT w.path FROM worktrees w JOIN repos r ON r.id = w.repo_id
+		WHERE r.path = ? COLLATE NOCASE AND w.deleted_at IS NULL
+		AND NOT (`+store.WorktreeNotTearingDown+`)`, repoRoot)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]bool{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err == nil {
+			out[filepath.Clean(p)] = true
+		}
+	}
+	return out
 }
 
 // gitWorktrees parses `git worktree list --porcelain` into
