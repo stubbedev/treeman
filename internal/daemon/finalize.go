@@ -37,6 +37,61 @@ func withRetryHint(msg string) string {
 	return msg + "\nhint: retry this worktree with `treeman worktree finalize`"
 }
 
+// finalizeFailure carries the terminal-failure context out of
+// FinalizeWorktree's defer and into recordFinalizeFailure. Grouped in a
+// struct so the defer stays a single call (keeping FinalizeWorktree
+// under the cyclomatic-complexity gate).
+type finalizeFailure struct {
+	repoRoot, wtRoot, slugVal string
+	repoID, wtID              int64
+	// enginesTouched is true only when engine prepare was entered — the
+	// gate on the recovery drops below.
+	enginesTouched bool
+	err            error
+}
+
+// recordFinalizeFailure is FinalizeWorktree's terminal-failure tail:
+// recover the engine namespaces (when prepare actually ran) and write
+// the worktree:create:error event that flips the row out of `preparing`
+// (see #11).
+//
+// Recovery resets the per-worktree primary namespace so the documented
+// `treeman worktree finalize` retry cold-rebuilds end-to-end instead of
+// tripping on the half-applied migrations a mid-prepare failure leaves
+// behind (duplicate-column / table-exists). It is gated on
+// f.enginesTouched: a failure BEFORE prepare — a create-before-engines
+// hook, bring-in, the checkout wait — left engine state untouched, so
+// dropping the databases destroys healthy state and turns the retry
+// into a rebuild-from-nothing (#21).
+//
+// Reaching here with f.err != nil already means a GENUINE failure: the
+// pipeline converts every cancellation/timeout into `done=true,
+// err=nil` at its phase boundaries (see runFinalizeSetupPipeline), so a
+// teardown preempt or watchdog timeout never lands here — those are
+// cleaned by TeardownWorktree / FinalizeWatchdogLoop respectively. No
+// ctx-liveness gate is possible anyway: FinalizeWorktree's `defer
+// cancel()` runs first under LIFO, so `ctx` is already cancelled.
+//
+// Both the recovery drops AND the terminal error event therefore run on
+// a FRESH context: the engine drops must dial, and the non-batched
+// WriteEvent path executes its INSERT against the ctx — on the
+// cancelled finalize ctx the very event that flips the row to `failed`
+// would be silently dropped.
+func recordFinalizeFailure(ctx context.Context, st *State, cfg *config.Config, f finalizeFailure) {
+	termCtx, termCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)
+	defer termCancel()
+	// Best-effort: drops surface as their own `worktree:recover:*`
+	// events and never mask the failure event written below.
+	if f.enginesTouched {
+		prepare.RecoverStaleWorktree(termCtx, cfg, f.slugVal, f.wtRoot, f.repoID, f.wtID, st.Store)
+	}
+	_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, withRetryHint(f.err.Error()),
+		f.repoID, f.wtID, "", 0, map[string]string{
+			"repo_path":     f.repoRoot,
+			"worktree_path": f.wtRoot,
+		})
+}
+
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
 // goroutine) tail of `treeman worktree create`: it runs the create
 // hook pipeline + engine prepare against the main repo root,
@@ -59,6 +114,15 @@ func FinalizeWorktree(
 		termRepoID int64
 		termWtID   int64
 		termSlug   string
+		// enginesTouched flips true the moment prepare.Run is entered —
+		// the ONLY point from which engine state can be half-applied.
+		// The terminal defer gates its recovery drops on this so a
+		// failure BEFORE prepare (create-before-engines hook, bring-in,
+		// checkout wait) never tears down databases it didn't touch:
+		// on an already-prepared worktree those DBs are healthy, and
+		// dropping them turns the documented `worktree finalize` retry
+		// into a rebuild-from-nothing (#21).
+		enginesTouched bool
 	)
 	defer func() {
 		if err == nil {
@@ -71,42 +135,17 @@ func FinalizeWorktree(
 			// dispatch.go log a global worktree:create:error error instead.
 			return
 		}
-		// Reset the per-worktree primary namespace so the documented
-		// `treeman worktree finalize` retry cold-rebuilds end-to-end instead
-		// of tripping on the half-applied migrations a mid-prepare
-		// failure leaves behind (duplicate-column / table-exists). This
-		// unifies the direct-failure path with SweepStalePreparing and
-		// FinalizeWatchdogLoop, which already recover before their retry.
-		//
-		// Reaching this defer with err != nil already means a GENUINE
-		// failure: the pipeline converts every cancellation/timeout into
-		// `done=true, err=nil` at its phase boundaries (see
-		// runFinalizeSetupPipeline), so a teardown preempt or watchdog
-		// timeout never lands here — those are cleaned by TeardownWorktree
-		// / FinalizeWatchdogLoop respectively. No ctx-liveness gate is
-		// possible anyway: the `defer cancel()` below runs first under
-		// LIFO, so `ctx` is already cancelled here.
-		//
-		// Both the recovery drops AND the terminal error event therefore
-		// run on a FRESH context: the engine drops must dial, and the
-		// non-batched WriteEvent path executes its INSERT against the
-		// ctx — on the cancelled finalize ctx the very event that flips
-		// the row to `failed` would be silently dropped.
-		termCtx, termCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)
-		defer termCancel()
-		// Best-effort: drops surface as their own `worktree:recover:*`
-		// events and never mask the failure event written below.
-		prepare.RecoverStaleWorktree(termCtx, &cfg, termSlug, wtRoot, termRepoID, termWtID, st.Store)
-		// Terminal event for `finalizeState` — without this, a
-		// prepare/hook failure leaves the row derived as preparing
-		// forever (see #11). Swallow the returned error afterwards so
-		// dispatch doesn't double-log the same failure as a second
-		// (row-less) worktree:create:error event.
-		_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, withRetryHint(err.Error()),
-			termRepoID, termWtID, "", 0, map[string]string{
-				"repo_path":     repoRoot,
-				"worktree_path": wtRoot,
-			})
+		recordFinalizeFailure(ctx, st, &cfg, finalizeFailure{
+			repoRoot:       repoRoot,
+			wtRoot:         wtRoot,
+			slugVal:        termSlug,
+			repoID:         termRepoID,
+			wtID:           termWtID,
+			enginesTouched: enginesTouched,
+			err:            err,
+		})
+		// Swallow the error so dispatch doesn't double-log the same
+		// failure as a second (row-less) worktree:create:error event.
 		err = nil
 	}()
 
@@ -274,7 +313,7 @@ func FinalizeWorktree(
 	// Phase boundaries double as cancellation checkpoints: a
 	// concurrent TeardownWorktree fires `cancel` via CancelFinalize,
 	// and the next check bails before prepare creates databases.
-	done, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl, isMain, repoID, wtID, inheritedEnv)
+	done, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl, isMain, repoID, wtID, inheritedEnv, &enginesTouched)
 	if err != nil {
 		return err
 	}
@@ -466,6 +505,10 @@ func applyFinalizePatches(
 // watcher / emitting the done event. A non-nil error aborts the
 // pipeline. Extracted from FinalizeWorktree to keep that function
 // under the cyclomatic-complexity gate.
+//
+// enginesTouched is set to true the moment prepare.Run is entered, so
+// the caller's terminal defer knows whether engine state could be
+// half-applied and thus whether recovery drops are warranted (#21).
 func runFinalizeSetupPipeline(
 	ctx context.Context,
 	st *State,
@@ -475,6 +518,7 @@ func runFinalizeSetupPipeline(
 	isMain bool,
 	repoID, wtID int64,
 	inheritedEnv map[string]string,
+	enginesTouched *bool,
 ) (done bool, err error) {
 	if cancelledBefore(ctx, st, "pre-hooks", repoID, wtID) {
 		return true, nil
@@ -495,6 +539,7 @@ func runFinalizeSetupPipeline(
 		return true, nil
 	}
 	if len(cfg.Databases) > 0 {
+		*enginesTouched = true
 		_, prepErr := prepare.Run(ctx, cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv)
 		// A cancelled context means a concurrent teardown preempted
 		// prepare — a clean stop regardless of whether prepare.Run
