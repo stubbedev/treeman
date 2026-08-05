@@ -40,6 +40,9 @@ import (
 //     active. The durable copy is left intact; the next prepare's
 //     runBranchScoped sees !exists and re-fills from durable(branch).
 //
+//   - s3 (either mode) → nothing. Object stores have no migrations to
+//     half-apply, and their contents are unrebuildable (#22).
+//
 // Errors per-engine are emitted as `wt_recovery_error` events at warn
 // level and otherwise swallowed: a missing engine connection or a
 // dropped server shouldn't block recovery of the others.
@@ -285,6 +288,21 @@ func recoverBranchScoped(
 ) error {
 	scope, _, ok := branchScopeFor(d.Engine)
 	if !ok {
+		return nil
+	}
+	// S3 is exempt, same as the test-clone arm above. Recovery exists to
+	// clear half-applied migrations — and validate.go rejects `dump:`,
+	// `migrate:`, `seed:` and `test_clones:` for object stores, so an s3
+	// bucket has no half-applied state to clear. What it does have is
+	// objects treeman cannot rebuild (they arrive via hooks or the user),
+	// and for the main worktree the active bucket IS the developer's live
+	// overlay bucket. Dropping it on an unrelated failure — a wedged
+	// prepare the watchdog cancels, a daemon restart, a
+	// create-after-engines hook exit — is silent data loss (#22). A
+	// partially copied bucket from an interrupted branch swap is the
+	// lesser evil, and `treeman db reset --engine s3` still re-seeds it
+	// when the user explicitly asks for that.
+	if fam, _ := engine.Canonical(d.Engine); fam == engine.FamilyS3 {
 		return nil
 	}
 	active, err := activeNamespace(d, scope, worktreePath)
