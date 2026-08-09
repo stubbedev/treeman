@@ -153,7 +153,12 @@ func installContextMiddleware(srv *mcpsdk.Server) {
 			// (the SDK's checkInitialized is a no-op, so it won't reject).
 			if ss, ok := req.GetSession().(*mcpsdk.ServerSession); ok && clientSupportsRoots(ss) {
 				r.listRoots = func() []string {
-					res, err := ss.ListRoots(ctx, nil)
+					// SEP-2577 deprecates roots as of 2026-07-28, but it
+					// stays functional for at least twelve months and is
+					// still how most clients hand us a workspace. Drop
+					// this branch once clients pass roots via headers or
+					// tool params instead.
+					res, err := ss.ListRoots(ctx, nil) //nolint:staticcheck // SA1019: deprecated but load-bearing for existing clients
 					if err != nil || res == nil {
 						return nil
 					}
@@ -175,13 +180,34 @@ func installContextMiddleware(srv *mcpsdk.Server) {
 	})
 }
 
+// rootsRemovedFrom is the first protocol revision that forbids
+// server-initiated requests (SEP-2322 / SEP-2575): from here on
+// roots/list can only be requested by returning InputRequests from a
+// tool handler, so the middleware's server->client call is dead. ISO
+// dates compare correctly as strings.
+const rootsRemovedFrom = "2026-07-28"
+
 // clientSupportsRoots reports whether the client advertised the MCP roots
-// capability at initialize. Guards the server->client roots/list call so
-// it is only issued to clients that will answer it.
+// capability and negotiated a protocol version where the server may still
+// ask for them. Guards the server->client roots/list call so it is only
+// issued to clients that will answer it.
+//
+// On >= 2026-07-28 the SDK rejects the call outright, so a shared HTTP
+// server must be handed its workspace some other way: the X-Repo-Root
+// header (see rootHeaders) or an explicit repo/worktree tool argument.
 func clientSupportsRoots(ss *mcpsdk.ServerSession) bool {
 	if ss == nil {
 		return false
 	}
-	ip := ss.InitializeParams()
-	return ip != nil && ip.Capabilities != nil && ip.Capabilities.RootsV2 != nil
+	return rootsUsable(ss.InitializeParams())
+}
+
+// rootsUsable is clientSupportsRoots' decision, split out so it can be
+// tested without a live session.
+func rootsUsable(ip *mcpsdk.InitializeParams) bool {
+	if ip == nil || ip.Capabilities == nil || ip.ProtocolVersion >= rootsRemovedFrom {
+		return false
+	}
+	// SA1019: roots deprecated in SEP-2577, still supported by clients.
+	return ip.Capabilities.RootsV2 != nil //nolint:staticcheck
 }

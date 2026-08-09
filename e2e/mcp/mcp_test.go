@@ -26,7 +26,10 @@ import (
 	"time"
 )
 
-func TestMCPServerJSONRPC(t *testing.T) {
+// startServer builds and spawns `treeman mcp` on stdio, returning a
+// send/read pair for raw JSON-RPC lines.
+func startServer(t *testing.T) (func(map[string]any), func() map[string]any) {
+	t.Helper()
 	// Build a fresh treeman binary.
 	repoRoot := projectRoot(t)
 	binDir := t.TempDir()
@@ -38,7 +41,7 @@ func TestMCPServerJSONRPC(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	srv := exec.CommandContext(ctx, filepath.Join(binDir, "treeman"), "mcp")
 	// Isolate state so MCP doesn't trip over stale registrations.
 	stateDir := t.TempDir()
@@ -95,6 +98,11 @@ func TestMCPServerJSONRPC(t *testing.T) {
 		}
 		return resp
 	}
+	return send, read
+}
+
+func TestMCPServerJSONRPC(t *testing.T) {
+	send, read := startServer(t)
 
 	// 1. initialize
 	send(map[string]any{

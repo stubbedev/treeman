@@ -3,6 +3,8 @@ package mcp
 import (
 	"net/http"
 	"testing"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestRootPath(t *testing.T) {
@@ -81,5 +83,33 @@ func TestReqResolverPrecedence(t *testing.T) {
 	var nilR *reqResolver
 	if got := nilR.rootDir(); got != "" {
 		t.Fatalf("nil resolver should yield empty, got %q", got)
+	}
+}
+
+// TestRootsUsable pins the protocol gate: server-initiated roots/list is
+// forbidden from 2026-07-28 on (SEP-2322/2575), so we must not attempt it
+// there — such clients supply the workspace via X-Repo-Root or a tool arg.
+func TestRootsUsable(t *testing.T) {
+	withRoots := func(ver string) *mcpsdk.InitializeParams {
+		//nolint:staticcheck // SA1019: exercising the deprecated roots path on purpose
+		caps := &mcpsdk.ClientCapabilities{RootsV2: &mcpsdk.RootCapabilities{}}
+		return &mcpsdk.InitializeParams{ProtocolVersion: ver, Capabilities: caps}
+	}
+	for ver, want := range map[string]bool{
+		"2024-11-05": true,
+		"2025-06-18": true,
+		"2025-11-25": true,
+		"2026-07-28": false,
+		"2027-01-01": false,
+	} {
+		if got := rootsUsable(withRoots(ver)); got != want {
+			t.Errorf("rootsUsable(%s) = %v, want %v", ver, got, want)
+		}
+	}
+	if rootsUsable(nil) {
+		t.Error("nil params should not be roots-usable")
+	}
+	if rootsUsable(&mcpsdk.InitializeParams{ProtocolVersion: "2025-11-25"}) {
+		t.Error("client without roots capability should not be roots-usable")
 	}
 }

@@ -465,8 +465,10 @@ func dispatchEventNotification(
 		sent++
 	}
 	// LoggingMessage gets ignored unless the client called SetLevel —
-	// best-effort.
-	if err := req.Session.Log(ctx, &mcpsdk.LoggingMessageParams{
+	// best-effort. SEP-2577 deprecates logging as of 2026-07-28 (the
+	// progress notification above is the supported path); kept while
+	// it still works for pre-2026-07-28 clients.
+	if err := req.Session.Log(ctx, &mcpsdk.LoggingMessageParams{ //nolint:staticcheck // SA1019: deprecated, still works for older clients
 		Level:  mapEventLevel(e.Level),
 		Logger: "treeman",
 		Data: map[string]any{
@@ -484,6 +486,8 @@ func dispatchEventNotification(
 
 // mapEventLevel maps treeman's level strings (debug|info|warn|error) to
 // the MCP LoggingLevel enum (RFC 5424 syslog levels).
+//
+//nolint:staticcheck // SA1019: LoggingLevel deprecated in SEP-2577, see dispatchEventNotification
 func mapEventLevel(lvl string) mcpsdk.LoggingLevel {
 	switch strings.ToLower(lvl) {
 	case "debug":
