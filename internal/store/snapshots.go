@@ -77,7 +77,23 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 			return nil, fmt.Errorf("decode inputs_json for %s: %w", fingerprint, err)
 		}
 	}
+	r.normalizeMaps()
 	return &r, nil
+}
+
+// normalizeMaps replaces nil map fields with empty ones so the record
+// marshals as `{}` instead of `null`. The MCP output schemas are
+// reflected off this struct and declare both maps as objects, so a nil
+// map made `inputs_fingerprint` fail its own output validation for any
+// snapshot with no input vectors — e.g. a dump-only template, whose row
+// is recorded with nil Inputs (#25).
+func (r *SnapshotRecord) normalizeMaps() {
+	if r.LockfileHashes == nil {
+		r.LockfileHashes = map[string]string{}
+	}
+	if r.Inputs == nil {
+		r.Inputs = map[string]InputVector{}
+	}
 }
 
 // LookupAndTouchSnapshot returns the snapshot row for `fingerprint` —
@@ -118,6 +134,7 @@ func (s *Store) LookupAndTouchSnapshot(ctx context.Context, fingerprint string) 
 			return nil, fmt.Errorf("decode inputs_json for %s: %w", fingerprint, err)
 		}
 	}
+	r.normalizeMaps()
 	return &r, nil
 }
 
@@ -359,6 +376,7 @@ func (s *Store) candidateSnapshots(
 				continue
 			}
 		}
+		r.normalizeMaps()
 		// Never offer a dump-only template as an ancestor: its empty
 		// Inputs would read as a prefix of every run and an incremental
 		// build off it would skip seed.

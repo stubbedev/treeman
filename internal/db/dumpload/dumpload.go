@@ -14,11 +14,17 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
+	"time"
+
+	gomysql "github.com/go-sql-driver/mysql"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/ident"
 )
 
 // LoadMySQL applies `dumpPath` to `targetDB` using the fastest
@@ -44,6 +50,9 @@ import (
 // Compression (gzip/zstd/bzip2/xz) is auto-detected from the file's
 // magic bytes — extension is not consulted.
 func LoadMySQL(ctx context.Context, db *sql.DB, conn *config.MysqlConn, targetDB, dumpPath string) (LoadStrategy, error) {
+	if err := ensureMySQLDB(ctx, db, targetDB); err != nil {
+		return "", err
+	}
 	if ok, err := runFastPathMySQL(ctx, conn, targetDB, dumpPath, tryDockerExecMySQL); ok {
 		return StrategyDockerExec, nil
 	} else if err != nil {
@@ -133,11 +142,99 @@ func loadMySQLViaWire(ctx context.Context, db *sql.DB, targetDB, dumpPath string
 	} {
 		_, _ = conn.ExecContext(ctx, s) // best-effort; some flags need SUPER
 	}
-	_, err = streamStatements(ctx, f, func(stmt string) error {
+	_, err = streamStatements(ctx, f, retryingExec(ctx, func(stmt string) error {
 		_, err := conn.ExecContext(ctx, stmt)
 		return err
-	})
+	}))
 	return err
+}
+
+// ensureMySQLDB creates `targetDB` when it is missing, so a dump load
+// never dies on `USE …: Error 1049 Unknown database`. A prepare that
+// fails between cold-build's DROP DATABASE and the dump load leaves the
+// source gone while SQLite still holds a snapshot row for it; before
+// this, every retry failed on the missing database and the only way out
+// was a manual `snapshots_drop` (#24). Idempotent, and the DDL matches
+// mysql.Driver.EnsureDB so a DB created here is not charset-divergent.
+func ensureMySQLDB(ctx context.Context, db *sql.DB, targetDB string) error {
+	if db == nil {
+		return nil
+	}
+	qname, err := ident.QuoteMySQL(targetDB)
+	if err != nil {
+		return err
+	}
+	//nolint:gosec // qname is validated/quoted via ident.QuoteMySQL; no user values concatenated
+	stmt := "CREATE DATABASE IF NOT EXISTS " + qname +
+		" DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+	if _, err := db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("CREATE DATABASE %s: %w", qname, err)
+	}
+	return nil
+}
+
+// stmtLockRetries / stmtLockBackoff bound the per-statement retry of an
+// InnoDB lock conflict. Contention comes from sibling worktrees loading
+// dumps into their own databases at the same time; the loser is told to
+// restart its transaction and usually wins within a few hundred ms.
+const stmtLockRetries = 4
+
+var stmtLockBackoff = []time.Duration{50 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond, 1 * time.Second}
+
+// retryingExec wraps a per-statement exec so a deadlock (1213) or lock-
+// wait timeout (1205) retries instead of aborting the whole dump load
+// — both are explicitly restartable, and losing a 10-minute load to one
+// of them left the worktree unpreparable (#24).
+//
+// Retrying is only sound under autocommit, where the rolled-back
+// transaction is the single failed statement. Dumps that open an
+// explicit transaction (`BEGIN` / `START TRANSACTION`) get no retry:
+// InnoDB rolled back everything since the BEGIN, so re-running just the
+// last statement would silently commit a partial transaction.
+func retryingExec(ctx context.Context, exec func(stmt string) error) func(stmt string) error {
+	inTx := false
+	return func(stmt string) error {
+		for attempt := 0; ; attempt++ {
+			err := exec(stmt)
+			if err == nil {
+				inTx = txStateAfter(inTx, stmt)
+				return nil
+			}
+			if inTx || attempt >= stmtLockRetries || !isLockContention(err) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(stmtLockBackoff[min(attempt, len(stmtLockBackoff)-1)]):
+			}
+		}
+	}
+}
+
+// txStateAfter reports whether an explicit transaction is open after
+// `stmt` ran. Only the statements mysqldump emits are recognised;
+// anything else leaves the state unchanged.
+func txStateAfter(inTx bool, stmt string) bool {
+	s := strings.ToUpper(strings.TrimLeft(stmt, " \t\r\n"))
+	switch {
+	case strings.HasPrefix(s, "BEGIN"), strings.HasPrefix(s, "START TRANSACTION"):
+		return true
+	case strings.HasPrefix(s, "COMMIT"), strings.HasPrefix(s, "ROLLBACK"):
+		return false
+	}
+	return inTx
+}
+
+// isLockContention reports whether err is an InnoDB deadlock (1213) or
+// lock-wait timeout (1205) — the two errors MySQL itself documents as
+// "try restarting transaction".
+func isLockContention(err error) bool {
+	var me *gomysql.MySQLError
+	if !errors.As(err, &me) {
+		return false
+	}
+	return me.Number == 1213 || me.Number == 1205
 }
 
 // loadPostgresViaWire is the original statement-streaming loader.
