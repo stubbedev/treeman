@@ -125,34 +125,40 @@ func requestCwd(ctx context.Context) (string, error) {
 // <cwd>/develop — a non-existent path that downstream registration
 // would otherwise persist as a phantom worktree row (plus per-branch
 // databases that no teardown reclaims). Branch is read from .git/HEAD.
-func resolveWorktree(ctx context.Context, path string) (wt, branch string) {
+//
+// An unresolvable non-empty argument is an error: the absolute form is
+// still returned (callers that only need a path for a slug computation
+// may ignore it), but every caller that acts on the worktree must fail
+// instead of operating on <cwd>/<name>.
+func resolveWorktree(ctx context.Context, path string) (wt, branch string, err error) {
 	if path == "" {
 		// Default to the request's workspace root (HTTP header / MCP
 		// roots) and only then the process cwd — see resolveRepo.
 		path, _ = requestCwd(ctx)
 		wt, _ = filepath.Abs(path)
-		return wt, detectBranch(wt)
+		return wt, detectBranch(wt), nil
 	}
 	wt, _ = filepath.Abs(path)
 	// An existing directory is an explicit path the caller chose —
 	// honour it verbatim.
-	if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
-		return wt, detectBranch(wt)
+	if fi, statErr := os.Stat(wt); statErr == nil && fi.IsDir() {
+		return wt, detectBranch(wt), nil
 	}
 	// Not an on-disk path: try resolving it as a registered worktree
 	// name (slug / branch / basename) against the repo inferred from
 	// the request's workspace root (or cwd over stdio).
-	if cwd, err := requestCwd(ctx); err == nil {
-		if repoRoot, err := gitenv.MainRoot(ctx, cwd); err == nil {
+	if cwd, cwdErr := requestCwd(ctx); cwdErr == nil {
+		if repoRoot, rootErr := gitenv.MainRoot(ctx, cwd); rootErr == nil {
 			if p, ok := wtpkg.LookupWorktree(ctx, repoRoot, path, wtpkg.NoopSink{}); ok {
-				return p, detectBranch(p)
+				return p, detectBranch(p), nil
 			}
 		}
 	}
-	// Unresolved name and no such path: return the absolute form. The
-	// ResolveIdentity guard refuses to register a non-worktree path, so
-	// a typo surfaces as a clear error instead of a phantom row.
-	return wt, detectBranch(wt)
+	// Neither an on-disk directory nor a registered slug/branch/basename
+	// — e.g. a slug that went stale after a branch switch. Reject it the
+	// way logs_query does instead of handing back <cwd>/<name>, which
+	// queues work against a path that never existed.
+	return wt, detectBranch(wt), fmt.Errorf("no worktree matches %q (try worktree_list)", path)
 }
 
 func detectBranch(worktree string) string {
@@ -225,7 +231,10 @@ func openStore(ctx context.Context) (*store.Store, error) {
 // RunPrepareOnWorktree. Discovers repo + cfg, opens the store,
 // dispatches prepare.Run.
 func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.Outcome, error) {
-	wt, branch := resolveWorktree(ctx, worktree)
+	wt, branch, err := resolveWorktree(ctx, worktree)
+	if err != nil {
+		return nil, err
+	}
 	repoRoot, err := resolveRepo(ctx, repoOverride)
 	if err != nil {
 		repoRoot, err = gitenv.MainRoot(ctx, wt)
@@ -294,7 +303,10 @@ func runPostEngineHooks(
 // restricts the reset to one engine family when non-empty. Returns only
 // the branch_scoped outcomes the reset actually re-seeded.
 func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.Outcome, error) {
-	wt, branch := resolveWorktree(ctx, worktree)
+	wt, branch, err := resolveWorktree(ctx, worktree)
+	if err != nil {
+		return nil, err
+	}
 	repoRoot, err := resolveRepo(ctx, repoOverride)
 	if err != nil {
 		repoRoot, err = gitenv.MainRoot(ctx, wt)
@@ -364,7 +376,10 @@ func runDbReset(ctx context.Context, worktree, repoOverride, engineFilter string
 // the current branch's durable copies without switching branches. Same
 // identity routing as runDbReset.
 func runDbSave(ctx context.Context, worktree, repoOverride, engineFilter string) ([]prepare.BranchScopedSave, error) {
-	wt, branch := resolveWorktree(ctx, worktree)
+	wt, branch, err := resolveWorktree(ctx, worktree)
+	if err != nil {
+		return nil, err
+	}
 	repoRoot, err := resolveRepo(ctx, repoOverride)
 	if err != nil {
 		repoRoot, err = gitenv.MainRoot(ctx, wt)
@@ -394,7 +409,10 @@ func runDbSave(ctx context.Context, worktree, repoOverride, engineFilter string)
 // namespace renders the same name the swap lifecycle uses (bare on the
 // main worktree).
 func runBranchScopedStatus(ctx context.Context, worktree, repoOverride string) ([]prepare.BranchScopedDB, error) {
-	wt, branch := resolveWorktree(ctx, worktree)
+	wt, branch, err := resolveWorktree(ctx, worktree)
+	if err != nil {
+		return nil, err
+	}
 	repoRoot, err := resolveRepo(ctx, repoOverride)
 	if err != nil {
 		repoRoot, err = gitenv.MainRoot(ctx, wt)
@@ -469,7 +487,10 @@ func confirmDestructive(
 // tweak one var (e.g. retry a flaky setup with `DEBUG=1`) without
 // editing .treeman.yaml.
 func runHookPhase(ctx context.Context, phase, worktree string, envOverrides map[string]string) (hooks.RunOutcome, error) {
-	wt, branch := resolveWorktree(ctx, worktree)
+	wt, branch, err := resolveWorktree(ctx, worktree)
+	if err != nil {
+		return hooks.RunOutcome{}, err
+	}
 	repoRoot, err := gitenv.MainRoot(ctx, wt)
 	if err != nil {
 		return hooks.RunOutcome{}, err

@@ -1127,7 +1127,9 @@ type slugComputeOut struct {
 }
 
 func slugComputeTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in slugComputeIn) (*mcpsdk.CallToolResult, slugComputeOut, error) {
-	wt, branch := resolveWorktree(ctx, in.Path)
+	// slug_compute is a pure calculator — an unregistered or not-yet-created
+	// path is a legitimate input, so the resolve error is ignored here.
+	wt, branch, _ := resolveWorktree(ctx, in.Path)
 	sl := slug.For(wt, branch)
 	q, ca := sl.RedisIndices()
 	return nil, slugComputeOut{

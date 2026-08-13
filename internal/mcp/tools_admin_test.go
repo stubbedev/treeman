@@ -51,6 +51,25 @@ func TestMainWorktree_PatchEnables(t *testing.T) {
 	}
 }
 
+// TestWorktreeFinalize_UnknownIdentifier — a stale slug that matches no
+// registered worktree must error like logs_query does, not resolve to
+// <cwd>/<name> and report queued=true (issue #23).
+func TestWorktreeFinalize_UnknownIdentifier(t *testing.T) {
+	repo := newTempRepo(t)
+	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "t.db"))
+
+	_, out, err := worktreeFinalizeTool(context.Background(), nil, worktreeFinalizeIn{
+		Worktree: "no_such_worktree_slug",
+		Repo:     repo,
+	})
+	if err == nil {
+		t.Fatalf("expected error, got queued=%v path=%q", out.Queued, out.WorktreePath)
+	}
+	if !strings.Contains(err.Error(), "no worktree matches") {
+		t.Errorf("error should mention 'no worktree matches', got: %v", err)
+	}
+}
+
 // TestNotifyTest_NoneRejected — backend "none" mutes everything, so the
 // test refuses it (before touching any sender).
 func TestNotifyTest_NoneRejected(t *testing.T) {

@@ -127,7 +127,10 @@ func worktreeFinalizeTool(
 	if err != nil {
 		return nil, worktreeFinalizeOut{}, err
 	}
-	wtPath, _ := resolveWorktree(ctx, in.Worktree)
+	wtPath, _, err := resolveWorktree(ctx, in.Worktree)
+	if err != nil {
+		return nil, worktreeFinalizeOut{}, err
+	}
 	if wtPath == "" {
 		wtPath = repoRoot
 	}

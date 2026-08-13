@@ -902,7 +902,10 @@ func prepareDryRunTool(
 	_ *mcpsdk.CallToolRequest,
 	in prepareDryRunIn,
 ) (*mcpsdk.CallToolResult, prepareDryRunOut, error) {
-	wt, _ := resolveWorktree(ctx, in.Worktree)
+	wt, _, err := resolveWorktree(ctx, in.Worktree)
+	if err != nil {
+		return nil, prepareDryRunOut{}, err
+	}
 	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, prepareDryRunOut{}, err

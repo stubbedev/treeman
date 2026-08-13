@@ -1313,7 +1313,10 @@ func worktreeRepairTool(
 	_ *mcpsdk.CallToolRequest,
 	in worktreeRepairIn,
 ) (*mcpsdk.CallToolResult, worktreeRepairOut, error) {
-	wtPath, _ := resolveWorktree(ctx, in.Worktree)
+	wtPath, _, err := resolveWorktree(ctx, in.Worktree)
+	if err != nil {
+		return nil, worktreeRepairOut{}, err
+	}
 	repoRoot, err := resolveRepo(ctx, in.Repo)
 	if err != nil {
 		return nil, worktreeRepairOut{}, err
