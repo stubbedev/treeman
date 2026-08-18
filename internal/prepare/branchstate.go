@@ -585,6 +585,9 @@ type branchScopedArgs struct {
 	// it; production leaves it nil so `baseBranchDurable` uses
 	// resolveBaseBranch.
 	resolveBaseBranchFn func(ctx context.Context, branch string) string
+	// resolveDefaultBranchFn, when non-nil, overrides the origin/HEAD
+	// default-branch resolver used by `adoptBranch`. Only tests set it.
+	resolveDefaultBranchFn func(ctx context.Context) string
 }
 
 // runBranchScoped is the unified swap lifecycle for one branch-scoped
@@ -639,12 +642,11 @@ func runBranchScoped(ctx context.Context, a branchScopedArgs) (Outcome, error) {
 
 	case !hasOld:
 		// Active exists but treeman never recorded who owns it — adopt
-		// the current contents as THIS branch's data. Back it up; leave
-		// the data in place. (First-enable on a pre-existing DB.)
-		if err := a.captureDurable(ctx, active, branch); err != nil {
-			return Outcome{}, fmt.Errorf("adopt-capture %s: %w", active, err)
+		// the current contents. (First-enable on a pre-existing DB.)
+		decision, err = a.adoptExisting(ctx, active, branch)
+		if err != nil {
+			return Outcome{}, err
 		}
-		decision = "adopt"
 
 	case old != branch:
 		// Branch switch. Preserve the OLD branch's data, then fill the
@@ -735,6 +737,25 @@ func (a branchScopedArgs) seedFresh(ctx context.Context, active, branch string) 
 		}
 	}
 	return builtEmpty, "seed:" + how, nil
+}
+
+// adoptExisting handles the `!hasOld` arm of runBranchScoped: the active
+// namespace holds data treeman never recorded an owner for. Back it up as a
+// durable copy and leave the data in place. The label the backup gets is
+// `branch` for a linked worktree, the default branch for the main checkout
+// — see adoptBranch.
+func (a branchScopedArgs) adoptExisting(ctx context.Context, active, branch string) (string, error) {
+	label := a.adoptBranch(ctx, branch)
+	if err := a.captureDurable(ctx, active, label); err != nil {
+		return "", fmt.Errorf("adopt-capture %s: %w", active, err)
+	}
+	if label != branch {
+		// The active slot mirrors durable(label), NOT durable(branch) — a
+		// distinct decision keeps recordClean from marking it clean
+		// against a durable copy that doesn't exist.
+		return "adopt:" + label, nil
+	}
+	return "adopt", nil
 }
 
 // swapBranch handles the `old != branch` arm of runBranchScoped: a
@@ -896,6 +917,58 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 		return true, "parent-snapshot", nil
 	}
 	return false, "", nil
+}
+
+// adoptBranch returns the branch label the adopt arm hangs the FIRST
+// durable copy on. For a linked worktree that's the checked-out branch.
+// The MAIN checkout is special: its pre-existing active namespace holds
+// the shared base dataset — it predates durable copies entirely — not the
+// work of whatever feature branch happens to be checked out when durable
+// copies get switched on. Labelling it with that feature branch is what we
+// must avoid: the base data becomes the feature's durable copy, both
+// reapers drop it once the branch is gone, and the default branch is left
+// with no durable copy to resume — so switching to it keeps whatever the
+// feature left behind instead of the base data.
+//
+// Labelling it with the default branch instead means the feature keeps the
+// live active namespace it is already using, and the first switch to the
+// default branch restores the base dataset it was captured from.
+//
+// Returns `branch` unchanged when this isn't the main worktree, when the
+// default branch is already checked out, or when the default branch can't
+// be resolved to a LOCAL ref — ReapOrphanDurables drops any durable whose
+// branch isn't a local ref, so a fabricated label would be reaped.
+func (a branchScopedArgs) adoptBranch(ctx context.Context, branch string) string {
+	row, err := a.st.LookupMainWorktree(ctx, a.repoID)
+	if err != nil || row.ID == 0 || row.ID != a.worktreeID {
+		return branch
+	}
+	def := a.defaultBranch(ctx, row.Path)
+	if def == "" || def == branch {
+		return branch
+	}
+	return def
+}
+
+// defaultBranch resolves the repo's default branch from origin/HEAD in the
+// main checkout, requiring a matching local ref. Tests inject
+// resolveDefaultBranchFn; production leaves it nil.
+func (a branchScopedArgs) defaultBranch(ctx context.Context, mainPath string) string {
+	if a.resolveDefaultBranchFn != nil {
+		return a.resolveDefaultBranchFn(ctx)
+	}
+	if mainPath == "" {
+		return ""
+	}
+	ref, err := gitcmd.String(ctx, mainPath, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	if err != nil || ref == "" {
+		return ""
+	}
+	def := stripRemotePrefix(ctx, mainPath, ref)
+	if def == "" || !gitcmd.Exists(ctx, mainPath, "refs/heads/"+def) {
+		return ""
+	}
+	return def
 }
 
 // baseBranchName resolves the local branch the new worktree's branch_scoped

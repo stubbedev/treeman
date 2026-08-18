@@ -137,7 +137,10 @@ type bsFixture struct {
 	active       string
 	parent       func(branch string) (string, bool, error)
 	baseBranch   func(branch string) string
-	migrateFP    string
+	// defaultBranch stands in for origin/HEAD resolution (no git repo in
+	// these fixtures). Only read when the worktree row is the main one.
+	defaultBranch func() string
+	migrateFP     string
 }
 
 func newBSFixture(t *testing.T) *bsFixture {
@@ -190,10 +193,15 @@ func (f *bsFixture) run(branch string) Outcome {
 	if f.baseBranch != nil {
 		rbb = func(_ context.Context, b string) string { return f.baseBranch(b) }
 	}
+	var rdb func(ctx context.Context) string
+	if f.defaultBranch != nil {
+		rdb = func(context.Context) string { return f.defaultBranch() }
+	}
 	out, err := runBranchScoped(ctx, branchScopedArgs{
 		cfg: f.cfg, d: f.d, dbIdx: 0, worktreePath: f.worktreePath,
 		st: f.st, repoID: f.repoID, worktreeID: f.worktreeID,
-		eng: f.eng, resolveParent: rp, resolveBaseBranchFn: rbb, migrateFP: f.migrateFP,
+		eng: f.eng, resolveParent: rp, resolveBaseBranchFn: rbb,
+		resolveDefaultBranchFn: rdb, migrateFP: f.migrateFP,
 	})
 	if err != nil {
 		f.t.Fatalf("runBranchScoped(%s): %v", branch, err)
@@ -359,6 +367,70 @@ func TestBranchScopedAdoptsExistingUnmarked(t *testing.T) {
 	f.assertMarker("develop")
 	if _, ok := f.fake.data[f.durable("develop")]; !ok {
 		t.Fatalf("adopt should have captured a durable copy for develop")
+	}
+}
+
+// TestBranchScopedMainAdoptsUnderDefaultBranch: the main checkout has
+// durable copies switched on while it sits on a feature branch. The
+// pre-existing data is the shared base dataset, so the first durable copy
+// must be labelled with the DEFAULT branch — not the feature branch, whose
+// deletion would take the only copy of the base data with it. The feature
+// keeps the live active namespace; switching to the default branch restores
+// the adopted base data.
+func TestBranchScopedMainAdoptsUnderDefaultBranch(t *testing.T) {
+	f := newBSFixture(t)
+	ctx := context.Background()
+	if _, err := f.st.EnsureMainWorktree(ctx, f.repoID, f.worktreePath, "wtslug", "feature/x"); err != nil {
+		t.Fatal(err)
+	}
+	f.defaultBranch = func() string { return "master" }
+	f.set(f.active, map[string]string{"base": "1"})
+
+	out := f.run("feature/x")
+	if out.Decision != "adopt:master" {
+		t.Fatalf("decision = %q, want adopt:master", out.Decision)
+	}
+	f.assertActive("base") // untouched
+	f.assertMarker("feature/x")
+	if _, ok := f.fake.data[f.durable("master")]; !ok {
+		t.Fatalf("adopt must capture the base data as master's durable copy")
+	}
+	if _, ok := f.fake.data[f.durable("feature/x")]; ok {
+		t.Fatalf("adopt must NOT label the base data with the feature branch")
+	}
+
+	// Feature diverges, then the checkout switches to the default branch:
+	// feature's work is preserved and master resumes the adopted base data.
+	f.write(f.active, "feature", "1")
+	out = f.run("master")
+	if out.Decision != "swap:resume" {
+		t.Fatalf("decision = %q, want swap:resume", out.Decision)
+	}
+	f.assertActive("base")
+	f.assertMarker("master")
+	if _, ok := f.fake.data[f.durable("feature/x")]; !ok {
+		t.Fatalf("swap must capture feature/x's divergence into its own durable copy")
+	}
+}
+
+// TestBranchScopedLinkedWorktreeAdoptsUnderItsOwnBranch: the default-branch
+// relabel is main-checkout-only. A linked worktree's active namespace holds
+// that worktree's own branch data, so adopt keeps labelling it with the
+// checked-out branch.
+func TestBranchScopedLinkedWorktreeAdoptsUnderItsOwnBranch(t *testing.T) {
+	f := newBSFixture(t)
+	f.defaultBranch = func() string { return "master" }
+	f.set(f.active, map[string]string{"k": "v"})
+
+	out := f.run("feature/x")
+	if out.Decision != "adopt" {
+		t.Fatalf("decision = %q, want adopt", out.Decision)
+	}
+	if _, ok := f.fake.data[f.durable("feature/x")]; !ok {
+		t.Fatalf("linked worktree adopt must capture durable(feature/x)")
+	}
+	if _, ok := f.fake.data[f.durable("master")]; ok {
+		t.Fatalf("linked worktree adopt must not touch the default branch's durable")
 	}
 }
 

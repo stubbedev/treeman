@@ -235,7 +235,9 @@ type Outcome struct {
 	// Decision is set only for branch_scoped databases: how the active
 	// namespace was filled this run — `seed:empty`, `seed:dump`,
 	// `seed:parent`, `seed:parent-snapshot`, `swap:resume`, `swap:parent`,
-	// `swap:parent-snapshot`, `swap:branch-point`, `adopt`, or `noop`.
+	// `swap:parent-snapshot`, `swap:branch-point`, `adopt`,
+	// `adopt:<default-branch>` (main checkout's first durable copy, see
+	// adoptBranch), or `noop`.
 	// Empty for the template/clone path.
 	Decision string
 	// Skipped is true when the engine's connection block is absent
