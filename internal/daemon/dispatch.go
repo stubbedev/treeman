@@ -623,7 +623,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnCheckout })
 		})
 		safeGo(lblHeadFinalize, wtPath, func() {
-			if err := FinalizeWorktree(runid.With(st.BgCtx, rid), st, repoPath, wtPath, env); err != nil {
+			if err := FinalizeWorktree(runid.With(st.BgCtx, rid), st, repoPath, wtPath, env, false); err != nil {
 				slog.Warn("head-triggered finalize", "wt", wtPath, "err", err)
 			}
 		})

@@ -175,7 +175,8 @@ func runOneTask(ctx context.Context, st *State, task rpc.Task) (json.RawMessage,
 }
 
 func runTaskWorktreeFinalize(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
-	return nil, FinalizeWorktree(ctx, st, task.RepoPath, task.WorktreePath, task.InheritedEnv)
+	return nil, FinalizeWorktree(ctx, st, task.RepoPath, task.WorktreePath, task.InheritedEnv,
+		task.Params[rpc.ParamSkipPrepare] == "1")
 }
 
 func runTaskWorktreeTeardown(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
@@ -531,7 +532,7 @@ func runTaskWorktreeCreate(ctx context.Context, st *State, task rpc.Task) (json.
 	if needsFinalize {
 		repoRoot, wtPath, env := req.RepoRoot, res.WtPath, req.Env
 		runFinalize := func(bg context.Context) {
-			if ferr := FinalizeWorktree(bg, st, repoRoot, wtPath, env); ferr != nil {
+			if ferr := FinalizeWorktree(bg, st, repoRoot, wtPath, env, req.SkipPrepare); ferr != nil {
 				_ = st.Store.WriteEvent(bg, store.LevelError, store.EvtWorktreeCreateError, ferr.Error(),
 					0, 0, "", 0, map[string]string{"repo_path": repoRoot, "worktree_path": wtPath})
 			}

@@ -32,8 +32,8 @@ Examples:
 | `--from` | base branch |
 | `--path` | explicit worktree path |
 | `-r`, `--repo` | repo root override |
-| `--skip-hooks` |  |
-| `--skip-prepare` |  |
+| `--skip-hooks` | checkout only: no create hooks, no databases (links/copies/patches still applied inline) |
+| `--skip-prepare` | run hooks/links/copies/patches but provision no databases |
 | `--no-fetch` | skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits) |
 | `--print-path` | print only the new worktree path on stdout; status lines redirect to stderr (enables `cd "$(treeman worktree create …)"`) |
 

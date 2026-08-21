@@ -100,10 +100,9 @@ func FinalizeWorktree(
 	ctx context.Context,
 	st *State,
 	repoPath, worktreePath string,
-	inheritedEnv map[string]string,
+	inheritedEnv map[string]string, skipPrepare bool,
 ) (err error) {
-	repoRoot := repoPath
-	wtRoot := worktreePath
+	repoRoot, wtRoot := repoPath, worktreePath
 	// Captured by the terminal-event defer below. Populated once the
 	// row identity is known so a hook/prepare error after that point
 	// always produces a worktree:create:error event scoped to the right row.
@@ -313,7 +312,8 @@ func FinalizeWorktree(
 	// Phase boundaries double as cancellation checkpoints: a
 	// concurrent TeardownWorktree fires `cancel` via CancelFinalize,
 	// and the next check bails before prepare creates databases.
-	done, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl, isMain, repoID, wtID, inheritedEnv, &enginesTouched)
+	done, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl,
+		isMain, repoID, wtID, inheritedEnv, skipPrepare, &enginesTouched)
 	if err != nil {
 		return err
 	}
@@ -518,6 +518,7 @@ func runFinalizeSetupPipeline(
 	isMain bool,
 	repoID, wtID int64,
 	inheritedEnv map[string]string,
+	skipPrepare bool,
 	enginesTouched *bool,
 ) (done bool, err error) {
 	if cancelledBefore(ctx, st, "pre-hooks", repoID, wtID) {
@@ -538,7 +539,7 @@ func runFinalizeSetupPipeline(
 	if cancelledBefore(ctx, st, "prepare", repoID, wtID) {
 		return true, nil
 	}
-	if len(cfg.Databases) > 0 {
+	if !skipPrepare && len(cfg.Databases) > 0 {
 		*enginesTouched = true
 		_, prepErr := prepare.Run(ctx, cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv)
 		// A cancelled context means a concurrent teardown preempted

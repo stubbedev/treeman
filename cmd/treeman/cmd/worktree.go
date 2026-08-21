@@ -157,8 +157,14 @@ Examples:
 			&cli.StringFlag{Name: "from", Usage: "base branch"},
 			&cli.StringFlag{Name: "path", Usage: "explicit worktree path"},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "repo root override"},
-			&cli.BoolFlag{Name: "skip-hooks"},
-			&cli.BoolFlag{Name: "skip-prepare"},
+			&cli.BoolFlag{
+				Name:  "skip-hooks",
+				Usage: "checkout only: no create hooks, no databases (links/copies/patches still applied inline)",
+			},
+			&cli.BoolFlag{
+				Name:  "skip-prepare",
+				Usage: "run hooks/links/copies/patches but provision no databases",
+			},
 			&cli.BoolFlag{
 				Name:  "no-fetch",
 				Usage: "skip the pre-create `git fetch origin <base>` (defaults on so new branches pick up upstream commits)",

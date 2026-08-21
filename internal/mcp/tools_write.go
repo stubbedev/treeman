@@ -138,7 +138,7 @@ func registerWriteTools(srv *mcpsdk.Server) {
 
 	addTool(srv, &mcpsdk.Tool{
 		Name:        "worktree_create",
-		Description: "Create a new git worktree under .worktrees/<branch> + dispatch setup hooks + prepare via the daemon. For the full guided flow (branches_list → daemon_status → create → wait) use the worktree-setup prompt. For one-off migration validation use the migration-trial prompt instead. Non-blocking — tail via logs_wait.",
+		Description: "Create a new git worktree under .worktrees/<branch> + dispatch setup hooks + prepare via the daemon. For the full guided flow (branches_list → daemon_status → create → wait) use the worktree-setup prompt. For one-off migration validation use the migration-trial prompt instead. Non-blocking — tail via logs_wait. For a throwaway checkout (review agent, git diff) pass skip_hooks=true so it costs a git add instead of a cold prepare + engine fanout.",
 		Annotations: writeAnno("Create worktree", false, false, true),
 	}, worktreeCreateTool)
 
@@ -930,6 +930,11 @@ type worktreeCreateIn struct {
 	Path    string `json:"path,omitempty"     jsonschema:"explicit worktree path"`
 	Repo    string `json:"repo,omitempty"`
 	NoFetch bool   `json:"no_fetch,omitempty"`
+	// Throwaway checkouts (review agents, a quick `git diff`) want the
+	// files and nothing else: a cold prepare costs minutes and a full
+	// engine fanout per worktree. Both flags mirror the CLI's.
+	SkipHooks   bool `json:"skip_hooks,omitempty"   jsonschema:"skip the create hooks and the daemon tail — links/copies/patches still applied inline, no databases provisioned. For throwaway checkouts (code review, git diff) where a cold prepare would cost minutes."`
+	SkipPrepare bool `json:"skip_prepare,omitempty" jsonschema:"run hooks/links/copies/patches but provision no databases. Use when the worktree needs its build deps but no engine state."`
 }
 
 func worktreeCreateTool(
@@ -958,6 +963,12 @@ func worktreeCreateTool(
 	}
 	if in.NoFetch {
 		task.Params[rpc.ParamNoFetch] = "1"
+	}
+	if in.SkipHooks {
+		task.Params[rpc.ParamSkipHooks] = "1"
+	}
+	if in.SkipPrepare {
+		task.Params[rpc.ParamSkipPrepare] = "1"
 	}
 	res, err := dispatchCreatePlan(ctx, task)
 	return nil, res, err
