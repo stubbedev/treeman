@@ -269,15 +269,20 @@ func wtDelete() *cli.Command {
 	return &cli.Command{
 		Name:      "delete",
 		Usage:     "delete a worktree end-to-end",
-		ArgsUsage: "<path-or-branch>",
+		ArgsUsage: "[path-or-branch...]",
 		Description: `Runs teardown hooks + DB teardown + git worktree remove, then
 removes the registry row. The teardown is dispatched to the daemon
 over the RPC socket — the CLI returns immediately. If the daemon
 can't be reached (even after autostart), the teardown runs
 in-process instead (blocks until done).
 
+Several targets may be given, and the no-argument picker is a
+Tab-toggle multi-select — both delete every named worktree in one
+invocation.
+
 Examples:
   treeman worktree delete PROJ-1234
+  treeman worktree delete PROJ-1234 PROJ-5678       # several at once
   treeman worktree delete /path/to/wt --force      # remove stale registry entry`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
@@ -289,91 +294,107 @@ Examples:
 			// teardown); nothing sets it automatically. Not in help.
 			&cli.BoolFlag{Name: "detached", Hidden: true},
 		},
-		ShellComplete: worktreeArgComplete,
+		ShellComplete: worktreeArgsComplete,
 		Action: func(ctx context.Context, c *cli.Command) error {
-			target := c.Args().First()
+			targets := c.Args().Slice()
 
 			// Resolve the repo root first (--repo flag > cwd walk-up >
 			// fall back to target-as-path). Needed before the branch /
 			// slug lookup so the SQLite query is scoped correctly.
 			repoRoot, err := resolveRepo(c.String("repo"))
 			if err != nil {
-				if target == "" {
+				if len(targets) == 0 {
 					return err
 				}
-				repoRoot, err = DiscoverRepoRoot(MustAbs(target))
+				repoRoot, err = DiscoverRepoRoot(MustAbs(targets[0]))
 				if err != nil {
 					return err
 				}
 			}
 
-			// No target → interactive picker over the repo's worktrees.
-			if target == "" {
-				picked, perr := pickWorktree(ctx, repoRoot, "select worktree to remove")
+			// No target → interactive multi-select over the repo's
+			// worktrees (Tab marks, Enter deletes the marked set).
+			if len(targets) == 0 {
+				picked, perr := pickWorktrees(ctx, repoRoot, "select worktrees to remove")
 				if perr != nil {
 					return perr
 				}
-				if picked == "" {
+				if len(picked) == 0 {
 					return nil
 				}
-				target = picked
+				targets = picked
 			}
 
-			// Confirmation lives in the CLI — wt.Delete itself is
-			// non-interactive. Resolve the wtPath up front so the
-			// prompt can name the target precisely; this duplicates
-			// wt.Delete's lookup but the second pass inside the
-			// orchestrator is cheap (sqlite query).
-			wtPath := MustAbs(target)
-			if p, ok := wt.LookupWorktree(ctx, repoRoot, target, cliSink{}); ok {
-				wtPath = p
-			}
-
-			// Refuse to tear down the worktree the shell is standing in —
-			// the daemon would rm -rf it under the user's feet and leave
-			// the shell in a deleted directory. `worktree back --remove`
-			// is the leave-and-drop flow. The main repo root is exempt
-			// here: wt.Delete has its own dedicated main-worktree
-			// refusal and that error message must win.
-			if cwd, cwdErr := os.Getwd(); cwdErr == nil && !strings.EqualFold(filepath.Clean(wtPath), filepath.Clean(repoRoot)) {
-				if top, topErr := gitWorktreeRoot(cwd); topErr == nil && top == wtPath {
-					return errors.New(
-						"refusing to delete the worktree you're in — use `cd \"$(treeman worktree back --remove)\"`")
+			// Each target is torn down independently: one failure (or
+			// one declined confirmation) must not strand the rest.
+			var errs []error
+			for _, target := range targets {
+				if derr := deleteWorktreeTarget(ctx, c, repoRoot, target); derr != nil {
+					errs = append(errs, derr)
 				}
 			}
-
-			// Prompt policy (zsh gwtd parity): a clean, fully-pushed
-			// worktree deletes without ceremony — its state is
-			// regenerable. Only uncommitted changes / unpushed commits
-			// warrant a stop, and then as a default-yes warning naming
-			// the reason.
-			if !c.Bool("yes") {
-				var reasons []string
-				if clean, _ := gitenv.IsWorktreeClean(ctx, wtPath); !clean {
-					reasons = append(reasons, "uncommitted changes")
-				}
-				if unpushed, _ := gitenv.HasUnpushedCommits(ctx, wtPath); unpushed {
-					reasons = append(reasons, "unpushed commits")
-				}
-				if len(reasons) > 0 {
-					q := fmt.Sprintf("Worktree %s has %s — destroy?", wtPath, strings.Join(reasons, ", "))
-					if !ui.ConfirmYes(q) {
-						PrintInfo("aborted: worktree %s left intact", wtPath)
-						return nil
-					}
-				}
-			}
-
-			_, err = wt.Delete(ctx, wt.DeleteRequest{
-				RepoRoot: repoRoot,
-				Target:   target,
-				Force:    c.Bool("force"),
-				Env:      CaptureInheritedEnv(),
-				Detached: c.Bool("detached"),
-			}, cliSink{})
-			return err
+			return errors.Join(errs...)
 		},
 	}
+}
+
+// deleteWorktreeTarget tears down one worktree named by path, branch or
+// slug: the cwd refusal, the dirty/unpushed confirmation, then the
+// delete itself.
+func deleteWorktreeTarget(ctx context.Context, c *cli.Command, repoRoot, target string) error {
+	// Confirmation lives in the CLI — wt.Delete itself is
+	// non-interactive. Resolve the wtPath up front so the
+	// prompt can name the target precisely; this duplicates
+	// wt.Delete's lookup but the second pass inside the
+	// orchestrator is cheap (sqlite query).
+	wtPath := MustAbs(target)
+	if p, ok := wt.LookupWorktree(ctx, repoRoot, target, cliSink{}); ok {
+		wtPath = p
+	}
+
+	// Refuse to tear down the worktree the shell is standing in —
+	// the daemon would rm -rf it under the user's feet and leave
+	// the shell in a deleted directory. `worktree back --remove`
+	// is the leave-and-drop flow. The main repo root is exempt
+	// here: wt.Delete has its own dedicated main-worktree
+	// refusal and that error message must win.
+	if cwd, cwdErr := os.Getwd(); cwdErr == nil && !strings.EqualFold(filepath.Clean(wtPath), filepath.Clean(repoRoot)) {
+		if top, topErr := gitWorktreeRoot(cwd); topErr == nil && top == wtPath {
+			return errors.New(
+				"refusing to delete the worktree you're in — use `cd \"$(treeman worktree back --remove)\"`")
+		}
+	}
+
+	// Prompt policy (zsh gwtd parity): a clean, fully-pushed
+	// worktree deletes without ceremony — its state is
+	// regenerable. Only uncommitted changes / unpushed commits
+	// warrant a stop, and then as a default-yes warning naming
+	// the reason.
+	if !c.Bool("yes") {
+		var reasons []string
+		if clean, _ := gitenv.IsWorktreeClean(ctx, wtPath); !clean {
+			reasons = append(reasons, "uncommitted changes")
+		}
+		if unpushed, _ := gitenv.HasUnpushedCommits(ctx, wtPath); unpushed {
+			reasons = append(reasons, "unpushed commits")
+		}
+		if len(reasons) > 0 {
+			q := fmt.Sprintf("Worktree %s has %s — destroy?", wtPath, strings.Join(reasons, ", "))
+			if !ui.ConfirmYes(q) {
+				PrintInfo("aborted: worktree %s left intact", wtPath)
+				return nil
+			}
+		}
+	}
+
+	_, err := wt.Delete(ctx, wt.DeleteRequest{
+		RepoRoot: repoRoot,
+		Target:   target,
+		Force:    c.Bool("force"),
+		Env:      CaptureInheritedEnv(),
+		Detached: c.Bool("detached"),
+	}, cliSink{})
+	return err
 }
 
 func wtRegister() *cli.Command {

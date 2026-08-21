@@ -458,10 +458,12 @@ func branchWizard(ctx context.Context, repoRoot, initial string) (name, base str
 	return final, base, nil
 }
 
-// pickWorktree shows a picker over the repo's linked worktrees
-// (excluding main) and returns the selected worktree path, or "" on
-// cancel / empty list.
-func pickWorktree(ctx context.Context, repoRoot, prompt string) (string, error) {
+// pickWorktrees shows a Tab-toggle multi-select picker over the repo's
+// linked worktrees (excluding main) and returns the selected worktree
+// paths, or nil on cancel / empty list. A plain Enter with nothing
+// marked yields the highlighted row, so the single-pick flow is
+// unchanged.
+func pickWorktrees(ctx context.Context, repoRoot, prompt string) ([]string, error) {
 	occ := occupiedWorktrees(ctx, repoRoot)
 	cwdTop := ""
 	if cwd, err := os.Getwd(); err == nil {
@@ -491,21 +493,25 @@ func pickWorktree(ctx context.Context, repoRoot, prompt string) (string, error) 
 	wg.Wait()
 	if len(rows) == 0 {
 		ui.Info("No linked worktrees found.")
-		return "", nil
+		return nil, nil
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].label < rows[j].label })
 	items := make([]string, len(rows))
 	for i, r := range rows {
 		items[i] = r.label
 	}
-	res, err := tui.Select(items, tui.Options{Prompt: prompt})
-	if errors.Is(err, tui.ErrCanceled) || res.Index < 0 {
-		return "", nil
+	res, err := tui.MultiSelect(items, tui.Options{Prompt: prompt})
+	if errors.Is(err, tui.ErrCanceled) || len(res.Indices) == 0 {
+		return nil, nil
 	}
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return rows[res.Index].path, nil
+	picked := make([]string, 0, len(res.Indices))
+	for _, i := range res.Indices {
+		picked = append(picked, rows[i].path)
+	}
+	return picked, nil
 }
 
 // worktreeArgComplete emits the branch names of live linked worktrees
@@ -514,12 +520,23 @@ func worktreeArgComplete(_ context.Context, c *cli.Command) {
 	if c.NArg() > 0 {
 		return
 	}
+	worktreeArgsComplete(context.Background(), c)
+}
+
+// worktreeArgsComplete is worktreeArgComplete for commands taking a
+// variadic target list (`worktree delete`): it keeps completing past the
+// first argument, minus the names already on the line.
+func worktreeArgsComplete(_ context.Context, c *cli.Command) {
 	repoRoot, err := resolveRepo(c.String("repo"))
 	if err != nil {
 		return
 	}
+	typed := make(map[string]bool, c.NArg())
+	for _, a := range c.Args().Slice() {
+		typed[a] = true
+	}
 	for branch, p := range branchOccupancy(context.Background(), repoRoot) {
-		if p != repoRoot {
+		if p != repoRoot && !typed[branch] {
 			_, _ = fmt.Fprintln(os.Stdout, branch)
 		}
 	}

@@ -48,8 +48,13 @@ over the RPC socket — the CLI returns immediately. If the daemon
 can't be reached (even after autostart), the teardown runs
 in-process instead (blocks until done).
 
+Several targets may be given, and the no-argument picker is a
+Tab-toggle multi-select — both delete every named worktree in one
+invocation.
+
 Examples:
   treeman worktree delete PROJ-1234
+  treeman worktree delete PROJ-1234 PROJ-5678       # several at once
   treeman worktree delete /path/to/wt --force      # remove stale registry entry
 ```
 
