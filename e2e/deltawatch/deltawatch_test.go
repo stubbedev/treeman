@@ -106,7 +106,7 @@ databases:
 	}
 
 	// Initial finalize → fingerprint F1
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env, false); err != nil {
 		t.Fatalf("initial finalize: %v", err)
 	}
 	fp1 := mostRecentFingerprint(t, rawDB)

@@ -59,7 +59,7 @@ hooks:
 	if _, err := daemon.EnrollMainWorktree(ctx, state, repoRoot); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, map[string]string{"PATH": os.Getenv("PATH")}); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, map[string]string{"PATH": os.Getenv("PATH")}, false); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 

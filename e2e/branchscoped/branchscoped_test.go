@@ -307,7 +307,7 @@ databases:
 		t.Fatalf("enroll: %v", err)
 	}
 	// Seed the active DB on develop (what `treeman main enable` does).
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env, false); err != nil {
 		t.Fatalf("finalize develop: %v", err)
 	}
 	waitForDB(t, active, 30*time.Second)

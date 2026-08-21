@@ -93,7 +93,7 @@ hooks:
 	// FinalizeWorktree records the failure as a terminal event and then
 	// deliberately returns nil (so dispatch doesn't double-log), so the
 	// failure is asserted via the event log below, not the return value.
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env, false); err != nil {
 		t.Fatalf("finalize returned a hard error: %v", err)
 	}
 
@@ -110,7 +110,7 @@ hooks:
 
 	// ── 2. Drop the failing hook, retry → clean cold rebuild ──
 	writeFile(t, filepath.Join(repoRoot, ".treeman.yaml"), base)
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env, false); err != nil {
 		t.Fatalf("retry finalize after recovery: %v", err)
 	}
 	if dbs := listMatching(t, dbPrefix); len(dbs) == 0 {

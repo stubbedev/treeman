@@ -95,7 +95,7 @@ databases:
 	if _, err := daemon.EnrollMainWorktree(ctx, state, repoRoot); err != nil {
 		t.Fatalf("enroll main: %v", err)
 	}
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env, false); err != nil {
 		t.Fatalf("finalize main: %v", err)
 	}
 
@@ -112,7 +112,7 @@ databases:
 	// ── Linked worktree: base config applies (base name + 2 clones) ──
 	wtPath := filepath.Join(repoRoot, ".worktrees", "feature-x")
 	mustGit(t, repoRoot, "worktree", "add", "-q", "-b", "feature/x", wtPath)
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, wtPath, env); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, wtPath, env, false); err != nil {
 		t.Fatalf("finalize linked: %v", err)
 	}
 

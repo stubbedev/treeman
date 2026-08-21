@@ -344,6 +344,7 @@ hooks:
 		repoRoot,
 		repoRoot,
 		map[string]string{"PATH": os.Getenv("PATH")},
+		false,
 	); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}

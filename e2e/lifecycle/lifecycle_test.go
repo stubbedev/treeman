@@ -115,7 +115,7 @@ hooks:
 		"PATH":         os.Getenv("PATH"),
 		"MYSQL_E2E_PW": "rootpw",
 	}
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env, false); err != nil {
 		t.Fatalf("FinalizeWorktree: %v", err)
 	}
 

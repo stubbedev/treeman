@@ -94,7 +94,7 @@ databases:
 	}
 
 	// ── 1. Finalize → source + 3 clones + 1 template populated ──
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env, false); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 	allDBs := listDatabases(t)

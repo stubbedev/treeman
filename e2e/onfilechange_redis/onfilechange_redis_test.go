@@ -87,7 +87,7 @@ hooks:
 	state := daemon.NewState(ctx, st)
 
 	env := map[string]string{"PATH": os.Getenv("PATH")}
-	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env); err != nil {
+	if err := daemon.FinalizeWorktree(ctx, state, repoRoot, repoRoot, env, false); err != nil {
 		t.Fatalf("initial finalize: %v", err)
 	}
 	if err := daemon.ResumeWorktreeWatcher(ctx, state, repoRoot, repoRoot); err != nil {
