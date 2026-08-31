@@ -47,15 +47,21 @@ lint: fmt
     go vet ./...
     golangci-lint run ./...
 
-# Strict read-only check — same logic CI runs, exposed for local pre-push
-# verification. Fails if formatting would change or any linter fires.
+# Strict read-only check — same gates CI's lint job runs, exposed for
+# local pre-push verification. Fails if the config references a
+# renamed/removed linter, if formatting would change, or if any linter
+# fires.
+#
+# CI runs these through the FLAKE-PINNED linter
+# (`nix develop .#ci --command golangci-lint …`), so flake.lock decides the
+# version for everyone. Reproduce CI exactly with:
+#   nix develop .#ci --command golangci-lint run ./...
 lint-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    out=$(golangci-lint fmt --diff ./...)
-    if [ -n "$out" ]; then
-        echo "code is not formatted; run 'just fmt':"
-        printf '%s\n' "$out"
+    golangci-lint config verify
+    if ! golangci-lint fmt --diff; then
+        echo "code is not formatted; run 'just fmt'" >&2
         exit 1
     fi
     go vet ./...

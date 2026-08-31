@@ -11,6 +11,17 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
+        # Go for the dev/CI shells. Pinned to the SAME major that nixpkgs
+        # builds golangci-lint with: the linter loads packages through the
+        # `go` on PATH, and a mismatch fails every package with
+        # `compile: version go1.X does not match go tool version go1.Y`
+        # rather than reporting real findings (nixpkgs currently ships
+        # golangci-lint built with 1.27 while `pkgs.go` is 1.26). When a
+        # nixpkgs bump moves the linter's toolchain, that error is the
+        # signal to bump this line. Not used for the package build, which
+        # goes through buildGoModule's own toolchain.
+        shellGo = pkgs.go_1_27;
+
         treeman = pkgs.buildGoModule {
           pname = "treeman";
           version = "2.5.87";
@@ -55,16 +66,25 @@
         checks.build = treeman;
 
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            go
+          packages = [ shellGo ] ++ (with pkgs; [
             gopls
             golangci-lint
             just
             git
-          ];
+          ]);
           shellHook = ''
             echo "treeman dev shell — \`just go-build\` to compile, \`just go-test\` to test"
           '';
+        };
+
+        # Lean shell for CI's lint job: the SAME golangci-lint the dev
+        # shell provides, minus the editor tooling. flake.lock is then the
+        # single source of truth for the linter version — CI and every
+        # developer run the identical binary, so a nixpkgs bump can't leave
+        # CI on an older linter than `just check` (which is how a renamed
+        # linter turned into 1481 local-only findings).
+        devShells.ci = pkgs.mkShell {
+          packages = [ shellGo pkgs.golangci-lint ];
         };
 
         formatter = pkgs.nixpkgs-fmt;

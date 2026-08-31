@@ -16,16 +16,21 @@ version: "2"
 linters:
   default: all
   disable:
+    # NB: `default: all` enables DEPRECATED aliases too (verified on
+    # 2.13.1), so a renamed linter stays listed under BOTH names until
+    # upstream drops the alias — removing the old name silently re-enables
+    # the same opinion under the old linter.
+    #
     # Whitespace/blank-line reformatters — not adopted (the formatters block
     # below is the auto-applied formatter stack we do enforce).
-    - wsl
+    - wsl     # deprecated alias of wsl_v5 — keep, see NB
     - wsl_v5
     - nlreturn
     - whitespace
     # Anti-idiomatic for this codebase's deliberate style.
     - noinlineerr
-    - exhaustruct
-    - exhaustruct_v5  # same opinion as exhaustruct, new name in 2.13
+    - exhaustruct    # deprecated alias of exhaustruct_v5 — keep, see NB
+    - exhaustruct_v5
     - nonamedreturns
     - err113
     - wrapcheck
@@ -52,7 +57,7 @@ linters:
     - containedctx
     - dupl
     - gosmopolitan
-    - gomodguard   # deprecated alias of gomodguard_v2; we don't gate modules
+    - gomodguard    # deprecated alias of gomodguard_v2 — keep, see NB
     - gomodguard_v2 # no module allow/block list configured — nothing to enforce
     # Opinionated style we intentionally don't adopt.
     - nilnil          # (nil, nil) is the codebase's "not found" idiom

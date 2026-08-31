@@ -53,23 +53,32 @@ jobs:
       - name: run container-free e2e batch
         run: just test-e2e lite
 
+  # Runs the flake-pinned golangci-lint (devShells.ci) instead of a
+  # second version pinned in this file. flake.lock is the only pin, so a
+  # nixpkgs bump moves CI and the dev shell together — the previous split
+  # left CI a minor behind and turned a renamed linter into 1481
+  # local-only findings that blocked `just release-*`. This job is exactly:
+  #   nix develop .#ci --command golangci-lint run ./...
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: nix-community/cache-nix-action@v7
         with:
-          go-version-file: go.mod
-          cache: true
-      - uses: golangci/golangci-lint-action@v9
-        with:
-          version: v2.13.1
-      - name: gofmt + go vet
-        run: |
-          unformatted=$(gofmt -l .)
-          [ -z "$unformatted" ] || { echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1; }
-          go vet ./...
+          primary-key: nix-lint-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
+          restore-prefixes-first-match: nix-lint-${{ runner.os }}-
+      - run: nix develop .#ci --command golangci-lint version
+      # Rejects a config that references a renamed/removed linter or a
+      # setting the current version no longer knows.
+      - run: nix develop .#ci --command golangci-lint config verify
+      # The real format gate: gofumpt + goimports + golines, the same
+      # stack `just fmt` applies. `gofmt -l` only knew about plain gofmt,
+      # so drift in the other three reached master untouched. Exits
+      # non-zero when a rewrite is pending.
+      - run: nix develop .#ci --command golangci-lint fmt --diff
+      - run: nix develop .#ci --command golangci-lint run ./...
 
   nix:
     name: nix flake check
