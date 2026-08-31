@@ -2,9 +2,11 @@ package patcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/gitcmd"
@@ -53,13 +55,23 @@ func EnsureFilter(ctx context.Context, worktreePath string, files []string) erro
 	// per-worktree `<GIT_DIR>/info/attributes` is not consulted, so
 	// writing there leaves the filter unwired and `git status` shows
 	// patched files as modified.
-	gcd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-common-dir")
+	//
+	// Both dirs come from ONE rev-parse: this function runs on every
+	// watcher-driven re-prepare and every git subprocess is latency
+	// that the patched files spend looking modified in `git status`.
+	dirs, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-common-dir", "--git-dir")
 	if err != nil {
-		return fmt.Errorf("rev-parse --git-common-dir: %w", err)
+		return fmt.Errorf("rev-parse --git-common-dir --git-dir: %w", err)
 	}
-	commonDir := strings.TrimSpace(gcd)
-	if !filepath.IsAbs(commonDir) {
-		commonDir = filepath.Join(worktreePath, commonDir)
+	commonDir, perWtGitDir := "", ""
+	if parts := strings.Fields(strings.TrimSpace(dirs)); len(parts) > 0 {
+		commonDir = absUnder(worktreePath, parts[0])
+		if len(parts) > 1 {
+			perWtGitDir = absUnder(worktreePath, parts[1])
+		}
+	}
+	if commonDir == "" {
+		return errors.New("rev-parse --git-common-dir: empty output")
 	}
 
 	if err := ensureFilterConfig(ctx, worktreePath); err != nil {
@@ -74,27 +86,26 @@ func EnsureFilter(ctx context.Context, worktreePath string, files []string) erro
 	// upgrading users don't see two stale copies of the file
 	// drifting from the live common-dir one. Best-effort: a missing
 	// per-wt file is fine, write errors are non-fatal.
-	if gd, err := gitcmd.String(ctx, worktreePath, "rev-parse", "--git-dir"); err == nil {
-		perWtGitDir := strings.TrimSpace(gd)
-		if !filepath.IsAbs(perWtGitDir) {
-			perWtGitDir = filepath.Join(worktreePath, perWtGitDir)
-		}
-		if perWtGitDir != commonDir {
-			_ = stripTreemanBlock(filepath.Join(perWtGitDir, "info", "attributes"))
+	// stripTreemanBlock is a no-op on a missing file, so the os.Stat
+	// is only there to keep the common case free of a pointless read.
+	if perWtGitDir != "" && perWtGitDir != commonDir {
+		legacy := filepath.Join(perWtGitDir, "info", "attributes")
+		if _, err := os.Stat(legacy); err == nil {
+			_ = stripTreemanBlock(legacy)
 		}
 	}
-	// Best-effort legacy migration: clear --skip-worktree on any
-	// patched file that still carries it from treeman < 2.5.
-	// Failure is not fatal — the worst case is the file stays
-	// pinned and the user clears it manually.
-	tracked := make([]string, 0, len(files))
-	for _, f := range files {
-		abs := filepath.Join(worktreePath, f)
-		if err := gitcmd.RunOptional(ctx, worktreePath, "ls-files", "--error-unmatch", abs); err != nil {
-			continue // untracked file — no index entry to clear
-		}
-		_, _ = gitcmd.OutputRW(ctx, worktreePath, false, "update-index", "--no-skip-worktree", abs)
-		tracked = append(tracked, f)
+	// One `ls-files -v -z` answers both questions at once — which
+	// paths are tracked, and which still carry a legacy
+	// `--skip-worktree` bit from treeman < 2.5 (lowercase tag / `S`).
+	// The old shape spent two subprocesses per file to learn the
+	// same thing.
+	tracked, pinned := indexTags(ctx, worktreePath, files)
+	if len(pinned) > 0 {
+		// Best-effort legacy migration. Failure is not fatal — the
+		// worst case is the file stays pinned and the user clears it
+		// manually.
+		_, _ = gitcmd.OutputRW(ctx, worktreePath, false,
+			append([]string{"update-index", "--no-skip-worktree", "--"}, pinned...)...)
 	}
 
 	// Push the filter-cleaned content into the index so git's pull /
@@ -126,11 +137,25 @@ func EnsureFilter(ctx context.Context, worktreePath string, files []string) erro
 	// back to HEAD, keeping the degradation genuinely cosmetic
 	// (working-tree-only), and report it rather than poisoning the
 	// index.
+	//
+	// Batched: one `add --renormalize` for every patched path, then one
+	// `diff --cached --quiet HEAD` over the same set. The happy path is
+	// "nothing poisoned", so it costs two subprocesses regardless of how
+	// many files are patched, and the per-file walk below only runs when
+	// that batch diff reports a difference.
+	if len(tracked) == 0 {
+		return nil
+	}
+	if _, err := gitcmd.OutputRW(ctx, worktreePath, false,
+		append([]string{"add", "--renormalize", "--"}, tracked...)...); err != nil {
+		return nil //nolint:nilerr // best-effort: gitignored / filter unreachable — nothing staged
+	}
+	if err := gitcmd.RunOptional(ctx, worktreePath, append(
+		[]string{"diff", "--cached", "--quiet", "HEAD", "--"}, tracked...)...); err == nil {
+		return nil
+	}
 	var poisoned []string
 	for _, f := range tracked {
-		if _, err := gitcmd.OutputRW(ctx, worktreePath, false, "add", "--renormalize", "--", f); err != nil {
-			continue // best-effort: gitignored / filter unreachable — nothing staged
-		}
 		if err := gitcmd.RunOptional(ctx, worktreePath, "diff", "--cached", "--quiet", "HEAD", "--", f); err != nil {
 			// Staged content differs from HEAD: the clean filter is not
 			// projecting patched keys back. Unstage so the index never
@@ -176,12 +201,67 @@ func ensureFilterConfig(ctx context.Context, worktreePath string) error {
 		// recoverable, unlike a blocked worktree.
 		{"filter." + FilterName + ".required", "false"},
 	}
+	// Read the whole filter block in one shot and skip the writes when
+	// the values already match. Re-running finalize or a watcher tick on
+	// an already-wired worktree is the common case, and three `git
+	// config` writes there are three subprocesses of pure latency.
+	have := map[string]string{}
+	if out, err := gitcmd.Output(ctx, worktreePath,
+		"config", "--local", "--get-regexp", "^filter\\."+regexp.QuoteMeta(FilterName)+"\\."); err == nil {
+		for line := range strings.SplitSeq(strings.TrimRight(string(out), "\n"), "\n") {
+			key, val, ok := strings.Cut(line, " ")
+			if ok {
+				have[key] = val
+			}
+		}
+	}
 	for _, kv := range pairs {
+		if have[kv[0]] == kv[1] {
+			continue
+		}
 		if _, err := gitcmd.OutputRW(ctx, worktreePath, false, "config", "--local", kv[0], kv[1]); err != nil {
 			return fmt.Errorf("git config %s=%s: %w", kv[0], kv[1], err)
 		}
 	}
 	return nil
+}
+
+// absUnder resolves a git-reported dir against the worktree root.
+func absUnder(worktreePath, dir string) string {
+	if dir == "" || filepath.IsAbs(dir) {
+		return dir
+	}
+	return filepath.Join(worktreePath, dir)
+}
+
+// indexTags splits `files` into the tracked ones and the subset still
+// carrying a `--skip-worktree` bit, using a single `git ls-files -v -z`.
+// The -v tag is `S` (or any lowercase letter) when skip-worktree is set;
+// untracked paths are simply absent from the output.
+func indexTags(ctx context.Context, worktreePath string, files []string) (tracked, pinned []string) {
+	out, err := gitcmd.Output(ctx, worktreePath,
+		append([]string{"ls-files", "-v", "-z", "--"}, files...)...)
+	if err != nil {
+		return nil, nil
+	}
+	seen := make(map[string]byte, len(files))
+	for rec := range strings.SplitSeq(string(out), "\x00") {
+		if len(rec) < 3 || rec[1] != ' ' {
+			continue
+		}
+		seen[rec[2:]] = rec[0]
+	}
+	for _, f := range files {
+		tag, ok := seen[filepath.ToSlash(f)]
+		if !ok {
+			continue
+		}
+		tracked = append(tracked, f)
+		if tag == 'S' || (tag >= 'a' && tag <= 'z') {
+			pinned = append(pinned, f)
+		}
+	}
+	return tracked, pinned
 }
 
 // writeAttributes rewrites `<gitCommonDir>/info/attributes`,
@@ -193,11 +273,13 @@ func ensureFilterConfig(ctx context.Context, worktreePath string) error {
 // `info/attributes`.
 func writeAttributes(gitDir string, files []string) error {
 	infoDir := filepath.Join(gitDir, "info")
-	if err := os.MkdirAll(infoDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", infoDir, err)
-	}
 	attrPath := filepath.Join(infoDir, "attributes")
-	body, _ := os.ReadFile(attrPath)
+	body, readErr := os.ReadFile(attrPath)
+	if readErr != nil {
+		if err := os.MkdirAll(infoDir, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", infoDir, err)
+		}
+	}
 
 	tail := dropTreemanBlock(string(body))
 	tail = strings.TrimRight(tail, "\n")
@@ -219,6 +301,9 @@ func writeAttributes(gitDir string, files []string) error {
 	}
 	tail += tailSb159.String()
 	tail += "\n"
+	if string(body) == tail {
+		return nil // already current — don't churn the file's mtime
+	}
 	return os.WriteFile(attrPath, []byte(tail), 0o644)
 }
 

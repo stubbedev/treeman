@@ -214,7 +214,7 @@ func runTaskPrepare(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	if err != nil {
 		return nil, err
 	}
-	outs, err := prepare.Run(ctx, &id.cfg, task.WorktreePath, id.sl, st.Store, id.repoID, id.wtID, task.InheritedEnv)
+	outs, err := lockedPrepare(ctx, st, id, task)
 	if err != nil {
 		return nil, err
 	}
@@ -228,18 +228,36 @@ func runTaskPrepare(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	return json.Marshal(map[string]any{"outcomes": outs})
 }
 
+// lockedPrepare runs prepare.Run for a task under the worktree's
+// engine-prepare lock, so a queued prepare can't collide with the
+// finalize pipeline, a watcher re-prepare, or another prepare task
+// building the same source databases (issue #28).
+func lockedPrepare(ctx context.Context, st *State, id taskIdentity, task rpc.Task) ([]prepare.Outcome, error) {
+	prepLk := st.LockWorktreePrepare(task.WorktreePath)
+	prepLk.Lock()
+	defer prepLk.Unlock()
+	return prepare.Run(ctx, &id.cfg, task.WorktreePath, id.sl, st.Store, id.repoID, id.wtID, task.InheritedEnv)
+}
+
 func runTaskDBReset(ctx context.Context, st *State, task rpc.Task) (json.RawMessage, error) {
 	id, err := resolveTaskIdentity(ctx, st, task.RepoPath, task.WorktreePath)
 	if err != nil {
 		return nil, err
 	}
 	engineFilter := task.Params[rpc.ParamEngineFilter]
-	if err := prepare.ResetBranchScoped(ctx, &id.cfg, task.WorktreePath, id.repoID, id.wtID, st.Store, engineFilter); err != nil {
-		return nil, err
+	// Reset + rebuild are one unit: dropping the branch-scoped state and
+	// then racing a concurrent build against the same databases is the
+	// collision issue #28 describes, so both run under the lock.
+	prepLk := st.LockWorktreePrepare(task.WorktreePath)
+	prepLk.Lock()
+	resetErr := prepare.ResetBranchScoped(ctx, &id.cfg, task.WorktreePath, id.repoID, id.wtID, st.Store, engineFilter)
+	var outs []prepare.Outcome
+	if resetErr == nil {
+		outs, resetErr = prepare.Run(ctx, &id.cfg, task.WorktreePath, id.sl, st.Store, id.repoID, id.wtID, task.InheritedEnv)
 	}
-	outs, err := prepare.Run(ctx, &id.cfg, task.WorktreePath, id.sl, st.Store, id.repoID, id.wtID, task.InheritedEnv)
-	if err != nil {
-		return nil, err
+	prepLk.Unlock()
+	if resetErr != nil {
+		return nil, resetErr
 	}
 	// db_reset re-seeded content — post-hooks fire like any prepare.
 	if err := runTriggerActions(ctx, st, "create-after-engines",

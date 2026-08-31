@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/bmatcuk/doublestar/v4"
+
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/patcher"
@@ -198,7 +200,68 @@ func resolveCreateTail(
 		result.Status = CreatedNoFinalize
 		return result, false, nil
 	}
+	// Frontload the patch phase. The caller's shell gets control the
+	// moment Create returns (`gwt` cd's straight into the worktree), so
+	// leaving patches to the daemon tail means an interactive `git
+	// status` can catch the file mid-flight: patched bytes on disk,
+	// filter not yet wired, index stat cache not yet refreshed — i.e. a
+	// dirty worktree the user did nothing to dirty. Doing it here means
+	// the tree is already clean when they land in it.
+	//
+	// The daemon tail repeats this; both halves are idempotent and the
+	// repeat is cheap (unchanged content is not rewritten, and
+	// EnsureFilter no-ops on already-correct config/attributes).
+	frontloadPatches(ctx, cfg, req.RepoRoot, wtPath, tplCtx, sink)
 	return result, true, nil
+}
+
+// frontloadPatches applies `patches:` + wires the clean/smudge filter
+// inline, before the create call returns. Only the `copies:` entries a
+// patch actually targets are brought in first (typically `.env`, which
+// has to exist before it can be patched); the rest stay on the daemon so
+// the CLI never blocks on a vendor/ or node_modules/ copy.
+//
+// Best-effort: every failure is a warning, never a create error. The
+// daemon's finalize tail runs the same two steps right after and is the
+// authority on reporting them.
+func frontloadPatches(
+	ctx context.Context,
+	cfg *config.Config,
+	repoRoot, wtPath string,
+	tplCtx template.Context,
+	sink Sink,
+) {
+	if len(cfg.Patches) == 0 {
+		return
+	}
+	if need := copiesCoveringPatches(cfg); len(need) > 0 {
+		if err := BringInFiles(ctx, repoRoot, wtPath, need, "copy", sink); err != nil {
+			sink.Warn("copy patch targets: %v", err)
+			return
+		}
+	}
+	if err := applyPatches(ctx, cfg.Patches, wtPath, tplCtx, sink); err != nil {
+		sink.Warn("apply patches: %v", err)
+	}
+}
+
+// copiesCoveringPatches returns the `worktrees.copies` entries that
+// supply at least one patch target — an exact match, a glob match, or a
+// directory entry the target sits under. Anything else is left to the
+// daemon's bring-in.
+func copiesCoveringPatches(cfg *config.Config) []string {
+	out := make([]string, 0, len(cfg.Patches))
+	for _, entry := range cfg.Worktrees.Copies {
+		for _, p := range cfg.Patches {
+			file := filepath.ToSlash(p.File)
+			match, _ := doublestar.Match(filepath.ToSlash(entry), file)
+			if match || strings.HasPrefix(file, filepath.ToSlash(entry)+"/") {
+				out = append(out, entry)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // createNeedsWork reports whether a finalize tail has anything to do.

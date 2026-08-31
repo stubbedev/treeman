@@ -142,6 +142,18 @@ func TestCleanFilterKeepsGitStatusClean(t *testing.T) {
 	if strings.TrimSpace(porcelain) != "" {
 		t.Logf("worktree git status (context):\n%s", porcelain)
 	}
+
+	// The index stat cache must be refreshed too, not just consistent in
+	// content. patcher.Apply rewrote each file, moving its size+mtime; if
+	// EnsureFilter's `git add --renormalize` did not re-stage, every later
+	// `git status` re-derives "modified" from the stale stat entry without
+	// persisting a refresh — the file then looks dirty forever even though
+	// index blob == HEAD blob (issue #29). `update-index --refresh` prints
+	// "<file>: needs update" and exits non-zero in exactly that state.
+	refresh := exec.Command("git", "-C", wt, "update-index", "--refresh")
+	if out, err := refresh.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "" {
+		t.Errorf("index stat cache is stale after patch + EnsureFilter (err=%v):\n%s", err, out)
+	}
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────

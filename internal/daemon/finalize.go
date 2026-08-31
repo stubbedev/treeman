@@ -541,7 +541,13 @@ func runFinalizeSetupPipeline(
 	}
 	if !skipPrepare && len(cfg.Databases) > 0 {
 		*enginesTouched = true
+		// Serialise against a queued `prepare` / `db reset` task or a
+		// watcher re-prepare for this same worktree — they build the same
+		// source databases (issue #28).
+		prepLk := st.LockWorktreePrepare(wtRoot)
+		prepLk.Lock()
 		_, prepErr := prepare.Run(ctx, cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv)
+		prepLk.Unlock()
 		// A cancelled context means a concurrent teardown preempted
 		// prepare — a clean stop regardless of whether prepare.Run
 		// surfaced an error on the way out. Mirrors the un-extracted
@@ -645,17 +651,16 @@ func FinalizeWorktreeForWatch(
 		return nil
 	}
 
-	// Re-apply patches. Cheap; idempotent for unchanged content.
+	// Re-apply patches through the same helper the full finalize uses,
+	// so the clean filter is re-asserted afterwards. patcher.Apply
+	// writes the file even when the content is unchanged, which moves
+	// size+mtime and so stales the index stat cache; without the
+	// `git add --renormalize` in EnsureFilter the file then reports as
+	// modified in `git status` forever.
 	// Skipped for the main worktree — see FinalizeWorktree for why
 	// the canonical clone's files are left untouched.
 	if len(cfg.Patches) > 0 && !id.IsMain {
-		portMap, _ := st.Store.LoadWorktreePorts(ctx, wtID)
-		tplCtx := template.FromSlug(sl).WithPorts(portMap)
-		for _, p := range cfg.Patches {
-			if _, err := patcher.Apply(p, wtRoot, tplCtx); err != nil {
-				slog.Warn("patch failed (watch-trigger)", "wt", wtRoot, "file", p.File, "err", err)
-			}
-		}
+		applyFinalizePatches(ctx, st, &cfg, wtRoot, sl, repoID, wtID)
 	}
 
 	if len(cfg.Databases) == 0 {
@@ -672,7 +677,11 @@ func FinalizeWorktreeForWatch(
 		opts.FilterDBs = true
 		opts.OnlyDBIndex = dbIdx
 	}
-	if _, err := prepare.RunFiltered(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv, opts); err != nil {
+	prepLk := st.LockWorktreePrepare(wtRoot)
+	prepLk.Lock()
+	_, prepErr := prepare.RunFiltered(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv, opts)
+	prepLk.Unlock()
+	if err := prepErr; err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}

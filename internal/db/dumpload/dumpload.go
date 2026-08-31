@@ -47,23 +47,114 @@ import (
 // downgraded to a warning log + fall-through to the next strategy, so
 // a misconfigured CLI on a dev box can never block a cold build.
 //
+// That fall-through is only safe while the failed attempt wrote NOTHING
+// — the usual case (no container, `mysql` missing inside it, bad
+// credentials). An attempt that died MID-DUMP has already applied part
+// of the file, and replaying the same dump on top of it produced "Table
+// 'x' already exists" or, worse, a target whose schema was complete but
+// whose skipped INSERTs left the framework `migrations` table empty, so
+// the following `migrate` replayed every migration and died on a
+// duplicate column (issue #28). So the target is probed for new objects
+// after a failed attempt: if it gained any, the error is returned
+// instead of falling through, and the next prepare cold-builds the
+// database from scratch.
+//
 // Compression (gzip/zstd/bzip2/xz) is auto-detected from the file's
 // magic bytes — extension is not consulted.
 func LoadMySQL(ctx context.Context, db *sql.DB, conn *config.MysqlConn, targetDB, dumpPath string) (LoadStrategy, error) {
 	if err := ensureMySQLDB(ctx, db, targetDB); err != nil {
 		return "", err
 	}
+	// Only the fast paths can leave a half-applied dump behind, and they
+	// need `conn`; the wire-only path (conn == nil) skips the probe.
+	countObjects := func() (int, bool) { return mysqlObjectCount(ctx, db, targetDB) }
+	before, counted := 0, false
+	if conn != nil {
+		before, counted = countObjects()
+	}
 	if ok, err := runFastPathMySQL(ctx, conn, targetDB, dumpPath, tryDockerExecMySQL); ok {
 		return StrategyDockerExec, nil
 	} else if err != nil {
-		slog.Warn("dump-load fast path (docker exec) failed; falling through", "error", err)
+		if perr := partialLoadError("docker exec", dumpPath, targetDB, err, before, counted, countObjects); perr != nil {
+			return "", perr
+		}
 	}
 	if ok, err := runFastPathMySQL(ctx, conn, targetDB, dumpPath, tryNativeCLIMySQL); ok {
 		return StrategyNativeCLI, nil
 	} else if err != nil {
-		slog.Warn("dump-load fast path (native CLI) failed; falling through", "error", err)
+		if perr := partialLoadError("native CLI", dumpPath, targetDB, err, before, counted, countObjects); perr != nil {
+			return "", perr
+		}
 	}
 	return StrategyWire, loadMySQLViaWire(ctx, db, targetDB, dumpPath)
+}
+
+// partialLoadError decides what a failed fast-path attempt means. It
+// returns nil when the attempt provably wrote nothing (the target holds
+// the same object count as before it ran, or the count is unknown) — the
+// caller then logs a warning and falls through to the next strategy, the
+// long-standing "a misconfigured CLI can never block a cold build"
+// behaviour. It returns an error when the target GAINED objects: the
+// dump was applied in part, replaying it would collide or silently skip
+// the aborted section's rows, and the honest move is to fail so the next
+// prepare rebuilds the database from scratch (issue #28).
+//
+// ponytail: object count, not content. An attempt that died after
+// INSERTing rows into existing tables without creating any is
+// indistinguishable from one that wrote nothing, so a data-only dump can
+// still be replayed on top of itself. Compare a row/checksum watermark
+// per table if that ever bites.
+func partialLoadError(
+	strategy, dumpPath, targetDB string,
+	attemptErr error,
+	before int,
+	counted bool,
+	countObjects func() (int, bool),
+) error {
+	if counted {
+		if after, ok := countObjects(); ok && after != before {
+			return fmt.Errorf(
+				"dump-load fast path (%s) aborted after applying part of %s: target %s gained %d object(s) "+
+					"and replaying the dump on top would corrupt it; not falling through: %w",
+				strategy, dumpPath, targetDB, after-before, attemptErr)
+		}
+	}
+	slog.Warn("dump-load fast path failed; falling through",
+		"strategy", strategy, "target", targetDB, "error", attemptErr)
+	return nil
+}
+
+// mysqlObjectCount counts tables + views in `targetDB`. The bool is
+// false when the count could not be taken (nil handle, query error), in
+// which case callers keep the old fall-through behaviour rather than
+// blocking a cold build on a probe failure.
+func mysqlObjectCount(ctx context.Context, db *sql.DB, targetDB string) (int, bool) {
+	if db == nil {
+		return 0, false
+	}
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
+		targetDB).Scan(&n); err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// postgresObjectCount mirrors mysqlObjectCount for a *sql.DB already
+// scoped to the target database (pg has no USE), counting every
+// non-system schema so a dump that creates its own schemas is covered.
+func postgresObjectCount(ctx context.Context, db *sql.DB) (int, bool) {
+	if db == nil {
+		return 0, false
+	}
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables "+
+			"WHERE table_schema NOT IN ('pg_catalog', 'information_schema')").Scan(&n); err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // LoadPostgres mirrors LoadMySQL for pgx-backed databases. The `db`
@@ -71,15 +162,25 @@ func LoadMySQL(ctx context.Context, db *sql.DB, conn *config.MysqlConn, targetDB
 // wire-protocol fallback uses it directly. The fast paths consult
 // `conn` and reconnect via the CLI.
 func LoadPostgres(ctx context.Context, db *sql.DB, conn *config.PostgresConn, targetDB, dumpPath string) (LoadStrategy, error) {
+	// See LoadMySQL: probe only when a fast path can actually run.
+	countObjects := func() (int, bool) { return postgresObjectCount(ctx, db) }
+	before, counted := 0, false
+	if conn != nil {
+		before, counted = countObjects()
+	}
 	if ok, err := runFastPathPostgres(ctx, conn, targetDB, dumpPath, tryDockerExecPostgres); ok {
 		return StrategyDockerExec, nil
 	} else if err != nil {
-		slog.Warn("dump-load fast path (docker exec) failed; falling through", "error", err)
+		if perr := partialLoadError("docker exec", dumpPath, targetDB, err, before, counted, countObjects); perr != nil {
+			return "", perr
+		}
 	}
 	if ok, err := runFastPathPostgres(ctx, conn, targetDB, dumpPath, tryNativeCLIPostgres); ok {
 		return StrategyNativeCLI, nil
 	} else if err != nil {
-		slog.Warn("dump-load fast path (native CLI) failed; falling through", "error", err)
+		if perr := partialLoadError("native CLI", dumpPath, targetDB, err, before, counted, countObjects); perr != nil {
+			return "", perr
+		}
 	}
 	return StrategyWire, loadPostgresViaWire(ctx, db, dumpPath)
 }

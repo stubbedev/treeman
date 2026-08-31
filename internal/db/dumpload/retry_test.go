@@ -105,3 +105,38 @@ func TestRetryingExecHonoursContextCancel(t *testing.T) {
 		t.Fatalf("want context.Canceled, got %v", err)
 	}
 }
+
+// TestPartialLoadError — a fast-path attempt that wrote nothing falls
+// through (nil), one that left new objects behind hard-fails so the next
+// prepare rebuilds instead of replaying the dump onto a half-loaded
+// database (issue #28).
+func TestPartialLoadError(t *testing.T) {
+	attemptErr := errors.New("exec mysql: exit status 127")
+
+	cases := []struct {
+		name    string
+		before  int
+		counted bool
+		after   int
+		afterOK bool
+		wantErr bool
+	}{
+		{"wrote nothing falls through", 4, true, 4, true, false},
+		{"gained objects hard-fails", 0, true, 12, true, true},
+		{"lost objects hard-fails", 12, true, 3, true, true},
+		{"unknown before falls through", 0, false, 9, true, false},
+		{"unknown after falls through", 0, true, 0, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := partialLoadError("docker exec", "/dumps/schema.sql", "app_wt_1", attemptErr,
+				c.before, c.counted, func() (int, bool) { return c.after, c.afterOK })
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, c.wantErr)
+			}
+			if err != nil && !errors.Is(err, attemptErr) {
+				t.Errorf("error does not wrap the attempt error: %v", err)
+			}
+		})
+	}
+}

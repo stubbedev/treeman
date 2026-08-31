@@ -50,6 +50,22 @@ type State struct {
 	teardownMu  sync.Mutex
 	teardownLks map[string]*sync.Mutex
 
+	// prepareMu/prepareLks serialise ENGINE-PREPARE work per worktree.
+	// Four independent entry points reach prepare.Run for the same
+	// worktree — the finalize pipeline, the watcher-driven re-prepare,
+	// a queued `prepare` task, and `db reset` — and only the first two
+	// excluded each other (via MarkFinalizeInFlight). So a `treeman
+	// prepare` issued while the HEAD watcher was already re-preparing
+	// after a merge ran two builds against the same source database:
+	// one DROP+CREATEs and dump-loads while the other creates tables in
+	// it ("Table 'x' already exists") and then runs migrate against a
+	// schema whose framework ledger the other half had not written yet
+	// ("Duplicate column name", issue #28). Per-worktree, not per-repo:
+	// two worktrees own disjoint databases and should still build in
+	// parallel.
+	prepareMu  sync.Mutex
+	prepareLks map[string]*sync.Mutex
+
 	// inFlightTeardowns is the set of worktree paths whose primary
 	// TeardownWorktree is currently running. The lifecycle watcher's
 	// onRemove consults this so the fsnotify REMOVE event fired by
@@ -154,6 +170,7 @@ func NewState(bg context.Context, s *store.Store) *State {
 		wtWatchers:        map[string]*WatcherEntry{},
 		lifecycleWatchers: map[string]*WatcherEntry{},
 		teardownLks:       map[string]*sync.Mutex{},
+		prepareLks:        map[string]*sync.Mutex{},
 		inFlightTeardowns: map[string]struct{}{},
 		inFlightFinalizes: map[string]inFlightFinalize{},
 		reapQueues:        map[string]chan string{},
@@ -411,6 +428,23 @@ func (st *State) LockRepoTeardown(repoPath string) *sync.Mutex {
 	if !ok {
 		mu = &sync.Mutex{}
 		st.teardownLks[repoPath] = mu
+	}
+	return mu
+}
+
+// LockWorktreePrepare returns the per-worktree engine-prepare mutex,
+// creating it on first call. Every caller that runs prepare.Run /
+// prepare.RunFiltered for a worktree must hold it across that call, so
+// concurrent builds queue instead of colliding on the same source
+// database (see prepareLks). Same usage contract as LockRepoTeardown:
+// `Lock()` on entry, `Unlock()` on exit.
+func (st *State) LockWorktreePrepare(wtPath string) *sync.Mutex {
+	st.prepareMu.Lock()
+	defer st.prepareMu.Unlock()
+	mu, ok := st.prepareLks[wtPath]
+	if !ok {
+		mu = &sync.Mutex{}
+		st.prepareLks[wtPath] = mu
 	}
 	return mu
 }
