@@ -208,6 +208,7 @@ func RunDoctorChecks(ctx context.Context) []DoctorResult {
 		results = append(results, checkConfig(repoRoot))
 		results = append(results, checkSchema(repoRoot))
 		results = append(results, checkFrameworks(repoRoot))
+		results = append(results, checkHooks(repoRoot))
 		results = append(results, checkRegistry(ctx, repoRoot))
 		results = append(results, checkSnapshots(ctx, repoRoot))
 		results = append(results, checkEngines(ctx, repoRoot))

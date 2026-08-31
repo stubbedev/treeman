@@ -206,6 +206,49 @@ engines, the `*-after-engines` variants after. Every hook trigger is
 async-dispatched — the CLI returns immediately after spawning
 drivers.
 
+### The `create-before-engines` contract
+
+`create-before-engines` runs after patches + bring-in but **before the
+engine databases exist**. Dependency installs belong there so `migrate`
+finds `vendor/` — but a package manager whose post-install script boots
+the framework (Laravel's `post-autoload-dump` → `artisan
+package:discover` / `vendor:publish`, an npm `postinstall` that calls the
+framework CLI) connects to a database that is not there yet and dies with
+`SQLSTATE[HY000] [1049] Unknown database`.
+
+It fails *intermittently*: only the boots that happen to touch the DB
+break, so the same config can pass eight creates and fail the ninth —
+after paying the full cold install first. `treeman doctor` now warns on
+this shape (`hooks` check) instead of letting you discover it from a
+two-minute failure.
+
+Two working recipes for a Laravel repo. Pick one:
+
+```yaml
+# A — split it: resolve deps early (so migrate sees vendor/), run the
+#     boot scripts once the databases exist.
+hooks:
+  create-before-engines:
+    - run: "composer install --no-interaction --no-scripts"
+  create-after-engines:
+    - run: "composer install --no-interaction"      # scripts armed, DB exists
+    - run: "yarn install --frozen-lockfile"
+```
+
+```yaml
+# B — move it: the whole install after engines. Simpler; only valid when
+#     nothing in the migrate/seed step needs vendor/ before it runs.
+hooks:
+  create-after-engines:
+    - run: "composer install --no-interaction"
+    - run: "yarn install --frozen-lockfile"
+```
+
+`--no-scripts` (composer) / `--ignore-scripts` (npm, yarn, pnpm, bun) is
+what disarms the boot. An inline env guard on the step
+(`DB_DATABASE=… composer install`) counts as deliberate too and silences
+the doctor warning.
+
 Per-step env vars are only available on `databases[].migrate.env`
 and `databases[].seed.env` (the framework-runner step), not on
 hook actions. Use the inherited shell environment + `cwd:` to
