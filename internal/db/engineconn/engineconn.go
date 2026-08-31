@@ -58,6 +58,7 @@ type mysqlConn struct{ d *dbmysql.Driver }
 
 func (c mysqlConn) Close() error                                      { return c.d.Close() }
 func (c mysqlConn) EngineVersion(ctx context.Context) (string, error) { return c.d.EngineVersion(ctx) }
+
 func (c mysqlConn) Exists(ctx context.Context, n string) (bool, error) {
 	return c.d.DatabaseExists(ctx, n)
 }
@@ -66,6 +67,7 @@ func (c mysqlConn) DropMatching(ctx context.Context, n string) (int, error) {
 	dropped, err := c.d.DropMatching(ctx, n)
 	return len(dropped), err
 }
+
 func (c mysqlConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
 
 func (c mysqlConn) ListMatching(ctx context.Context, p string) ([]string, error) {
@@ -122,6 +124,7 @@ type mongoConn struct {
 
 func (c mongoConn) Close() error                                      { return c.d.Close(c.ctx) }
 func (c mongoConn) EngineVersion(ctx context.Context) (string, error) { return c.d.EngineVersion(ctx) }
+
 func (c mongoConn) Exists(ctx context.Context, n string) (bool, error) {
 	return c.d.DatabaseExists(ctx, n)
 }
@@ -130,6 +133,7 @@ func (c mongoConn) DropMatching(ctx context.Context, n string) (int, error) {
 	dropped, err := c.d.DropMatching(ctx, n)
 	return len(dropped), err
 }
+
 func (c mongoConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
 
 func (c mongoConn) ListMatching(ctx context.Context, p string) ([]string, error) {
@@ -145,6 +149,7 @@ type redisConn struct{ d *dbredis.Driver }
 
 func (c redisConn) Close() error                                      { return c.d.Close() }
 func (c redisConn) EngineVersion(ctx context.Context) (string, error) { return c.d.EngineVersion(ctx) }
+
 func (c redisConn) Exists(ctx context.Context, n string) (bool, error) {
 	return c.d.PrefixExists(ctx, n)
 }
@@ -152,6 +157,7 @@ func (c redisConn) Exists(ctx context.Context, n string) (bool, error) {
 func (c redisConn) DropMatching(ctx context.Context, n string) (int, error) {
 	return c.d.DropPrefix(ctx, n)
 }
+
 func (c redisConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
 
 // ListMatching is nil for Redis: enumerating a key prefix needs a full
@@ -177,6 +183,7 @@ func (c esConn) DropMatching(ctx context.Context, n string) (int, error) {
 	dropped, err := c.d.DropMatching(ctx, n)
 	return len(dropped), err
 }
+
 func (c esConn) DropSnapshot(ctx context.Context, n string) error { return c.d.DropSnapshot(ctx, n) }
 
 func (c esConn) ListMatching(ctx context.Context, p string) ([]string, error) {

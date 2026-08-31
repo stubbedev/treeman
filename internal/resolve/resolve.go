@@ -555,7 +555,7 @@ func resolveElasticsearch(cfg *config.Config, env envfile.EnvFile) *resolvedConn
 	}
 	for _, k := range []string{"ELASTICSEARCH_URL", "ELASTIC_URL", "OPENSEARCH_URL", "SPRING_ELASTICSEARCH_URIS"} {
 		if v, ok := env.Get(k); ok {
-			first := strings.SplitN(v, ",", 2)[0]
+			first, _, _ := strings.Cut(v, ",")
 			first = strings.TrimSpace(first)
 			if first == "" {
 				continue
@@ -568,7 +568,7 @@ func resolveElasticsearch(cfg *config.Config, env envfile.EnvFile) *resolvedConn
 	}
 	for _, k := range []string{"ELASTICSEARCH_HOSTS", "ELASTIC_HOSTS", "ES_HOSTS", "ELASTICSEARCH_DSL_HOSTS"} {
 		if v, ok := env.Get(k); ok {
-			first := strings.SplitN(v, ",", 2)[0]
+			first, _, _ := strings.Cut(v, ",")
 			first = strings.TrimSpace(first)
 			if first == "" {
 				continue

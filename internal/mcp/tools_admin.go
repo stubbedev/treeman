@@ -479,20 +479,15 @@ func notifyTestTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in notifyTes
 		}
 	}
 	if backend == "none" {
-		return nil, notifyTestOut{
-				Backend: "none",
-			}, errors.New(
-				"backend is \"none\" — it mutes all notifications; pass backend=auto|notify-send|osascript to probe a real sender",
-			)
+		err := errors.New("backend is \"none\" — it mutes all notifications; " +
+			"pass backend=auto|notify-send|osascript to probe a real sender")
+		return nil, notifyTestOut{Backend: "none"}, err
 	}
 	sender := notify.NewSender(backend)
 	if !sender.Available() {
-		return nil, notifyTestOut{
-				Backend: backend,
-			}, fmt.Errorf(
-				"notification backend %q is not available on this host — install notify-send (Linux) or run on macOS",
-				backend,
-			)
+		err := fmt.Errorf("notification backend %q is not available on this host — "+
+			"install notify-send (Linux) or run on macOS", backend)
+		return nil, notifyTestOut{Backend: backend}, err
 	}
 	if err := sender.Send(ctx, notify.Notification{
 		Title:   "treeman: test",
