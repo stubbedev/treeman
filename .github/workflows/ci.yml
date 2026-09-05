@@ -65,6 +65,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          # Substitute from the self-hosted xilo cache. This must be set at
+          # install time: the `xilo use` step later in the job rewrites nix.conf
+          # only after the build has already run, so the cache was previously
+          # written to but never read from.
+          extra-conf: |
+            extra-substituters = https://nix.stubbe.dev/c/default/default
+            extra-trusted-public-keys = default:6uWvXutL9cXjV3lii+Ur5ff+ArQoG4kMBKNXWrIxhHg=
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-lint-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
@@ -93,6 +101,14 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
       - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          # Substitute from the self-hosted xilo cache. This must be set at
+          # install time: the `xilo use` step later in the job rewrites nix.conf
+          # only after the build has already run, so the cache was previously
+          # written to but never read from.
+          extra-conf: |
+            extra-substituters = https://nix.stubbe.dev/c/default/default
+            extra-trusted-public-keys = default:6uWvXutL9cXjV3lii+Ur5ff+ArQoG4kMBKNXWrIxhHg=
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock', '**/Cargo.lock', '**/go.sum') }}
@@ -161,12 +177,12 @@ jobs:
 
       - run: nix flake check --print-build-logs
 
-      # Push the built package closure to the self-hosted xilo cache on
-      # master pushes, so `nix run`/flake consumers tracking HEAD pull a
-      # prebuilt binary instead of recompiling. Release tags push the same
-      # way from release.yml's `cache` job. Best-effort: a cache-push
-      # failure (e.g. a transient 504 from the single-vCPU cache box on a
-      # large closure) must not redden CI.
+      # Push the built package closure to the self-hosted xilo cache on master
+      # pushes, so `nix run`/flake consumers tracking HEAD pull a prebuilt
+      # binary instead of recompiling. Release tags push the same way from
+      # release.yml's `cache` job. A failed push is not swallowed: it would
+      # leave every consumer rebuilding from source, so the step fails the
+      # job.
       - name: setup xilo
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: stubbedev/xilo@v1
@@ -177,7 +193,6 @@ jobs:
 
       - name: push nix build to xilo (master)
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        continue-on-error: true
         run: |
           OUT=$(nix build .#treeman --no-link --print-out-paths)
           xilo push default $OUT
