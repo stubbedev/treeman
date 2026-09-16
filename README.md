@@ -97,6 +97,7 @@ language-specific tooling required.
 Via Homebrew (macOS + Linux):
 
 ```sh
+brew tap stubbedev/tap
 brew install stubbedev/tap/treeman
 ```
 
