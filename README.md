@@ -97,7 +97,7 @@ language-specific tooling required.
 Via Homebrew (macOS + Linux):
 
 ```sh
-brew install stubbedev/treeman/treeman
+brew install stubbedev/tap/treeman
 ```
 
 Prebuilt tarballs for every tagged release. The asset filename
