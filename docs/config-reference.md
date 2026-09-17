@@ -199,6 +199,7 @@ databases:
 hooks:
     create-before-engines:
         - run: '...'
+          continue_on_error: false
           cwd: '...'
           container: '...'
           compose_service: '...'
@@ -206,6 +207,7 @@ hooks:
           container_engine: '...'
     create-after-engines:
         - run: '...'
+          continue_on_error: false
           cwd: '...'
           container: '...'
           compose_service: '...'
@@ -213,6 +215,7 @@ hooks:
           container_engine: '...'
     delete-before-engines:
         - run: '...'
+          continue_on_error: false
           cwd: '...'
           container: '...'
           compose_service: '...'
@@ -220,6 +223,7 @@ hooks:
           container_engine: '...'
     delete-after-engines:
         - run: '...'
+          continue_on_error: false
           cwd: '...'
           container: '...'
           compose_service: '...'
@@ -227,6 +231,7 @@ hooks:
           container_engine: '...'
     checkout:
         - run: '...'
+          continue_on_error: false
           cwd: '...'
           container: '...'
           compose_service: '...'
@@ -234,6 +239,7 @@ hooks:
           container_engine: '...'
     file-change:
         - run: '...'
+          continue_on_error: false
           cwd: '...'
           container: '...'
           compose_service: '...'
@@ -411,6 +417,10 @@ One action: a `run` (string or list of strings) plus optional cwd + container wr
 #### `run` *(one of: string, array of string)* — **required**
 
 Shell work for this action. String = single step; list = sequenced steps chained with `&&`. Required.
+
+#### `continue_on_error` *(boolean)*
+
+Allow a non-zero command exit without aborting later lifecycle phases. Still waits for completion and records the failure. Rendering and launch errors remain fatal.
 
 #### `cwd` *(string)*
 
@@ -812,6 +822,10 @@ On-file-change action with optional label filter. Same shape as a hook Action pl
 #### `run` *(one of: string, array of string)* — **required**
 
 Shell work for this action. String = single step; list = sequenced steps chained with `&&`. Required.
+
+#### `continue_on_error` *(boolean)*
+
+Allow a non-zero command exit without aborting later lifecycle phases. Still waits for completion and records the failure. Rendering and launch errors remain fatal.
 
 #### `cwd` *(string)*
 

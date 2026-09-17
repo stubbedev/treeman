@@ -530,6 +530,9 @@ func finalizeState(ctx context.Context, st *store.Store, wtID int64) (state, det
 	last := rows[0]
 	switch last.EventType {
 	case store.EvtWorktreeCreateEnd:
+		if last.Level == store.LevelWarn {
+			return ui.Yellow("ready (warnings)"), "— " + last.Message
+		}
 		return ui.Status("ready"), "(last finalize " + formatTs(last.Ts) + ")"
 	case store.EvtWorktreeCreateStart:
 		return ui.Status("preparing"), "(started " + formatTs(last.Ts) + ")"

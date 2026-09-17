@@ -202,9 +202,48 @@ Available triggers: `create-before-engines`,
 `create-after-engines`, `delete-before-engines`,
 `delete-after-engines`, `checkout`, `file-change`. The
 `*-before-engines` variants run before treeman touches its managed
-engines, the `*-after-engines` variants after. Every hook trigger is
-async-dispatched — the CLI returns immediately after spawning
-drivers.
+engines, the `*-after-engines` variants after. Worktree creation is
+async-dispatched: the CLI returns a queued result, while the daemon waits
+for each hook phase before proceeding to the next lifecycle phase.
+
+### Optional hook failures
+
+Hooks are fatal at lifecycle barriers by default: a failed
+`create-before-engines` action prevents database preparation, and a failed
+`create-after-engines` action fails finalize. Set **`continue_on_error: true`**
+on an independent action to allow its non-zero command exit without
+aborting subsequent phases:
+
+```yaml
+hooks:
+  create-before-engines:
+    - run: "composer install --no-interaction --no-scripts"
+    - cwd: frontend
+      run: "npm ci"
+      continue_on_error: true
+  create-after-engines:
+    - run: "composer install --no-interaction"
+```
+
+Here an invalid frontend lockfile still fails `npm ci`, but databases are
+prepared and after-engines hooks run if the required Composer install
+succeeds. Keep prerequisites for database migrations fatal. The setting
+applies to the whole action, not individual steps. Steps still short-circuit
+on failure, sibling actions still run in parallel, and the daemon still
+**waits** for completion: this is non-fatal, not fire-and-forget execution.
+Omitting the field or setting it to `false` preserves fail-fast behavior.
+Rendering/container-resolution errors, process launch errors, and lifecycle
+cancellation are not suppressed.
+
+The failed exit code and captured output remain in hook history. The daemon's
+create completion summary (`worktree:create:end` in `treeman logs tail --follow`)
+reports non-fatal failures with commands and hook log IDs. `treeman worktree show`
+displays **ready (warnings)** with that summary and recent failed hook runs;
+`treeman logs hooks --all --show ID` retrieves the full output. The immediate
+create response only reports that setup was queued, since hooks finish later.
+A successful retry with `treeman worktree finalize` clears the current warning
+state without erasing historical failures. Standalone hook runs continue to
+report actual exit codes, including opted-in failures.
 
 ### The `create-before-engines` contract
 

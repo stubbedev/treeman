@@ -38,6 +38,7 @@ func PersistOutcome(
 
 	runIDs := make([]int64, len(out.Groups))
 	failed := 0
+	nonFatal := 0
 	maxExit := 0
 	for i, g := range out.Groups {
 		// Every group's merged stdout+stderr is written to a log
@@ -61,6 +62,9 @@ func PersistOutcome(
 		}
 		if g.ExitCode != 0 {
 			failed++
+			if g.ContinueOnError {
+				nonFatal++
+			}
 			if g.ExitCode > maxExit {
 				maxExit = g.ExitCode
 			}
@@ -69,7 +73,10 @@ func PersistOutcome(
 
 	level := store.LevelInfo
 	if failed > 0 {
-		level = store.LevelError
+		level = store.LevelWarn
+		if failed > nonFatal {
+			level = store.LevelError
+		}
 	}
 
 	dur := int64(0)
@@ -87,6 +94,13 @@ func PersistOutcome(
 	}
 
 	msg := fmt.Sprintf("groups=%d failed=%d", len(out.Groups), failed)
+	if nonFatal > 0 {
+		payload["non_fatal"] = nonFatal
+		msg += fmt.Sprintf(" non-fatal=%d", nonFatal)
+		if failed == nonFatal {
+			msg += " (continuing)"
+		}
+	}
 	_ = st.WriteEvent(ctx, level, store.EvtHooksEnd, msg, repoID, wtID, phase, dur, payload)
 	return runIDs
 }

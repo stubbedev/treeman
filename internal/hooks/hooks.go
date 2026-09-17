@@ -45,9 +45,10 @@ type GroupOutcome struct {
 	// empty for sync phases.
 	LogPath string
 	// ExitCode is populated by the sync phase runner.
-	ExitCode   int
-	StdoutTail string
-	StderrTail string
+	ExitCode        int
+	ContinueOnError bool
+	StdoutTail      string
+	StderrTail      string
 	// LogBody is the full captured merged stdout+stderr for the group,
 	// kept verbatim (ANSI escapes preserved). Populated by the
 	// wait=true path so `PersistOutcome` can stream it into the
@@ -106,9 +107,10 @@ func RunHooksOrphan(
 		}
 		cmds = append(cmds, c)
 		out.Groups = append(out.Groups, GroupOutcome{
-			Command: cmdStr,
-			PID:     c.Process.Pid,
-			LogPath: logPath,
+			Command:         cmdStr,
+			PID:             c.Process.Pid,
+			LogPath:         logPath,
+			ContinueOnError: entry.ContinueOnError,
 		})
 	}
 	if wait {
@@ -172,9 +174,10 @@ func RunHooks(
 		}
 		cmds = append(cmds, c)
 		out.Groups = append(out.Groups, GroupOutcome{
-			Command: cmdStr,
-			PID:     c.Process.Pid,
-			LogPath: logPath,
+			Command:         cmdStr,
+			PID:             c.Process.Pid,
+			LogPath:         logPath,
+			ContinueOnError: entry.ContinueOnError,
 		})
 	}
 	if wait {
@@ -219,7 +222,7 @@ func RunHooks(
 // symptom (a `migrate` that fails only because vendor/ is half-written).
 func FirstFailureError(trigger string, out RunOutcome, runIDs []int64) error {
 	for i, g := range out.Groups {
-		if g.ExitCode == 0 {
+		if g.ExitCode == 0 || g.ContinueOnError {
 			continue
 		}
 		tail := strings.TrimSpace(g.StderrTail)

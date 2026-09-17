@@ -19,6 +19,11 @@
           ],
           "description": "Shell work for this action. String = single step; list = sequenced steps chained with `\u0026\u0026`. Required."
         },
+        "continue_on_error": {
+          "type": "boolean",
+          "description": "Allow a non-zero command exit without aborting later lifecycle phases. Still waits for completion and records the failure. Rendering and launch errors remain fatal.",
+          "default": false
+        },
         "cwd": {
           "type": "string",
           "description": "Working directory for every step in this action. Relative paths resolve against the worktree root (host) or container WORKDIR (when wrapped)."
@@ -392,6 +397,11 @@
             }
           ],
           "description": "Shell work for this action. String = single step; list = sequenced steps chained with `\u0026\u0026`. Required."
+        },
+        "continue_on_error": {
+          "type": "boolean",
+          "description": "Allow a non-zero command exit without aborting later lifecycle phases. Still waits for completion and records the failure. Rendering and launch errors remain fatal.",
+          "default": false
         },
         "cwd": {
           "type": "string",

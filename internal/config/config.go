@@ -1170,6 +1170,8 @@ type Action struct {
 	// in-memory form is the list. Required.
 	Run []string `yaml:"run"`
 
+	ContinueOnError bool `yaml:"continue_on_error,omitempty"`
+
 	// Cwd is the working directory for every step in this action.
 	// Relative paths resolve against the worktree root (host) or
 	// against the container's WORKDIR (when wrapped). Optional.
@@ -1206,6 +1208,11 @@ func (Action) JSONSchema() *jsonschema.Schema {
 			{Type: "array", Items: &jsonschema.Schema{Type: "string"}, Description: "Ordered list of shell commands chained with `&&`."},
 		},
 		Description: "Shell work for this action. String = single step; list = sequenced steps chained with `&&`. Required.",
+	})
+	props.Set("continue_on_error", &jsonschema.Schema{
+		Type:        "boolean",
+		Default:     false,
+		Description: "Allow a non-zero command exit without aborting later lifecycle phases. Still waits for completion and records the failure. Rendering and launch errors remain fatal.",
 	})
 	props.Set("cwd", &jsonschema.Schema{
 		Type:        "string",
@@ -1260,12 +1267,13 @@ func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 		}
 	}
 	var raw struct {
-		Run            yaml.Node `yaml:"run"`
-		Cwd            string    `yaml:"cwd"`
-		Container      string    `yaml:"container"`
-		ComposeService string    `yaml:"compose_service"`
-		ComposeProject string    `yaml:"compose_project"`
-		Engine         string    `yaml:"container_engine"`
+		Run             yaml.Node `yaml:"run"`
+		ContinueOnError bool      `yaml:"continue_on_error"`
+		Cwd             string    `yaml:"cwd"`
+		Container       string    `yaml:"container"`
+		ComposeService  string    `yaml:"compose_service"`
+		ComposeProject  string    `yaml:"compose_project"`
+		Engine          string    `yaml:"container_engine"`
 	}
 	if err := node.Decode(&raw); err != nil {
 		return err
@@ -1286,6 +1294,7 @@ func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 	default:
 		return fmt.Errorf("action (line %d): `run:` must be a string or list of strings", node.Line)
 	}
+	a.ContinueOnError = raw.ContinueOnError
 	a.Cwd = raw.Cwd
 	a.Container = raw.Container
 	a.ComposeService = raw.ComposeService

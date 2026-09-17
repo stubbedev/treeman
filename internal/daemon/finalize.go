@@ -312,6 +312,8 @@ func FinalizeWorktree(
 	// Phase boundaries double as cancellation checkpoints: a
 	// concurrent TeardownWorktree fires `cancel` via CancelFinalize,
 	// and the next check bails before prepare creates databases.
+	summary := &hookSummary{}
+	ctx = context.WithValue(ctx, hookSummaryKey{}, summary)
 	done, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl,
 		isMain, repoID, wtID, inheritedEnv, skipPrepare, &enginesTouched)
 	if err != nil {
@@ -331,9 +333,7 @@ func FinalizeWorktree(
 			repoID, wtID, "", 0, nil)
 	}
 
-	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateEnd,
-		"daemon-detached setup + prepare complete",
-		repoID, wtID, "", 0, nil)
+	summary.emit(ctx, st.Store, repoID, wtID)
 	return nil
 }
 
@@ -961,6 +961,9 @@ func runTriggerActions(
 	started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, trigger, len(actions))
 	out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtRoot, slugVal, isMain, inheritedEnv, true)
 	runIDs := hooks.PersistOutcome(ctx, st.Store, repoID, wtID, trigger, started, nowMillis(), out)
+	if summary, ok := ctx.Value(hookSummaryKey{}).(*hookSummary); ok {
+		summary.record(trigger, out, runIDs)
+	}
 	if err != nil {
 		return fmt.Errorf("%s: %w", trigger, err)
 	}
