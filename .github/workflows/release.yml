@@ -99,7 +99,7 @@ jobs:
             -o "dist/$STAGE/treemand" ./cmd/treemand
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/$STAGE/" 2>/dev/null || true
           cd dist
-          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          COPYFILE_DISABLE=1 tar --format=ustar -czf "${STAGE}.tar.gz" "$STAGE"
           shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v7

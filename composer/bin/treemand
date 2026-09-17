@@ -1,0 +1,8 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require dirname(__DIR__) . '/Bootstrap.php';
+
+\Stubbedev\Treeman\Bootstrap::run('treemand', array_slice($argv, 1));

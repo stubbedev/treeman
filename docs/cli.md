@@ -441,13 +441,14 @@ list local + remote-only branches with worktree occupancy
 
 ### `treeman prepare`
 
-ensure → dump → migrate → snapshot → replicate (foreground)
+ensure → dump → migrate → snapshot → replicate
 
 | Flag | Usage |
 |---|---|
 | `-w`, `--worktree` |  |
 | `-r`, `--repo` |  |
 | `--json` |  |
+| `--no-daemon` | run synchronously in this process without connecting to or starting a daemon (for CI) |
 | `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done (default: dispatch and return) |
 
 ### `treeman db`

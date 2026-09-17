@@ -87,8 +87,9 @@ schema, AI integration, internals.
   inspect` / `compose ps`) all work.
 - **Go 1.25+** — only if building from source.
 
-That's the whole dependency list. No Python, no Node, no
-language-specific tooling required.
+Native releases need no Python, Node, or language-specific tooling.
+The optional Composer bootstrap requires Composer 2.2+, PHP CLI 8.1+,
+and the curl, pcntl (with `pcntl_exec` enabled), and zlib extensions.
 
 ---
 
@@ -100,6 +101,62 @@ Via Homebrew (macOS + Linux):
 brew tap stubbedev/tap
 brew install stubbedev/tap/treeman
 ```
+
+### Composer (PHP dev dependency)
+
+After the first Composer-enabled release is published on Packagist:
+
+```sh
+composer require --dev stubbedev/treeman
+vendor/bin/treeman --version
+vendor/bin/treemand --version
+```
+
+Commit `composer.json` and `composer.lock` in your application. Composer's
+installed package metadata (populated from the lock on `composer install`)
+selects the **exact release**, never `latest`. Each new patch tag works
+without updating a version constant in this package. Development branches
+and branch aliases are rejected; use a published tag with release assets.
+
+This is a normal library with transparent Composer `bin` bootstraps, not
+a plugin: no plugin approval or dependency install scripts are needed.
+`composer install` does **not** download the native binaries. The first
+invocation of either bin announces a lazy download of both binaries from
+that tag's GitHub release, verifies its published SHA256, and extracts only
+allowlisted regular files. Subsequent invocations verify the cached binary
+hashes and execute directly, preserving arguments, working directory, signals,
+and exit status. The verified exact-version cache entry is prepended to `PATH`
+so daemon startup finds its matching `treemand`; the original `PATH` follows
+unchanged, and other environment variables are preserved. Linux/macOS amd64 and arm64 are supported;
+Windows and 32-bit platforms are not.
+
+First use needs HTTPS access to GitHub release assets (including GitHub's
+asset redirect host), plus a writable executable cache directory. The default
+is `$XDG_CACHE_HOME/treeman/composer`, or `$HOME/.cache/treeman/composer`.
+Set `TREEMAN_COMPOSER_CACHE` to an absolute path to override it. Entries are
+keyed by exact version and platform, serialized with a file lock, and published
+atomically. The cache root, entry directory, metadata, and binaries must not be
+group/world writable; symlinks at those locations are rejected. Keep the cache
+owned by the executing user, and trust every ancestor directory (including any
+ancestor symlink targets): other users must not be able to replace or redirect
+the cache through its ancestry. Ancestor permissions and ownership are not
+validated by the bootstrap. Restored caches must come from a trusted source;
+hashes detect corruption, not an attacker who can rewrite both binaries and
+cache metadata.
+Published checksums protect against corrupt downloads, not a compromised
+GitHub release publisher; they are not independently signed attestations.
+
+For offline/air-gapped jobs, warm the cache online with
+`vendor/bin/treeman --version`, then preserve the complete version/platform
+entry with executable permissions (or the entire cache). Set
+`TREEMAN_COMPOSER_OFFLINE=1` to forbid bootstrap downloads. Valid cached entries
+also work offline without this setting, including from a read-only cache.
+A missing/corrupt entry fails clearly; no other version is substituted. Remove
+an invalid entry and warm it online again. Composer's own package cache/vendor
+files must also be available for an offline `composer install`; the native
+binary cache does not replace them. No binaries are vendored in this package.
+
+### Native releases
 
 Prebuilt tarballs for every tagged release. The asset filename
 embeds the version, so resolve the latest tag first:
@@ -178,6 +235,51 @@ treeman worktree delete proj-123
 # 6. Cd back to the main checkout (with optional auto-remove if clean):
 cd "$(treeman worktree back --remove)"
 ```
+
+## CI without a daemon
+
+Use `prepare --no-daemon` in an existing checkout to force preparation in
+process and block until complete, without a user session or daemon. Bare
+`prepare` may use daemon RPC; `--foreground` starts a daemon rather than
+forcing inline preparation. Do not use daemon-backed worktree lifecycle
+commands as a substitute. A writable per-build directory isolates SQLite
+(including WAL/SHM sidecars) and scratch files; do not point concurrent builds
+at one `TREEMAN_DB_PATH`.
+
+```sh
+composer install --no-interaction
+export TREEMAN_COMPOSER_CACHE="$HOME/.cache/treeman/composer"
+vendor/bin/treeman --version
+export TREEMAN_COMPOSER_OFFLINE=1
+TREEMAN_BUILD_STATE=$(mktemp -d "$PWD/.treeman-ci.XXXXXXXX")
+export TREEMAN_DB_PATH="$TREEMAN_BUILD_STATE/treeman.db"
+export TMPDIR="$TREEMAN_BUILD_STATE/tmp"
+mkdir -p "$TMPDIR"
+cat > "$TREEMAN_BUILD_STATE/config.yaml" <<'YAML'
+snapshots:
+  cap_per_repo: 8
+YAML
+export TREEMAN_CONFIG="$TREEMAN_BUILD_STATE/config.yaml"
+vendor/bin/treeman prepare --no-daemon --repo "$PWD" --worktree "$PWD"
+vendor/bin/phpunit
+```
+
+`TREEMAN_CONFIG` (or `--config /absolute/path/config.yaml`, which wins over
+the environment variable) replaces the default **global** config layer.
+Repository `.treeman.yaml` still loads afterward and takes precedence for
+repo-scoped settings. Global-only settings such as `snapshots`, `daemon`,
+and `logs` belong in that replacement global file, not the repo file.
+This selects configuration for foreground/local execution; it does not
+reconfigure an already-running daemon handling RPC commands.
+
+Snapshot registry state lives in `TREEMAN_DB_PATH`; actual template snapshots
+live in your database engines, not a configurable `snapshots.path` directory.
+Keep SQLite's parent and `TMPDIR` writable, and provision writable engine
+storage with sufficient space/permissions for snapshots and clones. Isolating
+SQLite alone does not isolate shared database namespaces: concurrent builds
+also need distinct configured database/template names or isolated engine
+instances. Clean up engine resources and the per-build state directory after
+the job. Daemon periodic snapshot/log retention sweeps do not run in this mode.
 
 ## Git workflow
 

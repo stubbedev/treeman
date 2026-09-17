@@ -1,0 +1,32 @@
+name: composer
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        php: ['8.1', '8.5']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, pcntl, zlib
+          tools: composer:v2
+          coverage: none
+      - run: composer validate --strict
+      - run: |
+          php -l composer/Bootstrap.php
+          php -l composer/bin/treeman
+          php -l composer/bin/treemand
+          php -l composer/tests/run.php
+          php composer/tests/run.php

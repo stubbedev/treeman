@@ -2,6 +2,29 @@
 
 [← back to README](../README.md)
 
+## CI without a daemon
+
+Run `treeman prepare --no-daemon` in the checkout to execute the normal
+prepare pipeline and post-engine hooks synchronously in the CLI process.
+It never connects to a daemon socket, subscribes to events, or starts a
+daemon, even if a daemon is already reachable or a stale socket exists.
+A failed pipeline or fatal hook returns a nonzero exit status.
+
+Use `--json` for the usual structured outcomes. `--no-daemon` takes
+precedence over `--foreground`; without it, `--foreground` still streams
+live daemon progress and may start the daemon.
+
+The inline path loads the same layered configuration as normal prepare,
+including the effective global configuration selected by `--config` or
+`TREEMAN_CONFIG`. Engine services and credentials are still required for
+configured databases. SQLite state and snapshots are still used; isolate
+`TREEMAN_DB_PATH` and `XDG_DATA_HOME` between concurrent CI jobs, and avoid
+running inline prepare alongside a daemon mutating the same worktree.
+
+```sh
+treeman prepare --no-daemon --json
+```
+
 ## Snapshot cache + GC
 
 Each `prepare` run fingerprints the **content** that determines a

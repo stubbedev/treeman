@@ -1,0 +1,15 @@
+{
+    "name": "stubbedev/treeman",
+    "description": "Per-worktree development databases, snapshots and test clones, distributed as verified native binaries",
+    "type": "library",
+    "license": ["MIT", "Apache-2.0"],
+    "homepage": "https://github.com/stubbedev/treeman",
+    "require": {
+        "php": ">=8.1",
+        "composer-runtime-api": "^2.2",
+        "ext-curl": "*",
+        "ext-pcntl": "*",
+        "ext-zlib": "*"
+    },
+    "bin": ["composer/bin/treeman", "composer/bin/treemand"]
+}

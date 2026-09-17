@@ -36,11 +36,15 @@ import (
 func PrepareCmd() *cli.Command {
 	return &cli.Command{
 		Name:  "prepare",
-		Usage: "ensure → dump → migrate → snapshot → replicate (foreground)",
+		Usage: "ensure → dump → migrate → snapshot → replicate",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "json"},
+			&cli.BoolFlag{
+				Name:  "no-daemon",
+				Usage: "run synchronously in this process without connecting to or starting a daemon (for CI)",
+			},
 			&cli.BoolFlag{
 				Name:    "foreground",
 				Aliases: []string{"wait", "f"},
@@ -55,6 +59,24 @@ func PrepareCmd() *cli.Command {
 			task := rpc.Task{
 				Type: rpc.TaskPrepare, RepoPath: repoRoot, WorktreePath: wtPath,
 				InheritedEnv: CaptureInheritedEnv(),
+			}
+			if c.Bool("no-daemon") {
+				resp, err := daemon.RunPlanInProcess(ctx, *rpc.Plan(true, rpc.One(task)).RunPlan)
+				if err != nil {
+					return err
+				}
+				if !c.Bool("json") {
+					return reportInlineResult(resp, "prepare")
+				}
+				for _, result := range resp.TaskResults {
+					if !result.OK {
+						return fmt.Errorf("%s: %s", result.Type, result.Message)
+					}
+					if _, err := fmt.Fprintln(ui.Out, result.PayloadJSON); err != nil {
+						return err
+					}
+				}
+				return nil
 			}
 			if c.Bool("json") {
 				return runResultJSON(ctx, task)
