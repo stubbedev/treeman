@@ -7,6 +7,7 @@ package safego
 import (
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 )
 
 // Go runs fn in a new goroutine, recovering any panic and logging it
@@ -28,6 +29,12 @@ func Go(label, detail string, fn func()) {
 //	go func() { defer wg.Done(); defer safego.Recover(label, detail); ... }()
 func Recover(label, detail string) {
 	if r := recover(); r != nil {
-		slog.Error("goroutine panic", "label", label, "detail", detail, "panic", fmt.Sprint(r))
+		// The stack is the whole point of the log line: recovery keeps
+		// the daemon alive, so this record is the ONLY trace the panic
+		// leaves. Without it a "assignment to entry in nil map" names
+		// no file, and the only symptom downstream is whatever work the
+		// goroutine silently stopped doing.
+		slog.Error("goroutine panic", "label", label, "detail", detail,
+			"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 	}
 }

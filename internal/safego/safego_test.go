@@ -93,3 +93,36 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	defer l.mu.Unlock()
 	return l.w.Write(p)
 }
+
+// The stack is what makes a recovered panic actionable: the process
+// survives, so this log record is the only trace left behind.
+func TestRecoverLogsStack(t *testing.T) {
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&lockedWriter{w: &buf, mu: &mu}, nil)))
+	defer slog.SetDefault(old)
+
+	done := make(chan struct{})
+	Go("test:stack", "", func() {
+		defer close(done)
+		// Via a helper so staticcheck can't see the nil map statically
+		// (SA5000) — the panic is the point of the test.
+		nilMap()["boom"] = "x"
+	})
+	<-done
+	time.Sleep(50 * time.Millisecond)
+
+	mu.Lock()
+	got := buf.String()
+	mu.Unlock()
+	if !strings.Contains(got, "assignment to entry in nil map") {
+		t.Fatalf("panic value missing from log: %s", got)
+	}
+	if !strings.Contains(got, "stack=") || !strings.Contains(got, "safego_test.go") {
+		t.Fatalf("stack missing from log: %s", got)
+	}
+}
+
+// nilMap returns a nil map for TestRecoverLogsStack to panic on.
+func nilMap() map[string]string { return nil }

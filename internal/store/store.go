@@ -1089,11 +1089,25 @@ func injectRunID(ctx context.Context, payload any) any {
 	case nil:
 		return map[string]string{"run_id": id}
 	case map[string]any:
+		// A TYPED nil map lands here, not in the `case nil` above:
+		// `var payload map[string]any` passed as `any` is a non-nil
+		// interface holding a nil map, so the assertion succeeds and
+		// the write below panics with "assignment to entry in nil
+		// map". Callers that build a payload conditionally hit this on
+		// their empty path — it took down the worktree:create:end event
+		// at the tail of every finalize, so `worktree wait` sat there
+		// until its 10m timeout.
+		if p == nil {
+			return map[string]string{"run_id": id}
+		}
 		if _, ok := p["run_id"]; !ok {
 			p["run_id"] = id
 		}
 		return p
 	case map[string]string:
+		if p == nil {
+			return map[string]string{"run_id": id}
+		}
 		if _, ok := p["run_id"]; !ok {
 			p["run_id"] = id
 		}

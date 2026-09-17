@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -152,5 +153,43 @@ func TestHookSummaryCleanRetry(t *testing.T) {
 	}
 	if events[0].Level != store.LevelInfo || strings.Contains(events[0].Message, "failure") {
 		t.Fatalf("stale warning: %+v", events[0])
+	}
+}
+
+// The happy path — no non-fatal hook failures — leaves `payload` a
+// typed-nil map. Passed to WriteEvent under a run_id-carrying ctx (every
+// finalize runs under one) that used to panic inside injectRunID, so the
+// worktree:create:end event was never written and `treeman worktree wait`
+// sat there until its 10m timeout.
+func TestHookSummaryEmitWithoutWarnings(t *testing.T) {
+	st, cleanup := setup(t)
+	defer cleanup()
+	ctx := runid.With(context.Background(), "run12345")
+	repoID, err := st.Store.EnsureRepo(ctx, t.TempDir(), "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtID, err := st.Store.EnsureWorktree(ctx, repoID, t.TempDir(), "slug", "feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	(&hookSummary{}).emit(ctx, st.Store, repoID, wtID)
+
+	events, err := st.Store.QueryEvents(ctx, store.EventFilter{
+		WorktreeID: wtID,
+		EventTypes: []string{store.EvtWorktreeCreateEnd},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("want exactly one %s event, got %d", store.EvtWorktreeCreateEnd, len(events))
+	}
+	if events[0].Level != store.LevelInfo {
+		t.Errorf("level = %q, want %q", events[0].Level, store.LevelInfo)
+	}
+	if !strings.Contains(events[0].PayloadJSON, `"run_id":"run12345"`) {
+		t.Errorf("run_id missing from payload: %s", events[0].PayloadJSON)
 	}
 }

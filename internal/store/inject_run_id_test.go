@@ -83,3 +83,34 @@ func TestInjectRunID_NonMapPayloadGetsWrapped(t *testing.T) {
 		t.Fatalf("original payload not preserved under 'payload': %#v", m)
 	}
 }
+
+// A TYPED nil map is NOT the `case nil` arm: `var p map[string]any`
+// widened to `any` is a non-nil interface holding a nil map, so the
+// type switch matches and the write used to panic with "assignment to
+// entry in nil map". Callers that build their payload conditionally
+// (daemon.hookSummary.emit) pass exactly this on their empty path.
+func TestInjectRunID_TypedNilAnyMapDoesNotPanic(t *testing.T) {
+	ctx := runid.With(context.Background(), "abc12345")
+	var in map[string]any
+	got := injectRunID(ctx, in)
+	m, ok := got.(map[string]string)
+	if !ok {
+		t.Fatalf("typed-nil map[string]any should become map[string]string, got %T", got)
+	}
+	if m["run_id"] != "abc12345" {
+		t.Fatalf("run_id not set: %#v", m)
+	}
+}
+
+func TestInjectRunID_TypedNilStringMapDoesNotPanic(t *testing.T) {
+	ctx := runid.With(context.Background(), "abc12345")
+	var in map[string]string
+	got := injectRunID(ctx, in)
+	m, ok := got.(map[string]string)
+	if !ok {
+		t.Fatalf("typed-nil map[string]string should stay a map[string]string, got %T", got)
+	}
+	if m["run_id"] != "abc12345" {
+		t.Fatalf("run_id not set: %#v", m)
+	}
+}
