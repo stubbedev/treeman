@@ -46,11 +46,12 @@ const (
 	EvtPrepareUnsupported         = "prepare:unsupported"
 
 	// databases — db operations
-	EvtDBDrop          = "db:drop"
-	EvtDBReset         = "db:reset"
-	EvtDBSave          = "db:save"
-	EvtDBTeardownSkip  = "db:teardown:skip"
-	EvtDBTeardownError = "db:teardown:error"
+	EvtDBDrop             = "db:drop"
+	EvtDBReset            = "db:reset"
+	EvtDBSave             = "db:save"
+	EvtDBTeardownSkip     = "db:teardown:skip"
+	EvtDBTeardownError    = "db:teardown:error"
+	EvtDBTeardownProgress = "db:teardown:progress"
 
 	// databases[].migrate
 	EvtMigrateSkip = "migrate:skip"

@@ -16,7 +16,6 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/hooks"
-	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -239,13 +238,6 @@ func (lw *LifecycleWatcher) onRemove(ctx context.Context, adminDir string) {
 		}
 		wtPath = row.Path
 	}
-	// `treeman worktree delete` removes the admin dir via `git worktree
-	// remove` near the end of its teardown — that REMOVE fsnotify
-	// event lands here. The primary teardown already runs teardown
-	// + DB teardown + marks the row deleted; spawning an orphan
-	// teardown behind the same per-repo mutex just blocks waiting for
-	// the primary to release, then no-ops on the deleted-row check.
-	// Skip outright.
 	if lw.st.IsTeardownInFlight(wtPath) {
 		return
 	}
@@ -353,9 +345,10 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 // databases, and marks the row deleted. Does NOT call `git worktree
 // remove` — git already did.
 func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) error {
-	mu := st.LockRepoTeardown(repoPath)
-	mu.Lock()
-	defer mu.Unlock()
+	if !st.MarkTeardownInFlight(wtPath) {
+		return nil
+	}
+	defer st.UnmarkTeardownInFlight(wtPath)
 
 	cfg, err := resolve.LoadResolved(repoPath)
 	if err != nil {
@@ -404,7 +397,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) err
 		// fully-dropped state. The lifecycle goroutine already runs
 		// detached from the originating fsnotify event, so the cost
 		// stays off the user's CLI hot path.
-		if err := prepare.TeardownDatabases(ctx, &cfg, row.Slug, repoID, row.ID, st.Store); err != nil {
+		if err := teardownDatabasesWithHeartbeat(ctx, &cfg, row.Slug, repoID, row.ID, st.Store); err != nil {
 			slog.Warn("lifecycle teardown DB drop", "wt", wtPath, "err", err)
 		}
 	}

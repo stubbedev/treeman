@@ -817,7 +817,7 @@ func TeardownWorktree(
 		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, slugVal,
 		row.IsMain, repoID, wtID, inheritedEnv)
 	if len(cfg.Databases) > 0 {
-		if err := prepare.TeardownDatabases(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
+		if err := teardownDatabasesWithHeartbeat(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
 			slog.Warn("teardown DB drop", "wt", wtRoot, "err", err)
 		}
 	}
