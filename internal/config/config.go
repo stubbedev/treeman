@@ -1928,6 +1928,11 @@ func LoadGlobal() (Config, error) {
 	var cfg Config
 	applyDefaults(&cfg)
 	if g, ok := globalConfigPath(); ok {
+		if explicitGlobalConfigPath() != "" {
+			if _, err := os.Stat(g); err != nil {
+				return cfg, fmt.Errorf("explicit config %s: %w", g, err)
+			}
+		}
 		if err := checkLayerScope(g, "global"); err != nil {
 			return cfg, err
 		}
@@ -2032,15 +2037,9 @@ func scopeHint(scope string) string {
 // merged Config. Later layers override earlier. Missing files are
 // ignored.
 func LoadLayered(repoRoot string) (Config, error) {
-	var cfg Config
-	applyDefaults(&cfg)
-	if g, ok := globalConfigPath(); ok {
-		if err := checkLayerScope(g, "global"); err != nil {
-			return cfg, err
-		}
-		if err := mergeYAMLFile(&cfg, g); err != nil {
-			return cfg, err
-		}
+	cfg, err := LoadGlobal()
+	if err != nil {
+		return cfg, err
 	}
 	if repoRoot != "" {
 		for _, name := range []string{".treeman.yaml", ".treeman.local.yaml"} {
@@ -2064,15 +2063,9 @@ func LoadLayered(repoRoot string) (Config, error) {
 // worktree's own `.treeman.local.yaml`. Used by the daemon's
 // per-worktree fanout.
 func LoadLayeredForWorktree(mainRoot, wtRoot string) (Config, error) {
-	var cfg Config
-	applyDefaults(&cfg)
-	if g, ok := globalConfigPath(); ok {
-		if err := checkLayerScope(g, "global"); err != nil {
-			return cfg, err
-		}
-		if err := mergeYAMLFile(&cfg, g); err != nil {
-			return cfg, err
-		}
+	cfg, err := LoadGlobal()
+	if err != nil {
+		return cfg, err
 	}
 	repoFiles := []string{
 		filepath.Join(mainRoot, ".treeman.yaml"),
@@ -2218,6 +2211,9 @@ func applyStatusDefaults(cfg *Config) {
 }
 
 func globalConfigPath() (string, bool) {
+	if path := explicitGlobalConfigPath(); path != "" {
+		return path, true
+	}
 	xdg := os.Getenv("XDG_CONFIG_HOME")
 	if xdg == "" {
 		home, err := os.UserHomeDir()

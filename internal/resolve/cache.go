@@ -49,8 +49,8 @@ func configCacheKey(mainRoot, wtRoot string) string {
 // valid as long as the file remains absent.
 func candidateYAMLFiles(mainRoot, wtRoot string) []string {
 	var out []string
-	if home, err := os.UserHomeDir(); err == nil {
-		out = append(out, filepath.Join(home, ".config", "treeman", "config.yaml"))
+	if path, ok := config.GlobalConfigPath(); ok {
+		out = append(out, path)
 	}
 	if mainRoot != "" {
 		out = append(out,
@@ -86,7 +86,7 @@ func stampsEqual(a, b map[string]int64) bool {
 		return false
 	}
 	for k, v := range a {
-		if b[k] != v {
+		if other, ok := b[k]; !ok || other != v {
 			return false
 		}
 	}

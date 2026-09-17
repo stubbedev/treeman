@@ -5,9 +5,12 @@
 package treemanapp
 
 import (
+	"context"
+
 	"github.com/urfave/cli/v3"
 
 	"github.com/stubbedev/treeman/cmd/treeman/cmd"
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/version"
 )
 
@@ -15,6 +18,7 @@ import (
 // subcommand belongs in the Commands slice below; gen-docs walks
 // from here so undocumented additions can't slip in.
 func New() *cli.Command {
+	var restoreConfig func()
 	return &cli.Command{
 		Name:                  "treeman",
 		Usage:                 "per-worktree DB orchestrator",
@@ -24,6 +28,21 @@ func New() *cli.Command {
 			c.Hidden = false
 		},
 		Suggest: true,
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "config", Usage: "user-global config file (overrides TREEMAN_CONFIG)"},
+		},
+		Before: func(ctx context.Context, c *cli.Command) (context.Context, error) {
+			var err error
+			restoreConfig, err = config.ConfigureGlobalPath(c.String("config"))
+			return ctx, err
+		},
+		After: func(context.Context, *cli.Command) error {
+			if restoreConfig != nil {
+				restoreConfig()
+				restoreConfig = nil
+			}
+			return nil
+		},
 		Commands: []*cli.Command{
 			cmd.WorktreeCmd(),
 			cmd.GitCmd(),

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/stubbedev/treeman/internal/rpc"
 )
@@ -49,6 +50,7 @@ func Start(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("treemand not on PATH: %w", err)
 	}
 	cmd := exec.Command(binPath) //nolint:noctx // detached daemon fork; must outlive caller ctx
+	cmd.Env = daemonEnvironment(os.Environ())
 	cmd.Stdin = nil
 	cmd.Stdout, _ = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	cmd.Stderr = cmd.Stdout
@@ -58,6 +60,16 @@ func Start(ctx context.Context) (int, error) {
 	pid := cmd.Process.Pid
 	_ = cmd.Process.Release()
 	return pid, nil
+}
+
+func daemonEnvironment(environ []string) []string {
+	filtered := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		if !strings.HasPrefix(entry, "TREEMAN_CONFIG=") {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 // Stop asks treemand to shut down. Prefers the OS-native init when

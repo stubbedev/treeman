@@ -565,3 +565,22 @@ skipped if the engine socket isn't reachable — your configured
 the sibling service name (`host: db`) and it resolves via the
 compose-provided DNS. As a last resort `host.docker.internal` is
 probed before erroring.
+
+## Alternate global config
+
+Use `treeman --config ./config.yaml <command>` or
+`TREEMAN_CONFIG=./config.yaml treeman <command>` to replace (not add to)
+the user-global layer. A non-empty flag wins over `TREEMAN_CONFIG`; empty
+values fall through to the next source, then to
+`$XDG_CONFIG_HOME/treeman/config.yaml` (or `~/.config/treeman/config.yaml`).
+Relative override paths resolve from the invocation's working directory.
+An explicitly selected missing file is an error; a missing default file
+still uses built-in defaults. Scope validation and repo / repo-local /
+worktree-local precedence are unchanged.
+
+The override applies only to config loaded by that foreground invocation.
+It is not sent over RPC: an already-running daemon, its watchers, and
+jobs executed by it retain the daemon's own config. Auto-started daemons
+(and `treeman daemon start`) do not inherit `TREEMAN_CONFIG` from the CLI.
+To deliberately configure a daemon, start `TREEMAN_CONFIG=/absolute/config.yaml
+treemand` directly or set that environment in its service definition.

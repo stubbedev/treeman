@@ -63,6 +63,10 @@ func main() {
 		return
 	}
 
+	if _, err := config.ConfigureGlobalPath(""); err != nil {
+		fmt.Fprintln(os.Stderr, "treemand:", err)
+		os.Exit(1)
+	}
 	level := slog.LevelInfo
 	if gcfg, err := config.LoadGlobal(); err == nil {
 		level = slogLevel(gcfg.Daemon.LogLevel)
