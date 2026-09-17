@@ -1,6 +1,11 @@
 services:
   minio:
-    image: minio/minio:latest
+    # quay.io, not Docker Hub: MinIO withdrew the `minio/minio` Docker
+    # Hub repository (pulls now fail with "repository does not exist or
+    # may require 'docker login'"), and quay is where the project still
+    # publishes. Pinned to a concrete RELEASE like garage below, so the
+    # suite can't break again on someone else's retag.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: treeman-e2e-minio
     command: server /data --console-address ":9001"
     environment:
