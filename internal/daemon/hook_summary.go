@@ -41,7 +41,7 @@ func (s *hookSummary) emit(ctx context.Context, st *store.Store, repoID, wtID in
 	var payload map[string]any
 	if len(s.warnings) > 0 {
 		level = store.LevelWarn
-		var details []string
+		details := make([]string, 0, len(s.warnings))
 		for _, w := range s.warnings {
 			detail := fmt.Sprintf("%s: hook exited %d: %s", w.Phase, w.ExitCode, w.Command)
 			if w.RunID > 0 {

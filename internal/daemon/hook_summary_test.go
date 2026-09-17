@@ -78,49 +78,60 @@ func TestPipelineContinueOnError(t *testing.T) {
 			if (postErr == nil) != wantSuccess {
 				t.Fatalf("post hook: %v", postErr)
 			}
-			runs, err := st.Store.QueryHookRuns(ctx, wtID, 20)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var failedID int64
-			for _, run := range runs {
-				if run.ExitCode.Valid && run.ExitCode.Int64 == 7 {
-					failedID = run.ID
-					if !strings.Contains(run.StderrTail, "invalid-lockfile") {
-						t.Fatal("failure output lost")
-					}
-				}
-			}
-			if failedID == 0 {
-				t.Fatal("failed hook was not persisted")
-			}
+			failedID := assertFailedHookPersisted(ctx, t, st.Store, wtID)
 			if !wantSuccess {
 				return
 			}
 			summary.emit(ctx, st.Store, repoID, wtID)
-			events, err := st.Store.QueryEvents(
-				ctx,
-				store.EventFilter{WorktreeID: wtID, EventTypes: []string{store.EvtWorktreeCreateEnd}, Limit: 1},
-			)
-			if err != nil || len(events) != 1 {
-				t.Fatalf("events=%v err=%v", events, err)
-			}
-			e := events[0]
-			if e.Level != store.LevelWarn || !strings.Contains(e.Message, "non-fatal hook failure") ||
-				!strings.Contains(e.Message, "invalid-lockfile") ||
-				!strings.Contains(e.Message, "--show") {
-				t.Fatalf("summary: %+v", e)
-			}
-			var payload struct {
-				Warnings []hookWarning `json:"non_fatal_hooks"`
-			}
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &payload); err != nil {
-				t.Fatal(err)
-			}
-			if len(payload.Warnings) != 1 || payload.Warnings[0].RunID != failedID || payload.Warnings[0].ExitCode != 7 {
-				t.Fatalf("payload: %+v", payload)
-			}
+			assertHookWarningSummary(ctx, t, st.Store, wtID, failedID)
 		})
+	}
+}
+
+func assertFailedHookPersisted(ctx context.Context, t *testing.T, st *store.Store, wtID int64) int64 {
+	t.Helper()
+	runs, err := st.QueryHookRuns(ctx, wtID, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failedID int64
+	for _, run := range runs {
+		if run.ExitCode.Valid && run.ExitCode.Int64 == 7 {
+			failedID = run.ID
+			if !strings.Contains(run.StderrTail, "invalid-lockfile") {
+				t.Fatal("failure output lost")
+			}
+		}
+	}
+	if failedID == 0 {
+		t.Fatal("failed hook was not persisted")
+	}
+	return failedID
+}
+
+func assertHookWarningSummary(ctx context.Context, t *testing.T, st *store.Store, wtID, failedID int64) {
+	t.Helper()
+	events, err := st.QueryEvents(
+		ctx,
+		store.EventFilter{WorktreeID: wtID, EventTypes: []string{store.EvtWorktreeCreateEnd}, Limit: 1},
+	)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events=%v err=%v", events, err)
+	}
+	e := events[0]
+	if e.Level != store.LevelWarn || !strings.Contains(e.Message, "non-fatal hook failure") ||
+		!strings.Contains(e.Message, "invalid-lockfile") ||
+		!strings.Contains(e.Message, "--show") {
+		t.Fatalf("summary: %+v", e)
+	}
+	var payload struct {
+		Warnings []hookWarning `json:"non_fatal_hooks"`
+	}
+	if err := json.Unmarshal([]byte(e.PayloadJSON), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Warnings) != 1 || payload.Warnings[0].RunID != failedID || payload.Warnings[0].ExitCode != 7 {
+		t.Fatalf("payload: %+v", payload)
 	}
 }
 
