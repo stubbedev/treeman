@@ -289,7 +289,7 @@ try {
             fclose($pipes[1]);
             check(proc_close($process) === $expected, 'Exit status not preserved');
             if ($binary === 'treeman') {
-                check($output === "$project\ninherited\nspace argument\n; touch not-executed\n\n", 'Arguments/environment/cwd not preserved');
+                check($output === realpath($project) . "\ninherited\nspace argument\n; touch not-executed\n\n", 'Arguments/environment/cwd not preserved');
             }
         }
         check(!file_exists("$project/not-executed"), 'Shell injection');
