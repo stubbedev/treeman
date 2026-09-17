@@ -1,0 +1,137 @@
+name: packagist
+
+# Keeps https://packagist.org/packages/stubbedev/treeman in step with git.
+#
+# The repo also carries a Packagist push webhook, but a webhook fails
+# silently: a dropped delivery leaves `composer require stubbedev/treeman`
+# resolving to the previous tag with nothing in the release run to say so.
+# This workflow makes the sync part of the pipeline instead — it nudges
+# Packagist's update API, then polls the package metadata until the ref
+# actually shows up, and fails the run if it never does.
+#
+# Two entry points:
+#   * push to master  — refreshes dev-master (direct trigger, below).
+#   * release tags    — called by release.yml AFTER the GitHub release is
+#                       published, so the tag never appears on Packagist
+#                       before the binaries its Composer bootstrap
+#                       downloads exist.
+
+on:
+  push:
+    branches: [master]
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Serialise every update: a release pushes master and the tag back to back,
+# and two overlapping runs would race each other's verification poll.
+# Never cancel — a skipped run is a package left behind.
+concurrency:
+  group: packagist
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: sync packagist
+    runs-on: ubuntu-latest
+    # Forks have neither the credentials nor a package to update.
+    if: github.repository == 'stubbedev/treeman'
+    timeout-minutes: 15
+    steps:
+      # Explicit API nudge. Packagist would also pick this up from the
+      # webhook (or, eventually, its own crawl); calling the API just
+      # makes it prompt and puts the HTTP status in the run log. Missing
+      # credentials are a warning, not a failure — the verify step below
+      # is the real gate, and it passes on the webhook alone.
+      - name: Trigger Packagist update
+        env:
+          PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PACKAGIST_USERNAME:-}" ] || [ -z "${PACKAGIST_TOKEN:-}" ]; then
+            echo "::warning::PACKAGIST_USERNAME / PACKAGIST_TOKEN not configured — relying on the push webhook alone."
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/packagist-update.json -w '%{http_code}' \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              -d "{\"repository\":{\"url\":\"https://github.com/${GITHUB_REPOSITORY}\"}}" \
+              "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+              || echo 000)
+            echo "attempt ${attempt}: HTTP ${code}"
+            cat /tmp/packagist-update.json 2>/dev/null || true
+            echo
+            case "$code" in
+              2*) exit 0 ;;
+              # 4xx is a bad token or an unregistered package — retrying
+              # can't fix it, so surface it now rather than burning the
+              # verify poll on a request that will never land.
+              4*) echo "::error::Packagist rejected the update request (HTTP ${code})."; exit 1 ;;
+            esac
+            sleep $((attempt * 10))
+          done
+          echo "::error::Packagist update API unreachable after 3 attempts."
+          exit 1
+
+      # Ancestry check below needs master's history; a tag run only
+      # reads the metadata, but one checkout keeps the step uniform.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The guarantee. Poll the published composer metadata until it
+      # reports this exact ref: the tag for a release, or the pushed
+      # commit as dev-master's source reference for master. Anything
+      # else — dropped webhook, rejected API call, Packagist stuck on a
+      # stale crawl — fails the run.
+      - name: Verify Packagist picked up the ref
+        run: |
+          set -euo pipefail
+          PKG=stubbedev/treeman
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            URL="https://repo.packagist.org/p2/${PKG}.json"
+            WANT="${GITHUB_REF_NAME}"
+            FILTER='[.packages[$pkg][].version]'
+            WHAT="tag ${WANT}"
+          else
+            URL="https://repo.packagist.org/p2/${PKG}~dev.json"
+            WANT="${GITHUB_SHA}"
+            FILTER='[.packages[$pkg][] | select(.version == "dev-master") | .source.reference]'
+            WHAT="dev-master at ${WANT}"
+          fi
+
+          for attempt in $(seq 1 15); do
+            # Cache-buster: the p2 metadata sits behind a CDN that would
+            # otherwise keep serving the pre-update copy for minutes.
+            if curl -sS -f -H 'Cache-Control: no-cache' -o /tmp/p2.json "${URL}?_=$(date +%s)"; then
+              have=$(jq -r --arg pkg "$PKG" "${FILTER} | join(\" \")" /tmp/p2.json)
+              echo "attempt ${attempt}: packagist has [${have}]"
+              for entry in $have; do
+                if [ "$entry" = "$WANT" ]; then
+                  echo "Packagist is in sync: ${WHAT}"
+                  exit 0
+                fi
+                # Master moved on while we polled (the flake.nix
+                # auto-bump does exactly this, and pushes [skip ci] so
+                # no later run covers for us). Packagist sitting on a
+                # descendant of this commit means the sync worked and
+                # then some — accept it instead of failing the push
+                # that got overtaken.
+                if [ "${GITHUB_REF_TYPE}" != "tag" ] \
+                  && git fetch --quiet origin master 2>/dev/null \
+                  && git cat-file -e "${entry}^{commit}" 2>/dev/null \
+                  && git merge-base --is-ancestor "${WANT}" "${entry}"; then
+                  echo "Packagist is in sync: dev-master at ${entry}, a descendant of ${WANT}"
+                  exit 0
+                fi
+              done
+            else
+              echo "attempt ${attempt}: metadata fetch failed"
+            fi
+            sleep 20
+          done
+          echo "::error::Packagist never published ${WHAT} (waited 5 minutes). Check the package's update log at https://packagist.org/packages/${PKG}"
+          exit 1

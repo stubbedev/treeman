@@ -104,7 +104,7 @@ brew install stubbedev/tap/treeman
 
 ### Composer (PHP dev dependency)
 
-After the first Composer-enabled release is published on Packagist:
+Published on Packagist as [`stubbedev/treeman`](https://packagist.org/packages/stubbedev/treeman):
 
 ```sh
 composer require --dev stubbedev/treeman

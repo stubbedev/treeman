@@ -170,6 +170,14 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
 
+  packagist:
+    name: sync packagist
+    # After the release is published, so the tag never lands on Packagist
+    # before the release assets the Composer bootstrap downloads exist.
+    needs: release
+    uses: ./.github/workflows/packagist.yml
+    secrets: inherit
+
   bump-tap:
     name: bump homebrew tap
     needs: release
