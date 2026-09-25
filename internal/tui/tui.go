@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -57,6 +59,11 @@ type Options struct {
 	Multi      bool     // Tab-toggle multi-select
 	Actions    []Action // extra key bindings
 	CancelHint string   // what Ctrl+C does (footer hint; default "cancel")
+	// Values optionally carries the RAW string each item stands for
+	// when the display rows are decorated (ANSI, prefixes, markers):
+	// the fuzzy filter and ranking run against these, not the display
+	// text. Nil → items are matched as-is. Must match items 1:1.
+	Values []string
 }
 
 // Result is the outcome of a picker run.
@@ -110,6 +117,9 @@ func MultiSelect(items []string, opts Options) (Result, error) {
 
 // run drives the bubbletea program. UI on stderr, input from stdin.
 func run(items []string, opts Options) (Result, error) {
+	if len(opts.Values) != 0 && len(opts.Values) != len(items) {
+		return Result{Canceled: true}, fmt.Errorf("tui: Values (%d) must match items (%d) 1:1", len(opts.Values), len(items))
+	}
 	if !Interactive() {
 		return Result{Canceled: true}, ErrNotTTY
 	}
@@ -143,9 +153,10 @@ type model struct {
 	items    []string
 	opts     Options
 	query    string
-	filtered []int        // indices into items, post-filter
-	cursor   int          // index into filtered
-	marked   map[int]bool // keyed by ORIGINAL item index
+	filtered []int         // indices into items, post-filter
+	cursor   int           // index into filtered
+	marked   map[int]bool  // keyed by ORIGINAL item index
+	matched  map[int][]int // original index → rune offsets of the matched query runes
 	action   string
 	canceled bool // Ctrl+C — cancel this step
 	aborted  bool // Esc — quit the whole command
@@ -161,16 +172,36 @@ func newModel(items []string, opts Options) *model {
 func (m *model) Init() tea.Cmd { return nil }
 
 // refilter recomputes the visible subset from the current query and
-// clamps the cursor. Substring, case-insensitive, original order.
-//
-// ponytail: substring filter, not fzf's ranked fuzzy scoring — port
-// scoring only if match ordering ever actually matters here.
+// clamps the cursor. Queries are matched fuzzily (smart-case
+// subsequence, see fuzzy.go) against each item's VALUE — opts.Values
+// when the display rows are decorated — and the survivors are ranked
+// best-match-first. An empty query keeps every item in input order.
 func (m *model) refilter() {
-	q := strings.ToLower(m.query)
 	m.filtered = m.filtered[:0]
-	for i, it := range m.items {
-		if q == "" || strings.Contains(strings.ToLower(it), q) {
+	m.matched = nil
+	if m.query == "" {
+		for i := range m.items {
 			m.filtered = append(m.filtered, i)
+		}
+	} else {
+		query := []rune(m.query)
+		type hit struct {
+			idx int
+			fm  fuzzyMatch
+		}
+		var hits []hit
+		for i, v := range m.values() {
+			if fm, ok := fuzzyFind([]rune(v), query); ok {
+				hits = append(hits, hit{i, fm})
+			}
+		}
+		sort.SliceStable(hits, func(a, b int) bool {
+			return hits[a].fm.score > hits[b].fm.score
+		})
+		m.matched = map[int][]int{}
+		for _, h := range hits {
+			m.filtered = append(m.filtered, h.idx)
+			m.matched[h.idx] = h.fm.positions
 		}
 	}
 	if m.cursor >= len(m.filtered) {
@@ -179,6 +210,15 @@ func (m *model) refilter() {
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
+}
+
+// values returns the strings the filter matches against: opts.Values
+// when given, else the display items themselves.
+func (m *model) values() []string {
+	if len(m.opts.Values) != 0 {
+		return m.opts.Values
+	}
+	return m.items
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -372,7 +412,7 @@ func (m *model) View() string {
 				b.WriteString(ui.Dim(ui.SymMarkOff) + " ")
 			}
 		}
-		line := highlightMatch(m.items[orig], m.query)
+		line := m.highlightMatch(orig)
 		if cursor {
 			line = ui.Bold(line)
 		}
@@ -386,26 +426,41 @@ func (m *model) View() string {
 	return b.String()
 }
 
-// highlightMatch underlines the first case-insensitive occurrence of
-// query in item. Items that already carry ANSI styling (pre-colored
-// menu rows) are returned untouched — splicing codes into them would
-// garble the escapes.
-func highlightMatch(item, query string) string {
-	if query == "" || !ui.ColorEnabled() || strings.ContainsRune(item, 0x1b) {
+// highlightMatch underlines every rune the fuzzy matcher paired
+// with a query rune (positions from the scorer, so non-adjacent
+// matches highlight too). Items that already carry ANSI styling
+// (pre-colored menu rows) are returned untouched — splicing codes
+// into them would garble the escapes.
+func (m *model) highlightMatch(orig int) string {
+	item := m.items[orig]
+	positions := m.matched[orig]
+	if m.query == "" || positions == nil || !ui.ColorEnabled() || strings.ContainsRune(item, 0x1b) {
 		return item
 	}
-	li, lq := strings.ToLower(item), strings.ToLower(query)
-	// Case-folding can change byte lengths outside ASCII; only trust the
-	// lowered offsets when they map 1:1 onto the original.
-	if len(li) != len(item) || len(lq) != len(query) {
-		return item
+	return underlinePositions(m.values()[orig], positions)
+}
+
+// underlinePositions wraps the rune at each listed offset in
+// underline on/off escapes, merging adjacent offsets into runs.
+func underlinePositions(value string, positions []int) string {
+	var b strings.Builder
+	underlined := false
+	for i, r := range value {
+		on := slices.Contains(positions, i)
+		if on != underlined {
+			if on {
+				b.WriteString("\x1b[4m")
+			} else {
+				b.WriteString("\x1b[24m")
+			}
+			underlined = on
+		}
+		b.WriteRune(r)
 	}
-	idx := strings.Index(li, lq)
-	if idx < 0 {
-		return item
+	if underlined {
+		b.WriteString("\x1b[24m")
 	}
-	end := idx + len(query)
-	return item[:idx] + "\x1b[4m" + item[idx:end] + "\x1b[24m" + item[end:]
+	return b.String()
 }
 
 // visible returns the window of filtered-row indices to draw, scrolled

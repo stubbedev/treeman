@@ -159,7 +159,8 @@ func gitBranchDelete() *cli.Command {
 				ui.Info("No other local branches to delete.")
 				return nil
 			}
-			res, err := tui.MultiSelect(items, tui.Options{Prompt: "delete branches"})
+			// Rows carry a dim " (merged)" marker; match the raw names.
+			res, err := tui.MultiSelect(items, tui.Options{Prompt: "delete branches", Values: names})
 			if errors.Is(err, tui.ErrCanceled) || len(res.Indices) == 0 {
 				return nil
 			}

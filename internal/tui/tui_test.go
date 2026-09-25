@@ -132,7 +132,13 @@ func TestFooterSingleCancelHint(t *testing.T) {
 
 func TestHighlightMatchSkipsStyledItems(t *testing.T) {
 	styled := "\x1b[36m[worktree] foo\x1b[0m"
-	if got := highlightMatch(styled, "foo"); got != styled {
+	m := newModel([]string{styled}, Options{Height: 10, Values: []string{"foo"}})
+	m.query = "foo"
+	m.refilter()
+	if len(m.filtered) != 1 {
+		t.Fatal("expected match via Values")
+	}
+	if got := m.highlightMatch(0); got != styled {
 		t.Errorf("styled item mutated: %q", got)
 	}
 }

@@ -305,7 +305,9 @@ func switchInteractive(ctx context.Context, repoRoot, from string, noFetch bool,
 	if len(items) == 0 {
 		return wizardThenRoute(ctx, repoRoot, "", noFetch, route)
 	}
-	res, err := tui.Select(items, tui.Options{Prompt: "switch/create", CancelHint: "wizard"})
+	// Rows are decorated (markers, paths); the fuzzy filter matches the
+	// raw branch names in parallel Values.
+	res, err := tui.Select(items, tui.Options{Prompt: "switch/create", CancelHint: "wizard", Values: targets})
 	switch {
 	case errors.Is(err, tui.ErrAborted):
 		return nil // Esc — quit the whole command, no wizard
