@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -28,11 +27,10 @@ func LookupWorktree(ctx context.Context, repoRoot, name string, sink Sink) (stri
 	if err != nil {
 		return "", false
 	}
-	st, err := store.Open(ctx, dbPath)
+	st, err := store.OpenShared(ctx, dbPath)
 	if err != nil {
 		return "", false
 	}
-	defer func() { _ = st.Close() }()
 	// Worktrees mid-teardown are excluded: resolving one would hand out
 	// a path that's about to disappear (switch/go) or re-enter a
 	// teardown already in flight (delete).
@@ -93,19 +91,17 @@ func IsMatchingExistingWorktree(ctx context.Context, repoRoot, wtPath, branch st
 	if !gitenv.IsLinkedWorktree(wtPath) {
 		return false
 	}
-	current, err := gitcmd.String(ctx, wtPath, "branch", "--show-current")
-	if err != nil || current != branch {
+	if current := gitenv.DetectBranch(ctx, wtPath); current != branch {
 		return false
 	}
 	dbPath, err := store.DefaultDBPath()
 	if err != nil {
 		return false
 	}
-	st, err := store.Open(ctx, dbPath)
+	st, err := store.OpenShared(ctx, dbPath)
 	if err != nil {
 		return false
 	}
-	defer func() { _ = st.Close() }()
 	var n int
 	_ = st.DB.QueryRowContext(ctx,
 		`SELECT 1 FROM worktrees w JOIN repos r ON r.id = w.repo_id

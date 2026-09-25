@@ -18,6 +18,7 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/daemonctl"
+	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/initgen"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
@@ -1312,27 +1313,8 @@ func initGlobalAction(c *cli.Command) error {
 	return nil
 }
 
-// detectBranchOfWorktree reads .git/HEAD (handles gitlink files for
-// linked worktrees) and returns the branch or "".
+// detectBranchOfWorktree reads the worktree's HEAD file (fork-free)
+// and returns the branch or "".
 func detectBranchOfWorktree(worktree string) string {
-	head := filepath.Join(worktree, ".git", "HEAD")
-	if _, err := os.Stat(head); err != nil {
-		// gitlink
-		link, err := os.ReadFile(filepath.Join(worktree, ".git"))
-		if err != nil {
-			return ""
-		}
-		gitdir := strings.TrimSpace(strings.TrimPrefix(string(link), "gitdir:"))
-		head = filepath.Join(gitdir, "HEAD")
-	}
-	b, err := os.ReadFile(head)
-	if err != nil {
-		return ""
-	}
-	s := strings.TrimSpace(string(b))
-	const pfx = "ref: refs/heads/"
-	if after, ok := strings.CutPrefix(s, pfx); ok {
-		return after
-	}
-	return ""
+	return gitenv.DetectBranch(context.Background(), worktree)
 }

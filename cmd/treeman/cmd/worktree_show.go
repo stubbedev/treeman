@@ -504,46 +504,72 @@ func finalizeStatusLine(ctx context.Context, st *store.Store, wtID int64) string
 	return state + ui.Dim(" "+detail)
 }
 
-// finalizeStateShort returns just the colored state token, for use
-// in tables where a long parenthetical would overflow the column.
-func finalizeStateShort(ctx context.Context, st *store.Store, wtID int64) string {
-	state, _ := finalizeState(ctx, st, wtID)
-	return state
-}
-
 // finalizeState splits the state derivation so both forms share one
 // query path. detail is "" when there's nothing extra worth showing.
 func finalizeState(ctx context.Context, st *store.Store, wtID int64) (state, detail string) {
 	rows, _ := st.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{
-			store.EvtWorktreeCreateStart,
-			store.EvtWorktreeCreateEnd,
-			store.EvtWorktreeCreateError,
-			store.EvtWorktreeCreateDeferred,
-		},
-		Limit: 1,
+		EventTypes: finalizeStateEventTypes,
+		Limit:      1,
 	})
 	if len(rows) == 0 {
 		return ui.Status("ready"), ""
 	}
 	last := rows[0]
+	return finalizeStateLabel(last), finalizeStateDetail(last)
+}
+
+// finalizeStateEventTypes is the finalize-lifecycle set behind the
+// derived state column (wt list --with-state, wt show, --json rows).
+var finalizeStateEventTypes = []string{
+	store.EvtWorktreeCreateStart,
+	store.EvtWorktreeCreateEnd,
+	store.EvtWorktreeCreateError,
+	store.EvtWorktreeCreateDeferred,
+}
+
+// finalizeStateLabel maps the latest finalize event to the colored
+// state token. A zero Event (none yet) is ready.
+func finalizeStateLabel(last store.Event) string {
+	if last.ID == 0 {
+		return ui.Status("ready")
+	}
 	switch last.EventType {
 	case store.EvtWorktreeCreateEnd:
 		if last.Level == store.LevelWarn {
-			return ui.Yellow("ready (warnings)"), "— " + last.Message
+			return ui.Yellow("ready (warnings)")
 		}
-		return ui.Status("ready"), "(last finalize " + formatTs(last.Ts) + ")"
+		return ui.Status("ready")
 	case store.EvtWorktreeCreateStart:
-		return ui.Status("preparing"), "(started " + formatTs(last.Ts) + ")"
+		return ui.Status("preparing")
 	case store.EvtWorktreeCreateDeferred:
-		return ui.Status("deferred"), "— " + last.Message
+		return ui.Status("deferred")
 	case store.EvtWorktreeCreateError:
 		if last.Level == store.LevelError {
-			return ui.Status("error"), "— " + last.Message
+			return ui.Status("error")
 		}
 	}
-	return ui.Status("ready"), ""
+	return ui.Status("ready")
+}
+
+// finalizeStateDetail renders the parenthetical tail for `wt show`.
+func finalizeStateDetail(last store.Event) string {
+	switch last.EventType {
+	case store.EvtWorktreeCreateEnd:
+		if last.Level == store.LevelWarn {
+			return "— " + last.Message
+		}
+		return "(last finalize " + formatTs(last.Ts) + ")"
+	case store.EvtWorktreeCreateStart:
+		return "(started " + formatTs(last.Ts) + ")"
+	case store.EvtWorktreeCreateDeferred:
+		return "— " + last.Message
+	case store.EvtWorktreeCreateError:
+		if last.Level == store.LevelError {
+			return "— " + last.Message
+		}
+	}
+	return ""
 }
 
 func newestStartTs(ctx context.Context, st *store.Store, wtID int64) int64 {

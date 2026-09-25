@@ -51,6 +51,12 @@ type Driver struct {
 	// serializes on that per-template export lock. See physical_stage.go.
 	stagesMu sync.Mutex
 	stages   map[string]*templateStage
+
+	// strategyCache memoizes chooseStrategy per database — the size
+	// probe (information_schema SUM) returns the same answer for every
+	// clone in one fan-out wave, so the Nth call shouldn't re-query it.
+	strategyCacheMu sync.Mutex
+	strategyCache   map[string]CloneStrategy
 }
 
 // LastCloneStrategy returns the CloneStrategy used by the most recent
@@ -336,13 +342,29 @@ func (d *Driver) PreferLogicalFor(ctx context.Context, db string) bool {
 // size: physical only once the data is large enough to amortize its
 // per-table overhead, logical otherwise. A size-probe error falls back
 // to logical (the always-correct path). No user knob — treeman always
-// takes the faster path for the data at hand.
+// takes the faster path for the data at hand. Memoized per db on the
+// driver: fan-out waves ask the same question N times.
 func (d *Driver) chooseStrategy(ctx context.Context, db string) CloneStrategy {
-	bytes, err := d.sourceDataBytes(ctx, db)
-	if err != nil || bytes < physicalCloneMinBytes() {
-		return CloneStrategyLogical
+	d.strategyCacheMu.Lock()
+	if s, ok := d.strategyCache[db]; ok {
+		d.strategyCacheMu.Unlock()
+		return s
 	}
-	return CloneStrategyPhysical
+	d.strategyCacheMu.Unlock()
+
+	bytes, err := d.sourceDataBytes(ctx, db)
+	s := CloneStrategyLogical
+	if err == nil && bytes >= physicalCloneMinBytes() {
+		s = CloneStrategyPhysical
+	}
+
+	d.strategyCacheMu.Lock()
+	if d.strategyCache == nil {
+		d.strategyCache = map[string]CloneStrategy{}
+	}
+	d.strategyCache[db] = s
+	d.strategyCacheMu.Unlock()
+	return s
 }
 
 // sourceDataBytes returns the on-disk size (data + index length) of

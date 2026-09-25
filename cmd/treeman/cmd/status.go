@@ -134,17 +134,27 @@ func collectStatus(ctx context.Context) (statusData, error) {
 		repoOrder []string
 		byRepo    = map[string]*statusRepo{}
 	)
+	ids := make([]int64, 0, 16)
+	var scanned []statusWtWithID
 	for rows.Next() {
-		var (
-			id           int64
-			slug, branch string
-			wpath, rpath string
-			isMain       bool
-		)
-		if err := rows.Scan(&id, &slug, &branch, &wpath, &isMain, &rpath); err != nil {
+		var r statusWtWithID
+		if err := rows.Scan(&r.id, &r.wt.Slug, &r.wt.Branch, &r.wt.Path, &r.wt.IsMain, &r.repoPath); err != nil {
 			return statusData{}, err
 		}
-		state, bucket := deriveStatusBucket(ctx, st, id)
+		ids = append(ids, r.id)
+		scanned = append(scanned, r)
+	}
+	if err := rows.Err(); err != nil {
+		return statusData{}, err
+	}
+	// One query for every row's latest lifecycle event — the bar widget
+	// used to pay one QueryEvents per worktree per tick.
+	latest, err := st.LatestEventPerWorktree(ctx, ids, statusEventTypes)
+	if err != nil {
+		return statusData{}, err
+	}
+	for _, r := range scanned {
+		state, bucket := statusBucket(latest[r.id])
 		data.Total++
 		switch bucket {
 		case bucketStable:
@@ -156,24 +166,16 @@ func collectStatus(ctx context.Context) (statusData, error) {
 		case bucketFailed:
 			data.Failed++
 		}
-		rs, ok := byRepo[rpath]
+		rs, ok := byRepo[r.repoPath]
 		if !ok {
-			rs = &statusRepo{Repo: filepath.Base(rpath)}
-			byRepo[rpath] = rs
-			repoOrder = append(repoOrder, rpath)
+			rs = &statusRepo{Repo: filepath.Base(r.repoPath)}
+			byRepo[r.repoPath] = rs
+			repoOrder = append(repoOrder, r.repoPath)
 		}
 		rs.Total++
-		rs.Worktrees = append(rs.Worktrees, statusWt{
-			Branch: branch,
-			Slug:   slug,
-			State:  state,
-			Bucket: bucket,
-			IsMain: isMain,
-			Path:   wpath,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return statusData{}, err
+		r.wt.State = state
+		r.wt.Bucket = bucket
+		rs.Worktrees = append(rs.Worktrees, r.wt)
 	}
 	for _, rp := range repoOrder {
 		data.Repos = append(data.Repos, *byRepo[rp])
@@ -182,31 +184,39 @@ func collectStatus(ctx context.Context) (statusData, error) {
 	return data, nil
 }
 
-// deriveStatusBucket maps a worktree's most recent lifecycle event to
-// a (state, bucket) pair. Mirrors finalizeState but also folds in the
-// teardown events so an in-flight teardown surfaces as `down`. A
-// worktree with no events yet is treated as ready/stable.
-func deriveStatusBucket(ctx context.Context, st *store.Store, wtID int64) (state, bucket string) {
-	rows, _ := st.QueryEvents(ctx, store.EventFilter{
-		WorktreeID: wtID,
-		EventTypes: []string{
-			store.EvtWorktreeCreateStart, store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError,
-			store.EvtWorktreeCreateDeferred,
-			store.EvtWorktreeDeleteStart, store.EvtWorktreeDeleteEnd,
-			store.EvtWorktreeReapStart, store.EvtWorktreeReapEnd,
-			// A standalone prepare_run (manual or via repair) emits
-			// prepare:* but no worktree:create:end, so a successful
-			// recovery after a prior create error must be read off the
-			// prepare terminal events too — otherwise the stale error
-			// pins the worktree to "failed" forever.
-			store.EvtPrepareEnd, store.EvtPrepareError,
-		},
-		Limit: 1,
-	})
-	if len(rows) == 0 {
+// statusWtWithID pairs a status row with the ids/paths needed for the
+// batched-event second pass.
+type statusWtWithID struct {
+	wt       statusWt
+	id       int64
+	repoPath string
+}
+
+// statusEventTypes is the lifecycle set behind the status buckets (see
+// statusBucket).
+var statusEventTypes = []string{
+	store.EvtWorktreeCreateStart, store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError,
+	store.EvtWorktreeCreateDeferred,
+	store.EvtWorktreeDeleteStart, store.EvtWorktreeDeleteEnd,
+	store.EvtWorktreeReapStart, store.EvtWorktreeReapEnd,
+	// A standalone prepare_run (manual or via repair) emits prepare:*
+	// but no worktree:create:end, so a successful recovery after a
+	// prior create error must be read off the prepare terminal events
+	// too — otherwise the stale error pins the worktree to "failed"
+	// forever.
+	store.EvtPrepareEnd, store.EvtPrepareError,
+}
+
+// statusBucket maps a worktree's most recent lifecycle event (zero
+// Event = none yet) to a (state, bucket) pair. Mirrors finalizeState
+// but also folds in the teardown events so an in-flight teardown
+// surfaces as `down`. A worktree with no events yet is treated as
+// ready/stable.
+func statusBucket(last store.Event) (state, bucket string) {
+	if last.ID == 0 {
 		return "ready", bucketStable
 	}
-	switch last := rows[0]; last.EventType {
+	switch last.EventType {
 	case store.EvtWorktreeCreateStart:
 		return "preparing", bucketUp
 	case store.EvtWorktreeCreateDeferred:

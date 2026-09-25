@@ -110,17 +110,26 @@ func TestIsLinkedWorktree(t *testing.T) {
 }
 
 func TestIsWorktreeClean(t *testing.T) {
+	ctx := context.Background()
 	repo := initRepo(t)
-	clean, err := IsWorktreeClean(context.Background(), repo)
+	clean, err := IsWorktreeClean(ctx, repo)
 	if err != nil || !clean {
 		t.Fatalf("fresh repo: clean=%v err=%v, want true", clean, err)
 	}
-	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("y"), 0o644); err != nil {
+	// Untracked files deliberately DON'T count as dirty — the daemon's
+	// merge-safety check uses the same -uno definition.
+	if err := os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("y"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	clean, err = IsWorktreeClean(context.Background(), repo)
-	if err != nil || clean {
-		t.Fatalf("untracked file: clean=%v err=%v, want false", clean, err)
+	if clean, err := IsWorktreeClean(ctx, repo); err != nil || !clean {
+		t.Fatalf("untracked file: clean=%v err=%v, want true (-uno semantics)", clean, err)
+	}
+	// A modification to a tracked file does.
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if clean, err := IsWorktreeClean(ctx, repo); err != nil || clean {
+		t.Fatalf("tracked modification: clean=%v err=%v, want false", clean, err)
 	}
 }
 

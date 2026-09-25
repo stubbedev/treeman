@@ -154,6 +154,60 @@ func (s *Store) QueryEvents(ctx context.Context, f EventFilter) ([]Event, error)
 	return out, rows.Err()
 }
 
+// LatestEventPerWorktree returns the newest event among eventTypes
+// for each listed worktree — the batched form of the per-worktree
+// QueryEvents(Limit 1) lookups the status widget used to fire per row
+// per bar tick (N+1 queries). One query ordered newest-first, first
+// row per worktree id wins; worktrees with no matching event are
+// absent from the map.
+func (s *Store) LatestEventPerWorktree(ctx context.Context, wtIDs []int64, eventTypes []string) (map[int64]Event, error) {
+	out := map[int64]Event{}
+	if len(wtIDs) == 0 || len(eventTypes) == 0 {
+		return out, nil
+	}
+	//nolint:gosec // only placeholder fragments; values are parameterized
+	q := `SELECT e.id, e.ts, e.level, e.repo_id, e.worktree_id, e.event_type,
+		COALESCE(e.phase,''), COALESCE(e.message,''), e.payload_json, e.duration_ms
+		FROM events e
+		WHERE e.worktree_id IN (` + placeholders(len(wtIDs)) + `)
+		AND e.event_type IN (` + placeholders(len(eventTypes)) + `)
+		ORDER BY e.ts DESC, e.id DESC`
+	args := make([]any, 0, len(wtIDs)+len(eventTypes))
+	for _, id := range wtIDs {
+		args = append(args, id)
+	}
+	for _, t := range eventTypes {
+		args = append(args, t)
+	}
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query latest events per worktree: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(
+			&e.ID,
+			&e.Ts,
+			&e.Level,
+			&e.RepoID,
+			&e.WorktreeID,
+			&e.EventType,
+			&e.Phase,
+			&e.Message,
+			&e.PayloadJSON,
+			&e.DurationMs,
+		); err != nil {
+			return nil, err
+		}
+		id := e.WorktreeID.Int64
+		if _, seen := out[id]; !seen {
+			out[id] = e
+		}
+	}
+	return out, rows.Err()
+}
+
 // WorktreeNotTearingDown is a SQL predicate fragment (over a worktrees
 // alias `w`) that excludes worktrees whose teardown is in flight: the
 // latest delete-lifecycle event is delete:start with no later

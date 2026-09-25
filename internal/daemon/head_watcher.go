@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"github.com/stubbedev/treeman/internal/gitenv"
 )
 
 // HeadWatcher tails `.git/HEAD` (resolved through the gitlink for
@@ -40,33 +42,11 @@ type HeadWatcher struct {
 }
 
 // resolveHeadPath returns the absolute path of the HEAD file for
-// `worktreePath`. Handles the gitlink case (`.git` is a regular
-// file pointing at `<common-dir>/worktrees/<name>/`) by following
-// the `gitdir:` redirect once.
+// `worktreePath` — the shared fork-free gitenv resolver (handles the
+// gitlink case where `.git` is a regular file pointing at
+// `<common-dir>/worktrees/<name>/`).
 func resolveHeadPath(worktreePath string) (string, error) {
-	dotGit := filepath.Join(worktreePath, ".git")
-	info, err := os.Stat(dotGit)
-	if err != nil {
-		return "", fmt.Errorf("stat .git: %w", err)
-	}
-	if info.IsDir() {
-		return filepath.Join(dotGit, "HEAD"), nil
-	}
-	// Gitlink: file containing `gitdir: <path>`.
-	body, err := os.ReadFile(dotGit)
-	if err != nil {
-		return "", fmt.Errorf("read gitlink: %w", err)
-	}
-	line := strings.TrimSpace(string(body))
-	const prefix = "gitdir: "
-	if !strings.HasPrefix(line, prefix) {
-		return "", fmt.Errorf("gitlink missing %q prefix: %q", prefix, line)
-	}
-	gitdir := strings.TrimSpace(line[len(prefix):])
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(worktreePath, gitdir)
-	}
-	return filepath.Join(gitdir, "HEAD"), nil
+	return gitenv.HeadPath(worktreePath)
 }
 
 // NewHeadWatcher constructs a HeadWatcher. Returns an error when the

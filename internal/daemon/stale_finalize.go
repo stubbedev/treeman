@@ -53,31 +53,30 @@ const watchdogInterval = 2 * time.Minute
 // the message includes the worktree:create:start timestamp so consecutive
 // stale entries don't lose information.
 func SweepStalePreparing(ctx context.Context, st *State) {
-	wts, err := st.Store.ListActiveWorktrees(ctx)
+	wts, err := st.Store.ListActiveWorktreeRows(ctx)
 	if err != nil {
 		slog.Warn("stale-preparing sweep: list worktrees", "err", err)
 		return
 	}
-	for _, w := range wts {
-		row, err := lookupWorktreeByPath(ctx, st.Store, w.WorktreePath)
-		if err != nil || row.ID == 0 {
-			continue
-		}
-		evs, err := st.Store.QueryEvents(ctx, store.EventFilter{
-			WorktreeID: row.ID,
-			EventTypes: []string{
-				store.EvtWorktreeCreateStart,
-				store.EvtWorktreeCreateEnd,
-				store.EvtWorktreeCreateError,
-				store.EvtWorktreeCreateCancel,
-			},
-			Limit: 1,
-		})
-		if err != nil || len(evs) == 0 {
-			continue
-		}
-		last := evs[0]
-		if last.EventType != store.EvtWorktreeCreateStart {
+	ids := make([]int64, len(wts))
+	for i := range wts {
+		ids[i] = wts[i].ID
+	}
+	// One query for every row's latest finalize event — the sweep used
+	// to fire two queries per worktree at boot (row lookup + events).
+	latest, err := st.Store.LatestEventPerWorktree(ctx, ids, []string{
+		store.EvtWorktreeCreateStart,
+		store.EvtWorktreeCreateEnd,
+		store.EvtWorktreeCreateError,
+		store.EvtWorktreeCreateCancel,
+	})
+	if err != nil {
+		slog.Warn("stale-preparing sweep: query events", "err", err)
+		return
+	}
+	for _, row := range wts {
+		last, ok := latest[row.ID]
+		if !ok || last.EventType != store.EvtWorktreeCreateStart {
 			continue
 		}
 		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError,
@@ -87,7 +86,7 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 				"start_event_ts": last.Ts,
 			})
 		slog.Warn("marked stuck finalize as stale",
-			"wt", w.WorktreePath, "started_ms", last.Ts)
+			"wt", row.Path, "started_ms", last.Ts)
 
 		// Auto-recover the engine state. A prepare killed mid-migrate
 		// leaves the active DB (branch_scoped) or the source DB
@@ -99,14 +98,14 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 		// Worktree). Best-effort — config load / engine connect
 		// failures are surfaced as `wt_recovery_error` events but
 		// don't stop the sweep.
-		cfg, err := resolve.LoadResolvedForWorktree(w.RepoPath, w.WorktreePath)
+		cfg, err := resolve.LoadResolvedForWorktree(row.RepoPath, row.Path)
 		if err != nil {
 			_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
 				"load config for recovery: "+err.Error(),
 				row.RepoID, row.ID, "", 0, map[string]string{"error": err.Error()})
 			continue
 		}
-		prepare.RecoverStaleWorktree(ctx, &cfg, row.Slug, w.WorktreePath, row.RepoID, row.ID, st.Store)
+		prepare.RecoverStaleWorktree(ctx, &cfg, row.Slug, row.Path, row.RepoID, row.ID, st.Store)
 	}
 }
 

@@ -182,15 +182,10 @@ func listGitBranches(repoRoot string, remote bool) []string {
 // mid-teardown are excluded — they feed completion and the pickers,
 // and must never surface a path that's about to disappear.
 func branchOccupancy(ctx context.Context, repoRoot string) map[string]string {
-	dbPath, err := store.DefaultDBPath()
+	st, err := openSharedStore(ctx)
 	if err != nil {
 		return nil
 	}
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = st.Close() }()
 	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT COALESCE(w.branch, ''), w.path

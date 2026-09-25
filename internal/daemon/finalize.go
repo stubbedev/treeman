@@ -12,6 +12,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
+	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/ports"
@@ -979,28 +980,11 @@ func runTriggerActions(
 	return nil
 }
 
-// detectBranch reads `.git/HEAD` (or the gitlink-resolved file) and
-// returns the branch name, empty when detached or readable.
+// detectBranch reads the worktree's HEAD file (fork-free, via
+// gitenv) and returns the branch name, empty when detached or
+// unreadable.
 func detectBranch(worktree string) string {
-	headPath := filepath.Join(worktree, ".git", "HEAD")
-	info, err := os.Stat(headPath)
-	if err != nil || info.IsDir() {
-		// gitlink case (linked worktrees use .git as a file).
-		linkBytes, err := os.ReadFile(filepath.Join(worktree, ".git"))
-		if err != nil {
-			return ""
-		}
-		gitdir, _ := strings.CutPrefix(string(linkBytes), "gitdir: ")
-		headPath = filepath.Join(strings.TrimSpace(gitdir), "HEAD")
-	}
-	b, err := os.ReadFile(headPath)
-	if err != nil {
-		return ""
-	}
-	if ref, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "ref: refs/heads/"); ok {
-		return ref
-	}
-	return ""
+	return gitenv.DetectBranch(context.Background(), worktree)
 }
 
 // waitForCheckoutSettled blocks until every top-level entry recorded in

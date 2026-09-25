@@ -85,9 +85,15 @@ type entry struct {
 	expiry time.Time
 }
 
+type idEntry struct {
+	id     string
+	expiry time.Time
+}
+
 var (
-	mu    sync.Mutex
-	cache = map[string]entry{}
+	mu      sync.Mutex
+	cache   = map[string]entry{}
+	idCache = map[string]idEntry{}
 )
 
 func cacheKey(opts Opts) string {
@@ -226,6 +232,11 @@ func Refresh(container, engine string) {
 			delete(cache, k)
 		}
 	}
+	for k := range idCache {
+		if strings.HasPrefix(k, prefix) {
+			delete(idCache, k)
+		}
+	}
 	mu.Unlock()
 }
 
@@ -233,15 +244,36 @@ func Refresh(container, engine string) {
 func RefreshOpts(opts Opts) {
 	mu.Lock()
 	delete(cache, cacheKey(opts))
+	delete(idCache, cacheKey(opts))
 	mu.Unlock()
 }
 
 // ContainerID returns the container id/name for opts. For a
 // Container ref this is the ref itself; for a ComposeService it
 // runs `<engine> ps -q --filter label=...` to find the running
-// container.
+// container. Memoized for CacheTTL like ResolveAddr — dump-load fast
+// paths probe this per attempt and the fork is pure overhead within
+// a prepare run.
 func ContainerID(ctx context.Context, opts Opts) (string, error) {
-	return resolveContainerID(ctx, opts)
+	// Explicit container refs need no lookup at all.
+	if opts.Container != "" {
+		return opts.Container, nil
+	}
+	key := cacheKey(opts)
+	mu.Lock()
+	if e, ok := idCache[key]; ok && time.Now().Before(e.expiry) {
+		mu.Unlock()
+		return e.id, nil
+	}
+	mu.Unlock()
+	id, err := resolveContainerID(ctx, opts)
+	if err != nil {
+		return "", err
+	}
+	mu.Lock()
+	idCache[key] = idEntry{id: id, expiry: time.Now().Add(CacheTTL)}
+	mu.Unlock()
+	return id, nil
 }
 
 // resolveContainerID is the internal alias kept for older callers.

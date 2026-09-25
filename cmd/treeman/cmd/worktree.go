@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/gitenv"
@@ -506,8 +507,8 @@ func wtList() *cli.Command {
 				return fmt.Errorf("unknown --sort %q (id|mtime|visited)", c.String("sort"))
 			}
 			//nolint:gosec // where/orderBy are fixed fragments; values are parameterized via args
-			q := `SELECT w.id, w.slug, COALESCE(w.branch,'-'), w.path, COALESCE(w.last_visited_at, 0), w.is_main
-				FROM worktrees w WHERE ` + where + ` ` + orderBy
+			q := `SELECT w.id, w.slug, COALESCE(w.branch,'-'), w.path, COALESCE(w.last_visited_at, 0), w.is_main, r.path
+				FROM worktrees w JOIN repos r ON r.id = w.repo_id WHERE ` + where + ` ` + orderBy
 			rows, err := st.DB.QueryContext(ctx, q, args...)
 			if err != nil {
 				return err
@@ -517,7 +518,7 @@ func wtList() *cli.Command {
 			anyMain := false
 			for rows.Next() {
 				var r wtRow
-				if err := rows.Scan(&r.ID, &r.Slug, &r.Branch, &r.Path, &r.VisitedTs, &r.IsMain); err != nil {
+				if err := rows.Scan(&r.ID, &r.Slug, &r.Branch, &r.Path, &r.VisitedTs, &r.IsMain, &r.RepoPath); err != nil {
 					return err
 				}
 				if r.IsMain {
@@ -565,6 +566,7 @@ type wtRow struct {
 	Slug        string `json:"slug"`
 	Branch      string `json:"branch"`
 	Path        string `json:"path"`
+	RepoPath    string `json:"-"` // join column; drives the per-repo git fan-out below
 	IsMain      bool   `json:"is_main"`
 	HeadTs      int64  `json:"head_ts,omitempty"`
 	VisitedTs   int64  `json:"visited_ts,omitempty"`
@@ -576,33 +578,104 @@ type wtRow struct {
 }
 
 // enrichWtRows fills in per-row HEAD timestamp, git status and finalize
-// state for each worktree, honoring which optional columns were
-// requested (or JSON output, which always populates everything).
+// state, honoring which optional columns were requested (or JSON
+// output, which always populates everything).
+//
+// HEAD timestamps come from ONE `git for-each-ref refs/heads` per repo
+// (refs are shared across a repo's worktrees) instead of a git log fork
+// per row; dirty/unpushed probes fan out concurrently like the switch
+// menu; finalize states come from one batched events query instead of
+// one query per row.
 func enrichWtRows(ctx context.Context, st *store.Store, all []wtRow, withStatus, withState, needHeadTs, asJSON bool) {
+	if needHeadTs {
+		fillHeadTimestamps(ctx, all)
+	}
+	if withState || asJSON {
+		ids := make([]int64, len(all))
+		for i := range all {
+			ids[i] = all[i].ID
+		}
+		latest, _ := st.LatestEventPerWorktree(ctx, ids, finalizeStateEventTypes)
+		for i := range all {
+			all[i].FinalState = finalizeStateLabel(latest[all[i].ID])
+		}
+	}
+	if withStatus || asJSON {
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(8)
+		for i := range all {
+			g.Go(func() error {
+				enrichRowStatus(gctx, &all[i])
+				return nil
+			})
+		}
+		_ = g.Wait()
+	}
+}
+
+// fillHeadTimestamps sets HeadTs on every row via one
+// `for-each-ref refs/heads` per distinct repo (branch → committer
+// date). Rows whose branch is absent (detached HEAD, odd refs) fall
+// back to the per-row `git log -1` fork.
+func fillHeadTimestamps(ctx context.Context, all []wtRow) {
+	repos := map[string]map[string]int64{}
 	for i := range all {
 		r := &all[i]
-		if needHeadTs {
+		if r.RepoPath == "" {
+			r.HeadTs = headCommitTs(r.Path)
+			continue
+		}
+		tsByBranch, ok := repos[r.RepoPath]
+		if !ok {
+			tsByBranch = branchCommitTs(ctx, r.RepoPath)
+			repos[r.RepoPath] = tsByBranch
+		}
+		if ts, ok := tsByBranch[r.Branch]; ok {
+			r.HeadTs = ts
+		} else {
 			r.HeadTs = headCommitTs(r.Path)
 		}
-		if withStatus || asJSON {
-			dirty, dErr := worktreeDirty(ctx, r.Path)
-			unpushed, uErr := gitenv.HasUnpushedCommits(ctx, r.Path)
-			r.Dirty = dirty
-			r.Unpushed = unpushed
-			switch {
-			case dErr != nil:
-				r.Status = "?"
-				r.StatusError = dErr.Error()
-			case uErr != nil:
-				r.Status = "?"
-				r.StatusError = uErr.Error()
-			default:
-				r.Status = statusLabel(dirty, unpushed)
-			}
+	}
+}
+
+// branchCommitTs maps branch name → HEAD commit unix timestamp for
+// every local branch of the repo, in one fork.
+func branchCommitTs(ctx context.Context, repoRoot string) map[string]int64 {
+	out, err := gitcmd.Output(ctx, repoRoot,
+		"for-each-ref", "--format=%(refname:short) %(committerdate:unix)", "refs/heads")
+	if err != nil {
+		return nil
+	}
+	m := map[string]int64{}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		name, ts, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
 		}
-		if withState || asJSON {
-			r.FinalState = finalizeStateShort(ctx, st, r.ID)
+		n, err := strconv.ParseInt(ts, 10, 64)
+		if err != nil {
+			continue
 		}
+		m[name] = n
+	}
+	return m
+}
+
+// enrichRowStatus fills the dirty/unpushed columns of one row.
+func enrichRowStatus(ctx context.Context, r *wtRow) {
+	dirty, dErr := worktreeDirty(ctx, r.Path)
+	unpushed, uErr := gitenv.HasUnpushedCommits(ctx, r.Path)
+	r.Dirty = dirty
+	r.Unpushed = unpushed
+	switch {
+	case dErr != nil:
+		r.Status = "?"
+		r.StatusError = dErr.Error()
+	case uErr != nil:
+		r.Status = "?"
+		r.StatusError = uErr.Error()
+	default:
+		r.Status = statusLabel(dirty, unpushed)
 	}
 }
 
@@ -1268,15 +1341,10 @@ func goSpawnWorktree(ctx context.Context, repoRoot, branch, from string, noFetch
 // exact match on `worktrees.branch` — the column is populated by
 // `wt create` / `wt register --branch`.
 func registryWorktreeForBranch(ctx context.Context, repoRoot, branch string) (string, bool) {
-	dbPath, err := store.DefaultDBPath()
+	st, err := openSharedStore(ctx)
 	if err != nil {
 		return "", false
 	}
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return "", false
-	}
-	defer func() { _ = st.Close() }()
 	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	row := st.DB.QueryRowContext(ctx, `
 		SELECT w.path FROM worktrees w JOIN repos r ON r.id = w.repo_id
@@ -1294,14 +1362,20 @@ func registryWorktreeForBranch(ctx context.Context, repoRoot, branch string) (st
 // `path`. Swallows errors — visit-tracking is best-effort metadata,
 // not a correctness gate.
 func touchVisitedByPath(ctx context.Context, path string) {
+	st, err := openSharedStore(ctx)
+	if err != nil {
+		return
+	}
+	_ = st.TouchWorktreeVisitedByPath(ctx, path)
+}
+
+// openSharedStore is the CLI-side handle: one shared store per
+// process (see store.OpenShared) instead of every helper opening —
+// and migration-probing — its own.
+func openSharedStore(ctx context.Context) (*store.Store, error) {
 	dbPath, err := store.DefaultDBPath()
 	if err != nil {
-		return
+		return nil, err
 	}
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return
-	}
-	defer func() { _ = st.Close() }()
-	_ = st.TouchWorktreeVisitedByPath(ctx, path)
+	return store.OpenShared(ctx, dbPath)
 }

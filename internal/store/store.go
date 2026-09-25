@@ -135,6 +135,34 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	return &Store{DB: db}, nil
 }
 
+var (
+	sharedMu   sync.Mutex
+	sharedOpen = map[string]*Store{}
+)
+
+// OpenShared returns the process-wide shared Store for path, opening
+// (and migrating) it on first use. Short-lived CLI commands hit the
+// registry through several helpers (name lookup, occupancy, teardown
+// filter, last-visited touch) that each used to open — and migration-
+// probe — their own handle; sharing one cuts a `wt` invocation from
+// 3-4 opens to 1. The handle is intentionally never closed: process
+// exit does that, and closing under concurrent users would hand late
+// callers a dead *sql.DB. Long-lived single-writer processes (the
+// daemon) keep their explicit Open instead.
+func OpenShared(ctx context.Context, path string) (*Store, error) {
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+	if st, ok := sharedOpen[path]; ok {
+		return st, nil
+	}
+	st, err := Open(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	sharedOpen[path] = st
+	return st, nil
+}
+
 // RegisterEventHook installs a callback that fires after every
 // WriteEvent insert (both sync and batched paths). id is a caller-
 // chosen unique key — re-registering the same id replaces the prior
@@ -377,7 +405,66 @@ func (s *Store) CheckpointWAL(ctx context.Context) error {
 // missing and applies any embedded SQL files that haven't run yet.
 // Schema-content is hashed so checksum drift surfaces as an error
 // rather than silently re-applying.
+//
+// The probe is short-circuited with PRAGMA user_version: once the
+// stamp matches the newest embedded migration, a healthy open costs
+// ONE statement instead of a CREATE TABLE IF NOT EXISTS plus a
+// COUNT(*) per migration file (13 statements every open — ~50 per
+// `wt` invocation once the helper functions each opened their own
+// store). Existing databases are upgraded in place on first open:
+// the full probe runs once, then the stamp is written.
 func migrate(ctx context.Context, db *sql.DB) error {
+	latest, err := latestMigrationVersion()
+	if err != nil {
+		return err
+	}
+	var current int
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&current); err != nil {
+		return fmt.Errorf("read user_version: %w", err)
+	}
+	// Also >= not == so a downgrade doesn't brick opens; the older
+	// schema just keeps working as if nothing happened.
+	if current >= latest {
+		return nil
+	}
+	if err := applyMigrations(ctx, db); err != nil {
+		return err
+	}
+	// PRAGMA cannot be parameterized; latest is a parsed int, not
+	// user input.
+	if _, err := db.ExecContext(
+		ctx,
+		fmt.Sprintf("PRAGMA user_version = %d", latest),
+	); err != nil {
+		return fmt.Errorf("stamp user_version: %w", err)
+	}
+	return nil
+}
+
+// latestMigrationVersion returns the highest `NNNN_` version among
+// the embedded migration files.
+func latestMigrationVersion() (int, error) {
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		return 0, err
+	}
+	latest := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		var version int
+		if _, err := fmt.Sscanf(e.Name(), "%04d_", &version); err != nil {
+			continue
+		}
+		latest = max(latest, version)
+	}
+	return latest, nil
+}
+
+// applyMigrations is the full probe: create the bookkeeping table,
+// then apply every embedded SQL file it doesn't know about.
+func applyMigrations(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _treeman_migrations (
 		version INTEGER PRIMARY KEY,
 		filename TEXT NOT NULL,
@@ -658,6 +745,10 @@ type WorktreeRow struct {
 	AdminDir string
 	Deleted  bool
 	IsMain   bool
+
+	// RepoPath is only populated by queries that join repos
+	// (ListActiveWorktreeRows); empty elsewhere.
+	RepoPath string
 }
 
 // ListWorktreesForRepo returns every worktree row attached to repoID,
@@ -693,6 +784,31 @@ func (s *Store) CountActiveWorktreesForRepo(ctx context.Context, repoID int64) (
 		return 0, err
 	}
 	return n, nil
+}
+
+// ListActiveWorktreeRows returns every live worktree row (with the
+// owning repo's path in RepoPath) — the full-row form of
+// ListActiveWorktrees for callers that need ids/slugs/repo paths
+// without re-querying per row.
+func (s *Store) ListActiveWorktreeRows(ctx context.Context) ([]WorktreeRow, error) {
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT w.id, w.repo_id, w.path, w.slug, COALESCE(w.branch, ''), COALESCE(w.admin_dir, ''), w.deleted_at IS NOT NULL, w.is_main, r.path
+		FROM worktrees w JOIN repos r ON r.id = w.repo_id
+		WHERE w.deleted_at IS NULL
+		ORDER BY w.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []WorktreeRow
+	for rows.Next() {
+		var w WorktreeRow
+		if err := rows.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &w.Deleted, &w.IsMain, &w.RepoPath); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
 }
 
 // RemoveRepo deletes the repo row and every child row that would

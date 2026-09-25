@@ -176,15 +176,10 @@ func occupiedWorktrees(ctx context.Context, repoRoot string) map[string]string {
 // entries in occupiedWorktrees / liveWorktreeForBranch, where the SQL
 // predicate can't be applied at query time.
 func tearingDownPaths(ctx context.Context, repoRoot string) map[string]bool {
-	dbPath, err := store.DefaultDBPath()
+	st, err := openSharedStore(ctx)
 	if err != nil {
 		return nil
 	}
-	st, err := store.Open(ctx, dbPath)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = st.Close() }()
 	//nolint:gosec // WorktreeNotTearingDown is a compile-time constant fragment
 	rows, err := st.DB.QueryContext(ctx, `
 		SELECT w.path FROM worktrees w JOIN repos r ON r.id = w.repo_id
@@ -204,28 +199,21 @@ func tearingDownPaths(ctx context.Context, repoRoot string) map[string]bool {
 	return out
 }
 
-// gitWorktrees parses `git worktree list --porcelain` into
-// branch → path for the LINKED worktrees (main checkout and detached
-// entries are skipped). The git view catches worktrees created outside
-// treeman that the registry doesn't know about.
+// gitWorktrees builds branch → path for the repo's LINKED worktrees
+// (the main checkout and detached entries are skipped), fork-free:
+// wtreg.GitWorktreePaths enumerates them from `.git/worktrees/<name>/
+// gitdir`, and each entry's branch comes from a HEAD-file read. The
+// git view catches worktrees created outside treeman that the
+// registry doesn't know about.
 func gitWorktrees(ctx context.Context, repoRoot string) map[string]string {
-	out, err := gitcmd.Output(ctx, repoRoot, "worktree", "list", "--porcelain")
+	paths, err := wtreg.GitWorktreePaths(ctx, repoRoot)
 	if err != nil {
 		return nil
 	}
 	worktrees := map[string]string{}
-	var path string
-	for line := range strings.SplitSeq(string(out), "\n") {
-		switch {
-		case strings.HasPrefix(line, "worktree "):
-			path = strings.TrimPrefix(line, "worktree ")
-		case strings.HasPrefix(line, "branch refs/heads/"):
-			branch := strings.TrimPrefix(line, "branch refs/heads/")
-			if path != "" && !strings.EqualFold(filepath.Clean(path), filepath.Clean(repoRoot)) {
-				worktrees[branch] = path
-			}
-		case line == "":
-			path = ""
+	for _, p := range paths {
+		if branch := gitenv.DetectBranch(ctx, p); branch != "" {
+			worktrees[branch] = p
 		}
 	}
 	return worktrees

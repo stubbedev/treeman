@@ -12,6 +12,7 @@ package gitenv
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,15 +91,19 @@ func IsGitWorktree(path string) bool {
 	return err == nil
 }
 
-// IsWorktreeClean returns true when `git status --porcelain` in the
-// worktree is empty — no uncommitted changes, no untracked files.
-// Used by `wt back --remove-if-clean` and equivalent safety
-// checks.
+// IsWorktreeClean returns true when `git status --porcelain=v1 -uno`
+// in the worktree is empty — no uncommitted changes to TRACKED
+// files. Untracked files deliberately don't count: this is the same
+// dirty definition the daemon's merge-safety check uses
+// (autofetch), and git's own `worktree remove` still refuses on
+// untracked files where that matters.
+//
+// The probe runs WITHOUT GIT_OPTIONAL_LOCKS=0 (readOnly=false) so git
+// persists the refreshed index stat-cache — with it, every call
+// re-lstats the entire tracked tree, which dominated repeated status
+// checks on multi-GB worktrees.
 func IsWorktreeClean(ctx context.Context, path string) (bool, error) {
-	// `git status` is read-only from treeman's POV but updates the
-	// index lock by default — pass readOnly=false so we don't disable
-	// GIT_OPTIONAL_LOCKS for what is, semantically, a query.
-	out, err := gitcmd.Output(ctx, path, "status", "--porcelain")
+	out, err := gitcmd.OutputRW(ctx, path, false, "status", "--porcelain=v1", "-uno")
 	if err != nil {
 		return false, err
 	}
@@ -120,19 +125,41 @@ func HasUnpushedCommits(ctx context.Context, path string) (bool, error) {
 	return count != "0" && count != "", nil
 }
 
+// HeadPath returns the absolute path of a working tree's HEAD file,
+// following the `gitdir:` gitlink redirect when `.git` is a regular
+// file (linked worktrees). This is a plain file read — `git
+// symbolic-ref` / `branch --show-current` forks are replaceable by it
+// everywhere the branch name of a known worktree is needed.
+func HeadPath(worktree string) (string, error) {
+	dotGit := filepath.Join(worktree, ".git")
+	fi, err := os.Stat(dotGit)
+	if err != nil {
+		return "", fmt.Errorf("stat .git: %w", err)
+	}
+	if fi.IsDir() {
+		return filepath.Join(dotGit, "HEAD"), nil
+	}
+	body, err := os.ReadFile(dotGit)
+	if err != nil {
+		return "", fmt.Errorf("read gitlink: %w", err)
+	}
+	gitdir, ok := strings.CutPrefix(strings.TrimSpace(string(body)), "gitdir: ")
+	if !ok {
+		return "", fmt.Errorf("gitlink missing %q prefix", "gitdir: ")
+	}
+	gitdir = strings.TrimSpace(gitdir)
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(worktree, gitdir)
+	}
+	return filepath.Join(gitdir, "HEAD"), nil
+}
+
 // DetectBranch reads the HEAD of a worktree (handles gitlink files
 // for linked worktrees). Returns "" if detached HEAD or unreadable.
 func DetectBranch(_ context.Context, worktree string) string {
-	headPath := filepath.Join(worktree, ".git", "HEAD")
-	if fi, err := os.Stat(headPath); err != nil || fi.IsDir() {
-		// gitlink file — follow it.
-		linkBytes, err := os.ReadFile(filepath.Join(worktree, ".git"))
-		if err != nil {
-			return ""
-		}
-		gitdir := strings.TrimSpace(strings.TrimPrefix(string(linkBytes), "gitdir:"))
-		gitdir = strings.TrimSpace(gitdir)
-		headPath = filepath.Join(gitdir, "HEAD")
+	headPath, err := HeadPath(worktree)
+	if err != nil {
+		return ""
 	}
 	b, err := os.ReadFile(headPath)
 	if err != nil {

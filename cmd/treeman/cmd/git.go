@@ -72,10 +72,9 @@ func repoFlag() cli.Flag {
 }
 
 // currentBranch returns the checked-out branch of dir, or "" if
-// detached.
+// detached. Fork-free HEAD-file read.
 func currentBranch(ctx context.Context, dir string) string {
-	b, _ := gitcmd.String(ctx, dir, "branch", "--show-current")
-	return b
+	return gitenv.DetectBranch(ctx, dir)
 }
 
 // std wires a git subprocess to the terminal.
