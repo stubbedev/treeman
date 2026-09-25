@@ -776,7 +776,7 @@ func prepareMySQL(
 	// the cold build and just clone the template into paratest DBs.
 	// Inputs feed the fingerprint, so any user-meaningful change
 	// invalidates the cache naturally — no force-rebuild knob.
-	out, done, finishBuild, err := cacheHitGeneric(
+	out, done, flight, err := cacheHitGeneric(
 		ctx,
 		drv.DatabaseExists,
 		drv.SnapshotRestoreStaged,
@@ -791,7 +791,7 @@ func prepareMySQL(
 		maxConns,
 		started,
 	)
-	defer finishBuild()
+	defer flight.finish()
 	if done || err != nil {
 		return out, err
 	}
@@ -947,13 +947,14 @@ func prepareMySQL(
 }
 
 // cacheHitGeneric is the engine-agnostic fingerprint-cache fast path
-// shared by every engine. Returns (out, true, nil, nil) when the cached
-// template was reused and the caller should return `out`; (Outcome{},
-// false, nil, finishBuild) when the cache missed or the template
-// vanished mid-flight (caller must cold-build and defer finishBuild()
-// until its engine function returns, so concurrent same-fingerprint
-// prepares dedupe against the build); (Outcome{}, false, err, nil) on a
-// hard error.
+// shared by every engine. Returns (out, true, flight, nil) when the
+// cached template was reused and the caller should return `out`;
+// (Outcome{}, false, flight, nil) when the cache missed or the template
+// vanished mid-flight (caller must cold-build; flight releases the
+// cross-worktree build slot when the engine function returns — callers
+// `defer flight.finish()` unconditionally, which is safe on the zero
+// value by construction); (Outcome{}, false, flight, err) on a hard
+// error.
 //
 // `exists` is the driver's namespace-presence probe (DatabaseExists for
 // name-scoped engines, PrefixExists/IndexExists for prefix-scoped ones)
@@ -975,7 +976,7 @@ func cacheHitGeneric(
 	key snapshot.Key,
 	maxConns int,
 	started time.Time,
-) (Outcome, bool, func(), error) {
+) (Outcome, bool, buildFlight, error) {
 	// A lookup error is treated as a cache miss (fall through to cold
 	// build), matching the original `err == nil && rec != nil` guard.
 	// The lookup also touches the row in the same statement — BEFORE the
@@ -1013,7 +1014,7 @@ func cacheHitGeneric(
 		})
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
-		return Outcome{}, false, func() {}, err
+		return Outcome{}, false, buildFlight{}, err
 	}
 	// Per-worktree built-at gate: when this worktree's namespaces were
 	// already populated from THIS fingerprint and they all still exist,
@@ -1042,7 +1043,7 @@ func cacheHitGeneric(
 			Fingerprint:  key.Fingerprint(),
 			CacheHit:     true,
 			Clones:       clones,
-		}, true, nil, nil
+		}, true, buildFlight{}, nil
 	}
 	// Cache-hit skips the cold-build path that populates the source DB
 	// via dump+migrate. Restore source from the template so non-parallel
@@ -1056,7 +1057,7 @@ func cacheHitGeneric(
 	// to cold build instead of failing worktree:create:error.
 	if err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, restore,
 		d, rec.TemplateName, sourceDB, clones, maxConns, key.Fingerprint()); err != nil {
-		return Outcome{}, false, func() {}, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
+		return Outcome{}, false, buildFlight{}, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
 	}
 	_ = st.SetTemplateBuilt(ctx, worktreeID, sourceDB, d.Engine, key.Fingerprint())
 	ms := time.Since(started).Milliseconds()
@@ -1078,7 +1079,7 @@ func cacheHitGeneric(
 		Fingerprint:  key.Fingerprint(),
 		CacheHit:     true,
 		Clones:       clones,
-	}, true, func() {}, nil
+	}, true, buildFlight{}, nil
 }
 
 // templateBuiltTargets reports whether this worktree's source + clone
@@ -1456,21 +1457,40 @@ func waitForBuild(engine, fingerprint string) bool {
 	return true
 }
 
-// beginBuild marks a cold build in flight and returns the finish()
-// closure the caller must run when its engine function returns
-// (success or failure) — it unblocks waiters and clears the slot.
-func beginBuild(engine, fingerprint string) func() {
+// buildFlight releases a cold build's in-flight slot. The zero value
+// is a completed no-op flight, so a cacheHitGeneric result can always
+// be `defer flight.finish()`-ed — the nil-func variant of this
+// contract compiled fine and crashed every e2e suite in v2.5.91; a
+// struct with a nil-safe method cannot regress that way.
+type buildFlight struct {
+	release func()
+}
+
+func (f buildFlight) finish() {
+	if f.release != nil {
+		f.release()
+	}
+}
+
+// beginBuild marks a cold build in flight and returns the flight whose
+// finish() the caller must defer — it unblocks waiters and clears the
+// slot when the engine function returns (success or failure). finish
+// is idempotent (once-guarded), so a defensive extra call is harmless.
+func beginBuild(engine, fingerprint string) buildFlight {
 	key := buildFlightKey(engine, fingerprint)
 	ch := make(chan struct{})
 	buildFlights.Lock()
 	buildFlights.m[key] = ch
 	buildFlights.Unlock()
-	return func() {
-		buildFlights.Lock()
-		delete(buildFlights.m, key)
-		buildFlights.Unlock()
-		close(ch)
-	}
+	var once sync.Once
+	return buildFlight{release: func() {
+		once.Do(func() {
+			buildFlights.Lock()
+			delete(buildFlights.m, key)
+			buildFlights.Unlock()
+			close(ch)
+		})
+	}}
 }
 
 // incrementalOps bundles the engine-specific primitives the generic
@@ -2071,7 +2091,7 @@ func preparePostgres(
 	// to claim a pre-warmed spare via rename before paying a full
 	// `CREATE DATABASE … TEMPLATE`.
 	restore := postgresRestoreFor(drv, st, repoID, worktreeID, d)
-	out, done, finishBuild, err := cacheHitGeneric(
+	out, done, flight, err := cacheHitGeneric(
 		ctx,
 		drv.DatabaseExists,
 		restore,
@@ -2086,7 +2106,7 @@ func preparePostgres(
 		maxConns,
 		started,
 	)
-	defer finishBuild()
+	defer flight.finish()
 	if done || err != nil {
 		return out, err
 	}
@@ -2341,7 +2361,7 @@ func prepareMongo(
 		})
 
 	// Cache hit?
-	out, done, finishBuild, err := cacheHitGeneric(
+	out, done, flight, err := cacheHitGeneric(
 		ctx,
 		drv.DatabaseExists,
 		drv.SnapshotRestore,
@@ -2356,7 +2376,7 @@ func prepareMongo(
 		0,
 		started,
 	)
-	defer finishBuild()
+	defer flight.finish()
 	if done || err != nil {
 		return out, err
 	}
@@ -2604,7 +2624,7 @@ func prepareRedisPrefix(
 	}
 
 	// Cache hit?
-	out, done, finishBuild, err := cacheHitGeneric(
+	out, done, flight, err := cacheHitGeneric(
 		ctx,
 		drv.PrefixExists,
 		rdRestore,
@@ -2619,7 +2639,7 @@ func prepareRedisPrefix(
 		0,
 		started,
 	)
-	defer finishBuild()
+	defer flight.finish()
 	if done || err != nil {
 		return out, err
 	}
@@ -2868,7 +2888,7 @@ func prepareES(
 		matched, e := drv.ListMatching(ctx, prefix)
 		return len(matched) > 0, e
 	}
-	out, done, finishBuild, err := cacheHitGeneric(
+	out, done, flight, err := cacheHitGeneric(
 		ctx,
 		esTemplateExists,
 		esRestore,
@@ -2883,7 +2903,7 @@ func prepareES(
 		0,
 		started,
 	)
-	defer finishBuild()
+	defer flight.finish()
 	if done || err != nil {
 		return out, err
 	}

@@ -90,11 +90,18 @@ func backends() []backend {
 func TestS3EndToEnd(t *testing.T) {
 	harness.SkipIfNoDocker(t)
 	composeDir := harness.MustAbs(".")
-	t.Cleanup(harness.ComposeUp(t, composeDir))
+	t.Cleanup(func() { harness.ComposeDown(t, composeDir) })
 
 	ctx := context.Background()
 	for _, b := range backends() {
 		t.Run(b.name, func(t *testing.T) {
+			// Per-backend bring-up: a backend whose image can no longer
+			// be pulled (MinIO community edition is EOL; its images are
+			// being purged from Docker Hub AND quay) skips instead of
+			// taking the whole matrix down with it.
+			if err := harness.ComposeServiceUp(composeDir, b.name); err != nil {
+				t.Skipf("%s image unavailable (registry withdrew it?): %v", b.name, err)
+			}
 			runBackend(ctx, t, b)
 		})
 	}

@@ -30,19 +30,43 @@ import (
 // not failed — the test result is what matters.
 func ComposeUp(t *testing.T, dir string) func() {
 	t.Helper()
-	cmd := exec.Command("docker", "compose", "up", "-d", "--wait")
+	if err := composeRun(dir, "up", "-d", "--wait").Run(); err != nil {
+		t.Fatalf("compose up (%s): %v", dir, err)
+	}
+	return composeDown(t, dir)
+}
+
+// ComposeServiceUp brings up ONE service (with its dependencies) and
+// reports the error instead of failing the test — matrix suites use it
+// to SKIP a backend whose image is unpullable (the MinIO community
+// edition is EOL and its images are being purged from public
+// registries) while the other backends still run. The caller owns
+// teardown via ComposeDown.
+func ComposeServiceUp(dir, service string) error {
+	return composeRun(dir, "up", "-d", "--wait", service).Run()
+}
+
+// ComposeDown tears a compose project down; teardown failures are
+// logged, never fatal.
+func ComposeDown(t *testing.T, dir string) {
+	t.Helper()
+	composeDown(t, dir)()
+}
+
+// composeRun builds a `docker compose` command in dir with output
+// wired to the test's stderr.
+func composeRun(dir string, args ...string) *exec.Cmd {
+	cmd := exec.Command("docker", append([]string{"compose"}, args...)...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("compose up (%s): %v", dir, err)
-	}
+	return cmd
+}
+
+func composeDown(t *testing.T, dir string) func() {
+	t.Helper()
 	return func() {
-		cmd := exec.Command("docker", "compose", "down", "-v", "--remove-orphans")
-		cmd.Dir = dir
-		cmd.Stdout = os.Stderr
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := composeRun(dir, "down", "-v", "--remove-orphans").Run(); err != nil {
 			t.Logf("compose down (%s): %v", dir, err)
 		}
 	}

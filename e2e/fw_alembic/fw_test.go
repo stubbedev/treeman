@@ -61,7 +61,11 @@ func TestAlembicEndToEnd(t *testing.T) {
 				NameTemplate: "tm_al_{slug}",
 				Migrate: &config.Step{
 					Run: fmt.Sprintf(
-						`docker exec -w %s -e ALEMBIC_DATABASE_URL=postgresql://postgres:pgpw@postgres:5432/${DB_NAME} %s alembic upgrade head`,
+						// +psycopg2 pins the dialect to the driver the
+						// container installs: unpinned `postgresql://` lets
+						// SQLAlchemy pick its default dialect, which drifted
+						// to psycopg3 (not installed) in newer releases.
+						`docker exec -w %s -e ALEMBIC_DATABASE_URL=postgresql+psycopg2://postgres:pgpw@postgres:5432/${DB_NAME} %s alembic upgrade head`,
 						wt,
 						pyContainer,
 					),

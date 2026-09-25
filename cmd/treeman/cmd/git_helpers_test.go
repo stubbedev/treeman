@@ -31,9 +31,18 @@ func TestIsGitWorktreeDir(t *testing.T) {
 	run("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init")
 
 	// A live linked worktree counts…
-	run("worktree", "add", "-b", "feature/live", filepath.Join(repo, ".worktrees", "live"))
-	if !isGitWorktreeDir(ctx, repo, filepath.Join(repo, ".worktrees", "live")) {
+	live := filepath.Join(repo, ".worktrees", "live")
+	run("worktree", "add", "-b", "feature/live", live)
+	if !isGitWorktreeDir(ctx, repo, live) {
 		t.Error("live linked worktree must resolve")
+	}
+	// …including when candidate and git's recorded form differ by a
+	// symlinked prefix (macOS TMPDIR: callers pass /var/…, git records
+	// /private/var/…). Exercise BOTH spellings when they differ.
+	if resolved, err := filepath.EvalSymlinks(live); err == nil && resolved != filepath.Clean(live) {
+		if !isGitWorktreeDir(ctx, repo, resolved) {
+			t.Errorf("resolved candidate %q must resolve like %q", resolved, live)
+		}
 	}
 	// …a leftover non-git dir (e.g. node_modules/.cache after teardown)
 	// does not…

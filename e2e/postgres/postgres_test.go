@@ -206,13 +206,34 @@ func TestPostgresFanoutConcurrency(t *testing.T) {
 	}
 	env := harness.NewEnv(t, wt)
 
-	// Cold build: creates the template + first fan-out. Re-running with
-	// the same inputs hits the cache and exercises the parallel
-	// SnapshotRestore path we want to measure.
+	// Cold build: creates the template + first fan-out.
 	_ = harness.AssertOutcome(t, env.RunPrepare(t, cfg), "postgres", false)
 
-	// Only count events emitted from THIS point forward — the prior cold
-	// build also produced clone_restore_done events, and including those
+	// Re-prepare with unchanged inputs: the built-at gate makes this
+	// the no-op cache hit #38 promised — NO restore, NO clone events.
+	skipStartMs := time.Now().UnixMilli()
+	skipOutcome := harness.AssertOutcome(t, env.RunPrepare(t, cfg), "postgres", true)
+	skipEvs, err := env.Store.QueryEvents(env.Ctx, store.EventFilter{
+		WorktreeID: env.WTID,
+		EventTypes: []string{"clones:restore:end"},
+		SinceMs:    skipStartMs,
+	})
+	if err != nil {
+		t.Fatalf("query skip events: %v", err)
+	}
+	if len(skipEvs) != 0 {
+		t.Fatalf("unchanged-fingerprint re-prepare must skip the restore, got %d clone_restore_done events", len(skipEvs))
+	}
+
+	// Drop the built-at marker (as `db reset` / stale recovery would) so
+	// the next cache hit takes the parallel SnapshotRestore path this
+	// test measures.
+	if err := env.Store.ClearTemplateBuiltForKey(env.Ctx, env.WTID, skipOutcome.SourceDB); err != nil {
+		t.Fatalf("clear built marker: %v", err)
+	}
+
+	// Only count events emitted from THIS point forward — the prior
+	// runs also produced clone_restore_done events, and including those
 	// would double-count and inflate the parallelism factor.
 	probeStartMs := time.Now().UnixMilli()
 	wallStart := time.Now()

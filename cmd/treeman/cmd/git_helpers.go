@@ -223,18 +223,35 @@ func gitWorktrees(ctx context.Context, repoRoot string) map[string]string {
 // worktrees per git's own admin state (`.git/worktrees/<name>/gitdir`),
 // read fork-free via wtreg.GitWorktreePaths. A plain directory that
 // merely happens to sit under .worktrees/ does not count.
+//
+// Comparison resolves symlinks: git records the RESOLVED worktree path
+// in `gitdir`, while the candidate comes from user input / config that
+// may carry a symlinked prefix (macOS TMPDIR's /var → /private/var) —
+// a Clean-only comparison never matches there and the fallback would
+// be dead on macOS.
 func isGitWorktreeDir(ctx context.Context, repoRoot, path string) bool {
 	paths, err := wtreg.GitWorktreePaths(ctx, repoRoot)
 	if err != nil {
 		return false
 	}
-	clean := filepath.Clean(path)
+	cand := resolvePath(path)
 	for _, p := range paths {
-		if filepath.Clean(p) == clean {
+		if resolvePath(p) == cand {
 			return true
 		}
 	}
 	return false
+}
+
+// resolvePath canonicalises a path for comparison: Clean plus symlink
+// resolution when the path exists (EvalSymlinks errors on missing
+// paths, which stay Clean-only).
+func resolvePath(p string) string {
+	p = filepath.Clean(p)
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return p
 }
 
 // switchAction is the `git switch` handler; wtSwitchAction is the
