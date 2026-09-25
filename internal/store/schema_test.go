@@ -42,6 +42,7 @@ func TestFreshDBHasExpectedSchema(t *testing.T) {
 		"hook_runs",
 		"repos",
 		"snapshots",
+		"template_db_built",
 		"worktree_ports",
 		"worktrees",
 	}

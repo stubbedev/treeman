@@ -79,6 +79,10 @@ func RecoverStaleWorktree(
 					"error":  err.Error(),
 				})
 		}
+		// The namespaces this worktree's template-path databases were built
+		// into are gone now — drop their built-at fingerprints so the next
+		// prepare restores instead of trusting the skip gate.
+		_ = st.ClearTemplateBuiltForWorktree(ctx, worktreeID)
 	}
 }
 

@@ -633,35 +633,16 @@ func RunFiltered(
 			continue
 		}
 		g.Go(func() error {
-			var (
-				o   Outcome
-				err error
-			)
-			fam, ok := engine.Canonical(d.Engine)
-			if !ok {
-				// Engine not recognised. Surface via event so the
-				// user notices, but don't fail the whole prepare run.
-				_ = st.WriteEvent(gctx, store.LevelWarn, store.EvtPrepareUnsupported,
-					fmt.Sprintf("engine=%s not recognised", d.Engine),
-					repoID, worktreeID, "", 0, nil)
-				return nil
-			}
-			switch fam {
-			case engine.FamilyMySQL:
-				o, err = prepareMySQL(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			case engine.FamilyPostgres:
-				o, err = preparePostgres(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			case engine.FamilyMongo:
-				o, err = prepareMongo(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			case engine.FamilyRedis:
-				o, err = prepareRedis(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			case engine.FamilyES:
-				o, err = prepareES(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			case engine.FamilyS3:
-				o, err = prepareS3(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
-			}
+			o, err := prepareOneEngine(gctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 			if err != nil {
 				return err
+			}
+			// A successful template-path run leaves the worktree's
+			// namespaces populated at this fingerprint — record it so the
+			// next cache hit can skip the restore entirely (branch-scoped
+			// outcomes carry no fingerprint and skip the record).
+			if !o.CacheHit && o.Fingerprint != "" && o.SourceDB != "" {
+				_ = st.SetTemplateBuilt(gctx, worktreeID, o.SourceDB, d.Engine, o.Fingerprint)
 			}
 			results[i] = o
 			hasResult[i] = true
@@ -686,6 +667,44 @@ func RunFiltered(
 		}
 	}
 	return outcomes, nil
+}
+
+// prepareOneEngine dispatches one database to its engine prepare
+// function. An unrecognised engine is surfaced as an event + a zero
+// outcome, not a run failure.
+func prepareOneEngine(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	dbIdx int,
+	tplCtx template.Context,
+	worktreePath string,
+	st *store.Store,
+	repoID, worktreeID int64,
+	inheritedEnv map[string]string,
+) (Outcome, error) {
+	fam, ok := engine.Canonical(d.Engine)
+	if !ok {
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtPrepareUnsupported,
+			fmt.Sprintf("engine=%s not recognised", d.Engine),
+			repoID, worktreeID, "", 0, nil)
+		return Outcome{}, nil
+	}
+	switch fam {
+	case engine.FamilyMySQL:
+		return prepareMySQL(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+	case engine.FamilyPostgres:
+		return preparePostgres(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+	case engine.FamilyMongo:
+		return prepareMongo(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+	case engine.FamilyRedis:
+		return prepareRedis(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+	case engine.FamilyES:
+		return prepareES(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+	case engine.FamilyS3:
+		return prepareS3(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+	}
+	return Outcome{}, nil
 }
 
 //nolint:funlen // mirrors the linear cache-hit / incremental / cold-build / fanout flow used by every engine; extracting helpers just spreads the same conditions across functions
@@ -739,7 +758,7 @@ func prepareMySQL(
 		})
 	}
 
-	key := computeSnapshotKey(ctx, st, d, worktreePath, version)
+	key, inputs := computeKeyAndVectors(ctx, st, d, worktreePath, version)
 	templateName := key.TemplateName()
 
 	// Pin the fingerprint for the lifetime of this prepare so the
@@ -757,7 +776,7 @@ func prepareMySQL(
 	// the cold build and just clone the template into paratest DBs.
 	// Inputs feed the fingerprint, so any user-meaningful change
 	// invalidates the cache naturally — no force-rebuild knob.
-	out, done, err := cacheHitGeneric(
+	out, done, finishBuild, err := cacheHitGeneric(
 		ctx,
 		drv.DatabaseExists,
 		drv.SnapshotRestoreStaged,
@@ -772,6 +791,7 @@ func prepareMySQL(
 		maxConns,
 		started,
 	)
+	defer finishBuild()
 	if done || err != nil {
 		return out, err
 	}
@@ -779,7 +799,6 @@ func prepareMySQL(
 	// Per-input vectors used for ancestor lookup AND persisted into
 	// the new snapshot row so future preps can build incrementally
 	// off this one.
-	inputs := computeInputVectors(ctx, st, d, worktreePath)
 
 	ops := incrementalOps{
 		exists:                drv.DatabaseExists,
@@ -928,10 +947,13 @@ func prepareMySQL(
 }
 
 // cacheHitGeneric is the engine-agnostic fingerprint-cache fast path
-// shared by every engine. Returns (out, true, nil) when the cached
+// shared by every engine. Returns (out, true, nil, nil) when the cached
 // template was reused and the caller should return `out`; (Outcome{},
-// false, nil) when the cache missed or the template vanished mid-flight
-// (caller must cold-build); (Outcome{}, false, err) on a hard error.
+// false, nil, finishBuild) when the cache missed or the template
+// vanished mid-flight (caller must cold-build and defer finishBuild()
+// until its engine function returns, so concurrent same-fingerprint
+// prepares dedupe against the build); (Outcome{}, false, err, nil) on a
+// hard error.
 //
 // `exists` is the driver's namespace-presence probe (DatabaseExists for
 // name-scoped engines, PrefixExists/IndexExists for prefix-scoped ones)
@@ -953,7 +975,7 @@ func cacheHitGeneric(
 	key snapshot.Key,
 	maxConns int,
 	started time.Time,
-) (Outcome, bool, error) {
+) (Outcome, bool, func(), error) {
 	// A lookup error is treated as a cache miss (fall through to cold
 	// build), matching the original `err == nil && rec != nil` guard.
 	// The lookup also touches the row in the same statement — BEFORE the
@@ -963,7 +985,15 @@ func cacheHitGeneric(
 	rec, _ := st.LookupAndTouchSnapshot(ctx, key.Fingerprint())
 	if rec == nil {
 		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissNoRow)
-		return Outcome{}, false, nil
+		// A sibling worktree may be cold-building this exact fingerprint
+		// right now. Wait for it and retry once — its snapshot row then
+		// turns our would-be duplicate cold build into a restore.
+		if waitForBuild(d.Engine, key.Fingerprint()) {
+			rec, _ = st.LookupAndTouchSnapshot(ctx, key.Fingerprint())
+		}
+	}
+	if rec == nil {
+		return Outcome{}, false, beginBuild(d.Engine, key.Fingerprint()), nil
 	}
 	alive, _ := exists(ctx, rec.TemplateName)
 	if !alive {
@@ -971,7 +1001,7 @@ func cacheHitGeneric(
 		// cold-build path overwrites it cleanly.
 		emitCacheMiss(ctx, st, repoID, worktreeID, d.Engine, sourceDB, key.Fingerprint(), cacheMissTemplateGone)
 		_ = st.DeleteSnapshot(ctx, key.Fingerprint())
-		return Outcome{}, false, nil
+		return Outcome{}, false, beginBuild(d.Engine, key.Fingerprint()), nil
 	}
 	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsCacheHit,
 		"template="+rec.TemplateName,
@@ -983,7 +1013,36 @@ func cacheHitGeneric(
 		})
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
-		return Outcome{}, false, err
+		return Outcome{}, false, func() {}, err
+	}
+	// Per-worktree built-at gate: when this worktree's namespaces were
+	// already populated from THIS fingerprint and they all still exist,
+	// the restore + fan-out is the no-op "cache hit" promises. (Without
+	// it, every finalize re-restored the source + every clone from the
+	// template even though the inputs hadn't changed: ~90s of I/O on a
+	// 16-clone repo per HEAD move.)
+	if restored := templateBuiltTargets(ctx, st, exists, worktreeID, sourceDB, d.Engine, clones, key.Fingerprint()); restored {
+		ms := time.Since(started).Milliseconds()
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
+			fmt.Sprintf("cache_hit clones=%d restored=0 duration=%dms", len(clones), ms),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":      d.Engine,
+				"source_db":   sourceDB,
+				"template":    rec.TemplateName,
+				"clones":      strconv.Itoa(len(clones)),
+				"fingerprint": key.Fingerprint(),
+				"cache_hit":   "true",
+				"restored":    "0",
+				"duration_ms": strconv.FormatInt(ms, 10),
+			})
+		return Outcome{
+			Engine:       d.Engine,
+			SourceDB:     sourceDB,
+			TemplateName: rec.TemplateName,
+			Fingerprint:  key.Fingerprint(),
+			CacheHit:     true,
+			Clones:       clones,
+		}, true, nil, nil
 	}
 	// Cache-hit skips the cold-build path that populates the source DB
 	// via dump+migrate. Restore source from the template so non-parallel
@@ -997,8 +1056,9 @@ func cacheHitGeneric(
 	// to cold build instead of failing worktree:create:error.
 	if err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, restore,
 		d, rec.TemplateName, sourceDB, clones, maxConns, key.Fingerprint()); err != nil {
-		return Outcome{}, false, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
+		return Outcome{}, false, func() {}, nil //nolint:nilerr // cache-miss fallback: the helper already logged + dropped the stale row; returning the (Outcome{}, false, nil) sentinel makes the engine cold-build
 	}
+	_ = st.SetTemplateBuilt(ctx, worktreeID, sourceDB, d.Engine, key.Fingerprint())
 	ms := time.Since(started).Milliseconds()
 	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
 		fmt.Sprintf("cache_hit clones=%d duration=%dms", len(clones), ms),
@@ -1018,7 +1078,42 @@ func cacheHitGeneric(
 		Fingerprint:  key.Fingerprint(),
 		CacheHit:     true,
 		Clones:       clones,
-	}, true, nil
+	}, true, func() {}, nil
+}
+
+// templateBuiltTargets reports whether this worktree's source + clone
+// namespaces were already built at `fingerprint` and all of them still
+// exist on the engine (cheap per-target existence probes). Returns
+// true when the restore can be skipped entirely.
+func templateBuiltTargets(
+	ctx context.Context,
+	st *store.Store,
+	exists func(context.Context, string) (bool, error),
+	worktreeID int64,
+	sourceDB, engine string,
+	clones []string,
+	fingerprint string,
+) bool {
+	builtFP, ok, err := st.GetTemplateBuilt(ctx, worktreeID, sourceDB, engine)
+	if err != nil || !ok || builtFP != fingerprint {
+		return false
+	}
+	targets := make([]string, 0, len(clones)+1)
+	targets = append(targets, sourceDB)
+	for _, c := range clones {
+		if c != sourceDB {
+			targets = append(targets, c)
+		}
+	}
+	for _, t := range targets {
+		present, err := exists(ctx, t)
+		if err != nil || !present {
+			// Any missing namespace (manual drop, reset, engine wipe)
+			// re-arms the restore for the whole set.
+			return false
+		}
+	}
+	return true
 }
 
 // runPhase runs one cold-build runner phase (migrate or seed) against
@@ -1097,6 +1192,7 @@ func mysqlColdBuildSteps(
 	// so a later migration edit can rebuild from it without reloading
 	// the dump. Best-effort: failure here only forfeits the fast path.
 	seedDumpOnlyTemplate(ctx, st, d, repoID, worktreeID, sourceDB, version, dumpKey, len(dumps),
+		drv.DatabaseExists,
 		func(ctx context.Context, src, tmpl string) error { return drv.SnapshotCreate(ctx, src, tmpl) })
 	if d.Migrate != nil {
 		if err := runPhase(
@@ -1331,6 +1427,52 @@ func spawnEvict(cfg *config.Config, st *store.Store, repoID int64) {
 	})
 }
 
+// buildFlights dedupes concurrent cold builds of the same (engine,
+// fingerprint) template across worktrees — two worktrees preparing a
+// missing fingerprint both used to run the full dump+migrate+snapshot
+// pipeline in parallel; now the second waits for the first's snapshot
+// row and takes the restore path instead. Same shape as prewarm's
+// in-flight map.
+var buildFlights = struct {
+	sync.Mutex
+	m map[string]chan struct{}
+}{m: map[string]chan struct{}{}}
+
+func buildFlightKey(engine, fingerprint string) string {
+	return engine + "/" + fingerprint
+}
+
+// waitForBuild blocks while another prepare is cold-building this
+// (engine, fingerprint), returning true. False when nothing is in
+// flight (no wait happened).
+func waitForBuild(engine, fingerprint string) bool {
+	buildFlights.Lock()
+	ch, ok := buildFlights.m[buildFlightKey(engine, fingerprint)]
+	buildFlights.Unlock()
+	if !ok {
+		return false
+	}
+	<-ch
+	return true
+}
+
+// beginBuild marks a cold build in flight and returns the finish()
+// closure the caller must run when its engine function returns
+// (success or failure) — it unblocks waiters and clears the slot.
+func beginBuild(engine, fingerprint string) func() {
+	key := buildFlightKey(engine, fingerprint)
+	ch := make(chan struct{})
+	buildFlights.Lock()
+	buildFlights.m[key] = ch
+	buildFlights.Unlock()
+	return func() {
+		buildFlights.Lock()
+		delete(buildFlights.m, key)
+		buildFlights.Unlock()
+		close(ch)
+	}
+}
+
 // incrementalOps bundles the engine-specific primitives the generic
 // `tryIncrementalBuild` orchestrator needs. Each engine driver exposes
 // these under different concrete types (DatabaseExists vs PrefixExists
@@ -1546,12 +1688,21 @@ func seedDumpOnlyTemplate(
 	sourceDB, version string,
 	dumpKey snapshot.Key,
 	dumpCount int,
+	exists func(context.Context, string) (bool, error),
 	snapshotCreate func(ctx context.Context, src, tmpl string) error,
 ) {
 	if dumpCount == 0 || d.Migrate == nil {
 		return
 	}
 	dumpTpl := dumpKey.TemplateName()
+	// Skip the full template copy when a live dump-only template already
+	// exists — the post-dump state is immutable for a given dump hash, so
+	// the copy used to re-run on EVERY cold build for nothing.
+	if rec, lerr := st.LookupSnapshot(ctx, dumpKey.Fingerprint()); lerr == nil && rec != nil {
+		if alive, aerr := exists(ctx, rec.TemplateName); aerr == nil && alive {
+			return
+		}
+	}
 	start := time.Now()
 	if err := snapshotCreate(ctx, sourceDB, dumpTpl); err != nil {
 		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtPrepareDumpOnlyFallback,
@@ -1633,7 +1784,10 @@ func tryDumpOnlyBuild(
 	if len(d.Dump) == 0 || d.Migrate == nil {
 		return Outcome{}, false, nil
 	}
-	anc, _ := st.LookupSnapshot(ctx, dumpKey.Fingerprint())
+	// Touch the row on use (LRU): a hot dump-only template must not age
+	// out of the cache — a migration edit then silently falls back to a
+	// full dump reload, the dominant cold cost.
+	anc, _ := st.LookupAndTouchSnapshot(ctx, dumpKey.Fingerprint())
 	if anc == nil {
 		return Outcome{}, false, nil
 	}
@@ -1888,7 +2042,7 @@ func preparePostgres(
 		})
 	}
 
-	key := computeSnapshotKey(ctx, st, d, worktreePath, version)
+	key, inputs := computeKeyAndVectors(ctx, st, d, worktreePath, version)
 	templateName := key.TemplateName()
 
 	// See prepareMySQL's pin comment — same race, same fix.
@@ -1917,7 +2071,7 @@ func preparePostgres(
 	// to claim a pre-warmed spare via rename before paying a full
 	// `CREATE DATABASE … TEMPLATE`.
 	restore := postgresRestoreFor(drv, st, repoID, worktreeID, d)
-	out, done, err := cacheHitGeneric(
+	out, done, finishBuild, err := cacheHitGeneric(
 		ctx,
 		drv.DatabaseExists,
 		restore,
@@ -1932,6 +2086,7 @@ func preparePostgres(
 		maxConns,
 		started,
 	)
+	defer finishBuild()
 	if done || err != nil {
 		return out, err
 	}
@@ -1939,7 +2094,6 @@ func preparePostgres(
 	// Per-input vectors used for ancestor lookup AND persisted into
 	// the new snapshot row so future preps can build incrementally
 	// off this one. Mirrors prepareMySQL.
-	inputs := computeInputVectors(ctx, st, d, worktreePath)
 
 	ops := incrementalOps{
 		exists:          drv.DatabaseExists,
@@ -2082,7 +2236,7 @@ func postgresColdBuildSteps(
 	}
 	// Seed the dump-only intermediate template (post-dump, pre-migrate).
 	// Best-effort; see the mysql cold-build site for rationale.
-	seedDumpOnlyTemplate(ctx, st, d, repoID, worktreeID, sourceDB, version, dumpKey, len(dumps), drv.SnapshotCreate)
+	seedDumpOnlyTemplate(ctx, st, d, repoID, worktreeID, sourceDB, version, dumpKey, len(dumps), drv.DatabaseExists, drv.SnapshotCreate)
 	if d.Migrate != nil {
 		if err := runPhase(
 			ctx,
@@ -2170,7 +2324,7 @@ func prepareMongo(
 		})
 	}
 
-	key := computeSnapshotKey(ctx, st, d, worktreePath, version)
+	key, inputs := computeKeyAndVectors(ctx, st, d, worktreePath, version)
 	templateName := key.TemplateName()
 
 	// See prepareMySQL's pin comment — same race, same fix.
@@ -2187,7 +2341,7 @@ func prepareMongo(
 		})
 
 	// Cache hit?
-	out, done, err := cacheHitGeneric(
+	out, done, finishBuild, err := cacheHitGeneric(
 		ctx,
 		drv.DatabaseExists,
 		drv.SnapshotRestore,
@@ -2202,11 +2356,10 @@ func prepareMongo(
 		0,
 		started,
 	)
+	defer finishBuild()
 	if done || err != nil {
 		return out, err
 	}
-
-	inputs := computeInputVectors(ctx, st, d, worktreePath)
 
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, sourceDB, templateName, version, 0, key, inputs,
@@ -2419,7 +2572,7 @@ func prepareRedisPrefix(
 		return Outcome{}, fmt.Errorf("render key_prefix: %w", err)
 	}
 	version, _ := cachedProbe(ctx, "redis-version", func() (string, error) { return drv.EngineVersion(ctx) })
-	key := computeSnapshotKey(ctx, st, d, worktreePath, version)
+	key, inputs := computeKeyAndVectors(ctx, st, d, worktreePath, version)
 	templatePrefix := "_tm:" + key.Fingerprint()[:16] + ":"
 
 	// See prepareMySQL's pin comment — same race, same fix.
@@ -2451,7 +2604,7 @@ func prepareRedisPrefix(
 	}
 
 	// Cache hit?
-	out, done, err := cacheHitGeneric(
+	out, done, finishBuild, err := cacheHitGeneric(
 		ctx,
 		drv.PrefixExists,
 		rdRestore,
@@ -2466,11 +2619,10 @@ func prepareRedisPrefix(
 		0,
 		started,
 	)
+	defer finishBuild()
 	if done || err != nil {
 		return out, err
 	}
-
-	inputs := computeInputVectors(ctx, st, d, worktreePath)
 
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, sourcePrefix, templatePrefix, version, 0, key, inputs,
@@ -2689,7 +2841,7 @@ func prepareES(
 		return drv.SnapshotCreateFiltered(ctx, src, templatePrefix, esKeep)
 	}
 
-	key := computeSnapshotKey(ctx, st, d, worktreePath, version)
+	key, inputs := computeKeyAndVectors(ctx, st, d, worktreePath, version)
 	// ES forbids index names starting with `_`, so we use a
 	// dedicated prefix (tm_<fingerprint>_) for the template indices.
 	templatePrefix := key.IndexPrefix() + "_"
@@ -2716,7 +2868,7 @@ func prepareES(
 		matched, e := drv.ListMatching(ctx, prefix)
 		return len(matched) > 0, e
 	}
-	out, done, err := cacheHitGeneric(
+	out, done, finishBuild, err := cacheHitGeneric(
 		ctx,
 		esTemplateExists,
 		esRestore,
@@ -2731,11 +2883,10 @@ func prepareES(
 		0,
 		started,
 	)
+	defer finishBuild()
 	if done || err != nil {
 		return out, err
 	}
-
-	inputs := computeInputVectors(ctx, st, d, worktreePath)
 
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, sourcePrefix, templatePrefix, version, 0, key, inputs,
@@ -2969,34 +3120,84 @@ func esColdBuildSteps(
 // content depends only on the engine, version, and the hashed inputs
 // (migrations, dumps, commands) — not the name it's restored into. See
 // snapshot.FormatVersion v5.
+// inputWalk is one databases[].inputs[] glob's expansion: the matched
+// absolute paths plus their per-file content hashes, from one batched
+// stat-gated cache round-trip. The snapshot key's per-glob folds and
+// the ancestor vectors both derive from it, so the glob walk runs once
+// per prepare, not once per consumer.
+type inputWalk struct {
+	glob      string
+	hashByAbs map[string]string
+}
+
+func walkInputs(ctx context.Context, st *store.Store, d config.DatabaseConfig, worktreePath string) []inputWalk {
+	if st == nil {
+		return nil
+	}
+	var walks []inputWalk
+	for _, in := range d.Inputs {
+		// doublestar (not stdlib filepath.Glob) so `**` matches
+		// zero-or-more path segments, including files sitting directly in
+		// the glob base dir.
+		matches, _ := doublestar.FilepathGlob(filepath.Join(worktreePath, in.Glob))
+		if len(matches) == 0 {
+			continue
+		}
+		hashByAbs, err := st.BatchHashedFiles(ctx, matches)
+		if err != nil {
+			continue
+		}
+		walks = append(walks, inputWalk{glob: in.Glob, hashByAbs: hashByAbs})
+	}
+	return walks
+}
+
+// computeKeyAndVectors is the single-walk form of computeSnapshotKey +
+// computeInputVectors: one expansion + one BatchHashedFiles round-trip
+// per glob feeds both the snapshot key and the ancestor vectors (the
+// two previously re-walked and re-hashed the exact same files).
+func computeKeyAndVectors(
+	ctx context.Context,
+	st *store.Store,
+	d config.DatabaseConfig,
+	worktreePath, engineVersion string,
+) (snapshot.Key, map[string]store.InputVector) {
+	walks := walkInputs(ctx, st, d, worktreePath)
+	return keyFromWalks(ctx, st, walks, d, worktreePath, engineVersion), vectorsFromWalks(worktreePath, walks)
+}
+
 func computeSnapshotKey(
 	ctx context.Context,
 	st *store.Store,
 	d config.DatabaseConfig,
 	worktreePath, engineVersion string,
 ) snapshot.Key {
-	// 1. Hash every input under databases[].inputs[]. All inputs are
-	//    content-hashed — the historical `filename` shortcut for
-	//    append-only migration dirs is gone. doublestar (not stdlib
-	//    filepath.Glob) so `**` matches zero-or-more path segments,
-	//    including files sitting directly in the glob base dir.
+	return keyFromWalks(ctx, st, walkInputs(ctx, st, d, worktreePath), d, worktreePath, engineVersion)
+}
+
+// keyFromWalks builds the canonical Key from a completed input walk.
+func keyFromWalks(
+	ctx context.Context,
+	st *store.Store,
+	walks []inputWalk,
+	d config.DatabaseConfig,
+	worktreePath, engineVersion string,
+) snapshot.Key {
+	// 1. Fold each glob's per-file hashes into one entry, keyed by the
+	//    glob so the user can tell from the SQLite row what changed.
+	//    Basename-keyed so fingerprints stay byte-identical to the
+	//    historical fold.
 	inputHashes := map[string]string{}
-	for _, in := range d.Inputs {
-		matches, _ := doublestar.FilepathGlob(filepath.Join(worktreePath, in.Glob))
-		if len(matches) == 0 {
-			continue
+	for _, w := range walks {
+		baseHash := make(map[string]string, len(w.hashByAbs))
+		for abs, h := range w.hashByAbs {
+			baseHash[filepath.Base(abs)] = h
 		}
-		hs, err := snapshot.LockfileHashesForWithCache(ctx, st, matches)
-		if err != nil {
-			continue
-		}
-		// Fold per-file hashes into one entry per glob — keyed by the
-		// glob so the user can tell from the SQLite row what changed.
 		var sb strings.Builder
-		for _, k := range sortedKeys(hs) {
-			sb.WriteString(k + ":" + hs[k] + "\n")
+		for _, k := range sortedKeys(baseHash) {
+			sb.WriteString(k + ":" + baseHash[k] + "\n")
 		}
-		inputHashes[in.Glob] = sb.String()
+		inputHashes[w.glob] = sb.String()
 	}
 
 	// 2. Hash every dump file in declared ORDER and fold them into a
@@ -3033,7 +3234,7 @@ func computeSnapshotKey(
 	}
 
 	// 3. Hash the migrate + seed run-strings + env maps. Changing
-	//    what the user told us to run is itself an input change.
+	// what the user told us to run is itself an input change.
 	cmdHash := commandsHash(d)
 
 	// Stash command hash + dump hash in lockfileHashes (the snapshot
@@ -3105,35 +3306,26 @@ func InspectFingerprint(
 	return rep
 }
 
-// computeInputVectors produces the per-input ordered file vectors
-// stored alongside a snapshot so FindAncestorSnapshot can detect a
-// content-prefix ancestor. Mirrors computeSnapshotKey's input walk:
-// each `databases[].inputs[]` glob is expanded via doublestar, the
-// matches are sorted by repo-relative path, and each entry carries
-// the per-file content hash (looked up by absolute path so duplicate
-// basenames in different subdirs don't collide). Empty/missing globs
-// contribute no entry.
-func computeInputVectors(ctx context.Context, st *store.Store, d config.DatabaseConfig, worktreePath string) map[string]store.InputVector {
+// vectorsFromWalks renders the ancestor vectors (the per-input ordered
+// file vectors stored alongside a snapshot so FindAncestorSnapshot can
+// detect a content-prefix ancestor) from a completed input walk: each
+// `databases[].inputs[]` glob contributes one vector of repo-relative
+// paths with per-file content hashes (keyed by absolute path so
+// duplicate basenames in different subdirs don't collide). Empty or
+// missing globs contribute no entry.
+func vectorsFromWalks(worktreePath string, walks []inputWalk) map[string]store.InputVector {
 	out := map[string]store.InputVector{}
-	for _, in := range d.Inputs {
-		matches, _ := doublestar.FilepathGlob(filepath.Join(worktreePath, in.Glob))
-		if len(matches) == 0 {
-			continue
-		}
-		hashByAbs, err := st.BatchHashedFiles(ctx, matches)
-		if err != nil {
-			continue
-		}
-		vec := make(store.InputVector, 0, len(matches))
-		for _, abs := range matches {
+	for _, w := range walks {
+		vec := make(store.InputVector, 0, len(w.hashByAbs))
+		for abs, h := range w.hashByAbs {
 			rel, relErr := filepath.Rel(worktreePath, abs)
 			if relErr != nil {
 				rel = filepath.Base(abs)
 			}
-			vec = append(vec, store.FileHash{Path: rel, Hash: hashByAbs[abs]})
+			vec = append(vec, store.FileHash{Path: rel, Hash: h})
 		}
 		sort.Slice(vec, func(i, j int) bool { return vec[i].Path < vec[j].Path })
-		out[in.Glob] = vec
+		out[w.glob] = vec
 	}
 	return out
 }
