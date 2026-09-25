@@ -749,6 +749,9 @@ type WorktreeRow struct {
 	// RepoPath is only populated by queries that join repos
 	// (ListActiveWorktreeRows); empty elsewhere.
 	RepoPath string
+	// LastVisitedMs is the row's last_visited_at (unix ms), populated
+	// by ListActiveWorktreeRows; 0 elsewhere.
+	LastVisitedMs int64
 }
 
 // ListWorktreesForRepo returns every worktree row attached to repoID,
@@ -792,9 +795,9 @@ func (s *Store) CountActiveWorktreesForRepo(ctx context.Context, repoID int64) (
 // without re-querying per row.
 func (s *Store) ListActiveWorktreeRows(ctx context.Context) ([]WorktreeRow, error) {
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT w.id, w.repo_id, w.path, w.slug, COALESCE(w.branch, ''), COALESCE(w.admin_dir, ''), w.deleted_at IS NOT NULL, w.is_main, r.path
+		SELECT w.id, w.repo_id, w.path, w.slug, COALESCE(w.branch, ''), COALESCE(w.admin_dir, ''), w.deleted_at IS NOT NULL, w.is_main, r.path, COALESCE(w.last_visited_at, 0)
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		WHERE w.deleted_at IS NULL
+		WHERE w.deleted_at IS NULL AND `+WorktreeNotTearingDown+`
 		ORDER BY w.id`)
 	if err != nil {
 		return nil, err
@@ -803,7 +806,18 @@ func (s *Store) ListActiveWorktreeRows(ctx context.Context) ([]WorktreeRow, erro
 	var out []WorktreeRow
 	for rows.Next() {
 		var w WorktreeRow
-		if err := rows.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &w.Deleted, &w.IsMain, &w.RepoPath); err != nil {
+		if err := rows.Scan(
+			&w.ID,
+			&w.RepoID,
+			&w.Path,
+			&w.Slug,
+			&w.Branch,
+			&w.AdminDir,
+			&w.Deleted,
+			&w.IsMain,
+			&w.RepoPath,
+			&w.LastVisitedMs,
+		); err != nil {
 			return nil, err
 		}
 		out = append(out, w)

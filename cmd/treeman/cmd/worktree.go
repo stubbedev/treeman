@@ -44,6 +44,7 @@ func WorktreeCmd() *cli.Command {
 			wtGo(),
 			wtSwitch(),
 			wtPrune(),
+			WtGcCmd(),
 		},
 	}
 }
@@ -467,6 +468,7 @@ func wtList() *cli.Command {
 				Name:  "with-status",
 				Usage: "include a STATUS column (clean/dirty/unpushed; forks git status + rev-list per row)",
 			},
+			&cli.BoolFlag{Name: "with-size", Usage: "include a SIZE column (on-disk bytes; runs du per row concurrently)"},
 			&cli.StringFlag{Name: "sort", Value: "id", Usage: "id | mtime (HEAD commit ts) | visited (last_visited_at)"},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}, Usage: "scope to one repo (path)"},
 		},
@@ -532,12 +534,8 @@ func wtList() *cli.Command {
 
 			withStatus := c.Bool("with-status")
 			withState := c.Bool("with-state")
-			sortMode := c.String("sort")
-			needHeadTs := sortMode == "mtime" || c.Bool("json")
-			enrichWtRows(ctx, st, all, withStatus, withState, needHeadTs, c.Bool("json"))
-			if sortMode == "mtime" {
-				sort.SliceStable(all, func(i, j int) bool { return all[i].HeadTs > all[j].HeadTs })
-			}
+			withSize := c.Bool("with-size")
+			enrichAndSortWtRows(ctx, c, st, all, withStatus, withState, withSize)
 
 			if c.Bool("tsv") {
 				for _, r := range all {
@@ -554,9 +552,32 @@ func wtList() *cli.Command {
 				return nil
 			}
 
-			renderWtTable(all, anyMain, withStatus, withState)
+			renderWtTable(all, anyMain, withStatus, withState, withSize)
 			return nil
 		},
+	}
+}
+
+// enrichAndSortWtRows fills the optional columns requested by the
+// list flags (state, status, HEAD ts, sizes) and applies the --sort
+// mode. Extracted from wtList's action to keep it under the
+// complexity gate.
+func enrichAndSortWtRows(ctx context.Context, c *cli.Command, st *store.Store, all []wtRow, withStatus, withState, withSize bool) {
+	sortMode := c.String("sort")
+	needHeadTs := sortMode == "mtime" || c.Bool("json") || withSize
+	enrichWtRows(ctx, st, all, withStatus, withState, needHeadTs, c.Bool("json") || withSize)
+	if withSize {
+		paths := make([]string, len(all))
+		for i := range all {
+			paths[i] = all[i].Path
+		}
+		sizes := worktreeSizes(ctx, paths)
+		for i := range all {
+			all[i].SizeBytes = sizes[i]
+		}
+	}
+	if sortMode == "mtime" {
+		sort.SliceStable(all, func(i, j int) bool { return all[i].HeadTs > all[j].HeadTs })
 	}
 }
 
@@ -575,6 +596,7 @@ type wtRow struct {
 	Dirty       bool   `json:"dirty,omitempty"`
 	Unpushed    bool   `json:"unpushed,omitempty"`
 	FinalState  string `json:"state,omitempty"`
+	SizeBytes   int64  `json:"size_bytes,omitempty"` // on-disk bytes (populated by --with-size)
 }
 
 // enrichWtRows fills in per-row HEAD timestamp, git status and finalize
@@ -680,7 +702,7 @@ func enrichRowStatus(ctx context.Context, r *wtRow) {
 }
 
 // renderWtTable prints the human-readable `treeman worktree list` table.
-func renderWtTable(all []wtRow, anyMain, withStatus, withState bool) {
+func renderWtTable(all []wtRow, anyMain, withStatus, withState, withSize bool) {
 	// MAIN column only shows up when at least one row is the
 	// main wt — keeps the dominant linked-only output narrow.
 	headers := []string{"ID"}
@@ -693,6 +715,9 @@ func renderWtTable(all []wtRow, anyMain, withStatus, withState bool) {
 	}
 	if withState {
 		headers = append(headers, "STATE")
+	}
+	if withSize {
+		headers = append(headers, "SIZE")
 	}
 	headers = append(headers, "LAST", "PATH")
 	tbl := ui.NewTable(headers...)
@@ -717,6 +742,9 @@ func renderWtTable(all []wtRow, anyMain, withStatus, withState bool) {
 		}
 		if withState {
 			cells = append(cells, r.FinalState)
+		}
+		if withSize {
+			cells = append(cells, ui.Dim(humanBytes(r.SizeBytes)))
 		}
 		cells = append(cells, ui.Dim(lastLabel(r.HeadTs, r.VisitedTs)), r.Path)
 		tbl.Row(cells...)

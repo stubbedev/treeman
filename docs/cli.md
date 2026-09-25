@@ -88,6 +88,7 @@ list active worktrees
 | `--tsv` | machine output: one <path>\t<branch> line per active worktree (for shell consumption) |
 | `--with-state` | include a STATE column derived from the most recent finalize event |
 | `--with-status` | include a STATUS column (clean/dirty/unpushed; forks git status + rev-list per row) |
+| `--with-size` | include a SIZE column (on-disk bytes; runs du per row concurrently) |
 | `--sort` | id \| mtime (HEAD commit ts) \| visited (last_visited_at) |
 | `-r`, `--repo` | scope to one repo (path) |
 
@@ -188,6 +189,36 @@ prune worktrees whose directory is gone (git worktree prune + registry reconcile
 | Flag | Usage |
 |---|---|
 | `-r`, `--repo` |  |
+
+### `treeman worktree gc`
+
+reclaim disk from merged/stale worktrees (delete merged, drop caches of stale)
+
+```
+Plans and executes a reclaim across every registered repo
+(or one repo with --repo):
+
+  --merged     worktrees whose branch is contained in the default
+               branch (or --merged=<ref>) are DELETED (full teardown:
+               hooks, databases, git worktree remove, registry row).
+               Dirty or unpushed worktrees are skipped with a warning.
+  --stale <d>  worktrees with no activity (events, last visit, HEAD
+               commit) within <d> (e.g. 30d) get their regenerable
+               cache dirs removed (node_modules, vendor, storage, …) —
+               the checkout, branch, and registry row stay; a later
+               finalize rebuilds them.
+
+With no selector, --stale 30d applies (the safe default). --dry-run
+prints the plan and reclaimable bytes without touching anything.
+```
+
+| Flag | Usage |
+|---|---|
+| `-r`, `--repo` | scope to one repo (path) |
+| `--merged` | delete worktrees whose branch is merged into the default branch (or =<ref>) |
+| `--stale` | duration without activity after which caches are reclaimed (e.g. 30d; '' disables) |
+| `--dry-run` | print the plan + reclaimable bytes; change nothing |
+| `-y`, `--yes` | skip the confirmation prompt |
 
 ### `treeman git`
 

@@ -208,6 +208,37 @@ func (s *Store) LatestEventPerWorktree(ctx context.Context, wtIDs []int64, event
 	return out, rows.Err()
 }
 
+// LastEventTsPerWorktree returns the newest event timestamp (unix ms,
+// ANY type) per worktree id — the staleness signal for `worktree gc`.
+// Worktrees with no events are absent from the map.
+func (s *Store) LastEventTsPerWorktree(ctx context.Context, wtIDs []int64) (map[int64]int64, error) {
+	out := map[int64]int64{}
+	if len(wtIDs) == 0 {
+		return out, nil
+	}
+	//nolint:gosec // only placeholder fragments; values are parameterized
+	q := `SELECT worktree_id, MAX(ts) FROM events
+		WHERE worktree_id IN (` + placeholders(len(wtIDs)) + `)
+		GROUP BY worktree_id`
+	args := make([]any, 0, len(wtIDs))
+	for _, id := range wtIDs {
+		args = append(args, id)
+	}
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query last event per worktree: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id, ts int64
+		if err := rows.Scan(&id, &ts); err != nil {
+			return nil, err
+		}
+		out[id] = ts
+	}
+	return out, rows.Err()
+}
+
 // WorktreeNotTearingDown is a SQL predicate fragment (over a worktrees
 // alias `w`) that excludes worktrees whose teardown is in flight: the
 // latest delete-lifecycle event is delete:start with no later
