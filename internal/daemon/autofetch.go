@@ -11,8 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
+	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/store"
@@ -213,42 +216,163 @@ func SyncRepo(ctx context.Context, st *State, r store.RepoRef, cfg *config.Confi
 		paths = append(paths, linked...)
 	}
 
+	// ONE for-each-ref pass answers branch → upstream/ahead/behind for
+	// EVERY worktree (refs are shared); each worktree's branch is a
+	// fork-free HEAD-file read. Only the worktrees that are actually
+	// behind pay any further git fork — the old shape spawned 3-4 forks
+	// per worktree per tick (~60 serial forks at 16 worktrees).
+	tracks, refsDigest := branchTrackStates(ctx, r.Path)
+
 	mode := cfg.AutoFetch.ResolvedMode()
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(8)
 	for _, wtPath := range paths {
-		if ctx.Err() != nil {
-			return nil //nolint:nilerr // ctx cancelled mid-loop: stop syncing cleanly, not a failure
+		if gctx.Err() != nil {
+			break
 		}
-		_ = SyncWorktree(ctx, st, r.ID, wtPath, mode)
+		g.Go(func() error {
+			_ = syncWorktreeFromTracks(gctx, st, r.ID, wtPath, mode, tracks)
+			return nil
+		})
+	}
+	_ = g.Wait()
+	if ctx.Err() != nil {
+		return nil //nolint:nilerr // ctx cancelled mid-loop: stop syncing cleanly, not a failure
 	}
 
 	// After the mainline branch has advanced, prune local branches whose
 	// upstream was deleted and that are provably merged, then reap the
 	// branch_scoped durable databases those deleted branches left behind.
-	for _, branch := range pruneGoneLocals(ctx, r.Path) {
+	pruned := pruneGoneLocals(ctx, r.Path)
+	for _, branch := range pruned {
 		prepare.ReapBranchDurables(ctx, cfg, st.Store, r.ID, branch)
 		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtBranchPrune,
 			"pruned merged branch with deleted upstream: "+branch,
 			r.ID, 0, "", 0, map[string]string{"branch": branch})
 	}
 
-	// Catch-all: drop any tracked durable whose branch is gone regardless of
-	// HOW it went away (worktree removed, branch deleted out-of-band, prune
-	// missed it). ReapBranchDurables above only covers branches THIS tick
-	// pruned via a live worktree; this reclaims the rest by recorded name.
-	prepare.ReapOrphanDurables(ctx, cfg, st.Store, r.ID, r.Path)
+	// The catch-all reapers only have work to do when the repo's refs
+	// changed since the last sweep (a branch or upstream disappearing is
+	// exactly what orphans a durable), so gate them on the refs digest
+	// instead of re-connecting engines every tick.
+	if st.RefsDigestChanged(r.Path, refsDigest) {
+		// Catch-all: drop any tracked durable whose branch is gone regardless of
+		// HOW it went away (worktree removed, branch deleted out-of-band, prune
+		// missed it). ReapBranchDurables above only covers branches THIS tick
+		// pruned via a live worktree; this reclaims the rest by recorded name.
+		prepare.ReapOrphanDurables(ctx, cfg, st.Store, r.ID, r.Path)
 
-	// Deeper catch-all for Elasticsearch: drop ES durable index families
-	// (`tmbs_*`) that NO repo's registry references at all — durables that
-	// predate the branch_durables table or were left by a Capture that died
-	// before recording its row. Both reapers above are registry-driven and
-	// can't see those; left unbounded they pile up as ES shards until the
-	// single-node dev cluster can't recover. Skip while ANY finalize is in
-	// flight so the sweep can't race a Capture that hasn't recorded its row yet
-	// (it runs every tick — next one reclaims them).
-	if len(st.SnapshotInFlightFinalizes()) == 0 {
-		prepare.ReapUntrackedESDurables(ctx, cfg, st.Store, r.ID)
+		// Deeper catch-all for Elasticsearch: drop ES durable index families
+		// (`tmbs_*`) that NO repo's registry references at all — durables that
+		// predate the branch_durables table or were left by a Capture that died
+		// before recording its row. Both reapers above are registry-driven and
+		// can't see those; left unbounded they pile up as ES shards until the
+		// single-node dev cluster can't recover. Skip while ANY finalize is in
+		// flight so the sweep can't race a Capture that hasn't recorded its row
+		// yet (it runs on the next refs change — one reclaims them).
+		if len(st.SnapshotInFlightFinalizes()) == 0 {
+			prepare.ReapUntrackedESDurables(ctx, cfg, st.Store, r.ID)
+		}
 	}
 	return nil
+}
+
+// branchTrack is a branch's upstream relationship, from one
+// for-each-ref pass over refs/heads (refs are shared across all of a
+// repo's worktrees).
+type branchTrack struct {
+	upstream string // e.g. "origin/main"; "" when none configured
+	ahead    int
+	behind   int
+	gone     bool // upstream was deleted (pruned remote-tracking ref)
+}
+
+// branchTrackStates collects every local branch's upstream/ahead/
+// behind/gone state in ONE git fork, plus a digest of the raw ref
+// state. The digest feeds the reaper gate: unchanged refs mean no
+// durable could have been orphaned since the last sweep.
+func branchTrackStates(ctx context.Context, repoRoot string) (map[string]branchTrack, string) {
+	out, err := gitcmd.Output(ctx, repoRoot, "for-each-ref",
+		"--format=%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)", "refs/heads")
+	if err != nil {
+		slog.Warn("auto_fetch for-each-ref tracks", "repo", repoRoot, "err", err)
+		return nil, ""
+	}
+	tracks := map[string]branchTrack{}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		name, rest, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+		upstream, track, _ := strings.Cut(rest, "\t")
+		tr := branchTrack{upstream: upstream}
+		if track == "gone" {
+			tr.gone = true
+		} else if track != "" {
+			for part := range strings.SplitSeq(track, ",") {
+				part = strings.TrimSpace(part)
+				word, nStr, ok := strings.Cut(part, " ")
+				if !ok {
+					continue
+				}
+				n, err := strconv.Atoi(nStr)
+				if err != nil {
+					continue
+				}
+				switch word {
+				case "ahead":
+					tr.ahead = n
+				case "behind":
+					tr.behind = n
+				}
+			}
+		}
+		tracks[name] = tr
+	}
+	h := fnv.New64a()
+	_, _ = h.Write(out)
+	return tracks, strconv.FormatUint(h.Sum64(), 16)
+}
+
+// syncWorktreeFromTracks advances one working tree using the
+// precomputed per-branch track state. The branch comes from a
+// fork-free HEAD-file read; worktrees that aren't behind their
+// upstream (the common case) cost zero git forks. Falls back to the
+// fork-based SyncWorktree when the branch isn't in the map (created
+// after the for-each-ref pass ran).
+func syncWorktreeFromTracks(ctx context.Context, st *State, repoID int64, wtPath, mode string, tracks map[string]branchTrack) error {
+	if _, err := os.Stat(wtPath); err != nil {
+		emitSkip(ctx, st, repoID, wtPath, "", SyncSkipPathGone, err.Error())
+		return err
+	}
+	branch := gitenv.DetectBranch(ctx, wtPath)
+	if branch == "" {
+		emitSkip(ctx, st, repoID, wtPath, "", SyncSkipDetached, "detached HEAD or no branch")
+		return nil
+	}
+	tr, ok := tracks[branch]
+	if !ok {
+		return SyncWorktree(ctx, st, repoID, wtPath, mode)
+	}
+	if tr.upstream == "" || tr.gone {
+		emitSkip(ctx, st, repoID, wtPath, branch, SyncSkipNoUpstream, "no upstream configured")
+		return nil
+	}
+	if tr.behind == 0 {
+		// Up to date or strictly ahead: nothing to advance (the old
+		// fork-per-worktree path attempted a merge here and logged a
+		// spurious "advanced" event every tick).
+		return nil
+	}
+	if mode == "rebase" {
+		return advanceRebase(ctx, st, repoID, wtPath, branch)
+	}
+	if tr.ahead > 0 {
+		// Diverged — ff-only would refuse. We never resolve divergence.
+		emitSkip(ctx, st, repoID, wtPath, branch, SyncSkipNonFF, "fast-forward refused (divergent)")
+		return nil
+	}
+	return advanceFF(ctx, st, repoID, wtPath, branch)
 }
 
 // SyncWorktree advances one working tree's HEAD to its upstream-

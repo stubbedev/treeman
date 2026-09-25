@@ -3,11 +3,15 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/gitcmd"
+	"github.com/stubbedev/treeman/internal/gitenv"
+	"github.com/stubbedev/treeman/internal/wtreg"
 )
 
 // maxSquashScanCommits caps how far back of defRef history the squash-detection
@@ -64,6 +68,10 @@ func pruneGoneLocals(ctx context.Context, repoRoot string) []string {
 		return nil
 	}
 	checkedOut := checkedOutBranches(ctx, repoRoot)
+	// Ancestor check for EVERY branch in one fork: the set of local
+	// branches reachable from the default ref replaces a per-branch
+	// `merge-base --is-ancestor` inside the loop.
+	mergedIntoDefault := mergedBranchSet(ctx, repoRoot, defRef)
 
 	var deleted, suspects []string
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
@@ -79,7 +87,7 @@ func pruneGoneLocals(ctx context.Context, repoRoot string) []string {
 		}
 		// Fast path: tip already reachable from the default branch
 		// (fast-forward / merge-commit). No patch-id work needed.
-		if gitcmd.RunOptional(ctx, repoRoot, "merge-base", "--is-ancestor", name, defRef) == nil {
+		if _, merged := mergedIntoDefault[name]; merged {
 			deleteGoneLocal(ctx, repoRoot, name, &deleted)
 			continue
 		}
@@ -111,8 +119,14 @@ func deleteGoneLocal(ctx context.Context, repoRoot, name string, deleted *[]stri
 // branch (e.g. "origin/master") — the freshest mainline state right after
 // `fetch`, and the ref merge-status is proven against. ok=false when it can't
 // be resolved, so the caller declines to prune rather than guess against the
-// wrong target.
+// wrong target. The origin/HEAD symref is read fork-free first (git never
+// packs symbolic refs, so the loose file is authoritative when present).
 func defaultRemoteRef(ctx context.Context, repoRoot string) (string, bool) {
+	if b, err := os.ReadFile(filepath.Join(repoRoot, ".git", "refs", "remotes", "origin", "HEAD")); err == nil {
+		if ref, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "ref: refs/remotes/origin/"); ok && ref != "" {
+			return "origin/" + ref, true
+		}
+	}
 	if s, err := gitcmd.String(ctx, repoRoot, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil && s != "" {
 		return s, true
 	}
@@ -124,20 +138,42 @@ func defaultRemoteRef(ctx context.Context, repoRoot string) (string, bool) {
 	return "", false
 }
 
+// mergedBranchSet returns the set of local branch names whose tips are
+// reachable from ref — one `for-each-ref --merged` fork instead of a
+// `merge-base --is-ancestor` per branch.
+func mergedBranchSet(ctx context.Context, repoRoot, ref string) map[string]struct{} {
+	set := map[string]struct{}{}
+	out, err := gitcmd.Output(ctx, repoRoot, "for-each-ref",
+		"--merged="+ref, "--format=%(refname:short)", "refs/heads")
+	if err != nil {
+		slog.Warn("branch_prune merged set", "repo", repoRoot, "ref", ref, "err", err)
+		return set
+	}
+	for name := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		if name != "" {
+			set[name] = struct{}{}
+		}
+	}
+	return set
+}
+
 // checkedOutBranches returns the set of branch names currently checked out in
 // any of the repo's worktrees (including the main checkout). `git branch -D`
 // refuses these; pre-skipping keeps the logs free of expected failures.
+// Fork-free: worktrees enumerate from `.git/worktrees/<name>/gitdir`
+// (wtreg) and each branch is a HEAD-file read.
 func checkedOutBranches(ctx context.Context, repoRoot string) map[string]struct{} {
 	set := map[string]struct{}{}
-	out, err := gitcmd.Output(ctx, repoRoot, "worktree", "list", "--porcelain")
+	if b := gitenv.DetectBranch(ctx, repoRoot); b != "" {
+		set[b] = struct{}{}
+	}
+	paths, err := wtreg.GitWorktreePaths(ctx, repoRoot)
 	if err != nil {
 		return set
 	}
-	for line := range strings.SplitSeq(string(out), "\n") {
-		if rest, ok := strings.CutPrefix(line, "branch refs/heads/"); ok {
-			if b := strings.TrimSpace(rest); b != "" {
-				set[b] = struct{}{}
-			}
+	for _, p := range paths {
+		if b := gitenv.DetectBranch(ctx, p); b != "" {
+			set[b] = struct{}{}
 		}
 	}
 	return set

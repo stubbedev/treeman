@@ -112,6 +112,81 @@ func advanceOrigin(t *testing.T, origin string) {
 	gitRun(t, push, "push", "-q", "origin", "main")
 }
 
+// TestBranchTrackStates pins the one-fork-per-repo track map: every
+// branch's upstream/ahead/behind/gone state and the refs digest that
+// gates the reapers.
+func TestBranchTrackStates(t *testing.T) {
+	requireGitAutofetch(t)
+	ctx := context.Background()
+
+	work, origin := makeClone(t)
+	advanceOrigin(t, origin)
+	// Refresh remote-tracking state so upstream:track is meaningful.
+	gitRun(t, work, "fetch", "-q", "origin")
+
+	tracks, digest := branchTrackStates(ctx, work)
+	if digest == "" {
+		t.Fatal("digest empty")
+	}
+	tr, ok := tracks["main"]
+	if !ok {
+		t.Fatalf("main missing from tracks: %v", tracks)
+	}
+	if tr.upstream != "origin/main" {
+		t.Errorf("upstream = %q, want origin/main", tr.upstream)
+	}
+	if tr.behind != 1 || tr.ahead != 0 {
+		t.Errorf("ahead/behind = %d/%d, want 0/1", tr.ahead, tr.behind)
+	}
+	if tr.gone {
+		t.Error("upstream present; gone must be false")
+	}
+
+	// A deleted upstream reads as gone: create a branch with an
+	// upstream, then delete the remote ref.
+	gitRun(t, work, "branch", "-q", "doomed", "origin/main")
+	gitRun(t, work, "config", "branch.doomed.remote", "origin")
+	gitRun(t, work, "config", "branch.doomed.merge", "refs/heads/doomed")
+	gitRun(t, work, "push", "-q", "origin", "doomed")
+	gitRun(t, work, "fetch", "-q", "origin")
+	gitRun(t, work, "push", "-q", "origin", "--delete", "doomed")
+	gitRun(t, work, "fetch", "-q", "--prune", "origin")
+	_ = origin
+
+	tracks, digest2 := branchTrackStates(ctx, work)
+	if tr := tracks["doomed"]; !tr.gone {
+		t.Errorf("doomed track = %+v, want gone=true", tr)
+	}
+	if digest2 == digest {
+		t.Error("refs digest must change when refs change")
+	}
+}
+
+// TestRefsDigestChangedGate pins the reaper gate semantics: first
+// sighting is a change, identical digests are not, new refs are.
+func TestRefsDigestChangedGate(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(ctx, filepath.Join(t.TempDir(), "treeman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	st := NewState(ctx, s)
+
+	if !st.RefsDigestChanged("/repo", "a") {
+		t.Error("first digest must count as changed")
+	}
+	if st.RefsDigestChanged("/repo", "a") {
+		t.Error("identical digest must not count as changed")
+	}
+	if !st.RefsDigestChanged("/repo", "b") {
+		t.Error("new digest must count as changed")
+	}
+	if !st.RefsDigestChanged("/other", "b") {
+		t.Error("per-repo digests are independent")
+	}
+}
+
 // TestAutoFetchAdvancesCleanWorktree verifies the happy path: clean
 // tree, upstream has a new commit, sweep runs → HEAD advances.
 func TestAutoFetchAdvancesCleanWorktree(t *testing.T) {

@@ -135,10 +135,16 @@ func (w *Watcher) Start(ctx context.Context) error {
 			}
 			// If a new directory was created inside a tracked
 			// subtree, add it so we get events from inside it on
-			// Linux (Darwin's kqueue auto-recurses).
+			// Linux (Darwin's kqueue auto-recurses). Filter by
+			// basename exactly like addAllDirs — without this, an
+			// `npm ci` inside a watched subtree re-subscribes all of
+			// node_modules, defeating the initial skip list until the
+			// watcher restarts.
 			if ev.Op&fsnotify.Create != 0 {
 				if fi, err := os.Stat(ev.Name); err == nil && fi.IsDir() {
-					_ = w.fsw.Add(ev.Name)
+					if _, noisy := noiseDirNames[fi.Name()]; !noisy {
+						_ = w.fsw.Add(ev.Name)
+					}
 				}
 			}
 			dbIdx, label, matched := w.classify(ev.Name)
@@ -182,7 +188,9 @@ func (w *Watcher) Stop() { _ = w.fsw.Close() }
 // vendor/ if a glob's static prefix happened to enclose them — and
 // even one inotify watch on a deep node_modules generates wakeups
 // every time webpack or composer touches it. Filtering at subscribe
-// time means the kernel never delivers the events at all.
+// time means the kernel never delivers the events at all. storage/
+// is treeman's own per-worktree dump dir (~3G) — a walk over it at
+// every watcher start was pure cost.
 var noiseDirNames = map[string]struct{}{
 	".git":         {},
 	"node_modules": {},
@@ -196,6 +204,12 @@ var noiseDirNames = map[string]struct{}{
 	".turbo":       {},
 	".cache":       {},
 	".direnv":      {},
+	"storage":      {},
+	"var":          {},
+	"tmp":          {},
+	"coverage":     {},
+	"venv":         {},
+	".venv":        {},
 }
 
 // addAllDirs walks each glob's longest static prefix and adds every

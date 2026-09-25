@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/store"
@@ -212,7 +213,10 @@ func (cr *ConfigReloader) scheduleReload(dir string) {
 
 // ReloadAll invalidates the resolved-config cache and reloads watchers
 // for every registered repo. Invoked by the global-dir fsnotify path
-// and by SIGHUP / `config_reload` RPC with empty repo path.
+// and by SIGHUP / `config_reload` RPC with empty repo path. Repos
+// reload concurrently (bounded): each one re-pays a full addAllDirs
+// walk per worktree, and serialising them made a reload of a
+// many-worktree setup take the sum instead of the max.
 func (cr *ConfigReloader) ReloadAll(ctx context.Context) {
 	resolve.InvalidateConfigCache()
 	paths, err := cr.st.Store.ListRepoPaths(ctx)
@@ -220,8 +224,13 @@ func (cr *ConfigReloader) ReloadAll(ctx context.Context) {
 		slog.Warn("config reload: list repos failed", "err", err)
 		return
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(4)
 	for _, p := range paths {
-		cr.reloadOne(ctx, p)
+		g.Go(func() error {
+			cr.reloadOne(gctx, p)
+			return nil
+		})
 	}
 	// Re-read the global `notifications:` block so toggling it on/off
 	// (or changing the bucket list / backend) in
@@ -298,6 +307,10 @@ func (cr *ConfigReloader) reloadOne(ctx context.Context, repoPath string) {
 	if err := startRepoWatcher(ctx, cr.st, repoPath); err != nil {
 		slog.Warn("config reload: startRepoWatcher", "repo", repoPath, "err", err)
 	}
+	// Per-worktree spawns fan out — each one pays a full addAllDirs walk,
+	// and serialising them stretched the reload by the sum.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(8)
 	for _, wt := range wts {
 		if wt.RepoPath != repoPath {
 			continue
@@ -305,11 +318,15 @@ func (cr *ConfigReloader) reloadOne(ctx context.Context, repoPath string) {
 		if _, err := os.Stat(wt.WorktreePath); err != nil {
 			continue
 		}
-		if err := startWorktreeWatcher(ctx, cr.st, repoPath, wt.WorktreePath); err != nil {
-			slog.Warn("config reload: startWorktreeWatcher",
-				"wt", wt.WorktreePath, "err", err)
-		}
+		g.Go(func() error {
+			if err := startWorktreeWatcher(gctx, cr.st, repoPath, wt.WorktreePath); err != nil {
+				slog.Warn("config reload: startWorktreeWatcher",
+					"wt", wt.WorktreePath, "err", err)
+			}
+			return nil
+		})
 	}
+	_ = g.Wait()
 }
 
 // lockRepo returns the per-repo reload mutex, lazily creating it on

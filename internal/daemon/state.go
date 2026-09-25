@@ -122,6 +122,22 @@ type State struct {
 	// the worktree (dirty, no-upstream, non-ff, detached). Surfaces
 	// via `sync_status` for "why didn't my branch advance?".
 	syncLastSkip map[string]string
+	// syncRefsDigest[repoPath] is the last-seen digest of the repo's
+	// ref state (branch/upstream/track). The auto-fetch reapers only
+	// run when it CHANGES — an unchanged ref set can't have orphaned
+	// a durable since the last sweep.
+	syncRefsDigest map[string]string
+}
+
+// RefsDigestChanged records `digest` as the repo's current ref state
+// and reports whether it differs from the previous sweep's (absent =
+// first sweep = changed).
+func (st *State) RefsDigestChanged(repoPath, digest string) bool {
+	st.syncMu.Lock()
+	defer st.syncMu.Unlock()
+	prev, seen := st.syncRefsDigest[repoPath]
+	st.syncRefsDigest[repoPath] = digest
+	return !seen || prev != digest
 }
 
 // inFlightFinalize is the per-path tracking record kept in
@@ -179,6 +195,7 @@ func NewState(bg context.Context, s *store.Store) *State {
 		syncFailCount:     map[string]int{},
 		syncLastFetch:     map[string]time.Time{},
 		syncLastSkip:      map[string]string{},
+		syncRefsDigest:    map[string]string{},
 	}
 }
 
