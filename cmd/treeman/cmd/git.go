@@ -517,7 +517,7 @@ func gitWipe() *cli.Command {
 				_ = gitcmd.Run(ctx, dir, "stash", "push", "-u")
 				return gitcmd.Run(ctx, dir, "stash", "clear")
 			}
-			if clean, _ := gitenv.IsWorktreeClean(ctx, dir); clean {
+			if dirty, _ := gitenv.HasWorkingTreeChanges(ctx, dir); !dirty {
 				return nil
 			}
 			if !ui.ConfirmYes("Wipe non-pushed changes on local branch?") {

@@ -109,6 +109,32 @@ func TestIsLinkedWorktree(t *testing.T) {
 	}
 }
 
+func TestHasWorkingTreeChanges(t *testing.T) {
+	ctx := context.Background()
+	repo := initRepo(t)
+	changes, err := HasWorkingTreeChanges(ctx, repo)
+	if err != nil || changes {
+		t.Fatalf("fresh repo: changes=%v err=%v, want false", changes, err)
+	}
+	// Untracked files COUNT (destructive-op definition) — unlike
+	// IsWorktreeClean's tracked-only -uno view.
+	if err := os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if changes, err := HasWorkingTreeChanges(ctx, repo); err != nil || !changes {
+		t.Fatalf("untracked file: changes=%v err=%v, want true", changes, err)
+	}
+	if clean, err := IsWorktreeClean(ctx, repo); err != nil || !clean {
+		t.Fatalf("untracked file, tracked-only view: clean=%v err=%v, want true", clean, err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if changes, err := HasWorkingTreeChanges(ctx, repo); err != nil || !changes {
+		t.Fatalf("tracked modification: changes=%v err=%v, want true", changes, err)
+	}
+}
+
 func TestIsWorktreeClean(t *testing.T) {
 	ctx := context.Background()
 	repo := initRepo(t)

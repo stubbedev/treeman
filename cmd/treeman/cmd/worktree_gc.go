@@ -270,7 +270,7 @@ func gcMergedCandidate(ctx context.Context, cand gcCandidate, merged map[string]
 		return cand, false
 	}
 	// Batch safety: never delete dirty or unpushed work.
-	if clean, _ := gitenv.IsWorktreeClean(ctx, cand.row.Path); !clean {
+	if dirty, _ := gitenv.HasWorkingTreeChanges(ctx, cand.row.Path); dirty {
 		ui.Warn("skip %s: merged but dirty (uncommitted changes)", cand.row.Path)
 		cand.action = "skip"
 		return cand, false

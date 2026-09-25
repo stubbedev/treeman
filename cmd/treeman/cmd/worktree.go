@@ -374,7 +374,7 @@ func deleteWorktreeTarget(ctx context.Context, c *cli.Command, repoRoot, target 
 	// the reason.
 	if !c.Bool("yes") {
 		var reasons []string
-		if clean, _ := gitenv.IsWorktreeClean(ctx, wtPath); !clean {
+		if dirty, _ := gitenv.HasWorkingTreeChanges(ctx, wtPath); dirty {
 			reasons = append(reasons, "uncommitted changes")
 		}
 		if unpushed, _ := gitenv.HasUnpushedCommits(ctx, wtPath); unpushed {
@@ -768,16 +768,13 @@ func headCommitTs(path string) int64 {
 	return ts
 }
 
-// worktreeDirty mirrors gitenv.IsWorktreeClean but inverted: true when
-// `git status --porcelain` is non-empty. Returns false + error on
+// worktreeDirty reports whether the worktree differs from HEAD in any
+// way, untracked files included (the destructive-op definition — the
+// column feeds delete decisions and dirty markers). Returns false + error on
 // unreadable git state (treated as not-dirty so a missing repo doesn't
 // produce a misleading `*` marker).
 func worktreeDirty(ctx context.Context, path string) (bool, error) {
-	clean, err := gitenv.IsWorktreeClean(ctx, path)
-	if err != nil {
-		return false, err
-	}
-	return !clean, nil
+	return gitenv.HasWorkingTreeChanges(ctx, path)
 }
 
 func statusLabel(dirty, unpushed bool) string {
@@ -1026,13 +1023,14 @@ func wtBack() *cli.Command {
 			// get past gitignored build artifacts (vendor/, node_modules/),
 			// not past uncommitted changes. Explicitly nuking a dirty
 			// worktree is `treeman worktree delete --force`'s job.
-			clean, err := gitenv.IsWorktreeClean(ctx, wtRoot)
+			// Untracked files count: removing the worktree destroys them too.
+			dirty, err := gitenv.HasWorkingTreeChanges(ctx, wtRoot)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "git status failed: %v; --remove aborted\n", err)
 				fmt.Println(repoRoot)
 				return nil
 			}
-			if !clean {
+			if dirty {
 				fmt.Fprintln(os.Stderr, "keeping worktree (uncommitted changes)")
 				fmt.Println(repoRoot)
 				return nil

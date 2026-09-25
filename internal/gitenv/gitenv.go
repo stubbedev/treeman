@@ -91,23 +91,36 @@ func IsGitWorktree(path string) bool {
 	return err == nil
 }
 
-// IsWorktreeClean returns true when `git status --porcelain=v1 -uno`
-// in the worktree is empty — no uncommitted changes to TRACKED
-// files. Untracked files deliberately don't count: this is the same
-// dirty definition the daemon's merge-safety check uses
-// (autofetch), and git's own `worktree remove` still refuses on
-// untracked files where that matters.
-//
-// The probe runs WITHOUT GIT_OPTIONAL_LOCKS=0 (readOnly=false) so git
-// persists the refreshed index stat-cache — with it, every call
-// re-lstats the entire tracked tree, which dominated repeated status
-// checks on multi-GB worktrees.
-func IsWorktreeClean(ctx context.Context, path string) (bool, error) {
-	out, err := gitcmd.OutputRW(ctx, path, false, "status", "--porcelain=v1", "-uno")
+// statusEmpty runs `git status --porcelain=v1` with the given extra
+// args and reports whether it printed nothing. Runs WITHOUT
+// GIT_OPTIONAL_LOCKS=0 (readOnly=false) so git persists the refreshed
+// index stat-cache — with it, every call re-lstats the entire tracked
+// tree, which dominated repeated status checks on multi-GB worktrees.
+func statusEmpty(ctx context.Context, path string, args ...string) (bool, error) {
+	out, err := gitcmd.OutputRW(ctx, path, false, append([]string{"status", "--porcelain=v1"}, args...)...)
 	if err != nil {
 		return false, err
 	}
 	return strings.TrimSpace(string(out)) == "", nil
+}
+
+// IsWorktreeClean reports whether TRACKED files have no uncommitted
+// changes (`-uno`: untracked files deliberately don't count — the
+// dirty definition the daemon's merge-safety check uses, and matches
+// what blocks a checkout / fast-forward). Callers that destroy or
+// display state (wipe, delete confirms, dirty markers) want
+// HasWorkingTreeChanges instead.
+func IsWorktreeClean(ctx context.Context, path string) (bool, error) {
+	return statusEmpty(ctx, path, "-uno")
+}
+
+// HasWorkingTreeChanges reports whether the worktree differs from HEAD
+// in ANY way, including untracked files. This is the destructive-op
+// definition: wiping or deleting a worktree with untracked files loses
+// them, so those guards must count.
+func HasWorkingTreeChanges(ctx context.Context, path string) (bool, error) {
+	clean, err := statusEmpty(ctx, path)
+	return !clean, err
 }
 
 // HasUnpushedCommits returns true when the worktree's HEAD has

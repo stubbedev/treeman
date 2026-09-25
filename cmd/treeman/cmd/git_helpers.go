@@ -395,7 +395,7 @@ func buildSwitchMenu(ctx context.Context, repoRoot string) (items, targets []str
 // suffix for a worktree, or "" when clean and pushed.
 func worktreeMarkers(ctx context.Context, path string) string {
 	m := ""
-	if clean, _ := gitenv.IsWorktreeClean(ctx, path); !clean {
+	if dirty, _ := gitenv.HasWorkingTreeChanges(ctx, path); dirty {
 		m += "*"
 	}
 	if up, _ := gitenv.HasUnpushedCommits(ctx, path); up {
