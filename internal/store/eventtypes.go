@@ -86,6 +86,10 @@ const (
 	EvtBranchReap         = "branch:reap"
 	EvtBranchCaptureSkip  = "branch:capture:skip"
 	EvtBranchCaptureError = "branch:capture:error"
+	// branch:verify:warn flags a durable/parent copy whose row-count
+	// sample came back empty while its source had rows — the schema-
+	// only-capture corruption class from #41.
+	EvtBranchVerifyWarn = "branch:verify:warn"
 
 	// databases[].inputs + HEAD — watcher
 	EvtWatchStart = "watch:start"

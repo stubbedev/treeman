@@ -134,7 +134,106 @@ func bsHash(s string) string {
 	return string(out)
 }
 
-// ─── per-engine adapters ────────────────────────────────────────────
+// ─── per-engine adapters ──────────────────────────────────────
+
+// rowSampler is the optional nsDriver capability behind capture/restore
+// verification (#41). RowCountSample picks a namespace's smallest
+// non-empty tables (by catalog estimate) with their exact counts;
+// RowCountsFor takes exact counts of NAMED tables in another namespace.
+// Engines without it skip verification — the capability is opt-in per
+// engine.
+type rowSampler interface {
+	RowCountSample(ctx context.Context, ns string) (map[string]int64, error)
+	RowCountsFor(ctx context.Context, ns string, tables []string) (map[string]int64, error)
+}
+
+// captureVerified captures active → durable and VERIFIES the copy
+// before the caller records it as the branch's durable: a copy that
+// came back schema-only or partial (source sample non-empty, copy's
+// counts zero) is dropped and reported as a failed capture. Without
+// this, a capture that silently lost its rows — the #41 corruption,
+// where a mysql durable held 244 tables and zero rows — became the
+// branch's ONLY durable and every resume/seed propagated the empty DB.
+func captureVerified(ctx context.Context, drv nsDriver, active, durable string) error {
+	if err := captureRetrying(ctx, drv, active, durable); err != nil {
+		return err
+	}
+	srcSample, ok := sampleRows(ctx, drv, active)
+	if !ok {
+		return nil
+	}
+	if !sampleHasRows(srcSample) {
+		return nil // source itself has no rows — an empty copy is correct
+	}
+	if bad, why := sampleMissingRows(ctx, drv, durable, srcSample); bad {
+		_ = drv.DropDurable(ctx, durable)
+		return fmt.Errorf(
+			"capture %s → %s verified EMPTY (%s) — dropped the bad copy instead of recording it; treat this as a capture failure and investigate the engine",
+			active,
+			durable,
+			why,
+		)
+	}
+	return nil
+}
+
+// sampleRows fetches a namespace's row-count sample when the driver
+// supports it. ok=false (engine without the capability, or a probe
+// error) means the caller must skip verification, not fail the capture.
+func sampleRows(ctx context.Context, drv nsDriver, ns string) (map[string]int64, bool) {
+	rs, ok := drv.(rowSampler)
+	if !ok {
+		return nil, false
+	}
+	sample, err := rs.RowCountSample(ctx, ns)
+	if err != nil || len(sample) == 0 {
+		return nil, false
+	}
+	return sample, true
+}
+
+func sampleHasRows(sample map[string]int64) bool {
+	for _, n := range sample {
+		if n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// sampleMissingRows reports whether the copy's row counts contradict a
+// non-empty source sample: any sampled table with zero rows in the copy
+// proves the capture lost data (the source only grows during a copy, so
+// a healthy copy has at least the sampled counts). The copy's tables
+// are counted EXACTLY by name — the copy's own catalog estimates can
+// be stale right after a clone, so they must not decide anything.
+func sampleMissingRows(ctx context.Context, drv nsDriver, ns string, srcSample map[string]int64) (bool, string) {
+	rs, ok := drv.(rowSampler)
+	if !ok {
+		return false, ""
+	}
+	tables := make([]string, 0, len(srcSample))
+	for table, src := range srcSample {
+		if src > 0 {
+			tables = append(tables, table)
+		}
+	}
+	if len(tables) == 0 {
+		return false, ""
+	}
+	copyCounts, err := rs.RowCountsFor(ctx, ns, tables)
+	if err != nil {
+		return false, ""
+	}
+	for _, table := range tables {
+		if copyCounts[table] == 0 {
+			return true, fmt.Sprintf("table %q: source %d rows, copy 0", table, srcSample[table])
+		}
+	}
+	return false, ""
+}
+
+// ─── per-engine adapters ────────────────────────────────────
 
 type mysqlNS struct{ d *dbmysql.Driver }
 
@@ -881,11 +980,7 @@ func (a branchScopedArgs) recordClean(ctx context.Context, active, branch, decis
 // (filled, how) — filled=false means no source was available and the
 // caller decides the fallback (empty).
 func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool, string, error) {
-	dur := a.eng.durable(active, branch)
-	if ok, _ := a.eng.drv.Exists(ctx, dur); ok {
-		if err := retryTransient(ctx, func() error { return a.eng.drv.Restore(ctx, dur, active) }); err != nil {
-			return false, "", fmt.Errorf("restore durable copy for %q: %w", branch, err)
-		}
+	if a.resumeDurableVerified(ctx, active, branch) {
 		return true, "resume", nil
 	}
 	parent, ok, err := a.parentDB(ctx, branch)
@@ -894,10 +989,8 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 	}
 	if ok && parent != "" && parent != active {
 		if pe, _ := a.eng.drv.Exists(ctx, parent); pe {
-			keep := a.parentSourceKeep(ctx, parent)
-			if err := retryTransient(ctx, func() error { return a.eng.drv.RestoreParent(ctx, parent, active, keep) }); err != nil {
-				return false, "", fmt.Errorf("seed %q from parent branch's live db %q: %w%s",
-					active, parent, err, parentSeedHint(a.eng.engine, err))
+			if err := a.seedParentVerified(ctx, parent, active); err != nil {
+				return false, "", err
 			}
 			return true, "parent", nil
 		}
@@ -917,6 +1010,68 @@ func (a branchScopedArgs) fill(ctx context.Context, active, branch string) (bool
 		return true, "parent-snapshot", nil
 	}
 	return false, "", nil
+}
+
+// resumeDurableVerified restores `branch`'s durable copy into `active`
+// and reports whether the resume stands. A durable that holds only a
+// schema (the #41 corruption: the copy silently lost every row) must
+// not be resumed — its empty DB would propagate to this worktree and
+// every child seeded from it. Such a durable is dropped (namespace +
+// tracking row) and false is returned so fill falls through to parent
+// seeding. Verification is best-effort: engines without row-count
+// samples always resume.
+func (a branchScopedArgs) resumeDurableVerified(ctx context.Context, active, branch string) bool {
+	dur := a.eng.durable(active, branch)
+	if ok, _ := a.eng.drv.Exists(ctx, dur); !ok {
+		return false
+	}
+	if err := retryTransient(ctx, func() error { return a.eng.drv.Restore(ctx, dur, active) }); err != nil {
+		// A broken restore must not fail the whole prepare — the parent
+		// and snapshot paths below may still fill the namespace.
+		a.event(ctx, store.EvtBranchVerifyWarn,
+			fmt.Sprintf("restore durable %s failed (%v); trying parent seeding", dur, err),
+			map[string]string{"durable": dur, "branch": branch})
+		return false
+	}
+	srcSample, ok := sampleRows(ctx, a.eng.drv, dur)
+	if !ok || !sampleHasRows(srcSample) {
+		return true // no sample to contradict — resume stands
+	}
+	bad, why := sampleMissingRows(ctx, a.eng.drv, active, srcSample)
+	if !bad {
+		return true
+	}
+	a.event(ctx, store.EvtBranchVerifyWarn,
+		fmt.Sprintf("durable %s for branch %q verified EMPTY (%s) — dropping it and falling back to parent seeding", dur, branch, why),
+		map[string]string{"durable": dur, "branch": branch})
+	_ = a.eng.drv.DropDurable(ctx, dur)
+	_ = a.st.DeleteBranchDurable(ctx, a.repoID, dur)
+	return false
+}
+
+// seedParentVerified copies the parent branch's live namespace into
+// `active` and REFUSES to hand back a schema-only copy when the parent
+// has rows (#41): an empty copy would seed the branch with nothing.
+func (a branchScopedArgs) seedParentVerified(ctx context.Context, parent, active string) error {
+	keep := a.parentSourceKeep(ctx, parent)
+	if err := retryTransient(ctx, func() error { return a.eng.drv.RestoreParent(ctx, parent, active, keep) }); err != nil {
+		return fmt.Errorf("seed %q from parent branch's live db %q: %w%s",
+			active, parent, err, parentSeedHint(a.eng.engine, err))
+	}
+	srcSample, ok := sampleRows(ctx, a.eng.drv, parent)
+	if !ok || !sampleHasRows(srcSample) {
+		return nil
+	}
+	bad, why := sampleMissingRows(ctx, a.eng.drv, active, srcSample)
+	if !bad {
+		return nil
+	}
+	a.event(ctx, store.EvtBranchVerifyWarn,
+		fmt.Sprintf("parent seed %q → %q came back EMPTY (%s) — refusing to use it", parent, active, why),
+		map[string]string{"parent": parent})
+	return fmt.Errorf(
+		"parent seed %q produced an empty database (%s) — the copy lost its rows; re-run after investigating the engine",
+		parent, why)
 }
 
 // adoptBranch returns the branch label the adopt arm hangs the FIRST
@@ -1133,7 +1288,7 @@ func (a branchScopedArgs) event(ctx context.Context, typ, msg string, extra map[
 // branches deleted while their worktree is live.
 func (a branchScopedArgs) captureDurable(ctx context.Context, active, branch string) error {
 	dur := a.eng.durable(active, branch)
-	if err := captureRetrying(ctx, a.eng.drv, active, dur); err != nil {
+	if err := captureVerified(ctx, a.eng.drv, active, dur); err != nil {
 		return err
 	}
 	_ = a.st.RecordBranchDurable(ctx, store.BranchDurableRow{
@@ -1163,7 +1318,7 @@ func captureBranchScopedOnTeardown(ctx context.Context, eng *branchEngine, st *s
 		return err
 	}
 	dur := eng.durable(active, branch)
-	if err := captureRetrying(ctx, eng.drv, active, dur); err != nil {
+	if err := captureVerified(ctx, eng.drv, active, dur); err != nil {
 		return err
 	}
 	// Record so the orphan sweep can reclaim this durable once `branch` is

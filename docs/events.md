@@ -116,6 +116,12 @@ that emits it.
 | `branch:capture:skip` | `store.EvtBranchCaptureSkip` |
 | `branch:capture:error` | `store.EvtBranchCaptureError` |
 
+## branch:verify:warn flags a durable/parent copy whose row-count
+
+| Event | Constant |
+|-------|----------|
+| `branch:verify:warn` | `store.EvtBranchVerifyWarn` |
+
 ## databases[].inputs + HEAD — watcher
 
 | Event | Constant |
