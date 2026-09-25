@@ -1098,8 +1098,15 @@ func wtGo() *cli.Command {
 			if err != nil {
 				return err
 			}
+			// Filesystem fallback — but only for directories git itself
+			// knows as linked worktrees. A leftover non-git dir under
+			// .worktrees/ (e.g. node_modules/.cache from a torn-down
+			// worktree) must NOT resolve: git commands there would run
+			// against the main checkout. Registered worktrees already
+			// matched above; teardown-guarding is likewise covered there
+			// (only registered rows tear down).
 			fsCandidate := filepath.Join(wt.WorktreesRoot(cfg, repoRoot), target)
-			if fi, statErr := os.Stat(fsCandidate); statErr == nil && fi.IsDir() {
+			if isGitWorktreeDir(ctx, repoRoot, fsCandidate) {
 				fmt.Println(fsCandidate)
 				return nil
 			}

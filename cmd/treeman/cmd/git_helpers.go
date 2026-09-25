@@ -23,6 +23,7 @@ import (
 	"github.com/stubbedev/treeman/internal/tui"
 	"github.com/stubbedev/treeman/internal/ui"
 	"github.com/stubbedev/treeman/internal/wt"
+	"github.com/stubbedev/treeman/internal/wtreg"
 )
 
 // tagRe matches a semver-ish tag (`4.3.21`, `4.3.21-rc1`) → branch
@@ -228,6 +229,24 @@ func gitWorktrees(ctx context.Context, repoRoot string) map[string]string {
 		}
 	}
 	return worktrees
+}
+
+// isGitWorktreeDir reports whether `path` is one of the repo's linked
+// worktrees per git's own admin state (`.git/worktrees/<name>/gitdir`),
+// read fork-free via wtreg.GitWorktreePaths. A plain directory that
+// merely happens to sit under .worktrees/ does not count.
+func isGitWorktreeDir(ctx context.Context, repoRoot, path string) bool {
+	paths, err := wtreg.GitWorktreePaths(ctx, repoRoot)
+	if err != nil {
+		return false
+	}
+	clean := filepath.Clean(path)
+	for _, p := range paths {
+		if filepath.Clean(p) == clean {
+			return true
+		}
+	}
+	return false
 }
 
 // switchAction is the `git switch` handler; wtSwitchAction is the

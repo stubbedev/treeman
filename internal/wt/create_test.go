@@ -50,8 +50,8 @@ func TestCreateExistingPathNonMatchingErrors(t *testing.T) {
 	}
 	withTempStore(t)
 	repo := gitRepo(t, "main")
-	// Pre-create the destination as a plain directory (NOT a linked
-	// worktree).
+	// Pre-create the destination as a plain directory (NOT a git
+	// worktree) — the leftover-teardown case.
 	wtDir := filepath.Join(repo, ".worktrees", "feature-x")
 	if err := os.MkdirAll(wtDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -59,6 +59,21 @@ func TestCreateExistingPathNonMatchingErrors(t *testing.T) {
 	_, err := Create(context.Background(), CreateRequest{
 		RepoRoot: repo,
 		Branch:   "feature-x",
+	}, NoopSink{})
+	if err == nil || !strings.Contains(err.Error(), "not a git worktree") {
+		t.Fatalf("expected 'not a git worktree' for plain dir, got %v", err)
+	}
+
+	// A real linked worktree on a DIFFERENT branch still gets the
+	// plain "already exists" refusal.
+	other := filepath.Join(repo, ".worktrees", "occupied")
+	if out, err := exec.Command("git", "-C", repo, "worktree", "add", "-b", "occupied", other).CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v: %s", err, out)
+	}
+	_, err = Create(context.Background(), CreateRequest{
+		RepoRoot: repo,
+		Branch:   "feature-x",
+		Path:     other,
 	}, NoopSink{})
 	if err == nil || !strings.Contains(err.Error(), "destination path already exists") {
 		t.Fatalf("expected 'destination path already exists', got %v", err)

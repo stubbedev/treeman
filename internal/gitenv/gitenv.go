@@ -80,6 +80,16 @@ func IsLinkedWorktree(path string) bool {
 	return !fi.IsDir()
 }
 
+// IsGitWorktree returns true when `path` is any git working tree —
+// the main checkout or a standalone clone (`.git` directory) or a
+// linked worktree (`.git` gitlink file). A directory that merely
+// holds leftovers from a torn-down worktree has no `.git` at all,
+// which is exactly the case callers use this to reject.
+func IsGitWorktree(path string) bool {
+	_, err := os.Stat(filepath.Join(path, ".git"))
+	return err == nil
+}
+
 // IsWorktreeClean returns true when `git status --porcelain` in the
 // worktree is empty — no uncommitted changes, no untracked files.
 // Used by `wt back --remove-if-clean` and equivalent safety

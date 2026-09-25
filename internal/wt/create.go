@@ -14,6 +14,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
+	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/ports"
 	"github.com/stubbedev/treeman/internal/resolve"
@@ -136,6 +137,11 @@ func CreateInStore(ctx context.Context, req CreateRequest, st *store.Store, sink
 		if IsMatchingExistingWorktree(ctx, req.RepoRoot, wtPath, req.Branch) {
 			sink.Info("worktree already exists at %s on %s — no-op", wtPath, req.Branch)
 			return CreateResult{WtPath: wtPath, Status: CreatedNoop}, false, nil
+		}
+		if !gitenv.IsGitWorktree(wtPath) {
+			return CreateResult{}, false, fmt.Errorf(
+				"destination %s exists but is not a git worktree (leftover from an earlier teardown?) "+
+					"— move it aside or remove it, then re-run", wtPath)
 		}
 		return CreateResult{}, false, fmt.Errorf("destination path already exists: %s", wtPath)
 	}
