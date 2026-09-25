@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/cursor"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-isatty"
 
@@ -140,19 +142,22 @@ func run(items []string, opts Options) (Result, error) {
 		return Result{Canceled: true}, ErrCanceled
 	}
 	if fm.aborted {
-		return Result{Query: fm.query, Canceled: true}, ErrAborted
+		return Result{Query: fm.input.Value(), Canceled: true}, ErrAborted
 	}
 	if fm.canceled {
-		return Result{Query: fm.query, Canceled: true}, ErrCanceled
+		return Result{Query: fm.input.Value(), Canceled: true}, ErrCanceled
 	}
 	return fm.result(), nil
 }
 
-// model is the shared filterable-list state.
+// model is the shared filterable-list state. Query editing lives in
+// the embedded textinput — one implementation of caret movement,
+// word/backward deletes, and paste handling, shared with the plain
+// input prompt — so the picker gains readline-style editing for free.
 type model struct {
 	items    []string
 	opts     Options
-	query    string
+	input    textinput.Model
 	filtered []int         // indices into items, post-filter
 	cursor   int           // index into filtered
 	marked   map[int]bool  // keyed by ORIGINAL item index
@@ -164,7 +169,15 @@ type model struct {
 }
 
 func newModel(items []string, opts Options) *model {
-	m := &model{items: items, opts: opts, query: opts.Query, marked: map[int]bool{}}
+	ti := textinput.New()
+	ti.SetValue(opts.Query)
+	ti.CursorEnd()
+	ti.Focus()
+	// ponytail: bubbles' own reverse-video blink cursor is hidden here —
+	// View() draws the same static "▌" half-block cursor as the plain
+	// input prompt.
+	ti.Cursor.SetMode(cursor.CursorHide)
+	m := &model{items: items, opts: opts, input: ti, marked: map[int]bool{}}
 	m.refilter()
 	return m
 }
@@ -179,12 +192,12 @@ func (m *model) Init() tea.Cmd { return nil }
 func (m *model) refilter() {
 	m.filtered = m.filtered[:0]
 	m.matched = nil
-	if m.query == "" {
+	if m.input.Value() == "" {
 		for i := range m.items {
 			m.filtered = append(m.filtered, i)
 		}
 	} else {
-		query := []rune(m.query)
+		query := []rune(m.input.Value())
 		type hit struct {
 			idx int
 			fm  fuzzyMatch
@@ -250,7 +263,10 @@ func (m *model) tryAction(key tea.KeyMsg) (bool, tea.Cmd) {
 	return false, nil
 }
 
-// handleKey applies a navigation/edit key to the model.
+// handleKey applies list-navigation keys itself and routes everything
+// else (runes, backspace/delete, caret movement, ctrl+w/u, paste…)
+// through the textinput. List nav is dispatched first so the keys the
+// list owns never reach the editor.
 func (m *model) handleKey(key tea.KeyMsg) tea.Cmd {
 	switch key.String() {
 	case "esc":
@@ -266,29 +282,31 @@ func (m *model) handleKey(key tea.KeyMsg) tea.Cmd {
 		if m.cursor > 0 {
 			m.cursor--
 		}
+		return nil
 	case "down", "ctrl+n":
 		if m.cursor < len(m.filtered)-1 {
 			m.cursor++
 		}
+		return nil
+	case "pgup":
+		m.cursor = max(m.cursor-m.opts.Height, 0)
+		return nil
+	case "pgdown":
+		m.cursor = min(m.cursor+m.opts.Height, max(len(m.filtered)-1, 0))
+		return nil
 	case "tab":
 		m.markCursor()
+		return nil
 	case "shift+tab":
 		if m.opts.Multi {
 			m.toggleAll()
 		}
-	case "backspace":
-		if len(m.query) > 0 {
-			r := []rune(m.query)
-			m.query = string(r[:len(r)-1])
-			m.refilter()
-		}
-	default:
-		if key.Type == tea.KeyRunes && len(key.Runes) > 0 {
-			m.query += string(key.Runes)
-			m.refilter()
-		}
+		return nil
 	}
-	return nil
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(key)
+	m.refilter()
+	return cmd
 }
 
 // markCursor toggles the mark on the highlighted row (multi mode) and
@@ -358,7 +376,7 @@ func (m *model) result() Result {
 	if len(m.filtered) > 0 {
 		idx = m.filtered[m.cursor]
 	}
-	return Result{Index: idx, Indices: sel, Query: m.query, Action: m.action}
+	return Result{Index: idx, Indices: sel, Query: m.input.Value(), Action: m.action}
 }
 
 // View renders:
@@ -376,10 +394,14 @@ func (m *model) View() string {
 	}
 	var b strings.Builder
 
-	// Prompt line: pointer + live query + block cursor + match count.
+	// Prompt line: pointer + live query with the block caret at its
+	// position + match count.
 	b.WriteString(ui.Cyan(ui.SymPointer + " "))
-	b.WriteString(m.query)
+	value := []rune(m.input.Value())
+	pos := min(m.input.Position(), len(value))
+	b.WriteString(string(value[:pos]))
 	b.WriteString(ui.Dim("▌"))
+	b.WriteString(string(value[pos:]))
 	b.WriteString(ui.Dim(fmt.Sprintf("  %d/%d", len(m.filtered), len(m.items))))
 	b.WriteString("\n")
 
@@ -434,7 +456,7 @@ func (m *model) View() string {
 func (m *model) highlightMatch(orig int) string {
 	item := m.items[orig]
 	positions := m.matched[orig]
-	if m.query == "" || positions == nil || !ui.ColorEnabled() || strings.ContainsRune(item, 0x1b) {
+	if m.input.Value() == "" || positions == nil || !ui.ColorEnabled() || strings.ContainsRune(item, 0x1b) {
 		return item
 	}
 	return underlinePositions(m.values()[orig], positions)

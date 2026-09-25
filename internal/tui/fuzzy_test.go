@@ -94,7 +94,7 @@ func TestFuzzyEmptyQuery(t *testing.T) {
 
 func TestRefilterRanksAndKeepsOriginalIndices(t *testing.T) {
 	m := newModel([]string{"src/app/models/user.go", "user.go", "unrelated"}, Options{Height: 10})
-	m.query = "usergo"
+	m.input.SetValue("usergo")
 	m.refilter()
 	want := []int{1, 0} // user.go first, then the buried path; unrelated drops
 	if len(m.filtered) != len(want) {
@@ -129,7 +129,7 @@ func TestRefilterMatchesValuesNotDisplayRows(t *testing.T) {
 		"[branch]   feature/two",
 	}
 	m := newModel(items, Options{Height: 10, Values: []string{"feature/one", "feature/two"}})
-	m.query = "two"
+	m.input.SetValue("two")
 	m.refilter()
 	if len(m.filtered) != 1 || m.filtered[0] != 1 {
 		t.Fatalf("filtered = %v, want [1] (matched via Values)", m.filtered)
@@ -140,7 +140,7 @@ func TestHighlightMatchUnderlinesEveryMatchedRune(t *testing.T) {
 	// "abc" over "a-xbxc" matches a, b, c at 0, 2, 4 — three separate
 	// underline runs, merged where adjacent.
 	m := newModel([]string{"a-xbxc"}, Options{Height: 10})
-	m.query = "abc"
+	m.input.SetValue("abc")
 	m.refilter()
 	if len(m.filtered) != 1 {
 		t.Fatal("expected match")
