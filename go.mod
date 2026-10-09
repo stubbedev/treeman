@@ -18,7 +18,7 @@ require (
 	github.com/google/jsonschema-go v0.4.3
 	github.com/invopop/jsonschema v0.14.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/klauspost/compress v1.18.6
+	github.com/klauspost/compress v1.18.7
 	github.com/mattn/go-isatty v0.0.22
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/pb33f/ordered-map/v2 v2.3.1
@@ -27,8 +27,8 @@ require (
 	github.com/ulikunitz/xz v0.5.15
 	github.com/urfave/cli/v3 v3.9.1
 	go.mongodb.org/mongo-driver/v2 v2.6.0
-	golang.org/x/sync v0.21.0
-	golang.org/x/sys v0.46.0
+	golang.org/x/sync v0.23.0
+	golang.org/x/sys v0.48.0
 	gopkg.in/ini.v1 v1.67.2
 	gopkg.in/yaml.v3 v3.0.1
 	lukechampine.com/blake3 v1.4.1
@@ -89,9 +89,9 @@ require (
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
-	golang.org/x/crypto v0.33.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
