@@ -49,7 +49,7 @@ func (c *Config) Validate() error {
 	}
 
 	for i := range c.Databases {
-		errs = appendIfErr(errs, c.Databases[i].validate(fmt.Sprintf("databases[%d]", i)))
+		errs = appendIfErr(errs, c.Databases[i].validate(fmt.Sprintf("databases[%d]", i), len(c.Databases)))
 	}
 	for i := range c.Databases {
 		errs = appendIfErr(errs, c.validateConnectionSelector(fmt.Sprintf("databases[%d]", i), &c.Databases[i]))
@@ -457,7 +457,7 @@ func (d DatabaseConfig) validateNamespace(fam engine.Family, path string) error 
 	return validateWorktreeScoped(path+".name_template", d.NameTemplate)
 }
 
-func (d DatabaseConfig) validate(path string) error {
+func (d DatabaseConfig) validate(path string, dbCount int) error {
 	var errs []error
 	if d.Engine == "" {
 		return fmt.Errorf("%s: engine is required (one of: %s)", path, engine.KnownList())
@@ -480,25 +480,26 @@ func (d DatabaseConfig) validate(path string) error {
 	if d.KeyPrefix != "" {
 		errs = appendIfErr(errs, validateTemplate(path+".key_prefix", d.KeyPrefix, template.Scope{}))
 	}
+	stepEnv := template.Scope{AllowTargetDB: true, DBCount: dbCount}
 	if d.Migrate != nil {
 		for k, v := range d.Migrate.Env {
 			errs = appendIfErr(errs, validateTemplate(
 				fmt.Sprintf("%s.migrate.env[%s]", path, k), v,
-				template.Scope{AllowTargetDB: true}))
+				stepEnv))
 		}
 	}
 	if d.Seed != nil {
 		for k, v := range d.Seed.Env {
 			errs = appendIfErr(errs, validateTemplate(
 				fmt.Sprintf("%s.seed.env[%s]", path, k), v,
-				template.Scope{AllowTargetDB: true}))
+				stepEnv))
 		}
 	}
 	if d.Rollback != nil {
 		for k, v := range d.Rollback.Env {
 			errs = appendIfErr(errs, validateTemplate(
 				fmt.Sprintf("%s.rollback.env[%s]", path, k), v,
-				template.Scope{AllowTargetDB: true}))
+				stepEnv))
 		}
 	}
 	if d.TestClones != nil && d.TestClones.NameTemplate != "" {

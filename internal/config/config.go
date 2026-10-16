@@ -1857,6 +1857,9 @@ func (f FilteredAction) Matches(label string) bool {
 //	{slug_dash}         — slug with underscores → hyphens
 //	{slug_redis_queue}  — slug-derived Redis queue DB index (6..15)
 //	{slug_redis_cache}  — slug-derived Redis cache DB index (6..15)
+//	{db:<index>}        — rendered name of `databases[<index>]` in the
+//	                      current context (main-worktree overlay applied),
+//	                      for a step that also migrates a sibling engine
 //
 // Unknown keys fail loud at config-load time. Treeman also exports
 // `TREEMAN_TARGET_DB` to the subprocess unconditionally as a safety

@@ -503,6 +503,43 @@ func TestValidate(t *testing.T) {
 			},
 			want: "",
 		},
+		{
+			name: "step env may reference a sibling database by index",
+			cfg: Config{
+				Databases: []DatabaseConfig{
+					{
+						Engine:       "mysql",
+						NameTemplate: "app_testing_{slug}",
+						Migrate:      &Step{Run: "./mig.sh", Env: map[string]string{"MONGO_DB_DATABASE": "{db:1}"}},
+						Rollback:     &Step{Run: "./rb.sh", Env: map[string]string{"MONGO_DB_DATABASE": "{db:1}"}},
+						Seed:         &Step{Run: "./seed.sh", Env: map[string]string{"MONGO_DB_DATABASE": "{db:1}"}},
+					},
+					{Engine: "mongodb", NameTemplate: "mongodb_testing_{slug}"},
+				},
+			},
+			want: "",
+		},
+		{
+			name: "step env db index past the declared databases",
+			cfg: Config{
+				Databases: []DatabaseConfig{{
+					Engine:       "mysql",
+					NameTemplate: "app_{slug}",
+					Migrate:      &Step{Run: "./mig.sh", Env: map[string]string{"MONGO_DB_DATABASE": "{db:1}"}},
+				}},
+			},
+			want: "databases[0].migrate.env[MONGO_DB_DATABASE]: unknown template key: db:1",
+		},
+		{
+			name: "db token outside step env",
+			cfg: Config{
+				Databases: []DatabaseConfig{
+					{Engine: "mysql", NameTemplate: "app_{slug}_{db:1}"},
+					{Engine: "mysql", NameTemplate: "other_{slug}"},
+				},
+			},
+			want: "databases[0].name_template: unknown template key: db:1",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -589,7 +626,7 @@ func TestValidateFileFamily(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := c.d.validate("databases[0]")
+			err := c.d.validate("databases[0]", 1)
 			if c.want == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)

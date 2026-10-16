@@ -680,7 +680,10 @@ func RunFiltered(
 	// per-database goroutines below — N databases on one engine pay one
 	// round-trip instead of N.
 	ctx = withProbeCache(ctx)
-	tplCtx := template.FromSlug(sl)
+	tplCtx, err := withDBNamespaces(cfg, template.FromSlug(sl), worktreePath)
+	if err != nil {
+		return nil, err
+	}
 
 	results := make([]Outcome, len(cfg.Databases))
 	hasResult := make([]bool, len(cfg.Databases))
@@ -728,6 +731,34 @@ func RunFiltered(
 		return outcomes, &RunError{Failed: failed}
 	}
 	return outcomes, nil
+}
+
+// withDBNamespaces renders every database's namespace in this run's
+// context and exposes them to step env as `{db:<index>}` (#132). cfg
+// already carries the main-worktree overlay when the run targets the
+// main worktree, so a sibling resolves to the name it actually has
+// here rather than the linked-worktree template. File engines resolve
+// to the same path `{target_db}` would give that database's own steps.
+func withDBNamespaces(cfg *config.Config, tplCtx template.Context, worktreePath string) (template.Context, error) {
+	dbs := make([]string, len(cfg.Databases))
+	for i, d := range cfg.Databases {
+		fam, _ := engine.Canonical(d.Engine)
+		tmpl, field := d.NameTemplate, "name_template"
+		if fam.Scope() == engine.ScopePrefix {
+			tmpl, field = d.KeyPrefix, "key_prefix"
+		}
+		name, err := template.Render(tmpl, tplCtx)
+		if err != nil {
+			return tplCtx, fmt.Errorf("databases[%d].%s: %w", i, field, err)
+		}
+		if fam == engine.FamilyFile {
+			if name, err = dbfile.SourcePathFor(cfg, d.Connection, worktreePath, name); err != nil {
+				return tplCtx, fmt.Errorf("databases[%d]: %w", i, err)
+			}
+		}
+		dbs[i] = name
+	}
+	return tplCtx.WithDBs(dbs), nil
 }
 
 // DBError is one database's failure inside the error RunFiltered

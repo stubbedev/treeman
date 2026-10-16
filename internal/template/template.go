@@ -18,6 +18,10 @@
 //	{port_<name>}       — per-worktree port for the slot named `<name>`
 //	                     declared in the top-level `ports:` block. Only
 //	                     valid when `.WithPorts()` populated the context.
+//	{db:<index>}        — the rendered namespace of `databases[<index>]`
+//	                     in the current context (main-worktree overlay
+//	                     applied). Only valid when `.WithDBs()` populated
+//	                     the context, i.e. inside step env values.
 //
 // Unknown keys fail loudly (RenderError.UnknownKey) so a YAML typo
 // doesn't silently render as empty and quietly break some downstream
@@ -27,6 +31,7 @@ package template
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -49,6 +54,13 @@ type Context struct {
 	// "no ports allocated for this context"; rendering a `{port_*}`
 	// token against an empty map returns RenderError.UnknownKey.
 	Ports map[string]uint16
+	// DBs holds the rendered namespace (database name, key prefix or
+	// file path) of every `databases[]` entry in this context,
+	// index-aligned with the config. Tokens of the form `{db:<index>}`
+	// resolve to DBs[index], so a step that migrates several engines at
+	// once can point each sibling connection at its own per-context
+	// namespace instead of the worktree's `.env` (#132).
+	DBs []string
 }
 
 // FromSlug builds a Context from a Slug. The `N` field stays unset
@@ -90,6 +102,13 @@ func (c Context) WithPorts(ports map[string]uint16) Context {
 	dup := make(map[string]uint16, len(ports))
 	maps.Copy(dup, ports)
 	c.Ports = dup
+	return c
+}
+
+// WithDBs returns a copy with the per-context namespaces of every
+// `databases[]` entry set, index-aligned with the config.
+func (c Context) WithDBs(dbs []string) Context {
+	c.DBs = slices.Clone(dbs)
 	return c
 }
 
@@ -182,11 +201,14 @@ func renderWith(tmpl string, lookup func(key string) (string, bool)) (string, er
 // values render after, so it's legal. `{n}` is only valid in
 // templates the paratest fan-out renders per replica. AllowedPorts
 // lists the slot names that `{port_<name>}` tokens may reference;
-// nil means "no port tokens allowed in this scope".
+// nil means "no port tokens allowed in this scope". DBCount is the
+// number of `databases[]` entries `{db:<index>}` may reference; 0
+// means "no db tokens allowed in this scope".
 type Scope struct {
 	AllowN        bool
 	AllowTargetDB bool
 	AllowedPorts  []string
+	DBCount       int
 }
 
 // Validate checks that `tmpl` only references known keys allowed by
@@ -214,6 +236,9 @@ func Validate(tmpl string, sc Scope) error {
 			ports[name] = 1
 		}
 		ctx = ctx.WithPorts(ports)
+	}
+	if sc.DBCount > 0 {
+		ctx.DBs = make([]string, sc.DBCount)
 	}
 	_, err := Render(tmpl, ctx)
 	return err
@@ -246,5 +271,22 @@ func lookup(key string, ctx Context) (string, bool) {
 		}
 		return "", false
 	}
+	if idx, ok := strings.CutPrefix(key, "db:"); ok {
+		return lookupDB(idx, ctx.DBs)
+	}
 	return "", false
+}
+
+// lookupDB resolves the `<index>` of a `{db:<index>}` token. Only a
+// plain decimal index inside the declared databases resolves; signs,
+// spaces and out-of-range indices are unknown keys.
+func lookupDB(idx string, dbs []string) (string, bool) {
+	if idx == "" || strings.Trim(idx, "0123456789") != "" {
+		return "", false
+	}
+	n, err := strconv.Atoi(idx)
+	if err != nil || n >= len(dbs) {
+		return "", false
+	}
+	return dbs[n], true
 }
