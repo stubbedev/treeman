@@ -125,7 +125,8 @@ func FormatError(label, target string, out Outcome) string {
 // rendered through `template.Render` with `tplCtx.WithTargetDB(targetDB)`
 // — the same template pass that already produced `targetDB` — so they
 // can reference every supported placeholder (`{target_db}`, `{slug}`,
-// `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`, `{n}`)
+// `{slug_dash}`, `{slug_redis_queue}`, `{slug_redis_cache}`, `{n}`,
+// `{db:<index>}`)
 // and a typo like `{target-db}` fails loud instead of being passed
 // through to the subprocess. Rendered env entries are appended last
 // so they win over the inherited base.

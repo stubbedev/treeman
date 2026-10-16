@@ -151,8 +151,30 @@ worktree's slug:
 | `{slug_redis_queue}` | `9` — checksum-derived Redis DB index (6–15) |
 | `{slug_redis_cache}` | `12` — checksum-derived Redis DB index (6–15), distinct from queue |
 | `{port_<name>}` | allocated port for the `ports:` slot `<name>` (e.g. `{port_octane}`) |
-| `{target_db}` | the rendered per-run DB name (only in `migrate.env` / `seed.env`) |
+| `{target_db}` | the rendered per-run DB name (only in `migrate.env` / `seed.env` / `rollback.env`) |
+| `{db:<index>}` | the rendered name of `databases[<index>]` in the current context (only in `migrate.env` / `seed.env` / `rollback.env`) |
 | `{n}` | test-clone index, 1-based (only in `test_clones.name_template`) |
+
+`{db:<index>}` is for a step that migrates more than one engine at once
+(Laravel runs MySQL and MongoDB migrations in one `php artisan migrate`).
+Every connection the step does not redirect falls through to the
+worktree's `.env`, i.e. the dev databases, so point each sibling at its
+own entry. It resolves after the `main_worktree.databases` overlay, so
+the main worktree gets its overlay name and linked worktrees the
+slugged one:
+
+```yaml
+databases:
+  - engine: mysql
+    name_template: "app_testing_{slug}"
+    migrate:
+      run: "php artisan migrate --force"
+      env:
+        DB_DATABASE: "{target_db}"
+        MONGO_DB_DATABASE: "{db:1}"   # databases[1] in this context
+  - engine: mongodb
+    name_template: "mongodb_testing_{slug}"
+```
 
 ## Fully declarative — no hidden defaults
 

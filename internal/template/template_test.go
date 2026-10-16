@@ -112,3 +112,35 @@ func TestValidateAllowedPorts(t *testing.T) {
 		t.Errorf("want error when scope disallows port tokens")
 	}
 }
+
+func TestDBTokensRenderByIndex(t *testing.T) {
+	c := ctx().WithDBs([]string{"app_proj_1234", "mongodb_testing"})
+	got, err := Render("{db:0}/{db:1}", c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "app_proj_1234/mongodb_testing" {
+		t.Errorf("got %q", got)
+	}
+	for _, tmpl := range []string{"{db:2}", "{db:-1}", "{db:+1}", "{db: 1}", "{db:}", "{db:x}"} {
+		var re *RenderError
+		if _, err := Render(tmpl, c); !errors.As(err, &re) || re.UnknownKey == "" {
+			t.Errorf("Render(%q): want unknown-key error, got %v", tmpl, err)
+		}
+	}
+	if _, err := Render("{db:0}", ctx()); err == nil {
+		t.Errorf("want error when {db:0} used without WithDBs")
+	}
+}
+
+func TestValidateDBCount(t *testing.T) {
+	if err := Validate("{db:1}", Scope{DBCount: 2}); err != nil {
+		t.Errorf("want valid, got %v", err)
+	}
+	if err := Validate("{db:2}", Scope{DBCount: 2}); err == nil {
+		t.Errorf("want error for an index past the declared databases")
+	}
+	if err := Validate("{db:0}", Scope{}); err == nil {
+		t.Errorf("want error when scope disallows db tokens")
+	}
+}
