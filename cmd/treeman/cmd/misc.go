@@ -18,6 +18,7 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/daemonctl"
+	"github.com/stubbedev/treeman/internal/fspath"
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/initgen"
 	mcpsrv "github.com/stubbedev/treeman/internal/mcp"
@@ -1425,7 +1426,10 @@ func SlugCmd() *cli.Command {
 			}
 			path = MustAbs(path)
 			branch := detectBranchOfWorktree(path)
-			sl := slug.For(path, branch)
+			sl, err := slugForPath(ctx, path, branch)
+			if err != nil {
+				return err
+			}
 			if c.Bool("json") {
 				q, ca := sl.RedisIndices()
 				return jsonStream(map[string]any{
@@ -1440,6 +1444,38 @@ func SlugCmd() *cli.Command {
 			return nil
 		},
 	}
+}
+
+// slugForPath returns the slug treeman uses for path. The main checkout
+// goes through the identity decision prepare uses (#167): with
+// main_worktree enabled, or an active main row, its slug is the main
+// one, and slug.For would name a worktree no prepare ever touches. Any
+// other path (a linked worktree, a subdirectory, or a path outside a
+// git repo) keeps slug.For, which is what PlanIdentity returns for a
+// linked worktree anyway.
+func slugForPath(ctx context.Context, path, branch string) (slug.Slug, error) {
+	repoRoot, err := gitenv.MainRoot(ctx, path)
+	if err != nil || fspath.Canonical(repoRoot) != fspath.Canonical(path) {
+		return slug.For(path, branch), nil
+	}
+	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, repoRoot)
+	if err != nil {
+		return slug.Slug{}, fmt.Errorf("load resolved config: %w", err)
+	}
+	st, err := openDefaultStore(ctx)
+	if err != nil {
+		return slug.Slug{}, err
+	}
+	defer func() { _ = st.Close() }()
+	repoID, err := st.LookupRepoID(ctx, repoRoot)
+	if err != nil {
+		return slug.Slug{}, fmt.Errorf("look up repo %s: %w", repoRoot, err)
+	}
+	id, err := wt2.PlanIdentity(ctx, st, &cfg, repoRoot, repoRoot, branch, repoID)
+	if err != nil {
+		return slug.Slug{}, err
+	}
+	return id.Slug, nil
 }
 
 // InitCmd — `treeman init` scaffolds a `.treeman.yaml` tailored to
