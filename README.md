@@ -1,375 +1,68 @@
 # treeman
 
-**Per-worktree development environment helper.** Spin up isolated
-databases, search indices, and parallel test clones for each git
-worktree — torn down on delete, kept in sync as your migrations and
-fixtures change. Language- and framework-agnostic.
+**Isolated databases for every git worktree.**
 
-Pure wire-protocol DB access (Go `database/sql` for MySQL +
-PostgreSQL, the official Mongo / Redis / Elasticsearch SDKs) — no
-shelling out to `mysql` / `psql` / `mongosh` / `redis-cli`. A single
-user-mode daemon, a thin CLI client, and a SQLite-backed event log.
+treeman gives each git worktree its own databases, search indices and
+parallel test clones: migrated and ready when the worktree is, kept
+current as migrations change, dropped when the worktree is deleted.
+Language- and framework-agnostic; you declare the migrate command.
 
----
+**Documentation: [stubbedev.github.io/treeman](https://stubbedev.github.io/treeman/)**
 
-## Why treeman
-
-A git worktree gives every branch its own checkout — but a working
-tree also needs its own database, `N` test-runner clones fanning out
-from a cached template, migrations applied, `.env`-style config patched
-to the per-worktree DB names, install hooks run, and teardown that drops
-every namespace on delete. treeman owns that lifecycle:
-`treeman worktree create FOO` and `treeman worktree delete FOO` are the only
-commands you type.
-
-## Supported engines
-
-| Engine | Variants | Per-worktree isolation |
-|---|---|---|
-| MySQL | MariaDB, TiDB | Separate database |
-| PostgreSQL | — | Separate database |
-| MongoDB | — | Separate database |
-| Redis | Valkey, DragonflyDB | Key-prefix in DB 0 (cluster-safe, no 16-DB cap) |
-| Elasticsearch | OpenSearch | Index-name prefix |
-
-Variants are first-class aliases — declare `engine: mariadb`, `tidb`,
-`valkey`, `dragonfly`, or `opensearch` and treeman routes it to the
-parent engine's driver (Valkey/DragonflyDB ride the Redis wire
-protocol).
+```sh
+treeman worktree create PROJ-123   # checkout + databases + hooks
+treeman worktree delete PROJ-123   # hooks + drop databases + remove
+```
 
 ## Features
 
-- **Snapshot cache** — repeated `wt create` on the same migrations +
-  dump hits a cached template DB; LRU eviction with a per-repo cap
-  (default 8), per-source retention, age + size sweeps bound disk use;
-  `treeman doctor` flags (and `--fix` reclaims) orphaned templates
-  left behind by crashes.
-- **Spare-clone pre-warming** — `databases[].prewarm: N` (Postgres)
-  keeps N clones pre-restored from the cached template; a cache-hit
-  `wt create` claims one via `ALTER DATABASE … RENAME` in milliseconds
-  regardless of database size, and the pool refills in the background.
-- **Hook lifecycle** — declarative create / delete / checkout /
-  file-change trigger lists; actions in a list run in parallel, the
-  `run:` steps within an action chain sequentially.
-- **Parallel test runner support** — `clones: auto` detects the test
-  framework (paratest, pytest-xdist, jest / vitest, cargo-nextest, …)
-  and pre-warms one clone per CPU when that runner parallelizes
-  per-worker, else one.
-- **File watcher** — fsnotify re-fingerprints affected databases on
-  input edits and picks `auto | delta | rebuild`.
-- **MCP server** — `treeman mcp` exposes config authoring/validation,
-  event-log + hook-output queries, live engine state, and snapshot
-  inspection to Claude Code / Desktop / Cursor. Runs over stdio
-  (per-client) or, with `--http`, as one shared daemon every client
-  connects to, each request scoped to its own worktree.
-- **Desktop notifications** — opt-in `notifications:` block fires
-  `notify-send` (Linux) / native banners (macOS) when a worktree turns
-  ready, fails, or starts/finishes preparing; configurable per status
-  bucket, hot-reloaded without a restart.
-- **Single static binary** per platform — no CGo, no system libraries;
-  CI cross-builds linux `{amd64,arm64}` and darwin arm64.
-
-See [docs/](docs/) for the deep dives — CLI reference, configuration
-schema, AI integration, internals.
-
----
-
-## Requirements
-
-- **git** — `git worktree` is the substrate treeman manages.
-- **One of**: `systemd --user` (Linux) or `launchd` (macOS) for
-  auto-start. Without one, `treeman daemon start` still works;
-  the daemon just won't survive a reboot.
-- **Your database server(s)** — treeman manages namespaces on
-  existing MySQL / Postgres / Mongo / Redis / Elasticsearch
-  instances; it does not run them. Local server, remote server,
-  or container-hosted server (auto-discovered via `docker
-  inspect` / `compose ps`) all work.
-- **Go 1.25+** — only if building from source.
-
-Native releases need no Python, Node, or language-specific tooling.
-The optional Composer bootstrap requires Composer 2.2+, PHP CLI 8.1+,
-and the curl, pcntl (with `pcntl_exec` enabled), and zlib extensions.
-
----
+- MySQL, PostgreSQL, MongoDB, Redis, Elasticsearch, S3 and SQLite (plus
+  MariaDB, TiDB, Valkey, DragonflyDB, OpenSearch, DuckDB), spoken over
+  their wire protocols.
+- A snapshot cache keyed by the content of your migrations, dumps and
+  lockfiles: new worktrees are cloned, not re-migrated.
+- One database clone per parallel test worker (paratest, pytest-xdist,
+  jest, vitest, cargo-nextest, …).
+- Create, delete, checkout and file-change hooks; a file watcher and
+  auto-fetch that keep worktrees current.
+- Git helpers with a built-in picker, an MCP server for AI agents, and a
+  daemon-less mode for CI.
+- One static binary per platform plus a user-mode daemon.
 
 ## Install
 
-Via Homebrew (macOS + Linux):
-
 ```sh
-brew tap stubbedev/tap
-brew install stubbedev/tap/treeman
+brew install stubbedev/tap/treeman          # Homebrew (macOS, Linux)
+nix profile install github:stubbedev/treeman # Nix
+composer require --dev stubbedev/treeman     # Composer (PHP projects)
 ```
 
-### Composer (PHP dev dependency)
-
-Published on Packagist as [`stubbedev/treeman`](https://packagist.org/packages/stubbedev/treeman):
-
-```sh
-composer require --dev stubbedev/treeman
-vendor/bin/treeman --version
-vendor/bin/treemand --version
-```
-
-Commit `composer.json` and `composer.lock` in your application. Composer's
-installed package metadata (populated from the lock on `composer install`)
-selects the **exact release**, never `latest`. Each new patch tag works
-without updating a version constant in this package. Development branches
-and branch aliases are rejected; use a published tag with release assets.
-
-This is a normal library with transparent Composer `bin` bootstraps, not
-a plugin: no plugin approval or dependency install scripts are needed.
-`composer install` does **not** download the native binaries. The first
-invocation of either bin announces a lazy download of both binaries from
-that tag's GitHub release, verifies its published SHA256, and extracts only
-allowlisted regular files. Subsequent invocations verify the cached binary
-hashes and execute directly, preserving arguments, working directory, signals,
-and exit status. The verified exact-version cache entry is prepended to `PATH`
-so daemon startup finds its matching `treemand`; the original `PATH` follows
-unchanged, and other environment variables are preserved. Linux amd64 and arm64 and macOS arm64 are supported;
-Windows and 32-bit platforms are not.
-
-### Platform support
-
-Treeman targets POSIX systems. Linux is the primary, fully-tested
-platform; macOS and the BSDs (FreeBSD, OpenBSD, NetBSD) build and run
-(`CGO_ENABLED=0` for cross builds — the SQLite driver is pure Go),
-though only Linux and macOS see CI coverage. Windows can compile
-(`GOOS=windows go build ./...` is kept honest — no scattered syscall
-type errors), but running it is unsupported: hooks need `/bin/sh` and
-`setsid` and fail with an explicit unsupported-platform error, and the
-daemon's peer-credential check is stubbed out.
-
-First use needs HTTPS access to GitHub release assets (including GitHub's
-asset redirect host), plus a writable executable cache directory. The default
-is `$XDG_CACHE_HOME/treeman/composer`, or `$HOME/.cache/treeman/composer`.
-Set `TREEMAN_COMPOSER_CACHE` to an absolute path to override it. Entries are
-keyed by exact version and platform, serialized with a file lock, and published
-atomically. The cache root, entry directory, metadata, and binaries must not be
-group/world writable; symlinks at those locations are rejected. Keep the cache
-owned by the executing user, and trust every ancestor directory (including any
-ancestor symlink targets): other users must not be able to replace or redirect
-the cache through its ancestry. Ancestor permissions and ownership are not
-validated by the bootstrap. Restored caches must come from a trusted source;
-hashes detect corruption, not an attacker who can rewrite both binaries and
-cache metadata.
-Published checksums protect against corrupt downloads, not a compromised
-GitHub release publisher; they are not independently signed attestations.
-
-For offline/air-gapped jobs, warm the cache online with
-`vendor/bin/treeman --version`, then preserve the complete version/platform
-entry with executable permissions (or the entire cache). Set
-`TREEMAN_COMPOSER_OFFLINE=1` to forbid bootstrap downloads. Valid cached entries
-also work offline without this setting, including from a read-only cache.
-A missing/corrupt entry fails clearly; no other version is substituted. Remove
-an invalid entry and warm it online again. Composer's own package cache/vendor
-files must also be available for an offline `composer install`; the native
-binary cache does not replace them. No binaries are vendored in this package.
-
-### Native releases
-
-Prebuilt tarballs for every tagged release. The asset filename
-embeds the version, so resolve the latest tag first:
-
-```sh
-# linux/amd64 example — substitute the platform (darwin-arm64,
-# linux-arm64) you need.
-VER=$(curl -fsSL https://api.github.com/repos/stubbedev/treeman/releases/latest | grep '"tag_name":' | cut -d'"' -f4 | sed 's/^v//')
-curl -L -o /tmp/treeman.tgz \
-  "https://github.com/stubbedev/treeman/releases/download/v${VER}/treeman-${VER}-linux-amd64.tar.gz"
-tar -xzf /tmp/treeman.tgz -C /tmp
-install /tmp/treeman-*-linux-amd64/treeman  ~/.local/bin/
-install /tmp/treeman-*-linux-amd64/treemand ~/.local/bin/
-```
-
-From source (Go 1.25+):
-
-```sh
-git clone https://github.com/stubbedev/treeman
-cd treeman
-just install        # → $GOBIN/treeman + $GOBIN/treemand
-```
-
-Via Nix (flake):
-
-```sh
-nix profile install github:stubbedev/treeman
-```
-
-Shell completion (optional but recommended):
-
-```sh
-source <(treeman completion bash)    # or zsh / fish / pwsh
-```
-
----
+Release tarballs for linux amd64/arm64 and darwin arm64 are on the
+[releases page](https://github.com/stubbedev/treeman/releases). See
+[Getting started](https://stubbedev.github.io/treeman/getting-started/)
+for every option.
 
 ## Quick start
 
 ```sh
-# 1. Bootstrap a config in your repo. treeman init detects the
-#    package manager + framework markers and emits a tailored
-#    .treeman.yaml.
 cd ~/code/my-app
-treeman init
-
-# 2. Install + start the user-mode daemon (one-time).
-treeman daemon install      # systemd --user on Linux, launchd on macOS
-treeman daemon start        # idempotent — uses systemctl/launchctl when installed
-
-# Sanity check whenever something feels off:
-treeman doctor              # probes daemon, config, schema, git ↔ registry drift
-treeman repos               # every enrolled repo: worktrees, snapshots, last activity
-
-# 3. Spin up a worktree end-to-end.
-treeman worktree create proj-123
-#   ↳ git worktree add .worktrees/proj-123 -b proj-123 origin/HEAD
-#   ↳ brings in worktrees.copies (e.g. .env) + worktrees.links (e.g. node_modules)
-#   ↳ patches `patches:` entries (.env.testing, settings.py,
-#     phpunit.xml, etc.) to point at per-worktree DB names
-#   ↳ runs create hooks (parallel groups, detached)
-#   ↳ prepare: ensure_db → load dump → migrate → snapshot → N test clones
-
-# 4. Get the path of an existing worktree for `cd` integration:
-cd "$(treeman worktree go proj-123)"
-
-# (CI flow: block on the daemon's finalize before running tests.)
-treeman worktree wait proj-123                  # exits 0 on success, non-zero on failure
-treeman worktree show proj-123                  # dossier + recent events + hook runs
-
-# 5. Done with the branch:
-treeman worktree delete proj-123
-#   ↳ runs predelete hook (DB drops, FLUSHDB, ES index delete)
-#   ↳ git worktree remove
-
-# 6. Cd back to the main checkout (with optional auto-remove if clean):
-cd "$(treeman worktree back --remove)"
+treeman init                 # write a .treeman.yaml for this repo
+treeman daemon install       # start the daemon now and at login
+treeman worktree create PROJ-123
+cd "$(treeman worktree go PROJ-123)"
 ```
-
-## CI without a daemon
-
-Use `prepare --no-daemon` in an existing checkout to force preparation in
-process and block until complete, without a user session or daemon. Bare
-`prepare` may use daemon RPC; `--foreground` starts a daemon rather than
-forcing inline preparation. Do not use daemon-backed worktree lifecycle
-commands as a substitute. A writable per-build directory isolates SQLite
-(including WAL/SHM sidecars) and scratch files; do not point concurrent builds
-at one `TREEMAN_DB_PATH`. When two jobs can run the same branch on one
-machine (or share a DB server), set `TREEMAN_SLUG_SUFFIX` to a
-job-unique value (`$GITHUB_RUN_ID`, job id, …) so the `main_<branch>_<tag>`
-slug namespace — and with it every rendered database name — stays
-disjoint per job.
-
-```sh
-composer install --no-interaction
-export TREEMAN_COMPOSER_CACHE="$HOME/.cache/treeman/composer"
-vendor/bin/treeman --version
-export TREEMAN_COMPOSER_OFFLINE=1
-TREEMAN_BUILD_STATE=$(mktemp -d "$PWD/.treeman-ci.XXXXXXXX")
-export TREEMAN_DB_PATH="$TREEMAN_BUILD_STATE/treeman.db"
-export TMPDIR="$TREEMAN_BUILD_STATE/tmp"
-mkdir -p "$TMPDIR"
-cat > "$TREEMAN_BUILD_STATE/config.yaml" <<'YAML'
-snapshots:
-  cap_per_repo: 8
-YAML
-export TREEMAN_CONFIG="$TREEMAN_BUILD_STATE/config.yaml"
-export TREEMAN_SLUG_SUFFIX="${GITHUB_RUN_ID:-$(date +%s)}"
-vendor/bin/treeman prepare --no-daemon --repo "$PWD" --worktree "$PWD"
-vendor/bin/phpunit
-```
-
-`TREEMAN_CONFIG` (or `--config /absolute/path/config.yaml`, which wins over
-the environment variable) replaces the default **global** config layer.
-Unlike the default global file, an explicit file may also carry repo-scoped
-settings (`databases`, `patches`, `hooks`, …), so a repository can commit
-its CI config and pass it with `--config` instead of shipping a
-`.treeman.yaml`. A repository `.treeman.yaml` still loads afterward and
-takes precedence for repo-scoped settings. Global-only settings such as
-`snapshots`, `daemon`, and `logs` belong in the explicit file, not the
-repo file.
-This selects configuration for foreground/local execution; it does not
-reconfigure an already-running daemon handling RPC commands.
-
-Snapshot registry state lives in `TREEMAN_DB_PATH`; actual template snapshots
-live in your database engines, not a configurable `snapshots.path` directory.
-Keep SQLite's parent and `TMPDIR` writable, and provision writable engine
-storage with sufficient space/permissions for snapshots and clones. Isolating
-SQLite alone does not isolate shared database namespaces: concurrent builds
-also need distinct configured database/template names or isolated engine
-instances. Clean up engine resources and the per-build state directory after
-the job. Daemon periodic snapshot/log retention sweeps do not run in this mode.
-
-## Git workflow
-
-`treeman git` bundles the daily git verbs with a built-in interactive
-picker (no fzf needed), worktree-aware branch routing, and shell
-completions. Everything renders to stderr, so the `cd "$(…)"` shims
-stay clean.
-
-```sh
-treeman git commit            # message prompt, auto ticket prefix from the branch
-treeman git commit fix login  # same, prompt pre-filled (or commits directly when scripted)
-treeman git push              # guards protected branches + upstream divergence
-treeman git add               # multi-select stage: M → add -p, D/A → add
-treeman git switch            # picker: live worktrees first (* dirty, ! unpushed), then branches
-treeman git switch KON-1234   # checkout-or-create, worktree-aware; prints dest path for cd
-treeman git log               # interactive log: show / cherry-pick / revert / copy hash
-treeman git diff --pick       # three-dot diff vs a picked branch (--patch writes a .diff file)
-treeman git stash pop         # pick a stash
-treeman git amend|undo|discard|branch-delete|sync-branch|fixup
-```
-
-Picker keys: type to filter, Enter accepts, Tab marks (multi), Ctrl+C
-cancels the step (opens the branch wizard in `switch`), **Esc always
-quits the whole command with no action**. List height:
-`TREEMAN_PICKER_HEIGHT` (default 10); colors respect `NO_COLOR`.
-
-Worktree navigation pairs with a 2-line shell shim, since a child
-process can't `cd` its parent shell:
-
-```sh
-gwt() { local p; p=$(treeman worktree switch "$@") && [ -n "$p" ] && cd "$p"; }
-gcb() { local p; p=$(treeman git switch      "$@") && [ -n "$p" ] && cd "$p"; }
-```
-
-A ready-to-source shim that wraps `worktree go` / `worktree back`
-for `cd`-into-worktree UX lives in `contrib/` (exposes a `tm`
-shell function): `tm.zsh`, `tm.bash`, and `tm.fish` share the same
-usage matrix.
-
-```sh
-# In ~/.zshrc:
-source /path/to/treeman/contrib/tm.zsh
-
-# Then:
-tm proj-123          # cd into existing worktree (or report missing)
-tm proj-123 -c       # create + cd to new worktree
-tm new proj-123      # same as `tm proj-123 -c`
-tm -                 # cd back to main repo
-tm - --remove        # cd back + drop current worktree if clean
-tm list              # passthrough to `treeman worktree list`
-```
-
----
 
 ## Documentation
 
-| Page | What you'll find |
-|---|---|
-| [docs/cli.md](docs/cli.md) | Full command reference, log filters, completion, shell integration, output/color/paging, env vars |
-| [docs/configuration.md](docs/configuration.md) | `.treeman.yaml` guide — every block, per-stack examples, templated names, hooks, credential resolution, container DBs |
-| [docs/config-reference.md](docs/config-reference.md) | Generated field-by-field `.treeman.yaml` reference (from the Go types) |
-| [docs/advanced.md](docs/advanced.md) | Snapshot cache + GC, framework presets |
-| [docs/mcp.md](docs/mcp.md) | MCP / AI integration — Claude Code, Claude Desktop, Cursor, security model |
-| [docs/mcp-tools.md](docs/mcp-tools.md) | Generated MCP tool + prompt reference (from the registry) |
-| [docs/events.md](docs/events.md) | Generated event-type reference (from the `store.Evt*` constants) |
-| [docs/frameworks.md](docs/frameworks.md) | Generated migration-framework preset table (from the detector registry) |
-| [docs/rpc-reference.md](docs/rpc-reference.md) | Generated RPC method / task / kind reference (from `pkg/rpc`) |
-| [docs/internals.md](docs/internals.md) | Storage layout, daemon model, init parity, RPC envelope, development |
+- [Getting started](https://stubbedev.github.io/treeman/getting-started/)
+- [Concepts](https://stubbedev.github.io/treeman/concepts/)
+- [Configuration](https://stubbedev.github.io/treeman/configuration/)
+- [CI without a daemon](https://stubbedev.github.io/treeman/ci/)
+- [AI integration (MCP)](https://stubbedev.github.io/treeman/mcp/)
+- [CLI reference](https://stubbedev.github.io/treeman/cli/)
 
----
+The site is built from [`docs/`](docs/) and redeployed on every push to
+`master`. Preview it locally with `nix develop --command just docs-serve`.
 
 ## License
 
