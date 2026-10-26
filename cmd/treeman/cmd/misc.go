@@ -549,8 +549,9 @@ func HookCmd() *cli.Command {
 		Name:  "hook",
 		Usage: "run a hook phase",
 		Commands: []*cli.Command{{
-			Name:  "run",
-			Usage: "run a hook phase using the cwd's repo config",
+			Name:      "run",
+			Usage:     "run a hook phase using the cwd's repo config",
+			ArgsUsage: "<phase>",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}},
 				&cli.BoolFlag{Name: "json"},
@@ -1413,9 +1414,10 @@ func FwCmd() *cli.Command {
 // SlugCmd — `treeman slug [path]` prints the slug of a worktree.
 func SlugCmd() *cli.Command {
 	return &cli.Command{
-		Name:  "slug",
-		Usage: "print the slug treeman derives for a worktree",
-		Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
+		Name:      "slug",
+		Usage:     "print the slug treeman derives for a worktree",
+		ArgsUsage: "[path]",
+		Flags:     []cli.Flag{&cli.BoolFlag{Name: "json"}},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			path := "."
 			if c.NArg() >= 1 {

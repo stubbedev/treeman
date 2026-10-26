@@ -616,8 +616,9 @@ func stashTip(ctx context.Context, dir string) (string, error) {
 // reverts them, Ctrl+Y copies the highlighted hash.
 func gitLog() *cli.Command {
 	return &cli.Command{
-		Name:  "log",
-		Usage: "interactive log (Enter: show, Ctrl+X: cherry-pick, Ctrl+R: revert, Ctrl+Y: copy hash)",
+		Name:      "log",
+		Usage:     "interactive log (Enter: show, Ctrl+X: cherry-pick, Ctrl+R: revert, Ctrl+Y: copy hash)",
+		ArgsUsage: "[filter words...]",
 		Flags: []cli.Flag{
 			repoFlag(),
 			// The picker holds the whole list in memory (fzf streamed;

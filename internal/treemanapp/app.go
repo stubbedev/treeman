@@ -6,6 +6,7 @@ package treemanapp
 
 import (
 	"context"
+	"fmt"
 	"os"
 
 	"github.com/urfave/cli/v3"
@@ -20,6 +21,39 @@ import (
 // subcommand belongs in the Commands slice below; gen-docs walks
 // from here so undocumented additions can't slip in.
 func New() *cli.Command {
+	root := newTree()
+	rejectStrayArgs(root)
+	return root
+}
+
+// rejectStrayArgs makes every leaf command that declares no positional
+// arguments fail on one instead of running with it silently ignored:
+// `treeman prepare status` ran a full prepare. A command that takes
+// arguments declares them in ArgsUsage (or Arguments); a
+// SkipFlagParsing command (mcp) reads its own argv and is left alone.
+// The check runs in Before, after urfave has already answered shell
+// completion and --help, so neither is affected.
+func rejectStrayArgs(c *cli.Command) {
+	for _, sub := range c.Commands {
+		rejectStrayArgs(sub)
+	}
+	if len(c.Commands) > 0 || c.Action == nil || c.SkipFlagParsing || c.ArgsUsage != "" || len(c.Arguments) > 0 {
+		return
+	}
+	before := c.Before
+	c.Before = func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
+		if cmd.NArg() > 0 {
+			return ctx, fmt.Errorf("unexpected argument %q: `%s` takes no positional arguments",
+				cmd.Args().First(), cmd.FullName())
+		}
+		if before != nil {
+			return before(ctx, cmd)
+		}
+		return ctx, nil
+	}
+}
+
+func newTree() *cli.Command {
 	var restoreConfig func()
 	return &cli.Command{
 		Name:                  "treeman",

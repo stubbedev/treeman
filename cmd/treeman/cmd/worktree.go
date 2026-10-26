@@ -917,8 +917,9 @@ func previewBranchReset(ctx context.Context, c *cli.Command, repoRoot, wtPath st
 
 func wtRegister() *cli.Command {
 	return &cli.Command{
-		Name:  "register",
-		Usage: "register a worktree path (metadata only)",
+		Name:      "register",
+		Usage:     "register a worktree path (metadata only)",
+		ArgsUsage: "[path]",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "branch", Aliases: []string{"b"}},
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
@@ -963,8 +964,9 @@ func wtRegister() *cli.Command {
 
 func wtUnregister() *cli.Command {
 	return &cli.Command{
-		Name:  "unregister",
-		Usage: "mark a worktree deleted in SQLite without touching git",
+		Name:      "unregister",
+		Usage:     "mark a worktree deleted in SQLite without touching git",
+		ArgsUsage: "[path]",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "json"},
