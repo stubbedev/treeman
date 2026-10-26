@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
+	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -194,14 +196,38 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 	if err != nil {
 		return err
 	}
-	repoID, err := st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
-	if err != nil {
-		return fmt.Errorf("register repo %s for the teardown of %s: %w", repoRoot, wtPath, err)
-	}
-	branch := gitenv.DetectBranch(ctx, wtPath)
-	id, err := ResolveIdentity(ctx, st, &cfg, repoRoot, wtPath, branch, repoID)
-	if err != nil {
-		return err
+	// A worktree whose directory is already gone (removed by hand, then
+	// `worktree prune`) has no identity left on disk, and ResolveIdentity
+	// refuses a path that is not a linked worktree. Like the daemon's
+	// teardownOrphan, take it from the registry row, run the hooks from
+	// the repo root with their logs under XDG_STATE_HOME, and skip the
+	// git removal: there is no worktree left to remove.
+	_, statErr := os.Stat(wtPath)
+	gone := errors.Is(statErr, fs.ErrNotExist)
+	var (
+		repoID int64
+		id     Identity
+	)
+	if gone {
+		row, lookupErr := st.LookupWorktreeByPath(ctx, wtPath)
+		if lookupErr != nil {
+			return fmt.Errorf("look up the registry row of %s: %w", wtPath, lookupErr)
+		}
+		if row.ID == 0 || row.Deleted {
+			return nil
+		}
+		repoID = row.RepoID
+		id = Identity{Slug: slug.Slug{Value: row.Slug}, WtID: row.ID, Branch: row.Branch, IsMain: row.IsMain}
+	} else {
+		repoID, err = st.EnsureRepo(ctx, repoRoot, filepath.Base(repoRoot))
+		if err != nil {
+			return fmt.Errorf("register repo %s for the teardown of %s: %w", repoRoot, wtPath, err)
+		}
+		branch := gitenv.DetectBranch(ctx, wtPath)
+		id, err = ResolveIdentity(ctx, st, &cfg, repoRoot, wtPath, branch, repoID)
+		if err != nil {
+			return err
+		}
 	}
 	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteStart,
 		"in-process teardown hooks + db teardown + git remove beginning", repoID, id.WtID, "", 0, nil)
@@ -219,7 +245,16 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 			return
 		}
 		started := hooks.EmitHookStart(ctx, st, repoID, id.WtID, trigger, len(actions))
-		out, hookErr := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, id.Slug.Value, id.IsMain, env, true)
+		var (
+			out     hooks.RunOutcome
+			hookErr error
+		)
+		if gone {
+			out, hookErr = hooks.RunHooksOrphan(ctx, trigger, actions, repoRoot, wtPath, id.Slug.Value,
+				hooks.OrphanLogDir(repoRoot, id.Slug.Value), id.IsMain, env, true)
+		} else {
+			out, hookErr = hooks.RunHooks(ctx, trigger, actions, repoRoot, wtPath, id.Slug.Value, id.IsMain, env, true)
+		}
 		hooks.PersistOutcome(ctx, st, repoID, id.WtID, trigger, started, time.Now().UnixMilli(), out)
 		if hookErr != nil {
 			sink.Warn("%s hooks failed for %s (teardown continues): %v", trigger, wtPath, hookErr)
@@ -230,10 +265,12 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 		sink.Warn("dropping the databases of %s failed; the daemon retries it on its next sweep: %v", wtPath, err)
 	}
 	runTrigger("delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
-	if err := gitcmd.RunPiped(ctx, repoRoot, os.Stderr, os.Stderr, "worktree", "remove", "--force", wtPath); err != nil && !force {
-		return fmt.Errorf("git worktree remove %s: %w", wtPath, err)
+	if !gone {
+		if err := gitcmd.RunPiped(ctx, repoRoot, os.Stderr, os.Stderr, "worktree", "remove", "--force", wtPath); err != nil && !force {
+			return fmt.Errorf("git worktree remove %s: %w", wtPath, err)
+		}
+		RemoveWorktreeTree(wtPath, WorktreesRoot(cfg, repoRoot))
 	}
-	RemoveWorktreeTree(wtPath, WorktreesRoot(cfg, repoRoot))
 	if err := st.ReleaseWorktreePorts(ctx, id.WtID); err != nil {
 		sink.Warn("releasing the ports of %s failed; they stay reserved: %v", wtPath, err)
 	}

@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
@@ -53,6 +54,22 @@ type GroupOutcome struct {
 	// wait=true path so `PersistOutcome` can stream it into the
 	// hook_log_chunks table.
 	LogBody []byte
+}
+
+// OrphanLogDir is where RunHooksOrphan's logs go for a worktree whose
+// directory (which would normally host `.treeman-hooks/`) no longer
+// exists: a per-repo, per-run path under XDG_STATE_HOME.
+func OrphanLogDir(repoPath, slug string) string {
+	state := os.Getenv("XDG_STATE_HOME")
+	if state == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			state = filepath.Join(home, ".local", "state")
+		} else {
+			state = filepath.Join(os.TempDir(), "treeman-state")
+		}
+	}
+	return filepath.Join(state, "treeman", "lifecycle-logs",
+		filepath.Base(repoPath), slug+"-"+time.Now().UTC().Format("20060102T150405Z"))
 }
 
 // RunHooksOrphan is the lifecycle-watcher variant of RunHooks. The

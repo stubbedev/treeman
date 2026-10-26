@@ -887,6 +887,24 @@ func (s *Store) LookupWorktreeByAdminDir(ctx context.Context, adminDir string) (
 	return w, nil
 }
 
+// LookupWorktreeByPath resolves a worktree path to its row, for when the
+// path is all that is left (the directory is gone). The most recent
+// matching row is the right one: an older row for the same path has
+// deleted_at set. Returns 0 + nil when no row matches.
+func (s *Store) LookupWorktreeByPath(ctx context.Context, path string) (WorktreeRow, error) {
+	row := s.DB.QueryRowContext(ctx, `
+		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL, is_main
+		FROM worktrees WHERE path = ? COLLATE NOCASE ORDER BY id DESC LIMIT 1`, path)
+	var w WorktreeRow
+	if err := row.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &w.Deleted, &w.IsMain); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WorktreeRow{}, nil
+		}
+		return WorktreeRow{}, err
+	}
+	return w, nil
+}
+
 // WorktreeRow is the lifecycle-watcher view of a worktrees row.
 type WorktreeRow struct {
 	ID       int64

@@ -184,7 +184,7 @@ func wtPrune() *cli.Command {
 			if err := gitcmd.Run(ctx, repoRoot, "worktree", "prune"); err != nil {
 				return err
 			}
-			pruned := 0
+			pruned, failed := 0, 0
 			live, err := liveWorktreePaths(ctx, repoRoot)
 			if err != nil {
 				return err
@@ -200,10 +200,14 @@ func wtPrune() *cli.Command {
 					RepoRoot: repoRoot, Target: p, Force: true, Env: CaptureInheritedEnv(),
 				}, cliSink{}); delErr != nil {
 					PrintWarn("prune %s: %v", p, delErr)
+					failed++
 					continue
 				}
 				PrintOK("pruned %s (directory gone)", p)
 				pruned++
+			}
+			if failed > 0 {
+				return fmt.Errorf("%d worktree(s) whose directory is gone could not be pruned", failed)
 			}
 			if pruned == 0 {
 				PrintInfo("nothing to prune — all registered worktrees present on disk")

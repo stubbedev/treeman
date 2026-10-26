@@ -488,7 +488,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 	// Orphan teardown — the working tree is gone, so we run
 	// before-engines + after-engines hooks against a log dir under
 	// XDG_STATE_HOME instead of the (deleted) worktree.
-	logDir := orphanLogDir(repoPath, row.Slug)
+	logDir := hooks.OrphanLogDir(repoPath, row.Slug)
 	runOrphan := func(trigger string, actions []config.Action) {
 		if len(actions) == 0 {
 			return
@@ -531,42 +531,10 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 	return nil
 }
 
-// orphanLogDir routes lifecycle teardown logs to a daemon-managed
-// state path since the worktree dir (which would normally host
-// `.treeman-hooks/`) no longer exists.
-func orphanLogDir(repoPath, slug string) string {
-	state := os.Getenv("XDG_STATE_HOME")
-	if state == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			state = filepath.Join(home, ".local", "state")
-		} else {
-			state = filepath.Join(os.TempDir(), "treeman-state")
-		}
-	}
-	return filepath.Join(state, "treeman", "lifecycle-logs",
-		filepath.Base(repoPath), slug+"-"+time.Now().UTC().Format("20060102T150405Z"))
-}
-
 // lookupWorktreeByPath is the orphan-teardown helper: we only have a
-// path (the deleted worktree's filesystem location). The most recent
-// matching row is the right one — an old removed row for the same
-// path would have `deleted_at` set and we skip it.
+// path (the deleted worktree's filesystem location).
 func lookupWorktreeByPath(ctx context.Context, s *store.Store, path string) (store.WorktreeRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `
-		SELECT id, repo_id, path, slug, COALESCE(branch, ''), COALESCE(admin_dir, ''), deleted_at IS NOT NULL, is_main
-		FROM worktrees WHERE path = ? COLLATE NOCASE ORDER BY id DESC LIMIT 1`, path)
-	if err != nil {
-		return store.WorktreeRow{}, err
-	}
-	defer func() { _ = rows.Close() }()
-	if !rows.Next() {
-		return store.WorktreeRow{}, nil
-	}
-	var w store.WorktreeRow
-	if err := rows.Scan(&w.ID, &w.RepoID, &w.Path, &w.Slug, &w.Branch, &w.AdminDir, &w.Deleted, &w.IsMain); err != nil {
-		return store.WorktreeRow{}, err
-	}
-	return w, rows.Err()
+	return s.LookupWorktreeByPath(ctx, path)
 }
 
 // resolveGitCommonDir returns the absolute path of the repo's git
