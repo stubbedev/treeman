@@ -15,6 +15,10 @@ import (
 // that nothing else uses. Every other path keeps slug.For.
 func TestSlugForPathUsesMainWorktreeIdentity(t *testing.T) {
 	repo, run := newGitRepo(t)
+	repo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("TREEMAN_CONFIG", "")
 	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "t.db"))
