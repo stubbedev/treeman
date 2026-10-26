@@ -710,7 +710,7 @@ func finalizeStateDetail(last store.Event) string {
 	case store.StateDeferred:
 		return "— " + last.Message
 	case store.StateError:
-		return "— " + last.Message + " (retry: treeman wt finalize)"
+		return "— " + last.Message + " (retry: treeman worktree finalize)"
 	case store.StateReady:
 		return "(since " + formatTs(last.Ts) + ")"
 	}

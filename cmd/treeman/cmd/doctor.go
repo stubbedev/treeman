@@ -515,7 +515,7 @@ func checkFrameworks(repoRoot string) doctorResult {
 			Name:   "framework",
 			Status: "warn",
 			Detail: "no migration framework detected",
-			Hint:   "supported frameworks: laravel, rails, django, golang-migrate, goose, sqlx-cli, ... (see `treeman fw detect`)",
+			Hint:   "supported frameworks: laravel, rails, django, golang-migrate, goose, sqlx-cli, ... (see `treeman frameworks detect`)",
 		}
 	}
 	names := make([]string, 0, len(detected))

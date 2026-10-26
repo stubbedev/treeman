@@ -76,7 +76,7 @@ func TestWorktreeShowFailedFinalizeNamesTheRetryCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"error", "hook exited 4", "treeman wt finalize"} {
+	for _, want := range []string{"error", "hook exited 4", "treeman worktree finalize"} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("missing %q in %s", want, line)
 		}

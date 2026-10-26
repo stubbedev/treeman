@@ -47,7 +47,7 @@ func reposListCommand() *cli.Command {
 	return &cli.Command{
 		Description: `Reads the SQLite registry directly (no daemon round-trip), so it
 works while the daemon is down. A repo is enrolled the first time
-treeman touches it (wt create, prepare, or daemon watch); drop one
+treeman touches it (worktree create, prepare, or daemon watch); drop one
 with ` + "`treeman registry remove`" + `.`,
 		Flags: []cli.Flag{
 			&cli.BoolFlag{Name: "json"},

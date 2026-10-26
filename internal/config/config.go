@@ -125,10 +125,10 @@ type Config struct {
 
 	// Ports declares per-worktree port slots. Each entry is a named
 	// slot with a port range; treeman allocates a free port per slot
-	// at `wt create` time and exposes it via the `{port_<name>}`
+	// at `worktree create` time and exposes it via the `{port_<name>}`
 	// template token (usable in `patches[].set[*]` values).
 	// Persisted in SQLite so the assignment survives across daemon
-	// restarts; freed on `wt delete`.
+	// restarts; freed on `worktree delete`.
 	//
 	// Use slot names that match the role they fill in your app (e.g.
 	// `octane`, `webpack`, `reverb`) — the name shows up in every
@@ -1255,7 +1255,7 @@ type Patch struct {
 //
 // Triggers (all optional — omit any you don't need):
 //
-//   - create-before-engines — during `wt create`, after patches +
+//   - create-before-engines — during `worktree create`, after patches +
 //     bring-in (copies/links), BEFORE engine prepare. Standard
 //     home of dependency installs (composer/yarn/pip) so migrate
 //     can find vendor/. The engine databases do NOT exist yet in
@@ -1263,12 +1263,12 @@ type Patch struct {
 //     (e.g. a Laravel `composer install` whose post-autoload-dump
 //     runs a framework command) fails with "Unknown database". Keep
 //     DB-touching work in create-after-engines.
-//   - create-after-engines — during `wt create`, after engine
+//   - create-after-engines — during `worktree create`, after engine
 //     prepare. Use when actions need a populated database
 //     (cache warming, seed verification).
-//   - delete-before-engines — during `wt delete`, BEFORE DB
+//   - delete-before-engines — during `worktree delete`, BEFORE DB
 //     drop. Graceful shutdown: drain queues, docker compose stop.
-//   - delete-after-engines — during `wt delete`, AFTER DB drop +
+//   - delete-after-engines — during `worktree delete`, AFTER DB drop +
 //     git worktree remove. External notifications (Slack, CDN
 //     purge) that should announce only once the data is gone.
 //   - checkout — fires when the HEAD watcher sees a branch
@@ -2098,12 +2098,12 @@ type WatcherPath struct {
 type CustomFramework struct {
 	// Files (relative to repo root) whose presence indicates this
 	// framework is in use. All markers must be present for `treeman
-	// fw detect` / `treeman doctor` to recognise the framework.
+	// frameworks detect` / `treeman doctor` to recognise the framework.
 	// Example: `["alembic.ini", "migrations/env.py"]`.
 	Markers []string `yaml:"markers"`
 
 	// Glob patterns for the directories holding migration files.
-	// Carried on the detection Spec reported by `treeman fw detect` /
+	// Carried on the detection Spec reported by `treeman frameworks detect` /
 	// `treeman doctor`; not emitted into `inputs[]` by `treeman init`
 	// (init scaffolds only from built-in frameworks).
 	MigrationDirs []string `yaml:"migration_dirs"`

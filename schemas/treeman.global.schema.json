@@ -211,14 +211,14 @@
             "type": "string"
           },
           "type": "array",
-          "description": "Files (relative to repo root) whose presence indicates this\nframework is in use. All markers must be present for `treeman\nfw detect` / `treeman doctor` to recognise the framework.\nExample: `[\"alembic.ini\", \"migrations/env.py\"]`."
+          "description": "Files (relative to repo root) whose presence indicates this\nframework is in use. All markers must be present for `treeman\nframeworks detect` / `treeman doctor` to recognise the framework.\nExample: `[\"alembic.ini\", \"migrations/env.py\"]`."
         },
         "migration_dirs": {
           "items": {
             "type": "string"
           },
           "type": "array",
-          "description": "Glob patterns for the directories holding migration files.\nCarried on the detection Spec reported by `treeman fw detect` /\n`treeman doctor`; not emitted into `inputs[]` by `treeman init`\n(init scaffolds only from built-in frameworks)."
+          "description": "Glob patterns for the directories holding migration files.\nCarried on the detection Spec reported by `treeman frameworks detect` /\n`treeman doctor`; not emitted into `inputs[]` by `treeman init`\n(init scaffolds only from built-in frameworks)."
         },
         "file_pattern": {
           "type": "string",
@@ -619,7 +619,7 @@
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "HooksConfig — `hooks:` block. A flat set of trigger-keyed action\nlists. Each key's value is a list of Actions that fire when that\ntrigger happens. Actions in the same list run in parallel; the\ntrigger key itself encodes BOTH the lifecycle phase AND the timing\npoint, so there's no separate `when:` field anywhere.\n\nTriggers (all optional — omit any you don't need):\n\n  - create-before-engines — during `wt create`, after patches +\n    bring-in (copies/links), BEFORE engine prepare. Standard\n    home of dependency installs (composer/yarn/pip) so migrate\n    can find vendor/. The engine databases do NOT exist yet in\n    this phase, so a hook that BOOTS THE APP and queries the DB\n    (e.g. a Laravel `composer install` whose post-autoload-dump\n    runs a framework command) fails with \"Unknown database\". Keep\n    DB-touching work in create-after-engines.\n  - create-after-engines — during `wt create`, after engine\n    prepare. Use when actions need a populated database\n    (cache warming, seed verification).\n  - delete-before-engines — during `wt delete`, BEFORE DB\n    drop. Graceful shutdown: drain queues, docker compose stop.\n  - delete-after-engines — during `wt delete`, AFTER DB drop +\n    git worktree remove. External notifications (Slack, CDN\n    purge) that should announce only once the data is gone.\n  - checkout — fires when the HEAD watcher sees a branch\n    switch inside an existing worktree. Re-runs in addition to\n    the regular finalize-on-HEAD-change behaviour.\n  - file-change — fires when any `databases[].inputs[]` glob\n    matches a filesystem event. Each action can optionally\n    `match: \u003clabel\u003e` to filter by the input entry's label.\n\nDaemon execution is always non-blocking from the CLI's\nperspective — each list of actions dispatches in parallel."
+      "description": "HooksConfig — `hooks:` block. A flat set of trigger-keyed action\nlists. Each key's value is a list of Actions that fire when that\ntrigger happens. Actions in the same list run in parallel; the\ntrigger key itself encodes BOTH the lifecycle phase AND the timing\npoint, so there's no separate `when:` field anywhere.\n\nTriggers (all optional — omit any you don't need):\n\n  - create-before-engines — during `worktree create`, after patches +\n    bring-in (copies/links), BEFORE engine prepare. Standard\n    home of dependency installs (composer/yarn/pip) so migrate\n    can find vendor/. The engine databases do NOT exist yet in\n    this phase, so a hook that BOOTS THE APP and queries the DB\n    (e.g. a Laravel `composer install` whose post-autoload-dump\n    runs a framework command) fails with \"Unknown database\". Keep\n    DB-touching work in create-after-engines.\n  - create-after-engines — during `worktree create`, after engine\n    prepare. Use when actions need a populated database\n    (cache warming, seed verification).\n  - delete-before-engines — during `worktree delete`, BEFORE DB\n    drop. Graceful shutdown: drain queues, docker compose stop.\n  - delete-after-engines — during `worktree delete`, AFTER DB drop +\n    git worktree remove. External notifications (Slack, CDN\n    purge) that should announce only once the data is gone.\n  - checkout — fires when the HEAD watcher sees a branch\n    switch inside an existing worktree. Re-runs in addition to\n    the regular finalize-on-HEAD-change behaviour.\n  - file-change — fires when any `databases[].inputs[]` glob\n    matches a filesystem event. Each action can optionally\n    `match: \u003clabel\u003e` to filter by the input entry's label.\n\nDaemon execution is always non-blocking from the CLI's\nperspective — each list of actions dispatches in parallel."
     },
     "Input": {
       "oneOf": [
@@ -1228,7 +1228,7 @@
         "$ref": "#/$defs/PortSpec"
       },
       "type": "object",
-      "description": "Ports declares per-worktree port slots. Each entry is a named\nslot with a port range; treeman allocates a free port per slot\nat `wt create` time and exposes it via the `{port_\u003cname\u003e}`\ntemplate token (usable in `patches[].set[*]` values).\nPersisted in SQLite so the assignment survives across daemon\nrestarts; freed on `wt delete`.\n\nUse slot names that match the role they fill in your app (e.g.\n`octane`, `webpack`, `reverb`) — the name shows up in every\n`{port_\u003cname\u003e}` reference and in `wt show` output."
+      "description": "Ports declares per-worktree port slots. Each entry is a named\nslot with a port range; treeman allocates a free port per slot\nat `worktree create` time and exposes it via the `{port_\u003cname\u003e}`\ntemplate token (usable in `patches[].set[*]` values).\nPersisted in SQLite so the assignment survives across daemon\nrestarts; freed on `worktree delete`.\n\nUse slot names that match the role they fill in your app (e.g.\n`octane`, `webpack`, `reverb`) — the name shows up in every\n`{port_\u003cname\u003e}` reference and in `wt show` output."
     },
     "status": {
       "$ref": "#/$defs/StatusConfig",
