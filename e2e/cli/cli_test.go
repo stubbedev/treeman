@@ -299,7 +299,8 @@ func TestCLIPrintPathStreamDiscipline(t *testing.T) {
 	binDir := t.TempDir()
 	buildBin(t, binDir, repoRoot, "treeman", "./cmd/treeman")
 
-	// Isolated state so we don't trip over the developer's daemon.
+	// Isolated runtime dir + state so the CLI never reaches another daemon.
+	t.Setenv("XDG_RUNTIME_DIR", testsock.Dir(t))
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("TREEMAN_DB_PATH", filepath.Join(t.TempDir(), "treeman.db"))
