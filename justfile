@@ -70,113 +70,38 @@ lint-check:
 test:
     go test ./...
 
-# Run the e2e suite against real docker-backed engines. Pulls
-# ~3GB of images on first run (mysql, postgres, mongo, redis, es)
-# and binds local ports 13306-13356 + 15432 + 27117 + 16379 + 19200
-# — make sure those are free. Each subtest brings up + tears down
-# its own docker-compose stack.
+# Run the e2e suite inside a throwaway docker-in-docker sandbox: its own
+# dockerd, /tmp, HOME and treeman state, with the checkout mounted
+# read-only, so nothing a test does reaches this machine's daemon,
+# registry, ports or docker. Images and Go caches persist in the
+# treeman-e2e-* docker volumes. The harness refuses to run outside it.
 #
-# Suites are grouped into batches so docker doesn't drown under the
-# full ~60-suite fanout. Within a batch up to `parallel` compose
-# stacks run at once (default 4 — enough throughput without choking
-# the docker daemon). Between batches we stop any leftover compose
-# stacks under e2e/ so a flaky teardown can't bleed containers into
-# the next batch.
-#
-# First arg picks one batch (engines|fw1|fw2|matrix|watcher|features|cli)
-# or `all` for every batch. Second arg overrides the in-batch
-# concurrency. `just test-e2e-list` prints batch membership.
+# First arg picks one batch (see `just test-e2e-list`), one suite under
+# e2e/, or `all`. Second arg sets how many suites run at once.
 test-e2e batch="all" parallel="4":
     #!/usr/bin/env bash
     set -euo pipefail
+    go_version=$(awk '$1 == "toolchain" { sub(/^go/, "", $2); print $2 }' go.mod)
+    docker build -q -t treeman-e2e-sandbox --build-arg GO_VERSION="$go_version" e2e/sandbox >/dev/null
+    tty=()
+    if [ -t 0 ] && [ -t 1 ]; then tty=(-it); fi
+    docker run --rm --init --privileged --name treeman-e2e "${tty[@]}" \
+        -e DOCKERHUB_USERNAME -e DOCKERHUB_TOKEN \
+        -v "{{justfile_directory()}}:/src:ro" \
+        -v treeman-e2e-docker:/var/lib/docker \
+        -v treeman-e2e-go:/root/go \
+        -v treeman-e2e-gocache:/root/.cache/go-build \
+        treeman-e2e-sandbox just _test-e2e-sandboxed "{{batch}}" "{{parallel}}"
 
-    declare -A BATCHES
-    BATCHES[engines]="dumpload mysql postgres mongo redis elasticsearch s3"
-    BATCHES[fw1]="fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
-    BATCHES[fw2]="fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
-    BATCHES[matrix]="matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases named_conns"
-    BATCHES[watcher]="autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
-    BATCHES[features]="clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc patches poolmax race recover retention sighup snapshot_gc switchback teardown worktrees_root"
-    BATCHES[cli]="cli cli_engine cli_surface db_query mcp mcp_write mongo_dump"
-    BATCHES[lite]="cli_surface logs notifications file_engine"
-
-    ORDER=(engines fw1 fw2 matrix watcher features cli)
-
-    cleanup_e2e_stacks() {
-        for d in e2e/*/; do
-            local name
-            name=$(basename "$d")
-            [ "$name" = "harness" ] && continue
-            [ -f "$d/docker-compose.yml" ] || continue
-            local running
-            running=$(docker ps -aq --filter "label=com.docker.compose.project=$name" 2>/dev/null || true)
-            if [ -n "$running" ]; then
-                echo "  cleanup: stopping leftover stack '$name'"
-                (cd "$d" && docker compose down -v --remove-orphans >/dev/null 2>&1 || true)
-            fi
-        done
-    }
-
-    run_batch() {
-        local name=$1
-        local suites=${BATCHES[$name]:-}
-        if [ -z "$suites" ]; then
-            echo "unknown batch: $name (valid: ${ORDER[*]})" >&2
-            exit 2
-        fi
-        local pkgs=""
-        for s in $suites; do
-            if [ ! -d "e2e/$s" ]; then
-                echo "  warn: e2e/$s missing — skipping"
-                continue
-            fi
-            pkgs+=" ./e2e/$s/..."
-        done
-        echo
-        echo "==================== batch: $name ===================="
-        echo "suites: $suites"
-        echo "parallel: {{parallel}}"
-        go test -tags=e2e -p {{parallel}} -timeout 30m $pkgs
-        echo "==================== cleanup after $name ===================="
-        cleanup_e2e_stacks
-    }
-
-    SEL="{{batch}}"
-    if [ "$SEL" = "all" ]; then
-        cleanup_e2e_stacks
-        for b in "${ORDER[@]}"; do run_batch "$b"; done
-    else
-        run_batch "$SEL"
-    fi
-
-# Pre-pull every docker image an e2e batch needs, with retry, so the
-# suite's own `docker compose up --wait` hits a warm local cache
-# instead of racing a cold pull against a flaky Docker Hub. Transient
-# registry timeouts (context deadline / Client.Timeout) are the #1
-# source of release-e2e flakes; one retried pull up front absorbs them.
-#
-# Non-fatal by design: if a pull still fails after retries the recipe
-# returns 0 and lets the per-test compose up try again — prepull is an
-# optimisation, not a gate. BATCHES mirrors `test-e2e`; keep in sync.
-e2e-prepull batch:
+[private]
+_test-e2e-sandboxed batch parallel:
     #!/usr/bin/env bash
     set -euo pipefail
-
-    declare -A BATCHES
-    BATCHES[engines]="dumpload mysql postgres mongo redis elasticsearch s3"
-    BATCHES[fw1]="fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
-    BATCHES[fw2]="fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
-    BATCHES[matrix]="matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases named_conns"
-    BATCHES[watcher]="autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
-    BATCHES[features]="clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc patches poolmax race recover retention sighup snapshot_gc switchback teardown worktrees_root"
-    BATCHES[cli]="cli cli_engine cli_surface db_query mcp mcp_write mongo_dump"
-    BATCHES[lite]="cli_surface logs notifications file_engine"
-
-    suites=${BATCHES[{{batch}}]:-}
-    if [ -z "$suites" ]; then
-        echo "unknown batch: {{batch}}" >&2
+    if [ "${TREEMAN_E2E_SANDBOX:-}" != "1" ]; then
+        echo "_test-e2e-sandboxed runs inside the sandbox only; use 'just test-e2e'" >&2
         exit 2
     fi
+    source e2e/sandbox/batches.sh
 
     pull_retry() {
         local dir=$1 n=0
@@ -187,27 +112,55 @@ e2e-prepull batch:
             sleep $((n * 10))
         done
         echo "  WARN: prepull failed for $dir after 3 tries; suite will pull on demand" >&2
-        return 0
     }
 
-    for s in $suites; do
-        [ -f "e2e/$s/docker-compose.yml" ] || continue
-        echo "prepull e2e/$s"
-        pull_retry "e2e/$s"
-    done
+    cleanup_e2e_stacks() {
+        for d in e2e/*/; do
+            [ -f "$d/docker-compose.yml" ] || continue
+            (cd "$d" && docker compose down -v --remove-orphans >/dev/null 2>&1) ||
+                echo "  WARN: compose down failed in $d" >&2
+        done
+    }
+
+    run_batch() {
+        local name=$1
+        local suites=${E2E_BATCHES[$name]:-}
+        if [ -z "$suites" ]; then
+            if [ "$name" = harness ] || [ "$name" = sandbox ] || [ ! -d "e2e/$name" ]; then
+                echo "unknown batch or suite: $name (batches: ${!E2E_BATCHES[*]})" >&2
+                exit 2
+            fi
+            suites=$name
+        fi
+        local pkgs=() s
+        for s in $suites; do
+            [ -d "e2e/$s" ] || { echo "batch $name names missing suite e2e/$s" >&2; exit 2; }
+            if [ -f "e2e/$s/docker-compose.yml" ]; then pull_retry "e2e/$s"; fi
+            pkgs+=("./e2e/$s/...")
+        done
+        echo
+        echo "==================== batch: $name ===================="
+        echo "suites: $suites"
+        echo "parallel: {{parallel}}"
+        go test -tags=e2e -p "{{parallel}}" -timeout 30m "${pkgs[@]}"
+        echo "==================== cleanup after $name ===================="
+        cleanup_e2e_stacks
+    }
+
+    if [ "{{batch}}" = "all" ]; then
+        for b in "${E2E_ORDER[@]}"; do run_batch "$b"; done
+    else
+        run_batch "{{batch}}"
+    fi
 
 # List the e2e batch groupings used by `just test-e2e`.
 test-e2e-list:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "engines  : dumpload mysql postgres mongo redis elasticsearch s3"
-    echo "fw1      : fw_alembic fw_diesel fw_django fw_flyway fw_laravel fw_rails fw_sqlx"
-    echo "fw2      : fw_drizzle fw_golang_migrate fw_knex fw_mikro fw_prisma fw_sequelize fw_typeorm"
-    echo "matrix   : matrix_es matrix_mongo matrix_postgres matrix_redis containerref containerref-all conn_forms engine_aliases named_conns"
-    echo "watcher  : autofetch branchscoped deltawatch headwatcher hook_cwd lifecycle main_worktree main_worktree_db oncheckout onfilechange onfilechange_redis watcher"
-    echo "features : clones_auto coldbuild_siblings compression ctrrestart extras fanout log_level logs misc patches poolmax race recover retention sighup snapshot_gc switchback teardown worktrees_root"
-    echo "cli      : cli cli_engine cli_surface db_query mcp mcp_write mongo_dump"
-    echo "lite     : cli_surface logs notifications file_engine (container-free)"
+    source e2e/sandbox/batches.sh
+    for b in "${E2E_ORDER[@]}" lite; do
+        printf '%-9s: %s\n' "$b" "${E2E_BATCHES[$b]}"
+    done
 
 check: lint test sync-schema sync-docs sync-flake
 

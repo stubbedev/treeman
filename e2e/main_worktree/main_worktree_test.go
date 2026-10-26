@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/stubbedev/treeman/e2e/harness"
+
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"

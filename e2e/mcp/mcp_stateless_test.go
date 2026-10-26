@@ -2,7 +2,11 @@
 
 package mcp_e2e
 
-import "testing"
+import (
+	"testing"
+
+	_ "github.com/stubbedev/treeman/e2e/harness"
+)
 
 // TestMCPStatelessProtocol drives the 2026-07-28 spec revision, which
 // drops the `initialize` handshake: every request instead carries its

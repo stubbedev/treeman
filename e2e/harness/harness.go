@@ -3,10 +3,10 @@
 // for the named service to become reachable, runs assertions through
 // treeman's prepare layer, and tears the stack down via t.Cleanup.
 //
-// Tests run sequentially against the host's docker daemon — compose
-// files in this tree bind to known ports for clarity. Run them under
-// `go test -tags=e2e ./e2e/...` so they're excluded from the default
-// `go test ./...` flow.
+// Tests run inside the throwaway sandbox container started by
+// `just test-e2e`, against its own docker daemon; importing this
+// package under the e2e tag refuses to run anywhere else. Compose
+// files in this tree bind to known ports for clarity.
 package harness
 
 import (

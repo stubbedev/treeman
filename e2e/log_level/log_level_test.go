@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/stubbedev/treeman/e2e/harness"
+
 	"github.com/stubbedev/treeman/internal/testsock"
 )
 

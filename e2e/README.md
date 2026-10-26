@@ -8,17 +8,25 @@ owns one compose file and one Go test file gated with
 ## Running
 
 ```sh
-just test-e2e
-# or
-go test -tags=e2e ./e2e/... -timeout 60m
+just test-e2e              # every batch
+just test-e2e cli          # one batch (`just test-e2e-list` shows them)
+just test-e2e fw_laravel   # one suite
 ```
 
-First run pulls ~6 GB of images and compiles ~2 GB of Rust deps
-(sqlx-cli + diesel_cli). Subsequent runs are container-cached.
+Everything runs inside a throwaway docker-in-docker container built
+from `sandbox/`: its own dockerd, `/tmp`, `HOME` and treeman state,
+with the checkout mounted read-only. Nothing a test does reaches the
+host's treeman daemon, registry, ports or docker. Importing `harness`
+under the `e2e` tag refuses to run outside that container, so plain
+`go test -tags=e2e` fails fast instead of polluting the machine.
 
-Tests run sequentially against the host's docker daemon — each suite
-binds a unique host port (13306–15562, 16380, 19200–19201, 27117–27118)
-so you don't need `-p 1`.
+First run pulls ~6 GB of images and compiles ~2 GB of Rust deps
+(sqlx-cli + diesel_cli). Images and Go caches persist in the
+`treeman-e2e-docker`, `treeman-e2e-go` and `treeman-e2e-gocache`
+docker volumes; `docker volume rm` them to reclaim the space.
+
+Each suite binds a unique port inside the sandbox (13306–15562, 16380,
+19200–19201, 27117–27118) so suites of a batch run in parallel.
 
 ## Coverage matrix
 
@@ -99,8 +107,11 @@ Each framework test:
 2. `docker-compose.yml` binding a fresh port number (see existing ones to pick the next free port)
 3. `<name>_test.go` with `//go:build e2e` and a test that uses
    `harness.SkipIfNoDocker`, `harness.ComposeUp`, `harness.WaitForReady`,
-   `harness.NewEnv` + `RunPrepare` or direct `daemon.*` calls
-4. Run with `go test -tags=e2e -v ./e2e/<name>/...`
+   `harness.NewEnv` + `RunPrepare` or direct `daemon.*` calls. Every
+   suite imports `harness` (blank import if it uses nothing from it) so
+   the sandbox guard runs; `go test ./e2e/harness` enforces this.
+4. Add it to a batch in `sandbox/batches.sh`
+5. Run with `just test-e2e <name>`
 
 The harness deliberately keeps a thin surface — tests construct
 `config.Config` in-memory and call `prepare.Run` directly when they

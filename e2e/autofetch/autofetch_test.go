@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 
+	_ "github.com/stubbedev/treeman/e2e/harness"
+
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/resolve"

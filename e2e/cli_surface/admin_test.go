@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	_ "github.com/stubbedev/treeman/e2e/harness"
 )
 
 // ── treeman registry ─────────────────────────────────────────────
