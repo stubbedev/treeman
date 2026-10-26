@@ -74,7 +74,6 @@ func main() {
 	app := treemanapp.New()
 	var b strings.Builder
 	b.WriteString("# CLI reference\n\n")
-	b.WriteString("[← back to README](../README.md)\n\n")
 	b.WriteString("Auto-generated from the `treeman` binary's command tree.\n")
 	b.WriteString("Run `just sync-docs` after touching any subcommand to refresh.\n\n")
 	b.WriteString("## Commands\n\n")

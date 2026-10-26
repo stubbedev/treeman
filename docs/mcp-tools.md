@@ -1,7 +1,5 @@
 # MCP tool reference
 
-[← back to README](../README.md)
-
 Auto-generated from the MCP tool registry (`internal/mcp.Catalog`).
 Run `just sync-docs` after adding or renaming a tool to refresh.
 Tools marked **core** load up-front; the rest are revealed on demand

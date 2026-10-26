@@ -1,7 +1,5 @@
 # Internals — daemon, RPC, storage
 
-[← back to README](../README.md)
-
 ## Scope and non-goals
 
 These boundaries are deliberate design decisions, not gaps. Each is
@@ -53,7 +51,7 @@ client that round-trips JSON over the unix socket. Why a daemon:
 1. **Watcher lifecycles** survive shell exits. `watcher start` from
    one shell keeps watching even after the shell closes.
 2. **Hook drivers** are detached into their own session (`setsid`),
-   so they survive the CLI exit and `wt create` returns promptly
+   so they survive the CLI exit and `worktree create` returns promptly
    regardless of how slow the hooks themselves are.
 3. **Snapshot cache** is shared across shells; two terminals
    creating two worktrees on the same branch share the cached

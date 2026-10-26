@@ -37,7 +37,6 @@ func main() {
 
 	var b strings.Builder
 	b.WriteString("# Configuration reference\n\n")
-	b.WriteString("[← back to README](../README.md)\n\n")
 	b.WriteString("Auto-generated from the `config.Config` Go types (the same\n")
 	b.WriteString("reflection that produces `schemas/treeman.schema.json`).\n")
 	b.WriteString("Run `just sync-docs` after touching a config field to refresh.\n")

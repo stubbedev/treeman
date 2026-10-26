@@ -1,7 +1,5 @@
 # Configuration
 
-[← back to README](../README.md)
-
 treeman reads config from two files that merge into one effective
 config, last-write-wins:
 
@@ -149,8 +147,8 @@ worktree's slug:
 
 | Token | Example |
 |---|---|
-| `{slug}` | `proj_123` |
-| `{slug_dash}` | `proj-123` |
+| `{slug}` | `proj_123_33a85ab4` |
+| `{slug_dash}` | `proj-123-33a85ab4` |
 | `{slug_redis_queue}` | `9` — checksum-derived Redis DB index (6–15) |
 | `{slug_redis_cache}` | `12` — checksum-derived Redis DB index (6–15), distinct from queue |
 | `{port_<name>}` | allocated port for the `ports:` slot `<name>` (e.g. `{port_octane}`) |
@@ -192,7 +190,7 @@ databases:
 
 treeman runs against what `.treeman.yaml` says, not what it
 guesses from filesystem markers. Init helpers (`treeman init`,
-`treeman fw detect`) inspect the repo and write the corresponding
+`treeman frameworks detect`) inspect the repo and write the corresponding
 YAML; once written, those fields are authoritative. If a migration
 glob lives somewhere unusual, change `inputs:` and the next prepare
 sees it — no recompile, no rebuild of treeman, no per-framework
@@ -200,7 +198,7 @@ code path. The same applies to env files: only what
 `env_sources:` lists is read.
 
 The built-in framework presets exist solely as init-time templates
-and are listed by `treeman fw detect`. Copy fields in by hand for
+and are listed by `treeman frameworks detect`. Copy fields in by hand for
 custom layouts.
 
 ## Hooks
@@ -355,7 +353,7 @@ container's `WORKDIR`.
 
 ### Hook environment variables
 
-Every hook subprocess inherits the user's `wt create`-time env (PATH,
+Every hook subprocess inherits the user's `worktree create`-time env (PATH,
 shims, `.env`-loaded vars) plus four scoping variables treeman sets
 unconditionally:
 

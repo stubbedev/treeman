@@ -1,7 +1,5 @@
 # MCP / AI integration
 
-[← back to README](../README.md)
-
 treeman ships an MCP (Model Context Protocol) server so AI agents
 — Claude Code, Claude Desktop, Cursor, Continue, anything that
 speaks MCP — get a structured tool surface onto treeman's state.
@@ -229,7 +227,7 @@ enable-state — which is shared across clients on one server — doesn't churn
 `tools/list_changed` for everyone when one client enables a tool.
 
 `~/.config/systemd/user/treeman-mcp.service` (see also
-[contrib/treeman-mcp.service](../contrib/treeman-mcp.service)):
+[contrib/treeman-mcp.service](https://github.com/stubbedev/treeman/blob/master/contrib/treeman-mcp.service)):
 
 ```ini
 [Unit]

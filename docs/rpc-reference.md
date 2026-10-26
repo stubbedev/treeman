@@ -1,7 +1,5 @@
 # RPC reference
 
-[← back to docs](README.md)
-
 Auto-generated from the `Method*` / `Kind*` / `Task*` / `Param*`
 constants in `pkg/rpc/rpc.go`. Run `just sync-docs` after touching
 the RPC surface to refresh.

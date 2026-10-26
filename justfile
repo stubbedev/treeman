@@ -255,8 +255,18 @@ sync-schema:
         echo "sync-schema: schemas already in sync"
     fi
 
+# Render the docs site (MkDocs Material, strict: broken links and
+# anchors fail) into site/ from freshly regenerated reference pages.
+# The pages workflow runs exactly this.
+docs-build: sync-docs
+    mkdocs build --strict
+
+# Live-reloading preview of the docs site on http://127.0.0.1:8000.
+docs-serve: sync-docs
+    mkdocs serve
+
 clean:
-    rm -rf bin/
+    rm -rf bin/ site/
 
 # ─────────────────────────── Nix ───────────────────────────
 

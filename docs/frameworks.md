@@ -1,10 +1,8 @@
 # Framework presets
 
-[← back to docs](README.md)
-
 Auto-generated from `framework.DefaultRegistry` (the built-in
 migration-framework detectors). Run `just sync-docs` after adding a
-preset to refresh. `treeman fw detect` lists which of these match the
+preset to refresh. `treeman frameworks detect` lists which of these match the
 current repo; declare your own under the `frameworks:` config block.
 
 21 built-in detectors. Marker entries joined by `|` mean any-of.

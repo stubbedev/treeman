@@ -1,7 +1,5 @@
 # Event reference
 
-[← back to README](../README.md)
-
 Auto-generated from `internal/store/eventtypes.go` (the `store.Evt*`
 constants — the single source of truth for every `event_type` written
 to the SQLite log). Run `just sync-docs` after adding an event to refresh.

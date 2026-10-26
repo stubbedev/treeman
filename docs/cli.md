@@ -1,7 +1,5 @@
 # CLI reference
 
-[← back to README](../README.md)
-
 Auto-generated from the `treeman` binary's command tree.
 Run `just sync-docs` after touching any subcommand to refresh.
 
@@ -430,7 +428,7 @@ list repos enrolled in treeman
 ```
 Reads the SQLite registry directly (no daemon round-trip), so it
 works while the daemon is down. A repo is enrolled the first time
-treeman touches it (wt create, prepare, or daemon watch); drop one
+treeman touches it (worktree create, prepare, or daemon watch); drop one
 with `treeman registry remove`.
 ```
 
@@ -903,7 +901,7 @@ list repos enrolled in the registry
 ```
 Reads the SQLite registry directly (no daemon round-trip), so it
 works while the daemon is down. A repo is enrolled the first time
-treeman touches it (wt create, prepare, or daemon watch); drop one
+treeman touches it (worktree create, prepare, or daemon watch); drop one
 with `treeman registry remove`.
 ```
 

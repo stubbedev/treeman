@@ -69,7 +69,6 @@ func main() {
 
 	var b strings.Builder
 	b.WriteString("# Event reference\n\n")
-	b.WriteString("[← back to README](../README.md)\n\n")
 	b.WriteString("Auto-generated from `internal/store/eventtypes.go` (the `store.Evt*`\n")
 	b.WriteString("constants — the single source of truth for every `event_type` written\n")
 	b.WriteString("to the SQLite log). Run `just sync-docs` after adding an event to refresh.\n\n")

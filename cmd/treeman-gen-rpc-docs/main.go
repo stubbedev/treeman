@@ -73,7 +73,6 @@ func main() {
 
 	var b strings.Builder
 	b.WriteString("# RPC reference\n\n")
-	b.WriteString("[← back to docs](README.md)\n\n")
 	b.WriteString("Auto-generated from the `Method*` / `Kind*` / `Task*` / `Param*`\n")
 	b.WriteString("constants in `pkg/rpc/rpc.go`. Run `just sync-docs` after touching\n")
 	b.WriteString("the RPC surface to refresh.\n\n")

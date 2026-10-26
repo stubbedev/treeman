@@ -34,7 +34,6 @@ func main() {
 
 	var b strings.Builder
 	b.WriteString("# MCP tool reference\n\n")
-	b.WriteString("[← back to README](../README.md)\n\n")
 	b.WriteString("Auto-generated from the MCP tool registry (`internal/mcp.Catalog`).\n")
 	b.WriteString("Run `just sync-docs` after adding or renaming a tool to refresh.\n")
 	b.WriteString("Tools marked **core** load up-front; the rest are revealed on demand\n")

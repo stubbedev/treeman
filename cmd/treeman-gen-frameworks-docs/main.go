@@ -17,10 +17,9 @@ func main() {
 
 	var b strings.Builder
 	b.WriteString("# Framework presets\n\n")
-	b.WriteString("[← back to docs](README.md)\n\n")
 	b.WriteString("Auto-generated from `framework.DefaultRegistry` (the built-in\n")
 	b.WriteString("migration-framework detectors). Run `just sync-docs` after adding a\n")
-	b.WriteString("preset to refresh. `treeman fw detect` lists which of these match the\n")
+	b.WriteString("preset to refresh. `treeman frameworks detect` lists which of these match the\n")
 	b.WriteString("current repo; declare your own under the `frameworks:` config block.\n\n")
 	fmt.Fprintf(&b, "%d built-in detectors. Marker entries joined by `|` mean any-of.\n\n", len(reg.Specs))
 
