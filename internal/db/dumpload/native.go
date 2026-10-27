@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/containerip"
@@ -21,8 +22,8 @@ type LoadStrategy string
 const (
 	// StrategyDockerExec ran the engine's native CLI inside the engine
 	// container via `<container-engine> exec -i ...`. Fastest because
-	// the CLI talks to the engine over a unix socket inside the same
-	// container — no network layer between host and engine.
+	// the CLI talks to the engine in the same container — no network
+	// hop from host to engine.
 	StrategyDockerExec LoadStrategy = "docker-exec"
 	// StrategyNativeCLI ran the engine's CLI from $PATH on the host,
 	// piping the dump over stdin. Skips per-statement round-trips that
@@ -77,11 +78,7 @@ func tryDockerExecMySQL(ctx context.Context, conn *config.MysqlConn, targetDB st
 	if user == "" {
 		user = "root"
 	}
-	args := []string{
-		"exec", "-i", "-e", "MYSQL_PWD", cid,
-		"mysql", "-u", user, targetDB,
-	}
-	cmd := exec.CommandContext(ctx, engineBin, args...)
+	cmd := exec.CommandContext(ctx, engineBin, dockerExecMysqlArgs(cid, conn, user, targetDB)...)
 	// `-e MYSQL_PWD` with no value copies it from the client's own
 	// environment: a `-e MYSQL_PWD=<password>` argument is readable by
 	// every local user through ps.
@@ -93,6 +90,22 @@ func tryDockerExecMySQL(ctx context.Context, conn *config.MysqlConn, targetDB st
 		return false, fmt.Errorf("%s exec mysql: %w (stderr: %s)", engineBin, err, stderr.String())
 	}
 	return true, nil
+}
+
+// dockerExecMysqlArgs builds the `<engine> exec … mysql …` argv used by
+// tryDockerExecMySQL. A socket-mode connection (Host is a path) is
+// reached over that socket, so the in-container client keeps its own
+// default socket. Every other connection reached the server over TCP, so
+// the client dials TCP instead of guessing where the server put its
+// socket file: an image whose server socket differs from the client's
+// compiled-in default would otherwise fail the fast path with "Can't
+// connect to local MySQL server through socket".
+func dockerExecMysqlArgs(cid string, conn *config.MysqlConn, user, targetDB string) []string {
+	args := []string{"exec", "-i", "-e", "MYSQL_PWD", cid, "mysql"}
+	if !strings.HasPrefix(conn.Host, "/") {
+		args = append(args, "--protocol=TCP", "--host=127.0.0.1")
+	}
+	return append(args, "-u", user, targetDB)
 }
 
 // tryNativeCLIMySQL pipes the dump through the host's `mysql` CLI when

@@ -206,7 +206,7 @@ if [ "$TREEMAN_ROLLBACK_STEPS" != "1" ]; then
   exit 1
 fi
 container="${MYSQL_CONTAINER:-treeman-e2e-mysql}"
-docker exec -i "$container" mysql --user=root --password=rootpw "$DB_DATABASE" <<'SQL'
+docker exec -i "$container" mysql --protocol=TCP --host=127.0.0.1 --user=root --password=rootpw "$DB_DATABASE" <<'SQL'
 DROP TABLE IF EXISTS widget;
 DELETE FROM _treeman_e2e_migrations WHERE filename = 'm1.sql';
 SQL

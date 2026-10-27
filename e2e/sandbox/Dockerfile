@@ -10,6 +10,7 @@ RUN apk add --no-cache \
         bash \
         bzip2 \
         composer \
+        curl \
         git \
         just \
         mongodb-tools \

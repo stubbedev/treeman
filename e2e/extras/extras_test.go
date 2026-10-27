@@ -60,6 +60,7 @@ func TestDumpOptionalSkipsMissing(t *testing.T) {
 touch `+witness+`
 echo "DB_DATABASE=$DB_DATABASE" > `+logFile+`
 docker exec treeman-e2e-extras-mysql mysql \
+  --protocol=TCP --host=127.0.0.1 \
   --user=root --password=rootpw --database="$DB_DATABASE" \
   -e "CREATE TABLE marker (id INT);" >> `+logFile+` 2>&1
 echo "exit=$?" >> `+logFile+`
