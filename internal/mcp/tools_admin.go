@@ -432,7 +432,7 @@ func statusOverview(ctx context.Context, st *store.Store, in statusOverviewIn) (
 	for i, w := range page {
 		ids[i] = w.ID
 	}
-	latest, err := st.LatestEventPerWorktree(ctx, ids, store.WorktreeStateEventTypes)
+	latest, err := st.LatestWorktreeStates(ctx, ids)
 	if err != nil {
 		return statusOverviewOut{}, fmt.Errorf("status overview: lifecycle state of %d worktrees: %w", len(ids), err)
 	}

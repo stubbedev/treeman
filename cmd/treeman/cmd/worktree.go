@@ -1176,7 +1176,7 @@ func enrichWtRows(ctx context.Context, st *store.Store, all []wtRow, withStatus,
 		for i := range all {
 			ids[i] = all[i].ID
 		}
-		latest, err := st.LatestEventPerWorktree(ctx, ids, store.WorktreeStateEventTypes)
+		latest, err := st.LatestWorktreeStates(ctx, ids)
 		if err != nil {
 			return fmt.Errorf("read the setup state of %d worktrees: %w", len(ids), err)
 		}

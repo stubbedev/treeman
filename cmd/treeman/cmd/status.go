@@ -211,7 +211,7 @@ func collectStatus(ctx context.Context, repoFilter string) (statusData, error) {
 	}
 	// One query for every row's latest lifecycle event — the bar widget
 	// used to pay one QueryEvents per worktree per tick.
-	latest, err := st.LatestEventPerWorktree(ctx, ids, store.WorktreeStateEventTypes)
+	latest, err := st.LatestWorktreeStates(ctx, ids)
 	if err != nil {
 		return statusData{}, err
 	}
