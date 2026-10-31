@@ -131,8 +131,16 @@ func Output(ctx context.Context, dir string, args ...string) ([]byte, error) {
 // operation (commit / worktree add) doesn't silently skip the lock
 // it needs.
 func OutputRW(ctx context.Context, dir string, readOnly bool, args ...string) ([]byte, error) {
+	return output(ctx, dir, readOnly, nil, args...)
+}
+
+func OutputStdin(ctx context.Context, dir string, stdin io.Reader, args ...string) ([]byte, error) {
+	return output(ctx, dir, true, stdin, args...)
+}
+
+func output(ctx context.Context, dir string, readOnly bool, stdin io.Reader, args ...string) ([]byte, error) {
 	cmd := command(ctx, dir, readOnly, args...)
-	cmd.Stdin = nil
+	cmd.Stdin = stdin
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

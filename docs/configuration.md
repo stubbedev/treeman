@@ -61,7 +61,7 @@ connections:
 databases:
   - engine: mysql                          # mysql|mariadb|tidb|postgres|postgresql|mongodb|redis|elasticsearch|opensearch
     name_template: "myapp_testing_{slug}"
-    dump: { path: storage/dumps/seed.sql.gz }
+    dump: { path: storage/dumps/seed.sql.gz }  # resolved in the worktree; a gitignored dump is symlinked from main
     fanout: 0                              # 0 = safe per-engine default (mysql 4, pg GOMAXPROCS, mongo 6, es 8).
                                            # raise only if the server is provisioned (max_connections bumped, etc.).
     prewarm: 0                             # Postgres only: keep N spare clones pre-restored from the cached

@@ -1965,7 +1965,13 @@ type DumpSpec struct {
 // JSONSchema documents the bare-string-or-mapping shape.
 func (DumpSpec) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
-	props.Set("path", &jsonschema.Schema{Type: "string", Description: "Dump file path, relative to the worktree checkout root. Required."})
+	props.Set(
+		"path",
+		&jsonschema.Schema{
+			Type:        "string",
+			Description: "Dump file path, relative to the worktree checkout root. A gitignored dump the worktree lacks is symlinked from the main checkout. Required.",
+		},
+	)
 	props.Set("optional", &jsonschema.Schema{Type: "boolean", Description: "When true, missing dump is not an error."})
 	props.Set(
 		"source_db",

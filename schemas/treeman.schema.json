@@ -397,7 +397,7 @@
           "properties": {
             "path": {
               "type": "string",
-              "description": "Dump file path, relative to the worktree checkout root. Required."
+              "description": "Dump file path, relative to the worktree checkout root. A gitignored dump the worktree lacks is symlinked from the main checkout. Required."
             },
             "optional": {
               "type": "boolean",
@@ -426,7 +426,7 @@
                 "properties": {
                   "path": {
                     "type": "string",
-                    "description": "Dump file path, relative to the worktree checkout root. Required."
+                    "description": "Dump file path, relative to the worktree checkout root. A gitignored dump the worktree lacks is symlinked from the main checkout. Required."
                   },
                   "optional": {
                     "type": "boolean",

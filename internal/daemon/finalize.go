@@ -478,7 +478,11 @@ func bringInWithEvents(
 			})
 		return brErr
 	}
-	if err := emit(store.EvtLinksStart, store.EvtLinksPath, store.EvtLinksEnd, "link", cfg.Worktrees.Links); err != nil {
+	links, err := wt.LinkPaths(ctx, cfg, repoRoot, wtRoot)
+	if err != nil {
+		return err
+	}
+	if err := emit(store.EvtLinksStart, store.EvtLinksPath, store.EvtLinksEnd, "link", links); err != nil {
 		return err
 	}
 	return emit(store.EvtCopiesStart, store.EvtCopiesPath, store.EvtCopiesEnd, "copy", cfg.Worktrees.Copies)

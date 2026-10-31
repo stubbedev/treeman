@@ -303,7 +303,11 @@ func bringInAndPatch(
 	tplCtx template.Context,
 	sink Sink,
 ) error {
-	if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Links, "link", sink); err != nil {
+	links, err := LinkPaths(ctx, cfg, repoRoot, wtPath)
+	if err != nil {
+		return err
+	}
+	if err := BringInFiles(ctx, repoRoot, wtPath, links, "link", sink); err != nil {
 		return err
 	}
 	if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Copies, "copy", sink); err != nil {

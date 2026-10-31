@@ -91,7 +91,11 @@ func runLocalFinalizeSteps(
 	// child / `wt finalize --local` fallback. Skipped for the main
 	// worktree (src == dst), matching the daemon.
 	if !isMain {
-		if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Links, "link", sink); err != nil {
+		links, err := LinkPaths(ctx, cfg, repoRoot, wtPath)
+		if err != nil {
+			return false, err
+		}
+		if err := BringInFiles(ctx, repoRoot, wtPath, links, "link", sink); err != nil {
 			return false, err
 		}
 		if err := BringInFiles(ctx, repoRoot, wtPath, cfg.Worktrees.Copies, "copy", sink); err != nil {
