@@ -33,6 +33,9 @@ type dumpRef struct {
 }
 
 func ignoredDumpLinks(ctx context.Context, dbs []config.DatabaseConfig, repoRoot, wtPath string) ([]string, error) {
+	if filepath.Clean(repoRoot) == filepath.Clean(wtPath) {
+		return nil, nil
+	}
 	var refs []dumpRef
 	for i, d := range dbs {
 		for j, ds := range d.Dump {

@@ -105,3 +105,18 @@ func TestLinkPathsSkipsMissingOptionalAndTrackedDumps(t *testing.T) {
 		t.Errorf("LinkPaths = %v, want %v", got, want)
 	}
 }
+
+func TestLinkPathsAddsNoDumpLinksForTheMainCheckout(t *testing.T) {
+	notARepo := t.TempDir()
+	cfg := &config.Config{
+		Databases: []config.DatabaseConfig{{Engine: "mysql", Dump: config.DumpList{{Path: ignoredDumpRel}}}},
+	}
+	cfg.Worktrees.Links = []string{"vendor"}
+	got, err := LinkPaths(context.Background(), cfg, notARepo, notARepo+"/")
+	if err != nil {
+		t.Fatalf("LinkPaths on the main checkout must not consult git: %v", err)
+	}
+	if !slices.Equal(got, []string{"vendor"}) {
+		t.Fatalf("LinkPaths = %v, want only the configured links", got)
+	}
+}
