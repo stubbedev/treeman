@@ -1,11 +1,15 @@
 package shellenv
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stubbedev/treeman/internal/shellenv/shellenvtest"
 )
 
 func TestParseProbedPATH(t *testing.T) {
@@ -89,11 +93,9 @@ func TestMergePaths(t *testing.T) {
 // TestBaseEnvMergesLoginPath asserts the inheritedEnv PATH keeps
 // precedence (leads) while the login-shell PATH is folded in after.
 func TestBaseEnvMergesLoginPath(t *testing.T) {
-	orig := LoginShellPATH
-	defer func() { LoginShellPATH = orig }()
-	LoginShellPATH = func() string { return "/nix-profile/bin:/user/shims" }
+	stubLoginShellPATH(t, "/nix-profile/bin:/user/shims")
 
-	env := BaseEnv(map[string]string{"PATH": "/user/shims:/user/bin"})
+	env := baseEnv(map[string]string{"PATH": "/user/shims:/user/bin"})
 	got := env["PATH"]
 	const wantPrefix = "/user/shims:/user/bin"
 	if got[:len(wantPrefix)] != wantPrefix {
@@ -109,9 +111,7 @@ func TestBaseEnvMergesLoginPath(t *testing.T) {
 // lead the daemon floor, so a stale /usr/local/bin tool can't shadow
 // the user's profile bin (#121).
 func TestBaseEnvLoginPathLeadsWithoutInherited(t *testing.T) {
-	orig := LoginShellPATH
-	defer func() { LoginShellPATH = orig }()
-	LoginShellPATH = func() string { return "/nix-profile/bin:/usr/bin" }
+	stubLoginShellPATH(t, "/nix-profile/bin:/usr/bin")
 	t.Setenv("PATH", "/usr/local/bin:/usr/bin")
 
 	for name, inherited := range map[string]map[string]string{
@@ -120,7 +120,7 @@ func TestBaseEnvLoginPathLeadsWithoutInherited(t *testing.T) {
 		"no PATH":    {"FOO": "bar"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			got := BaseEnv(inherited)["PATH"]
+			got := baseEnv(inherited)["PATH"]
 			if want := "/nix-profile/bin:/usr/bin:/usr/local/bin"; got != want {
 				t.Errorf("PATH = %q, want %q", got, want)
 			}
@@ -160,5 +160,84 @@ func TestLoginShellPATHDoesNotCacheFailure(t *testing.T) {
 	result = ""
 	if got := cachedLoginShellPATH(); got != "/nix-profile/bin" || calls != 2 {
 		t.Fatalf("cached probe: got %q calls=%d", got, calls)
+	}
+}
+
+func stubLoginShellPATH(t *testing.T, p string) {
+	t.Helper()
+	orig := LoginShellPATH
+	t.Cleanup(func() { LoginShellPATH = orig })
+	LoginShellPATH = func() string { return p }
+}
+
+func TestCommandEnvAppliesDirenvDiff(t *testing.T) {
+	stubLoginShellPATH(t, "")
+	bin := shellenvtest.FakeDirenv(t, `[ "$1 $2" = "export json" ] || exit 2
+printf '{"PATH":"/flake/bin:%s","FLAKE_DIR":"%s","STALE":null}' "$PATH" "$(pwd)"
+`)
+	dir := t.TempDir()
+	env, err := CommandEnv(context.Background(), map[string]string{"PATH": bin, "STALE": "1"}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := env["PATH"], "/flake/bin:"+bin; got != want {
+		t.Errorf("PATH = %q, want %q", got, want)
+	}
+	if got := env["FLAKE_DIR"]; got != dir {
+		t.Errorf("FLAKE_DIR = %q, want direnv run in %q", got, dir)
+	}
+	if _, ok := env["STALE"]; ok {
+		t.Error("STALE should be unset by a null in the direnv diff")
+	}
+}
+
+func TestCommandEnvNoDirenvDiff(t *testing.T) {
+	stubLoginShellPATH(t, "")
+	bin := shellenvtest.FakeDirenv(t, "exit 0\n")
+	env, err := CommandEnv(context.Background(), map[string]string{"PATH": bin, "KEEP": "1"}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env["KEEP"] != "1" || env["PATH"] != bin {
+		t.Errorf("env changed without a direnv diff: KEEP=%q PATH=%q", env["KEEP"], env["PATH"])
+	}
+}
+
+func TestCommandEnvWithoutDirenvOnPath(t *testing.T) {
+	stubLoginShellPATH(t, "")
+	empty := t.TempDir()
+	env, err := CommandEnv(context.Background(), map[string]string{"PATH": empty, "KEEP": "1"}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env["KEEP"] != "1" || env["PATH"] != empty {
+		t.Errorf("env changed without direnv: KEEP=%q PATH=%q", env["KEEP"], env["PATH"])
+	}
+}
+
+func TestCommandEnvFailsOnBlockedEnvrc(t *testing.T) {
+	stubLoginShellPATH(t, "")
+	bin := shellenvtest.FakeDirenv(t, "echo 'direnv: error .envrc is blocked. Run `direnv allow` to approve its content' >&2\nexit 1\n")
+	dir := t.TempDir()
+	_, err := CommandEnv(context.Background(), map[string]string{"PATH": bin}, dir)
+	if err == nil {
+		t.Fatal("expected an error for a blocked .envrc")
+	}
+	for _, want := range []string{dir, "is blocked", "direnv allow"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestBaseEnvDropsDaemonDirenvState(t *testing.T) {
+	stubLoginShellPATH(t, "")
+	t.Setenv("DIRENV_DIFF", "daemon")
+	t.Setenv("DIRENV_DIR", "-/daemon")
+	if env := baseEnv(nil); env["DIRENV_DIFF"] != "" || env["DIRENV_DIR"] != "" {
+		t.Errorf("daemon direnv state leaked: DIRENV_DIFF=%q DIRENV_DIR=%q", env["DIRENV_DIFF"], env["DIRENV_DIR"])
+	}
+	if env := baseEnv(map[string]string{"DIRENV_DIFF": "user"}); env["DIRENV_DIFF"] != "user" {
+		t.Errorf("user direnv state dropped: DIRENV_DIFF=%q", env["DIRENV_DIFF"])
 	}
 }

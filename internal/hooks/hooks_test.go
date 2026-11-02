@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/shellenv/shellenvtest"
 )
 
 // emptyEnv returns the minimum env needed for `sh -c <cmd>` to
@@ -269,11 +270,22 @@ func TestRenderActionNoContainerPassesThrough(t *testing.T) {
 // TestBuildEnvUserPathWins asserts the user's PATH from inheritedEnv
 // keeps precedence — its directories lead the merged PATH, so their
 // version-manager shims (asdf, nvm, mise, …) resolve first. The
-// login-shell PATH is merged in after (see shellenv.BaseEnv), so the
+// login-shell PATH is merged in after (see shellenv.CommandEnv), so the
 // user's dirs stay at the front while the user's profile bin dirs are
 // still guaranteed present.
 func TestBuildEnvUserPathWins(t *testing.T) {
-	env := buildEnv(map[string]string{"PATH": "/user/shims:/user/bin"}, "/repo", "/wt", "slug", false)
+	env, err := buildEnv(
+		context.Background(),
+		map[string]string{"PATH": "/user/shims:/user/bin"},
+		t.TempDir(),
+		"/repo",
+		"/wt",
+		"slug",
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pathLine := ""
 	for _, kv := range env {
 		if len(kv) > 5 && kv[:5] == "PATH=" {
@@ -295,7 +307,10 @@ func TestBuildEnvFallsBackToDaemonPath(t *testing.T) {
 	if os.Getenv("PATH") == "" {
 		t.Skip("test runner has no PATH set; skipping fallback assertion")
 	}
-	env := buildEnv(nil, "/repo", "/wt", "slug", false) // no inheritedEnv, no PATH
+	env, err := buildEnv(context.Background(), nil, t.TempDir(), "/repo", "/wt", "slug", false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	foundPath := false
 	for _, kv := range env {
 		if len(kv) > 5 && kv[:5] == "PATH=" {
@@ -365,4 +380,36 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// TestRunHooksLoadDirenvEnvironment asserts a hook resolves a tool that
+// only the worktree's direnv environment provides, as `use flake` does
+// for composer/php (#182).
+func TestRunHooksLoadDirenvEnvironment(t *testing.T) {
+	wt := t.TempDir()
+	tools := shellenvtest.FakeTool(t, "composer", "echo composer-from-flake\n")
+	env := emptyEnv()
+	env["PATH"] = shellenvtest.FlakeDirenv(t, tools) + ":" + env["PATH"]
+	entries := []config.Action{{Run: []string{"composer install"}}}
+	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, env, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := out.Groups[0]; g.ExitCode != 0 || !strings.Contains(string(g.LogBody), "composer-from-flake") {
+		t.Errorf("hook did not run under the direnv environment: exit=%d log=%q", g.ExitCode, g.LogBody)
+	}
+}
+
+// TestRunHooksFailsWhenDirenvCannotLoad asserts a blocked `.envrc`
+// fails the phase with direnv's own message instead of running the
+// hooks without the environment they were written for.
+func TestRunHooksFailsWhenDirenvCannotLoad(t *testing.T) {
+	wt := t.TempDir()
+	env := emptyEnv()
+	env["PATH"] = shellenvtest.FakeDirenv(t, "echo '.envrc is blocked' >&2; exit 1\n") + ":" + env["PATH"]
+	entries := []config.Action{{Run: []string{"true"}}}
+	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, env, true)
+	if err == nil || !strings.Contains(err.Error(), ".envrc is blocked") {
+		t.Fatalf("err = %v, want the direnv failure", err)
+	}
 }

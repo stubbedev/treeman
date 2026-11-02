@@ -7,7 +7,7 @@
 // terminal. They should never have to write it differently because
 // treeman ran it.
 //
-// To honour that, BaseEnv layers three sources:
+// To honour that, baseEnv layers three sources:
 //
 //  1. The daemon's own os.Environ() — the floor. HOME, USER, LANG,
 //     XDG_*, the OS essentials every process its user owns receives.
@@ -25,10 +25,17 @@
 //     dirs are appended (the user's live session wins); without one
 //     they LEAD the daemon floor, so a stale /usr/local/bin tool can't
 //     shadow the profile bin the user's terminal would resolve (#121).
+//
+// CommandEnv then applies the directory's direnv environment on top,
+// exactly as the user's direnv shell hook would on `cd`: a repo whose
+// tools come from `.envrc` (`use flake`, `layout php`, …) resolves them
+// in hooks and engine steps without any per-command wrapping (#182).
 package shellenv
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -45,15 +52,106 @@ import (
 	"github.com/stubbedev/treeman/internal/detach"
 )
 
-// BaseEnv returns the foundational env map: daemon floor, overlaid with
+// CommandEnv returns the env a user-declared command run in dir gets:
+// baseEnv, with dir's direnv environment applied when direnv is on the
+// resulting PATH. Callers overlay their own scoping vars (TREEMAN_*) on
+// top. A direnv that fails to load (a blocked or broken `.envrc`) is an
+// error rather than a silently missing toolchain.
+func CommandEnv(ctx context.Context, inheritedEnv map[string]string, dir string) (map[string]string, error) {
+	env := baseEnv(inheritedEnv)
+	if err := applyDirenv(ctx, env, dir); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+// Flatten renders env as the KEY=VALUE list exec.Cmd.Env takes.
+func Flatten(env map[string]string) []string {
+	out := make([]string, 0, len(env))
+	for k, v := range env {
+		out = append(out, k+"="+v)
+	}
+	return out
+}
+
+const direnvTimeout = 10 * time.Minute
+
+// applyDirenv runs `direnv export json` in dir against env and applies
+// the resulting diff to env in place: a string sets the variable, null
+// unsets it. direnv computes the diff from env itself, so an inherited
+// environment from another direnv directory is reverted first, the same
+// as `cd` between two such directories in the user's terminal.
+func applyDirenv(ctx context.Context, env map[string]string, dir string) error {
+	bin := lookPathIn("direnv", env["PATH"])
+	if bin == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, direnvTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "export", "json")
+	cmd.Dir = dir
+	cmd.Env = Flatten(env)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("load direnv environment for %s (%s export json): %w: %s",
+			dir, bin, err, strings.TrimSpace(stderr.String()))
+	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		return nil
+	}
+	var diff map[string]*string
+	if err := json.Unmarshal(out, &diff); err != nil {
+		return fmt.Errorf("parse %s export json output for %s: %w", bin, dir, err)
+	}
+	for k, v := range diff {
+		if v == nil {
+			delete(env, k)
+			continue
+		}
+		env[k] = *v
+	}
+	return nil
+}
+
+// lookPathIn resolves name against pathList the way the shell would,
+// returning "" when no directory holds an executable of that name.
+// exec.LookPath cannot be used: it searches the daemon's own PATH, not
+// the one the command will run with.
+func lookPathIn(name, pathList string) string {
+	for dir := range strings.SplitSeq(pathList, string(os.PathListSeparator)) {
+		if dir == "" || !filepath.IsAbs(dir) {
+			continue
+		}
+		p := filepath.Join(dir, name)
+		info, err := os.Stat(p)
+		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			return p
+		}
+	}
+	return ""
+}
+
+// direnvStatePrefix marks the variables direnv keeps about what it has
+// loaded (DIRENV_DIFF, DIRENV_DIR, …). The daemon's own are dropped from
+// the floor: they describe whatever shell started the daemon, and direnv
+// would revert that foreign diff over the user's PATH. The user's, from
+// inheritedEnv, are kept so a worktree's `.envrc` replaces the one their
+// terminal had loaded, as `cd` would.
+const direnvStatePrefix = "DIRENV_"
+
+// baseEnv returns the foundational env map: daemon floor, overlaid with
 // the user's inheritedEnv, with the login-shell PATH always merged into
-// PATH. Callers overlay their own scoping vars (TREEMAN_*) on top.
-func BaseEnv(inheritedEnv map[string]string) map[string]string {
+// PATH.
+func baseEnv(inheritedEnv map[string]string) map[string]string {
 	merged := make(map[string]string, len(inheritedEnv)+32)
 	for _, kv := range os.Environ() {
-		if k, v, ok := strings.Cut(kv, "="); ok {
-			merged[k] = v
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || strings.HasPrefix(k, direnvStatePrefix) {
+			continue
 		}
+		merged[k] = v
 	}
 	daemonPATH := merged["PATH"]
 	maps.Copy(merged, inheritedEnv)

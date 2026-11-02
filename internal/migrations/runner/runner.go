@@ -160,24 +160,14 @@ func Run(
 	c := exec.CommandContext(ctx, "sh", "-c", spec.Run)
 	c.Dir = repoRoot
 
-	// Build the subprocess env via the same model as hooks: daemon
-	// floor, overlaid with the user's cached env, with the login-shell
-	// PATH always merged in (see shellenv.BaseEnv). This gives migrate/
-	// seed commands the same env they'd have in the user's own terminal,
-	// and keeps them working when inheritedEnv is empty (an externally-
-	// created worktree finalized by the lifecycle watcher). Rendered env
-	// and TREEMAN_TARGET_DB are layered last so they win.
-	merged := shellenv.BaseEnv(inheritedEnv)
+	merged, err := shellenv.CommandEnv(ctx, inheritedEnv, repoRoot)
+	if err != nil {
+		return Outcome{ExitCode: -1}, fmt.Errorf("%s environment: %w", spec.Label, err)
+	}
 	merged["TREEMAN_TARGET_DB"] = targetDB
 	maps.Copy(merged, renderedEnv)
-	// ExtraEnv carries already-resolved literals (e.g.
-	// TREEMAN_ROLLBACK_STEPS); layer last so it wins.
 	maps.Copy(merged, spec.ExtraEnv)
-	env := make([]string, 0, len(merged))
-	for k, v := range merged {
-		env = append(env, k+"="+v)
-	}
-	c.Env = env
+	c.Env = shellenv.Flatten(merged)
 
 	var stdout, stderr bytes.Buffer
 	var stdoutW io.Writer = tailWriter(&stdout, 16*1024)
@@ -198,7 +188,7 @@ func Run(
 	c.Stdout = stdoutW
 	c.Stderr = stderrW
 
-	err := c.Run()
+	err = c.Run()
 	out := Outcome{
 		StdoutTail: stdout.String(),
 		StderrTail: stderr.String(),

@@ -105,6 +105,10 @@ func RunHooksOrphan(
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return out, fmt.Errorf("create %s: %w", logDir, err)
 	}
+	env, err := buildEnv(ctx, inheritedEnv, repoRoot, repoRoot, worktreePath, slug, isMain)
+	if err != nil {
+		return out, err
+	}
 	out.Groups = make([]GroupOutcome, 0, len(entries))
 	cmds := make([]*exec.Cmd, 0, len(entries))
 	for i, entry := range entries {
@@ -117,7 +121,7 @@ func RunHooksOrphan(
 		if err != nil {
 			return out, err
 		}
-		c, err := spawnDetached(cmdStr, repoRoot, worktreePath, repoRoot, slug, isMain, logPath, inheritedEnv, wait)
+		c, err := spawnDetached(cmdStr, repoRoot, logPath, env, wait)
 		if err != nil {
 			return out, err
 		}
@@ -172,6 +176,10 @@ func RunHooks(
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return out, fmt.Errorf("create %s: %w", logDir, err)
 	}
+	env, err := buildEnv(ctx, inheritedEnv, worktreePath, repoRoot, worktreePath, slug, isMain)
+	if err != nil {
+		return out, err
+	}
 	out.Groups = make([]GroupOutcome, 0, len(entries))
 	cmds := make([]*exec.Cmd, 0, len(entries))
 	for i, entry := range entries {
@@ -183,7 +191,7 @@ func RunHooks(
 		if err != nil {
 			return out, err
 		}
-		c, err := spawnDetached(cmdStr, worktreePath, worktreePath, repoRoot, slug, isMain, logPath, inheritedEnv, wait)
+		c, err := spawnDetached(cmdStr, worktreePath, logPath, env, wait)
 		if err != nil {
 			return out, err
 		}
@@ -354,26 +362,12 @@ func shellSingleQuote(s string) string {
 	return b.String()
 }
 
-// spawnDetached forks a `setsid /bin/sh -c <cmd>` child with
-// stdout+stderr redirected to logPath. Env is cleared then layered
-// with the caller's inheritedEnv plus the four standard overlay
-// vars (TREEMAN_MAIN_ROOT, TREEMAN_WORKTREE, TREEMAN_SLUG,
-// TREEMAN_IS_MAIN). Returns the *exec.Cmd so the caller can either
-// reap it inline (`Wait()` on the wait=true path) or fire-and-forget
-// via a detached goroutine.
-//
-// `cwd` is the child's working directory. For the normal flow this
-// equals `worktreePath`; for the lifecycle-orphan flow (worktree
-// already deleted) it is the repo root, while `worktreePath` is the
-// deleted absolute path — surfaced in the env so user scripts can
-// still reference it.
-func spawnDetached(
-	cmdStr, cwd, worktreePath, repoRoot, slug string,
-	isMain bool,
-	logPath string,
-	inheritedEnv map[string]string,
-	wait bool,
-) (*exec.Cmd, error) {
+// spawnDetached forks a `setsid /bin/sh -c <cmd>` child in cwd with
+// exactly env (see buildEnv) and stdout+stderr redirected to logPath.
+// Returns the *exec.Cmd so the caller can either reap it inline
+// (`Wait()` on the wait=true path) or fire-and-forget via a detached
+// goroutine.
+func spawnDetached(cmdStr, cwd, logPath string, env []string, wait bool) (*exec.Cmd, error) {
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open hook log %s: %w", logPath, err)
@@ -389,7 +383,7 @@ func spawnDetached(
 		return nil, err
 	}
 	c.Dir = cwd
-	c.Env = buildEnv(inheritedEnv, repoRoot, worktreePath, slug, isMain)
+	c.Env = env
 	c.Stdout = logFile
 	c.Stderr = logFile
 	c.Stdin = nil
@@ -419,34 +413,26 @@ func spawnDetached(
 	return c, nil
 }
 
-// buildEnv assembles the env shipped to a hook subprocess. The goal:
-// user commands declared in `.treeman.yaml` should see the same env
-// they would see if the user pasted them into their terminal.
+// buildEnv assembles the env shipped to every hook subprocess of one
+// phase: shellenv.CommandEnv for cwd (the user's terminal env, including
+// cwd's direnv environment), overlaid with the treeman scoping vars
+// (TREEMAN_MAIN_ROOT, _WORKTREE, _SLUG, _IS_MAIN), which always win.
+// _IS_MAIN is "1" when this hook is firing for the repo root's main-wt
+// enrollment, "0" for any linked worktree.
 //
-// The model:
-//
-//  1. Start from the daemon's own `os.Environ()`. This is the floor:
-//     HOME, USER, SHELL, LANG, XDG_*, PATH — every essential the OS
-//     gives any process its user owns. Without this, commands like
-//     `composer install` fail because they refuse to run when HOME is
-//     unset, even though every interactive shell on the host has HOME.
-//  2. Overlay the user's CLI-captured env (`inheritedEnv`, ultimately
-//     os.Environ() at `treeman worktree create` time). The user's PATH,
-//     language version manager shims (asdf, nvm, mise, rbenv, …),
-//     and any session-specific overrides take precedence over the
-//     daemon's floor.
-//  3. Overlay the treeman scoping vars (TREEMAN_MAIN_ROOT, _WORKTREE,
-//     _SLUG, _IS_MAIN) so user scripts can address them. These always
-//     win. _IS_MAIN is "1" when this hook is firing for the repo
-//     root's main-wt enrollment, "0" for any linked worktree — lets a
-//     shared create-* hook branch behaviour (e.g. skip the dev .env
-//     copy on linked wts).
-//
-// Layering order means the lifecycle watcher's empty `inheritedEnv`
-// is still safe (the daemon's env fills the floor), and a user with a
-// rich shell setup still gets their PATH / shims propagated.
-func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug string, isMain bool) []string {
-	merged := shellenv.BaseEnv(inheritedEnv)
+// cwd is the hooks' working directory: the worktree normally, the repo
+// root for the lifecycle-orphan flow, where worktreePath is the deleted
+// path, still surfaced so user scripts can reference it.
+func buildEnv(
+	ctx context.Context,
+	inheritedEnv map[string]string,
+	cwd, repoRoot, worktreePath, slug string,
+	isMain bool,
+) ([]string, error) {
+	merged, err := shellenv.CommandEnv(ctx, inheritedEnv, cwd)
+	if err != nil {
+		return nil, fmt.Errorf("hook environment: %w", err)
+	}
 	merged["TREEMAN_MAIN_ROOT"] = repoRoot
 	merged["TREEMAN_WORKTREE"] = worktreePath
 	merged["TREEMAN_SLUG"] = slug
@@ -455,9 +441,5 @@ func buildEnv(inheritedEnv map[string]string, repoRoot, worktreePath, slug strin
 	} else {
 		merged["TREEMAN_IS_MAIN"] = "0"
 	}
-	out := make([]string, 0, len(merged))
-	for k, v := range merged {
-		out = append(out, k+"="+v)
-	}
-	return out
+	return shellenv.Flatten(merged), nil
 }

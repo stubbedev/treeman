@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/shellenv/shellenvtest"
 	"github.com/stubbedev/treeman/internal/template"
 )
 
@@ -41,7 +42,7 @@ func TestRollbackStepsVisibleToCommand(t *testing.T) {
 
 // TestRollbackSharesMigratePathInjection proves the rollback command
 // runs with the exact same PATH as migrate — both flow through
-// runner.Run → shellenv.BaseEnv, which merges the daemon's login-shell
+// runner.Run → shellenv.CommandEnv, which merges the daemon's login-shell
 // PATH. Equal, non-empty PATH for both specs guards against rollback
 // ever bypassing that shared env injection.
 func TestRollbackSharesMigratePathInjection(t *testing.T) {
@@ -61,5 +62,26 @@ func TestRollbackSharesMigratePathInjection(t *testing.T) {
 	}
 	if mg.StdoutTail != rb.StdoutTail {
 		t.Errorf("rollback PATH differs from migrate:\n migrate=%q\n rollback=%q", mg.StdoutTail, rb.StdoutTail)
+	}
+}
+
+// TestMigrateAndRollbackLoadDirenvEnvironment asserts engine steps
+// resolve a binary only the worktree's direnv environment provides, as
+// `use flake` does for php (#183).
+func TestMigrateAndRollbackLoadDirenvEnvironment(t *testing.T) {
+	tools := shellenvtest.FakeTool(t, "php", "echo php-from-flake\n")
+	env := map[string]string{"PATH": shellenvtest.FlakeDirenv(t, tools) + ":/usr/bin:/bin"}
+	for _, spec := range []Spec{
+		FromMigrate(config.Step{Run: "php artisan migrate"}),
+		FromRollback(config.Step{Run: "php artisan migrate:rollback"}, 1),
+	} {
+		out, err := Run(context.Background(), spec, t.TempDir(), "anydb", template.Context{}, env)
+		if err != nil {
+			t.Fatalf("%s: %v", spec.Label, err)
+		}
+		if out.ExitCode != 0 || !strings.Contains(out.StdoutTail, "php-from-flake") {
+			t.Errorf("%s did not run under the direnv environment: exit=%d stdout=%q stderr=%q",
+				spec.Label, out.ExitCode, out.StdoutTail, out.StderrTail)
+		}
 	}
 }

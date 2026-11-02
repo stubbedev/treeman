@@ -354,8 +354,16 @@ container's `WORKDIR`.
 ### Hook environment variables
 
 Every hook subprocess inherits the user's `worktree create`-time env (PATH,
-shims, `.env`-loaded vars) plus four scoping variables treeman sets
-unconditionally:
+shims, `.env`-loaded vars). When `direnv` is on that PATH, the environment of
+the directory the command runs in is applied on top, exactly as direnv's shell
+hook would on `cd`, so tools that only a `.envrc` provides (`use flake`,
+`layout php`, …) resolve without wrapping each command in `direnv exec`. The
+same environment applies to every `databases[]` `migrate`, `rollback` and
+`seed` step. A `.envrc` that direnv refuses to load (blocked, or failing)
+fails the hook or step with direnv's message; run `direnv allow` in the
+worktree, or whitelist the worktree root in `direnv.toml`.
+
+Hooks additionally get four scoping variables treeman sets unconditionally:
 
 | Variable           | Value                                                                  |
 | ------------------ | ---------------------------------------------------------------------- |
