@@ -53,12 +53,14 @@ import (
 )
 
 // CommandEnv returns the env a user-declared command run in dir gets:
-// baseEnv, with dir's direnv environment applied when direnv is on the
-// resulting PATH. Callers overlay their own scoping vars (TREEMAN_*) on
+// baseEnv with PWD set to dir, as `cd` would (the inherited one names
+// whatever directory the daemon or CLI ran in), and dir's direnv
+// environment applied when direnv is on the resulting PATH. Callers overlay their own scoping vars (TREEMAN_*) on
 // top. A direnv that fails to load (a blocked or broken `.envrc`) is an
 // error rather than a silently missing toolchain.
 func CommandEnv(ctx context.Context, inheritedEnv map[string]string, dir string) (map[string]string, error) {
 	env := baseEnv(inheritedEnv)
+	env["PWD"] = dir
 	if err := applyDirenv(ctx, env, dir); err != nil {
 		return nil, err
 	}

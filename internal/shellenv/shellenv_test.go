@@ -241,3 +241,16 @@ func TestBaseEnvDropsDaemonDirenvState(t *testing.T) {
 		t.Errorf("user direnv state dropped: DIRENV_DIFF=%q", env["DIRENV_DIFF"])
 	}
 }
+
+func TestCommandEnvSetsPWD(t *testing.T) {
+	stubLoginShellPATH(t, "")
+	t.Setenv("PWD", "/daemon/cwd")
+	dir := t.TempDir()
+	env, err := CommandEnv(context.Background(), map[string]string{"PATH": t.TempDir(), "PWD": "/cli/cwd"}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env["PWD"] != dir {
+		t.Errorf("PWD = %q, want %q", env["PWD"], dir)
+	}
+}
