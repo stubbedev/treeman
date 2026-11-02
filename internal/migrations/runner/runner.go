@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -117,6 +118,68 @@ func FormatError(label, target string, out Outcome) string {
 		fmt.Fprintf(&b, " (full log: %s)", out.LogPath)
 	}
 	return b.String()
+}
+
+// commandNotFoundExit is the status POSIX shells exit with when the
+// command they were asked to run does not resolve on PATH.
+const commandNotFoundExit = 127
+
+// missingCommandPatterns extract the unresolved command from the shell's
+// complaint: dash (`sh: 1: php: not found`), bash (`sh: line 1: php:
+// command not found`) and env (`env: 'php': No such file or directory`).
+var missingCommandPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`: ([^\s:]+): (?:command )?not found`),
+	regexp.MustCompile(`env: '([^']+)': No such file or directory`),
+}
+
+// StepError is a step that ran and exited non-zero.
+type StepError struct {
+	Label   string
+	Target  string
+	Outcome Outcome
+}
+
+func (e *StepError) Error() string {
+	msg := FormatError(e.Label, e.Target, e.Outcome)
+	if !e.CommandNotFound() {
+		return msg
+	}
+	what := "the command"
+	if name := e.MissingCommand(); name != "" {
+		what = "`" + name + "`"
+	}
+	return msg + "\nhint: " + what + " was not found on the PATH this step runs with (exit 127). " +
+		"This is a configuration problem, not a database one: install it, or provide it from the worktree's " +
+		"`.envrc` (treeman loads it via direnv)"
+}
+
+// CommandNotFound reports whether the shell could not resolve the
+// step's command: nothing ran, so the target database is untouched.
+func (e *StepError) CommandNotFound() bool { return e.Outcome.ExitCode == commandNotFoundExit }
+
+// MissingCommand names the command the shell could not resolve, or ""
+// when its complaint is not in a recognised form.
+func (e *StepError) MissingCommand() string {
+	if !e.CommandNotFound() {
+		return ""
+	}
+	name := ""
+	for _, re := range missingCommandPatterns {
+		for _, m := range re.FindAllStringSubmatch(e.Outcome.StderrTail, -1) {
+			name = m[1]
+		}
+		if name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// IsCommandNotFound reports whether err is, or wraps, a StepError whose
+// command did not resolve.
+func IsCommandNotFound(err error) bool {
+	se, ok := errors.AsType[*StepError](err)
+	return ok && se.CommandNotFound()
 }
 
 // Run executes `spec.Run` via `sh -c` against `targetDB`.

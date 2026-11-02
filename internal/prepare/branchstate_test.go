@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -996,6 +997,34 @@ func TestResumeMigrateAbortDoesNotReseed(t *testing.T) {
 				t.Fatal("durable must survive an aborted migrate")
 			}
 		})
+	}
+}
+
+// TestResumeMigrateMissingCommandDoesNotReseed: a migrate whose command
+// is not on PATH never touched the resumed durable. It must not be
+// re-seeded over or dropped, and the error must not send the user to
+// `treeman db reset` (#183).
+func TestResumeMigrateMissingCommandDoesNotReseed(t *testing.T) {
+	f := newBSFixture(t)
+	f.d.Migrate = &config.Step{Run: "php artisan migrate"}
+	f.set(f.durable("feature/x"), map[string]string{"data": "1"})
+	f.set("parentdb", map[string]string{"p": "1"})
+	f.parent = func(string) (string, bool, error) { return "parentdb", true, nil }
+	missing := &runner.StepError{Label: "migrate", Target: f.active, Outcome: runner.Outcome{
+		ExitCode: 127, StderrTail: "sh: 1: php: not found",
+	}}
+	f.migrateFn = func(context.Context, string) error { return missing }
+
+	_, err := f.runErr("feature/x")
+	if !errors.Is(err, missing) {
+		t.Fatalf("want the missing-command error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "db reset") {
+		t.Errorf("a missing command must not suggest db reset: %v", err)
+	}
+	f.assertActive("data")
+	if _, ok := f.fake.data[f.durable("feature/x")]; !ok {
+		t.Fatal("durable must survive a migrate whose command was missing")
 	}
 }
 

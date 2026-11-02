@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -178,5 +180,62 @@ func TestRunInheritsCwd(t *testing.T) {
 	gotAbs, _ := filepath.EvalSymlinks(got)
 	if gotAbs != want {
 		t.Errorf("cwd: got %q, want %q", got, want)
+	}
+}
+
+// TestMissingCommandIsCommandNotFound: a step whose command does not
+// resolve exits 127 and is classified as a configuration error naming
+// the missing binary, not as a database failure (#183).
+func TestMissingCommandIsCommandNotFound(t *testing.T) {
+	spec := FromMigrate(config.Step{Run: "treeman-no-such-binary artisan migrate"})
+	out, err := Run(context.Background(), spec, t.TempDir(), "anydb", template.Context{},
+		map[string]string{"PATH": "/usr/bin:/bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepErr := &StepError{Label: "migrate", Target: "anydb", Outcome: out}
+	if !IsCommandNotFound(fmt.Errorf("databases[0]: %w", stepErr)) {
+		t.Fatalf("exit %d not classified as command not found; stderr=%q", out.ExitCode, out.StderrTail)
+	}
+	if got := stepErr.MissingCommand(); got != "treeman-no-such-binary" {
+		t.Errorf("MissingCommand = %q, want treeman-no-such-binary (stderr=%q)", got, out.StderrTail)
+	}
+	msg := stepErr.Error()
+	for _, want := range []string{"`treeman-no-such-binary` was not found", "exit 127", ".envrc"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not mention %q", msg, want)
+		}
+	}
+}
+
+func TestStepErrorMissingCommand(t *testing.T) {
+	cases := []struct {
+		name, stderr, want string
+		exit               int
+	}{
+		{"dash", "sh: 1: php: not found\n", "php", 127},
+		{"bash", "sh: line 1: composer: command not found\n", "composer", 127},
+		{"env", "env: 'php': No such file or directory\n", "php", 127},
+		{"last complaint wins", "sh: 1: a: not found\nsh: 1: php: not found\n", "php", 127},
+		{"unrecognised", "something else\n", "", 127},
+		{"not a 127", "sh: 1: php: not found\n", "", 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := &StepError{Label: "migrate", Target: "db", Outcome: Outcome{ExitCode: c.exit, StderrTail: c.stderr}}
+			if got := e.MissingCommand(); got != c.want {
+				t.Errorf("MissingCommand = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestOrdinaryFailureIsNotCommandNotFound(t *testing.T) {
+	err := &StepError{Label: "migrate", Target: "db", Outcome: Outcome{ExitCode: 1, StderrTail: "SQLSTATE[42S21]"}}
+	if IsCommandNotFound(err) || IsCommandNotFound(errors.New("exit 127")) {
+		t.Fatal("only a StepError with exit 127 is a missing command")
+	}
+	if strings.Contains(err.Error(), "hint:") {
+		t.Errorf("ordinary failure must not carry the missing-command hint: %q", err)
 	}
 }

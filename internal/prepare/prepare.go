@@ -90,11 +90,16 @@ func emitRunnerError(ctx context.Context, st *store.Store, repoID, worktreeID in
 		})
 }
 
-func runnerStepFailure(phase, target string, out runner.Outcome, err error) string {
+// stepFailure is the error of one runner.Run, or nil when it ran and
+// exited zero.
+func stepFailure(phase, target string, out runner.Outcome, err error) error {
 	if err != nil {
-		return fmt.Sprintf("%s %s: %v", phase, target, err)
+		return fmt.Errorf("%s %s: %w", phase, target, err)
 	}
-	return runner.FormatError(phase, target, out)
+	if out.ExitCode != 0 {
+		return &runner.StepError{Label: phase, Target: target, Outcome: out}
+	}
+	return nil
 }
 
 // emitPhaseDone writes a `prepare_phase` event tagged with the step
@@ -797,18 +802,24 @@ func (e *RunError) Unwrap() []error {
 	return out
 }
 
-// FailedDBIndices lists the cfg.Databases indices whose prepare failed
-// in an error returned (possibly wrapped) by Run / RunFiltered. nil means
-// err carries no per-database attribution, so the caller cannot tell
-// which databases are healthy.
-func FailedDBIndices(err error) []int {
+// RecoverDBIndices lists the cfg.Databases indices a failed prepare
+// left needing recovery, from an error returned (possibly wrapped) by
+// Run / RunFiltered. A database whose step command did not resolve is
+// left out: nothing ran against it, so dropping it would only discard
+// healthy data over a configuration error. nil means err carries no
+// per-database attribution, so the caller cannot tell which databases
+// are healthy.
+func RecoverDBIndices(err error) []int {
 	var re *RunError
 	if !errors.As(err, &re) {
 		return nil
 	}
-	idx := make([]int, len(re.Failed))
-	for i, f := range re.Failed {
-		idx[i] = f.Index
+	idx := make([]int, 0, len(re.Failed))
+	for _, f := range re.Failed {
+		if runner.IsCommandNotFound(f.Err) {
+			continue
+		}
+		idx = append(idx, f.Index)
 	}
 	return idx
 }
@@ -1397,7 +1408,7 @@ func runPhase(
 	}
 	if out.ExitCode != 0 {
 		emitRunnerError(ctx, st, repoID, worktreeID, d.Engine, target, phase, out)
-		return fmt.Errorf("%s", runner.FormatError(phase+" source", target, out))
+		return &runner.StepError{Label: phase + " source", Target: target, Outcome: out}
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, target, phase, stepStart)
 	return nil
@@ -1874,7 +1885,7 @@ func tryIncrementalBuild(
 		}
 		if out.ExitCode != 0 {
 			emitRunnerError(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", out)
-			return Outcome{}, false, fmt.Errorf("%s", runner.FormatError("incremental migrate", source, out))
+			return Outcome{}, false, &runner.StepError{Label: "incremental migrate", Target: source, Outcome: out}
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", migrateStart)
 	}
@@ -2202,6 +2213,16 @@ func tryRollbackIncrementalBuild(
 				"engine": d.Engine, "ancestor_fingerprint": anc.Fingerprint, "reason": reason,
 			})
 	}
+	// A step whose command does not resolve fails the cold build the
+	// same way, so falling back to one only re-runs the dump load
+	// before the same error.
+	abandonStep := func(err error) (Outcome, bool, error) {
+		if runner.IsCommandNotFound(err) {
+			return Outcome{}, false, err
+		}
+		rollbackFallback(err.Error())
+		return Outcome{}, false, nil
+	}
 
 	if err := ops.snapshotRestore(ctx, anc.TemplateName, source); err != nil {
 		rollbackFallback(fmt.Sprintf("ancestor restore failed: %v", err))
@@ -2215,9 +2236,8 @@ func tryRollbackIncrementalBuild(
 		WithLogPath(runnerLogPath(worktreePath, d.Engine, "rollback", source))
 	rbStart := time.Now()
 	out, err := runner.Run(ctx, rbSpec, worktreePath, source, tplCtx, inheritedEnv)
-	if err != nil || out.ExitCode != 0 {
-		rollbackFallback(runnerStepFailure("rollback", source, out, err))
-		return Outcome{}, false, nil
+	if err := stepFailure("rollback", source, out, err); err != nil {
+		return abandonStep(err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "rollback", rbStart)
 
@@ -2225,9 +2245,8 @@ func tryRollbackIncrementalBuild(
 		WithLogPath(runnerLogPath(worktreePath, d.Engine, "migrate", source))
 	mgStart := time.Now()
 	out, err = runner.Run(ctx, mgSpec, worktreePath, source, tplCtx, inheritedEnv)
-	if err != nil || out.ExitCode != 0 {
-		rollbackFallback(runnerStepFailure("re-migrate", source, out, err))
-		return Outcome{}, false, nil
+	if err := stepFailure("re-migrate", source, out, err); err != nil {
+		return abandonStep(err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", mgStart)
 
@@ -2236,9 +2255,8 @@ func tryRollbackIncrementalBuild(
 			WithLogPath(runnerLogPath(worktreePath, d.Engine, "seed", source))
 		sdStart := time.Now()
 		out, err = runner.Run(ctx, sdSpec, worktreePath, source, tplCtx, inheritedEnv)
-		if err != nil || out.ExitCode != 0 {
-			rollbackFallback(runnerStepFailure("seed", source, out, err))
-			return Outcome{}, false, nil
+		if err := stepFailure("seed", source, out, err); err != nil {
+			return abandonStep(err)
 		}
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "seed", sdStart)
 	}

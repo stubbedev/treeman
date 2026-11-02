@@ -93,10 +93,11 @@ func recordFinalizeFailure(ctx context.Context, st *State, cfg *config.Config, f
 	// events and never mask the failure event written below.
 	if f.enginesTouched {
 		// When the error names which databases failed, recover only
-		// those — the rest finished preparing and are healthy (#119).
+		// those — the rest finished preparing and are healthy (#119) —
+		// and not the ones whose step command was missing (#183).
 		// Otherwise (a post-engine hook failed, say) recover them all.
 		prepare.RecoverDatabases(termCtx, cfg, f.slugVal, f.wtRoot, f.repoID, f.wtID, st.Store,
-			prepare.FailedDBIndices(f.err))
+			prepare.RecoverDBIndices(f.err))
 	}
 	_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, withRetryHint(f.err.Error()),
 		f.repoID, f.wtID, f.phase, 0, map[string]string{

@@ -45,8 +45,8 @@ func TestRunFilteredFailureDoesNotCancelSiblings(t *testing.T) {
 	if err == nil {
 		t.Fatal("want the failing database's error")
 	}
-	if got := FailedDBIndices(err); !slices.Equal(got, []int{0}) {
-		t.Fatalf("FailedDBIndices = %v, want [0] (err: %v)", got, err)
+	if got := RecoverDBIndices(err); !slices.Equal(got, []int{0}) {
+		t.Fatalf("RecoverDBIndices = %v, want [0] (err: %v)", got, err)
 	}
 	if _, serr := os.Stat(done); serr != nil {
 		t.Fatalf("sibling migrate was cut short: %v", serr)

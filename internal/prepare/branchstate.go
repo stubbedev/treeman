@@ -1399,6 +1399,13 @@ func (a branchScopedArgs) migrateStep(
 		return false, builtEmpty, decision, nil
 	}
 	if err := a.migrate(ctx, active); err != nil {
+		// A migrate whose command did not resolve never touched the
+		// data: neither the durable nor the database is at fault, so
+		// re-seeding would discard the branch's data and the reset hint
+		// would point the user at the wrong fix.
+		if runner.IsCommandNotFound(err) {
+			return false, builtEmpty, decision, err
+		}
 		// Only a migrate that genuinely failed on just-resumed data
 		// indicts the durable. An abort (teardown, watchdog) or a dropped
 		// engine connection says nothing about it, and re-seeding on one
@@ -1502,7 +1509,7 @@ func (a branchScopedArgs) runStep(ctx context.Context, spec runner.Spec, active,
 	}
 	if out.ExitCode != 0 {
 		emitRunnerError(ctx, a.st, a.repoID, a.worktreeID, a.eng.engine, active, label, out)
-		return fmt.Errorf("%s", runner.FormatError(label, active, out))
+		return &runner.StepError{Label: label, Target: active, Outcome: out}
 	}
 	return nil
 }
