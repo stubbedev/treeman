@@ -39,9 +39,8 @@ func reapWorkers() int {
 // working trees are renamed for background reaping. Chosen to (a) be
 // hidden, (b) carry the treeman prefix so accidental ls reveals
 // origin, and (c) live inside the worktrees root so the rename stays
-// on the same filesystem. Shared with wt, whose create moves stale
-// leftovers aside into the same dir.
-const trashDirName = wt.TrashDirName
+// on the same filesystem.
+const trashDirName = ".treeman-trash"
 
 // removeWorktreeViaTrash atomically moves wtRoot into a trash dir on
 // the same filesystem and then runs `git worktree prune` to unregister

@@ -86,10 +86,7 @@ func TestCreateExistingPathNonMatchingErrors(t *testing.T) {
 	}
 }
 
-// A container bind-mounting a path inside a torn-down worktree makes
-// Docker recreate the missing source as empty (root-owned) dirs. Create
-// moves such a dirs-only leftover into the trash and proceeds.
-func TestCreateMovesAsideDirOnlyLeftover(t *testing.T) {
+func TestCreateRemovesDirOnlyLeftover(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -111,10 +108,66 @@ func TestCreateMovesAsideDirOnlyLeftover(t *testing.T) {
 	if !gitenv.IsGitWorktree(res.WtPath) {
 		t.Errorf("%s is not a git worktree after create", res.WtPath)
 	}
-	trash, err := os.ReadDir(filepath.Join(repo, ".worktrees", TrashDirName))
-	if err != nil || len(trash) != 1 || !strings.HasSuffix(trash[0].Name(), "-feature-y") {
-		t.Errorf("expected leftover moved to trash, got %v (err %v)", trash, err)
+	if stale := staleLeftovers(t, filepath.Join(repo, ".worktrees")); len(stale) != 0 {
+		t.Errorf("expected the leftover deleted, found %v", stale)
 	}
+}
+
+func TestCreateMovesAsideUndeletableDirOnlyLeftover(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the directory permissions this test relies on")
+	}
+	withTempStore(t)
+	repo := gitRepo(t, "main")
+	worktrees := filepath.Join(repo, ".worktrees")
+	wtDir := filepath.Join(worktrees, "develop")
+	if err := os.MkdirAll(filepath.Join(wtDir, "docker", "garage.toml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(wtDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, p := range staleLeftovers(t, worktrees) {
+			_ = os.Chmod(filepath.Join(worktrees, p), 0o755)
+		}
+	})
+	sink := &recordingSink{}
+	res, err := Create(context.Background(), CreateRequest{
+		RepoRoot:  repo,
+		Branch:    "develop",
+		SkipHooks: true,
+	}, sink)
+	if err != nil {
+		t.Fatalf("Create: %v\nsink:\n%s", err, sink.joined())
+	}
+	if !gitenv.IsGitWorktree(res.WtPath) {
+		t.Errorf("%s is not a git worktree after create", res.WtPath)
+	}
+	if stale := staleLeftovers(t, worktrees); len(stale) != 1 || !strings.HasSuffix(stale[0], "-develop") {
+		t.Errorf("expected one stale leftover sibling, got %v", stale)
+	}
+	if !strings.Contains(sink.joined(), "sudo rm -rf") {
+		t.Errorf("expected a removal hint, sink:\n%s", sink.joined())
+	}
+}
+
+func staleLeftovers(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), staleLeftoverPrefix) {
+			names = append(names, e.Name())
+		}
+	}
+	return names
 }
 
 func TestCreateSkipHooksReturnsNoFinalize(t *testing.T) {
