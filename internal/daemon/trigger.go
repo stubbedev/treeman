@@ -13,6 +13,7 @@ const (
 	triggerHeadChange       triggerSource = "head_change"
 	triggerWorktreeAppeared triggerSource = "worktree_appeared"
 	triggerFileChange       triggerSource = "file_change"
+	triggerDaemonRestart    triggerSource = "daemon_restart"
 )
 
 type trigger struct {

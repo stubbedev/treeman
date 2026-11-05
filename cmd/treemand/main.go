@@ -28,15 +28,16 @@ import (
 // plumbing, in the same colon-hierarchy convention as event types and
 // the internal daemon labels. Passed to safego.Go for panic recovery.
 const (
-	lblWatchdog      = "loop:watchdog"
-	lblSnapshotGC    = "loop:snapshot-gc"
-	lblWALCheckpoint = "loop:wal-checkpoint"
-	lblLogPrune      = "loop:log-prune"
-	lblAutoFetch     = "loop:auto-fetch"
-	lblHUPReload     = "loop:hup-reload"
-	lblAccept        = "rpc:accept"
-	lblConn          = "rpc:conn"
-	lblBoot          = "boot"
+	lblWatchdog       = "loop:watchdog"
+	lblTeardownResume = "boot:teardown-resume"
+	lblSnapshotGC     = "loop:snapshot-gc"
+	lblWALCheckpoint  = "loop:wal-checkpoint"
+	lblLogPrune       = "loop:log-prune"
+	lblAutoFetch      = "loop:auto-fetch"
+	lblHUPReload      = "loop:hup-reload"
+	lblAccept         = "rpc:accept"
+	lblConn           = "rpc:conn"
+	lblBoot           = "boot"
 )
 
 // slogLevel parses a daemon.log_level YAML value into a slog.Level.
@@ -218,6 +219,10 @@ func run() error {
 	// fire setup / teardown. Unconditional — worktree
 	// lifecycle is infrastructure, not user policy.
 	resumeLifecycleWatchers(ctx, s, st)
+
+	// Finish teardowns the previous daemon was stopped in the middle
+	// of. Off the boot path: a resumed engine drop can take minutes.
+	safego.Go(lblTeardownResume, "", func() { daemon.SweepInterruptedTeardowns(st.BgCtx, st) })
 
 	// Watchdog for in-flight FinalizeWorktree goroutines: cancels +
 	// flags any that exceed the prepare timeout. Catches the

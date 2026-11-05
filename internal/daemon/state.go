@@ -526,6 +526,7 @@ const (
 	lblWorktreeFinalize  = "worktree:finalize"
 	lblWorktreeReap      = "worktree:reap"
 	lblWorktreeReapDrain = "worktree:reap:drain"
+	lblTeardownResume    = "worktree:teardown:resume"
 	lblHeadActions       = "head:actions"
 	lblHeadFinalize      = "head:finalize"
 	lblHeadSync          = "head:sync"

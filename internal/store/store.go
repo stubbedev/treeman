@@ -990,11 +990,37 @@ func (s *Store) ActiveWorktreePage(ctx context.Context, afterID int64, limit int
 // ListActiveWorktrees for callers that need ids/slugs/repo paths
 // without re-querying per row.
 func (s *Store) ListActiveWorktreeRows(ctx context.Context) ([]WorktreeRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `
+	rows, err := s.listUndeletedWorktreeRows(ctx, activeWorktreeRowsQuery)
+	if err != nil {
+		return nil, fmt.Errorf("list active worktrees: %w", err)
+	}
+	return rows, nil
+}
+
+// ListInterruptedTeardowns returns every undeleted worktree row whose
+// latest delete:start has no delete:end / delete:error after it. In a
+// daemon that has not dispatched a teardown yet, no goroutine owns
+// these: the previous daemon stopped mid-teardown.
+func (s *Store) ListInterruptedTeardowns(ctx context.Context) ([]WorktreeRow, error) {
+	rows, err := s.listUndeletedWorktreeRows(ctx, interruptedTeardownRowsQuery)
+	if err != nil {
+		return nil, fmt.Errorf("list worktrees with an unfinished teardown: %w", err)
+	}
+	return rows, nil
+}
+
+const undeletedWorktreeRowsSelect = `
 		SELECT w.id, w.repo_id, w.path, w.slug, COALESCE(w.branch, ''), COALESCE(w.admin_dir, ''), w.deleted_at IS NOT NULL, w.is_main, r.path, COALESCE(w.last_visited_at, 0)
 		FROM worktrees w JOIN repos r ON r.id = w.repo_id
-		WHERE w.deleted_at IS NULL AND `+WorktreeNotTearingDown+`
-		ORDER BY w.id`)
+		WHERE w.deleted_at IS NULL AND `
+
+const (
+	activeWorktreeRowsQuery      = undeletedWorktreeRowsSelect + WorktreeNotTearingDown + ` ORDER BY w.id`
+	interruptedTeardownRowsQuery = undeletedWorktreeRowsSelect + `NOT ` + WorktreeNotTearingDown + ` ORDER BY w.id`
+)
+
+func (s *Store) listUndeletedWorktreeRows(ctx context.Context, query string) ([]WorktreeRow, error) {
+	rows, err := s.DB.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
