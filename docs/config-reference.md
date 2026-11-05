@@ -746,9 +746,15 @@ template built from a source ahead of the branch (migrations the
 branch does not contain) or holding a migration file the branch
 removed is never chosen — the branch has no down() for it and
 step-based CLIs skip it silently, baking the schema change into the
-template — so those divergences always cold-rebuild. Leave
-this unset to disable the rollback path entirely (cold rebuild
-only).
+template — so those divergences always cold-rebuild.
+
+Migrations present only on the branch (e.g. earlier-dated files
+merged in from another branch) are never unwound: they are
+pending, so the prior template is restored and Migrate applies
+them forward without running Rollback. They then run after
+later-dated migrations that are already applied, unlike a cold
+build, which applies everything in date order. Leave this unset
+to disable the rollback path entirely (cold rebuild only).
 
 #### `seed` *([Step](#step))*
 
