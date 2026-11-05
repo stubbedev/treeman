@@ -79,7 +79,7 @@ func resolveAndProbeOnce(ctx context.Context, engine string, opts containerip.Op
 	containerip.RefreshOpts(opts)
 	h2, p2, err := resolveEndpoint(ctx, opts, host, port)
 	if err != nil {
-		return h, p, fmt.Errorf("%w (re-resolving the container after that also failed: %v)", probeErr, err)
+		return h, p, fmt.Errorf("%w (re-resolving the container after that also failed: %w)", probeErr, err)
 	}
 	return h2, p2, reachability.ProbeCtx(ctx, engine, h2, p2)
 }

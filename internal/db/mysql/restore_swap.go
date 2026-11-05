@@ -84,11 +84,9 @@ func (d *Driver) swapInto(ctx context.Context, stage restorestage.Stage, target 
 	if err := d.EnsureDB(ctx, target); err != nil {
 		return err
 	}
-	//nolint:gosec // qtarget is validated/quoted via ident.QuoteMySQL; charset/collation via config validation
 	if _, err := d.DB.ExecContext(ctx, "ALTER DATABASE "+qtarget+d.createCharsetClause()); err != nil {
 		return fmt.Errorf("ALTER DATABASE %s: %w", qtarget, err)
 	}
-	//nolint:gosec // qretired is validated/quoted via ident.QuoteMySQL; charset/collation via config validation
 	if _, err := d.DB.ExecContext(ctx, "CREATE DATABASE "+qretired+d.createCharsetClause()); err != nil {
 		return fmt.Errorf("CREATE DATABASE %s: %w", qretired, err)
 	}

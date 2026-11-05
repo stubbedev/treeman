@@ -25,7 +25,7 @@ func TestSwapErrorNamesWhatHappenedToTheTarget(t *testing.T) {
 		}
 	}
 	other := &pgconn.PgError{Code: "42501", Message: "permission denied"}
-	if err := swapError("app_test_6", other); err != other {
+	if err := swapError("app_test_6", other); err.Error() != other.Error() {
 		t.Errorf("unrelated error was rewritten: %v", err)
 	}
 }

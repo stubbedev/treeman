@@ -127,8 +127,8 @@ func WaitFor(ctx context.Context, attempt func(context.Context) error, retryable
 }
 
 func gaveUp(ctx context.Context, start time.Time, last error) error {
-	return fmt.Errorf("still not ready after waiting %s (%v): %w",
-		time.Since(start).Round(100*time.Millisecond), ctx.Err(), last)
+	return fmt.Errorf("still not ready after waiting %s (%s): %w",
+		time.Since(start).Round(100*time.Millisecond), ctx.Err().Error(), last)
 }
 
 // HostPort extracts host and port from a URL-style connection string,
