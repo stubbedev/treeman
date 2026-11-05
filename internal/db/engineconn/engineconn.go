@@ -65,10 +65,11 @@ type SnapshotCreator interface {
 }
 
 // SpareClaimer is the optional capability of landing a pre-warmed
-// spare onto `target` cheaply — Postgres by renaming the spare (a
+// spare onto `target` cheaply, replacing `target` in place so it never
+// stops existing — Postgres by renaming the spare over it (a
 // catalog-only, millisecond operation), MySQL by a staged physical
-// clone of the spare (file-copy import, no logical dump load). The
-// caller has already cleared `target` (#53).
+// clone of the spare swapped into it (file-copy import, no logical dump
+// load) (#53, #186).
 type SpareClaimer interface {
 	ClaimSpare(ctx context.Context, spare, target string) error
 }
@@ -95,7 +96,7 @@ func (c postgresConn) CreateSnapshot(ctx context.Context, template, target strin
 }
 
 func (c postgresConn) ClaimSpare(ctx context.Context, spare, target string) error {
-	return c.d.RenameDatabase(ctx, spare, target)
+	return c.d.ReplaceDatabase(ctx, spare, target)
 }
 
 func (c mysqlConn) CreateSnapshot(ctx context.Context, template, target string) error {

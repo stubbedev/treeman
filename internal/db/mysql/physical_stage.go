@@ -17,7 +17,7 @@ import (
 	"github.com/stubbedev/treeman/internal/db/ident"
 )
 
-// templateStage is the once-per-template export used by SnapshotRestore
+// templateStage is the once-per-template export used by SnapshotRestoreStaged
 // to avoid serializing a fan-out on FLUSH TABLES … FOR EXPORT.
 //
 // A template is immutable for the life of a fan-out, so its InnoDB

@@ -69,17 +69,17 @@ func spareEngineFor(ctx context.Context, cfg *config.Config, engineName string) 
 }
 
 // spareClaimRestore wraps the plain restore with the spare-claim fast
-// path: clear the target, then try to claim one of the template's
-// pre-warmed spares. A claim is milliseconds (Postgres rename) or a
-// file-copy import (MySQL physical clone) versus a full logical
-// restore. The restorer serves the cache-hit source AND its fanout
-// clones concurrently, so slots are handed out by one shared allocator:
-// each slot is tried by exactly one restore — no two claims contend for
-// the same spare (Postgres: the rename race; MySQL, where a claim
-// copies rather than consumes the spare: the shared export lock) — and
-// a pool of N covers at most the first N restores of a prepare. A
-// restore whose slots are exhausted or unclaimable falls back to the
-// plain restore.
+// path: try to claim one of the template's pre-warmed spares, which
+// replaces the target in place, so it never stops existing. A claim is
+// milliseconds (Postgres rename) or a file-copy import (MySQL physical
+// clone) versus a full logical restore. The restorer serves the
+// cache-hit source AND its fanout clones concurrently, so slots are
+// handed out by one shared allocator: each slot is tried by exactly one
+// restore — no two claims contend for the same spare (Postgres: the
+// rename race; MySQL, where a claim copies rather than consumes the
+// spare: the shared export lock) — and a pool of N covers at most the
+// first N restores of a prepare. A restore whose slots are exhausted or
+// unclaimable falls back to the plain restore.
 func spareClaimRestore(
 	se *spareEngine,
 	st *store.Store,
@@ -92,24 +92,18 @@ func spareClaimRestore(
 		if se.claimer == nil {
 			return plainRestore(ctx, template, target)
 		}
-		// The claim path can't overwrite, so clear the target first. A
-		// failed drop (e.g. lingering connections) just means no fast
-		// path — the plain restore re-attempts the drop with its own
-		// semantics.
-		if err := se.conn.DropSnapshot(ctx, target); err == nil {
-			for slot := nextSlot.Add(1); slot <= prewarm; slot = nextSlot.Add(1) {
-				spare := snapshot.SpareName(template, int(slot))
-				if err := se.claimer.ClaimSpare(ctx, spare, target); err == nil {
-					_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsPrewarmClaim,
-						fmt.Sprintf("claimed spare %s → %s", spare, target),
-						repoID, worktreeID, "", 0, map[string]string{
-							"engine":   se.engine,
-							"template": template,
-							"spare":    spare,
-							"target":   target,
-						})
-					return nil
-				}
+		for slot := nextSlot.Add(1); slot <= prewarm; slot = nextSlot.Add(1) {
+			spare := snapshot.SpareName(template, int(slot))
+			if err := se.claimer.ClaimSpare(ctx, spare, target); err == nil {
+				_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtSnapshotsPrewarmClaim,
+					fmt.Sprintf("claimed spare %s → %s", spare, target),
+					repoID, worktreeID, "", 0, map[string]string{
+						"engine":   se.engine,
+						"template": template,
+						"spare":    spare,
+						"target":   target,
+					})
+				return nil
 			}
 		}
 		return plainRestore(ctx, template, target)

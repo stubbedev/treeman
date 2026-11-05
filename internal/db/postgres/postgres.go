@@ -278,38 +278,54 @@ func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) (e
 	return nil
 }
 
-// RenameDatabase renames `from` to `to` via ALTER DATABASE … RENAME TO
-// — a catalog-only metadata operation, constant-time regardless of DB
-// size. Postgres requires zero live connections on `from` (true for
-// idle pre-warmed spares) and fails — never overwrites — when `to`
-// already exists, which is exactly the atomicity the spare-claim path
-// leans on: of two racing claimers, exactly one wins the rename.
-func (d *Driver) RenameDatabase(ctx context.Context, from, to string) error {
-	qfrom, err := ident.QuotePostgres(from)
-	if err != nil {
-		return err
-	}
-	qto, err := ident.QuotePostgres(to)
-	if err != nil {
-		return err
-	}
-	return d.execOutsideTx(ctx, "ALTER DATABASE "+qfrom+" RENAME TO "+qto)
-}
-
-func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
+// SnapshotRestore replaces `target` with a clone of `template`. The
+// clone is made under a private name with `CREATE DATABASE … TEMPLATE`
+// and swapped in by replaceDatabase, so `target` exists throughout.
+// Both private databases are dropped on every return path; a crashed
+// run's leftovers are reaped by a later restore once they are
+// restorestage.MaxAge old.
+func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) (err error) {
 	qtemplate, err := ident.QuotePostgres(template)
 	if err != nil {
 		return err
 	}
-	qtarget, err := ident.QuotePostgres(target)
+	if err := ident.ValidatePostgres(target); err != nil {
+		return err
+	}
+	stage := d.beginRestoreStage(ctx)
+	defer d.dropRestoreStage(ctx, &err, template, target, stage.Incoming, stage.Retired)
+	qincoming, err := ident.QuotePostgres(stage.Incoming)
 	if err != nil {
 		return err
 	}
-	if err := d.execOutsideTx(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
+	if err := d.execOutsideTx(ctx, "CREATE DATABASE "+qincoming+" TEMPLATE "+qtemplate); err != nil {
+		return fmt.Errorf("restore %s into %s: clone into %s: %w", template, target, stage.Incoming, err)
+	}
+	if err := d.replaceDatabase(ctx, stage.Incoming, target, stage.Retired); err != nil {
+		return fmt.Errorf("restore %s into %s: %w", template, target, err)
+	}
+	return nil
+}
+
+// ReplaceDatabase renames `from` to `to`, replacing any existing `to`
+// in the same transaction, so `to` never stops existing. Renaming is a
+// catalog-only operation, constant-time regardless of size. Postgres
+// requires zero live connections on both databases (true for idle
+// pre-warmed spares), and fails when `from` is gone, so of two racing
+// claimers of one spare exactly one wins.
+func (d *Driver) ReplaceDatabase(ctx context.Context, from, to string) (err error) {
+	if err := ident.ValidatePostgres(from); err != nil {
 		return err
 	}
-	return d.execOutsideTx(ctx,
-		"CREATE DATABASE "+qtarget+" TEMPLATE "+qtemplate)
+	if err := ident.ValidatePostgres(to); err != nil {
+		return err
+	}
+	stage := d.beginRestoreStage(ctx)
+	defer d.dropRestoreStage(ctx, &err, from, to, stage.Retired)
+	if err := d.replaceDatabase(ctx, from, to, stage.Retired); err != nil {
+		return fmt.Errorf("replace %s with %s: %w", to, from, err)
+	}
+	return nil
 }
 
 func (d *Driver) DropSnapshot(ctx context.Context, template string) error {

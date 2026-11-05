@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,7 +43,7 @@ type Driver struct {
 
 	// stagesMu guards stages. Keyed by template name, each entry holds
 	// a sync.Once that exports the (immutable) template's InnoDB
-	// tablespaces to a staging dir exactly once. SnapshotRestore then
+	// tablespaces to a staging dir exactly once. SnapshotRestoreStaged then
 	// imports from staging without re-taking FLUSH TABLES … FOR EXPORT
 	// on the shared template, so a fan-out of N restores no longer
 	// serializes on that per-template export lock. See physical_stage.go.
@@ -297,8 +298,18 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 	return d.EnsureDB(ctx, name)
 }
 
-// SnapshotCreate clones `source` into `template` using the fastest
-// available strategy:
+// SnapshotCreate clones `source` into `template`: base tables and
+// their data via cloneTables, then the dictionary-only objects (views,
+// triggers) via cloneDictionaryObjects.
+func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
+	if err := d.cloneTables(ctx, source, template); err != nil {
+		return err
+	}
+	return d.cloneDictionaryObjects(ctx, source, template)
+}
+
+// cloneTables recreates `dest` holding `source`'s base tables and data,
+// using the fastest available strategy:
 //
 //  1. PHYSICAL: InnoDB transferable tablespaces. Requires
 //     `connections.mysql.container` / `compose_service` to be set so
@@ -309,33 +320,34 @@ func (d *Driver) FlushDatabase(ctx context.Context, name string) error {
 //     INSERT ... SELECT round-trips entirely. See physical_clone.go.
 //
 //  2. LOGICAL: the serial-DDL + parallel-INSERT-SELECT loader (see
-//     logicalSnapshotCreate). Always available; picked when the
+//     logicalCloneTables). Always available; picked when the
 //     physical preconditions aren't met OR when physical was
 //     attempted but failed (the warning is logged and the fall-back
 //     takes over).
 //
 // The strategy chosen for this call is recorded on the Driver and
 // retrievable via LastCloneStrategy(); the prepare layer reads it to
-// emit a snapshot_clone_strategy event.
-func (d *Driver) SnapshotCreate(ctx context.Context, source, template string) error {
+// emit a snapshot_clone_strategy event. Views and triggers are not
+// copied; callers replay them with cloneDictionaryObjects.
+func (d *Driver) cloneTables(ctx context.Context, source, dest string) error {
 	if d.chooseStrategy(ctx, source) == CloneStrategyLogical {
 		d.setLastStrategy(CloneStrategyLogical)
-		return d.logicalSnapshotCreate(ctx, source, template)
+		return d.logicalCloneTables(ctx, source, dest)
 	}
-	if ok, perr := d.tryPhysicalSnapshotCreate(ctx, source, template); ok {
+	ok, perr := d.tryPhysicalSnapshotCreate(ctx, source, dest)
+	if ok {
 		d.setLastStrategy(CloneStrategyPhysical)
-		return d.cloneDictionaryObjects(ctx, source, template)
+		return nil
+	}
+	if skip, isSkip := errors.AsType[*physicalSkippedError](perr); isSkip {
+		slog.Debug("mysql physical clone preconditions not met; using logical fallback",
+			"source", source, "dest", dest, "reason", skip.reason)
 	} else if perr != nil {
-		if skip, ok := errors.AsType[*physicalSkippedError](perr); ok {
-			slog.Debug("mysql physical clone preconditions not met; using logical fallback",
-				"source", source, "template", template, "reason", skip.reason)
-		} else {
-			slog.Warn("mysql physical clone failed; falling back to logical clone",
-				"source", source, "template", template, "error", perr)
-		}
+		slog.Warn("mysql physical clone failed; falling back to logical clone",
+			"source", source, "dest", dest, "error", perr)
 	}
 	d.setLastStrategy(CloneStrategyLogical)
-	return d.logicalSnapshotCreate(ctx, source, template)
+	return d.logicalCloneTables(ctx, source, dest)
 }
 
 // defaultPhysicalCloneMinBytes is the source-size floor at/above which
@@ -501,12 +513,11 @@ func (d *Driver) globalRowWatermark(ctx context.Context) (string, error) {
 	return "ir:" + strconv.FormatInt(sum, 10), nil
 }
 
-// logicalSnapshotCreate is the pre-physical implementation kept as the
-// always-available fallback. Clones `source` into `template` in two
-// phases:
+// logicalCloneTables is the always-available clone path. Recreates
+// `dest` and fills it with `source`'s base tables in two phases:
 //
 //  1. Serial DDL pass on a single connection — every base table's
-//     `CREATE TABLE` runs against the new template, and the
+//     `CREATE TABLE` runs against the new dest, and the
 //     non-generated column list is captured for the data pass.
 //     Doing DDL serially avoids the InnoDB data-dictionary
 //     deadlocks (Error 1213) that parallel CREATE × INSERT pairs
@@ -516,11 +527,7 @@ func (d *Driver) globalRowWatermark(ctx context.Context) (string, error) {
 //     `SET SESSION` flags from applyCloneSession remain in scope,
 //     and the INSERTs hit pre-created destination tables so the
 //     lock graph stays purely data-side.
-//
-// Views replay serially afterwards because views can reference
-// other views / tables and engines reject CREATE VIEW against a
-// missing dependency.
-func (d *Driver) logicalSnapshotCreate(ctx context.Context, source, template string) error {
+func (d *Driver) logicalCloneTables(ctx context.Context, source, template string) error {
 	qsource, err := ident.QuoteMySQL(source)
 	if err != nil {
 		return err
@@ -572,11 +579,7 @@ func (d *Driver) logicalSnapshotCreate(ctx context.Context, source, template str
 			return copyOneTableData(gctx, d.DB, source, template, j.name, j.cols)
 		})
 	}
-	if err := g.Wait(); err != nil {
-		return err
-	}
-
-	return d.cloneDictionaryObjects(ctx, source, template)
+	return g.Wait()
 }
 
 // schemaObject is one base table or view enumerated from
@@ -794,11 +797,17 @@ func createView(ctx context.Context, conn *sql.Conn, def viewDef) error {
 	return err
 }
 
-// isNoSuchTable reports MySQL's ER_NO_SUCH_TABLE (1146): a view's
-// dependency doesn't exist yet.
+// isNoSuchTable reports MySQL's ER_NO_SUCH_TABLE: a view's dependency
+// doesn't exist yet.
 func isNoSuchTable(err error) bool {
+	return hasErrorNumber(err, erNoSuchTable)
+}
+
+// hasErrorNumber reports whether err wraps a MySQL server error with
+// one of the given numbers.
+func hasErrorNumber(err error, numbers ...uint16) bool {
 	me, ok := errors.AsType[*gomysql.MySQLError](err)
-	return ok && me.Number == 1146
+	return ok && slices.Contains(numbers, me.Number)
 }
 
 // cloneTriggers replays every trigger from `source` onto `template`.
@@ -1067,36 +1076,34 @@ func backtickJoin(cols []string) (string, error) {
 	return b.String(), nil
 }
 
-// SnapshotRestore re-creates `target` from `template` with a single
-// direct clone. Symmetric to SnapshotCreate. Use this for one-shot
-// restores (incremental ancestor→source); for restoring one template
-// into many targets use SnapshotRestoreStaged, which amortizes the
-// export across the fan-out.
+// SnapshotRestore replaces `target` with a clone of `template` made by
+// a single direct clone (cloneTables). Symmetric to SnapshotCreate. Use
+// this for one-shot restores (incremental ancestor→source); for
+// restoring one template into many targets use SnapshotRestoreStaged,
+// which amortizes the export across the fan-out. The clone is built in
+// a private schema and swapped in by restoreViaSwap, so `target` never
+// stops existing.
 func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) error {
-	qtarget, err := ident.QuoteMySQL(target)
-	if err != nil {
-		return err
-	}
-	if err := ident.ValidateMySQL(template); err != nil {
-		return err
-	}
-	if _, err := d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
-		return err
-	}
-	return d.SnapshotCreate(ctx, template, target)
+	return d.restoreViaSwap(ctx, template, target, d.cloneTables)
 }
 
-// SnapshotRestoreStaged re-creates `target` from `template`, importing
-// from a once-per-template export instead of cloning the template
-// directly. It is the fan-out path: one prepare clones a single
-// immutable template into N targets concurrently, and the direct
-// physical clone (SnapshotCreate) takes FLUSH TABLES <template>.* FOR
-// EXPORT on the shared template and holds it across the .ibd copy — so N
-// concurrent direct restores serialize on that one export lock.
+// SnapshotRestoreStaged replaces `target` with a clone of `template`,
+// importing from a once-per-template export instead of cloning the
+// template directly (stagedCloneTables), then swapping the result in
+// with restoreViaSwap like SnapshotRestore.
+func (d *Driver) SnapshotRestoreStaged(ctx context.Context, template, target string) error {
+	return d.restoreViaSwap(ctx, template, target, d.stagedCloneTables)
+}
+
+// stagedCloneTables is the fan-out clone path: one prepare clones a
+// single immutable template into N targets concurrently, and the direct
+// physical clone (cloneTables) takes FLUSH TABLES <template>.* FOR
+// EXPORT on the shared template and holds it across the .ibd copy — so
+// N concurrent direct clones serialize on that one export lock.
 //
 // Staging exports the template's tablespaces to a staging dir exactly
 // once (ensureStage / stageTemplate, guarded by a per-template
-// sync.Once); every restore then imports plain file copies from staging
+// sync.Once); every clone then imports plain file copies from staging
 // (physicalRestoreFromStage) and takes no lock on the template, so the
 // fan-out is bounded by disk + IMPORT rather than a serial export lock.
 //
@@ -1106,27 +1113,13 @@ func (d *Driver) SnapshotRestore(ctx context.Context, template, target string) e
 //
 // Fallback chain matches the direct path: when staging is unavailable
 // (no ContainerRef, engine binary absent, empty secure_file_priv,
-// non-InnoDB tables, …) or fails, the restore falls back to the always-
-// available logical clone. logicalSnapshotCreate is called directly so
+// non-InnoDB tables, …) or fails, the clone falls back to the always-
+// available logical clone. logicalCloneTables is called directly so
 // no redundant FLUSH-FOR-EXPORT probe runs per clone.
-func (d *Driver) SnapshotRestoreStaged(ctx context.Context, template, target string) error {
-	qtarget, err := ident.QuoteMySQL(target)
-	if err != nil {
-		return err
-	}
-	if err := ident.ValidateMySQL(template); err != nil {
-		return err
-	}
-	if _, err := d.DB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+qtarget); err != nil {
-		return err
-	}
-
-	// Honor the strategy selector: for small templates the logical
-	// restore beats staged physical (same per-table-overhead trade-off
-	// as SnapshotCreate), so don't stage at all.
+func (d *Driver) stagedCloneTables(ctx context.Context, template, dest string) error {
 	if d.chooseStrategy(ctx, template) == CloneStrategyLogical {
 		d.setLastStrategy(CloneStrategyLogical)
-		return d.logicalSnapshotCreate(ctx, template, target)
+		return d.logicalCloneTables(ctx, template, dest)
 	}
 
 	st := d.ensureStage(ctx, template)
@@ -1138,16 +1131,16 @@ func (d *Driver) SnapshotRestoreStaged(ctx context.Context, template, target str
 		slog.Warn("mysql physical staging failed; using logical restore",
 			"template", template, "error", st.err)
 	default:
-		rerr := d.physicalRestoreFromStage(ctx, st, target)
+		rerr := d.physicalRestoreFromStage(ctx, st, dest)
 		if rerr == nil {
 			d.setLastStrategy(CloneStrategyPhysical)
-			return d.cloneDictionaryObjects(ctx, template, target)
+			return nil
 		}
 		slog.Warn("mysql physical restore-from-stage failed; using logical restore",
-			"template", template, "target", target, "error", rerr)
+			"template", template, "dest", dest, "error", rerr)
 	}
 	d.setLastStrategy(CloneStrategyLogical)
-	return d.logicalSnapshotCreate(ctx, template, target)
+	return d.logicalCloneTables(ctx, template, dest)
 }
 
 // DropSnapshot drops a template DB. Idempotent. Also reaps any staging
