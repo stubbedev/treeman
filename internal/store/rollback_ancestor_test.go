@@ -481,3 +481,93 @@ func TestFindRollbackAncestor_PrefersZeroStepsOnEqualPrefix(t *testing.T) {
 		t.Fatalf("want fpPrefix with 0 steps, got %v steps=%d", got, steps)
 	}
 }
+
+// Regression for #185: merging develop into a branch inserted migrations
+// dated earlier than the branch's own. The pre-merge template diverged
+// from the merged inputs at the first inserted file, so every template
+// entry after it counted as a step (34) and the rollback ran a lossy
+// down() whose re-migrate failed. An inserted file is pending, not
+// changed: nothing needs unwinding.
+func TestFindRollbackAncestor_InsertedEarlierMigrationsAreZeroSteps(t *testing.T) {
+	ctx := context.Background()
+	s := openRepoStore(t)
+	migs := "database/migrations/*.php"
+	anc := record("fpPreMerge", "ch", map[string]InputVector{migs: {
+		{Path: "database/migrations/2026_09_01_000000_create_clients.php", Hash: "h1"},
+		{Path: "database/migrations/2026_10_14_123257_drop_moved_and_dead_columns.php", Hash: "hb1"},
+		{Path: "database/migrations/2026_10_30_000000_branch_followup.php", Hash: "hb2"},
+	}})
+	if err := s.RecordSnapshot(ctx, anc); err != nil {
+		t.Fatal(err)
+	}
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
+		map[string]InputVector{migs: {
+			{Path: "database/migrations/2026_09_01_000000_create_clients.php", Hash: "h1"},
+			{Path: "database/migrations/2026_10_01_000000_develop_a.php", Hash: "hd1"},
+			{Path: "database/migrations/2026_10_14_123257_drop_moved_and_dead_columns.php", Hash: "hb1"},
+			{Path: "database/migrations/2026_10_20_000000_develop_b.php", Hash: "hd2"},
+			{Path: "database/migrations/2026_10_30_000000_branch_followup.php", Hash: "hb2"},
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Fingerprint != "fpPreMerge" {
+		t.Fatalf("want fpPreMerge ancestor, got %v", got)
+	}
+	if steps != 0 {
+		t.Errorf("steps = %d, want 0 (inserted migrations are applied forward, never unwound)", steps)
+	}
+}
+
+func TestFindRollbackAncestor_EditAfterInsertionsCountsCandidateEntriesOnly(t *testing.T) {
+	ctx := context.Background()
+	s := openRepoStore(t)
+	migs := "migrations/*.sql"
+	anc := record("fpInsertEdit", "ch", map[string]InputVector{migs: {
+		{Path: "010.sql", Hash: "h10"},
+		{Path: "030.sql", Hash: "h30"},
+		{Path: "050.sql", Hash: "hOLD"},
+		{Path: "070.sql", Hash: "h70"},
+	}})
+	if err := s.RecordSnapshot(ctx, anc); err != nil {
+		t.Fatal(err)
+	}
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
+		map[string]InputVector{migs: {
+			{Path: "010.sql", Hash: "h10"},
+			{Path: "020.sql", Hash: "h20"},
+			{Path: "030.sql", Hash: "h30"},
+			{Path: "040.sql", Hash: "h40"},
+			{Path: "050.sql", Hash: "hNEW"},
+			{Path: "060.sql", Hash: "h60"},
+			{Path: "070.sql", Hash: "h70"},
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Fingerprint != "fpInsertEdit" {
+		t.Fatalf("want fpInsertEdit ancestor, got %v", got)
+	}
+	if steps != 2 {
+		t.Errorf("steps = %d, want 2 (050 edited + 070 after it; inserted 020/040/060 are not steps)", steps)
+	}
+}
+
+func TestUnchangedLeadLen(t *testing.T) {
+	cand := []FileHash{{Path: "1", Hash: "h1"}, {Path: "2", Hash: "h2"}, {Path: "3", Hash: "h3"}}
+	cases := []struct {
+		name    string
+		current map[string]string
+		want    int
+	}{
+		{"all held, insertions ignored", map[string]string{"0": "h0", "1": "h1", "2": "h2", "25": "h25", "3": "h3"}, 3},
+		{"edited entry ends the run", map[string]string{"1": "h1", "2": "hX", "3": "h3"}, 1},
+		{"removed entry ends the run", map[string]string{"1": "h1", "3": "h3"}, 1},
+		{"first entry removed", map[string]string{"2": "h2", "3": "h3"}, 0},
+	}
+	for _, c := range cases {
+		if got := unchangedLeadLen(cand, c.current); got != c.want {
+			t.Errorf("%s: unchangedLeadLen = %d, want %d", c.name, got, c.want)
+		}
+	}
+}

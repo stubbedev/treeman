@@ -282,17 +282,21 @@ func (s *Store) FindAncestorSnapshot(
 // "rollback + re-migrate" rebuild after an EXISTING migration was
 // edited mid-sequence. Unlike FindAncestorSnapshot — which
 // requires a strict content-prefix (pure append) — this looks for a
-// candidate that DIVERGES from the current inputs: it shares the longest
-// common prefix and then differs.
+// candidate that DIVERGES from the current inputs.
 //
 // Both the candidate's and the current run's per-glob vectors are merged
 // into one global list ordered by file basename (timestamp-prefixed
 // migration filenames sort in ledger order for Laravel/Rails/Django/…),
 // because single-ledger frameworks roll back by a single global step
-// count, not per-glob. `steps` is the number of the candidate's
-// migrations at or after the first divergent position — i.e. how many
-// ledger entries `migrate:rollback` must unwind to reach the last-good
-// common state before re-running `migrate` forward.
+// count, not per-glob. Divergence is measured over the CANDIDATE's
+// entries only: a migration present only in the current run (e.g. an
+// earlier-dated file merged in from another branch) is pending, and the
+// framework's migrate applies it whatever its date, so it never needs
+// unwinding. `steps` is the number of the candidate's migrations from the
+// first one whose content changed or that the current run lacks — i.e.
+// how many ledger entries `migrate:rollback` must unwind before `migrate`
+// runs forward. A candidate whose ledger divergence is insertions only
+// yields steps == 0.
 //
 // Globs in lockfileGlobs are not ledger entries: they are left out of
 // the merged order and never counted as steps. A candidate whose ledger
@@ -303,15 +307,15 @@ func (s *Store) FindAncestorSnapshot(
 // Candidates whose ledger AND lockfiles both form a prefix of the
 // current run are skipped (pure append / exact match are
 // FindAncestorSnapshot's / LookupSnapshot's job), as are candidates
-// whose diverging tail contains a migration the branch does not have
+// whose unwound tail contains a migration the branch does not have
 // on disk — a template built from a source AHEAD of the branch, or
 // holding a file the branch removed. The branch has no down() for such
 // an entry, and step-based CLIs skip it silently (Laravel prints
 // "Migration not found" and exits 0), leaving its schema change applied
 // while the rebuild still gets cached as a template. Returns
 // (nil, 0, nil) when no unwindable diverging candidate exists — prepare
-// falls back to a cold build. The chosen candidate maximises the
-// common-prefix length, then minimises steps.
+// falls back to a cold build. The chosen candidate keeps the most of its
+// migrations applied, then unwinds the fewest.
 func (s *Store) FindRollbackAncestor(
 	ctx context.Context,
 	repoID int64,
@@ -325,33 +329,49 @@ func (s *Store) FindRollbackAncestor(
 	}
 	curLedger := mergeVectorsByBasename(withoutGlobs(currentInputs, lockfileGlobs))
 	curNames := make(map[string]struct{}, len(curLedger))
+	curHashes := make(map[string]string, len(curLedger))
 	for _, fh := range curLedger {
 		curNames[pathBase(fh.Path)] = struct{}{}
+		curHashes[fh.Path] = fh.Hash
 	}
 	var best *SnapshotRecord
 	bestSteps := 0
-	bestPrefix := -1
+	bestKept := -1
 	for i := range cands {
 		r := &cands[i]
 		if r.LockfileHashes[CommandsHashKey] != currentCommandsHash {
 			continue
 		}
 		candLedger := mergeVectorsByBasename(withoutGlobs(r.Inputs, lockfileGlobs))
-		prefix := commonPrefixLen(candLedger, curLedger)
-		if prefix == len(candLedger) && lockfilesEqual(r.Inputs, currentInputs, lockfileGlobs) {
+		if commonPrefixLen(candLedger, curLedger) == len(candLedger) &&
+			lockfilesEqual(r.Inputs, currentInputs, lockfileGlobs) {
 			continue
 		}
-		if !unwindableTail(candLedger[prefix:], curNames) {
+		kept := unchangedLeadLen(candLedger, curHashes)
+		if !unwindableTail(candLedger[kept:], curNames) {
 			continue
 		}
-		steps := len(candLedger) - prefix
-		if prefix > bestPrefix || (prefix == bestPrefix && steps < bestSteps) {
+		steps := len(candLedger) - kept
+		if kept > bestKept || (kept == bestKept && steps < bestSteps) {
 			best = r
-			bestPrefix = prefix
+			bestKept = kept
 			bestSteps = steps
 		}
 	}
 	return best, bestSteps, nil
+}
+
+// unchangedLeadLen returns how many leading entries of the merged
+// candidate ledger the current run still holds, by path, with identical
+// content. Entries present only in the current run do not end the run:
+// they are pending migrations, not divergence.
+func unchangedLeadLen(cand []FileHash, currentHashes map[string]string) int {
+	for i := range cand {
+		if h, ok := currentHashes[cand[i].Path]; !ok || h != cand[i].Hash {
+			return i
+		}
+	}
+	return len(cand)
 }
 
 // withoutGlobs returns m minus the entries keyed by a glob in drop.

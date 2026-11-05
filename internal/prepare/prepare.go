@@ -2162,9 +2162,12 @@ func tryDumpOnlyBuild(
 // failure is recorded as a warn-level prepare:rollback:fallback, never
 // a prepare:error: the run recovers, so it must not read as terminal.
 //
-// When only `kind: lockfile` inputs changed, the ancestor comes back
-// with zero steps: the rollback command is skipped (and not required)
-// and the restored template just migrates forward.
+// When only `kind: lockfile` inputs changed, or the migrations differ
+// from the ancestor's only by insertions (e.g. earlier-dated files merged
+// in from another branch), the ancestor comes back with zero steps: the
+// rollback command is skipped and the restored template just migrates
+// forward. A `rollback:` block is not required for the lockfile-only
+// case.
 //
 // WARNING: rollback runs the migration's CURRENT down(), not the one
 // that matched the applied schema — see the config doc on Rollback.

@@ -13,7 +13,8 @@ import (
 	"github.com/stubbedev/treeman/internal/template"
 )
 
-func TestRollbackFallbackReportsTheFailingStepsOutput(t *testing.T) {
+func openRollbackStore(t *testing.T) (*store.Store, int64, int64) {
+	t.Helper()
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
@@ -28,6 +29,12 @@ func TestRollbackFallbackReportsTheFailingStepsOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return st, repoID, wtID
+}
+
+func TestRollbackFallbackReportsTheFailingStepsOutput(t *testing.T) {
+	ctx := context.Background()
+	st, repoID, wtID := openRollbackStore(t)
 
 	d := config.DatabaseConfig{
 		Engine:   "mysql",
@@ -94,19 +101,7 @@ func TestLockfileOnlyChangeMigratesForwardWithoutRollback(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
-			st, err := store.Open(ctx, filepath.Join(t.TempDir(), "t.db"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = st.Close() })
-			repoID, err := st.EnsureRepo(ctx, "/r", "r")
-			if err != nil {
-				t.Fatal(err)
-			}
-			wtID, err := st.EnsureWorktree(ctx, repoID, "/r/wt", "wt", "main")
-			if err != nil {
-				t.Fatal(err)
-			}
+			st, repoID, wtID := openRollbackStore(t)
 
 			const migs, lock = "migrations/*.php", "composer.lock"
 			d := config.DatabaseConfig{
@@ -166,5 +161,68 @@ func TestLockfileOnlyChangeMigratesForwardWithoutRollback(t *testing.T) {
 				t.Errorf("a lockfile-only change must skip rollback and migrate forward, got %q", msg)
 			}
 		})
+	}
+}
+
+func TestInsertedEarlierMigrationsMigrateForwardWithoutRollback(t *testing.T) {
+	ctx := context.Background()
+	st, repoID, wtID := openRollbackStore(t)
+
+	const migs = "migrations/*.php"
+	d := config.DatabaseConfig{
+		Engine:   "mysql",
+		Inputs:   []config.Input{{Glob: migs}},
+		Migrate:  &config.Step{Run: "echo MIGRATE_RAN >&2; exit 1"},
+		Rollback: &config.Step{Run: "echo ROLLBACK_RAN >&2; exit 1"},
+	}
+	key := snapshot.New("mysql", "8.0", "", "", "", "", map[string]string{store.CommandsHashKey: commandsHash(d)})
+	if err := st.RecordSnapshot(ctx, store.SnapshotRecord{
+		Fingerprint:    "ancestor",
+		Engine:         "mysql",
+		EngineVersion:  "8.0",
+		SourceDB:       "src",
+		TemplateName:   "_tm_ancestor",
+		LockfileHashes: map[string]string{store.CommandsHashKey: commandsHash(d)},
+		Inputs: map[string]store.InputVector{migs: {
+			{Path: "migrations/2026_09_01_base.php", Hash: "h1"},
+			{Path: "migrations/2026_10_14_branch_drop_columns.php", Hash: "hb"},
+		}},
+		RepoID: repoID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current := map[string]store.InputVector{migs: {
+		{Path: "migrations/2026_09_01_base.php", Hash: "h1"},
+		{Path: "migrations/2026_10_01_develop.php", Hash: "hd"},
+		{Path: "migrations/2026_10_14_branch_drop_columns.php", Hash: "hb"},
+	}}
+	var restored string
+	ops := incrementalOps{
+		exists: func(context.Context, string) (bool, error) { return true, nil },
+		snapshotRestore: func(_ context.Context, tmpl, _ string) error {
+			restored = tmpl
+			return nil
+		},
+	}
+
+	_, done, err := tryRollbackIncrementalBuild(ctx, &config.Config{}, d, template.Context{}, t.TempDir(), st,
+		repoID, wtID, "src", key.TemplateName(), "8.0", 0, key, current, nil, time.Now(), ops)
+	if err != nil || done {
+		t.Fatalf("the failing migrate must fall through: done=%v err=%v", done, err)
+	}
+	if restored != "_tm_ancestor" {
+		t.Errorf("ancestor restored = %q, want _tm_ancestor", restored)
+	}
+
+	evs, err := st.QueryEvents(ctx, store.EventFilter{WorktreeID: wtID, EventTypes: []string{store.EvtPrepareRollbackFallback}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("fallback events = %d, want 1", len(evs))
+	}
+	msg := evs[0].Message
+	if !strings.Contains(msg, "MIGRATE_RAN") || strings.Contains(msg, "ROLLBACK_RAN") {
+		t.Errorf("an insertion-only divergence must skip rollback and migrate forward, got %q", msg)
 	}
 }
