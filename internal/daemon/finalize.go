@@ -955,11 +955,6 @@ func TeardownWorktree(
 		}
 	}
 
-	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
-	if err != nil {
-		return err
-	}
-
 	repoID, err := st.Store.LookupRepoID(ctx, repoRoot)
 	if err != nil {
 		return err
@@ -973,6 +968,10 @@ func TeardownWorktree(
 		// side. Still honour --force by letting git reap a stale
 		// checkout if one happens to remain on disk.
 		if force {
+			cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
+			if err != nil {
+				return err
+			}
 			st.withRepoTeardown(repoPath, func() {
 				gitArgs := []string{"-C", repoRoot, "worktree", "remove", "--force", wtRoot}
 				_ = lowPriorityCommand(ctx, "git", gitArgs).Run()
@@ -999,7 +998,6 @@ func TeardownWorktree(
 			"wt", wtRoot, "id", row.ID)
 	}
 	wtID := row.ID
-	worktreesRoot := worktreesRootOf(cfg.Worktrees.Root, repoRoot)
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteStart,
 		"daemon-detached teardown hooks + db teardown + git remove beginning",
@@ -1015,6 +1013,12 @@ func TeardownWorktree(
 		_ = st.Store.WriteEvent(context.WithoutCancel(ctx), store.LevelError, store.EvtWorktreeDeleteError,
 			err.Error(), repoID, wtID, "", 0, map[string]string{"worktree_path": wtRoot})
 	}()
+
+	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
+	if err != nil {
+		return fmt.Errorf("load config for teardown of %s: %w", wtRoot, err)
+	}
+	worktreesRoot := worktreesRootOf(cfg.Worktrees.Root, repoRoot)
 
 	if err := runTeardownBeforeRemoval(ctx, st, &cfg, repoRoot, wtRoot, row, repoID, inheritedEnv); err != nil {
 		return err

@@ -89,3 +89,35 @@ func assertTeardownFinished(t *testing.T, st *State, repo, wt string, row store.
 		t.Fatalf("git must no longer list the torn-down worktree:\n%s", out)
 	}
 }
+
+func TestResumedTeardownFailingOnItsConfigEndsInDeleteError(t *testing.T) {
+	st, repo, wt := newWatchWorktreeWithConfig(t, "auto_fetch:\n  enabled: false\n")
+	ctx := t.Context()
+	repoID, err := st.Store.EnsureRepo(ctx, repo, "repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtID, err := st.Store.EnsureWorktree(ctx, repoID, wt, "feat", "feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteStart,
+		"daemon-detached teardown hooks + db teardown + git remove beginning", repoID, wtID, "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	writeRepoConfig(t, repo, "databases: [")
+
+	SweepInterruptedTeardowns(ctx, st)
+
+	last, err := st.Store.LatestWorktreeStateEvent(ctx, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := store.DeriveWorktreeState(last); state != store.StateError ||
+		last.EventType != store.EvtWorktreeDeleteError || !strings.Contains(last.Message, "load config") {
+		t.Fatalf("a resumed teardown failing on its config must end in delete:error, got state %q from %+v", state, last)
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("a teardown that failed before removal must leave the checkout: %v", err)
+	}
+}
