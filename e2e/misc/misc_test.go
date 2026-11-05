@@ -8,6 +8,7 @@
 package misc_e2e
 
 import (
+	"context"
 	"net"
 	"strings"
 	"testing"
@@ -31,7 +32,7 @@ func TestReachabilityProbeFailsCleanly(t *testing.T) {
 	_ = l.Close()
 	time.Sleep(20 * time.Millisecond) // let the kernel free the port
 
-	err = reachability.Probe("mysql", "127.0.0.1", port)
+	err = reachability.ProbeCtx(context.Background(), "mysql", "127.0.0.1", port)
 	if err == nil {
 		t.Fatal("probe against closed port should error")
 	}

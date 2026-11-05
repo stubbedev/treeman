@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/reachability"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/hooks"
@@ -611,7 +612,7 @@ func runFinalizeSetupPipeline(
 		// source databases (issue #28).
 		var prepErr error
 		st.withWorktreePrepare(wtRoot, func() {
-			_, prepErr = prepare.Run(ctx, cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv)
+			_, prepErr = prepare.Run(reachability.WithStartupWait(ctx), cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv)
 		})
 		// A cancelled context means a concurrent teardown preempted
 		// prepare — a clean stop regardless of whether prepare.Run
@@ -875,7 +876,7 @@ func FinalizeWorktreeForWatch(
 	var prepErr error
 	failure.enginesTouched = true
 	st.withWorktreePrepare(wtRoot, func() {
-		_, prepErr = prepare.RunFiltered(ctx, &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv, opts)
+		_, prepErr = prepare.RunFiltered(reachability.WithStartupWait(ctx), &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv, opts)
 	})
 	if prepErr != nil {
 		if ctx.Err() != nil {

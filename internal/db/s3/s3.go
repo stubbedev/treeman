@@ -33,8 +33,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
-	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
 // Driver wraps an aws-sdk-go-v2 S3 client. Buckets are addressed by
@@ -59,28 +59,19 @@ func Connect(ctx context.Context, cfg config.S3Conn) (*Driver, error) {
 		region = "us-east-1"
 	}
 	endpoint := cfg.Endpoint
-	if cfg.Container != "" || cfg.ComposeService != "" {
-		opts := containerip.Opts{
+	if endpoint != "" {
+		resolved, err := adapter.ResolveAndProbeURL(ctx, "s3", containerip.Opts{
 			Container:      cfg.Container,
 			ComposeService: cfg.ComposeService,
 			ComposeProject: cfg.ComposeProject,
 			Engine:         cfg.ContainerEngine,
 			Network:        cfg.Network,
 			InternalPort:   containerip.URIPort(endpoint, 9000),
-		}
-		addr, err := containerip.ResolveAddr(ctx, opts)
+		}, endpoint)
 		if err != nil {
-			return nil, fmt.Errorf("resolve container: %w", err)
-		}
-		if addr != nil {
-			endpoint = containerip.RewriteHostPortInURIWithPort(endpoint, addr.Host, addr.Port)
-		}
-	}
-
-	if endpoint != "" {
-		if err := reachability.ProbeURLCtx(ctx, "s3", endpoint); err != nil {
 			return nil, err
 		}
+		endpoint = resolved
 	}
 
 	// Both creds must be supplied together. Passing one half to the

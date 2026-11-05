@@ -14,8 +14,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
-	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
 // Driver wraps the mongo Client.
@@ -40,27 +40,19 @@ type Driver struct {
 // isn't mongodb+srv:// where the host is a SRV record), and dials.
 func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 	uri := cfg.URI
-	if cfg.Container != "" || cfg.ComposeService != "" {
-		opts := containerip.Opts{
+	if !strings.HasPrefix(uri, "mongodb+srv://") {
+		resolved, err := adapter.ResolveAndProbeURL(ctx, "mongodb", containerip.Opts{
 			Container:      cfg.Container,
 			ComposeService: cfg.ComposeService,
 			ComposeProject: cfg.ComposeProject,
 			Engine:         cfg.ContainerEngine,
 			Network:        cfg.Network,
 			InternalPort:   containerip.URIPort(uri, 27017),
-		}
-		addr, err := containerip.ResolveAddr(ctx, opts)
+		}, uri)
 		if err != nil {
-			return nil, fmt.Errorf("resolve container: %w", err)
-		}
-		if addr != nil {
-			uri = containerip.RewriteHostPortInURIWithPort(uri, addr.Host, addr.Port)
-		}
-	}
-	if !strings.HasPrefix(uri, "mongodb+srv://") {
-		if err := reachability.ProbeURLCtx(ctx, "mongodb", uri); err != nil {
 			return nil, err
 		}
+		uri = resolved
 	}
 	clientOpts := options.Client().ApplyURI(uri)
 	if cfg.PoolMax > 0 {

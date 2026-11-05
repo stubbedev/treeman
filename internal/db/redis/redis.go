@@ -11,8 +11,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
-	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
 // Driver wraps go-redis's Client. Clients are pooled per db index
@@ -35,25 +35,15 @@ type Driver struct {
 // Connect probes TCP reachability + parses the URL once. Per-db
 // clients are opened lazily.
 func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
-	url := cfg.URL
-	if cfg.Container != "" || cfg.ComposeService != "" {
-		opts := containerip.Opts{
-			Container:      cfg.Container,
-			ComposeService: cfg.ComposeService,
-			ComposeProject: cfg.ComposeProject,
-			Engine:         cfg.ContainerEngine,
-			Network:        cfg.Network,
-			InternalPort:   containerip.URIPort(url, 6379),
-		}
-		addr, err := containerip.ResolveAddr(ctx, opts)
-		if err != nil {
-			return nil, fmt.Errorf("resolve container: %w", err)
-		}
-		if addr != nil {
-			url = containerip.RewriteHostPortInURIWithPort(url, addr.Host, addr.Port)
-		}
-	}
-	if err := reachability.ProbeURLCtx(ctx, "redis", url); err != nil {
+	url, err := adapter.ResolveAndProbeURL(ctx, "redis", containerip.Opts{
+		Container:      cfg.Container,
+		ComposeService: cfg.ComposeService,
+		ComposeProject: cfg.ComposeProject,
+		Engine:         cfg.ContainerEngine,
+		Network:        cfg.Network,
+		InternalPort:   containerip.URIPort(cfg.URL, 6379),
+	}, cfg.URL)
+	if err != nil {
 		return nil, err
 	}
 	opts, err := redis.ParseURL(url)

@@ -5,6 +5,7 @@ package es
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/reachability"
 )
@@ -33,29 +35,25 @@ type Driver struct {
 // the common case stays byte-identical.
 func escSeg(s string) string { return url.PathEscape(s) }
 
-// Connect probes reachability + returns a Driver. Auth (api key /
-// basic) is left for a future patch; the local-dev target uses
-// unauthenticated Elasticsearch.
+// Connect probes reachability + returns a Driver. Under a ctx marked by
+// reachability.WithStartupWait it instead waits for the cluster to
+// accept connections and reach at least yellow health, both within one
+// reachability.StartupWait bound, so a container that is still booting
+// (or a cluster recovering its shards) delays the caller instead of
+// failing it. Auth (api key / basic) is left for a future patch; the
+// local-dev target uses unauthenticated Elasticsearch.
 func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
-	url := cfg.URL
-	if cfg.Container != "" || cfg.ComposeService != "" {
-		opts := containerip.Opts{
-			Container:      cfg.Container,
-			ComposeService: cfg.ComposeService,
-			ComposeProject: cfg.ComposeProject,
-			Engine:         cfg.ContainerEngine,
-			Network:        cfg.Network,
-			InternalPort:   containerip.URIPort(url, 9200),
-		}
-		addr, err := containerip.ResolveAddr(ctx, opts)
-		if err != nil {
-			return nil, fmt.Errorf("resolve container: %w", err)
-		}
-		if addr != nil {
-			url = containerip.RewriteHostPortInURIWithPort(url, addr.Host, addr.Port)
-		}
-	}
-	if err := reachability.ProbeURLCtx(ctx, "elasticsearch", url); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, reachability.StartupWait)
+	defer cancel()
+	url, err := adapter.ResolveAndProbeURL(ctx, "elasticsearch", containerip.Opts{
+		Container:      cfg.Container,
+		ComposeService: cfg.ComposeService,
+		ComposeProject: cfg.ComposeProject,
+		Engine:         cfg.ContainerEngine,
+		Network:        cfg.Network,
+		InternalPort:   containerip.URIPort(cfg.URL, 9200),
+	}, cfg.URL)
+	if err != nil {
 		return nil, err
 	}
 	httpClient := &http.Client{Timeout: 30 * time.Second}
@@ -71,10 +69,75 @@ func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 		tr.MaxIdleConnsPerHost = int(cfg.PoolMax)
 		httpClient.Transport = tr
 	}
-	return &Driver{
+	d := &Driver{
 		Base: strings.TrimRight(url, "/"),
 		HTTP: httpClient,
-	}, nil
+	}
+	if !reachability.StartupWaitEnabled(ctx) {
+		return d, nil
+	}
+	if err := reachability.WaitFor(ctx, d.clusterReady, isClusterNotReady); err != nil {
+		return nil, fmt.Errorf("elasticsearch at %s: %w", d.Base, err)
+	}
+	return d, nil
+}
+
+// clusterNotReadyError is a cluster that answered, or tried to, but
+// is not serving yet: health below yellow, no elected master, or a
+// connection dropped while the node boots.
+type clusterNotReadyError struct {
+	reason string
+	err    error
+}
+
+func (e *clusterNotReadyError) Error() string {
+	if e.err == nil {
+		return e.reason
+	}
+	return e.reason + ": " + e.err.Error()
+}
+
+func (e *clusterNotReadyError) Unwrap() error { return e.err }
+
+func isClusterNotReady(err error) bool {
+	var nr *clusterNotReadyError
+	return errors.As(err, &nr)
+}
+
+const clusterHealthPath = "/_cluster/health?wait_for_status=yellow&timeout=5s&master_timeout=5s"
+
+// clusterReady asks for yellow health, letting the server hold the
+// request for a few seconds while shards recover. ES answers 408 with
+// the current status when yellow is not reached in time and 503 while
+// no master is elected; both, and transport failures of a node still
+// booting, are reported as clusterNotReadyError so the caller retries.
+func (d *Driver) clusterReady(ctx context.Context) error {
+	body, err := d.get(ctx, clusterHealthPath)
+	if err != nil {
+		var se *httpStatusError
+		if !errors.As(err, &se) {
+			return &clusterNotReadyError{reason: "cluster health request failed", err: err}
+		}
+		if se.Status != http.StatusRequestTimeout && se.Status != http.StatusServiceUnavailable {
+			return err
+		}
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	jerr := json.Unmarshal(body, &health)
+	switch {
+	case health.Status == "green" || health.Status == "yellow":
+		return nil
+	case health.Status != "":
+		return &clusterNotReadyError{reason: "cluster health is " + health.Status + " (want yellow or green)"}
+	case err != nil:
+		return &clusterNotReadyError{reason: "cluster not serving yet", err: err}
+	case jerr != nil:
+		return fmt.Errorf("parse GET %s response %q: %w", clusterHealthPath, truncate(string(body), 512), jerr)
+	default:
+		return fmt.Errorf("GET %s response %q has no status", clusterHealthPath, truncate(string(body), 512))
+	}
 }
 
 // EngineVersion fetches the cluster root, parses the `version.number`
@@ -265,9 +328,22 @@ func (d *Driver) get(ctx context.Context, path string) ([]byte, error) {
 		return nil, fmt.Errorf("GET %s: read body: %w", path, err)
 	}
 	if resp.StatusCode >= 400 {
-		return body, fmt.Errorf("GET %s → HTTP %d: %s", path, resp.StatusCode, string(body))
+		return body, &httpStatusError{Method: http.MethodGet, Path: path, Status: resp.StatusCode, Body: body}
 	}
 	return body, nil
+}
+
+// httpStatusError is a request the cluster answered with an HTTP
+// error status.
+type httpStatusError struct {
+	Method string
+	Path   string
+	Status int
+	Body   []byte
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s %s → HTTP %d: %s", e.Method, e.Path, e.Status, string(e.Body))
 }
 
 func (d *Driver) delete(ctx context.Context, path string) (int, error) {

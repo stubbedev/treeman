@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/db/containerip"
+	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
 // TestConfigurePoolAppliesLimits checks the pool knobs land on the
@@ -57,10 +58,60 @@ func TestResolveAndProbePlainHost(t *testing.T) {
 	}
 
 	_ = l.Close()
-	deadCtx, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel2()
-	if err := ResolveAndProbe(deadCtx, "mysql", containerip.Opts{}, &host, &port); err == nil {
-		t.Error("closed port: want probe error")
+	start := time.Now()
+	if err := ResolveAndProbe(context.Background(), "mysql", containerip.Opts{}, &host, &port); !reachability.IsRefused(err) {
+		t.Errorf("closed port: want refused probe error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("closed port without startup wait took %v, want an immediate failure", elapsed)
+	}
+}
+
+// TestResolveAndProbeWaitsForRefusedEngine: under a startup-wait ctx a
+// refused port is retried until the caller's deadline instead of
+// failing on the first dial, and the final error still names the
+// refusal.
+func TestResolveAndProbeWaitsForRefusedEngine(t *testing.T) {
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, portStr, _ := net.SplitHostPort(l.Addr().String())
+	_ = l.Close()
+	p, _ := strconv.Atoi(portStr)
+	host, port := "127.0.0.1", uint16(p) //nolint:gosec // listener port fits uint16
+
+	ctx, cancel := context.WithTimeout(reachability.WithStartupWait(context.Background()), 600*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = ResolveAndProbe(ctx, "mysql", containerip.Opts{}, &host, &port)
+	elapsed := time.Since(start)
+	if !reachability.IsRefused(err) {
+		t.Fatalf("want refused error after the wait, got %v", err)
+	}
+	if elapsed < 500*time.Millisecond {
+		t.Errorf("returned after %v, want it to keep retrying until the 600ms deadline", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("returned after %v, want it bounded by the 600ms deadline", elapsed)
+	}
+}
+
+// TestResolveAndProbeURLKeepsURIWithoutContainer: with no container
+// reference the URI comes back byte-identical.
+func TestResolveAndProbeURLKeepsURIWithoutContainer(t *testing.T) {
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	uri := "http://" + l.Addr().String() + "/"
+	got, err := ResolveAndProbeURL(context.Background(), "elasticsearch", containerip.Opts{}, uri)
+	if err != nil {
+		t.Fatalf("live listener: %v", err)
+	}
+	if got != uri {
+		t.Errorf("uri = %q, want %q unchanged", got, uri)
 	}
 }
 
