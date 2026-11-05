@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
@@ -266,8 +267,19 @@ func run() error {
 	}
 	_ = ln.Close()
 	_ = os.Remove(sockPath)
+	stop()
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), teardownDrainTimeout)
+	defer cancelDrain()
+	if stuck := st.WaitTeardownsDrained(drainCtx); len(stuck) > 0 {
+		slog.Error("teardowns still running at shutdown; the next daemon start resumes them", "worktrees", stuck)
+	}
 	return nil
 }
+
+// teardownDrainTimeout bounds how long shutdown waits for in-flight
+// teardowns to reach a stopping point before the store closes under
+// them; it stays well inside systemd's default 90s stop timeout.
+const teardownDrainTimeout = 30 * time.Second
 
 // resumeRepoWatchers re-spawns per-repo watchers on boot via the same
 // path the watcher_start RPC takes. Failures per-repo are logged +

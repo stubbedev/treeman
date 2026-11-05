@@ -999,34 +999,31 @@ func TeardownWorktree(
 			"wt", wtRoot, "id", row.ID)
 	}
 	wtID := row.ID
-	slugVal := row.Slug
 	worktreesRoot := worktreesRootOf(cfg.Worktrees.Root, repoRoot)
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteStart,
 		"daemon-detached teardown hooks + db teardown + git remove beginning",
 		repoID, wtID, "", 0, triggerPayload(ctx))
 	defer func() {
-		if err != nil {
-			_ = st.Store.WriteEvent(context.WithoutCancel(ctx), store.LevelError, store.EvtWorktreeDeleteError,
-				err.Error(), repoID, wtID, "", 0, map[string]string{"worktree_path": wtRoot})
+		if err == nil {
+			return
 		}
+		if ctx.Err() != nil {
+			slog.Warn("teardown stopped by daemon shutdown; the next daemon start resumes it", "wt", wtRoot, "err", err)
+			return
+		}
+		_ = st.Store.WriteEvent(context.WithoutCancel(ctx), store.LevelError, store.EvtWorktreeDeleteError,
+			err.Error(), repoID, wtID, "", 0, map[string]string{"worktree_path": wtRoot})
 	}()
 
-	// Three-step teardown: delete-before-engines actions →
-	// engine drop (inline + synchronous so post-engine actions can
-	// observe the drop) → delete-after-engines actions. Drop
-	// failures are logged but don't abort the rest.
-	_ = runTriggerActions(ctx, st, "delete-before-engines",
-		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, slugVal,
-		row.IsMain, repoID, wtID, inheritedEnv)
-	if len(cfg.Databases) > 0 {
-		if err := teardownDatabasesWithHeartbeat(ctx, &cfg, slugVal, repoID, wtID, st.Store); err != nil {
-			slog.Warn("teardown DB drop", "wt", wtRoot, "err", err)
-		}
+	if err := runTeardownBeforeRemoval(ctx, st, &cfg, repoRoot, wtRoot, row, repoID, inheritedEnv); err != nil {
+		return err
 	}
-	_ = runTriggerActions(ctx, st, "delete-after-engines",
-		cfg.Hooks.OnDeleteAfterEngines, repoRoot, wtRoot, slugVal,
-		row.IsMain, repoID, wtID, inheritedEnv)
+
+	// From here on the checkout is being removed: finish the removal
+	// and its bookkeeping even if shutdown starts meanwhile, so git,
+	// the trash and the registry never disagree. Shutdown waits for it.
+	ctx = context.WithoutCancel(ctx)
 
 	// Acquire the per-repo mutex only for the git operations — they
 	// touch the shared <common>/worktrees/ admin tree and aren't
@@ -1061,6 +1058,41 @@ func TeardownWorktree(
 		"daemon-detached teardown complete",
 		repoID, wtID, "", 0, nil)
 	return nil
+}
+
+// runTeardownBeforeRemoval runs the three steps that precede removing
+// the checkout: delete-before-engines actions → engine drop (inline +
+// synchronous so post-engine actions can observe the drop) →
+// delete-after-engines actions. Drop failures are logged but don't
+// abort the rest; a cancelled ctx does, before anything irreversible
+// happens to the checkout.
+func runTeardownBeforeRemoval(
+	ctx context.Context,
+	st *State,
+	cfg *config.Config,
+	repoRoot, wtRoot string,
+	row store.WorktreeRow,
+	repoID int64,
+	inheritedEnv map[string]string,
+) error {
+	_ = runTriggerActions(ctx, st, "delete-before-engines",
+		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, row.Slug,
+		row.IsMain, repoID, row.ID, inheritedEnv)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(cfg.Databases) > 0 {
+		if err := teardownDatabasesWithHeartbeat(ctx, cfg, row.Slug, repoID, row.ID, st.Store); err != nil {
+			slog.Warn("teardown DB drop", "wt", wtRoot, "err", err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_ = runTriggerActions(ctx, st, "delete-after-engines",
+		cfg.Hooks.OnDeleteAfterEngines, repoRoot, wtRoot, row.Slug,
+		row.IsMain, repoID, row.ID, inheritedEnv)
+	return ctx.Err()
 }
 
 // worktreesRootOf resolves the configured worktrees.root (default

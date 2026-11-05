@@ -479,10 +479,15 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 		"lifecycle watcher: teardown hooks + db teardown beginning",
 		repoID, row.ID, "", 0, nil)
 	defer func() {
-		if err != nil {
-			_ = st.Store.WriteEvent(context.WithoutCancel(ctx), store.LevelError, store.EvtWorktreeReapError,
-				err.Error(), repoID, row.ID, "", 0, map[string]string{"worktree_path": wtPath})
+		if err == nil {
+			return
 		}
+		if ctx.Err() != nil {
+			slog.Warn("orphan teardown stopped by daemon shutdown; the next daemon start reconciles it", "wt", wtPath, "err", err)
+			return
+		}
+		_ = st.Store.WriteEvent(context.WithoutCancel(ctx), store.LevelError, store.EvtWorktreeReapError,
+			err.Error(), repoID, row.ID, "", 0, map[string]string{"worktree_path": wtPath})
 	}()
 
 	// Orphan teardown — the working tree is gone, so we run
@@ -502,6 +507,9 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 		hooks.PersistOutcome(ctx, st.Store, repoID, row.ID, trigger, started, nowMillis(), out)
 	}
 	runOrphan("delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if len(cfg.Databases) > 0 {
 		// Inline drop so delete-after-engines actions observe a
@@ -512,7 +520,14 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 			slog.Warn("lifecycle teardown DB drop", "wt", wtPath, "err", err)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	runOrphan("delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
 
 	// Physically release the port reservations,
 	// same as the CLI delete path. A bare MarkWorktreeDeleted leaves the

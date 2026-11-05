@@ -320,6 +320,26 @@ func (st *State) UnmarkTeardownInFlight(wtPath string) {
 	st.inFlightMu.Unlock()
 }
 
+// WaitTeardownsDrained blocks until no teardown is in flight or ctx is
+// done, and returns the paths still in flight at that point.
+func (st *State) WaitTeardownsDrained(ctx context.Context) []string {
+	ticker := time.NewTicker(teardownDrainPoll)
+	defer ticker.Stop()
+	for {
+		inFlight := st.SnapshotInFlightTeardowns()
+		if len(inFlight) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return inFlight
+		case <-ticker.C:
+		}
+	}
+}
+
+const teardownDrainPoll = 50 * time.Millisecond
+
 // IsTeardownInFlight reports whether a primary teardown is currently
 // running for wtPath. The lifecycle watcher uses this to skip
 // spawning an orphan teardown for the same worktree.
