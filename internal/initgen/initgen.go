@@ -501,32 +501,39 @@ func stepBlock(run string, envMap map[string]string) *yaml.Node {
 
 // inputNodes builds the `databases[].inputs:` sequence from a
 // detected framework. Each (migration_dir, file_glob) pair becomes
-// one entry; each lockfile becomes another. All entries are content-
-// hashed — there is no per-entry hash mode anymore.
+// one entry; each lockfile becomes another, marked `kind: lockfile` so
+// a lockfile change never counts as a rollback step. All entries are
+// content-hashed — there is no per-entry hash mode anymore.
 func inputNodes(spec framework.Spec) *yaml.Node {
-	type entry struct{ glob, label string }
+	type entry struct {
+		glob, label string
+		kind        config.InputKind
+	}
 	var entries []entry
 	seen := map[string]struct{}{}
-	add := func(glob, label string) {
+	add := func(glob, label string, kind config.InputKind) {
 		if _, dup := seen[glob]; dup {
 			return
 		}
 		seen[glob] = struct{}{}
-		entries = append(entries, entry{glob: glob, label: label})
+		entries = append(entries, entry{glob: glob, label: label, kind: kind})
 	}
 	for _, dir := range spec.MigrationDirs {
 		for _, pat := range spec.FileGlobs {
-			add(dir+"/**/"+pat, "migrations")
+			add(dir+"/**/"+pat, "migrations", config.InputKindMigrations)
 		}
 	}
 	for _, lf := range spec.Lockfiles {
-		add(lf, "lockfile")
+		add(lf, "lockfile", config.InputKindLockfile)
 	}
 	seq := seqNode()
 	for _, e := range entries {
 		m := mapNode("glob", scalar(e.glob))
 		if e.label != "" {
 			mapSet(m, "label", scalar(e.label))
+		}
+		if e.kind != config.InputKindMigrations {
+			mapSet(m, "kind", scalar(string(e.kind)))
 		}
 		seq.Content = append(seq.Content, m)
 	}

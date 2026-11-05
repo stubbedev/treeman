@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/stubbedev/treeman/internal/engine"
@@ -293,7 +294,14 @@ func (s *Store) FindAncestorSnapshot(
 // ledger entries `migrate:rollback` must unwind to reach the last-good
 // common state before re-running `migrate` forward.
 //
-// Pure-append and exact-match candidates are skipped (those are
+// Globs in lockfileGlobs are not ledger entries: they are left out of
+// the merged order and never counted as steps. A candidate whose ledger
+// is a prefix of (or equal to) the current one but whose lockfiles
+// differ is returned with steps == 0 — the caller restores it and
+// migrates forward without unwinding anything.
+//
+// Candidates whose ledger AND lockfiles both form a prefix of the
+// current run are skipped (pure append / exact match are
 // FindAncestorSnapshot's / LookupSnapshot's job), as are candidates
 // whose diverging tail contains a migration the branch does not have
 // on disk — a template built from a source AHEAD of the branch, or
@@ -303,20 +311,21 @@ func (s *Store) FindAncestorSnapshot(
 // while the rebuild still gets cached as a template. Returns
 // (nil, 0, nil) when no unwindable diverging candidate exists — prepare
 // falls back to a cold build. The chosen candidate maximises the
-// common-prefix length (minimises steps).
+// common-prefix length, then minimises steps.
 func (s *Store) FindRollbackAncestor(
 	ctx context.Context,
 	repoID int64,
 	eng, engineVersion, dumpHash, currentCommandsHash string,
+	lockfileGlobs map[string]struct{},
 	currentInputs map[string]InputVector,
 ) (*SnapshotRecord, int, error) {
 	cands, err := s.candidateSnapshots(ctx, repoID, eng, engineVersion, dumpHash)
 	if err != nil {
 		return nil, 0, err
 	}
-	curMerged := mergeVectorsByBasename(currentInputs)
-	curNames := make(map[string]struct{}, len(curMerged))
-	for _, fh := range curMerged {
+	curLedger := mergeVectorsByBasename(withoutGlobs(currentInputs, lockfileGlobs))
+	curNames := make(map[string]struct{}, len(curLedger))
+	for _, fh := range curLedger {
 		curNames[pathBase(fh.Path)] = struct{}{}
 	}
 	var best *SnapshotRecord
@@ -327,25 +336,47 @@ func (s *Store) FindRollbackAncestor(
 		if r.LockfileHashes[CommandsHashKey] != currentCommandsHash {
 			continue
 		}
-		candMerged := mergeVectorsByBasename(r.Inputs)
-		prefix := commonPrefixLen(candMerged, curMerged)
-		if prefix == len(candMerged) {
-			// Candidate fully consumed as a prefix of current → pure
-			// append or exact match, not a rollback target.
+		candLedger := mergeVectorsByBasename(withoutGlobs(r.Inputs, lockfileGlobs))
+		prefix := commonPrefixLen(candLedger, curLedger)
+		if prefix == len(candLedger) && lockfilesEqual(r.Inputs, currentInputs, lockfileGlobs) {
 			continue
 		}
-		if !unwindableTail(candMerged[prefix:], curNames) {
+		if !unwindableTail(candLedger[prefix:], curNames) {
 			continue
 		}
-		steps := len(candMerged) - prefix
-		// Prefer the longest common prefix (fewest migrations to unwind).
-		if prefix > bestPrefix {
+		steps := len(candLedger) - prefix
+		if prefix > bestPrefix || (prefix == bestPrefix && steps < bestSteps) {
 			best = r
 			bestPrefix = prefix
 			bestSteps = steps
 		}
 	}
 	return best, bestSteps, nil
+}
+
+// withoutGlobs returns m minus the entries keyed by a glob in drop.
+func withoutGlobs(m map[string]InputVector, drop map[string]struct{}) map[string]InputVector {
+	if len(drop) == 0 {
+		return m
+	}
+	out := make(map[string]InputVector, len(m))
+	for glob, v := range m {
+		if _, skip := drop[glob]; !skip {
+			out[glob] = v
+		}
+	}
+	return out
+}
+
+// lockfilesEqual reports whether every lockfile glob carries the same
+// file vector in a and b (absent on both sides counts as equal).
+func lockfilesEqual(a, b map[string]InputVector, lockfileGlobs map[string]struct{}) bool {
+	for glob := range lockfileGlobs {
+		if !slices.Equal(a[glob], b[glob]) {
+			return false
+		}
+	}
+	return true
 }
 
 // unwindableTail reports whether every migration the rollback must

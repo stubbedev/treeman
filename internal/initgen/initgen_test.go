@@ -212,6 +212,11 @@ func TestRenderTemplateLaravelEndToEnd(t *testing.T) {
 	if cfg.Databases[0].Rollback.Run != "php artisan migrate:rollback --force --step=$TREEMAN_ROLLBACK_STEPS" {
 		t.Errorf("bound Rollback.Run = %q", cfg.Databases[0].Rollback.Run)
 	}
+	if got := config.LockfileGlobs(cfg.Databases[0].Inputs); len(got) != 1 {
+		t.Errorf("lockfile globs bound from scaffold = %v, want only composer.lock", got)
+	} else if _, ok := got["composer.lock"]; !ok {
+		t.Errorf("lockfile globs bound from scaffold = %v, want composer.lock", got)
+	}
 
 	inputs, ok := db["inputs"].([]any)
 	if !ok || len(inputs) == 0 {

@@ -1711,17 +1711,69 @@ type Input struct {
 	// against via their `match:` field. Multiple entries can share a
 	// label so one action handles a logical group of file types.
 	Label string `yaml:"label,omitempty"`
+
+	// Kind says whether the matched files are migration-ledger entries
+	// (the default) or a lockfile. Both are hashed into the fingerprint,
+	// but only ledger files count toward a rollback's step count: a
+	// changed lockfile rebuilds from the ancestor template by migrating
+	// forward, never by unwinding the newest migration.
+	Kind InputKind `yaml:"kind,omitempty"`
+}
+
+// InputKind classifies an Input's files for rollback-ancestor matching.
+// The zero value is InputKindMigrations.
+type InputKind string
+
+const (
+	InputKindMigrations InputKind = ""
+	InputKindLockfile   InputKind = "lockfile"
+)
+
+const inputKindMigrationsName = "migrations"
+
+// UnmarshalYAML accepts `migrations` or `lockfile` and rejects anything
+// else, so a typo fails the config load instead of silently counting a
+// lockfile as a migration.
+func (k *InputKind) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Value {
+	case "", inputKindMigrationsName:
+		*k = InputKindMigrations
+	case string(InputKindLockfile):
+		*k = InputKindLockfile
+	default:
+		return fmt.Errorf("input kind (line %d): want %q or %q, got %q",
+			node.Line, inputKindMigrationsName, InputKindLockfile, node.Value)
+	}
+	return nil
+}
+
+// LockfileGlobs returns the globs of every input declared
+// `kind: lockfile`.
+func LockfileGlobs(inputs []Input) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, in := range inputs {
+		if in.Kind == InputKindLockfile {
+			out[in.Glob] = struct{}{}
+		}
+	}
+	return out
 }
 
 // JSONSchema documents the polymorphic shape: an Input is either a
 // bare glob string (shorthand for `{glob: <string>}`) or a full
-// `{glob, label}` mapping. All inputs are content-hashed; there is no
+// `{glob, label, kind}` mapping. All inputs are content-hashed; there is no
 // per-entry hash mode (the historical `filename` shortcut relied on an
 // append-only-migrations assumption that wasn't actually enforced).
 func (Input) JSONSchema() *jsonschema.Schema {
 	props := orderedmap.New[string, *jsonschema.Schema]()
 	props.Set("glob", &jsonschema.Schema{Type: "string", Description: "Glob pattern (repo-root-relative). Required."})
 	props.Set("label", &jsonschema.Schema{Type: "string", Description: "Optional label for `hooks.file-change` matchers."})
+	props.Set("kind", &jsonschema.Schema{
+		Type:        "string",
+		Enum:        []any{inputKindMigrationsName, string(InputKindLockfile)},
+		Default:     inputKindMigrationsName,
+		Description: "`migrations` (default): files are migration-ledger entries, counted as rollback steps. `lockfile`: hashed into the fingerprint but never unwound; a change migrates forward from the ancestor template.",
+	})
 	return &jsonschema.Schema{
 		OneOf: []*jsonschema.Schema{
 			{Type: "string", Description: "Bare glob string. Equivalent to `{glob: <this string>}`."},
@@ -1730,7 +1782,7 @@ func (Input) JSONSchema() *jsonschema.Schema {
 				Properties:           props,
 				Required:             []string{"glob"},
 				AdditionalProperties: jsonschema.FalseSchema,
-				Description:          "Full input mapping with optional label.",
+				Description:          "Full input mapping with optional label and kind.",
 			},
 		},
 		Description: "One source of file state for the template fingerprint. Bare string OR full mapping.",

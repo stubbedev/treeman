@@ -2162,6 +2162,10 @@ func tryDumpOnlyBuild(
 // failure is recorded as a warn-level prepare:rollback:fallback, never
 // a prepare:error: the run recovers, so it must not read as terminal.
 //
+// When only `kind: lockfile` inputs changed, the ancestor comes back
+// with zero steps: the rollback command is skipped (and not required)
+// and the restored template just migrates forward.
+//
 // WARNING: rollback runs the migration's CURRENT down(), not the one
 // that matched the applied schema — see the config doc on Rollback.
 func tryRollbackIncrementalBuild(
@@ -2180,16 +2184,17 @@ func tryRollbackIncrementalBuild(
 	started time.Time,
 	ops incrementalOps,
 ) (Outcome, bool, error) {
-	if d.Rollback == nil || d.Migrate == nil {
+	lockfileGlobs := config.LockfileGlobs(d.Inputs)
+	if d.Migrate == nil || (d.Rollback == nil && len(lockfileGlobs) == 0) {
 		return Outcome{}, false, nil
 	}
 	commandsHash := key.LockfileHashes[store.CommandsHashKey]
 	anc, steps, err := st.FindRollbackAncestor(ctx, repoID, d.Engine, version,
-		key.DumpHashHex, commandsHash, inputs)
+		key.DumpHashHex, commandsHash, lockfileGlobs, inputs)
 	if err != nil {
 		return Outcome{}, false, fmt.Errorf("find a rollback ancestor %s snapshot: %w", d.Engine, err)
 	}
-	if anc == nil || steps <= 0 {
+	if anc == nil || (steps > 0 && d.Rollback == nil) {
 		return Outcome{}, false, nil
 	}
 	unpin := snapshot.Pin(anc.Fingerprint)
@@ -2232,19 +2237,21 @@ func tryRollbackIncrementalBuild(
 	// Rollback then re-migrate. Both run via runner.Run directly (not
 	// runPhase) so a failure becomes a cold-build fall-through, not a
 	// propagated error.
-	rbSpec := runner.FromRollback(*d.Rollback, steps).
-		WithLogPath(runnerLogPath(worktreePath, d.Engine, "rollback", source))
-	rbStart := time.Now()
-	out, err := runner.Run(ctx, rbSpec, worktreePath, source, tplCtx, inheritedEnv)
-	if err := stepFailure("rollback", source, out, err); err != nil {
-		return abandonStep(err)
+	if steps > 0 {
+		rbSpec := runner.FromRollback(*d.Rollback, steps).
+			WithLogPath(runnerLogPath(worktreePath, d.Engine, "rollback", source))
+		rbStart := time.Now()
+		out, err := runner.Run(ctx, rbSpec, worktreePath, source, tplCtx, inheritedEnv)
+		if err := stepFailure("rollback", source, out, err); err != nil {
+			return abandonStep(err)
+		}
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "rollback", rbStart)
 	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "rollback", rbStart)
 
 	mgSpec := runner.FromMigrate(*d.Migrate).
 		WithLogPath(runnerLogPath(worktreePath, d.Engine, "migrate", source))
 	mgStart := time.Now()
-	out, err = runner.Run(ctx, mgSpec, worktreePath, source, tplCtx, inheritedEnv)
+	out, err := runner.Run(ctx, mgSpec, worktreePath, source, tplCtx, inheritedEnv)
 	if err := stepFailure("re-migrate", source, out, err); err != nil {
 		return abandonStep(err)
 	}

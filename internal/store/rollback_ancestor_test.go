@@ -34,7 +34,7 @@ func TestFindRollbackAncestor_EditMidSequence(t *testing.T) {
 	if err := s.RecordSnapshot(ctx, anc); err != nil {
 		t.Fatal(err)
 	}
-	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
 		map[string]InputVector{migs: {
 			{Path: "001.sql", Hash: "h1"},
 			{Path: "002.sql", Hash: "hNEW"},
@@ -67,7 +67,7 @@ func TestFindRollbackAncestor_MultiGlobGlobalOrder(t *testing.T) {
 	if err := s.RecordSnapshot(ctx, anc); err != nil {
 		t.Fatal(err)
 	}
-	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
 		map[string]InputVector{
 			core: {{Path: "database/migrations/2024_01_01_a.php", Hash: "h1"}},
 			mod:  {{Path: "app/Modules/X/database/migrations/2024_02_01_b.php", Hash: "hNEW"}},
@@ -99,7 +99,7 @@ func TestFindRollbackAncestor_RemovedFileReturnsNil(t *testing.T) {
 	// Current drops 002: the branch has no down() for it, so a step
 	// rollback would skip it silently and leave its schema applied.
 	// The candidate must be rejected — prepare cold-rebuilds instead.
-	got, _, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+	got, _, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
 		map[string]InputVector{migs: {
 			{Path: "001.sql", Hash: "h1"},
 			{Path: "003.sql", Hash: "h3"},
@@ -135,7 +135,7 @@ func TestFindRollbackAncestor_AheadOfBranchReturnsNil(t *testing.T) {
 	}
 	// The branch forked before the develop-only migrations and carries
 	// one of its own; none of the develop tail exists on disk here.
-	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
 		map[string]InputVector{migs: {
 			{Path: "2024_01_01_000001_create_users.php", Hash: "h1"},
 			{Path: "2024_01_02_000001_create_orders.php", Hash: "h2"},
@@ -165,7 +165,7 @@ func TestFindRollbackAncestor_MixedTailReturnsNil(t *testing.T) {
 	if err := s.RecordSnapshot(ctx, anc); err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+	got, _, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
 		map[string]InputVector{migs: {
 			{Path: "001.sql", Hash: "h1"},
 			{Path: "002.sql", Hash: "hNEW"},
@@ -190,7 +190,7 @@ func TestFindRollbackAncestor_PureAppendReturnsNil(t *testing.T) {
 	if err := s.RecordSnapshot(ctx, anc); err != nil {
 		t.Fatal(err)
 	}
-	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
 		map[string]InputVector{migs: {
 			{Path: "001.sql", Hash: "h1"},
 			{Path: "002.sql", Hash: "h2"},
@@ -212,7 +212,7 @@ func TestFindRollbackAncestor_ExactMatchReturnsNil(t *testing.T) {
 	if err := s.RecordSnapshot(ctx, record("fpSame", "ch", map[string]InputVector{migs: v})); err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+	got, _, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
 		map[string]InputVector{migs: v})
 	if err != nil {
 		t.Fatal(err)
@@ -240,7 +240,7 @@ func TestFindRollbackAncestor_PicksLongestCommonPrefix(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
 		map[string]InputVector{migs: {
 			{Path: "001.sql", Hash: "h1"},
 			{Path: "002.sql", Hash: "h2"},
@@ -272,7 +272,7 @@ func TestFindRollbackAncestor_ExcludesDumpOnlyTemplate(t *testing.T) {
 	if err := s.RecordSnapshot(ctx, dumpOnly); err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+	got, _, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch", nil,
 		map[string]InputVector{migs: {
 			{Path: "001.sql", Hash: "h1"}, {Path: "002.sql", Hash: "h2"},
 		}})
@@ -329,5 +329,155 @@ func TestPathBase(t *testing.T) {
 		if got := pathBase(in); got != want {
 			t.Errorf("pathBase(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Regression: a composer.lock bump with identical migrations sorted the
+// lockfile after every timestamped migration, so the merged order read
+// it as one diverging step and the rebuild unwound the newest real
+// migration. Declared `kind: lockfile`, it is not a step: the ancestor
+// comes back with zero steps for a forward-only migrate.
+func TestFindRollbackAncestor_LockfileOnlyChangeIsZeroSteps(t *testing.T) {
+	ctx := context.Background()
+	s := openRepoStore(t)
+	migs := "database/migrations/**/*.php"
+	lock := "composer.lock"
+	ledger := InputVector{
+		{Path: "database/migrations/2026_11_04_150019_add_style_columns.php", Hash: "h1"},
+		{Path: "database/migrations/2026_11_05_090000_add_cdn_hash_date_index.php", Hash: "h2"},
+	}
+	anc := record("fpLock", "ch", map[string]InputVector{
+		migs: ledger,
+		lock: {{Path: "composer.lock", Hash: "hOLD"}},
+	})
+	if err := s.RecordSnapshot(ctx, anc); err != nil {
+		t.Fatal(err)
+	}
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+		map[string]struct{}{lock: {}},
+		map[string]InputVector{
+			migs: ledger,
+			lock: {{Path: "composer.lock", Hash: "hNEW"}},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Fingerprint != "fpLock" {
+		t.Fatalf("want fpLock ancestor, got %v", got)
+	}
+	if steps != 0 {
+		t.Errorf("steps = %d, want 0 (a lockfile is never unwound)", steps)
+	}
+}
+
+func TestFindRollbackAncestor_LockfileChangeWithAppendIsZeroSteps(t *testing.T) {
+	ctx := context.Background()
+	s := openRepoStore(t)
+	migs := "migrations/*.sql"
+	lock := "composer.lock"
+	anc := record("fpLockAppend", "ch", map[string]InputVector{
+		migs: {{Path: "001.sql", Hash: "h1"}},
+		lock: {{Path: "composer.lock", Hash: "hOLD"}},
+	})
+	if err := s.RecordSnapshot(ctx, anc); err != nil {
+		t.Fatal(err)
+	}
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+		map[string]struct{}{lock: {}},
+		map[string]InputVector{
+			migs: {{Path: "001.sql", Hash: "h1"}, {Path: "002.sql", Hash: "h2"}},
+			lock: {{Path: "composer.lock", Hash: "hNEW"}},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || steps != 0 {
+		t.Fatalf("want fpLockAppend with 0 steps, got %v steps=%d", got, steps)
+	}
+}
+
+func TestFindRollbackAncestor_LockfileNotCountedInEditSteps(t *testing.T) {
+	ctx := context.Background()
+	s := openRepoStore(t)
+	migs := "migrations/*.sql"
+	lock := "composer.lock"
+	anc := record("fpLockEdit", "ch", map[string]InputVector{
+		migs: {{Path: "001.sql", Hash: "h1"}, {Path: "002.sql", Hash: "hOLD"}},
+		lock: {{Path: "composer.lock", Hash: "hOLD"}},
+	})
+	if err := s.RecordSnapshot(ctx, anc); err != nil {
+		t.Fatal(err)
+	}
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+		map[string]struct{}{lock: {}},
+		map[string]InputVector{
+			migs: {{Path: "001.sql", Hash: "h1"}, {Path: "002.sql", Hash: "hNEW"}},
+			lock: {{Path: "composer.lock", Hash: "hNEW"}},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || steps != 1 {
+		t.Fatalf("want fpLockEdit with 1 step (002 only), got %v steps=%d", got, steps)
+	}
+}
+
+func TestFindRollbackAncestor_UnchangedLockfileWithAppendReturnsNil(t *testing.T) {
+	ctx := context.Background()
+	s := openRepoStore(t)
+	migs := "migrations/*.sql"
+	lock := "composer.lock"
+	lockVec := InputVector{{Path: "composer.lock", Hash: "h"}}
+	anc := record("fpLockSame", "ch", map[string]InputVector{
+		migs: {{Path: "001.sql", Hash: "h1"}},
+		lock: lockVec,
+	})
+	if err := s.RecordSnapshot(ctx, anc); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+		map[string]struct{}{lock: {}},
+		map[string]InputVector{
+			migs: {{Path: "001.sql", Hash: "h1"}, {Path: "002.sql", Hash: "h2"}},
+			lock: lockVec,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Errorf("pure append with unchanged lockfile is FindAncestorSnapshot's case; got %s", got.Fingerprint)
+	}
+}
+
+func TestFindRollbackAncestor_PrefersZeroStepsOnEqualPrefix(t *testing.T) {
+	ctx := context.Background()
+	s := openRepoStore(t)
+	migs := "migrations/*.sql"
+	lock := "composer.lock"
+	for _, r := range []SnapshotRecord{
+		record("fpTail", "ch", map[string]InputVector{
+			migs: {{Path: "001.sql", Hash: "h1"}, {Path: "002.sql", Hash: "hOLD"}},
+			lock: {{Path: "composer.lock", Hash: "hNEW"}},
+		}),
+		record("fpPrefix", "ch", map[string]InputVector{
+			migs: {{Path: "001.sql", Hash: "h1"}},
+			lock: {{Path: "composer.lock", Hash: "hOLD"}},
+		}),
+	} {
+		if err := s.RecordSnapshot(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, steps, err := s.FindRollbackAncestor(ctx, 1, "mysql", "8.0", "dh", "ch",
+		map[string]struct{}{lock: {}},
+		map[string]InputVector{
+			migs: {{Path: "001.sql", Hash: "h1"}, {Path: "002.sql", Hash: "hNEW"}},
+			lock: {{Path: "composer.lock", Hash: "hNEW"}},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Fingerprint != "fpPrefix" || steps != 0 {
+		t.Fatalf("want fpPrefix with 0 steps, got %v steps=%d", got, steps)
 	}
 }
