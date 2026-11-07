@@ -100,8 +100,8 @@ func TestRestoreKeepsTargetExistingWhileAClientRecreatesIt(t *testing.T) {
 	}
 	var refSchema string
 	if err := db.QueryRowContext(ctx,
-		`SELECT REFERENCED_TABLE_SCHEMA FROM information_schema.REFERENTIAL_CONSTRAINTS
-		 WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = 'child'`, target).Scan(&refSchema); err != nil || refSchema != target {
+		`SELECT REFERENCED_TABLE_SCHEMA FROM information_schema.KEY_COLUMN_USAGE
+		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'child' AND REFERENCED_TABLE_NAME IS NOT NULL`, target).Scan(&refSchema); err != nil || refSchema != target {
 		t.Fatalf("child FK references schema %q (err %v), want %q", refSchema, err, target)
 	}
 
