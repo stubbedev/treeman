@@ -518,41 +518,35 @@ Examples:
 			// dirty/unpushed probes out of the per-target loop so N
 			// risky picks cost ONE question instead of N sequential
 			// ones (#77). --yes skips everything, as before.
-			batchConfirmed := false
+			preConfirmed := false
+			var declined []string
 			if len(targets) > 1 && !c.Bool("yes") {
-				confirmed, aborted, err := confirmBatchDelete(ctx, repoRoot, targets)
+				plan, err := confirmBatchDelete(ctx, repoRoot, targets)
 				if err != nil {
 					return err
 				}
-				if aborted {
-					return nil
-				}
-				batchConfirmed = confirmed
+				targets, declined, preConfirmed = plan.proceed, plan.declined, true
 			}
 
 			// Each target is torn down independently: one failure (or
 			// one declined confirmation) must not strand the rest.
 			var errs []error
 			for _, target := range targets {
-				if derr := deleteWorktreeTarget(ctx, c, repoRoot, target, batchConfirmed); derr != nil {
+				if derr := deleteWorktreeTarget(ctx, c, repoRoot, target, preConfirmed); derr != nil {
 					errs = append(errs, derr)
 				}
+			}
+			if len(declined) > 0 {
+				errs = append(errs, errDeleteDeclined(declined))
 			}
 			return errors.Join(errs...)
 		},
 	}
 }
 
-// confirmBatchDelete hoists the dirty/unpushed probes for a
-// multi-target delete into one danger-styled confirmation. Every
-// target with unregenerable state (uncommitted changes, unpushed
-// commits) gets a line naming the worktree, its branch, and its
-// reasons; a single ConfirmYes then covers the whole batch. Returns
-// (confirmed, aborted): confirmed skips the per-target prompts, and
-// aborted means the user declined — everything stays intact.
-// All-clean batches return (false, false): nothing risky, so the
-// delete proceeds without ceremony, exactly like the single-target
-// path.
+// unregenerableState names what deleting wtPath would destroy beyond
+// recovery: uncommitted changes and commits not on its upstream. An
+// empty result means the worktree can be recreated from the remote.
 func unregenerableState(ctx context.Context, wtPath string) ([]string, error) {
 	dirty, err := gitenv.HasWorkingTreeChanges(ctx, wtPath)
 	if err != nil {
@@ -572,47 +566,88 @@ func unregenerableState(ctx context.Context, wtPath string) ([]string, error) {
 	return reasons, nil
 }
 
-func confirmBatchDelete(ctx context.Context, repoRoot string, targets []string) (confirmed, aborted bool, err error) {
-	type finding struct {
-		path, branch string
-		reasons      []string
+// resolveDeleteTarget maps a delete target (registered basename,
+// branch, slug or prefix, else a path relative to the cwd) to the
+// worktree path it names.
+func resolveDeleteTarget(ctx context.Context, repoRoot, target string) (string, error) {
+	p, ok, err := wt.LookupWorktree(ctx, repoRoot, target, cliSink{})
+	if err != nil {
+		return "", err
 	}
+	if ok {
+		return p, nil
+	}
+	return MustAbs(target), nil
+}
+
+// batchDeletePlan is the outcome of a multi-target delete's single
+// confirmation. proceed holds the targets, in the order given, to tear
+// down without a further prompt: the clean ones, plus the risky ones
+// when the confirmation was accepted. declined labels the risky
+// worktrees left intact because it was not.
+type batchDeletePlan struct {
+	proceed  []string
+	declined []string
+}
+
+// confirmBatchDelete hoists the dirty/unpushed probes for a
+// multi-target delete into one danger-styled confirmation. Every
+// target with unregenerable state gets a line naming the worktree, its
+// branch, and its reasons; a single ConfirmYes then covers all of
+// them. Declining it skips only those targets, never the clean ones.
+func confirmBatchDelete(ctx context.Context, repoRoot string, targets []string) (batchDeletePlan, error) {
+	type finding struct {
+		label   string
+		reasons []string
+	}
+	risky := make([]bool, len(targets))
 	var findings []finding
-	for _, target := range targets {
-		wtPath := MustAbs(target)
-		p, ok, lookupErr := wt.LookupWorktree(ctx, repoRoot, target, cliSink{})
-		if lookupErr != nil {
-			return false, false, lookupErr
-		}
-		if ok {
-			wtPath = p
+	for i, target := range targets {
+		wtPath, err := resolveDeleteTarget(ctx, repoRoot, target)
+		if err != nil {
+			return batchDeletePlan{}, err
 		}
 		reasons, err := unregenerableState(ctx, wtPath)
 		if err != nil {
-			return false, false, err
+			return batchDeletePlan{}, err
 		}
 		if len(reasons) == 0 {
 			continue
 		}
-		branch, _ := gitcmd.String(ctx, wtPath, "rev-parse", "--abbrev-ref", "HEAD")
-		findings = append(findings, finding{path: wtPath, branch: branch, reasons: reasons})
-	}
-	if len(findings) == 0 {
-		return false, false, nil
-	}
-	_, _ = fmt.Fprintln(ui.Err, ui.Red(fmt.Sprintf("destroying %d worktree(s) with unregenerable state:", len(findings))))
-	for _, f := range findings {
-		label := f.path
-		if f.branch != "" {
-			label = fmt.Sprintf("%s (%s)", f.path, f.branch)
+		risky[i] = true
+		label := wtPath
+		if branch, berr := gitcmd.String(ctx, wtPath, "rev-parse", "--abbrev-ref", "HEAD"); berr == nil && branch != "" {
+			label = fmt.Sprintf("%s (%s)", wtPath, branch)
 		}
-		_, _ = fmt.Fprintf(ui.Err, "  %s — %s\n", label, strings.Join(f.reasons, ", "))
+		findings = append(findings, finding{label: label, reasons: reasons})
 	}
-	if !ui.ConfirmYes(fmt.Sprintf("destroy these %d worktrees?", len(findings))) {
-		PrintInfo("aborted: all %d worktrees left intact", len(targets))
-		return false, true, nil
+	confirmed := true
+	if len(findings) > 0 {
+		_, _ = fmt.Fprintln(ui.Err, ui.Red(fmt.Sprintf("destroying %d worktree(s) with unregenerable state:", len(findings))))
+		for _, f := range findings {
+			_, _ = fmt.Fprintf(ui.Err, "  %s — %s\n", f.label, strings.Join(f.reasons, ", "))
+		}
+		confirmed = ui.ConfirmYes(fmt.Sprintf("destroy these %d worktrees?", len(findings)))
 	}
-	return true, false, nil
+	var plan batchDeletePlan
+	for i, target := range targets {
+		if risky[i] && !confirmed {
+			continue
+		}
+		plan.proceed = append(plan.proceed, target)
+	}
+	if !confirmed {
+		for _, f := range findings {
+			plan.declined = append(plan.declined, f.label)
+		}
+	}
+	return plan, nil
+}
+
+// errDeleteDeclined reports the worktrees a delete left intact because
+// their destroy confirmation was declined.
+func errDeleteDeclined(labels []string) error {
+	return fmt.Errorf("destroy confirmation declined, %d worktree(s) not deleted: %s", len(labels), strings.Join(labels, ", "))
 }
 
 // deleteWorktreeTarget tears down one worktree named by path, branch or
@@ -625,13 +660,9 @@ func deleteWorktreeTarget(ctx context.Context, c *cli.Command, repoRoot, target 
 	// prompt can name the target precisely; this duplicates
 	// wt.Delete's lookup but the second pass inside the
 	// orchestrator is cheap (sqlite query).
-	wtPath := MustAbs(target)
-	p, ok, err := wt.LookupWorktree(ctx, repoRoot, target, cliSink{})
+	wtPath, err := resolveDeleteTarget(ctx, repoRoot, target)
 	if err != nil {
 		return err
-	}
-	if ok {
-		wtPath = p
 	}
 
 	// --dry-run (#60): resolve the target, show the git state + the
@@ -667,8 +698,7 @@ func deleteWorktreeTarget(ctx context.Context, c *cli.Command, repoRoot, target 
 		if len(reasons) > 0 {
 			q := fmt.Sprintf("Worktree %s has %s — destroy?", wtPath, strings.Join(reasons, ", "))
 			if !ui.ConfirmYes(q) {
-				PrintInfo("aborted: worktree %s left intact", wtPath)
-				return nil
+				return errDeleteDeclined([]string{wtPath})
 			}
 		}
 	}

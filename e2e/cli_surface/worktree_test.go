@@ -412,8 +412,9 @@ func TestWtDeleteDispatch(t *testing.T) {
 
 // TestWtDeleteConfirmNonTTY pins the destructive-confirm refusal: a
 // piped (non-TTY) `wt delete` of a DIRTY worktree must not auto-answer
-// the destroy prompt — it aborts with the --yes hint and leaves the
-// worktree registered; --yes is the scripting opt-in that proceeds.
+// the destroy prompt — it fails with the --yes hint, names the worktree
+// it left registered, and exits non-zero (#197); --yes is the scripting
+// opt-in that proceeds.
 func TestWtDeleteConfirmNonTTY(t *testing.T) {
 	repo := newGitRepo(t)
 	e := newEnv(t)
@@ -428,8 +429,11 @@ func TestWtDeleteConfirmNonTTY(t *testing.T) {
 	}
 
 	res = e.run(t, repo, "worktree", "delete", "dirty")
-	if res.err != nil {
-		t.Fatalf("refused delete must exit 0: %v\nstderr:\n%s", res.err, res.stderr)
+	if res.err == nil {
+		t.Fatalf("refused delete must exit non-zero:\nstdout:\n%s\nstderr:\n%s", res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "not deleted: "+dirty) {
+		t.Errorf("refused delete must name the worktree it left intact:\nstderr:\n%s", res.stderr)
 	}
 	if !strings.Contains(res.stdout+res.stderr, "--yes") {
 		t.Errorf("refused dirty delete should hint at --yes:\nstdout:\n%s\nstderr:\n%s", res.stdout, res.stderr)
@@ -448,7 +452,7 @@ func TestWtDeleteConfirmNonTTY(t *testing.T) {
 
 // TestWtDeleteBatchConfirm pins the multi-target confirmation (#77):
 // two dirty targets non-interactively refuse as a batch (one --yes
-// hint, both worktrees intact); with --yes the teardown runs with zero
+// hint, both worktrees intact, non-zero exit naming both); with --yes the teardown runs with zero
 // prompts and the picked-set summary lands on stderr before the first
 // teardown message.
 func TestWtDeleteBatchConfirm(t *testing.T) {
@@ -472,8 +476,11 @@ func TestWtDeleteBatchConfirm(t *testing.T) {
 	// Without --yes: the batch confirm refuses (non-TTY) after naming
 	// BOTH targets with their reasons — and nothing is destroyed.
 	res := e.run(t, repo, "worktree", "delete", alpha, beta)
-	if res.err != nil {
-		t.Fatalf("refused batch delete must exit 0: %v\nstderr:\n%s", res.err, res.stderr)
+	if res.err == nil {
+		t.Fatalf("refused batch delete must exit non-zero:\nstdout:\n%s\nstderr:\n%s", res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "2 worktree(s) not deleted") {
+		t.Errorf("refused batch delete must report both skipped worktrees:\nstderr:\n%s", res.stderr)
 	}
 	combined := res.stdout + res.stderr
 	for _, want := range []string{"unregenerable state", "alpha", "beta", "uncommitted changes"} {
@@ -512,6 +519,62 @@ func TestWtDeleteBatchConfirm(t *testing.T) {
 			t.Fatalf("batch --yes must delete both worktrees; still registered:\n%s", list.stdout)
 		}
 		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// TestWtDeleteBatchDeclineKeepsCleanTargets pins #197: in a
+// non-interactive multi-target delete, the refused batch confirmation
+// skips only the risky target. The clean sibling worktree, named by a
+// cwd-relative `../` path, is still torn down, and the run exits
+// non-zero with an error naming the worktree it left intact.
+func TestWtDeleteBatchDeclineKeepsCleanTargets(t *testing.T) {
+	repo := newGitRepo(t)
+	e := newEnv(t)
+	addSibling := func(name string) string {
+		p := filepath.Join(filepath.Dir(repo), name)
+		mustGit(t, repo, "worktree", "add", "-b", name+"-branch", p, "HEAD")
+		res := e.run(t, p, "worktree", "register", "--branch", name+"-branch")
+		if res.err != nil {
+			t.Fatalf("register %s: %v\nstderr:\n%s", name, res.err, res.stderr)
+		}
+		return p
+	}
+	clean := addSibling("clean")
+	risky := addSibling("risky")
+	if err := os.WriteFile(filepath.Join(risky, "uncommitted.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := e.run(t, repo, "worktree", "delete", "../clean", "../risky")
+	if res.err == nil {
+		t.Fatalf("delete that skipped a target must exit non-zero:\nstdout:\n%s\nstderr:\n%s", res.stdout, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "1 worktree(s) not deleted: "+risky+" (risky-branch)") {
+		t.Errorf("error must name the skipped worktree %s:\nstderr:\n%s", risky, res.stderr)
+	}
+	if !strings.Contains(res.stdout, "deleting "+clean) {
+		t.Errorf("the clean target must still be deleted:\nstdout:\n%s\nstderr:\n%s", res.stdout, res.stderr)
+	}
+	if strings.Contains(res.stdout, "deleting "+risky) {
+		t.Errorf("the declined target must not be deleted:\nstdout:\n%s", res.stdout)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		list := e.run(t, repo, "worktree", "list", "--json")
+		if !strings.Contains(list.stdout, `"clean-branch"`) {
+			if !strings.Contains(list.stdout, `"risky-branch"`) {
+				t.Fatalf("declined target must stay registered:\n%s", list.stdout)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("clean target must be torn down; still registered:\n%s", list.stdout)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(risky, "uncommitted.txt")); err != nil {
+		t.Errorf("declined target's uncommitted work must survive: %v", err)
 	}
 }
 
