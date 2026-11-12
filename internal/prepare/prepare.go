@@ -958,7 +958,7 @@ func prepareMySQL(
 	// cache must not hand server A's version/max_conns to server B.
 	version, _ := cachedProbe(ctx, "mysql-version:"+d.Connection, func() (string, error) { return drv.EngineVersion(ctx) })
 	maxConns, _ := cachedProbe(ctx, "mysql-maxconns:"+d.Connection, func() (int, error) { return drv.MaxConnections(ctx) })
-	budget := opts.serverBudget(maxConns, mysqlServerKey(*mysqlConn))
+	budget := opts.serverBudget(maxConns, mysqlServerKey(drv))
 
 	// branch_scoped databases bypass the fingerprint template cache
 	// entirely — their content is per-branch live data swapped through
@@ -2430,7 +2430,7 @@ func preparePostgres(
 	// not share probe results (see prepareMySQL, #44).
 	version, _ := cachedProbe(ctx, "postgres-version:"+d.Connection, func() (string, error) { return drv.EngineVersion(ctx) })
 	maxConns, _ := cachedProbe(ctx, "postgres-maxconns:"+d.Connection, func() (int, error) { return drv.MaxConnections(ctx) })
-	budget := opts.serverBudget(maxConns, postgresServerKey(*pgConn))
+	budget := opts.serverBudget(maxConns, postgresServerKey(drv))
 
 	if d.BranchScoped {
 		return runBranchScopedAt(ctx, version, branchScopedArgs{

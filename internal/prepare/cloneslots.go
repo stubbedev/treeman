@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/netip"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 
-	"github.com/stubbedev/treeman/internal/config"
+	dbmysql "github.com/stubbedev/treeman/internal/db/mysql"
+	dbpostgres "github.com/stubbedev/treeman/internal/db/postgres"
 	"github.com/stubbedev/treeman/internal/engine"
 )
 
@@ -34,28 +38,50 @@ func NewCloneSlots() *CloneSlots {
 	return &CloneSlots{servers: map[serverKey]*serverSlots{}}
 }
 
-// serverKey identifies one engine server as a connection block
-// addresses it. Two spellings of the same server (localhost vs
-// 127.0.0.1) count as two servers.
+// serverKey identifies one engine server by the endpoint its driver
+// dials: the address after container resolution, so a container ref
+// and its published port meet on one key, with every loopback
+// spelling (localhost, 127.0.0.0/8, ::1, the unspecified address)
+// folded into one host. Build it with newServerKey only.
 type serverKey struct {
-	family                                    engine.Family
-	host                                      string
-	port                                      uint16
-	container, composeService, composeProject string
+	family engine.Family
+	host   string
+	port   uint16
 }
 
-func mysqlServerKey(c config.MysqlConn) serverKey {
-	return serverKey{
-		family: engine.FamilyMySQL, host: c.Host, port: c.Port,
-		container: c.Container, composeService: c.ComposeService, composeProject: c.ComposeProject,
-	}
+const loopbackHost = "127.0.0.1"
+
+func newServerKey(family engine.Family, host string, port uint16) serverKey {
+	return serverKey{family: family, host: canonicalHost(host), port: port}
 }
 
-func postgresServerKey(c config.PostgresConn) serverKey {
-	return serverKey{
-		family: engine.FamilyPostgres, host: c.Host, port: c.Port,
-		container: c.Container, composeService: c.ComposeService, composeProject: c.ComposeProject,
+func canonicalHost(host string) string {
+	if strings.HasPrefix(host, "/") {
+		return filepath.Clean(host)
 	}
+	name := strings.TrimSuffix(strings.ToLower(host), ".")
+	if name == "localhost" {
+		return loopbackHost
+	}
+	addr, err := netip.ParseAddr(name)
+	if err != nil {
+		return name
+	}
+	addr = addr.Unmap()
+	if addr.IsLoopback() || addr.IsUnspecified() {
+		return loopbackHost
+	}
+	return addr.String()
+}
+
+func mysqlServerKey(drv *dbmysql.Driver) serverKey {
+	host, port := drv.Endpoint()
+	return newServerKey(engine.FamilyMySQL, host, port)
+}
+
+func postgresServerKey(drv *dbpostgres.Driver) serverKey {
+	host, port := drv.Endpoint()
+	return newServerKey(engine.FamilyPostgres, host, port)
 }
 
 // server returns the slots of the server key names; nil when c is nil.

@@ -151,6 +151,10 @@ func connDSN(cfg config.MysqlConn) (string, error) {
 	return mc.FormatDSN(), nil
 }
 
+// Endpoint is the host and port the driver dials: the configured
+// address after container resolution, or the unix socket path.
+func (d *Driver) Endpoint() (host string, port uint16) { return d.cfg.Host, d.cfg.Port }
+
 func (d *Driver) Close() error {
 	d.removeStages()
 	return d.DB.Close()

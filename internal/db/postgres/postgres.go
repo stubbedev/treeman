@@ -84,6 +84,10 @@ func dial(ctx context.Context, cfg config.PostgresConn, addr string) (*Driver, e
 	return &Driver{DB: db, cfg: cfg}, nil
 }
 
+// Endpoint is the host and port the driver dials: the configured
+// address after container resolution, or the unix socket path.
+func (d *Driver) Endpoint() (host string, port uint16) { return d.cfg.Host, d.cfg.Port }
+
 func (d *Driver) Close() error { return d.DB.Close() }
 
 // dsn builds the pgx URL for dbName: a unix socket when cfg.Host is a
