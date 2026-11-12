@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/stubbedev/treeman/internal/prepare/progress"
+	"github.com/stubbedev/treeman/internal/progress"
 )
 
 // TestWaitForRecoveryReportsAdvances: a clone's shard recovery reports

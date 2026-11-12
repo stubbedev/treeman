@@ -14,6 +14,8 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/stubbedev/treeman/internal/progress"
 )
 
 // hasGlobMeta reports whether `p` carries any glob meta-character we
@@ -95,6 +97,7 @@ func BringInFilesReport(ctx context.Context, repoRoot, wtPath string, paths []st
 			}
 			res, rels, err := bringInOneEntry(gctx, repoRoot, wtPath, rel, mode, sink)
 			results[i] = res
+			progress.Report(gctx)
 			if len(rels) > 0 {
 				mu.Lock()
 				broughtRels = append(broughtRels, rels...)

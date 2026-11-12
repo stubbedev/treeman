@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stubbedev/treeman/internal/prepare/progress"
+	"github.com/stubbedev/treeman/internal/progress"
 )
 
 // Regression for #209: work reporting progress on the lease's context

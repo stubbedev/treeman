@@ -19,7 +19,7 @@ import (
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/ports"
 	"github.com/stubbedev/treeman/internal/prepare"
-	"github.com/stubbedev/treeman/internal/prepare/progress"
+	"github.com/stubbedev/treeman/internal/progress"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/slug"

@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/config"
-	"github.com/stubbedev/treeman/internal/prepare/progress"
+	"github.com/stubbedev/treeman/internal/progress"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )

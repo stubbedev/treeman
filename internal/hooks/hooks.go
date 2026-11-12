@@ -134,15 +134,7 @@ func RunHooksOrphan(
 		})
 	}
 	if wait {
-		for idx, c := range cmds {
-			if err := c.Wait(); err != nil {
-				if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-					out.Groups[idx].ExitCode = exitErr.ExitCode()
-				} else {
-					out.Groups[idx].ExitCode = -1
-				}
-			}
-		}
+		waitGroups(ctx, cmds, out.Groups, func(int) {})
 	}
 	return out, nil
 }
@@ -204,30 +196,15 @@ func RunHooks(
 		})
 	}
 	if wait {
-		for idx, c := range cmds {
-			if err := c.Wait(); err != nil {
-				// Don't abort the whole phase — surface the
-				// exit code on the outcome and let the caller
-				// decide. The same group's stdout/stderr are
-				// already in its log file.
-				if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-					out.Groups[idx].ExitCode = exitErr.ExitCode()
-				} else {
-					out.Groups[idx].ExitCode = -1
-				}
+		waitGroups(ctx, cmds, out.Groups, func(idx int) {
+			if out.Groups[idx].LogPath == "" {
+				return
 			}
-			// Slurp the full merged stdout+stderr log into the
-			// outcome so PersistOutcome can persist it as a
-			// hook_log_chunks row. The on-disk file stays put so
-			// `tail -f` workflows keep working; the DB copy is what
-			// survives worktree teardown.
-			if out.Groups[idx].LogPath != "" {
-				out.Groups[idx].LogBody = readFileBytes(out.Groups[idx].LogPath)
-				if out.Groups[idx].ExitCode != 0 {
-					out.Groups[idx].StderrTail = lastBytes(out.Groups[idx].LogBody, 4096)
-				}
+			out.Groups[idx].LogBody = readFileBytes(out.Groups[idx].LogPath)
+			if out.Groups[idx].ExitCode != 0 {
+				out.Groups[idx].StderrTail = lastBytes(out.Groups[idx].LogBody, 4096)
 			}
-		}
+		})
 	}
 	return out, nil
 }

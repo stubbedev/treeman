@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/prepare"
-	"github.com/stubbedev/treeman/internal/prepare/progress"
+	"github.com/stubbedev/treeman/internal/progress"
 )
 
 // finalizeStalledError is the cancel cause of a finalize the watchdog

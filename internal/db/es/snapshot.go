@@ -32,7 +32,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/stubbedev/treeman/internal/prepare/progress"
+	"github.com/stubbedev/treeman/internal/progress"
 )
 
 // srcBlockRegistry refcounts `index.blocks.write` per (cluster, index)
