@@ -43,6 +43,10 @@
         "container_engine": {
           "type": "string",
           "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`."
+        },
+        "container_network": {
+          "type": "string",
+          "description": "Docker network to prefer when the container is attached to several. Part of the container lookup key shared with connection blocks."
         }
       },
       "additionalProperties": false,
@@ -547,6 +551,10 @@
         "container_engine": {
           "type": "string",
           "description": "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`."
+        },
+        "container_network": {
+          "type": "string",
+          "description": "Docker network to prefer when the container is attached to several. Part of the container lookup key shared with connection blocks."
         },
         "match": {
           "oneOf": [

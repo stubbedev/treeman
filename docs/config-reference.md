@@ -229,6 +229,7 @@ hooks:
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
+          container_network: '...'
     create-after-engines:
         - run: '...'
           continue_on_error: false
@@ -237,6 +238,7 @@ hooks:
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
+          container_network: '...'
     delete-before-engines:
         - run: '...'
           continue_on_error: false
@@ -245,6 +247,7 @@ hooks:
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
+          container_network: '...'
     delete-after-engines:
         - run: '...'
           continue_on_error: false
@@ -253,6 +256,7 @@ hooks:
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
+          container_network: '...'
     checkout:
         - run: '...'
           continue_on_error: false
@@ -261,6 +265,7 @@ hooks:
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
+          container_network: '...'
     file-change:
         - run: '...'
           continue_on_error: false
@@ -269,6 +274,7 @@ hooks:
           compose_service: '...'
           compose_project: '...'
           container_engine: '...'
+          container_network: '...'
           match: '...'
 # DebounceMs is the file-watcher debounce window in
 debounce_ms: 0
@@ -483,6 +489,10 @@ Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or pa
 #### `container_engine` *(string)*
 
 Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`.
+
+#### `container_network` *(string)*
+
+Docker network to prefer when the container is attached to several. Part of the container lookup key shared with connection blocks.
 
 ### AutoFetchConfig
 
@@ -986,6 +996,10 @@ Docker Compose project name (`-p` flag). Defaults to $COMPOSE_PROJECT_NAME or pa
 #### `container_engine` *(string)*
 
 Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`.
+
+#### `container_network` *(string)*
+
+Docker network to prefer when the container is attached to several. Part of the container lookup key shared with connection blocks.
 
 #### `match` *(one of: string, array of string)*
 
