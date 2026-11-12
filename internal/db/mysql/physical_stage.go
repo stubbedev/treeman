@@ -10,61 +10,55 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/ident"
 )
 
-// templateStage is the once-per-template export used by SnapshotRestoreStaged
-// to avoid serializing a fan-out on FLUSH TABLES … FOR EXPORT.
+// stagedTemplate is a template's InnoDB tablespaces exported once to a
+// staging dir, for SnapshotRestoreStaged to avoid serializing a fan-out
+// on FLUSH TABLES … FOR EXPORT.
 //
-// A template is immutable for the life of a fan-out, so its InnoDB
-// tablespaces are copied to `dir` exactly once (under a single export
-// lock); every restore then imports plain file copies from `dir`
-// without locking the template. Exactly one of skip / err / (dir set)
-// is meaningful after `once` fires:
-//
-//   - skip != nil  → preconditions for physical staging not met
-//     (no ContainerRef, engine binary absent, empty secure_file_priv,
-//     non-InnoDB table, empty schema). Caller uses the logical restore.
-//   - err != nil   → staging was attempted but failed. Caller logs a
-//     warning and uses the logical restore.
-//   - otherwise    → dir/tables/cid/engineBin/datadir are populated and
-//     physicalRestoreFromStage can import from `dir`.
-type templateStage struct {
-	once sync.Once
-
+// A template is immutable for the life of a fan-out, so its tablespaces
+// are copied to `dir` exactly once (under a single export lock); every
+// restore then imports plain file copies from `dir` without locking the
+// template.
+type stagedTemplate struct {
 	dir       string   // container path holding the exported .ibd/.cfg
 	tables    []string // InnoDB base tables captured from the template
 	createSQL []string // SHOW CREATE TABLE per table, aligned with tables
 	cid       string   // resolved container id
 	engineBin string   // container engine binary (docker/podman/…)
 	datadir   string   // mysql @@datadir inside the container
-
-	skip *physicalSkippedError
-	err  error
 }
 
-// ensureStage returns the templateStage for `template`, running the
-// one-shot export the first time it is requested. Concurrent callers
-// block on sync.Once until the export completes, then all read the same
-// result.
-func (d *Driver) ensureStage(ctx context.Context, template string) *templateStage {
+// ensureStage returns the stagedTemplate for `template`, running the
+// export the first time it is requested. Concurrent callers share one
+// export and each stops waiting when its own ctx ends. An export cut
+// short by its caller's cancellation is not kept, so the next caller
+// exports again instead of inheriting that failure.
+//
+// A *physicalSkippedError means the preconditions for physical staging
+// are not met (no ContainerRef, engine binary absent, empty
+// secure_file_priv, non-InnoDB table, empty schema); any other error
+// means staging was attempted and failed. Both are kept until the stage
+// is dropped, and the caller uses the logical restore.
+func (d *Driver) ensureStage(ctx context.Context, template string) (*stagedTemplate, error) {
 	d.stagesMu.Lock()
 	if d.stages == nil {
-		d.stages = make(map[string]*templateStage)
+		d.stages = make(map[string]*sharedOnce[*stagedTemplate])
 	}
 	st := d.stages[template]
 	if st == nil {
-		st = &templateStage{}
+		st = &sharedOnce[*stagedTemplate]{}
 		d.stages[template] = st
 	}
 	d.stagesMu.Unlock()
 
-	st.once.Do(func() { d.stageTemplate(ctx, st, template) })
-	return st
+	return st.do(ctx, func(ctx context.Context) (*stagedTemplate, error) {
+		return d.stageTemplate(ctx, template)
+	})
 }
 
 // resolveStageTarget runs the physical-clone preconditions for staging
@@ -128,38 +122,44 @@ func (d *Driver) resolveStageTarget(ctx context.Context, template string) (
 }
 
 // stageTemplate exports `template`'s InnoDB tablespaces to a staging dir
-// under secure_file_priv. Runs once per template via ensureStage.
-func (d *Driver) stageTemplate(ctx context.Context, st *templateStage, template string) {
+// under secure_file_priv. Runs once per template via ensureStage. On
+// failure the staging dir is removed, even when ctx has ended.
+func (d *Driver) stageTemplate(ctx context.Context, template string) (_ *stagedTemplate, err error) {
 	cid, engineBin, datadir, stageDir, tables, skip, err := d.resolveStageTarget(ctx, template)
 	if skip != nil {
-		st.skip = skip
-		return
+		return nil, skip
 	}
 	if err != nil {
-		st.err = err
-		return
+		return nil, err
 	}
 
 	// Fresh staging dir, owned by the in-container mysql user so the
 	// later `cp` lands files mysqld can read for IMPORT.
 	if err := dockerExecMysql(ctx, engineBin, cid, "mkdir", "-p", stageDir); err != nil {
-		st.err = fmt.Errorf("mkdir staging dir: %w", err)
-		return
+		return nil, fmt.Errorf("mkdir staging dir: %w", err)
 	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if rmErr := dockerExecRoot(rmCtx, engineBin, cid, "rm", "-rf", stageDir); rmErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove the partial stage %s: %w", stageDir, rmErr))
+		}
+	}()
 
 	// Capture each table's CREATE statement once, here, instead of in
 	// every restore: the schema is identical for all clones, so a
 	// per-clone SHOW CREATE is N× redundant work on the fan-out hot path.
 	createSQL, err := d.captureCreateDDL(ctx, template, tables)
 	if err != nil {
-		st.err = err
-		return
+		return nil, err
 	}
 
 	flushList, err := exportFlushList(template, tables)
 	if err != nil {
-		st.err = err
-		return
+		return nil, err
 	}
 
 	// FLUSH … FOR EXPORT on a held connection: it freezes the template
@@ -168,32 +168,28 @@ func (d *Driver) stageTemplate(ctx context.Context, st *templateStage, template 
 	// held (UNLOCK deletes it), so the copy MUST run before UNLOCK.
 	lockConn, releaseLockConn, err := sessionConn(ctx, d.DB)
 	if err != nil {
-		st.err = err
-		return
+		return nil, err
 	}
 	defer releaseLockConn()
 	if _, err := lockConn.ExecContext(ctx, "FLUSH TABLES "+strings.Join(flushList, ", ")+" FOR EXPORT"); err != nil {
-		st.err = fmt.Errorf("FLUSH TABLES FOR EXPORT: %w", err)
-		return
+		return nil, fmt.Errorf("FLUSH TABLES FOR EXPORT: %w", err)
 	}
 	copyErr := copyTablespaces(ctx, engineBin, cid, datadir+"/"+template, stageDir, tables)
 	if _, err := lockConn.ExecContext(ctx, "UNLOCK TABLES"); err != nil && copyErr == nil {
 		copyErr = fmt.Errorf("UNLOCK TABLES: %w", err)
 	}
 	if copyErr != nil {
-		if rmErr := dockerExecRoot(ctx, engineBin, cid, "rm", "-rf", stageDir); rmErr != nil {
-			copyErr = errors.Join(copyErr, fmt.Errorf("remove the partial stage %s: %w", stageDir, rmErr))
-		}
-		st.err = copyErr
-		return
+		return nil, copyErr
 	}
 
-	st.cid = cid
-	st.engineBin = engineBin
-	st.datadir = datadir
-	st.dir = stageDir
-	st.tables = tables
-	st.createSQL = createSQL
+	return &stagedTemplate{
+		dir:       stageDir,
+		tables:    tables,
+		createSQL: createSQL,
+		cid:       cid,
+		engineBin: engineBin,
+		datadir:   datadir,
+	}, nil
 }
 
 // captureCreateDDL reads each table's CREATE statement from `schema`.
@@ -273,7 +269,7 @@ func copyTablespaces(ctx context.Context, engineBin, cid, srcDir, dstDir string,
 //
 // On any failure past the target CREATE the partially-built target is
 // dropped so the caller's logical fallback gets a clean slate.
-func (d *Driver) physicalRestoreFromStage(ctx context.Context, st *templateStage, target string) (err error) {
+func (d *Driver) physicalRestoreFromStage(ctx context.Context, st *stagedTemplate, target string) (err error) {
 	qtarget, err := ident.QuoteMySQL(target)
 	if err != nil {
 		return err
@@ -438,8 +434,9 @@ func (d *Driver) removeStages() {
 	stages := d.stages
 	d.stages = nil
 	d.stagesMu.Unlock()
-	for template, st := range stages {
-		if st.dir == "" {
+	for template, shared := range stages {
+		st, ok := shared.peek()
+		if !ok {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -42,13 +42,13 @@ type Driver struct {
 	lastCloneStrategy CloneStrategy
 
 	// stagesMu guards stages. Keyed by template name, each entry holds
-	// a sync.Once that exports the (immutable) template's InnoDB
-	// tablespaces to a staging dir exactly once. SnapshotRestoreStaged then
+	// a sharedOnce that exports the (immutable) template's InnoDB
+	// tablespaces to a staging dir once. SnapshotRestoreStaged then
 	// imports from staging without re-taking FLUSH TABLES … FOR EXPORT
 	// on the shared template, so a fan-out of N restores no longer
 	// serializes on that per-template export lock. See physical_stage.go.
 	stagesMu sync.Mutex
-	stages   map[string]*templateStage
+	stages   map[string]*sharedOnce[*stagedTemplate]
 
 	// strategyCache memoizes chooseStrategy per database — the size
 	// probe (information_schema SUM) returns the same answer for every
@@ -1095,8 +1095,8 @@ func (d *Driver) SnapshotRestoreStaged(ctx context.Context, template, target str
 // N concurrent direct clones serialize on that one export lock.
 //
 // Staging exports the template's tablespaces to a staging dir exactly
-// once (ensureStage / stageTemplate, guarded by a per-template
-// sync.Once); every clone then imports plain file copies from staging
+// once (ensureStage / stageTemplate, shared per template through a
+// sharedOnce); every clone then imports plain file copies from staging
 // (physicalRestoreFromStage) and takes no lock on the template, so the
 // fan-out is bounded by disk + IMPORT rather than a serial export lock.
 //
@@ -1115,14 +1115,17 @@ func (d *Driver) stagedCloneTables(ctx context.Context, template, dest string) e
 		return d.logicalCloneTables(ctx, template, dest)
 	}
 
-	st := d.ensureStage(ctx, template)
+	st, err := d.ensureStage(ctx, template)
+	skip, skipped := errors.AsType[*physicalSkippedError](err)
 	switch {
-	case st.skip != nil:
+	case err != nil && ctx.Err() != nil:
+		return fmt.Errorf("stage the tablespaces of %s: %w", template, err)
+	case skipped:
 		slog.Debug("mysql physical staging unavailable; using logical restore",
-			"template", template, "reason", st.skip.reason)
-	case st.err != nil:
+			"template", template, "reason", skip.reason)
+	case err != nil:
 		slog.Warn("mysql physical staging failed; using logical restore",
-			"template", template, "error", st.err)
+			"template", template, "error", err)
 	default:
 		rerr := d.physicalRestoreFromStage(ctx, st, dest)
 		if rerr == nil {
