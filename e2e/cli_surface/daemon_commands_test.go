@@ -4,7 +4,8 @@
 // don't need a running daemon or engine to test their plumbing:
 //   - `main enable|disable|status` (config write + store read; graceful
 //     when no daemon is up)
-//   - `sync` / `sync --status` (clean error when no daemon is reachable)
+//   - `sync` / `sync --status` (clean error when no daemon is reachable,
+//     and outside a repo without --all)
 //   - `prepare` with no databases (loads config, runs the no-op prepare)
 //
 // The full engine-backed paths live in e2e/cli (real daemon + MySQL).
@@ -75,6 +76,28 @@ func TestSyncNoDaemonErrorsCleanly(t *testing.T) {
 	res = e.run(t, repo, "sync", "--status")
 	if res.err == nil {
 		t.Errorf("sync --status with no daemon should exit non-zero, got success:\n%s", res.stdout)
+	}
+}
+
+func TestSyncOutsideARepoFailsBeforeWideningToEveryRepo(t *testing.T) {
+	dir := t.TempDir()
+	e := newEnv(t)
+	extra := []string{"GIT_CEILING_DIRECTORIES=" + filepath.Dir(dir)}
+
+	for _, args := range [][]string{{"sync"}, {"sync", "--status"}} {
+		res := e.runEnv(t, dir, extra, args...)
+		if res.err == nil {
+			t.Errorf("%v outside a repo should exit non-zero, got success:\n%s", args, res.stdout)
+			continue
+		}
+		if !strings.Contains(res.stderr, "scope the sync to the current repo") {
+			t.Errorf("%v outside a repo must fail on repo discovery, not reach the daemon:\n%s", args, res.stderr)
+		}
+	}
+
+	res := e.runEnv(t, dir, extra, "sync", "--all", dir)
+	if res.err == nil || !strings.Contains(res.stderr, "mutually exclusive") {
+		t.Errorf("sync --all with a path must be refused as mutually exclusive: err=%v\n%s", res.err, res.stderr)
 	}
 }
 

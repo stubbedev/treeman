@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/urfave/cli/v3"
@@ -27,22 +28,9 @@ func SyncCmd() *cli.Command {
 			&cli.BoolFlag{Name: "status", Usage: "print sync status only; do not fetch"},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
-			target := ""
-			if c.NArg() > 0 {
-				abs, err := absPath(c.Args().First())
-				if err != nil {
-					return err
-				}
-				target = abs
-			} else if !c.Bool("all") {
-				cwd, err := absPath(".")
-				if err != nil {
-					return err
-				}
-				// Default: scope to cwd's repo if we can find one.
-				if root, err := DiscoverRepoRoot(cwd); err == nil {
-					target = root
-				}
+			target, err := resolveSyncTarget(c.Args().First(), c.Bool("all"))
+			if err != nil {
+				return err
 			}
 
 			if c.Bool("status") {
@@ -74,6 +62,30 @@ func SyncCmd() *cli.Command {
 			return nil
 		},
 	}
+}
+
+// resolveSyncTarget maps the command line onto SyncNowArgs.Path: a
+// given path as-is, --all as the empty every-repo scope, and otherwise
+// the repo containing the current directory. Failing to find that repo
+// is an error, never a silent widening to every registered repo.
+func resolveSyncTarget(path string, all bool) (string, error) {
+	switch {
+	case path != "" && all:
+		return "", fmt.Errorf("--all and a path (%s) are mutually exclusive", path)
+	case all:
+		return "", nil
+	case path != "":
+		return absPath(path)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve the current directory to scope the sync to its repo: %w", err)
+	}
+	root, err := DiscoverRepoRoot(cwd)
+	if err != nil {
+		return "", fmt.Errorf("scope the sync to the current repo (pass a path, or --all for every registered repo): %w", err)
+	}
+	return root, nil
 }
 
 func syncStatusAction(ctx context.Context, target string, jsonOut bool) error {
