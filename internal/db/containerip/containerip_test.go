@@ -20,15 +20,65 @@ func TestRewriteHostPortInURI(t *testing.T) {
 		// userinfo with @ but slash before @ in path — must not be
 		// treated as userinfo.
 		{"http://h/path@x", "n", "http://n/path@x"},
-		// IPv6-looking bracket (won't be touched as a host but should
-		// not crash).
-		{"redis://[::1]:6379", "10.0.0.1", "redis://10.0.0.1:6379"},
 	}
 	for _, c := range cases {
 		got := RewriteHostPortInURI(c.uri, c.newHost)
 		if got != c.want {
 			t.Errorf("RewriteHostPortInURI(%q, %q)=%q want %q", c.uri, c.newHost, got, c.want)
 		}
+	}
+}
+
+func TestRewriteHostPortInURIHostForms(t *testing.T) {
+	cases := []struct {
+		name    string
+		uri     string
+		newHost string
+		newPort uint16
+		want    string
+	}{
+		{"ipv4 to ipv4 keeps port", "mysql://u:p@10.0.0.1:3306/db", "10.0.0.2", 0, "mysql://u:p@10.0.0.2:3306/db"},
+		{"ipv4 without port", "http://10.0.0.1/p", "10.0.0.2", 0, "http://10.0.0.2/p"},
+		{"hostname to hostname with new port", "redis://cache:6379/0", "db", 6380, "redis://db:6380/0"},
+		{"hostname without port", "mongodb://mongo/db", "db", 0, "mongodb://db/db"},
+		{"ipv6 host keeps port", "mysql://u:p@db:3306/db", "fd00::2", 0, "mysql://u:p@[fd00::2]:3306/db"},
+		{"ipv6 host with new port", "mysql://db:3306/db", "fd00::2", 3307, "mysql://[fd00::2]:3307/db"},
+		{"ipv6 host without port", "http://es/p", "fd00::2", 0, "http://[fd00::2]/p"},
+		{"ipv6 host adds port", "http://es/p", "fd00::2", 9200, "http://[fd00::2]:9200/p"},
+		{"bracketed source keeps port", "redis://[::1]:6379", "10.0.0.1", 0, "redis://10.0.0.1:6379"},
+		{"bracketed source without port", "redis://[::1]/0", "10.0.0.1", 0, "redis://10.0.0.1/0"},
+		{"bracketed source to ipv6", "redis://u@[::1]:6379?x=1", "fd00::5", 0, "redis://u@[fd00::5]:6379?x=1"},
+		{"bracketed source without port to ipv6", "redis://[::1]", "::1", 0, "redis://[::1]"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := RewriteHostPortInURIWithPort(c.uri, c.newHost, c.newPort); got != c.want {
+				t.Errorf("RewriteHostPortInURIWithPort(%q, %q, %d)=%q want %q", c.uri, c.newHost, c.newPort, got, c.want)
+			}
+		})
+	}
+}
+
+func TestURIPortHostForms(t *testing.T) {
+	cases := []struct {
+		name string
+		uri  string
+		want uint16
+	}{
+		{"ipv4 with port", "mysql://10.0.0.1:3307/db", 3307},
+		{"ipv4 without port", "mysql://10.0.0.1/db", 3306},
+		{"hostname with port", "mysql://u:p@db:3308", 3308},
+		{"hostname without port", "mysql://db", 3306},
+		{"bracketed ipv6 with port", "mysql://u:p@[fd00::2]:3309/db", 3309},
+		{"bracketed ipv6 without port", "mysql://[fd00::2]/db", 3306},
+		{"bracketed loopback without port", "mysql://[::1]", 3306},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := URIPort(c.uri, 3306); got != c.want {
+				t.Errorf("URIPort(%q, 3306)=%d want %d", c.uri, got, c.want)
+			}
+		})
 	}
 }
 

@@ -529,7 +529,8 @@ func hostLoopbackReachable(port uint16) bool {
 
 // RewriteHostPortInURI returns `uri` with its host swapped for
 // `newHost`. Preserves scheme, userinfo, port, path, query.
-// When newPort != 0 the URI's port is also rewritten.
+// newHost is a bare hostname or IP literal; an IPv6 address is
+// bracketed in the rewritten authority.
 func RewriteHostPortInURI(uri, newHost string) string {
 	return RewriteHostPortInURIWithPort(uri, newHost, 0)
 }
@@ -546,19 +547,25 @@ func RewriteHostPortInURIWithPort(uri, newHost string, newPort uint16) string {
 		return uri
 	}
 	port := splitHostPort(hostPart)
-	newHostPort := newHost
-	switch {
-	case newPort != 0:
-		newHostPort = newHost + ":" + strconv.Itoa(int(newPort))
-	case port != "":
-		newHostPort = newHost + ":" + port
+	if newPort != 0 {
+		port = strconv.Itoa(int(newPort))
 	}
 	out := scheme + "://"
 	if userinfo != "" {
 		out += userinfo + "@"
 	}
-	out += newHostPort + tail
+	out += joinHostPort(newHost, port) + tail
 	return out
+}
+
+func joinHostPort(host, port string) string {
+	if port != "" {
+		return net.JoinHostPort(host, port)
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
 }
 
 func splitScheme(uri string) (scheme, rest string) {
@@ -608,10 +615,11 @@ func URIPort(uri string, fallback uint16) uint16 {
 }
 
 func splitHostPort(s string) (port string) {
-	if i := strings.LastIndex(s, ":"); i >= 0 && !strings.Contains(s[i+1:], "]") {
-		return s[i+1:]
+	_, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return ""
 	}
-	return ""
+	return port
 }
 
 // ErrNoContainer is returned when Resolve is called with no
