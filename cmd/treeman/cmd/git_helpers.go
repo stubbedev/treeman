@@ -373,9 +373,9 @@ func buildSwitchMenu(ctx context.Context, repoRoot string) (items, targets []str
 	if err != nil {
 		return nil, nil, err
 	}
-	cwdTop := ""
-	if cwd, err := os.Getwd(); err == nil {
-		cwdTop, _ = gitWorktreeRoot(cwd)
+	cwdTop, err := currentWorktreeTop()
+	if err != nil {
+		return nil, nil, err
 	}
 	// The branch we're already on has nothing to switch to.
 	curBranch, err := currentBranch(ctx, cmp.Or(cwdTop, repoRoot))
@@ -537,6 +537,15 @@ func branchWizard(ctx context.Context, repoRoot, initial string) (name, base str
 	return final, base, nil
 }
 
+func currentWorktreeTop() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve the current directory to find its worktree: %w", err)
+	}
+	top, _ := gitWorktreeRoot(cwd)
+	return top, nil
+}
+
 // pickWorktrees shows a Tab-toggle multi-select picker over the repo's
 // linked worktrees (excluding main) and returns the selected worktree
 // paths, or nil on cancel / empty list. A plain Enter with nothing
@@ -547,9 +556,9 @@ func pickWorktrees(ctx context.Context, repoRoot, prompt string) ([]string, erro
 	if err != nil {
 		return nil, err
 	}
-	cwdTop := ""
-	if cwd, err := os.Getwd(); err == nil {
-		cwdTop, _ = gitWorktreeRoot(cwd)
+	cwdTop, err := currentWorktreeTop()
+	if err != nil {
+		return nil, err
 	}
 	type row struct{ label, path string }
 	// Markers cost a `git status` per worktree — scan concurrently,
@@ -637,11 +646,8 @@ func branchArgComplete(_ context.Context, c *cli.Command) {
 	}
 	dir, err := gitWorkdir(c)
 	if err != nil {
-		if cwd, cerr := os.Getwd(); cerr == nil {
-			dir = cwd
-		} else {
-			return
-		}
+		warnCompletion(err)
+		return
 	}
 	for _, b := range allBranches(dir) {
 		_, _ = fmt.Fprintln(os.Stdout, b)

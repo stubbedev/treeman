@@ -1007,7 +1007,10 @@ func schemaInstall(ctx context.Context, c *cli.Command) error {
 	if c.Bool("global") && c.Bool("url") {
 		return errors.New("--global and --url are mutually exclusive")
 	}
-	cwd, _ := os.Getwd()
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve the current directory to find the repo to install the schema into: %w", err)
+	}
 	repoRoot, err := DiscoverRepoRoot(cwd)
 	if err != nil {
 		return err
@@ -1362,7 +1365,10 @@ func FwCmd() *cli.Command {
 			Name:  "detect",
 			Flags: []cli.Flag{&cli.BoolFlag{Name: "json"}},
 			Action: func(ctx context.Context, c *cli.Command) error {
-				cwd, _ := os.Getwd()
+				cwd, err := os.Getwd()
+				if err != nil {
+					return fmt.Errorf("resolve the current directory to find the repo to detect frameworks in: %w", err)
+				}
 				repoRoot, err := DiscoverRepoRoot(cwd)
 				if err != nil {
 					return err
@@ -1530,7 +1536,10 @@ func InitCmd() *cli.Command {
 // without a root config would be silently inert for repo-wide reads,
 // so init refuses and points at the root.
 func initRepoAction(c *cli.Command) error {
-	cwd, _ := os.Getwd()
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("resolve the current directory to scaffold .treeman.yaml in: %w", err)
+	}
 	if err := guardSubdirInit(cwd); err != nil {
 		return err
 	}
@@ -1542,7 +1551,6 @@ func initRepoAction(c *cli.Command) error {
 		PrintWarn("--interactive needs a terminal — scaffolding without engine selection")
 	}
 	if c.Bool("interactive") && tui.Interactive() && len(engines) == 0 {
-		var err error
 		if engines, err = pickEngines(); err != nil {
 			return err
 		}

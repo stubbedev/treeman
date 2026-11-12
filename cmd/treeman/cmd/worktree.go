@@ -698,10 +698,9 @@ func deleteWorktreeTarget(ctx context.Context, c *cli.Command, repoRoot, target 
 	// is the leave-and-drop flow. The main repo root is exempt
 	// here: wt.Delete has its own dedicated main-worktree
 	// refusal and that error message must win.
-	if cwd, cwdErr := os.Getwd(); cwdErr == nil && !strings.EqualFold(filepath.Clean(wtPath), filepath.Clean(repoRoot)) {
-		if top, topErr := gitWorktreeRoot(cwd); topErr == nil && top == wtPath {
-			return errors.New(
-				"refusing to delete the worktree you're in — use `cd \"$(treeman worktree back --remove)\"`")
+	if !strings.EqualFold(filepath.Clean(wtPath), filepath.Clean(repoRoot)) {
+		if err := refuseDeletingCurrentWorktree(wtPath); err != nil {
+			return err
 		}
 	}
 
@@ -873,14 +872,25 @@ func pollTeardown(ctx context.Context, st *store.Store, row worktreeRow, anchor 
 // renders, with NO engine connections. Refusals that would stop the
 // real delete (main worktree, cwd) still error — a preview that lies
 // about being deletable is worse than none.
+// refuseDeletingCurrentWorktree errors when the shell's cwd is inside
+// wtPath: the teardown would remove the directory under the user's feet.
+func refuseDeletingCurrentWorktree(wtPath string) error {
+	top, err := currentWorktreeTop()
+	if err != nil {
+		return fmt.Errorf("check whether %s is the worktree you're in: %w", wtPath, err)
+	}
+	if top == wtPath {
+		return errors.New("refusing to delete the worktree you're in — use `cd \"$(treeman worktree back --remove)\"`")
+	}
+	return nil
+}
+
 func previewDelete(ctx context.Context, c *cli.Command, repoRoot, _, wtPath string) error {
 	if strings.EqualFold(filepath.Clean(wtPath), filepath.Clean(repoRoot)) {
 		return fmt.Errorf("refusing to delete %q: it is the repo's main worktree (primary checkout), not a linked worktree", wtPath)
 	}
-	if cwd, cwdErr := os.Getwd(); cwdErr == nil {
-		if top, topErr := gitWorktreeRoot(cwd); topErr == nil && top == wtPath {
-			return errors.New("refusing to delete the worktree you're in — use `cd \"$(treeman worktree back --remove)\"`")
-		}
+	if err := refuseDeletingCurrentWorktree(wtPath); err != nil {
+		return err
 	}
 	branch := gitenv.DetectBranch(ctx, wtPath)
 	cfg, err := resolve.LoadResolvedForWorktree(repoRoot, wtPath)
@@ -1599,7 +1609,7 @@ func resolveRepo(override string) (string, error) {
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("resolve the current directory to find its repo: %w", err)
 	}
 	return DiscoverRepoRoot(cwd)
 }
@@ -1764,8 +1774,10 @@ func wtPrev() *cli.Command {
 			if repoID == 0 {
 				return fmt.Errorf("repo %s not registered yet", repoRoot)
 			}
-			cwd, _ := os.Getwd()
-			cwdTop, _ := gitWorktreeRoot(cwd)
+			cwdTop, err := currentWorktreeTop()
+			if err != nil {
+				return err
+			}
 			path, ok, err := st.PrevVisitedWorktree(ctx, repoID, cwdTop)
 			if err != nil {
 				return err
@@ -1897,19 +1909,17 @@ func goCheckout(ctx context.Context, repoRoot, branch string, create bool, opts 
 	if err != nil {
 		return err
 	}
-	if ok {
-		cwd, _ := os.Getwd()
-		cwdTop, _ := gitWorktreeRoot(cwd)
-		if path != cwdTop {
-			landExisting(ctx, path)
-			return nil
-		}
+	cwdTop, err := currentWorktreeTop()
+	if err != nil {
+		return err
+	}
+	if ok && path != cwdTop {
+		landExisting(ctx, path)
+		return nil
 	}
 
 	mode, base := resolveGoMode(ctx, repoRoot, branch, opts.from, create, opts.noFetch)
 
-	cwd, _ := os.Getwd()
-	cwdTop, _ := gitWorktreeRoot(cwd)
 	inLinked := cwdTop != "" && gitenv.IsLinkedWorktree(cwdTop)
 
 	runCheckoutIn := func(dir string) error {

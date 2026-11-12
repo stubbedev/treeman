@@ -156,7 +156,10 @@ func resolveShowRepoID(ctx context.Context, st *store.Store, repoOverride string
 	if repoOverride != "" {
 		return lookupExplicitRepoID(ctx, st, repoOverride)
 	}
-	root := cwdRepoRoot()
+	root, err := cwdRepoRoot()
+	if err != nil {
+		return 0, err
+	}
 	if root == "" {
 		return 0, nil
 	}
@@ -167,16 +170,16 @@ func resolveShowRepoID(ctx context.Context, st *store.Store, repoOverride string
 	return repoID, nil
 }
 
-func cwdRepoRoot() string {
+func cwdRepoRoot() (string, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("resolve the current directory to find its repo: %w", err)
 	}
 	root, err := DiscoverRepoRoot(cwd)
 	if err != nil {
-		return ""
+		return "", nil
 	}
-	return root
+	return root, nil
 }
 
 func lookupExplicitRepoID(ctx context.Context, st *store.Store, repo string) (int64, error) {

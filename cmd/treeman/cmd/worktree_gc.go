@@ -208,7 +208,10 @@ func gcPlan(ctx context.Context, st *store.Store, rows []store.WorktreeRow, opts
 	mergedSets := map[string]map[string]bool{}
 	mergedRefs := map[string]string{}
 	now := time.Now()
-	cwd, _ := os.Getwd()
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, 0, fmt.Errorf("resolve the current directory to protect its worktree from gc: %w", err)
+	}
 
 	mergedSetFor := func(repoPath string) (map[string]bool, string) {
 		if set, ok := mergedSets[repoPath]; ok {
