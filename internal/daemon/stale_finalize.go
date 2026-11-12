@@ -44,12 +44,16 @@ const watchdogInterval = 2 * time.Minute
 // indefinitely (the state is derived from the latest finalize event
 // per worktree). See issue #9.
 //
-// The fix is intentionally conservative: emit a synthetic
-// `worktree:create:error` error event so the derived state flips to `error`
-// with a clear message. We don't auto-requeue — silently re-running
-// setup hooks + cold builds on a fresh daemon would be surprising,
-// and the user already has `treeman worktree finalize` to retry. They get a
-// visible signal instead of an invisible wedge.
+// The synthetic `worktree:create:error` names the phase the restart
+// interrupted, derived from how far the finalize got (#211): a restart
+// before engine prepare (bring-in, create-before-engines hooks) left the
+// worktree's setup incomplete, so the setup gate refuses prepares until
+// a finalize succeeds, and the engines are left alone; a restart during
+// or after engine prepare recovers the engines it touched, like a
+// failed prepare. Nothing about the worktree caused the failure, so the
+// error is tagged for the create-retry sweep, which re-runs the finalize
+// within the usual attempt bound (the interrupted run's own re-run
+// number counts, so a finalize that keeps crashing the daemon stops).
 //
 // Idempotent: the sweep emits at most one stale event per row per
 // daemon start. A second start without intervening activity still
@@ -79,39 +83,92 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 		slog.Warn("stale-preparing sweep: query events", "err", err)
 		return
 	}
+	var stale []store.WorktreeRow
+	var staleIDs []int64
 	for _, row := range wts {
-		last, ok := latest[row.ID]
-		if !ok || last.EventType != store.EvtWorktreeCreateStart {
-			continue
+		if last, ok := latest[row.ID]; ok && last.EventType == store.EvtWorktreeCreateStart {
+			stale = append(stale, row)
+			staleIDs = append(staleIDs, row.ID)
 		}
-		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError,
-			"stale finalize: daemon restarted while prepare was in flight — rerun `treeman worktree finalize` to retry",
-			row.RepoID, row.ID, "", 0, map[string]any{
-				"reason":         "daemon_restart",
-				"start_event_ts": last.Ts,
-			})
-		slog.Warn("marked stuck finalize as stale",
-			"wt", row.Path, "started_ms", last.Ts)
-
-		// Auto-recover the engine state. A prepare killed mid-migrate
-		// leaves the active DB (branch_scoped) or the source DB
-		// (test-clone) half-migrated; a manual rerun without recovery
-		// trips on duplicate-column / table-exists errors. Drop the
-		// primary namespace now so the next `treeman worktree finalize`
-		// re-runs cold-build / branch_scoped seed end-to-end. Durable
-		// per-branch copies are preserved (see prepare.RecoverStale-
-		// Worktree). Best-effort — config load / engine connect
-		// failures are surfaced as `wt_recovery_error` events but
-		// don't stop the sweep.
-		cfg, err := resolve.LoadResolvedForWorktree(row.RepoPath, row.Path)
-		if err != nil {
-			_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
-				"load config for recovery: "+err.Error(),
-				row.RepoID, row.ID, "", 0, map[string]string{"error": err.Error()})
-			continue
-		}
-		prepare.RecoverStaleWorktree(ctx, &cfg, row.Slug, row.Path, row.RepoID, row.ID, st.Store)
 	}
+	if len(stale) == 0 {
+		return
+	}
+	reached, err := st.Store.LatestEventPerWorktree(ctx, staleIDs, store.FinalizeProgressEventTypes)
+	if err != nil {
+		slog.Warn("stale-preparing sweep: query how far the finalizes got", "err", err)
+		return
+	}
+	for _, row := range stale {
+		failStaleFinalize(ctx, st, row, latest[row.ID], reached[row.ID])
+	}
+}
+
+// failStaleFinalize records the restart-interrupted finalize of row,
+// opened by start, whose newest hook-run or prepare start is reached
+// (the zero Event when it has none), and recovers the engines it
+// touched.
+func failStaleFinalize(ctx context.Context, st *State, row store.WorktreeRow, start, reached store.Event) {
+	t, err := triggerOf(start)
+	if err != nil {
+		slog.Warn("stale-preparing sweep: read the trigger of the interrupted finalize", "wt", row.Path, "err", err)
+	}
+	phase := interruptedPhase(t, start, reached)
+	msg := "stale finalize: daemon restarted while it was in flight"
+	payload := map[string]any{
+		"reason":         "daemon_restart",
+		"start_event_ts": start.Ts,
+	}
+	if retry, ok := retryWithinAttempts(store.CreateRetry{Cause: store.RetryDaemonRestart}, t.Attempt); ok {
+		retry.AddTo(payload)
+		msg += "\n" + retryHint(retry)
+	} else {
+		msg = withRetryHint(msg)
+	}
+	_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError, msg,
+		row.RepoID, row.ID, phase.EventPhase(), 0, payload)
+	slog.Warn("marked stuck finalize as stale",
+		"wt", row.Path, "started_ms", start.Ts, "phase", phase.EventPhase())
+	if phase != store.FinalizeEngines {
+		return
+	}
+
+	// Auto-recover the engine state. A prepare killed mid-migrate
+	// leaves the active DB (branch_scoped) or the source DB
+	// (test-clone) half-migrated; a manual rerun without recovery
+	// trips on duplicate-column / table-exists errors. Drop the
+	// primary namespace now so the next `treeman worktree finalize`
+	// re-runs cold-build / branch_scoped seed end-to-end. Durable
+	// per-branch copies are preserved (see prepare.RecoverStale-
+	// Worktree). Best-effort — config load / engine connect
+	// failures are surfaced as `wt_recovery_error` events but
+	// don't stop the sweep.
+	cfg, err := resolve.LoadResolvedForWorktree(row.RepoPath, row.Path)
+	if err != nil {
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
+			"load config for recovery: "+err.Error(),
+			row.RepoID, row.ID, "", 0, map[string]string{"error": err.Error()})
+		return
+	}
+	prepare.RecoverStaleWorktree(ctx, &cfg, row.Slug, row.Path, row.RepoID, row.ID, st.Store)
+}
+
+// interruptedPhase is the phase a finalize opened by start, run for
+// trigger t, was in when the daemon stopped, given reached, the newest
+// hook-run or prepare start of its worktree. A watch re-prepare runs no
+// setup. A full finalize is in setup until a database's prepare or a
+// hook run of a later trigger starts.
+func interruptedPhase(t trigger, start, reached store.Event) store.FinalizePhase {
+	if t.Source == triggerFileChange {
+		return store.FinalizeEngines
+	}
+	if reached.ID <= start.ID {
+		return store.FinalizeSetup
+	}
+	if reached.EventType == store.EvtHooksStart && reached.Phase == hookCreateBeforeEngines {
+		return store.FinalizeSetup
+	}
+	return store.FinalizeEngines
 }
 
 // FinalizeWatchdogLoop is the live-daemon counterpart to

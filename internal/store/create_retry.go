@@ -18,11 +18,14 @@ const (
 	// RetryEngineUnreachable: an engine refused the connection (down or
 	// still starting). The re-run waits until the engines of DBs answer.
 	RetryEngineUnreachable RetryCause = "engine_unreachable"
+	// RetryDaemonRestart: treemand restarted while the create was in
+	// flight; nothing about the worktree caused the failure.
+	RetryDaemonRestart RetryCause = "daemon_restart"
 )
 
 func (c RetryCause) valid() bool {
 	switch c {
-	case RetryEnvLoadTimeout, RetryEngineUnreachable:
+	case RetryEnvLoadTimeout, RetryEngineUnreachable, RetryDaemonRestart:
 		return true
 	}
 	return false

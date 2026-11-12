@@ -80,7 +80,7 @@ func TestRecordFinalizeFailureTagsTransientFailures(t *testing.T) {
 
 	recordFinalizeFailure(ctx, st, &config.Config{}, finalizeFailure{
 		repoRoot: "/repo", wtRoot: "/repo/wt", repoID: repoID, wtID: wtID,
-		phase: store.PhaseBeforeEngines, err: beforeEnginesFailure(envLoadFailure(shellenv.DirenvTimedOut)),
+		phase: store.FinalizeSetup, err: beforeEnginesFailure(envLoadFailure(shellenv.DirenvTimedOut)),
 	})
 
 	pending, err := st.Store.PendingCreateRetries(ctx)

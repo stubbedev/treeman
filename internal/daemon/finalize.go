@@ -53,9 +53,13 @@ type finalizeFailure struct {
 	// enginesTouched is true only when engine prepare was entered — the
 	// gate on the recovery drops below.
 	enginesTouched bool
-	phase          string
+	phase          store.FinalizePhase
 	err            error
 }
+
+// hookCreateBeforeEngines is the trigger of the setup hooks a finalize
+// runs before engine prepare.
+const hookCreateBeforeEngines = "create-before-engines"
 
 // recordFinalizeFailure is FinalizeWorktree's terminal-failure tail:
 // recover the engine namespaces (when prepare actually ran) and write
@@ -111,7 +115,7 @@ func recordFinalizeFailure(ctx context.Context, st *State, cfg *config.Config, f
 		msg = f.err.Error() + "\n" + retryHint(retry)
 	}
 	_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, msg,
-		f.repoID, f.wtID, f.phase, 0, payload)
+		f.repoID, f.wtID, f.phase.EventPhase(), 0, payload)
 }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
@@ -195,7 +199,7 @@ func finalizeWorktree(
 			repoID:         termRepoID,
 			wtID:           termWtID,
 			enginesTouched: enginesTouched,
-			phase:          store.FinalizeFailurePhase(enginesTouched),
+			phase:          store.FinalizePhaseOf(enginesTouched),
 			err:            err,
 		})
 	}()
@@ -599,7 +603,7 @@ func runFinalizeSetupPipeline(
 	if stop, err := stopBefore(ctx, st, "pre-hooks", repoID, wtID, nil); stop {
 		return err == nil, err
 	}
-	if err := runTriggerActions(ctx, st, "create-before-engines",
+	if err := runTriggerActions(ctx, st, hookCreateBeforeEngines,
 		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
 		isMain, repoID, wtID, inheritedEnv); err != nil {
 		return false, beforeEnginesFailure(err)
@@ -833,7 +837,7 @@ func FinalizeWorktreeForWatch(
 		release func()
 		lease   *finalizeLease
 	)
-	failure := finalizeFailure{repoRoot: repoRoot, wtRoot: wtRoot}
+	failure := finalizeFailure{repoRoot: repoRoot, wtRoot: wtRoot, phase: store.FinalizeEngines}
 	defer func() {
 		if release != nil {
 			release()

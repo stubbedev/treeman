@@ -70,7 +70,16 @@ func refusedDatabases(err error) ([]int, bool) {
 // not transient or the re-runs are used up.
 func createRetryFor(err error, attempt int) (store.CreateRetry, bool) {
 	r, ok := transientCause(err)
-	if !ok || attempt >= createRetryAttempts {
+	if !ok {
+		return store.CreateRetry{}, false
+	}
+	return retryWithinAttempts(r, attempt)
+}
+
+// retryWithinAttempts returns r tagged with the automatic re-run number
+// of the failed run, false when the re-runs are used up.
+func retryWithinAttempts(r store.CreateRetry, attempt int) (store.CreateRetry, bool) {
+	if attempt >= createRetryAttempts {
 		return store.CreateRetry{}, false
 	}
 	r.Attempt = attempt

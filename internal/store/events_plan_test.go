@@ -167,3 +167,16 @@ func TestPendingCreateRetriesQueriesUseAnIndex(t *testing.T) {
 		t.Errorf("plan:\n%s\nwant the teardown check served by idx_events_worktree*", plan)
 	}
 }
+
+// The daemon-restart sweep reads how far each interrupted finalize got
+// (#211) with one batched query over the worktree index.
+func TestFinalizeProgressQueryUsesTheWorktreeIndex(t *testing.T) {
+	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	q, args := latestEventPerWorktreeSQL([]int64{1, 2, 3}, FinalizeProgressEventTypes)
+	assertServedWithoutSort(t, st, q, args, "COVERING INDEX idx_events_worktree_recent")
+}

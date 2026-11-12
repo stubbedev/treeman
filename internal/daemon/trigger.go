@@ -2,7 +2,10 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
+	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/pkg/rpc"
 )
 
@@ -43,6 +46,21 @@ func inheritTrigger(dst, src context.Context) context.Context {
 func triggerAttempt(ctx context.Context) int {
 	t, _ := ctx.Value(triggerKey{}).(trigger)
 	return t.Attempt
+}
+
+// triggerOf returns the trigger recorded in the payload of e, an event
+// written with triggerPayload; the zero trigger when e carries none.
+func triggerOf(e store.Event) (trigger, error) {
+	if e.PayloadJSON == "" {
+		return trigger{}, nil
+	}
+	var p struct {
+		Trigger trigger `json:"trigger"`
+	}
+	if err := json.Unmarshal([]byte(e.PayloadJSON), &p); err != nil {
+		return trigger{}, fmt.Errorf("decode the trigger of event %d: %w", e.ID, err)
+	}
+	return p.Trigger, nil
 }
 
 func triggerPayload(ctx context.Context) map[string]any {

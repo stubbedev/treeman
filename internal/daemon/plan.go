@@ -344,7 +344,7 @@ func runTaskHookRun(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	phase := task.Params[rpc.ParamPhase]
 	var entries []config.Action
 	switch phase {
-	case "create-before-engines":
+	case hookCreateBeforeEngines:
 		entries = id.cfg.Hooks.OnCreateBeforeEngines
 	case "create-after-engines":
 		entries = id.cfg.Hooks.OnCreateAfterEngines

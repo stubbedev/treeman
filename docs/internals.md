@@ -72,6 +72,15 @@ daemon restart; any later lifecycle op on the worktree (a manual
 finalize, a teardown) supersedes them, and a worktree with a teardown
 or finalize in flight is skipped.
 
+A create that was still running when treemand stopped is failed at
+the next start with the phase it was in: before engine prepare (the
+copy/link passes, the `create-before-engines` hooks) it counts as a
+failed setup, so prepare refuses to run until a finalize succeeds, and
+the databases are left alone; from engine prepare on, the databases
+it touched are reset like after a failed prepare. Either way it is
+re-run like a transient failure, counting the interrupted run's own
+re-run number.
+
 A create whose prepare failed only because engines refused the
 connection (down, or still starting past the 2-minute startup wait)
 is tagged with the databases it failed on. From 30 seconds after the

@@ -92,11 +92,43 @@ func opInFlight(e Event) bool {
 	return false
 }
 
-func FinalizeFailurePhase(enginesTouched bool) string {
+// FinalizePhase is the part of a finalize a worktree:create:error
+// reports as failed or interrupted.
+type FinalizePhase int
+
+const (
+	// FinalizeSetup is everything before engine prepare: the copy/link
+	// passes, ports, patches and the create-before-engines hooks. A
+	// failure here leaves the worktree's setup incomplete (SetupFailure).
+	FinalizeSetup FinalizePhase = iota + 1
+	// FinalizeEngines is engine prepare and the hooks after it.
+	FinalizeEngines
+)
+
+// FinalizePhaseOf is the phase a finalize was in: engines once it
+// entered engine prepare, setup before.
+func FinalizePhaseOf(enginesTouched bool) FinalizePhase {
 	if enginesTouched {
-		return ""
+		return FinalizeEngines
 	}
-	return PhaseBeforeEngines
+	return FinalizeSetup
+}
+
+// EventPhase is the phase column a worktree:create:error carries for p.
+func (p FinalizePhase) EventPhase() string {
+	if p == FinalizeSetup {
+		return PhaseBeforeEngines
+	}
+	return ""
+}
+
+// FinalizeProgressEventTypes are the events that show how far a
+// finalize got: a hook run starting (phase = its trigger) and a
+// database's prepare starting.
+var FinalizeProgressEventTypes = []string{EvtHooksStart, EvtPrepareStart}
+
+func FinalizeFailurePhase(enginesTouched bool) string {
+	return FinalizePhaseOf(enginesTouched).EventPhase()
 }
 
 func FailedBeforeEngines(last Event) bool {
