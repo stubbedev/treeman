@@ -1105,6 +1105,7 @@ func prepareMySQL(
 		snapshotRestoreFanout: drv.SnapshotRestoreStaged,
 		snapshotCreate:        drv.SnapshotCreate,
 		cloneStrategy:         func() string { return string(drv.LastCloneStrategy()) },
+		mergeFanout:           drv.PreferLogicalFor,
 		appliedBatches:        drv.AppliedBatches,
 	}
 	dumpKey := dumpOnlySnapshotKey(d.Engine, d.Connection, version, key.DumpHashHex)
@@ -1187,7 +1188,6 @@ func prepareMySQL(
 	if err != nil {
 		return Outcome{}, err
 	}
-	ops.mergeFanout = drv.PreferLogicalFor
 	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
 		sourceDB, templateName, version, budget, key, inputs, ledger, ops)
 	if err != nil {
