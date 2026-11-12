@@ -49,6 +49,8 @@ func TestRewriteHostPortInURIHostForms(t *testing.T) {
 		{"bracketed source without port", "redis://[::1]/0", "10.0.0.1", 0, "redis://10.0.0.1/0"},
 		{"bracketed source to ipv6", "redis://u@[::1]:6379?x=1", "fd00::5", 0, "redis://u@[fd00::5]:6379?x=1"},
 		{"bracketed source without port to ipv6", "redis://[::1]", "::1", 0, "redis://[::1]"},
+		{"unescaped @ in password", "mysql://u:p@ss@db:3306/db", "10.0.0.2", 0, "mysql://u:p@ss@10.0.0.2:3306/db"},
+		{"@ in query after host", "mongodb://db:27017/x?authSource=a@b", "10.0.0.2", 0, "mongodb://10.0.0.2:27017/x?authSource=a@b"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -68,6 +70,7 @@ func TestURIPortHostForms(t *testing.T) {
 		{"ipv4 with port", "mysql://10.0.0.1:3307/db", 3307},
 		{"ipv4 without port", "mysql://10.0.0.1/db", 3306},
 		{"hostname with port", "mysql://u:p@db:3308", 3308},
+		{"unescaped @ in password", "mysql://u:p@ss@db:3310/db", 3310},
 		{"hostname without port", "mysql://db", 3306},
 		{"bracketed ipv6 with port", "mysql://u:p@[fd00::2]:3309/db", 3309},
 		{"bracketed ipv6 without port", "mysql://[fd00::2]/db", 3306},

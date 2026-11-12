@@ -577,12 +577,15 @@ func splitScheme(uri string) (scheme, rest string) {
 }
 
 func splitUserinfo(s string) (userinfo, rest string) {
-	at := strings.Index(s, "@")
-	slash := strings.Index(s, "/")
-	if at >= 0 && (slash < 0 || at < slash) {
-		return s[:at], s[at+1:]
+	authority := s
+	if end := strings.IndexAny(s, "/?#"); end >= 0 {
+		authority = s[:end]
 	}
-	return "", s
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		return "", s
+	}
+	return s[:at], s[at+1:]
 }
 
 func splitHostFromTail(s string) (host, tail string) {
