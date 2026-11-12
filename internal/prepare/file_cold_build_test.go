@@ -15,11 +15,6 @@ import (
 	"github.com/stubbedev/treeman/internal/store"
 )
 
-// TestFileColdBuildRecordsLedgerAndFansOutThroughBudget: the file-db
-// cold build goes through the shared snapshot/record/fan-out tail
-// (#213), so its snapshot row carries the applied ledger, every clone
-// restore is reported through the run's progress, and the clones come
-// back as resolved paths.
 // sqliteWorktree is a worktree with a store row and a data/ directory
 // for a sqlite database named data/app_{slug}.db.
 type sqliteWorktree struct {
@@ -81,6 +76,11 @@ func (w sqliteWorktree) prepare(ctx context.Context, t *testing.T, d config.Data
 	return outs[0]
 }
 
+// TestFileColdBuildRecordsLedgerAndFansOutThroughBudget: the file-db
+// cold build goes through the shared snapshot/record/fan-out tail
+// (#213), so its snapshot row carries the applied ledger, every clone
+// restore is reported through the run's progress, and the clones come
+// back as resolved paths.
 func TestFileColdBuildRecordsLedgerAndFansOutThroughBudget(t *testing.T) {
 	ctx := context.Background()
 	w := newSQLiteWorktree(t)

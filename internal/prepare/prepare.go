@@ -405,23 +405,106 @@ func fanOutClones(
 	override uint32,
 	budget fanoutBudget,
 ) error {
-	if len(clones) == 0 {
+	return fanOutWave(ctx, st, repoID, worktreeID,
+		cloneWave{copy: restore, from: template, template: template, targets: clones}, engine, override, budget)
+}
+
+// cloneWave is one parallel fan-out: copy reproduces from into every
+// target. In a merged wave from is the populated source and the
+// template is built as one of the targets, alongside the clones;
+// otherwise from is the template itself.
+type cloneWave struct {
+	copy     cloneRestorer
+	from     string
+	template string
+	targets  []string
+}
+
+func (w cloneWave) merged() bool { return w.from != w.template }
+
+// fromKey names from in event payloads.
+func (w cloneWave) fromKey() string {
+	if w.merged() {
+		return "source"
+	}
+	return "template"
+}
+
+// verb names copy in the error a failed target returns.
+func (w cloneWave) verb() string {
+	if w.merged() {
+		return "snapshot create"
+	}
+	return "restore"
+}
+
+// startEvent is the clones:start message and payload of w.
+func (w cloneWave) startEvent(engine string, limit int, autoTuned bool, maxConns int) (string, map[string]any) {
+	fields := map[string]any{
+		"engine":     engine,
+		"template":   w.template,
+		"limit":      limit,
+		"auto_tuned": autoTuned,
+		"max_conns":  maxConns,
+	}
+	if !w.merged() {
+		fields["clones"] = len(w.targets)
+		return fmt.Sprintf("engine=%s template=%s clones=%d limit=%d", engine, w.template, len(w.targets), limit), fields
+	}
+	fields["source"] = w.from
+	fields["targets"] = len(w.targets)
+	fields["merged"] = true
+	return fmt.Sprintf("engine=%s source=%s targets=%d (template+%d clones) limit=%d",
+		engine, w.from, len(w.targets), len(w.targets)-1, limit), fields
+}
+
+// errorMessage is the clones:restore:error message of a failed target.
+func (w cloneWave) errorMessage(engine, target string, err error) string {
+	if w.merged() {
+		return fmt.Sprintf("engine=%s source=%s db=%s err=%v", engine, w.from, target, err)
+	}
+	return fmt.Sprintf("engine=%s db=%s err=%v", engine, target, err)
+}
+
+// endEvent is the clones:end message and payload of w.
+func (w cloneWave) endEvent(engine string, ok, fail uint32, slowestMs int64, slowestDB string) (string, map[string]any) {
+	msg := fmt.Sprintf("engine=%s ok=%d fail=%d slowest=%dms", engine, ok, fail, slowestMs)
+	fields := map[string]any{
+		"engine":     engine,
+		"template":   w.template,
+		"ok":         ok,
+		"fail":       fail,
+		"slowest_ms": slowestMs,
+		"slowest_db": slowestDB,
+	}
+	if w.merged() {
+		msg += " (merged)"
+		fields["source"] = w.from
+		fields["merged"] = true
+	}
+	return msg, fields
+}
+
+// fanOutWave runs w with the events, limits and budget documented on
+// fanOutClones.
+func fanOutWave(
+	ctx context.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+	w cloneWave,
+	engine string,
+	override uint32,
+	budget fanoutBudget,
+) error {
+	if len(w.targets) == 0 {
 		return nil
 	}
-	limit, autoTuned := fanOutLimit(override, budget.maxConns, len(clones), engine)
+	limit, autoTuned := fanOutLimit(override, budget.maxConns, len(w.targets), engine)
 
 	startedMs := time.Now().UnixMilli()
 	if st != nil {
-		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtClonesStart,
-			fmt.Sprintf("engine=%s template=%s clones=%d limit=%d", engine, template, len(clones), limit),
-			repoID, worktreeID, "", 0, map[string]any{
-				"engine":     engine,
-				"template":   template,
-				"clones":     len(clones),
-				"limit":      limit,
-				"auto_tuned": autoTuned,
-				"max_conns":  budget.maxConns,
-			})
+		msg, fields := w.startEvent(engine, limit, autoTuned, budget.maxConns)
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtClonesStart, msg, repoID, worktreeID, "", 0, fields)
 	}
 
 	var (
@@ -434,11 +517,11 @@ func fanOutClones(
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(limit)
-	for _, c := range clones {
+	for _, c := range w.targets {
 		g.Go(func() error {
 			cloneStart := time.Now()
 			err := budget.runRestore(gctx, override, engine, func() error {
-				return retryTransient(gctx, func() error { return restore(gctx, template, c) })
+				return retryTransient(gctx, func() error { return w.copy(gctx, w.from, c) })
 			})
 			dur := time.Since(cloneStart).Milliseconds()
 			if err != nil {
@@ -451,25 +534,24 @@ func fanOutClones(
 				}
 				failCount.Add(1)
 				if st != nil {
-					_ = st.WriteEvent(gctx, store.LevelWarn, store.EvtClonesRestoreError,
-						fmt.Sprintf("engine=%s db=%s err=%v", engine, c, err),
+					_ = st.WriteEvent(gctx, store.LevelWarn, store.EvtClonesRestoreError, w.errorMessage(engine, c, err),
 						repoID, worktreeID, "", dur, map[string]any{
-							"engine":   engine,
-							"template": template,
-							"db":       c,
-							"error":    err.Error(),
+							"engine":    engine,
+							w.fromKey(): w.from,
+							"db":        c,
+							"error":     err.Error(),
 						})
 				}
-				return fmt.Errorf("restore %s → %s: %w", template, c, err)
+				return fmt.Errorf("%s %s → %s: %w", w.verb(), w.from, c, err)
 			}
 			okCount.Add(1)
 			if st != nil {
 				_ = st.WriteEvent(gctx, store.LevelDebug, store.EvtClonesRestoreEnd,
 					fmt.Sprintf("engine=%s db=%s", engine, c),
 					repoID, worktreeID, "", dur, map[string]any{
-						"engine":   engine,
-						"template": template,
-						"db":       c,
+						"engine":    engine,
+						w.fromKey(): w.from,
+						"db":        c,
 					})
 			}
 			if cur := slowestMs.Load(); dur > cur {
@@ -494,17 +576,8 @@ func fanOutClones(
 		slowestMu.Lock()
 		slowDB := slowestDB
 		slowestMu.Unlock()
-		_ = st.WriteEvent(ctx, level, store.EvtClonesEnd,
-			fmt.Sprintf("engine=%s ok=%d fail=%d slowest=%dms",
-				engine, okCount.Load(), failCount.Load(), slowestMs.Load()),
-			repoID, worktreeID, "", totalMs, map[string]any{
-				"engine":     engine,
-				"template":   template,
-				"ok":         okCount.Load(),
-				"fail":       failCount.Load(),
-				"slowest_ms": slowestMs.Load(),
-				"slowest_db": slowDB,
-			})
+		msg, fields := w.endEvent(engine, okCount.Load(), failCount.Load(), slowestMs.Load(), slowDB)
+		_ = st.WriteEvent(ctx, level, store.EvtClonesEnd, msg, repoID, worktreeID, "", totalMs, fields)
 	}
 	return gErr
 }
@@ -919,7 +992,7 @@ func prepareFamily(
 	return Outcome{}, nil
 }
 
-//nolint:funlen,cyclop // mirrors the linear cache-hit / incremental / cold-build / fanout flow used by every engine; extracting helpers just spreads the same conditions across functions
+//nolint:funlen // mirrors the linear cache-hit / incremental / cold-build / fanout flow used by every engine; extracting helpers just spreads the same conditions across functions
 func prepareMySQL(
 	ctx context.Context,
 	cfg *config.Config,
@@ -1030,15 +1103,9 @@ func prepareMySQL(
 		exists:                drv.DatabaseExists,
 		snapshotRestore:       drv.SnapshotRestore,
 		snapshotRestoreFanout: drv.SnapshotRestoreStaged,
-		snapshotCreate: func(ctx context.Context, src, tmpl string) error {
-			if cerr := drv.SnapshotCreate(ctx, src, tmpl); cerr != nil {
-				return cerr
-			}
-			emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, src, tmpl,
-				string(drv.LastCloneStrategy()))
-			return nil
-		},
-		appliedBatches: drv.AppliedBatches,
+		snapshotCreate:        drv.SnapshotCreate,
+		cloneStrategy:         func() string { return string(drv.LastCloneStrategy()) },
+		appliedBatches:        drv.AppliedBatches,
 	}
 	dumpKey := dumpOnlySnapshotKey(d.Engine, d.Connection, version, key.DumpHashHex)
 
@@ -1116,48 +1183,15 @@ func prepareMySQL(
 		return Outcome{}, err
 	}
 
-	// Template + clones: logical strategy can be fanned out from source
-	// in one parallel wave (template + N clones together) because logical
-	// INSERT…SELECT doesn't share a per-source FLUSH lock. The physical
-	// strategy keeps the 2-step path (build template, then staged restore
-	// to clones) where the staging dir absorbs the FOR EXPORT
-	// serialization that N+1 concurrent physical clones would otherwise
-	// hit on the source.
-	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-	if err != nil {
-		return Outcome{}, err
-	}
 	ledger, err := builtLedger(ctx, st, repoID, worktreeID, d, sourceDB, inputs, ops.appliedBatches)
 	if err != nil {
 		return Outcome{}, err
 	}
-	if drv.PreferLogicalFor(ctx, sourceDB) {
-		if err := mysqlMergedColdFanout(ctx, drv, cfg, d, st, repoID, worktreeID,
-			sourceDB, templateName, version, key, inputs, ledger, clones, budget); err != nil {
-			return Outcome{}, err
-		}
-	} else {
-		if err := mysqlSnapshotAndRecord(
-			ctx,
-			drv,
-			cfg,
-			d,
-			st,
-			repoID,
-			worktreeID,
-			sourceDB,
-			templateName,
-			version,
-			key,
-			inputs,
-			ledger,
-		); err != nil {
-			return Outcome{}, err
-		}
-		if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestoreStaged,
-			templateName, clones, d.Engine, d.Fanout, budget); err != nil {
-			return Outcome{}, err
-		}
+	ops.mergeFanout = drv.PreferLogicalFor
+	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+		sourceDB, templateName, version, budget, key, inputs, ledger, ops)
+	if err != nil {
+		return Outcome{}, err
 	}
 
 	ms := time.Since(started).Milliseconds()
@@ -1537,10 +1571,6 @@ func mysqlColdBuildSteps(
 	return nil
 }
 
-// mysqlSnapshotAndRecord builds the template snapshot from the populated
-// source, records the SQLite snapshot row, and fires the detached LRU
-// eviction sweep. Extracted verbatim from prepareMySQL's snapshot/record
-// block.
 // recordSnapshot writes the SQLite snapshot row for a freshly-built
 // template. Identical across every engine and across both the cold-build
 // and incremental paths — only the engine label, version, source/template
@@ -1570,167 +1600,6 @@ func recordSnapshot(
 	if err != nil {
 		return fmt.Errorf("record %s snapshot %s of %s: %w", engine, template, source, err)
 	}
-	return nil
-}
-
-func mysqlSnapshotAndRecord(
-	ctx context.Context,
-	drv *dbmysql.Driver,
-	cfg *config.Config,
-	d config.DatabaseConfig,
-	st *store.Store,
-	repoID, worktreeID int64,
-	sourceDB, templateName, version string,
-	key snapshot.Key,
-	inputs map[string]store.InputVector,
-	ledger *store.AppliedLedger,
-) error {
-	snapStart := time.Now()
-	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
-		return fmt.Errorf("snapshot create %s → %s: %w", sourceDB, templateName, err)
-	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
-	emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, sourceDB, templateName, string(drv.LastCloneStrategy()))
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName,
-		inputs, ledger, repoID); err != nil {
-		return err
-	}
-	// Fire-and-forget LRU eviction for this repo. Uses a fresh
-	// background context with a hard deadline so a stalled DROP
-	// (e.g. lock contention) can't leak this goroutine forever.
-	// Errors are logged inside EvictExcess.
-	spawnEvict(cfg, st, repoID)
-	return nil
-}
-
-// mysqlMergedColdFanout fans source → [template + clones...] in ONE
-// parallel wave when the strategy selector picked logical. Saves the
-// serial snapshot-create-then-restore round trip the 2-step path pays
-// (~10s on a 200-table schema) and keeps every target reading from the
-// freshly-built source DB while its pages are still hot in the buffer
-// pool. Mirrors the build_helper.d prepare flow that originally
-// inspired this codebase: 9 concurrent INSERT…SELECT clones from one
-// source, capped by the same auto-tuned connection budget as
-// fanOutClones.
-//
-// Logical clones don't share a per-source FLUSH lock, so concurrent
-// SnapshotCreate from the same source is safe; the physical path's
-// FLUSH TABLES … FOR EXPORT would serialize, which is why the
-// dispatcher keeps it on the 2-step staged path.
-func mysqlMergedColdFanout(
-	ctx context.Context,
-	drv *dbmysql.Driver,
-	cfg *config.Config,
-	d config.DatabaseConfig,
-	st *store.Store,
-	repoID, worktreeID int64,
-	sourceDB, templateName, version string,
-	key snapshot.Key,
-	inputs map[string]store.InputVector,
-	ledger *store.AppliedLedger,
-	clones []string,
-	budget fanoutBudget,
-) error {
-	targets := make([]string, 0, len(clones)+1)
-	targets = append(targets, templateName)
-	targets = append(targets, clones...)
-
-	limit, autoTuned := fanOutLimit(d.Fanout, budget.maxConns, len(targets), d.Engine)
-	started := time.Now()
-	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtClonesStart,
-		fmt.Sprintf("engine=%s source=%s targets=%d (template+%d clones) limit=%d", d.Engine, sourceDB, len(targets), len(clones), limit),
-		repoID, worktreeID, "", 0, map[string]any{
-			"engine":     d.Engine,
-			"source":     sourceDB,
-			"template":   templateName,
-			"targets":    len(targets),
-			"limit":      limit,
-			"auto_tuned": autoTuned,
-			"max_conns":  budget.maxConns,
-			"merged":     true,
-		})
-
-	var (
-		okCount   atomic.Uint32
-		failCount atomic.Uint32
-		slowestMs atomic.Int64
-		slowestMu sync.Mutex
-		slowestDB string
-	)
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(limit)
-	for _, tgt := range targets {
-		g.Go(func() error {
-			cloneStart := time.Now()
-			err := budget.runRestore(gctx, d.Fanout, d.Engine, func() error { return drv.SnapshotCreate(gctx, sourceDB, tgt) })
-			dur := time.Since(cloneStart).Milliseconds()
-			if err != nil {
-				failCount.Add(1)
-				_ = st.WriteEvent(gctx, store.LevelWarn, store.EvtClonesRestoreError,
-					fmt.Sprintf("engine=%s source=%s db=%s err=%v", d.Engine, sourceDB, tgt, err),
-					repoID, worktreeID, "", dur, map[string]any{
-						"engine": d.Engine,
-						"source": sourceDB,
-						"db":     tgt,
-						"error":  err.Error(),
-					})
-				return fmt.Errorf("snapshot create %s → %s: %w", sourceDB, tgt, err)
-			}
-			okCount.Add(1)
-			_ = st.WriteEvent(gctx, store.LevelDebug, store.EvtClonesRestoreEnd,
-				fmt.Sprintf("engine=%s db=%s", d.Engine, tgt),
-				repoID, worktreeID, "", dur, map[string]any{
-					"engine": d.Engine,
-					"source": sourceDB,
-					"db":     tgt,
-				})
-			if cur := slowestMs.Load(); dur > cur {
-				slowestMu.Lock()
-				if dur > slowestMs.Load() {
-					slowestMs.Store(dur)
-					slowestDB = tgt
-				}
-				slowestMu.Unlock()
-			}
-			return nil
-		})
-	}
-	gErr := g.Wait()
-
-	totalMs := time.Since(started).Milliseconds()
-	level := store.LevelInfo
-	if failCount.Load() > 0 {
-		level = store.LevelError
-	}
-	slowestMu.Lock()
-	slowDB := slowestDB
-	slowestMu.Unlock()
-	_ = st.WriteEvent(ctx, level, store.EvtClonesEnd,
-		fmt.Sprintf("engine=%s ok=%d fail=%d slowest=%dms (merged)", d.Engine, okCount.Load(), failCount.Load(), slowestMs.Load()),
-		repoID, worktreeID, "", totalMs, map[string]any{
-			"engine":     d.Engine,
-			"source":     sourceDB,
-			"template":   templateName,
-			"ok":         okCount.Load(),
-			"fail":       failCount.Load(),
-			"slowest_ms": slowestMs.Load(),
-			"slowest_db": slowDB,
-			"merged":     true,
-		})
-	if gErr != nil {
-		return gErr
-	}
-
-	// Synthetic snapshot-create event so downstream observers (and the
-	// existing TestMySQLEndToEnd-style assertions) still see the
-	// template's strategy + a per-template phase boundary.
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", started)
-	emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, sourceDB, templateName, string(drv.LastCloneStrategy()))
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName,
-		inputs, ledger, repoID); err != nil {
-		return err
-	}
-	spawnEvict(cfg, st, repoID)
 	return nil
 }
 
@@ -1842,6 +1711,15 @@ type incrementalOps struct {
 	// (mysql DDL+INSERT, postgres CREATE DATABASE TEMPLATE, mongo $out,
 	// redis COPY, ES _clone). Wraps the per-driver SnapshotCreate.
 	snapshotCreate func(ctx context.Context, source, template string) error
+	// cloneStrategy, when non-nil, reports the mechanism the latest
+	// snapshotCreate took, recorded on the template's snapshot-create
+	// boundary; nil for engines with a single mechanism.
+	cloneStrategy func() string
+	// mergeFanout, when non-nil and true for the source, builds the
+	// template and the test clones from the source together in one
+	// snapshotCreate wave instead of building the template first and
+	// restoring the clones from it.
+	mergeFanout func(ctx context.Context, source string) bool
 	// appliedBatches reads a framework's batch ledger table from a
 	// database; nil for engines that hold no such table.
 	appliedBatches batchReader
@@ -2095,10 +1973,12 @@ func seedDumpOnlyTemplate(
 	return recordSnapshot(ctx, st, dumpKey, d.Engine, version, sourceDB, dumpTpl, nil, nil, repoID)
 }
 
-// snapshotRecordFanout is the shared tail of the incremental build
-// paths: create the template from the populated source, record its
-// snapshot row with the given applied ledger, fire LRU eviction, then
-// fan out the test clones.
+// snapshotRecordFanout is the shared tail of every template build:
+// create the template from the populated source, record its snapshot
+// row with the given applied ledger, fire LRU eviction, then fan out
+// the test clones. When ops.mergeFanout picks it, the template is
+// created in the same wave as the clones, all straight from the source,
+// and recorded once that wave has succeeded.
 func snapshotRecordFanout(
 	ctx context.Context,
 	cfg *config.Config,
@@ -2114,18 +1994,43 @@ func snapshotRecordFanout(
 	ledger *store.AppliedLedger,
 	ops incrementalOps,
 ) ([]string, error) {
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	if err != nil {
+		return nil, err
+	}
+	record := func(snapStart time.Time) error {
+		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "snapshot-create", snapStart)
+		if ops.cloneStrategy != nil {
+			emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, source, templateName, ops.cloneStrategy())
+		}
+		if err := recordSnapshot(ctx, st, key, d.Engine, version, source, templateName, inputs, ledger, repoID); err != nil {
+			return err
+		}
+		spawnEvict(cfg, st, repoID)
+		return nil
+	}
+
 	snapStart := time.Now()
+	if ops.mergeFanout != nil && ops.mergeFanout(ctx, source) {
+		wave := cloneWave{
+			copy:     ops.snapshotCreate,
+			from:     source,
+			template: templateName,
+			targets:  append([]string{templateName}, clones...),
+		}
+		if err := fanOutWave(ctx, st, repoID, worktreeID, wave, d.Engine, d.Fanout, budget); err != nil {
+			return nil, err
+		}
+		if err := record(snapStart); err != nil {
+			return nil, err
+		}
+		return clones, nil
+	}
+
 	if err := ops.snapshotCreate(ctx, source, templateName); err != nil {
 		return nil, fmt.Errorf("snapshot create %s → %s: %w", source, templateName, err)
 	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, source, templateName, inputs, ledger, repoID); err != nil {
-		return nil, err
-	}
-	spawnEvict(cfg, st, repoID)
-
-	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-	if err != nil {
+	if err := record(snapStart); err != nil {
 		return nil, err
 	}
 	fanoutRestore := ops.snapshotRestore
