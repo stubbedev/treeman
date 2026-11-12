@@ -52,7 +52,7 @@ func (e *physicalSkippedError) Error() string {
 //  2. Recreate template DB; for every table SHOW CREATE on the template
 //     then ALTER … DISCARD TABLESPACE so the freshly-created .ibd is
 //     unlinked and the slot ready for an import.
-//  3. FLUSH TABLES source.* FOR EXPORT on a held connection. This
+//  3. FLUSH TABLES source.* FOR EXPORT on the same connection. This
 //     freezes those tables read-only and writes a .cfg next to each
 //     .ibd describing the tablespace layout.
 //  4. `<engine> exec CID cp` each .ibd/.cfg inside the container, which
@@ -140,41 +140,32 @@ func (d *Driver) tryPhysicalSnapshotCreate(ctx context.Context, source, template
 		err = errors.Join(err, cleanupPartialSchema(dropCtx, d, engineBin, cid, datadir, template, qtemplate))
 	}()
 
-	// Recreate every table on the template + discard its tablespace.
-	// One connection so we don't churn USE statements; defer reset.
-	prepConn, releasePrepConn, err := sessionConn(ctx, d.DB)
+	conn, releaseConn, err := sessionConn(ctx, d.DB)
 	if err != nil {
 		return false, err
 	}
-	defer releasePrepConn()
+	defer releaseConn()
 	// Disable FK / unique checks for the whole DDL pass: tables are
 	// recreated in alphabetic order, so an `orders` table whose
 	// CREATE references `products` would error out if FKs validate
 	// during CREATE. The IMPORT TABLESPACE pass later carries the
 	// same flag so referential integrity on the imported data isn't
 	// re-validated row by row (it's preserved verbatim from source).
-	if _, err := prepConn.ExecContext(ctx, "SET SESSION foreign_key_checks=0"); err != nil {
+	if _, err := conn.ExecContext(ctx, "SET SESSION foreign_key_checks=0"); err != nil {
 		return false, fmt.Errorf("disable foreign_key_checks: %w", err)
 	}
-	if _, err := prepConn.ExecContext(ctx, "SET SESSION unique_checks=0"); err != nil {
+	if _, err := conn.ExecContext(ctx, "SET SESSION unique_checks=0"); err != nil {
 		return false, fmt.Errorf("disable unique_checks: %w", err)
 	}
-	if _, err := prepConn.ExecContext(ctx, "USE "+qtemplate); err != nil {
+	if _, err := conn.ExecContext(ctx, "USE "+qtemplate); err != nil {
 		return false, err
 	}
 	for _, t := range tables {
-		if err := recreateAndDiscard(ctx, prepConn, qsource, t); err != nil {
+		if err := recreateAndDiscard(ctx, conn, qsource, t); err != nil {
 			return false, err
 		}
 	}
 
-	// FLUSH lock taken on a dedicated connection so it survives the
-	// per-table IMPORTs below. UNLOCK runs from this same connection.
-	lockConn, releaseLockConn, err := sessionConn(ctx, d.DB)
-	if err != nil {
-		return false, err
-	}
-	defer releaseLockConn()
 	flushList := make([]string, 0, len(tables))
 	for _, t := range tables {
 		qt, qerr := ident.QuoteMySQL(t)
@@ -183,7 +174,7 @@ func (d *Driver) tryPhysicalSnapshotCreate(ctx context.Context, source, template
 		}
 		flushList = append(flushList, qsource+"."+qt)
 	}
-	if _, err := lockConn.ExecContext(ctx, "FLUSH TABLES "+strings.Join(flushList, ", ")+" FOR EXPORT"); err != nil {
+	if _, err := conn.ExecContext(ctx, "FLUSH TABLES "+strings.Join(flushList, ", ")+" FOR EXPORT"); err != nil {
 		return false, fmt.Errorf("FLUSH TABLES FOR EXPORT: %w", err)
 	}
 
@@ -196,7 +187,7 @@ func (d *Driver) tryPhysicalSnapshotCreate(ctx context.Context, source, template
 	srcDir := datadir + "/" + source
 	dstDir := datadir + "/" + template
 	copyErr := copyTablespaces(ctx, engineBin, cid, srcDir, dstDir, tables)
-	if _, err := lockConn.ExecContext(ctx, "UNLOCK TABLES"); err != nil && copyErr == nil {
+	if _, err := conn.ExecContext(ctx, "UNLOCK TABLES"); err != nil && copyErr == nil {
 		copyErr = fmt.Errorf("UNLOCK TABLES: %w", err)
 	}
 	if copyErr != nil {
@@ -208,7 +199,7 @@ func (d *Driver) tryPhysicalSnapshotCreate(ctx context.Context, source, template
 		if qerr != nil {
 			return false, qerr
 		}
-		if _, err := prepConn.ExecContext(ctx, "ALTER TABLE "+qt+" IMPORT TABLESPACE"); err != nil {
+		if _, err := conn.ExecContext(ctx, "ALTER TABLE "+qt+" IMPORT TABLESPACE"); err != nil {
 			return false, fmt.Errorf("IMPORT TABLESPACE %s: %w", t, err)
 		}
 	}
