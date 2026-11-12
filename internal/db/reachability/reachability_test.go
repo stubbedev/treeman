@@ -30,6 +30,30 @@ func TestProbeCtxHonorsCancelledContext(t *testing.T) {
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("cancelled ctx took %v to return (should be near-instant)", elapsed)
 	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want it to wrap context.Canceled", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{"mysql", "198.51.100.1:3306"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q should contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "tcp connect timeout") {
+		t.Errorf("error %q must not diagnose a caller cancellation as a connect timeout", msg)
+	}
+}
+
+func TestProbeCtxReportsCallerDeadlineNotConnectTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := ProbeCtx(ctx, "mysql", "198.51.100.1", 3306)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if strings.Contains(err.Error(), "tcp connect timeout") {
+		t.Errorf("error %q must not diagnose the caller's deadline as a connect timeout", err)
+	}
 }
 
 // TestProbeCtxAppliesDefaultTimeoutWhenNoDeadline asserts the
@@ -46,6 +70,15 @@ func TestProbeCtxAppliesDefaultTimeoutWhenNoDeadline(t *testing.T) {
 	// Allow a generous margin over DefaultTimeout for slow CI.
 	if elapsed > DefaultTimeout+500*time.Millisecond {
 		t.Errorf("probe took %v, should cap near DefaultTimeout (%v)", elapsed, DefaultTimeout)
+	}
+	if elapsed < DefaultTimeout-200*time.Millisecond {
+		t.Skipf("dial to the unroutable host failed after %v without timing out: %v", elapsed, err)
+	}
+	if !strings.Contains(err.Error(), "tcp connect timeout") {
+		t.Errorf("error %q should carry the connect-timeout hint", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error %q is the probe's own timeout, not a caller deadline", err)
 	}
 }
 
@@ -234,5 +267,43 @@ func TestWaitForProbeSeesEngineStartLate(t *testing.T) {
 	defer func() { _ = ln.Close() }()
 	if err != nil {
 		t.Fatalf("WaitFor should succeed once the listener is up: %v", err)
+	}
+}
+
+func TestWaitForCancelledMidWaitWrapsCancellationAndLastError(t *testing.T) {
+	ctx, cancel := context.WithCancel(WithStartupWait(context.Background()))
+	defer cancel()
+	attempts := 0
+	err := WaitFor(ctx, func(context.Context) error {
+		attempts++
+		if attempts == 2 {
+			cancel()
+		}
+		return errStarting
+	}, isStarting)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want it to wrap context.Canceled", err)
+	}
+	if !errors.Is(err, errStarting) {
+		t.Errorf("err = %v, want it to wrap the last retryable error", err)
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestWaitForDoesNotRetryCancelledProbe(t *testing.T) {
+	ctx, cancel := context.WithCancel(WithStartupWait(context.Background()))
+	cancel()
+	attempts := 0
+	err := WaitFor(ctx, func(ctx context.Context) error {
+		attempts++
+		return ProbeCtx(ctx, "elasticsearch", "198.51.100.1", 9200)
+	}, IsRefused)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want it to wrap context.Canceled", err)
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1", attempts)
 	}
 }

@@ -31,17 +31,22 @@ const StartupWait = 2 * time.Minute
 const pollInterval = 250 * time.Millisecond
 
 // ProbeCtx tries a single TCP connect bounded by ctx and DefaultTimeout,
-// whichever ends first, and returns immediately on failure.
+// whichever ends first, and returns immediately on failure. When ctx
+// itself ends first the returned error wraps ctx.Err(), so a caller's
+// cancellation or deadline is never reported as an unreachable service.
 func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
-	ctx, cancel := context.WithTimeout(ctx, DefaultTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, DefaultTimeout)
 	defer cancel()
 	d := net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	conn, err := d.DialContext(probeCtx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
 	if err == nil {
 		_ = conn.Close()
 		return nil
 	}
-	if ctx.Err() != nil {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%s probe of %s:%d interrupted: %w", engine, host, port, ctxErr)
+	}
+	if probeCtx.Err() != nil {
 		return fmt.Errorf(
 			"%s unreachable at %s:%d (tcp connect timeout — is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`)",
 			engine,
@@ -96,8 +101,9 @@ func StartupWaitEnabled(ctx context.Context) bool {
 // WaitFor runs attempt once, or, when ctx is marked by WithStartupWait,
 // until it succeeds, returns an error retryable rejects, or StartupWait
 // (or ctx's earlier deadline) elapses, pausing between attempts. When
-// the wait ends without success the last retryable error is returned,
-// wrapped with how long was waited.
+// the wait ends without success the returned error wraps both the
+// context's error and the last retryable error, with how long was
+// waited.
 func WaitFor(ctx context.Context, attempt func(context.Context) error, retryable func(error) bool) error {
 	if !StartupWaitEnabled(ctx) {
 		return attempt(ctx)
@@ -127,8 +133,8 @@ func WaitFor(ctx context.Context, attempt func(context.Context) error, retryable
 }
 
 func gaveUp(ctx context.Context, start time.Time, last error) error {
-	return fmt.Errorf("still not ready after waiting %s (%s): %w",
-		time.Since(start).Round(100*time.Millisecond), ctx.Err().Error(), last)
+	return fmt.Errorf("still not ready after waiting %s (%w): %w",
+		time.Since(start).Round(100*time.Millisecond), ctx.Err(), last)
 }
 
 // HostPort extracts host and port from a URL-style connection string,
