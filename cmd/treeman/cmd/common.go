@@ -57,11 +57,18 @@ func CaptureInheritedEnv() map[string]string {
 // absPath resolves p against the current working directory, failing
 // with an error naming p when that directory cannot be determined.
 func absPath(p string) (string, error) {
-	abs, err := filepath.Abs(p)
+	return absPathFrom(os.Getwd, p)
+}
+
+func absPathFrom(getwd func() (string, error), p string) (string, error) {
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p), nil
+	}
+	wd, err := getwd()
 	if err != nil {
 		return "", fmt.Errorf("resolve %s to an absolute path: %w", p, err)
 	}
-	return abs, nil
+	return filepath.Join(wd, p), nil
 }
 
 // PrintOK / PrintWarn delegate to the ui package's colored helpers.
