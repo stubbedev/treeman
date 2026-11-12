@@ -144,3 +144,26 @@ func TestOpenWaitsForAWriterBeforeSwitchingToWAL(t *testing.T) {
 		t.Fatalf("journal mode = %q, %v; want wal", mode, err)
 	}
 }
+
+// PendingCreateRetries runs on every watchdog tick: both of its queries
+// must be index-served, with no scan of the events table.
+func TestPendingCreateRetriesQueriesUseAnIndex(t *testing.T) {
+	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	latest, latestArgs := latestEventPerWorktreeSQL([]int64{1, 2, 3}, WorktreeOpEventTypes)
+	assertServedWithoutSort(t, st, latest, latestArgs, "COVERING INDEX idx_events_worktree_recent")
+
+	plan := explain(t, st, activeWorktreeRowsQuery)
+	for line := range strings.SplitSeq(plan, "\n") {
+		if strings.HasPrefix(line, "SCAN e") {
+			t.Errorf("plan:\n%s\nwant the teardown check served by an events index, not a scan", plan)
+		}
+	}
+	if !strings.Contains(plan, "idx_events_worktree") {
+		t.Errorf("plan:\n%s\nwant the teardown check served by idx_events_worktree*", plan)
+	}
+}

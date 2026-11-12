@@ -111,7 +111,7 @@ func TestFanOutClonesHonoursMaxConnsProbe(t *testing.T) {
 		close(release)
 	}()
 
-	if err := fanOutClones(context.Background(), nil, 0, 0, restore, "tmpl", clones, "mysql", 0, 30); err != nil {
+	if err := fanOutClones(context.Background(), nil, 0, 0, restore, "tmpl", clones, "mysql", 0, fanoutBudget{maxConns: 30}); err != nil {
 		t.Fatal(err)
 	}
 	got := peak.Load()
@@ -157,7 +157,7 @@ func TestFanOutClonesExplicitOverrideWinsOverProbe(t *testing.T) {
 		}
 		close(release)
 	}()
-	if err := fanOutClones(context.Background(), nil, 0, 0, restore, "tmpl", clones, "mysql", 3, 1000); err != nil {
+	if err := fanOutClones(context.Background(), nil, 0, 0, restore, "tmpl", clones, "mysql", 3, fanoutBudget{maxConns: 1000}); err != nil {
 		t.Fatal(err)
 	}
 	if peak.Load() > 3 {

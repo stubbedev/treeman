@@ -1484,7 +1484,10 @@ func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 // during clone restore + DropMatching. Leave unset (omitempty / 0)
 // to use the safe per-engine default from internal/prepare. Raise
 // only if the server is provisioned for it (max_connections raised,
-// PG pg_database lock contention acceptable, etc.).
+// PG pg_database lock contention acceptable, etc.). On MySQL and
+// Postgres the daemon also holds the restores of every worktree on one
+// server to that cap together, so concurrent creates queue instead of
+// multiplying it.
 type DatabaseConfig struct {
 	// Engine discriminator. Gates which connection block is dialed
 	// and which sub-fields (dump, migrations, namespaces) are valid.
@@ -1568,8 +1571,12 @@ type DatabaseConfig struct {
 	// pending, so the prior template is restored and Migrate applies
 	// them forward without running Rollback. They then run after
 	// later-dated migrations that are already applied, unlike a cold
-	// build, which applies everything in date order. Leave this unset
-	// to disable the rollback path entirely (cold rebuild only).
+	// build, which applies everything in date order. Treeman records
+	// which migrate run applied each file, because Laravel unwinds the
+	// newest run first while Rails, Ecto and golang-migrate unwind by
+	// date; TREEMAN_ROLLBACK_STEPS is widened until both orders unwind
+	// the same migrations. Leave this unset to disable the rollback path
+	// entirely (cold rebuild only).
 	Rollback *Step `yaml:"rollback,omitempty"`
 
 	// Seed is the shell command that populates non-migration data

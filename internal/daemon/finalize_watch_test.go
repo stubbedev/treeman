@@ -117,18 +117,18 @@ func TestWatchRunOptionsPrepareEveryEngineUnlessWorktreeIsReady(t *testing.T) {
 	}
 	for matched, engine := range engines {
 		for _, p := range notReady {
-			if got := prepared(watchRunOptions(p.ev, matched, len(engines))); !slices.Equal(got, engines) {
+			if got := prepared(watchRunOptions(p.ev, matched, len(engines), prepare.RunOptions{})); !slices.Equal(got, engines) {
 				t.Errorf("%s worktree, %s input changed: prepared %v, want every engine %v", p.name, engine, got, engines)
 			}
 		}
 		for _, p := range ready {
-			if got := prepared(watchRunOptions(p.ev, matched, len(engines))); !slices.Equal(got, []string{engine}) {
+			if got := prepared(watchRunOptions(p.ev, matched, len(engines), prepare.RunOptions{})); !slices.Equal(got, []string{engine}) {
 				t.Errorf("%s worktree, %s input changed: prepared %v, want only %s", p.name, engine, got, engine)
 			}
 		}
 	}
 	for _, p := range ready {
-		if got := prepared(watchRunOptions(p.ev, -1, len(engines))); !slices.Equal(got, engines) {
+		if got := prepared(watchRunOptions(p.ev, -1, len(engines), prepare.RunOptions{})); !slices.Equal(got, engines) {
 			t.Errorf("top-level input changed: prepared %v, want every engine %v", got, engines)
 		}
 	}

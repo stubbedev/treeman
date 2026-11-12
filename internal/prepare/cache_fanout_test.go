@@ -79,7 +79,7 @@ func TestCacheHitRestoreAndFanoutFoldsSource(t *testing.T) {
 	// to exercise dedup.
 	clones := []string{"app_t1", "app_t2", "app"}
 	if _, err := cacheHitRestoreAndFanout(ctx, s, repoID, wtID, templateExists(true), restore, d,
-		"_tm_abc", "app", clones, 0, "fp123"); err != nil {
+		"_tm_abc", "app", clones, fanoutBudget{}, "fp123"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -130,7 +130,7 @@ func TestCacheHitRestoreAndFanoutFallbackDropsRowWhenTemplateGone(t *testing.T) 
 
 	d := config.DatabaseConfig{Engine: "postgres"}
 	gone, err := cacheHitRestoreAndFanout(ctx, s, repoID, wtID, templateExists(false),
-		restoreFailingSource(errors.New("Unknown database '_tm_abc'")), d, "_tm_abc", "app", []string{"app_t1"}, 0, fp)
+		restoreFailingSource(errors.New("Unknown database '_tm_abc'")), d, "_tm_abc", "app", []string{"app_t1"}, fanoutBudget{}, fp)
 	if err != nil || !gone {
 		t.Fatalf("a vanished template must report templateGone for a rebuild: gone=%v err=%v", gone, err)
 	}
@@ -161,7 +161,7 @@ func TestCacheHitRestoreAndFanoutKeepsLiveTemplate(t *testing.T) {
 	boom := errors.New("pin mysql connection: Error 1040: Too many connections")
 	d := config.DatabaseConfig{Engine: "mysql"}
 	gone, err := cacheHitRestoreAndFanout(ctx, s, repoID, wtID, templateExists(true),
-		restoreFailingSource(boom), d, "_tm_abc", "app", []string{"app_t1"}, 0, fp)
+		restoreFailingSource(boom), d, "_tm_abc", "app", []string{"app_t1"}, fanoutBudget{}, fp)
 	if gone || !errors.Is(err, boom) {
 		t.Fatalf("a restore failure against a live template must surface, not rebuild: gone=%v err=%v", gone, err)
 	}

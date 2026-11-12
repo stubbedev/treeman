@@ -91,6 +91,10 @@ type State struct {
 	inFlightFinalizes map[string]inFlightFinalize
 	inFlightCreates   map[string]int
 
+	// cloneSlots caps the clone restores of every prepare this daemon
+	// runs, per engine server (#199).
+	cloneSlots *prepare.CloneSlots
+
 	// reapQueuesMu guards reapQueues. Each repo gets a single worker
 	// goroutine draining a buffered channel of trash paths — bursty
 	// `gwtd` runs that delete five worktrees at once don't spawn five
@@ -151,12 +155,12 @@ func (st *State) RefsDigestChanged(repoPath, digest string) bool {
 
 // inFlightFinalize is the per-path tracking record kept in
 // State.inFlightFinalizes. cancel preempts the FinalizeWorktree
-// goroutine via its context; startedAt anchors the watchdog that
-// fails-out hung finalizes whose owning child has wedged (see
-// WatchdogStalePreparing).
+// goroutine via its context; startedAt is when it claimed the slot;
+// lease is what FinalizeWatchdogLoop judges a stall by.
 type inFlightFinalize struct {
 	cancel    context.CancelFunc
 	startedAt time.Time
+	lease     leaseState
 	// watchReruns holds the watch-triggered re-prepares that arrived
 	// while this finalize ran, keyed by database index (-1 = every
 	// database). They are handed back by UnmarkFinalizeInFlight.
@@ -223,6 +227,7 @@ func NewState(bg context.Context, s *store.Store) *State {
 		inFlightTeardowns: map[string]struct{}{},
 		inFlightFinalizes: map[string]inFlightFinalize{},
 		inFlightCreates:   map[string]int{},
+		cloneSlots:        prepare.NewCloneSlots(),
 		reapQueues:        map[string]chan string{},
 		syncBackoff:       map[string]time.Time{},
 		syncFailCount:     map[string]int{},
@@ -554,6 +559,7 @@ const (
 	lblWatcherFS         = "watcher:fs"
 	lblWatchActions      = "watch:actions"
 	lblWatchFinalize     = "watch:finalize"
+	lblCreateRetry       = "worktree:create:retry"
 	lblNotify            = "notify:dispatch"
 	lblPlanLane          = "plan:lane"
 	lblPlanTask          = "plan:task"

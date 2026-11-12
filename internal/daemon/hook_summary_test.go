@@ -55,7 +55,7 @@ func TestPipelineContinueOnError(t *testing.T) {
 			}
 			touched := false
 			done, err := runFinalizeSetupPipeline(
-				ctx,
+				st.leaseFinalize(ctx, root),
 				st,
 				&cfg,
 				repo,

@@ -10,21 +10,19 @@ import (
 	"github.com/stubbedev/treeman/internal/store"
 )
 
-// finalizeTimeout caps how long any single FinalizeWorktree run is
-// allowed to occupy its slot before it is cancelled and a
-// worktree:create:error event is emitted. It is enforced twice: the
-// finalize pipeline derives its ctx with context.WithTimeout(_,
-// finalizeTimeout) so a wedged run self-cancels at the next phase
-// boundary, and FinalizeWatchdogLoop below is the backstop that emits
-// the error event + recovery for a phase that never reaches a boundary.
+// finalizeTimeout is how long a finalize may go without progress
+// before FinalizeWatchdogLoop cancels its work as stalled. The clock
+// starts when the finalize holds its cross-process lock, restarts on
+// every clone restore admitted to or finishing in its slot, and is
+// paused while a restore waits for a daemon-wide clone slot (#199):
+// eight concurrent creates queue behind each other's restores, and
+// that wait is progress, not a wedge.
 //
-// 15 minutes sits just above the largest realistic cold-build we've
+// 15 minutes sits just above the largest realistic single step we've
 // measured (largest production schema with seed data: ~12 min) so a
-// legitimate slow build is never aborted, while halving the previous
-// 30-min ceiling: a silent stall (the issue-#9 / ES-meltdown class)
-// stops pinning a slot — and the machine — within ~15 min + one
-// watchdog interval instead of 30. Not yet user-configurable — promote
-// to DaemonConfig if a schema legitimately needs longer.
+// legitimate slow build is never aborted, while a silent stall (the
+// issue-#9 / ES-meltdown class) stops pinning a slot within ~15 min +
+// one watchdog interval.
 const finalizeTimeout = 15 * time.Minute
 
 // watchdogInterval bounds detection latency. A finalize that wedges
@@ -112,31 +110,26 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 	}
 }
 
-// errString returns err.Error() or "<nil>" when err is nil; lets the
-// watchdog recovery branch quote the lookup error inside a Sprintf
-// without separate guards.
-func errString(err error) string {
-	if err == nil {
-		return "<nil>"
-	}
-	return err.Error()
-}
-
 // FinalizeWatchdogLoop is the live-daemon counterpart to
-// SweepStalePreparing: it cancels in-flight finalizes that have
-// exceeded finalizeTimeout (a child wedged on a network read, a
-// blocked DB connection, etc.) and emits a synthetic worktree:create:error
-// error so the row's derived state flips out of "preparing".
+// SweepStalePreparing: it cancels the work of in-flight finalizes that
+// made no progress for finalizeTimeout (a child wedged on a network
+// read, a blocked DB connection, etc.).
 //
 // Runs until ctx cancels. Designed to be launched once at boot off
 // the daemon-lifetime BgCtx.
 //
-// The cancel only takes effect at the FinalizeWorktree phase
-// boundaries that check ctx.Err() — that's the same contract
-// TeardownWorktree relies on, so the timeout doesn't need to model
-// any new "force kill" path. If a phase ignores ctx, the row's
-// derived state still flips to error because we emit the synthetic
-// event regardless of whether the cancel landed.
+// The cancel carries a finalizeStalledError cause. The finalize records
+// the failure (and recovers the databases it touched) itself once its
+// work returns, so recovery never races a prepare that is still
+// running; a step that finishes despite the cancel renews the lease and
+// the finalize carries on to `ready`. Only a finalize still in flight a
+// watchdog interval after its cancel (a phase that ignores its context)
+// gets a worktree:create:error from here, so its state stops reading
+// `preparing`; should it still finish, its later worktree:create:end
+// supersedes that error.
+//
+// The same tick re-runs creates that failed for a transient cause once
+// their back-off elapsed (see sweepCreateRetries).
 func FinalizeWatchdogLoop(ctx context.Context, st *State) {
 	ticker := time.NewTicker(watchdogInterval)
 	defer ticker.Stop()
@@ -146,58 +139,34 @@ func FinalizeWatchdogLoop(ctx context.Context, st *State) {
 			return
 		case <-ticker.C:
 			sweepExpiredFinalizes(ctx, st)
+			sweepCreateRetries(ctx, st)
 		}
 	}
 }
 
 func sweepExpiredFinalizes(ctx context.Context, st *State) {
-	cutoff := time.Now().Add(-finalizeTimeout)
-	for wtPath, startedAt := range st.SnapshotInFlightFinalizes() {
-		if startedAt.After(cutoff) {
+	now := time.Now()
+	for wtPath, exp := range st.expiredLeases(now) {
+		idle := now.Sub(exp.lease.lastProgress).Round(time.Second)
+		if exp.action == watchdogStall {
+			exp.lease.stall(&finalizeStalledError{idle: idle})
+			slog.Warn("watchdog: cancelled stalled finalize", "wt", wtPath, "idle", idle)
 			continue
 		}
-		// Cancel first so the goroutine's next phase-boundary check
-		// bails — the in-flight slot will clear when the goroutine
-		// returns, but we don't wait. Emitting the synthetic error
-		// event below makes the wedge visible even if the goroutine
-		// is wedged in a phase that doesn't observe ctx.Err().
-		st.CancelFinalize(wtPath)
-
 		row, err := lookupWorktreeByPath(ctx, st.Store, wtPath)
 		if err != nil || row.ID == 0 {
 			slog.Warn("watchdog: in-flight finalize has no DB row",
 				"wt", wtPath, "err", err)
 			continue
 		}
-		age := time.Since(startedAt).Round(time.Second)
 		_ = st.Store.WriteEvent(ctx, store.LevelError, store.EvtWorktreeCreateError,
-			"prepare timed out after "+age.String()+" — child wedged; rerun `treeman worktree finalize` once unstuck",
+			"prepare timed out: "+(&finalizeStalledError{idle: idle}).Error()+
+				", and it did not stop when cancelled; rerun `treeman worktree finalize` once unstuck",
 			row.RepoID, row.ID, "", 0, map[string]any{
 				"reason":     "prepare_timeout",
-				"started_ms": startedAt.UnixMilli(),
-				"age_ms":     age.Milliseconds(),
+				"started_ms": exp.startedAt.UnixMilli(),
+				"idle_ms":    idle.Milliseconds(),
 			})
-		slog.Warn("watchdog: timed out in-flight finalize",
-			"wt", wtPath, "age", age)
-
-		// Same recovery as SweepStalePreparing: a wedged prepare that
-		// the watchdog cancels leaves the same half-applied engine
-		// state a daemon-restart leaves. Reset primary namespaces so
-		// the user's rerun starts clean.
-		repoPath, repoErr := st.Store.RepoPath(ctx, row.RepoID)
-		if repoErr != nil || repoPath == "" {
-			_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
-				"lookup repo path for recovery: "+errString(repoErr),
-				row.RepoID, row.ID, "", 0, map[string]string{"error": errString(repoErr)})
-			continue
-		}
-		cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
-		if err != nil {
-			_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeRecoverError,
-				"load config for recovery: "+err.Error(),
-				row.RepoID, row.ID, "", 0, map[string]string{"error": err.Error()})
-			continue
-		}
-		prepare.RecoverStaleWorktree(ctx, &cfg, row.Slug, wtPath, row.RepoID, row.ID, st.Store)
+		slog.Warn("watchdog: stalled finalize did not stop", "wt", wtPath, "idle", idle)
 	}
 }

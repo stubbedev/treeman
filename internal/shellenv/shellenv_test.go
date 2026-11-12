@@ -2,6 +2,7 @@ package shellenv
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,4 +254,71 @@ func TestCommandEnvSetsPWD(t *testing.T) {
 	if env["PWD"] != dir {
 		t.Errorf("PWD = %q, want %q", env["PWD"], dir)
 	}
+}
+
+func TestCommandEnvBlockedEnvrcIsAPermanentDirenvError(t *testing.T) {
+	stubLoginShellPATH(t, "")
+	bin := shellenvtest.FakeDirenv(t, "echo 'direnv: error .envrc is blocked' >&2\nexit 1\n")
+	_, err := CommandEnv(context.Background(), map[string]string{"PATH": bin}, t.TempDir())
+	de, ok := errors.AsType[*DirenvError](err)
+	if !ok {
+		t.Fatalf("want a *DirenvError, got %T: %v", err, err)
+	}
+	if de.Failure != DirenvFailed || de.Transient() {
+		t.Errorf("a blocked .envrc must be a permanent DirenvFailed, got failure=%v transient=%v", de.Failure, de.Transient())
+	}
+}
+
+// Regression for #198: a cold nix build ran past the limit and the
+// error said only "signal: killed".
+func TestApplyDirenvTimeoutSaysItTimedOut(t *testing.T) {
+	stubLoginShellPATH(t, "")
+	bin := shellenvtest.FakeDirenv(t, "echo 'building c2pa' >&2\nexec "+sleepBin(t)+" 30\n")
+	env := baseEnv(map[string]string{"PATH": bin})
+	start := time.Now()
+	err := applyDirenv(context.Background(), env, t.TempDir(), 200*time.Millisecond)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("the kill must end the load, took %s", elapsed)
+	}
+	de, ok := errors.AsType[*DirenvError](err)
+	if !ok {
+		t.Fatalf("want a *DirenvError, got %T: %v", err, err)
+	}
+	if de.Failure != DirenvTimedOut || !de.Transient() {
+		t.Errorf("failure = %v transient = %v, want a transient DirenvTimedOut", de.Failure, de.Transient())
+	}
+	for _, want := range []string{"timed out after", "limit 200ms", "building c2pa"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+func TestApplyDirenvInterruptedNamesTheCallersCause(t *testing.T) {
+	stubLoginShellPATH(t, "")
+	bin := shellenvtest.FakeDirenv(t, "exec "+sleepBin(t)+" 30\n")
+	env := baseEnv(map[string]string{"PATH": bin})
+	cause := errors.New("finalize stalled")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	time.AfterFunc(100*time.Millisecond, func() { cancel(cause) })
+	err := applyDirenv(ctx, env, t.TempDir(), time.Minute)
+	de, ok := errors.AsType[*DirenvError](err)
+	if !ok {
+		t.Fatalf("want a *DirenvError, got %T: %v", err, err)
+	}
+	if de.Failure != DirenvInterrupted || de.Transient() {
+		t.Errorf("failure = %v transient = %v, want a non-transient DirenvInterrupted", de.Failure, de.Transient())
+	}
+	if !errors.Is(err, cause) || !strings.Contains(err.Error(), "finalize stalled") || !strings.Contains(err.Error(), "limit 1m0s") {
+		t.Errorf("error %q must carry the caller's cause and the limit", err)
+	}
+}
+
+func sleepBin(t *testing.T) string {
+	t.Helper()
+	bin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Fatalf("find sleep for the fake direnv: %v", err)
+	}
+	return bin
 }

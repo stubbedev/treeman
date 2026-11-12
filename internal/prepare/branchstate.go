@@ -1668,6 +1668,9 @@ func ResetBranchScoped(
 	st *store.Store,
 	engineFilter string,
 ) error {
+	if err := requireSetup(ctx, st, worktreeID); err != nil {
+		return err
+	}
 	// Canonicalize the filter so `--engine mysql` also matches a DB
 	// declared as `mariadb`/`tidb`, `--engine postgres` matches
 	// `postgresql`, etc.

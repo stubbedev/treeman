@@ -83,7 +83,7 @@ func TestCacheHitGenericAlwaysReturnsCallableFinish(t *testing.T) {
 			_ = st.DeleteSnapshot(ctx, key.Fingerprint())
 			_ = st.ClearTemplateBuiltForKey(ctx, wtID, "db_a")
 			if scenario == "skip-gate" || scenario == "full-restore" {
-				if err := recordSnapshot(ctx, st, key, "mysql", "8", "db_a", key.TemplateName(), nil, repoID); err != nil {
+				if err := recordSnapshot(ctx, st, key, "mysql", "8", "db_a", key.TemplateName(), nil, nil, repoID); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -96,7 +96,7 @@ func TestCacheHitGenericAlwaysReturnsCallableFinish(t *testing.T) {
 			}
 
 			_, _, finish, cerr := cacheHitGeneric(ctx, exists, restore, d, tplCtx, "/wt", st,
-				repoID, wtID, "db_a", key, 0, time.Now())
+				repoID, wtID, "db_a", key, fanoutBudget{}, time.Now())
 			if cerr != nil {
 				t.Fatalf("unexpected error: %v", cerr)
 			}

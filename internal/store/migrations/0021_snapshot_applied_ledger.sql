@@ -1,0 +1,14 @@
+-- Record which migrate run (batch) applied each input file of a
+-- template. Laravel unwinds `migrate:rollback --step N` by batch, then
+-- by name; Rails, Ecto and golang-migrate unwind by version (name)
+-- alone. A template built incrementally (append or forward-only
+-- rebuild) holds later batches whose files can sort before files of an
+-- earlier batch, so the rollback-ancestor search needs the batches to
+-- pick a step count every framework unwinds identically.
+--
+-- Shape: JSON object mapping each repo-relative input path to the
+-- 0-based index of the run that applied it. NULL when the provenance
+-- is unknown (rows predating this column, dump-only templates, and
+-- templates built incrementally on top of such a row); those rows are
+-- never offered as rollback ancestors.
+ALTER TABLE snapshots ADD COLUMN ledger_json TEXT;

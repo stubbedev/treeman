@@ -100,11 +100,17 @@ func recordFinalizeFailure(ctx context.Context, st *State, cfg *config.Config, f
 		prepare.RecoverDatabases(termCtx, cfg, f.slugVal, f.wtRoot, f.repoID, f.wtID, st.Store,
 			prepare.RecoverDBIndices(f.err))
 	}
-	_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, withRetryHint(f.err.Error()),
-		f.repoID, f.wtID, f.phase, 0, map[string]string{
-			"repo_path":     f.repoRoot,
-			"worktree_path": f.wtRoot,
-		})
+	payload := map[string]any{
+		"repo_path":     f.repoRoot,
+		"worktree_path": f.wtRoot,
+	}
+	msg := withRetryHint(f.err.Error())
+	if retry, ok := createRetryFor(f.err, triggerAttempt(ctx)); ok {
+		retry.AddTo(payload)
+		msg = f.err.Error() + "\n" + retryHint(retry)
+	}
+	_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, msg,
+		f.repoID, f.wtID, f.phase, 0, payload)
 }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go
@@ -166,6 +172,7 @@ func finalizeWorktree(
 		// into a rebuild-from-nothing (#21).
 		enginesTouched bool
 		release        func()
+		lease          *finalizeLease
 	)
 	defer func() {
 		if release != nil {
@@ -176,6 +183,7 @@ func finalizeWorktree(
 		if err == nil {
 			return
 		}
+		err = lease.annotate(err)
 		// Every failure is recorded here, exactly once, and still
 		// returned so a caller that waits on the run (create/finalize
 		// --foreground) fails with it (#129).
@@ -191,19 +199,14 @@ func finalizeWorktree(
 		})
 	}()
 
-	// Derive a cancellable, DEADLINE-bound ctx. Two jobs:
-	//   1. TeardownWorktree preempts via CancelFinalize (the cancel func is
-	//      registered with MarkFinalizeInFlight below). ctx.Err() is consulted
-	//      at each phase boundary so a concurrent `wt delete` preempts before
-	//      prepare.Run creates databases the cleanup would then have to chase.
-	//   2. The finalizeTimeout deadline self-cancels a wedged run instead of
-	//      relying solely on the external FinalizeWatchdogLoop — a prepare that
-	//      hangs inside an engine/network op stops pinning its slot (and the
-	//      machine) the moment a phase boundary observes the expired ctx, plus
-	//      every engine HTTP call inherits the deadline. The watchdog stays as
-	//      the backstop that emits the error event + recovery if a phase never
-	//      reaches a boundary.
-	ctx, cancel := context.WithTimeout(ctx, finalizeTimeout)
+	// Derive a cancellable ctx: TeardownWorktree preempts via
+	// CancelFinalize (the cancel func is registered with
+	// MarkFinalizeInFlight below). ctx.Err() is consulted at each phase
+	// boundary so a concurrent `wt delete` preempts before prepare.Run
+	// creates databases the cleanup would then have to chase. The work
+	// itself runs on a lease (see leaseFinalize) that the watchdog
+	// cancels once it stops making progress.
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Pin the caller's shell PATH onto ctx for every git subprocess
@@ -227,13 +230,13 @@ func finalizeWorktree(
 	if release == nil {
 		return err
 	}
+	summary := &hookSummary{}
+	lease = st.leaseFinalize(context.WithValue(ctx, hookSummaryKey{}, summary), wtRoot)
+	defer lease.end()
+	ctx = lease.ctx
 
-	if err := awaitIndexUnlocked(ctx, wtRoot, indexLockWait, indexLockPoll); err != nil {
+	if cfg, err = loadSettledConfig(ctx, repoRoot, wtRoot); err != nil {
 		return unlessCancelled(ctx, err)
-	}
-	cfg, err = resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
-	if err != nil {
-		return err
 	}
 
 	repoName := filepath.Base(repoRoot)
@@ -318,9 +321,10 @@ func finalizeWorktree(
 		if err := bringInWithEvents(ctx, st, repoRoot, wtRoot, &cfg, repoID, wtID); err != nil {
 			// A cancelled ctx here means a concurrent teardown preempted the
 			// copy (it now honors ctx mid-tree) — a clean stop, not a create
-			// error. Record it like the pipeline's phase-boundary checks.
-			if cancelledBefore(ctx, st, "bring-in", repoID, wtID) {
-				return nil
+			// error — or the watchdog stalled it. Record it like the
+			// pipeline's phase-boundary checks.
+			if stop, stopErr := stopBefore(ctx, st, "bring-in", repoID, wtID, nil); stop {
+				return stopErr
 			}
 			return err
 		}
@@ -364,9 +368,7 @@ func finalizeWorktree(
 	// Phase boundaries double as cancellation checkpoints: a
 	// concurrent TeardownWorktree fires `cancel` via CancelFinalize,
 	// and the next check bails before prepare creates databases.
-	summary := &hookSummary{}
-	ctx = context.WithValue(ctx, hookSummaryKey{}, summary)
-	done, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl,
+	done, err := runFinalizeSetupPipeline(lease, st, &cfg, repoRoot, wtRoot, sl,
 		isMain, repoID, wtID, inheritedEnv, skipPrepare, &enginesTouched)
 	if err != nil {
 		return err
@@ -375,7 +377,7 @@ func finalizeWorktree(
 		return nil
 	}
 
-	summary.emit(ctx, st.Store, repoID, wtID, finalizeCompleteMessage)
+	summary.emit(lease.ctx, st.Store, repoID, wtID, finalizeCompleteMessage)
 	return nil
 }
 
@@ -564,19 +566,22 @@ func applyFinalizePatches(
 
 // runFinalizeSetupPipeline runs the three-step setup pipeline:
 // create-before-engines actions → engine prepare →
-// create-after-engines actions. Each phase boundary is a
-// cancellation checkpoint: when a concurrent TeardownWorktree fires
-// `cancel`, the next check writes a worktree:create:cancel event and
-// returns (done=true, nil) so the caller stops short of starting the
-// watcher / emitting the done event. A non-nil error aborts the
-// pipeline. Extracted from FinalizeWorktree to keep that function
-// under the cyclomatic-complexity gate.
+// create-after-engines actions, each on the lease's current work
+// context. Each phase boundary is a cancellation checkpoint: when a
+// concurrent TeardownWorktree fires `cancel`, the next check writes a
+// worktree:create:cancel event and returns (done=true, nil) so the
+// caller stops short of starting the watcher / emitting the done
+// event; when the watchdog stalled the work, it returns the stall. A
+// prepare that finishes despite a stall cancel renews the lease and the
+// pipeline carries on. A non-nil error aborts the pipeline. Extracted
+// from FinalizeWorktree to keep that function under the
+// cyclomatic-complexity gate.
 //
 // enginesTouched is set to true the moment prepare.Run is entered, so
 // the caller's terminal defer knows whether engine state could be
 // half-applied and thus whether recovery drops are warranted (#21).
 func runFinalizeSetupPipeline(
-	ctx context.Context,
+	lease *finalizeLease,
 	st *State,
 	cfg *config.Config,
 	repoRoot, wtRoot string,
@@ -587,47 +592,35 @@ func runFinalizeSetupPipeline(
 	skipPrepare bool,
 	enginesTouched *bool,
 ) (done bool, err error) {
-	if cancelledBefore(ctx, st, "pre-hooks", repoID, wtID) {
-		return true, nil
+	ctx := lease.ctx
+	if stop, err := stopBefore(ctx, st, "pre-hooks", repoID, wtID, nil); stop {
+		return err == nil, err
 	}
 	if err := runTriggerActions(ctx, st, "create-before-engines",
 		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
 		isMain, repoID, wtID, inheritedEnv); err != nil {
-		// create-before-engines runs BEFORE the engine databases exist
-		// (deps must install so migrate can find them) — a hook that boots
-		// the app and queries the DB here hits "Unknown database" (#18).
-		// Name the contract + the recovery so the failure isn't a dead end.
-		return false, fmt.Errorf(
-			"%w\nhint: create-before-engines hooks run before this worktree's databases exist; move any app-boot / DB-touching step to create-after-engines. Retry this worktree with `treeman worktree finalize`",
-			err,
-		)
+		return false, beforeEnginesFailure(err)
 	}
-	if cancelledBefore(ctx, st, "prepare", repoID, wtID) {
-		return true, nil
+	if stop, err := stopBefore(ctx, st, "prepare", repoID, wtID, nil); stop {
+		return err == nil, err
 	}
+	var prepErr error
 	if !skipPrepare && len(cfg.Databases) > 0 {
 		*enginesTouched = true
 		// Serialise against a queued `prepare` / `db reset` task or a
 		// watcher re-prepare for this same worktree — they build the same
 		// source databases (issue #28).
-		var prepErr error
 		st.withWorktreePrepare(wtRoot, func() {
-			_, prepErr = prepare.Run(reachability.WithStartupWait(ctx), cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv)
+			_, prepErr = prepare.RunFiltered(reachability.WithStartupWait(ctx), cfg, wtRoot, sl, st.Store,
+				repoID, wtID, inheritedEnv, st.finalizeRunOptions(wtRoot))
 		})
-		// A cancelled context means a concurrent teardown preempted
-		// prepare — a clean stop regardless of whether prepare.Run
-		// surfaced an error on the way out. Mirrors the un-extracted
-		// FinalizeWorktreeForWatch path; nilerr can't tell this
-		// ctx-cancellation guard apart from a swallowed prepare error.
-		if ctx.Err() != nil {
-			return true, nil //nolint:nilerr // cancellation is a clean stop, not an error
-		}
-		if prepErr != nil {
+		ctx, prepErr = afterPrepare(lease, prepErr)
+		if prepErr != nil && !preempted(ctx) {
 			return false, fmt.Errorf("prepare: %w", prepErr)
 		}
 	}
-	if cancelledBefore(ctx, st, "post-hooks", repoID, wtID) {
-		return true, nil
+	if stop, err := stopBefore(ctx, st, "post-hooks", repoID, wtID, prepErr); stop {
+		return err == nil, err
 	}
 	if err := runTriggerActions(ctx, st, "create-after-engines",
 		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
@@ -700,35 +693,112 @@ func replayReruns(st *State, wtRoot string, q QueuedReruns) {
 	})
 }
 
-func watchRunOptions(prior store.Event, dbIdx, dbCount int) prepare.RunOptions {
+// watchRunOptions narrows base to the database a watch re-prepare
+// matched while the worktree is ready; otherwise every database runs.
+func watchRunOptions(prior store.Event, dbIdx, dbCount int, base prepare.RunOptions) prepare.RunOptions {
 	if state, _ := store.DeriveWorktreeState(prior); state != store.StateReady || dbIdx < 0 || dbIdx >= dbCount {
-		return prepare.RunOptions{}
+		return base
 	}
-	return prepare.RunOptions{FilterDBs: true, OnlyDBIndex: dbIdx}
+	base.FilterDBs, base.OnlyDBIndex = true, dbIdx
+	return base
 }
 
-// unlessCancelled drops err when ctx was cancelled: a run stopped by
-// its own cancellation is a clean stop, not a failure.
+// unlessCancelled drops err when ctx was cancelled by a teardown
+// preempt: a run stopped that way is a clean stop, not a failure. A
+// stalled run keeps its error, annotated with the stall.
 func unlessCancelled(ctx context.Context, err error) error {
-	if ctx.Err() != nil {
-		return nil //nolint:nilerr // cancellation is a clean stop, not an error
+	if ctx.Err() == nil {
+		return err
 	}
-	return err
+	if stalled := stallCause(ctx); stalled != nil {
+		return fmt.Errorf("%w: %w", stalled, err)
+	}
+	return nil
 }
 
-// cancelledBefore is a phase-boundary cancellation checkpoint: when a
-// concurrent TeardownWorktree has fired `cancel`, it records a
-// worktree:create:cancel event naming the phase about to be skipped and
-// reports true so the pipeline bails. Isolating the ctx.Err() check
-// here keeps the "cancelled, not an error" return out of the call
-// site's error-handling flow.
-func cancelledBefore(ctx context.Context, st *State, phase string, repoID, wtID int64) bool {
+// stopBefore is a phase-boundary checkpoint. When a concurrent
+// TeardownWorktree has fired `cancel`, it records a
+// worktree:create:cancel event naming the phase about to be skipped,
+// plus the error the interrupted step returned on the way out (usually
+// the cancellation itself), and reports a clean stop (true, nil). When
+// the watchdog stalled the work, it reports a stop with the stall as its
+// error. Isolating the ctx.Err() check here keeps the "cancelled, not an
+// error" return out of the call site's error-handling flow.
+func stopBefore(ctx context.Context, st *State, phase string, repoID, wtID int64, interrupted error) (bool, error) {
 	if ctx.Err() == nil {
-		return false
+		return false, nil
+	}
+	if stalled := stallCause(ctx); stalled != nil {
+		return true, fmt.Errorf("stopped before %s: %w", phase, stalled)
+	}
+	var payload map[string]string
+	if interrupted != nil {
+		payload = map[string]string{"interrupted_error": interrupted.Error()}
 	}
 	_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWorktreeCreateCancel,
-		"finalize aborted before "+phase, repoID, wtID, "", 0, nil)
-	return true
+		"finalize aborted before "+phase, repoID, wtID, "", 0, payload)
+	return true, nil
+}
+
+// preempted reports whether ctx was cancelled by a teardown preempt
+// rather than by the watchdog.
+func preempted(ctx context.Context) bool {
+	return ctx.Err() != nil && stallCause(ctx) == nil
+}
+
+// afterPrepare settles a finished prepare against its lease's stall and
+// returns the context the run continues on with the prepare's error. A
+// stalled prepare that failed returns its error with the stall; one
+// that succeeded despite the stall cancel was not wedged, so the lease
+// is renewed and the run carries on. A teardown preempt is left to the
+// caller's next stopBefore.
+func afterPrepare(lease *finalizeLease, prepErr error) (context.Context, error) {
+	stalled := stallCause(lease.ctx)
+	switch {
+	case stalled == nil:
+		return lease.ctx, prepErr
+	case prepErr == nil:
+		return lease.renew(), nil
+	}
+	return lease.ctx, fmt.Errorf("%w: %w", stalled, prepErr)
+}
+
+// loadSettledConfig waits for a git operation rewriting wtRoot to finish,
+// then loads the worktree's resolved config.
+func loadSettledConfig(ctx context.Context, repoRoot, wtRoot string) (config.Config, error) {
+	if err := awaitIndexUnlocked(ctx, wtRoot, indexLockWait, indexLockPoll); err != nil {
+		return config.Config{}, err
+	}
+	return resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
+}
+
+// watchPrepareOptions returns the prepare options of a watch re-prepare
+// of the worktree, and run=false when it must not prepare: its setup
+// failed and has not succeeded since (recorded as a watch skip), or a
+// store read failed (returned as the error).
+func watchPrepareOptions(
+	ctx context.Context,
+	st *State,
+	wtRoot string,
+	repoID, wtID int64,
+	dbIdx, dbCount int,
+) (opts prepare.RunOptions, run bool, err error) {
+	setupFailure, setupFailed, err := st.Store.SetupFailure(ctx, wtID)
+	if err != nil {
+		return prepare.RunOptions{}, false, err
+	}
+	if setupFailed {
+		_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWatchSkip,
+			"watch re-prepare skipped: the last finalize failed before it prepared the databases, "+
+				"so they stay as it left them until `treeman worktree finalize` succeeds",
+			repoID, wtID, "", 0, map[string]string{"db_idx": strconv.Itoa(dbIdx), "failure": setupFailure.Message})
+		return prepare.RunOptions{}, false, nil
+	}
+	prior, err := st.Store.LatestWorktreeStateEvent(ctx, wtID)
+	if err != nil {
+		return prepare.RunOptions{}, false, err
+	}
+	return watchRunOptions(prior, dbIdx, dbCount, st.finalizeRunOptions(wtRoot)), true, nil
 }
 
 // FinalizeWorktreeForWatch is the watcher-driven re-prepare path.
@@ -758,6 +828,7 @@ func FinalizeWorktreeForWatch(
 	var (
 		cfg     config.Config
 		release func()
+		lease   *finalizeLease
 	)
 	failure := finalizeFailure{repoRoot: repoRoot, wtRoot: wtRoot}
 	defer func() {
@@ -769,6 +840,7 @@ func FinalizeWorktreeForWatch(
 		if err == nil {
 			return
 		}
+		err = lease.annotate(err)
 		failure.err = err
 		recordFinalizeFailure(ctx, st, &cfg, failure)
 	}()
@@ -793,16 +865,17 @@ func FinalizeWorktreeForWatch(
 	if release == nil {
 		return err
 	}
+	summary := &hookSummary{}
+	lease = st.leaseFinalize(context.WithValue(ctx, hookSummaryKey{}, summary), wtRoot)
+	defer lease.end()
+	ctx = lease.ctx
 
 	// A watched input changing is often git rewriting the tree (merge,
-	// checkout, pull). Wait for it to finish so config and inputs are
-	// read from the settled tree, not halfway through (#173).
-	if err := awaitIndexUnlocked(ctx, wtRoot, indexLockWait, indexLockPoll); err != nil {
+	// checkout, pull). loadSettledConfig waits for it to finish so config
+	// and inputs are read from the settled tree, not halfway through
+	// (#173).
+	if cfg, err = loadSettledConfig(ctx, repoRoot, wtRoot); err != nil {
 		return unlessCancelled(ctx, err)
-	}
-	cfg, err = resolve.LoadResolvedForWorktree(repoRoot, wtRoot)
-	if err != nil {
-		return err
 	}
 	repoName := filepath.Base(repoRoot)
 	repoID, err := st.Store.EnsureRepo(ctx, repoRoot, repoName)
@@ -847,19 +920,11 @@ func FinalizeWorktreeForWatch(
 		return nil
 	}
 	if ctx.Err() != nil {
-		return nil
+		return unlessCancelled(ctx, ctx.Err())
 	}
-	st.Store.FlushEvents(ctx)
-	prior, err := st.Store.LatestWorktreeStateEvent(ctx, wtID)
-	if err != nil {
+	opts, run, err := watchPrepareOptions(ctx, st, wtRoot, repoID, wtID, dbIdx, len(cfg.Databases))
+	if !run {
 		return err
-	}
-	if store.FailedBeforeEngines(prior) {
-		_ = st.Store.WriteEvent(ctx, store.LevelWarn, store.EvtWatchSkip,
-			"watch re-prepare skipped: the last finalize failed before it prepared the databases, "+
-				"so they stay as it left them until `treeman worktree finalize` succeeds",
-			repoID, wtID, "", 0, map[string]string{"db_idx": strconv.Itoa(dbIdx), "failure": prior.Message})
-		return nil
 	}
 	// Bracketed by the same finalize lifecycle events as a full
 	// finalize: the clones stay stale until the re-prepare lands, so the
@@ -867,29 +932,24 @@ func FinalizeWorktreeForWatch(
 	// `ready` that hides a rebuild in flight or one that failed (#169).
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateStart,
 		"watch re-prepare beginning", repoID, wtID, "", 0, triggerPayload(ctx))
-	summary := &hookSummary{}
-	ctx = context.WithValue(ctx, hookSummaryKey{}, summary)
 	// The fingerprint hashes every declared input + dump + the
 	// migrate/seed run-strings. If anything changed, prepare cold-
 	// builds; otherwise cache-hits. No separate force-rebuild knob.
-	opts := watchRunOptions(prior, dbIdx, len(cfg.Databases))
 	var prepErr error
 	failure.enginesTouched = true
 	st.withWorktreePrepare(wtRoot, func() {
 		_, prepErr = prepare.RunFiltered(reachability.WithStartupWait(ctx), &cfg, wtRoot, sl, st.Store, repoID, wtID, inheritedEnv, opts)
 	})
-	if prepErr != nil {
-		if ctx.Err() != nil {
-			return nil
-		}
+	ctx, prepErr = afterPrepare(lease, prepErr)
+	if prepErr != nil && !preempted(ctx) {
 		return fmt.Errorf("prepare (watch-trigger): %w", prepErr)
 	}
 	// Post-engine hooks fire on this path too: a watcher-driven
 	// re-prepare mutates DB content just like the full finalize, so
 	// hooks that react to fresh data (cache flushes etc.) must run —
 	// this was the one prepare path that skipped them.
-	if ctx.Err() != nil {
-		return nil
+	if stop, err := stopBefore(ctx, st, "post-hooks", repoID, wtID, prepErr); stop {
+		return err
 	}
 	if err := runTriggerActions(ctx, st, "create-after-engines",
 		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,

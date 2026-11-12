@@ -363,6 +363,15 @@ same environment applies to every `databases[]` `migrate`, `rollback` and
 fails the hook or step with direnv's message; run `direnv allow` in the
 worktree, or whitelist the worktree root in `direnv.toml`.
 
+Loading the environment is limited to 10 minutes. A cold `use flake` build
+can take longer; the error then says that the load timed out, after how long,
+and what the limit was. The nix daemon keeps building after the timeout, so
+treemand re-runs a create that failed this way on its own, up to three times
+(after 30 seconds, 2 minutes and 8 minutes). Until a create's
+`create-before-engines` step has succeeded, prepare refuses to run against the
+worktree (`treeman prepare`, `db reset`, the MCP prepare tools, watch
+re-prepares): its migrate steps would run without what setup installs.
+
 Hooks additionally get four scoping variables treeman sets unconditionally:
 
 | Variable           | Value                                                                  |

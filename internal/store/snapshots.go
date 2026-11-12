@@ -44,7 +44,10 @@ type SnapshotRecord struct {
 	// time. Keys are input globs (matching the keys used in
 	// LockfileHashes). Empty for snapshots predating the inputs_json
 	// column (those can't participate as ancestors).
-	Inputs     map[string]InputVector
+	Inputs map[string]InputVector
+	// Ledger records which migrate run applied each input file; nil
+	// when unknown. Not part of the JSON views of a snapshot.
+	Ledger     *AppliedLedger `json:"-"`
 	SizeBytes  int64
 	CreatedAt  int64
 	LastUsedAt int64
@@ -58,13 +61,13 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 	row := s.DB.QueryRowContext(ctx, `
 		SELECT fingerprint, engine, engine_version, source_db, template_name,
 		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
-		       COALESCE(inputs_json,'{}'), connection, COALESCE(repo_id,0),
+		       COALESCE(inputs_json,'{}'), ledger_json, connection, COALESCE(repo_id,0),
 		       COALESCE(size_bytes,0), created_at, last_used_at, use_count
 		FROM snapshots WHERE fingerprint = ?`, fingerprint)
 	var r SnapshotRecord
-	var lockJSON, inputsJSON string
+	var enc snapshotJSON
 	err := row.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
-		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
+		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &enc.lockfiles, &enc.inputs, &enc.ledger,
 		&r.Connection, &r.RepoID,
 		&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -73,18 +76,38 @@ func (s *Store) LookupSnapshot(ctx context.Context, fingerprint string) (*Snapsh
 	if err != nil {
 		return nil, err
 	}
-	if lockJSON != "" {
-		if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
-			return nil, fmt.Errorf("decode lockfile_hashes_json for %s: %w", fingerprint, err)
+	if err := enc.decodeInto(&r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// snapshotJSON holds the JSON columns of a snapshots row as scanned.
+type snapshotJSON struct {
+	lockfiles, inputs string
+	ledger            sql.NullString
+}
+
+// decodeInto decodes the JSON columns into r and normalises its maps.
+func (e snapshotJSON) decodeInto(r *SnapshotRecord) error {
+	if e.lockfiles != "" {
+		if err := json.Unmarshal([]byte(e.lockfiles), &r.LockfileHashes); err != nil {
+			return fmt.Errorf("decode lockfile_hashes_json for %s: %w", r.Fingerprint, err)
 		}
 	}
-	if inputsJSON != "" && inputsJSON != "{}" {
-		if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
-			return nil, fmt.Errorf("decode inputs_json for %s: %w", fingerprint, err)
+	if e.inputs != "" && e.inputs != "{}" {
+		if err := json.Unmarshal([]byte(e.inputs), &r.Inputs); err != nil {
+			return fmt.Errorf("decode inputs_json for %s: %w", r.Fingerprint, err)
+		}
+	}
+	if e.ledger.Valid {
+		r.Ledger = &AppliedLedger{}
+		if err := json.Unmarshal([]byte(e.ledger.String), r.Ledger); err != nil {
+			return fmt.Errorf("decode ledger_json for %s: %w", r.Fingerprint, err)
 		}
 	}
 	r.normalizeMaps()
-	return &r, nil
+	return nil
 }
 
 // normalizeMaps replaces nil map fields with empty ones so the record
@@ -116,13 +139,13 @@ func (s *Store) LookupAndTouchSnapshot(ctx context.Context, fingerprint string) 
 		WHERE fingerprint = ?
 		RETURNING fingerprint, engine, engine_version, source_db, template_name,
 		          migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
-		          COALESCE(inputs_json,'{}'),
+		          COALESCE(inputs_json,'{}'), ledger_json,
 		          COALESCE(size_bytes,0), created_at, last_used_at, use_count`,
 		nowMillis(), fingerprint)
 	var r SnapshotRecord
-	var lockJSON, inputsJSON string
+	var enc snapshotJSON
 	err := row.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
-		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
+		&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &enc.lockfiles, &enc.inputs, &enc.ledger,
 		&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -130,17 +153,9 @@ func (s *Store) LookupAndTouchSnapshot(ctx context.Context, fingerprint string) 
 	if err != nil {
 		return nil, err
 	}
-	if lockJSON != "" {
-		if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
-			return nil, fmt.Errorf("decode lockfile_hashes_json for %s: %w", fingerprint, err)
-		}
+	if err := enc.decodeInto(&r); err != nil {
+		return nil, err
 	}
-	if inputsJSON != "" && inputsJSON != "{}" {
-		if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
-			return nil, fmt.Errorf("decode inputs_json for %s: %w", fingerprint, err)
-		}
-	}
-	r.normalizeMaps()
 	return &r, nil
 }
 
@@ -170,6 +185,14 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	if err != nil {
 		return fmt.Errorf("encode inputs_json: %w", err)
 	}
+	var ledgerJSON sql.NullString
+	if r.Ledger != nil {
+		b, err := json.Marshal(r.Ledger)
+		if err != nil {
+			return fmt.Errorf("encode ledger_json: %w", err)
+		}
+		ledgerJSON = sql.NullString{String: string(b), Valid: true}
+	}
 	now := nowMillis()
 	if r.CreatedAt == 0 {
 		r.CreatedAt = now
@@ -184,10 +207,10 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 	_, err = s.DB.ExecContext(ctx, `
 		INSERT INTO snapshots(fingerprint, engine, engine_version, source_db,
 		                      template_name, migrations_hash, dump_hash,
-		                      lockfile_hashes_json, inputs_json,
+		                      lockfile_hashes_json, inputs_json, ledger_json,
 		                      size_bytes, created_at,
 		                      last_used_at, use_count, repo_id, connection)
-		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, ?, NULLIF(?,0), ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, NULLIF(?,''), ?, ?, ?, NULLIF(?,0), ?, ?, ?, ?, ?)
 		ON CONFLICT(fingerprint) DO UPDATE SET
 		    template_name        = excluded.template_name,
 		    engine_version       = excluded.engine_version,
@@ -196,12 +219,13 @@ func (s *Store) RecordSnapshot(ctx context.Context, r SnapshotRecord) error {
 		    dump_hash             = excluded.dump_hash,
 		    lockfile_hashes_json = excluded.lockfile_hashes_json,
 		    inputs_json          = excluded.inputs_json,
+		    ledger_json          = excluded.ledger_json,
 		    size_bytes           = excluded.size_bytes,
 		    last_used_at         = excluded.last_used_at,
 		    repo_id              = excluded.repo_id,
 		    connection           = excluded.connection`,
 		r.Fingerprint, r.Engine, r.EngineVersion, r.SourceDB,
-		r.TemplateName, r.MigrationsHash, r.DumpHash, string(lockJSON), string(inputsJSON),
+		r.TemplateName, r.MigrationsHash, r.DumpHash, string(lockJSON), string(inputsJSON), ledgerJSON,
 		r.SizeBytes, r.CreatedAt, r.LastUsedAt, r.UseCount, repoID, r.Connection)
 	return err
 }
@@ -278,6 +302,15 @@ func (s *Store) FindAncestorSnapshot(
 	return best, nil
 }
 
+// RollbackAncestor is the snapshot FindRollbackAncestor picked, with the
+// number of its migrations to unwind and the ledger left applied after
+// unwinding them.
+type RollbackAncestor struct {
+	Snapshot SnapshotRecord
+	Steps    int
+	Kept     *AppliedLedger
+}
+
 // FindRollbackAncestor finds the prior snapshot best suited to a
 // "rollback + re-migrate" rebuild after an EXISTING migration was
 // edited mid-sequence. Unlike FindAncestorSnapshot — which
@@ -285,23 +318,28 @@ func (s *Store) FindAncestorSnapshot(
 // candidate that DIVERGES from the current inputs.
 //
 // Both the candidate's and the current run's per-glob vectors are merged
-// into one global list ordered by file basename (timestamp-prefixed
-// migration filenames sort in ledger order for Laravel/Rails/Django/…),
-// because single-ledger frameworks roll back by a single global step
-// count, not per-glob. Divergence is measured over the CANDIDATE's
-// entries only: a migration present only in the current run (e.g. an
-// earlier-dated file merged in from another branch) is pending, and the
-// framework's migrate applies it whatever its date, so it never needs
-// unwinding. `steps` is the number of the candidate's migrations from the
-// first one whose content changed or that the current run lacks — i.e.
-// how many ledger entries `migrate:rollback` must unwind before `migrate`
-// runs forward. A candidate whose ledger divergence is insertions only
-// yields steps == 0.
+// into one global list ordered by file basename, because single-ledger
+// frameworks roll back by a single global step count, not per-glob.
+// Divergence is measured over the CANDIDATE's entries only: a migration
+// present only in the current run (e.g. an earlier-dated file merged in
+// from another branch) is pending, and the framework's migrate applies
+// it whatever its date, so it never needs unwinding.
+//
+// The unwind order depends on the framework: Rails, Ecto and
+// golang-migrate unwind by name (version), Laravel by batch and then by
+// name. A template built incrementally holds later batches whose files
+// can sort before files of earlier batches, so the two orders differ.
+// Steps is the smallest count, covering every entry from the first one
+// whose content changed or that the current run lacks, whose last
+// Steps entries are the same migrations in both orders: unwinding them
+// leaves the same applied set under either semantics. A candidate whose
+// AppliedLedger is unknown is skipped. A candidate whose ledger
+// divergence is insertions only yields Steps == 0.
 //
 // Globs in lockfileGlobs are not ledger entries: they are left out of
 // the merged order and never counted as steps. A candidate whose ledger
 // is a prefix of (or equal to) the current one but whose lockfiles
-// differ is returned with steps == 0 — the caller restores it and
+// differ is returned with Steps == 0 — the caller restores it and
 // migrates forward without unwinding anything.
 //
 // Candidates whose ledger AND lockfiles both form a prefix of the
@@ -312,20 +350,20 @@ func (s *Store) FindAncestorSnapshot(
 // holding a file the branch removed. The branch has no down() for such
 // an entry, and step-based CLIs skip it silently (Laravel prints
 // "Migration not found" and exits 0), leaving its schema change applied
-// while the rebuild still gets cached as a template. Returns
-// (nil, 0, nil) when no unwindable diverging candidate exists — prepare
-// falls back to a cold build. The chosen candidate keeps the most of its
-// migrations applied, then unwinds the fewest.
+// while the rebuild still gets cached as a template. Returns (nil, nil)
+// when no unwindable diverging candidate exists — prepare falls back to
+// a cold build. The chosen candidate keeps the most of its migrations
+// applied, then unwinds the fewest.
 func (s *Store) FindRollbackAncestor(
 	ctx context.Context,
 	repoID int64,
 	eng, engineVersion, dumpHash, currentCommandsHash string,
 	lockfileGlobs map[string]struct{},
 	currentInputs map[string]InputVector,
-) (*SnapshotRecord, int, error) {
+) (*RollbackAncestor, error) {
 	cands, err := s.candidateSnapshots(ctx, repoID, eng, engineVersion, dumpHash)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	curLedger := mergeVectorsByBasename(withoutGlobs(currentInputs, lockfileGlobs))
 	curNames := make(map[string]struct{}, len(curLedger))
@@ -334,31 +372,33 @@ func (s *Store) FindRollbackAncestor(
 		curNames[pathBase(fh.Path)] = struct{}{}
 		curHashes[fh.Path] = fh.Hash
 	}
-	var best *SnapshotRecord
-	bestSteps := 0
+	var best *RollbackAncestor
 	bestKept := -1
 	for i := range cands {
 		r := &cands[i]
-		if r.LockfileHashes[CommandsHashKey] != currentCommandsHash {
+		if r.LockfileHashes[CommandsHashKey] != currentCommandsHash || r.Ledger == nil {
 			continue
 		}
-		candLedger := mergeVectorsByBasename(withoutGlobs(r.Inputs, lockfileGlobs))
-		if commonPrefixLen(candLedger, curLedger) == len(candLedger) &&
+		byName := mergeVectorsByBasename(withoutGlobs(r.Inputs, lockfileGlobs))
+		if commonPrefixLen(byName, curLedger) == len(byName) &&
 			lockfilesEqual(r.Inputs, currentInputs, lockfileGlobs) {
 			continue
 		}
-		kept := unchangedLeadLen(candLedger, curHashes)
-		if !unwindableTail(candLedger[kept:], curNames) {
+		byBatch, ok := r.Ledger.batchOrder(byName)
+		if !ok {
 			continue
 		}
-		steps := len(candLedger) - kept
-		if kept > bestKept || (kept == bestKept && steps < bestSteps) {
-			best = r
+		steps := agreedUnwindLen(byName, byBatch, len(byName)-unchangedLeadLen(byName, curHashes))
+		kept := len(byName) - steps
+		if !unwindableTail(byName[kept:], curNames) {
+			continue
+		}
+		if kept > bestKept || (kept == bestKept && steps < best.Steps) {
+			best = &RollbackAncestor{Snapshot: *r, Steps: steps, Kept: r.Ledger.retain(byName[:kept])}
 			bestKept = kept
-			bestSteps = steps
 		}
 	}
-	return best, bestSteps, nil
+	return best, nil
 }
 
 // unchangedLeadLen returns how many leading entries of the merged
@@ -414,8 +454,8 @@ func unwindableTail(tail []FileHash, currentNames map[string]struct{}) bool {
 
 // candidateSnapshots runs the shared (repo, engine, version, dump)
 // filter query and returns every matching snapshot row with its
-// lockfile/inputs JSON decoded. Rows whose JSON fails to decode are
-// skipped (mirrors the lenient behaviour of the prior inline loop).
+// lockfile/inputs/ledger JSON decoded. Rows whose JSON fails to decode
+// are skipped (mirrors the lenient behaviour of the prior inline loop).
 func (s *Store) candidateSnapshots(
 	ctx context.Context,
 	repoID int64,
@@ -428,7 +468,7 @@ func (s *Store) candidateSnapshots(
 	rows, err := s.DB.QueryContext(ctx, `
 		SELECT fingerprint, engine, engine_version, source_db, template_name,
 		       migrations_hash, COALESCE(dump_hash,''), COALESCE(lockfile_hashes_json,'{}'),
-		       COALESCE(inputs_json,'{}'),
+		       COALESCE(inputs_json,'{}'), ledger_json,
 		       COALESCE(size_bytes,0), created_at, last_used_at, use_count
 		FROM snapshots
 		WHERE repo_id = ?
@@ -443,23 +483,15 @@ func (s *Store) candidateSnapshots(
 	var out []SnapshotRecord
 	for rows.Next() {
 		var r SnapshotRecord
-		var lockJSON, inputsJSON string
+		var enc snapshotJSON
 		if err := rows.Scan(&r.Fingerprint, &r.Engine, &r.EngineVersion, &r.SourceDB,
-			&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &lockJSON, &inputsJSON,
+			&r.TemplateName, &r.MigrationsHash, &r.DumpHash, &enc.lockfiles, &enc.inputs, &enc.ledger,
 			&r.SizeBytes, &r.CreatedAt, &r.LastUsedAt, &r.UseCount); err != nil {
 			return nil, err
 		}
-		if lockJSON != "" {
-			if err := json.Unmarshal([]byte(lockJSON), &r.LockfileHashes); err != nil {
-				continue
-			}
+		if err := enc.decodeInto(&r); err != nil {
+			continue
 		}
-		if inputsJSON != "" && inputsJSON != "{}" {
-			if err := json.Unmarshal([]byte(inputsJSON), &r.Inputs); err != nil {
-				continue
-			}
-		}
-		r.normalizeMaps()
 		// Never offer a dump-only template as an ancestor: its empty
 		// Inputs would read as a prefix of every run and an incremental
 		// build off it would skip seed.
@@ -485,14 +517,17 @@ func mergeVectorsByBasename(m map[string]InputVector) []FileHash {
 	for _, v := range m {
 		all = append(all, v...)
 	}
-	sort.SliceStable(all, func(i, j int) bool {
-		bi, bj := pathBase(all[i].Path), pathBase(all[j].Path)
-		if bi != bj {
-			return bi < bj
-		}
-		return all[i].Path < all[j].Path
-	})
+	sort.SliceStable(all, func(i, j int) bool { return lessByBasename(all[i], all[j]) })
 	return all
+}
+
+// lessByBasename orders entries by file basename, then by full path.
+func lessByBasename(a, b FileHash) bool {
+	ba, bb := pathBase(a.Path), pathBase(b.Path)
+	if ba != bb {
+		return ba < bb
+	}
+	return a.Path < b.Path
 }
 
 // commonPrefixLen returns the number of leading entries that are

@@ -43,6 +43,10 @@ func TestRollbackFallbackReportsTheFailingStepsOutput(t *testing.T) {
 	}
 	key := snapshot.New("mysql", "8.0", "", "", "", "", map[string]string{store.CommandsHashKey: commandsHash(d)})
 	const glob = "migrations/*.php"
+	ancInputs := map[string]store.InputVector{glob: {
+		{Path: "migrations/001.php", Hash: "h1"},
+		{Path: "migrations/002.php", Hash: "hOLD"},
+	}}
 	if err := st.RecordSnapshot(ctx, store.SnapshotRecord{
 		Fingerprint:    "ancestor",
 		Engine:         "mysql",
@@ -50,11 +54,9 @@ func TestRollbackFallbackReportsTheFailingStepsOutput(t *testing.T) {
 		SourceDB:       "src",
 		TemplateName:   "_tm_ancestor",
 		LockfileHashes: map[string]string{store.CommandsHashKey: commandsHash(d)},
-		Inputs: map[string]store.InputVector{glob: {
-			{Path: "migrations/001.php", Hash: "h1"},
-			{Path: "migrations/002.php", Hash: "hOLD"},
-		}},
-		RepoID: repoID,
+		Inputs:         ancInputs,
+		Ledger:         store.NewAppliedLedger(ancInputs),
+		RepoID:         repoID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +70,7 @@ func TestRollbackFallbackReportsTheFailingStepsOutput(t *testing.T) {
 	}
 
 	_, done, err := tryRollbackIncrementalBuild(ctx, &config.Config{}, d, template.Context{}, t.TempDir(), st,
-		repoID, wtID, "src", key.TemplateName(), "8.0", 0, key, current, nil, time.Now(), ops)
+		repoID, wtID, "src", key.TemplateName(), "8.0", fanoutBudget{}, key, current, nil, time.Now(), ops)
 	if err != nil || done {
 		t.Fatalf("a failed re-migrate must fall through to the next build path: done=%v err=%v", done, err)
 	}
@@ -112,6 +114,10 @@ func TestLockfileOnlyChangeMigratesForwardWithoutRollback(t *testing.T) {
 			}
 			key := snapshot.New("mysql", "8.0", "", "", "", "", map[string]string{store.CommandsHashKey: commandsHash(d)})
 			ledger := store.InputVector{{Path: "migrations/001.php", Hash: "h1"}}
+			ancInputs := map[string]store.InputVector{
+				migs: ledger,
+				lock: {{Path: "composer.lock", Hash: "hOLD"}},
+			}
 			if err := st.RecordSnapshot(ctx, store.SnapshotRecord{
 				Fingerprint:    "ancestor",
 				Engine:         "mysql",
@@ -119,11 +125,9 @@ func TestLockfileOnlyChangeMigratesForwardWithoutRollback(t *testing.T) {
 				SourceDB:       "src",
 				TemplateName:   "_tm_ancestor",
 				LockfileHashes: map[string]string{store.CommandsHashKey: commandsHash(d)},
-				Inputs: map[string]store.InputVector{
-					migs: ledger,
-					lock: {{Path: "composer.lock", Hash: "hOLD"}},
-				},
-				RepoID: repoID,
+				Inputs:         ancInputs,
+				Ledger:         store.NewAppliedLedger(ancInputs),
+				RepoID:         repoID,
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -141,7 +145,7 @@ func TestLockfileOnlyChangeMigratesForwardWithoutRollback(t *testing.T) {
 			}
 
 			_, done, err := tryRollbackIncrementalBuild(ctx, &config.Config{}, d, template.Context{}, t.TempDir(), st,
-				repoID, wtID, "src", key.TemplateName(), "8.0", 0, key, current, nil, time.Now(), ops)
+				repoID, wtID, "src", key.TemplateName(), "8.0", fanoutBudget{}, key, current, nil, time.Now(), ops)
 			if err != nil || done {
 				t.Fatalf("the failing migrate must fall through: done=%v err=%v", done, err)
 			}
@@ -176,6 +180,10 @@ func TestInsertedEarlierMigrationsMigrateForwardWithoutRollback(t *testing.T) {
 		Rollback: &config.Step{Run: "echo ROLLBACK_RAN >&2; exit 1"},
 	}
 	key := snapshot.New("mysql", "8.0", "", "", "", "", map[string]string{store.CommandsHashKey: commandsHash(d)})
+	ancInputs := map[string]store.InputVector{migs: {
+		{Path: "migrations/2026_09_01_base.php", Hash: "h1"},
+		{Path: "migrations/2026_10_14_branch_drop_columns.php", Hash: "hb"},
+	}}
 	if err := st.RecordSnapshot(ctx, store.SnapshotRecord{
 		Fingerprint:    "ancestor",
 		Engine:         "mysql",
@@ -183,11 +191,9 @@ func TestInsertedEarlierMigrationsMigrateForwardWithoutRollback(t *testing.T) {
 		SourceDB:       "src",
 		TemplateName:   "_tm_ancestor",
 		LockfileHashes: map[string]string{store.CommandsHashKey: commandsHash(d)},
-		Inputs: map[string]store.InputVector{migs: {
-			{Path: "migrations/2026_09_01_base.php", Hash: "h1"},
-			{Path: "migrations/2026_10_14_branch_drop_columns.php", Hash: "hb"},
-		}},
-		RepoID: repoID,
+		Inputs:         ancInputs,
+		Ledger:         store.NewAppliedLedger(ancInputs),
+		RepoID:         repoID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +212,7 @@ func TestInsertedEarlierMigrationsMigrateForwardWithoutRollback(t *testing.T) {
 	}
 
 	_, done, err := tryRollbackIncrementalBuild(ctx, &config.Config{}, d, template.Context{}, t.TempDir(), st,
-		repoID, wtID, "src", key.TemplateName(), "8.0", 0, key, current, nil, time.Now(), ops)
+		repoID, wtID, "src", key.TemplateName(), "8.0", fanoutBudget{}, key, current, nil, time.Now(), ops)
 	if err != nil || done {
 		t.Fatalf("the failing migrate must fall through: done=%v err=%v", done, err)
 	}

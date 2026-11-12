@@ -56,6 +56,35 @@ client that round-trips JSON over the unix socket. Why a daemon:
 3. **Snapshot cache** is shared across shells; two terminals
    creating two worktrees on the same branch share the cached
    template DB.
+4. **Clone restores are capped per server.** Every prepare the daemon
+   runs draws its MySQL/Postgres clone restores from one set of slots
+   per engine server, sized like a single database's fan-out limit,
+   so concurrent creates queue in FIFO order instead of each running
+   its own full fan-out. An inline prepare (`finalize --local`, the
+   MCP server) has only its own fan-out limit.
+
+A create that failed for a transient cause (the direnv environment
+load timing out) is tagged as such on its `worktree:create:error`
+event, and the watchdog tick re-runs its finalize after a back-off of
+30 seconds, 2 minutes and 8 minutes, three times at most. The tag and
+the attempt count live in the event log, so the retries survive a
+daemon restart; any later lifecycle op on the worktree (a manual
+finalize, a teardown) supersedes them, and a worktree with a teardown
+or finalize in flight is skipped.
+
+A create whose prepare failed only because engines refused the
+connection (down, or still starting past the 2-minute startup wait)
+is tagged with the databases it failed on. From 30 seconds after the
+failure on, each watchdog tick probes those databases' engines once
+and re-runs the finalize as soon as they answer; it gives up when the
+engines still refuse 30 minutes later.
+
+A finalize is cancelled as stalled when it makes no progress for 15
+minutes. The clock starts once it holds its worktree lock, restarts
+whenever one of its clone restores is admitted to a slot or finishes,
+and pauses while a restore waits for a slot. A stalled finalize
+records its own failure once its work returns; a prepare that
+finishes despite the cancel carries on to `ready`.
 
 The daemon's socket is 0600 and ownership-checked on every
 accept; on Linux via `SO_PEERCRED`, on other platforms via

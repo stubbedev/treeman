@@ -17,6 +17,7 @@ func record(fp, cmds string, inputs map[string]InputVector) SnapshotRecord {
 		DumpHash:       "dh",
 		LockfileHashes: map[string]string{CommandsHashKey: cmds},
 		Inputs:         inputs,
+		Ledger:         NewAppliedLedger(inputs),
 		RepoID:         1,
 	}
 }

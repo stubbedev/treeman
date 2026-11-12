@@ -244,7 +244,7 @@ func runTaskPrepare(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 // finalize pipeline, a watcher re-prepare, or another prepare task
 // building the same source databases (issue #28).
 func lockedPrepare(ctx context.Context, st *State, id taskIdentity, task rpc.Task) ([]prepare.Outcome, error) {
-	opts := prepare.RunOptions{Fresh: rpc.PrepareArgsOf(task).Fresh}
+	opts := prepare.RunOptions{Fresh: rpc.PrepareArgsOf(task).Fresh, CloneSlots: st.cloneSlots}
 	var outs []prepare.Outcome
 	var err error
 	st.withWorktreePrepare(task.WorktreePath, func() {
@@ -267,7 +267,8 @@ func runTaskDBReset(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	st.withWorktreePrepare(task.WorktreePath, func() {
 		resetErr = prepare.ResetBranchScoped(ctx, &id.cfg, task.WorktreePath, id.repoID, id.wtID, st.Store, engineFilter)
 		if resetErr == nil {
-			outs, resetErr = prepare.Run(ctx, &id.cfg, task.WorktreePath, id.sl, st.Store, id.repoID, id.wtID, task.InheritedEnv)
+			outs, resetErr = prepare.RunFiltered(ctx, &id.cfg, task.WorktreePath, id.sl, st.Store, id.repoID, id.wtID, task.InheritedEnv,
+				prepare.RunOptions{CloneSlots: st.cloneSlots})
 		}
 	})
 	if resetErr != nil {

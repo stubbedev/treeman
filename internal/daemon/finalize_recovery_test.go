@@ -40,7 +40,7 @@ func TestPipelineEnginesTouchedGate(t *testing.T) {
 	}
 
 	touched := false
-	if _, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl,
+	if _, err := runFinalizeSetupPipeline(st.leaseFinalize(ctx, wtRoot), st, &cfg, repoRoot, wtRoot, sl,
 		false, repoID, wtID, nil, false, &touched); err == nil {
 		t.Fatal("expected the failing create-before-engines hook to abort the pipeline")
 	}
@@ -52,7 +52,7 @@ func TestPipelineEnginesTouchedGate(t *testing.T) {
 	// the missing connections block), so the flag flips.
 	cfg.Hooks.OnCreateBeforeEngines = []config.Action{{Run: []string{"true"}}}
 	touched = false
-	if _, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl,
+	if _, err := runFinalizeSetupPipeline(st.leaseFinalize(ctx, wtRoot), st, &cfg, repoRoot, wtRoot, sl,
 		false, repoID, wtID, nil, false, &touched); err != nil {
 		t.Fatalf("pipeline: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestPipelineSkipPrepareGate(t *testing.T) {
 	}
 
 	touched := false
-	if _, err := runFinalizeSetupPipeline(ctx, st, &cfg, repoRoot, wtRoot, sl,
+	if _, err := runFinalizeSetupPipeline(st.leaseFinalize(ctx, wtRoot), st, &cfg, repoRoot, wtRoot, sl,
 		false, repoID, wtID, nil, true, &touched); err != nil {
 		t.Fatalf("pipeline: %v", err)
 	}

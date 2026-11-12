@@ -61,7 +61,7 @@ import (
 func CommandEnv(ctx context.Context, inheritedEnv map[string]string, dir string) (map[string]string, error) {
 	env := baseEnv(inheritedEnv)
 	env["PWD"] = dir
-	if err := applyDirenv(ctx, env, dir); err != nil {
+	if err := applyDirenv(ctx, env, dir, direnvTimeout); err != nil {
 		return nil, err
 	}
 	return env, nil
@@ -76,36 +76,125 @@ func Flatten(env map[string]string) []string {
 	return out
 }
 
+// direnvTimeout bounds one `direnv export json`. It stays below the
+// daemon's 15-minute finalize stall timeout so a slow load fails as its
+// own, retryable timeout rather than as a stalled finalize. A cold
+// `use flake` build keeps running in the nix daemon after direnv is
+// killed, so the retry finds it further along or finished.
 const direnvTimeout = 10 * time.Minute
+
+// direnvWaitDelay bounds how long a killed direnv's children (nix) may
+// keep its output pipes open before they are closed, so the kill ends
+// the load instead of waiting out the build.
+const direnvWaitDelay = 5 * time.Second
+
+// DirenvFailure classifies why direnv could not load an environment.
+type DirenvFailure int
+
+const (
+	// DirenvFailed: direnv ran and failed (a blocked or broken
+	// `.envrc`) or printed output that is not its JSON diff.
+	DirenvFailed DirenvFailure = iota + 1
+	// DirenvTimedOut: direnv ran past direnvTimeout and was killed.
+	DirenvTimedOut
+	// DirenvInterrupted: the caller's context ended while direnv ran.
+	DirenvInterrupted
+)
+
+// DirenvError reports that direnv could not load the environment of
+// Dir. Callers tell an environment that never loaded (no command ran)
+// from a command that failed with errors.As.
+type DirenvError struct {
+	Dir     string
+	Bin     string
+	Failure DirenvFailure
+	Elapsed time.Duration
+	Limit   time.Duration
+	Stderr  string
+	// Err is the underlying exec or decode error.
+	Err error
+	// Cause is why the caller's context ended; set for
+	// DirenvInterrupted only.
+	Cause error
+}
+
+func (e *DirenvError) Error() string {
+	head := fmt.Sprintf("load direnv environment for %s (%s export json)", e.Dir, e.Bin)
+	var msg string
+	switch e.Failure {
+	case DirenvTimedOut:
+		msg = fmt.Sprintf("%s: timed out after %s (limit %s), a cold `use flake` build can take longer; %v",
+			head, e.Elapsed.Round(time.Second), e.Limit, e.Err)
+	case DirenvInterrupted:
+		msg = fmt.Sprintf("%s: stopped after %s (limit %s) because %v; %v",
+			head, e.Elapsed.Round(time.Second), e.Limit, e.Cause, e.Err)
+	default:
+		msg = fmt.Sprintf("%s: %v", head, e.Err)
+	}
+	if e.Stderr == "" {
+		return msg
+	}
+	return msg + ": " + e.Stderr
+}
+
+func (e *DirenvError) Unwrap() []error {
+	if e.Cause == nil {
+		return []error{e.Err}
+	}
+	return []error{e.Err, e.Cause}
+}
+
+// Transient reports whether loading again later can succeed without
+// anyone changing the `.envrc`: a timeout, typically a cold nix build
+// that finishes in the background.
+func (e *DirenvError) Transient() bool {
+	return e.Failure == DirenvTimedOut
+}
 
 // applyDirenv runs `direnv export json` in dir against env and applies
 // the resulting diff to env in place: a string sets the variable, null
 // unsets it. direnv computes the diff from env itself, so an inherited
 // environment from another direnv directory is reverted first, the same
-// as `cd` between two such directories in the user's terminal.
-func applyDirenv(ctx context.Context, env map[string]string, dir string) error {
+// as `cd` between two such directories in the user's terminal. direnv
+// is killed after limit. Every failure is a *DirenvError.
+func applyDirenv(ctx context.Context, env map[string]string, dir string, limit time.Duration) error {
 	bin := lookPathIn("direnv", env["PATH"])
 	if bin == "" {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, direnvTimeout)
+	runCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "export", "json")
+	cmd := exec.CommandContext(runCtx, bin, "export", "json")
 	cmd.Dir = dir
 	cmd.Env = Flatten(env)
+	cmd.WaitDelay = direnvWaitDelay
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	started := time.Now()
 	out, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("load direnv environment for %s (%s export json): %w: %s",
-			dir, bin, err, strings.TrimSpace(stderr.String()))
+		de := &DirenvError{
+			Dir: dir, Bin: bin, Failure: DirenvFailed,
+			Elapsed: time.Since(started), Limit: limit,
+			Stderr: strings.TrimSpace(stderr.String()), Err: err,
+		}
+		switch {
+		case ctx.Err() != nil:
+			de.Failure, de.Cause = DirenvInterrupted, context.Cause(ctx)
+		case runCtx.Err() != nil:
+			de.Failure = DirenvTimedOut
+		}
+		return de
 	}
 	if len(bytes.TrimSpace(out)) == 0 {
 		return nil
 	}
 	var diff map[string]*string
 	if err := json.Unmarshal(out, &diff); err != nil {
-		return fmt.Errorf("parse %s export json output for %s: %w", bin, dir, err)
+		return &DirenvError{
+			Dir: dir, Bin: bin, Failure: DirenvFailed, Limit: limit,
+			Err: fmt.Errorf("parse the export json output: %w", err),
+		}
 	}
 	for k, v := range diff {
 		if v == nil {

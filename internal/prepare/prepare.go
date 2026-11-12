@@ -383,6 +383,10 @@ func autoTuneOuter(fam engine.Family, maxConns int) int {
 // with the slowest-clone duration so the user can spot stragglers
 // without trawling the per-clone debug stream.
 //
+// Each restore also holds a slot of budget.server for its duration, so
+// the restores of every prepare targeting one server stay under that
+// server's limit together (#199).
+//
 // Returns the first error seen. errgroup's ctx cancellation
 // propagates so peer restores abort instead of hammering a server
 // that already refused the first one.
@@ -395,12 +399,12 @@ func fanOutClones(
 	clones []string,
 	engine string,
 	override uint32,
-	maxConns int,
+	budget fanoutBudget,
 ) error {
 	if len(clones) == 0 {
 		return nil
 	}
-	limit, autoTuned := fanOutLimit(override, maxConns, len(clones), engine)
+	limit, autoTuned := fanOutLimit(override, budget.maxConns, len(clones), engine)
 
 	startedMs := time.Now().UnixMilli()
 	if st != nil {
@@ -412,7 +416,7 @@ func fanOutClones(
 				"clones":     len(clones),
 				"limit":      limit,
 				"auto_tuned": autoTuned,
-				"max_conns":  maxConns,
+				"max_conns":  budget.maxConns,
 			})
 	}
 
@@ -429,7 +433,9 @@ func fanOutClones(
 	for _, c := range clones {
 		g.Go(func() error {
 			cloneStart := time.Now()
-			err := retryTransient(gctx, func() error { return restore(gctx, template, c) })
+			err := budget.runRestore(gctx, override, engine, func() error {
+				return retryTransient(gctx, func() error { return restore(gctx, template, c) })
+			})
 			dur := time.Since(cloneStart).Milliseconds()
 			if err != nil {
 				if isCancellation(err) {
@@ -556,7 +562,7 @@ func cacheHitRestoreAndFanout(
 	d config.DatabaseConfig,
 	template, source string,
 	clones []string,
-	maxConns int,
+	budget fanoutBudget,
 	fingerprint string,
 ) (templateGone bool, err error) {
 	targets := make([]string, 0, len(clones)+1)
@@ -566,7 +572,7 @@ func cacheHitRestoreAndFanout(
 			targets = append(targets, c)
 		}
 	}
-	fanoutErr := fanOutClones(ctx, st, repoID, worktreeID, restore, template, targets, d.Engine, d.Fanout, maxConns)
+	fanoutErr := fanOutClones(ctx, st, repoID, worktreeID, restore, template, targets, d.Engine, d.Fanout, budget)
 	if fanoutErr == nil {
 		return false, nil
 	}
@@ -636,6 +642,14 @@ type RunOptions struct {
 	// the current fingerprint, discarding whatever state they picked up
 	// since (e.g. rows a previous CI build's tests left behind).
 	Fresh bool
+	// CloneSlots, when set, caps the clone restores of this run together
+	// with every other run sharing it, per engine server. The daemon
+	// passes its own; nil leaves only the per-database fan-out limit.
+	CloneSlots *CloneSlots
+	// Progress, when set, receives every clone restore's way through the
+	// clone slots, so the caller can tell a run that waits for or makes
+	// clone progress from a wedged one.
+	Progress ProgressFunc
 }
 
 func (o RunOptions) Includes(dbIdx int) bool {
@@ -676,10 +690,8 @@ func RunFiltered(
 		return nil, fmt.Errorf("wait for concurrent prepare: %w", err)
 	}
 	defer unlock()
-	if opts.Fresh && st != nil {
-		if err := st.ClearTemplateBuiltForWorktree(ctx, worktreeID); err != nil {
-			return nil, fmt.Errorf("clear built-at fingerprints of worktree %d for a fresh prepare: %w", worktreeID, err)
-		}
+	if err := checkRunPreconditions(ctx, st, worktreeID, opts); err != nil {
+		return nil, err
 	}
 	// Share engine version / max_connections probes across the parallel
 	// per-database goroutines below — N databases on one engine pay one
@@ -704,7 +716,7 @@ func RunFiltered(
 			continue
 		}
 		g.Go(func() error {
-			o, err := prepareOneEngine(ctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+			o, err := prepareOneEngine(ctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 			if err == nil && !o.CacheHit && o.Fingerprint != "" && o.SourceDB != "" {
 				err = recordTemplateBuilt(ctx, st, worktreeID, o.SourceDB, d.Engine, d.Connection, o.Fingerprint)
 			}
@@ -736,6 +748,22 @@ func RunFiltered(
 		return outcomes, &RunError{Failed: failed}
 	}
 	return outcomes, nil
+}
+
+// checkRunPreconditions refuses a run of a worktree whose setup failed
+// and, for a fresh run, forgets which fingerprints its databases were
+// built at so every one is restored again.
+func checkRunPreconditions(ctx context.Context, st *store.Store, worktreeID int64, opts RunOptions) error {
+	if err := requireSetup(ctx, st, worktreeID); err != nil {
+		return err
+	}
+	if !opts.Fresh || st == nil {
+		return nil
+	}
+	if err := st.ClearTemplateBuiltForWorktree(ctx, worktreeID); err != nil {
+		return fmt.Errorf("clear built-at fingerprints of worktree %d for a fresh prepare: %w", worktreeID, err)
+	}
+	return nil
 }
 
 // withDBNamespaces renders every database's namespace in this run's
@@ -837,6 +865,7 @@ func prepareOneEngine(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
+	opts RunOptions,
 ) (Outcome, error) {
 	fam, ok := engine.Canonical(d.Engine)
 	if !ok {
@@ -845,7 +874,7 @@ func prepareOneEngine(
 			repoID, worktreeID, "", 0, nil)
 		return Outcome{}, nil
 	}
-	out, err := prepareFamily(ctx, fam, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+	out, err := prepareFamily(ctx, fam, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 	maybeSpawnPrewarm(cfg, st, repoID, worktreeID, d, out, err)
 	return out, err
 }
@@ -863,22 +892,23 @@ func prepareFamily(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
+	opts RunOptions,
 ) (Outcome, error) {
 	switch fam {
 	case engine.FamilyMySQL:
-		return prepareMySQL(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+		return prepareMySQL(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 	case engine.FamilyPostgres:
-		return preparePostgres(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+		return preparePostgres(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 	case engine.FamilyMongo:
-		return prepareMongo(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+		return prepareMongo(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 	case engine.FamilyRedis:
-		return prepareRedis(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+		return prepareRedis(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 	case engine.FamilyES:
-		return prepareES(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+		return prepareES(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 	case engine.FamilyS3:
 		return prepareS3(ctx, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
 	case engine.FamilyFile:
-		return prepareFileEngine(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+		return prepareFileEngine(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 	}
 	return Outcome{}, nil
 }
@@ -894,6 +924,7 @@ func prepareMySQL(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
+	opts RunOptions,
 ) (Outcome, error) {
 	started := time.Now()
 	sourceDB, err := template.Render(d.NameTemplate, tplCtx)
@@ -921,6 +952,7 @@ func prepareMySQL(
 	// cache must not hand server A's version/max_conns to server B.
 	version, _ := cachedProbe(ctx, "mysql-version:"+d.Connection, func() (string, error) { return drv.EngineVersion(ctx) })
 	maxConns, _ := cachedProbe(ctx, "mysql-maxconns:"+d.Connection, func() (int, error) { return drv.MaxConnections(ctx) })
+	budget := opts.serverBudget(maxConns, mysqlServerKey(*mysqlConn))
 
 	// branch_scoped databases bypass the fingerprint template cache
 	// entirely — their content is per-branch live data swapped through
@@ -976,7 +1008,7 @@ func prepareMySQL(
 		worktreeID,
 		sourceDB,
 		key,
-		maxConns,
+		budget,
 		started,
 	)
 	defer flight.finish()
@@ -1009,7 +1041,7 @@ func prepareMySQL(
 	// cold build. The migration framework's own ledger skips the
 	// already-applied files so only the new ones run.
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
+		repoID, worktreeID, sourceDB, templateName, version, budget, key, inputs,
 		inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
@@ -1024,7 +1056,7 @@ func prepareMySQL(
 	// FindRollbackAncestor and fall through to cold. Hard-falls-back to
 	// cold on any error.
 	out, done, err = tryRollbackIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
+		repoID, worktreeID, sourceDB, templateName, version, budget, key, inputs,
 		inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
@@ -1035,7 +1067,7 @@ func prepareMySQL(
 	// but skips reloading the dump. No dump-only template yet → falls
 	// through to the cold build below (which seeds it).
 	out, done, err = tryDumpOnlyBuild(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, dumpKey,
+		repoID, worktreeID, sourceDB, templateName, version, budget, key, dumpKey,
 		inputs, inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
@@ -1090,7 +1122,7 @@ func prepareMySQL(
 	}
 	if drv.PreferLogicalFor(ctx, sourceDB) {
 		if err := mysqlMergedColdFanout(ctx, drv, cfg, d, st, repoID, worktreeID,
-			sourceDB, templateName, version, key, inputs, clones, maxConns); err != nil {
+			sourceDB, templateName, version, key, inputs, clones, budget); err != nil {
 			return Outcome{}, err
 		}
 	} else {
@@ -1111,7 +1143,7 @@ func prepareMySQL(
 			return Outcome{}, err
 		}
 		if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestoreStaged,
-			templateName, clones, d.Engine, d.Fanout, maxConns); err != nil {
+			templateName, clones, d.Engine, d.Fanout, budget); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -1149,9 +1181,9 @@ func prepareMySQL(
 //
 // `exists` is the driver's namespace-presence probe (DatabaseExists for
 // name-scoped engines, PrefixExists/IndexExists for prefix-scoped ones)
-// and `restore` is its template→target clone. `maxConns` bounds the
-// clone fan-out (0 for engines with no connection cap). Behaviour is
-// identical across engines — only these two closures, the connection
+// and `restore` is its template→target clone. `budget` bounds the
+// clone fan-out (a zero maxConns for engines with no connection cap).
+// Behaviour is identical across engines — only these two closures, the connection
 // cap, and the engine label vary, so the five per-engine copies collapse
 // into this one.
 func cacheHitGeneric(
@@ -1165,7 +1197,7 @@ func cacheHitGeneric(
 	repoID, worktreeID int64,
 	sourceDB string,
 	key snapshot.Key,
-	maxConns int,
+	budget fanoutBudget,
 	started time.Time,
 ) (Outcome, bool, buildFlight, error) {
 	rec, err := lookupCachedSnapshot(ctx, st, d.Engine, key.Fingerprint(), func() {
@@ -1252,7 +1284,7 @@ func cacheHitGeneric(
 	// under a build flight so sibling worktrees wait for the rebuild
 	// instead of racing their own.
 	templateGone, err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, exists, restore,
-		d, rec.TemplateName, sourceDB, clones, maxConns, key.Fingerprint())
+		d, rec.TemplateName, sourceDB, clones, budget, key.Fingerprint())
 	if err != nil {
 		return Outcome{}, false, buildFlight{}, err
 	}
@@ -1499,13 +1531,14 @@ func mysqlColdBuildSteps(
 // recordSnapshot writes the SQLite snapshot row for a freshly-built
 // template. Identical across every engine and across both the cold-build
 // and incremental paths — only the engine label, version, source/template
-// names, and input vectors vary.
+// names, input vectors and applied ledger vary.
 func recordSnapshot(
 	ctx context.Context,
 	st *store.Store,
 	key snapshot.Key,
 	engine, version, source, template string,
 	inputs map[string]store.InputVector,
+	ledger *store.AppliedLedger,
 	repoID int64,
 ) error {
 	err := st.RecordSnapshot(ctx, store.SnapshotRecord{
@@ -1518,6 +1551,7 @@ func recordSnapshot(
 		DumpHash:       key.DumpHashHex,
 		LockfileHashes: key.LockfileHashes,
 		Inputs:         inputs,
+		Ledger:         ledger,
 		RepoID:         repoID,
 	})
 	if err != nil {
@@ -1543,7 +1577,8 @@ func mysqlSnapshotAndRecord(
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
 	emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, sourceDB, templateName, string(drv.LastCloneStrategy()))
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName, inputs, repoID); err != nil {
+	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName,
+		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
 		return err
 	}
 	// Fire-and-forget LRU eviction for this repo. Uses a fresh
@@ -1579,13 +1614,13 @@ func mysqlMergedColdFanout(
 	key snapshot.Key,
 	inputs map[string]store.InputVector,
 	clones []string,
-	maxConns int,
+	budget fanoutBudget,
 ) error {
 	targets := make([]string, 0, len(clones)+1)
 	targets = append(targets, templateName)
 	targets = append(targets, clones...)
 
-	limit, autoTuned := fanOutLimit(d.Fanout, maxConns, len(targets), d.Engine)
+	limit, autoTuned := fanOutLimit(d.Fanout, budget.maxConns, len(targets), d.Engine)
 	started := time.Now()
 	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtClonesStart,
 		fmt.Sprintf("engine=%s source=%s targets=%d (template+%d clones) limit=%d", d.Engine, sourceDB, len(targets), len(clones), limit),
@@ -1596,7 +1631,7 @@ func mysqlMergedColdFanout(
 			"targets":    len(targets),
 			"limit":      limit,
 			"auto_tuned": autoTuned,
-			"max_conns":  maxConns,
+			"max_conns":  budget.maxConns,
 			"merged":     true,
 		})
 
@@ -1612,7 +1647,7 @@ func mysqlMergedColdFanout(
 	for _, tgt := range targets {
 		g.Go(func() error {
 			cloneStart := time.Now()
-			err := drv.SnapshotCreate(gctx, sourceDB, tgt)
+			err := budget.runRestore(gctx, d.Fanout, d.Engine, func() error { return drv.SnapshotCreate(gctx, sourceDB, tgt) })
 			dur := time.Since(cloneStart).Milliseconds()
 			if err != nil {
 				failCount.Add(1)
@@ -1676,7 +1711,8 @@ func mysqlMergedColdFanout(
 	// template's strategy + a per-template phase boundary.
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", started)
 	emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, sourceDB, templateName, string(drv.LastCloneStrategy()))
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName, inputs, repoID); err != nil {
+	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName,
+		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
 		return err
 	}
 	spawnEvict(cfg, st, repoID)
@@ -1823,7 +1859,7 @@ func tryIncrementalBuild(
 	st *store.Store,
 	repoID, worktreeID int64,
 	source, templateName, version string,
-	maxConns int,
+	budget fanoutBudget,
 	key snapshot.Key,
 	inputs map[string]store.InputVector,
 	inheritedEnv map[string]string,
@@ -1890,27 +1926,10 @@ func tryIncrementalBuild(
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", migrateStart)
 	}
 
-	snapStart := time.Now()
-	if err := ops.snapshotCreate(ctx, source, templateName); err != nil {
-		return Outcome{}, false, fmt.Errorf("incremental snapshot create %s → %s: %w", source, templateName, err)
-	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, source, templateName, inputs, repoID); err != nil {
-		return Outcome{}, false, err
-	}
-	spawnEvict(cfg, st, repoID)
-
-	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+		source, templateName, version, budget, key, inputs, anc.Ledger.Advance(inputs), ops)
 	if err != nil {
-		return Outcome{}, false, err
-	}
-	fanoutRestore := ops.snapshotRestore
-	if ops.snapshotRestoreFanout != nil {
-		fanoutRestore = ops.snapshotRestoreFanout
-	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, fanoutRestore, templateName,
-		clones, d.Engine, d.Fanout, maxConns); err != nil {
-		return Outcome{}, false, err
+		return Outcome{}, false, fmt.Errorf("incremental build: %w", err)
 	}
 
 	ms := time.Since(started).Milliseconds()
@@ -2007,12 +2026,13 @@ func seedDumpOnlyTemplate(
 		return nil
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "dumponly-snapshot", start)
-	return recordSnapshot(ctx, st, dumpKey, d.Engine, version, sourceDB, dumpTpl, nil, repoID)
+	return recordSnapshot(ctx, st, dumpKey, d.Engine, version, sourceDB, dumpTpl, nil, nil, repoID)
 }
 
 // snapshotRecordFanout is the shared tail of the incremental build
 // paths: create the template from the populated source, record its
-// snapshot row, fire LRU eviction, then fan out the test clones.
+// snapshot row with the given applied ledger, fire LRU eviction, then
+// fan out the test clones.
 func snapshotRecordFanout(
 	ctx context.Context,
 	cfg *config.Config,
@@ -2022,9 +2042,10 @@ func snapshotRecordFanout(
 	st *store.Store,
 	repoID, worktreeID int64,
 	source, templateName, version string,
-	maxConns int,
+	budget fanoutBudget,
 	key snapshot.Key,
 	inputs map[string]store.InputVector,
+	ledger *store.AppliedLedger,
 	ops incrementalOps,
 ) ([]string, error) {
 	snapStart := time.Now()
@@ -2032,7 +2053,7 @@ func snapshotRecordFanout(
 		return nil, fmt.Errorf("snapshot create %s → %s: %w", source, templateName, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, source, templateName, inputs, repoID); err != nil {
+	if err := recordSnapshot(ctx, st, key, d.Engine, version, source, templateName, inputs, ledger, repoID); err != nil {
 		return nil, err
 	}
 	spawnEvict(cfg, st, repoID)
@@ -2046,7 +2067,7 @@ func snapshotRecordFanout(
 		fanoutRestore = ops.snapshotRestoreFanout
 	}
 	if err := fanOutClones(ctx, st, repoID, worktreeID, fanoutRestore, templateName,
-		clones, d.Engine, d.Fanout, maxConns); err != nil {
+		clones, d.Engine, d.Fanout, budget); err != nil {
 		return nil, err
 	}
 	return clones, nil
@@ -2069,7 +2090,7 @@ func tryDumpOnlyBuild(
 	st *store.Store,
 	repoID, worktreeID int64,
 	source, templateName, version string,
-	maxConns int,
+	budget fanoutBudget,
 	key, dumpKey snapshot.Key,
 	inputs map[string]store.InputVector,
 	inheritedEnv map[string]string,
@@ -2126,7 +2147,7 @@ func tryDumpOnlyBuild(
 	}
 
 	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, source, templateName, version, maxConns, key, inputs, ops)
+		repoID, worktreeID, source, templateName, version, budget, key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
 		return Outcome{}, false, err
 	}
@@ -2180,7 +2201,7 @@ func tryRollbackIncrementalBuild(
 	st *store.Store,
 	repoID, worktreeID int64,
 	source, templateName, version string,
-	maxConns int,
+	budget fanoutBudget,
 	key snapshot.Key,
 	inputs map[string]store.InputVector,
 	inheritedEnv map[string]string,
@@ -2192,14 +2213,15 @@ func tryRollbackIncrementalBuild(
 		return Outcome{}, false, nil
 	}
 	commandsHash := key.LockfileHashes[store.CommandsHashKey]
-	anc, steps, err := st.FindRollbackAncestor(ctx, repoID, d.Engine, version,
+	plan, err := st.FindRollbackAncestor(ctx, repoID, d.Engine, version,
 		key.DumpHashHex, commandsHash, lockfileGlobs, inputs)
 	if err != nil {
 		return Outcome{}, false, fmt.Errorf("find a rollback ancestor %s snapshot: %w", d.Engine, err)
 	}
-	if anc == nil || (steps > 0 && d.Rollback == nil) {
+	if plan == nil || (plan.Steps > 0 && d.Rollback == nil) {
 		return Outcome{}, false, nil
 	}
+	anc, steps := &plan.Snapshot, plan.Steps
 	unpin := snapshot.Pin(anc.Fingerprint)
 	defer unpin()
 
@@ -2272,7 +2294,7 @@ func tryRollbackIncrementalBuild(
 	}
 
 	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, source, templateName, version, maxConns, key, inputs, ops)
+		repoID, worktreeID, source, templateName, version, budget, key, inputs, plan.Kept.Advance(inputs), ops)
 	if err != nil {
 		return Outcome{}, false, err
 	}
@@ -2312,6 +2334,7 @@ func preparePostgres(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
+	opts RunOptions,
 ) (out Outcome, err error) {
 	started := time.Now()
 	sourceDB, err := template.Render(d.NameTemplate, tplCtx)
@@ -2337,6 +2360,7 @@ func preparePostgres(
 	// not share probe results (see prepareMySQL, #44).
 	version, _ := cachedProbe(ctx, "postgres-version:"+d.Connection, func() (string, error) { return drv.EngineVersion(ctx) })
 	maxConns, _ := cachedProbe(ctx, "postgres-maxconns:"+d.Connection, func() (int, error) { return drv.MaxConnections(ctx) })
+	budget := opts.serverBudget(maxConns, postgresServerKey(*pgConn))
 
 	if d.BranchScoped {
 		return runBranchScopedAt(ctx, version, branchScopedArgs{
@@ -2392,7 +2416,7 @@ func preparePostgres(
 		worktreeID,
 		sourceDB,
 		key,
-		maxConns,
+		budget,
 		started,
 	)
 	defer flight.finish()
@@ -2412,21 +2436,21 @@ func preparePostgres(
 	dumpKey := dumpOnlySnapshotKey(d.Engine, d.Connection, version, key.DumpHashHex)
 
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
+		repoID, worktreeID, sourceDB, templateName, version, budget, key, inputs,
 		inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
 	}
 
 	out, done, err = tryRollbackIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, inputs,
+		repoID, worktreeID, sourceDB, templateName, version, budget, key, inputs,
 		inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
 	}
 
 	out, done, err = tryDumpOnlyBuild(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, sourceDB, templateName, version, maxConns, key, dumpKey,
+		repoID, worktreeID, sourceDB, templateName, version, budget, key, dumpKey,
 		inputs, inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
@@ -2450,7 +2474,7 @@ func preparePostgres(
 		return Outcome{}, err
 	}
 	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
-		sourceDB, templateName, version, maxConns, key, inputs, ops)
+		sourceDB, templateName, version, budget, key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -2591,6 +2615,7 @@ func prepareMongo(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
+	opts RunOptions,
 ) (Outcome, error) {
 	started := time.Now()
 	sourceDB, err := template.Render(d.NameTemplate, tplCtx)
@@ -2659,7 +2684,7 @@ func prepareMongo(
 		worktreeID,
 		sourceDB,
 		key,
-		0,
+		opts.localBudget(),
 		started,
 	)
 	defer flight.finish()
@@ -2668,7 +2693,7 @@ func prepareMongo(
 	}
 
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, sourceDB, templateName, version, 0, key, inputs,
+		repoID, worktreeID, sourceDB, templateName, version, opts.localBudget(), key, inputs,
 		inheritedEnv, started, incrementalOps{
 			exists:          drv.DatabaseExists,
 			snapshotRestore: drv.SnapshotRestore,
@@ -2698,7 +2723,8 @@ func prepareMongo(
 		return Outcome{}, fmt.Errorf("mongo snapshot create %s → %s: %w", sourceDB, templateName, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName, inputs, repoID); err != nil {
+	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName,
+		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
 		return Outcome{}, err
 	}
 	spawnEvict(cfg, st, repoID)
@@ -2707,7 +2733,8 @@ func prepareMongo(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones, d.Engine, d.Fanout, 0); err != nil {
+	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones,
+		d.Engine, d.Fanout, opts.localBudget()); err != nil {
 		return Outcome{}, err
 	}
 
@@ -2834,6 +2861,7 @@ func prepareRedis(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
+	opts RunOptions,
 ) (Outcome, error) {
 	redisConn, err := cfg.Connections.ResolveRedis(d.Connection)
 	if err != nil {
@@ -2878,7 +2906,7 @@ func prepareRedis(
 		})
 	}
 
-	return prepareRedisPrefix(ctx, cfg, d, redisConn, drv, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv)
+	return prepareRedisPrefix(ctx, cfg, d, redisConn, drv, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 }
 
 // prepareRedisPrefix is the modern path — prefix-isolated keys in
@@ -2894,6 +2922,7 @@ func prepareRedisPrefix(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
+	opts RunOptions,
 ) (Outcome, error) {
 	started := time.Now()
 	sourcePrefix, err := template.Render(d.KeyPrefix, tplCtx)
@@ -2951,7 +2980,7 @@ func prepareRedisPrefix(
 		worktreeID,
 		sourcePrefix,
 		key,
-		0,
+		opts.localBudget(),
 		started,
 	)
 	defer flight.finish()
@@ -2959,13 +2988,10 @@ func prepareRedisPrefix(
 		return out, err
 	}
 
+	ops := incrementalOps{exists: drv.PrefixExists, snapshotRestore: rdRestore, snapshotCreate: rdCreate}
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, sourcePrefix, templatePrefix, version, 0, key, inputs,
-		inheritedEnv, started, incrementalOps{
-			exists:          drv.PrefixExists,
-			snapshotRestore: rdRestore,
-			snapshotCreate:  rdCreate,
-		})
+		repoID, worktreeID, sourcePrefix, templatePrefix, version, opts.localBudget(), key, inputs,
+		inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
 	}
@@ -2974,22 +3000,10 @@ func prepareRedisPrefix(
 	if err := redisColdBuildSteps(ctx, drv, rc, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
-	snapStart := time.Now()
-	if err := rdCreate(ctx, sourcePrefix, templatePrefix); err != nil {
-		return Outcome{}, fmt.Errorf("redis snapshot create %s → %s: %w", sourcePrefix, templatePrefix, err)
-	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourcePrefix, templatePrefix, inputs, repoID); err != nil {
-		return Outcome{}, err
-	}
-	spawnEvict(cfg, st, repoID)
-
-	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+		sourcePrefix, templatePrefix, version, opts.localBudget(), key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
-		return Outcome{}, err
-	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, rdRestore, templatePrefix, clones, d.Engine, d.Fanout, 0); err != nil {
-		return Outcome{}, err
+		return Outcome{}, fmt.Errorf("redis cold build: %w", err)
 	}
 
 	ms := time.Since(started).Milliseconds()
@@ -3125,6 +3139,7 @@ func prepareES(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
+	opts RunOptions,
 ) (Outcome, error) {
 	started := time.Now()
 	if d.KeyPrefix == "" {
@@ -3233,7 +3248,7 @@ func prepareES(
 		worktreeID,
 		sourcePrefix,
 		key,
-		0,
+		opts.localBudget(),
 		started,
 	)
 	defer flight.finish()
@@ -3242,7 +3257,7 @@ func prepareES(
 	}
 
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, sourcePrefix, templatePrefix, version, 0, key, inputs,
+		repoID, worktreeID, sourcePrefix, templatePrefix, version, opts.localBudget(), key, inputs,
 		inheritedEnv, started, incrementalOps{
 			exists: func(ctx context.Context, name string) (bool, error) {
 				m, err := drv.ListMatching(ctx, name)
@@ -3275,7 +3290,8 @@ func prepareES(
 		return Outcome{}, fmt.Errorf("es snapshot create %s → %s: %w", sourcePrefix, templatePrefix, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourcePrefix, templatePrefix, inputs, repoID); err != nil {
+	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourcePrefix, templatePrefix,
+		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
 		return Outcome{}, err
 	}
 	spawnEvict(cfg, st, repoID)
@@ -3284,7 +3300,8 @@ func prepareES(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, esRestore, templatePrefix, clones, d.Engine, d.Fanout, 0); err != nil {
+	if err := fanOutClones(ctx, st, repoID, worktreeID, esRestore, templatePrefix, clones,
+		d.Engine, d.Fanout, opts.localBudget()); err != nil {
 		return Outcome{}, err
 	}
 
@@ -3414,6 +3431,7 @@ func prepareFileEngine(
 	st *store.Store,
 	repoID, worktreeID int64,
 	inheritedEnv map[string]string,
+	opts RunOptions,
 ) (Outcome, error) {
 	started := time.Now()
 	rendered, err := template.Render(d.NameTemplate, tplCtx)
@@ -3469,7 +3487,7 @@ func prepareFileEngine(
 	}
 
 	out, done, flight, err := cacheHitGeneric(ctx, fileExists, fileRestore, d, tplCtx, worktreePath,
-		st, repoID, worktreeID, sourceFile, key, 0, started)
+		st, repoID, worktreeID, sourceFile, key, opts.localBudget(), started)
 	defer flight.finish()
 	if err != nil {
 		return out, err
@@ -3494,7 +3512,8 @@ func prepareFileEngine(
 		return Outcome{}, fmt.Errorf("file snapshot create %s → %s: %w", sourceFile, templatePath, err)
 	}
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceFile, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, "", sourceFile, templatePath, inputs, repoID); err != nil {
+	if err := recordSnapshot(ctx, st, key, d.Engine, "", sourceFile, templatePath,
+		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
 		return Outcome{}, err
 	}
 	spawnEvict(cfg, st, repoID)
@@ -3503,7 +3522,8 @@ func prepareFileEngine(
 	if err != nil {
 		return Outcome{}, err
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, fileRestore, templatePath, clones, d.Engine, d.Fanout, 0); err != nil {
+	if err := fanOutClones(ctx, st, repoID, worktreeID, fileRestore, templatePath, clones,
+		d.Engine, d.Fanout, opts.localBudget()); err != nil {
 		return Outcome{}, err
 	}
 
