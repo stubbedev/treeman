@@ -347,9 +347,19 @@ hooks:
         - "php artisan migrate"
 ```
 
+An action takes the same container keys as a connection block
+(`container`, `compose_service`, `compose_project`, `container_engine`,
+`container_network`; see [Connecting to DBs in a container](#connecting-to-dbs-in-a-container)),
+so a container resolves identically for hooks and engines.
+
 `action.cwd` becomes `-w <cwd>` on the `exec` call (interpreted
 inside the container's filesystem). Leave unset to use the
 container's `WORKDIR`.
+
+Any other key in an action is an error naming the keys an action
+accepts. The removed `engine:` key reports `rename it to
+container_engine:`, and `in_container:` reports `rename it to
+container:`.
 
 ### Hook environment variables
 

@@ -8,7 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/shellenv/shellenvtest"
 )
 
@@ -232,10 +235,10 @@ func TestRenderActionGroupLevelCwd(t *testing.T) {
 
 func TestRenderActionWrapsInDockerExec(t *testing.T) {
 	a := config.Action{
-		Container: "myapp",
-		Engine:    "docker",
-		Run:       []string{"composer install", "php artisan migrate"},
-		Cwd:       "/var/www/html",
+		Container:       "myapp",
+		ContainerEngine: "docker",
+		Run:             []string{"composer install", "php artisan migrate"},
+		Cwd:             "/var/www/html",
 	}
 	got, err := renderAction(context.Background(), a, "/host/wt")
 	if err != nil {
@@ -253,6 +256,38 @@ func TestRenderActionWrapsInDockerExec(t *testing.T) {
 	}
 	if !contains(got, " && ") {
 		t.Errorf("steps not chained: %s", got)
+	}
+}
+
+func TestRenderActionResolvesContainerRefKeys(t *testing.T) {
+	engine := filepath.Join(t.TempDir(), "fake-engine")
+	script := "#!/bin/sh\necho \"$*\" > \"$0.args\"\necho resolved-id\n"
+	if err := os.WriteFile(engine, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var a config.Action
+	body := "run: make\ncompose_service: app\ncompose_project: proj\ncontainer_engine: " + engine + "\ncontainer_network: backend\n"
+	if err := yaml.Unmarshal([]byte(body), &a); err != nil {
+		t.Fatal(err)
+	}
+	if got := containerip.FromRef(a.ContainerRef, 0).Network; got != "backend" {
+		t.Fatalf("container_network not carried into the lookup: %q", got)
+	}
+	got, err := renderAction(context.Background(), a, "/host/wt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := shellJoin([]string{engine, "exec", "resolved-id", "sh", "-c", "make"}); got != want {
+		t.Fatalf("render = %s, want %s", got, want)
+	}
+	args, err := os.ReadFile(engine + ".args")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"label=com.docker.compose.service=app", "label=com.docker.compose.project=proj"} {
+		if !strings.Contains(string(args), want) {
+			t.Errorf("engine lookup args %q missing %q", args, want)
+		}
 	}
 }
 

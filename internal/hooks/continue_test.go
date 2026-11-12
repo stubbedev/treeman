@@ -74,7 +74,12 @@ func TestContinueOnErrorDoesNotHideLaunchFailure(t *testing.T) {
 func TestContinueOnErrorDoesNotHideRenderFailure(t *testing.T) {
 	root := t.TempDir()
 	_, err := RunHooks(context.Background(), "create-before-engines", []config.Action{
-		{Run: []string{"true"}, ContinueOnError: true, ComposeService: "frontend", Engine: filepath.Join(root, "missing-engine")},
+		{
+			Run:             []string{"true"},
+			ContinueOnError: true,
+			ComposeService:  "frontend",
+			ContainerEngine: filepath.Join(root, "missing-engine"),
+		},
 	}, root, root, "slug", false, emptyEnv(), true)
 	if err == nil || !strings.Contains(err.Error(), "container resolve") {
 		t.Fatalf("render error ignored: %v", err)

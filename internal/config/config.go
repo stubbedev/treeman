@@ -1329,9 +1329,9 @@ type HooksConfig struct {
 //   - `container` / `compose_service` (mutually exclusive) run the
 //     action inside the named container. `compose_service` resolves
 //     the running container via the standard compose labels; either
-//     way each step is wrapped in `<engine> exec <id> sh -c` and
-//     chained with `&&`. `in_container` is an accepted alias for
-//     `container`. `engine` is an alias for `container_engine`.
+//     way each step is wrapped in `<container_engine> exec <id> sh -c`
+//     and chained with `&&`. The container keys are the same
+//     ContainerRef keys a connection block takes.
 //
 // Actions within one trigger's list run in parallel; steps within
 // one action run sequentially.
@@ -1348,25 +1348,9 @@ type Action struct {
 	// against the container's WORKDIR (when wrapped). Optional.
 	Cwd string `yaml:"cwd,omitempty"`
 
-	// Container name or ID. When set, every step runs via
-	// `<engine> exec <id> sh -c '<cmd>'`. Mutually exclusive with
-	// ComposeService.
-	Container string `yaml:"container,omitempty"`
-
-	// ComposeService is the docker-compose service name. Treeman
-	// resolves the running container via the standard compose
-	// labels and wraps every step in `<engine> exec <id> sh -c`.
-	// Mutually exclusive with Container.
-	ComposeService string `yaml:"compose_service,omitempty"`
-
-	// ComposeProject is the docker-compose project (`-p` flag).
-	// Defaults to $COMPOSE_PROJECT_NAME / parent directory name.
-	// Only meaningful with ComposeService.
-	ComposeProject string `yaml:"compose_project,omitempty"`
-
-	// Engine is the container engine binary: `docker` (default),
-	// `podman`, `nerdctl`, `finch`.
-	Engine string `yaml:"container_engine,omitempty"`
+	// ContainerRef names the container every step is exec'd in.
+	// Unset runs the steps on the host.
+	ContainerRef `yaml:",inline"`
 }
 
 // JSONSchema describes the YAML shape — one map per action, with
@@ -1405,6 +1389,10 @@ func (Action) JSONSchema() *jsonschema.Schema {
 		Type:        "string",
 		Description: "Container engine binary used for the exec wrap: `docker` (default), `podman`, `nerdctl`, `finch`.",
 	})
+	props.Set("container_network", &jsonschema.Schema{
+		Type:        "string",
+		Description: "Docker network to prefer when the container is attached to several. Part of the container lookup key shared with connection blocks.",
+	})
 	return &jsonschema.Schema{
 		Type:                 "object",
 		Properties:           props,
@@ -1414,10 +1402,22 @@ func (Action) JSONSchema() *jsonschema.Schema {
 	}
 }
 
+var removedActionKeys = map[string]string{
+	"background":   "`background:` is no longer supported — hooks are always async",
+	"steps":        "`steps:` is no longer supported — use `run:` with a list of strings",
+	"in_container": "`in_container:` was removed — rename it to `container:`",
+	"engine":       "`engine:` was removed — rename it to `container_engine:`",
+}
+
+// plainAction is Action without its UnmarshalYAML, so the non-`run`
+// keys decode through yaml.v3's own field rules.
+type plainAction Action
+
 // UnmarshalYAML decodes one action map. Accepts both `run: string`
-// and `run: [string, ...]`. Rejects the legacy `background:`,
-// `steps:`, `in_container:`, and `engine:` keys loudly so old
-// configs surface a clear error rather than silently mis-parse.
+// and `run: [string, ...]`. Every key must be one Action declares:
+// the legacy `background:`, `steps:`, `in_container:` and `engine:`
+// keys fail with the rename to make, and any other unknown key fails
+// naming the accepted ones, so a typo never silently drops a setting.
 func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
 		return fmt.Errorf(
@@ -1425,55 +1425,54 @@ func (a *Action) UnmarshalYAML(node *yaml.Node) error {
 			node.Line,
 		)
 	}
-	for i := 0; i < len(node.Content); i += 2 {
-		switch node.Content[i].Value {
-		case "background":
-			return fmt.Errorf("action: `background:` is no longer supported — hooks are always async (line %d)", node.Content[i].Line)
-		case "steps":
-			return fmt.Errorf("action: `steps:` is no longer supported — use `run:` with a list of strings (line %d)", node.Content[i].Line)
-		case "in_container":
-			return fmt.Errorf("action: `in_container:` alias removed — use `container:` (line %d)", node.Content[i].Line)
-		case "engine":
-			return fmt.Errorf("action: `engine:` alias removed — use `container_engine:` (line %d)", node.Content[i].Line)
+	keys, _ := yamlKeys(reflect.TypeFor[Action]())
+	accepted := make([]string, 0, len(keys))
+	for _, k := range keys {
+		accepted = append(accepted, k.Name)
+	}
+	var run *yaml.Node
+	rest := *node
+	rest.Content = make([]*yaml.Node, 0, len(node.Content))
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := node.Content[i]
+		if msg, removed := removedActionKeys[key.Value]; removed {
+			return fmt.Errorf("action (line %d): %s", key.Line, msg)
 		}
+		if !slices.Contains(accepted, key.Value) {
+			return fmt.Errorf("action (line %d): unknown key %q (expected one of: %s)",
+				key.Line, key.Value, strings.Join(accepted, ", "))
+		}
+		if key.Value == "run" {
+			run = node.Content[i+1]
+			continue
+		}
+		rest.Content = append(rest.Content, key, node.Content[i+1])
 	}
-	var raw struct {
-		Run             yaml.Node `yaml:"run"`
-		ContinueOnError bool      `yaml:"continue_on_error"`
-		Cwd             string    `yaml:"cwd"`
-		Container       string    `yaml:"container"`
-		ComposeService  string    `yaml:"compose_service"`
-		ComposeProject  string    `yaml:"compose_project"`
-		Engine          string    `yaml:"container_engine"`
+	if run == nil {
+		return fmt.Errorf("action (line %d): `run:` is required", node.Line)
 	}
-	if err := node.Decode(&raw); err != nil {
-		return err
+	var decoded plainAction
+	if err := rest.Decode(&decoded); err != nil {
+		return fmt.Errorf("action (line %d): %w", node.Line, err)
 	}
-	switch raw.Run.Kind {
+	switch run.Kind {
 	case yaml.ScalarNode:
-		a.Run = []string{raw.Run.Value}
+		decoded.Run = []string{run.Value}
 	case yaml.SequenceNode:
-		a.Run = make([]string, 0, len(raw.Run.Content))
-		for _, child := range raw.Run.Content {
+		decoded.Run = make([]string, 0, len(run.Content))
+		for _, child := range run.Content {
 			if child.Kind != yaml.ScalarNode {
 				return fmt.Errorf("action (line %d): every entry in `run:` must be a string", child.Line)
 			}
-			a.Run = append(a.Run, child.Value)
+			decoded.Run = append(decoded.Run, child.Value)
 		}
-	case 0:
-		return fmt.Errorf("action (line %d): `run:` is required", node.Line)
 	default:
-		return fmt.Errorf("action (line %d): `run:` must be a string or list of strings", node.Line)
+		return fmt.Errorf("action (line %d): `run:` must be a string or list of strings", run.Line)
 	}
-	a.ContinueOnError = raw.ContinueOnError
-	a.Cwd = raw.Cwd
-	a.Container = raw.Container
-	a.ComposeService = raw.ComposeService
-	a.ComposeProject = raw.ComposeProject
-	a.Engine = raw.Engine
-	if a.Container != "" && a.ComposeService != "" {
-		return fmt.Errorf("action (line %d): set either `container:` or `compose_service:`, not both", node.Line)
+	if err := decoded.validate(fmt.Sprintf("action (line %d)", node.Line)); err != nil {
+		return err
 	}
+	*a = Action(decoded)
 	return nil
 }
 
@@ -1860,10 +1859,11 @@ func (f *FilteredAction) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
 		return fmt.Errorf("file-change action (line %d): want a mapping", node.Line)
 	}
-	// Pull the `match:` value out separately so we can accept both
-	// scalar + sequence forms. Other keys are decoded by Action.
+	rest := *node
+	rest.Content = make([]*yaml.Node, 0, len(node.Content))
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		if node.Content[i].Value != "match" {
+			rest.Content = append(rest.Content, node.Content[i], node.Content[i+1])
 			continue
 		}
 		v := node.Content[i+1]
@@ -1883,9 +1883,8 @@ func (f *FilteredAction) UnmarshalYAML(node *yaml.Node) error {
 		default:
 			return fmt.Errorf("file-change (line %d): `match` must be a string or list of strings", v.Line)
 		}
-		break
 	}
-	return f.Action.UnmarshalYAML(node)
+	return f.Action.UnmarshalYAML(&rest)
 }
 
 // Matches reports whether this action's label filter accepts an

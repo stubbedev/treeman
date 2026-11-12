@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeTmp(t *testing.T, body string) string {
@@ -197,19 +199,68 @@ hooks:
 	}
 }
 
-// TestActionInContainerAliasRejected asserts the removed `in_container:`
-// alias produces a clear error rather than silently mis-parsing.
-func TestActionInContainerAliasRejected(t *testing.T) {
+func TestActionRejectsRemovedAndUnknownKeys(t *testing.T) {
+	for _, tc := range []struct{ key, want string }{
+		{"engine: podman", "rename it to `container_engine:`"},
+		{"in_container: app", "rename it to `container:`"},
+		{"steps: [a]", "use `run:` with a list of strings"},
+		{"background: true", "hooks are always async"},
+		{"container_net: backend", `unknown key "container_net" (expected one of: run, continue_on_error, cwd, container, compose_service, compose_project, container_engine, container_network)`},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			d := writeTmp(t, "repo: x\nhooks:\n  create-before-engines:\n    - run: \"composer install\"\n      "+tc.key+"\n")
+			_, err := LoadLayered(d)
+			if err == nil {
+				t.Fatalf("%s: want error", tc.key)
+			}
+			if !strings.Contains(err.Error(), "action (line 5)") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%s: error %q should locate the key and say %q", tc.key, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestFileChangeActionRejectsUnknownKeyButAcceptsMatch(t *testing.T) {
+	var ok FilteredAction
+	if err := yaml.Unmarshal([]byte("match: [a, b]\nrun: x\ncontainer_network: backend"), &ok); err != nil {
+		t.Fatal(err)
+	}
+	if len(ok.Match) != 2 || ok.Network != "backend" {
+		t.Fatalf("filtered action: %+v", ok)
+	}
+	var bad FilteredAction
+	err := yaml.Unmarshal([]byte("match: a\nrun: x\nengine: podman"), &bad)
+	if err == nil || !strings.Contains(err.Error(), "container_engine") {
+		t.Fatalf("legacy engine key under file-change: %v", err)
+	}
+}
+
+func TestActionContainerRefKeys(t *testing.T) {
 	d := writeTmp(t, `
 repo: x
 hooks:
   create-before-engines:
-    - run: "composer install"
-      in_container: app
+    - compose_service: app
+      compose_project: myproj
+      container_engine: podman
+      container_network: backend
+      run: "composer install"
 `)
-	_, err := LoadLayered(d)
-	if err == nil {
-		t.Fatal("want error for removed in_container alias")
+	cfg, err := LoadLayered(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ContainerRef{ComposeService: "app", ComposeProject: "myproj", ContainerEngine: "podman", Network: "backend"}
+	if got := cfg.Hooks.OnCreateBeforeEngines[0].ContainerRef; got != want {
+		t.Fatalf("ContainerRef = %+v, want %+v", got, want)
+	}
+}
+
+func TestActionContainerAndComposeServiceExclusive(t *testing.T) {
+	var a Action
+	err := yaml.Unmarshal([]byte("run: x\ncontainer: a\ncompose_service: b"), &a)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("want mutual-exclusion error, got %v", err)
 	}
 }
 
@@ -230,7 +281,7 @@ hooks:
 		t.Fatal(err)
 	}
 	a := cfg.Hooks.OnCreateBeforeEngines[0]
-	if a.ComposeService != "app" || a.ComposeProject != "myproj" || a.Engine != "podman" {
+	if a.ComposeService != "app" || a.ComposeProject != "myproj" || a.ContainerEngine != "podman" {
 		t.Errorf("meta: %#v", a)
 	}
 	if len(a.Run) != 2 {

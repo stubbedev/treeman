@@ -311,13 +311,7 @@ func renderAction(ctx context.Context, a config.Action, defaultCwd string) (stri
 		}
 		return strings.Join(parts, " && "), nil
 	}
-	// Container exec path.
-	opts := containerip.Opts{
-		Container:      a.Container,
-		ComposeService: a.ComposeService,
-		ComposeProject: a.ComposeProject,
-		Engine:         a.Engine,
-	}
+	opts := containerip.FromRef(a.ContainerRef, 0)
 	engine := opts.EngineBin()
 	id, err := containerip.ContainerID(ctx, opts)
 	if err != nil {
