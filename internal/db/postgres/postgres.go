@@ -22,6 +22,7 @@ import (
 	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/ident"
+	"github.com/stubbedev/treeman/internal/migrations/framework"
 )
 
 // Driver wraps a server-level *sql.DB so DDL like CREATE DATABASE
@@ -102,6 +103,40 @@ func (d *Driver) OpenScoped(ctx context.Context, dbName string) (*sql.DB, error)
 		return nil, fmt.Errorf("ping postgres %s: %w", dbName, err)
 	}
 	return db, nil
+}
+
+// AppliedBatches reads t from database db (in its current schema): the
+// batch of every migration it records, keyed by name. found is false
+// when db has no such table with both columns.
+func (d *Driver) AppliedBatches(ctx context.Context, db string, t framework.BatchTable) (map[string]int, bool, error) {
+	qt, err := ident.QuotePostgres(t.Table)
+	if err != nil {
+		return nil, false, err
+	}
+	qn, err := ident.QuotePostgres(t.NameColumn)
+	if err != nil {
+		return nil, false, err
+	}
+	qb, err := ident.QuotePostgres(t.BatchColumn)
+	if err != nil {
+		return nil, false, err
+	}
+	scoped, err := d.OpenScoped(ctx, db)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = scoped.Close() }()
+	batches, found, err := adapter.AppliedBatches(
+		ctx,
+		scoped,
+		`SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name IN ($2, $3)`,
+		[]any{t.Table, t.NameColumn, t.BatchColumn},
+		"SELECT "+qn+", "+qb+" FROM "+qt,
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("postgres %s.%s: %w", db, t.Table, err)
+	}
+	return batches, found, nil
 }
 
 func (d *Driver) EngineVersion(ctx context.Context) (string, error) {

@@ -69,6 +69,7 @@ const (
 	EvtSnapshotsCacheMiss     = "snapshots:cache:miss"
 	EvtSnapshotsCacheFallback = "snapshots:cache:fallback"
 	EvtSnapshotsStrategy      = "snapshots:strategy"
+	EvtSnapshotsLedgerUnknown = "snapshots:ledger:unknown"
 	EvtSnapshotsEvictCap      = "snapshots:evict:cap"
 	EvtSnapshotsEvictSource   = "snapshots:evict:source"
 	EvtSnapshotsEvictAge      = "snapshots:evict:age"

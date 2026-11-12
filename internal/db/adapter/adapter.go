@@ -112,3 +112,48 @@ func ConfigurePool(db *sql.DB, poolMax int) {
 	db.SetConnMaxLifetime(30 * time.Minute)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 }
+
+// AppliedBatches reads a framework's batch ledger table through db:
+// countColumns must count the table's name and batch columns (2 when
+// the table exists with both), selectRows must return its (name, batch)
+// rows. found is false when the table or one of its columns is absent.
+// The ledger holds one row per applied migration, so the read is
+// bounded by the migration count.
+func AppliedBatches(
+	ctx context.Context,
+	db *sql.DB,
+	countColumns string,
+	countArgs []any,
+	selectRows string,
+) (batches map[string]int, found bool, err error) {
+	var cols int
+	if err := db.QueryRowContext(ctx, countColumns, countArgs...).Scan(&cols); err != nil {
+		return nil, false, fmt.Errorf("look up the migration ledger table: %w", err)
+	}
+	if cols != 2 {
+		return nil, false, nil
+	}
+	rows, err := db.QueryContext(ctx, selectRows)
+	if err != nil {
+		return nil, false, fmt.Errorf("read the migration ledger: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	batches = map[string]int{}
+	for rows.Next() {
+		var (
+			name  string
+			batch int
+		)
+		if err := rows.Scan(&name, &batch); err != nil {
+			return nil, false, fmt.Errorf("read the migration ledger: %w", err)
+		}
+		if _, dup := batches[name]; dup {
+			return nil, false, fmt.Errorf("the migration ledger records %q twice", name)
+		}
+		batches[name] = batch
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("read the migration ledger: %w", err)
+	}
+	return batches, true, nil
+}

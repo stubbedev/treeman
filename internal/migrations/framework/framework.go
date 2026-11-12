@@ -30,9 +30,9 @@ const (
 	OnDelta   OnModify = "delta"
 )
 
-// Spec describes one migration framework. Consumed only by
-// `treeman init` (scaffolding) and `treeman fw detect` (diagnostic) —
-// nothing at runtime dispatches off a Spec, so these fields are pure
+// Spec describes one migration framework. Consumed by `treeman init`
+// (scaffolding) and `treeman fw detect` (diagnostic); at runtime only
+// Batches is read (see BatchTables), so the other fields are pure
 // templating data.
 type Spec struct {
 	Name          string
@@ -63,6 +63,10 @@ type Spec struct {
 	// RollbackEnv is the env-var override map for the rollback command —
 	// the same DB-targeting env as MigrateEnv. Empty when RollbackRun is.
 	RollbackEnv map[string]string
+	// Batches, when non-nil, names the table the framework records
+	// its applied migrations in, with the run (batch) that applied
+	// each. Nil for frameworks that unwind by name alone.
+	Batches *BatchTable `yaml:"-" json:"-"`
 	// Validate, when non-nil, runs after the marker check and must
 	// also pass for Detect to return true. Used to disambiguate
 	// frameworks whose Markers are too coarse on their own (e.g.
@@ -75,6 +79,41 @@ type Spec struct {
 	// reflection panics and the entire `treeman mcp` server fails to
 	// boot. Mirrors testfw.Spec.Detect.
 	Validate Validator `yaml:"-" json:"-"`
+}
+
+// BatchTable is the ledger table of a framework that applies pending
+// migrations in numbered batches and unwinds `rollback N` by batch,
+// then by name. Prepare reads it from a database restored from a dump,
+// whose applied migrations treeman did not run itself.
+type BatchTable struct {
+	Table       string
+	NameColumn  string
+	BatchColumn string
+	// NameKeepsExt reports whether the name column holds the
+	// migration file's basename with its extension; otherwise without.
+	NameKeepsExt bool
+}
+
+// MigrationName returns the name column value the framework records
+// for the migration file at path.
+func (t BatchTable) MigrationName(path string) string {
+	base := filepath.Base(path)
+	if t.NameKeepsExt {
+		return base
+	}
+	return strings.TrimSuffix(base, filepath.Ext(base))
+}
+
+// BatchTables returns the ledger tables of every built-in framework
+// that applies migrations in batches, in registry order.
+func BatchTables() []BatchTable {
+	var out []BatchTable
+	for _, s := range builtins() {
+		if s.Batches != nil {
+			out = append(out, *s.Batches)
+		}
+	}
+	return out
 }
 
 // Detect returns true iff every marker group in spec.Markers has at
@@ -362,6 +401,7 @@ func builtinsClassic() []Spec {
 				"DB_DATABASE":      "{target_db}",
 				"DB_TEST_DATABASE": "{target_db}",
 			},
+			Batches: &BatchTable{Table: "migrations", NameColumn: "migration", BatchColumn: "batch"},
 		},
 		{
 			Name:          "rails",
@@ -454,6 +494,7 @@ func builtinsJSAndOther() []Spec {
 			OnModify:      OnRebuild,
 			MigrateRun:    "npx knex migrate:latest",
 			MigrateEnv:    dbNameEnv(),
+			Batches:       &BatchTable{Table: "knex_migrations", NameColumn: "name", BatchColumn: "batch", NameKeepsExt: true},
 		},
 		{
 			Name:          "alembic",

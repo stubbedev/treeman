@@ -28,6 +28,7 @@ import (
 	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/ident"
+	"github.com/stubbedev/treeman/internal/migrations/framework"
 )
 
 // Driver wraps a *sql.DB plus the connection config used to open it.
@@ -281,6 +282,36 @@ func (d *Driver) DatabaseExists(ctx context.Context, name string) (bool, error) 
 		return false, err
 	}
 	return true, nil
+}
+
+// AppliedBatches reads t from database db: the batch of every migration
+// it records, keyed by name. found is false when db has no such table
+// with both columns.
+func (d *Driver) AppliedBatches(ctx context.Context, db string, t framework.BatchTable) (map[string]int, bool, error) {
+	qdb, err := ident.QuoteMySQL(db)
+	if err != nil {
+		return nil, false, err
+	}
+	qt, err := ident.QuoteMySQL(t.Table)
+	if err != nil {
+		return nil, false, err
+	}
+	qn, err := ident.QuoteMySQL(t.NameColumn)
+	if err != nil {
+		return nil, false, err
+	}
+	qb, err := ident.QuoteMySQL(t.BatchColumn)
+	if err != nil {
+		return nil, false, err
+	}
+	batches, found, err := adapter.AppliedBatches(ctx, d.DB,
+		`SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME IN (?, ?)`,
+		[]any{db, t.Table, t.NameColumn, t.BatchColumn},
+		"SELECT "+qn+", "+qb+" FROM "+qdb+"."+qt)
+	if err != nil {
+		return nil, false, fmt.Errorf("mysql %s.%s: %w", db, t.Table, err)
+	}
+	return batches, found, nil
 }
 
 // FlushDatabase drops + recreates `name`, leaving it empty.

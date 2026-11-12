@@ -3,14 +3,17 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 )
 
 // AppliedLedger records, for every input file a template's migrate runs
-// applied, the 0-based index of the run (batch) that applied it. A cold
-// or dump-only build applies every file in one run; an incremental build
-// applies the files its ancestor lacked in one more run.
+// applied, the run (batch) that applied it; only the batches' order
+// matters. A cold build without a dump applies every file in one run;
+// a build on a restored dump keeps the batches the framework recorded
+// (LedgerFromBatches); an incremental build applies the files its
+// ancestor lacked in one more run.
 //
 // Frameworks disagree on the order `rollback N` unwinds: Laravel unwinds
 // by batch, then by name; Rails, Ecto and golang-migrate by name alone.
@@ -28,6 +31,71 @@ type AppliedLedger struct {
 // applied every file in inputs at once.
 func NewAppliedLedger(inputs map[string]InputVector) *AppliedLedger {
 	return (&AppliedLedger{batch: map[string]int{}}).Advance(inputs)
+}
+
+// LedgerFromBatches returns the ledger of a template whose framework
+// recorded the batch of every migration it applied, keyed by migration
+// name; nameOf maps an input path to that name. It is the ledger of a
+// database restored from a dump, whose migrations treeman did not
+// apply itself. Every input outside lockfileGlobs must have a recorded
+// batch, and every recorded migration no input names must come before
+// all of the inputs' in batch order: a rollback reaches it otherwise,
+// and nothing on disk says how to unwind it. The error says which
+// condition failed.
+func LedgerFromBatches(
+	inputs map[string]InputVector,
+	lockfileGlobs map[string]struct{},
+	batches map[string]int,
+	nameOf func(path string) string,
+) (*AppliedLedger, error) {
+	ledgerInputs := withoutGlobs(inputs, lockfileGlobs)
+	out := make(map[string]int, vectorTotalLen(ledgerInputs))
+	named := make(map[string]struct{}, len(out))
+	var first *batchedName
+	for _, v := range ledgerInputs {
+		for _, fh := range v {
+			name := nameOf(fh.Path)
+			b, ok := batches[name]
+			if !ok {
+				return nil, fmt.Errorf("the migration ledger has no row for input %s (migration %q)", fh.Path, name)
+			}
+			out[fh.Path] = b
+			named[name] = struct{}{}
+			if bn := (batchedName{b, name}); first == nil || bn.less(*first) {
+				first = &bn
+			}
+		}
+	}
+	if first == nil {
+		return &AppliedLedger{batch: out}, nil
+	}
+	for _, name := range slices.Sorted(maps.Keys(batches)) {
+		if _, ok := named[name]; ok {
+			continue
+		}
+		if bn := (batchedName{batches[name], name}); !bn.less(*first) {
+			return nil, fmt.Errorf(
+				"the migration ledger records %q in batch %d, which no input names, after input migration %q in batch %d",
+				name,
+				bn.batch,
+				first.name,
+				first.batch,
+			)
+		}
+	}
+	return &AppliedLedger{batch: out}, nil
+}
+
+type batchedName struct {
+	batch int
+	name  string
+}
+
+func (a batchedName) less(b batchedName) bool {
+	if a.batch != b.batch {
+		return a.batch < b.batch
+	}
+	return a.name < b.name
 }
 
 // Advance returns the ledger after one more migrate run against inputs:

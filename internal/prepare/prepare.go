@@ -42,6 +42,7 @@ import (
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/engine"
+	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
 	"github.com/stubbedev/treeman/internal/runid"
@@ -1032,6 +1033,7 @@ func prepareMySQL(
 				string(drv.LastCloneStrategy()))
 			return nil
 		},
+		appliedBatches: drv.AppliedBatches,
 	}
 	dumpKey := dumpOnlySnapshotKey(d.Engine, d.Connection, version, key.DumpHashHex)
 
@@ -1120,9 +1122,13 @@ func prepareMySQL(
 	if err != nil {
 		return Outcome{}, err
 	}
+	ledger, err := builtLedger(ctx, st, repoID, worktreeID, d, sourceDB, inputs, ops.appliedBatches)
+	if err != nil {
+		return Outcome{}, err
+	}
 	if drv.PreferLogicalFor(ctx, sourceDB) {
 		if err := mysqlMergedColdFanout(ctx, drv, cfg, d, st, repoID, worktreeID,
-			sourceDB, templateName, version, key, inputs, clones, budget); err != nil {
+			sourceDB, templateName, version, key, inputs, ledger, clones, budget); err != nil {
 			return Outcome{}, err
 		}
 	} else {
@@ -1139,6 +1145,7 @@ func prepareMySQL(
 			version,
 			key,
 			inputs,
+			ledger,
 		); err != nil {
 			return Outcome{}, err
 		}
@@ -1570,6 +1577,7 @@ func mysqlSnapshotAndRecord(
 	sourceDB, templateName, version string,
 	key snapshot.Key,
 	inputs map[string]store.InputVector,
+	ledger *store.AppliedLedger,
 ) error {
 	snapStart := time.Now()
 	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
@@ -1578,7 +1586,7 @@ func mysqlSnapshotAndRecord(
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
 	emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, sourceDB, templateName, string(drv.LastCloneStrategy()))
 	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName,
-		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
+		inputs, ledger, repoID); err != nil {
 		return err
 	}
 	// Fire-and-forget LRU eviction for this repo. Uses a fresh
@@ -1613,6 +1621,7 @@ func mysqlMergedColdFanout(
 	sourceDB, templateName, version string,
 	key snapshot.Key,
 	inputs map[string]store.InputVector,
+	ledger *store.AppliedLedger,
 	clones []string,
 	budget fanoutBudget,
 ) error {
@@ -1712,7 +1721,7 @@ func mysqlMergedColdFanout(
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", started)
 	emitCloneStrategy(ctx, st, repoID, worktreeID, d.Engine, sourceDB, templateName, string(drv.LastCloneStrategy()))
 	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName,
-		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
+		inputs, ledger, repoID); err != nil {
 		return err
 	}
 	spawnEvict(cfg, st, repoID)
@@ -1827,6 +1836,56 @@ type incrementalOps struct {
 	// (mysql DDL+INSERT, postgres CREATE DATABASE TEMPLATE, mongo $out,
 	// redis COPY, ES _clone). Wraps the per-driver SnapshotCreate.
 	snapshotCreate func(ctx context.Context, source, template string) error
+	// appliedBatches reads a framework's batch ledger table from a
+	// database; nil for engines that hold no such table.
+	appliedBatches batchReader
+}
+
+// batchReader reads framework batch table t from database db: the batch
+// of every migration it records, keyed by name; found is false when db
+// has no such table.
+type batchReader func(ctx context.Context, db string, t framework.BatchTable) (batches map[string]int, found bool, err error)
+
+// builtLedger returns the applied ledger of the template about to be
+// snapshotted from source after a full build. Without a dump treeman
+// applied every input in one migrate run. A dump brings migrations
+// treeman did not apply, in whatever batches the dump recorded: they
+// are read from the framework's batch table when the restored database
+// has one; a framework without batches unwinds by name, which one run
+// already describes. A batch table the inputs do not account for
+// leaves the ledger unknown, so the template is never a rollback
+// ancestor.
+func builtLedger(
+	ctx context.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+	d config.DatabaseConfig,
+	source string,
+	inputs map[string]store.InputVector,
+	read batchReader,
+) (*store.AppliedLedger, error) {
+	if len(d.Dump) == 0 || read == nil {
+		return store.NewAppliedLedger(inputs), nil
+	}
+	for _, t := range framework.BatchTables() {
+		batches, found, err := read(ctx, source, t)
+		if err != nil {
+			return nil, fmt.Errorf("read the applied migrations of %s: %w", source, err)
+		}
+		if !found {
+			continue
+		}
+		ledger, lerr := store.LedgerFromBatches(inputs, config.LockfileGlobs(d.Inputs), batches, t.MigrationName)
+		if lerr != nil {
+			_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtSnapshotsLedgerUnknown,
+				fmt.Sprintf("%s/%s: %v; the template is never a rollback ancestor", d.Engine, source, lerr),
+				repoID, worktreeID, "", 0, map[string]string{
+					"engine": d.Engine, "source_db": source, "table": t.Table, "error": lerr.Error(),
+				})
+		}
+		return ledger, nil
+	}
+	return store.NewAppliedLedger(inputs), nil
 }
 
 // tryIncrementalBuild looks for a content-prefix ancestor template and,
@@ -2146,8 +2205,12 @@ func tryDumpOnlyBuild(
 		}
 	}
 
+	ledger, err := builtLedger(ctx, st, repoID, worktreeID, d, source, inputs, ops.appliedBatches)
+	if err != nil {
+		return Outcome{}, false, err
+	}
 	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st,
-		repoID, worktreeID, source, templateName, version, budget, key, inputs, store.NewAppliedLedger(inputs), ops)
+		repoID, worktreeID, source, templateName, version, budget, key, inputs, ledger, ops)
 	if err != nil {
 		return Outcome{}, false, err
 	}
@@ -2432,6 +2495,7 @@ func preparePostgres(
 		exists:          drv.DatabaseExists,
 		snapshotRestore: drv.SnapshotRestore,
 		snapshotCreate:  drv.SnapshotCreate,
+		appliedBatches:  drv.AppliedBatches,
 	}
 	dumpKey := dumpOnlySnapshotKey(d.Engine, d.Connection, version, key.DumpHashHex)
 
@@ -2473,8 +2537,12 @@ func preparePostgres(
 	); err != nil {
 		return Outcome{}, err
 	}
+	ledger, err := builtLedger(ctx, st, repoID, worktreeID, d, sourceDB, inputs, ops.appliedBatches)
+	if err != nil {
+		return Outcome{}, err
+	}
 	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
-		sourceDB, templateName, version, budget, key, inputs, store.NewAppliedLedger(inputs), ops)
+		sourceDB, templateName, version, budget, key, inputs, ledger, ops)
 	if err != nil {
 		return Outcome{}, err
 	}

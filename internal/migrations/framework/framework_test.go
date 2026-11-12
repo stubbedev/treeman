@@ -172,3 +172,25 @@ func TestRegistryForMapsCustomFrameworkFields(t *testing.T) {
 			len(r.Specs), len(DefaultRegistry().Specs))
 	}
 }
+
+func TestBatchTablesNameMigrationsLikeTheirFramework(t *testing.T) {
+	byTable := map[string]BatchTable{}
+	for _, bt := range BatchTables() {
+		byTable[bt.Table] = bt
+	}
+	cases := []struct {
+		table, path, want string
+	}{
+		{"migrations", "database/migrations/2024_01_01_000000_create_users.php", "2024_01_01_000000_create_users"},
+		{"knex_migrations", "migrations/20240101_create_users.js", "20240101_create_users.js"},
+	}
+	for _, tc := range cases {
+		bt, ok := byTable[tc.table]
+		if !ok {
+			t.Fatalf("no built-in framework records batches in %q", tc.table)
+		}
+		if got := bt.MigrationName(tc.path); got != tc.want {
+			t.Errorf("%s: MigrationName(%q) = %q, want %q", tc.table, tc.path, got, tc.want)
+		}
+	}
+}
