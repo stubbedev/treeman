@@ -47,7 +47,7 @@ func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("%s probe of %s interrupted: %w", engine, addr, ctxErr)
 	}
-	if probeCtx.Err() != nil {
+	if probeCtx.Err() != nil || isTimeout(err) {
 		return fmt.Errorf(
 			"%s unreachable at %s (tcp connect timeout — is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`)",
 			engine,
@@ -159,6 +159,11 @@ func HostPort(engine, raw string) (string, uint16, error) {
 		return host, dp, nil
 	}
 	return "", 0, fmt.Errorf("%s: no port in URI %q and no default for scheme %q", engine, raw, u.Scheme)
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func isLoopback(host string) bool {
