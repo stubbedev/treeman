@@ -13,10 +13,10 @@ func TestSharedOnceRunsOnceForConcurrentCallers(t *testing.T) {
 	var s sharedOnce[string]
 	var calls atomic.Int32
 	gate := make(chan struct{})
-	compute := func(context.Context) (string, error) {
+	compute := func(ctx context.Context) (string, error) {
 		calls.Add(1)
 		<-gate
-		return "staged", nil
+		return "staged", ctx.Err()
 	}
 	const callers = 8
 	results := make(chan string, callers)
@@ -96,10 +96,10 @@ func TestSharedOnceWaiterStopsWhenItsOwnContextEnds(t *testing.T) {
 	var s sharedOnce[string]
 	started := make(chan struct{})
 	gate := make(chan struct{})
-	compute := func(context.Context) (string, error) {
+	compute := func(ctx context.Context) (string, error) {
 		close(started)
 		<-gate
-		return "staged", nil
+		return "staged", ctx.Err()
 	}
 	leaderResult := make(chan string, 1)
 	go func() {

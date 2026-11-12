@@ -177,7 +177,7 @@ func cwdRepoRoot() (string, error) {
 	}
 	root, err := DiscoverRepoRoot(cwd)
 	if err != nil {
-		return "", nil
+		return "", nil //nolint:nilerr // outside a repo the show lookup is deliberately unscoped
 	}
 	return root, nil
 }
