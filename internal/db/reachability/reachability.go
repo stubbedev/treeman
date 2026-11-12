@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strconv"
@@ -30,10 +31,85 @@ const StartupWait = 2 * time.Minute
 
 const pollInterval = 250 * time.Millisecond
 
+// Reason is why an engine did not answer: each one is what an engine
+// that is down or still starting looks like from treeman's side.
+type Reason int
+
+const (
+	// Refused: the host answered, but nothing listens on the port.
+	Refused Reason = iota + 1
+	// TimedOut: the TCP connect timed out (the port is filtered, or
+	// nothing listens yet behind a proxy that drops the SYN).
+	TimedOut
+	// ContainerDown: the engine's container is stopped or not created.
+	ContainerDown
+	// HandshakeDropped: TCP connected but the connection was refused,
+	// reset or closed during the protocol handshake, as when docker's
+	// userland proxy accepts before the engine listens.
+	HandshakeDropped
+	// Starting: the engine completed the handshake to say it does not
+	// accept connections yet.
+	Starting
+)
+
+func (r Reason) String() string {
+	switch r {
+	case Refused:
+		return "tcp connect refused"
+	case TimedOut:
+		return "tcp connect timeout"
+	case ContainerDown:
+		return "container not running"
+	case HandshakeDropped:
+		return "connection dropped during the protocol handshake"
+	case Starting:
+		return "engine still starting"
+	}
+	return fmt.Sprintf("reason(%d)", int(r))
+}
+
+// UnreachableError is an engine that did not answer for a Reason that
+// waiting can get past: the create pipeline waits for it at startup
+// (WaitFor with IsUnreachable) and the daemon re-runs a create that
+// failed on it once the engine answers. A failure the engine itself
+// reports (bad credentials, an unknown database) is never one.
+type UnreachableError struct {
+	Engine string
+	// Addr is the host:port dialled, or the container reference for
+	// ContainerDown.
+	Addr   string
+	Reason Reason
+	// Hint, when set, says what to check.
+	Hint string
+	// Err is the underlying failure; nil for TimedOut.
+	Err error
+}
+
+func (e *UnreachableError) Error() string {
+	msg := fmt.Sprintf("%s unreachable at %s (%s", e.Engine, e.Addr, e.Reason)
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	if e.Hint != "" {
+		msg += " — " + e.Hint
+	}
+	return msg + ")"
+}
+
+func (e *UnreachableError) Unwrap() error { return e.Err }
+
+// IsUnreachable reports whether err is, or wraps, an engine that is
+// down or still starting (an *UnreachableError).
+func IsUnreachable(err error) bool {
+	_, ok := errors.AsType[*UnreachableError](err)
+	return ok
+}
+
 // ProbeCtx tries a single TCP connect bounded by ctx and DefaultTimeout,
-// whichever ends first, and returns immediately on failure. When ctx
-// itself ends first the returned error wraps ctx.Err(), so a caller's
-// cancellation or deadline is never reported as an unreachable service.
+// whichever ends first, and returns immediately on failure. A refusal
+// or a connect timeout is an *UnreachableError. When ctx itself ends
+// first the returned error wraps ctx.Err(), so a caller's cancellation
+// or deadline is never reported as an unreachable service.
 func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
 	probeCtx, cancel := context.WithTimeout(ctx, DefaultTimeout)
 	defer cancel()
@@ -48,21 +124,20 @@ func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
 		return fmt.Errorf("%s probe of %s interrupted: %w", engine, addr, ctxErr)
 	}
 	if probeCtx.Err() != nil || isTimeout(err) {
-		return fmt.Errorf(
-			"%s unreachable at %s (tcp connect timeout — is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`)",
-			engine,
-			addr,
+		return &UnreachableError{Engine: engine, Addr: addr, Reason: TimedOut, Hint: fmt.Sprintf(
+			"is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`",
 			port,
-		)
+		)}
 	}
-	outcome, hint := "failed", "if the service is in docker, set `container:`/`compose_service:` so treeman can find its bridge IP or published port"
-	if IsRefused(err) {
-		outcome = "refused"
-		if isLoopback(host) {
-			hint = "nothing is listening there: the engine is down or still starting, check `treeman doctor`"
-		}
+	containerHint := "if the service is in docker, set `container:`/`compose_service:` so treeman can find its bridge IP or published port"
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return fmt.Errorf("%s unreachable at %s (tcp connect failed: %w — %s)", engine, addr, err, containerHint)
 	}
-	return fmt.Errorf("%s unreachable at %s (tcp connect %s: %w — %s)", engine, addr, outcome, err, hint)
+	hint := containerHint
+	if isLoopback(host) {
+		hint = "nothing is listening there: the engine is down or still starting, check `treeman doctor`"
+	}
+	return &UnreachableError{Engine: engine, Addr: addr, Reason: Refused, Hint: hint, Err: err}
 }
 
 // ProbeURLCtx parses a URL-style connection string and probes the
@@ -75,11 +150,55 @@ func ProbeURLCtx(ctx context.Context, engine, raw string) error {
 	return ProbeCtx(ctx, engine, host, port)
 }
 
-// IsRefused reports whether err is a TCP connect refusal: the host
-// answered but nothing listens on the port, which is what an engine
-// that is down or still starting looks like.
-func IsRefused(err error) bool {
-	return errors.Is(err, syscall.ECONNREFUSED)
+// HandshakeError classifies err, the failure of a driver's protocol
+// handshake with engine at addr under ctx. A transport failure is an
+// *UnreachableError: the connect refused or timed out, or the
+// connection was reset or closed before the handshake completed
+// (io.EOF, ECONNRESET, EPIPE, or one of the driver's own lost-connection
+// sentinels in lost). Any other error, notably one the engine reported
+// (authentication, an unknown database), and any failure after ctx
+// ended, is returned unchanged.
+func HandshakeError(ctx context.Context, engine, addr string, err error, lost ...error) error {
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+	var reason Reason
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		reason = Refused
+	case connectionLost(err, lost):
+		reason = HandshakeDropped
+	case isTimeout(err):
+		reason = TimedOut
+	default:
+		return err
+	}
+	return &UnreachableError{Engine: engine, Addr: addr, Reason: reason, Err: err}
+}
+
+// StartingError is engine at addr answering its handshake with err, a
+// refusal that says it is still starting (postgres 57P03, redis
+// LOADING, an Elasticsearch cluster below yellow health).
+func StartingError(engine, addr string, err error) *UnreachableError {
+	return &UnreachableError{Engine: engine, Addr: addr, Reason: Starting, Err: err}
+}
+
+// droppedConnection are the transport errors of a connection the peer
+// closed or reset.
+var droppedConnection = [...]error{io.EOF, io.ErrUnexpectedEOF, syscall.ECONNRESET, syscall.EPIPE, syscall.ECONNABORTED}
+
+func connectionLost(err error, lost []error) bool {
+	for _, target := range droppedConnection {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	for _, target := range lost {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
 }
 
 type startupWaitKey struct{}

@@ -13,6 +13,7 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
+	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
 // Driver wraps go-redis's Client. Clients are pooled per db index
@@ -32,21 +33,30 @@ type Driver struct {
 	copySupported bool
 }
 
-// Connect probes TCP reachability + parses the URL once. Per-db
-// clients are opened lazily.
+// Connect probes TCP reachability, parses the URL and completes one
+// PING on the base client. A PING the server never got to answer (the
+// connection refused, reset or closed), or answered with LOADING, is
+// an engine-unreachable failure. Per-db clients are opened lazily.
 func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
-	url, err := adapter.ResolveAndProbeURL(ctx, "redis", containerip.FromRef(cfg.ContainerRef, containerip.URIPort(cfg.URL, 6379)), cfg.URL)
-	if err != nil {
-		return nil, err
-	}
-	opts, err := redis.ParseURL(url)
-	if err != nil {
-		return nil, fmt.Errorf("redis url: %w", err)
-	}
-	if cfg.PoolMax > 0 {
-		opts.PoolSize = int(cfg.PoolMax)
-	}
-	return &Driver{baseOpts: opts, clients: map[int]*redis.Client{}}, nil
+	opts := containerip.FromRef(cfg.ContainerRef, containerip.URIPort(cfg.URL, 6379))
+	return adapter.ConnectURL(ctx, "redis", opts, cfg.URL, func(ctx context.Context, url, addr string) (*Driver, error) {
+		o, err := redis.ParseURL(url)
+		if err != nil {
+			return nil, fmt.Errorf("redis url: %w", err)
+		}
+		if cfg.PoolMax > 0 {
+			o.PoolSize = int(cfg.PoolMax)
+		}
+		base := redis.NewClient(o)
+		if err := base.Ping(ctx).Err(); err != nil {
+			_ = base.Close()
+			if redis.IsLoadingError(err) {
+				return nil, fmt.Errorf("ping redis: %w", reachability.StartingError("redis", addr, err))
+			}
+			return nil, fmt.Errorf("ping redis: %w", reachability.HandshakeError(ctx, "redis", addr, err))
+		}
+		return &Driver{baseOpts: o, clients: map[int]*redis.Client{-1: base}}, nil
+	})
 }
 
 // Close shuts down every pooled client.

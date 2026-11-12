@@ -81,12 +81,15 @@ it touched are reset like after a failed prepare. Either way it is
 re-run like a transient failure, counting the interrupted run's own
 re-run number.
 
-A create whose prepare failed only because engines refused the
-connection (down, or still starting past the 2-minute startup wait)
-is tagged with the databases it failed on. From 30 seconds after the
+A create whose prepare failed only because engines were unreachable
+(the connection refused or timed out, the engine's container stopped
+or not created yet, the connection dropped during the protocol
+handshake, the engine answering that it is still starting, all past
+the 2-minute startup wait, which waits on the same conditions) is
+tagged with the databases it failed on. From 30 seconds after the
 failure on, each watchdog tick probes those databases' engines once
 and re-runs the finalize as soon as they answer; it gives up when the
-engines still refuse 30 minutes later.
+engines are still unreachable 30 minutes later.
 
 A finalize is cancelled as stalled when it makes no progress for 15
 minutes. The clock starts once it holds its worktree lock and restarts

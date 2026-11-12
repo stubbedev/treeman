@@ -26,6 +26,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -216,7 +217,10 @@ func resolveUncached(ctx context.Context, opts Opts) (*Addr, error) {
 	}
 	info, err := inspectContainer(ctx, engine, id)
 	if err != nil {
-		return nil, err
+		return nil, notRunningIfAbsent(ctx, engine, id, err)
+	}
+	if !info.State.Running {
+		return nil, &NotRunningError{Bin: engine, Ref: id, Created: true}
 	}
 	// Prefer a published-port mapping when the caller asked about
 	// a specific internal port. Cross-platform: bridge IPs are
@@ -343,7 +347,42 @@ func resolveContainerID(ctx context.Context, opts Opts) (string, error) {
 			return line, nil
 		}
 	}
-	return "", fmt.Errorf("no running container for compose service %q (project=%q) via %s", opts.ComposeService, project, engine)
+	return "", &NotRunningError{Bin: engine, Ref: fmt.Sprintf("compose service %q (project=%q)", opts.ComposeService, project)}
+}
+
+// NotRunningError is a container reference with no running container
+// behind it: the container is stopped, or not created yet.
+type NotRunningError struct {
+	// Bin is the container engine binary that was asked.
+	Bin string
+	// Ref names the container or compose service.
+	Ref string
+	// Created is true when the container exists but is stopped.
+	Created bool
+}
+
+func (e *NotRunningError) Error() string {
+	if e.Created {
+		return fmt.Sprintf("%s: container %s is not running", e.Bin, e.Ref)
+	}
+	return fmt.Sprintf("%s: no running container for %s", e.Bin, e.Ref)
+}
+
+// notRunningIfAbsent returns a *NotRunningError when `<engine> inspect`
+// of ref failed with inspectErr because no container by that name or
+// ID exists, and inspectErr otherwise (the engine is down, the binary
+// is missing).
+func notRunningIfAbsent(ctx context.Context, engine, ref string, inspectErr error) error {
+	for _, filter := range []string{"name=^/?" + regexp.QuoteMeta(ref) + "$", "id=" + ref} {
+		out, err := exec.CommandContext(ctx, engine, "ps", "-a", "-q", "--filter", filter).Output()
+		if err != nil {
+			return inspectErr
+		}
+		if strings.TrimSpace(string(out)) != "" {
+			return inspectErr
+		}
+	}
+	return &NotRunningError{Bin: engine, Ref: ref}
 }
 
 // inspectInfo is the subset of `<engine> inspect` JSON treeman uses.

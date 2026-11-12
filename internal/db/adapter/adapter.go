@@ -7,68 +7,86 @@ package adapter
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"time"
 
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
-// ResolveAndProbe rewrites *host / *port via container-IP detection
-// (when opts.Container or opts.ComposeService is set) and probes TCP
-// reachability with the caller's context as the deadline source. Under
-// a ctx marked by reachability.WithStartupWait a refused connect (an
-// engine that is down or still starting) is retried for up to
-// reachability.StartupWait; any other failure returns immediately.
-//
-// Each attempt that fails against a containerized target refreshes the
-// container-IP cache and probes the re-resolved address once more
-// before returning. This covers the "container restarted, IP/port
-// shifted" case that otherwise surfaces as a confusing connect-refused
-// on the first wt-create after `docker compose restart`.
-//
-// The host/port pointers must be non-nil and pre-populated with the
-// user's configured values; the function overwrites them with the
-// resolved address only when it returns nil.
-func ResolveAndProbe(ctx context.Context, engine string, opts containerip.Opts, host *string, port *uint16) error {
-	h, p, err := awaitEndpoint(ctx, engine, opts, *host, *port)
-	if err != nil {
+// Await runs connect once, or, under a ctx marked by
+// reachability.WithStartupWait, until it succeeds, fails for a reason
+// other than the engine being unreachable (reachability.IsUnreachable:
+// refused, timed out, its container down, the handshake dropped, the
+// engine still starting), or reachability.StartupWait elapses. A
+// failure the engine itself reports (authentication, an unknown
+// database) returns at once.
+func Await[T any](ctx context.Context, connect func(context.Context) (T, error)) (T, error) {
+	var out T
+	err := reachability.WaitFor(ctx, func(ctx context.Context) error {
+		v, err := connect(ctx)
+		out = v
 		return err
-	}
-	*host, *port = h, p
-	return nil
+	}, reachability.IsUnreachable)
+	return out, err
 }
 
-// ResolveAndProbeURL is ResolveAndProbe for a URL-style connection
-// string: it returns uri with its host/port rewritten to the resolved
-// container address, or uri unchanged when opts names no container.
-func ResolveAndProbeURL(ctx context.Context, engine string, opts containerip.Opts, uri string) (string, error) {
+// Connect connects to engine at host:port, or at the address of the
+// container opts names (Container or ComposeService), the way Await
+// retries: each attempt resolves the container, probes the endpoint
+// over TCP, then runs connect against the resolved address. An attempt
+// whose probe fails against a containerized target refreshes the
+// container-IP cache and probes the re-resolved address once more, so
+// a container that restarted with a new IP or port settles within one
+// attempt.
+func Connect[T any](
+	ctx context.Context,
+	engine string,
+	opts containerip.Opts,
+	host string,
+	port uint16,
+	connect func(ctx context.Context, host string, port uint16) (T, error),
+) (T, error) {
+	return Await(ctx, func(ctx context.Context) (T, error) {
+		h, p, err := resolveAndProbeOnce(ctx, engine, opts, host, port)
+		if err != nil {
+			var zero T
+			return zero, err
+		}
+		return connect(ctx, h, p)
+	})
+}
+
+// ConnectURL is Connect for a URL-style connection string: connect
+// gets uri with its host and port rewritten to the resolved container
+// address (uri unchanged when opts names no container), and that
+// address as host:port for error messages.
+func ConnectURL[T any](
+	ctx context.Context,
+	engine string,
+	opts containerip.Opts,
+	uri string,
+	connect func(ctx context.Context, uri, addr string) (T, error),
+) (T, error) {
 	host, port, err := reachability.HostPort(engine, uri)
 	if err != nil {
-		return "", err
+		var zero T
+		return zero, err
 	}
-	h, p, err := awaitEndpoint(ctx, engine, opts, host, port)
-	if err != nil {
-		return "", err
-	}
-	if h == host && p == port {
-		return uri, nil
-	}
-	return containerip.RewriteHostPortInURIWithPort(uri, h, p), nil
-}
-
-func awaitEndpoint(ctx context.Context, engine string, opts containerip.Opts, host string, port uint16) (string, uint16, error) {
-	resolvedHost, resolvedPort := host, port
-	err := reachability.WaitFor(ctx, func(ctx context.Context) error {
-		h, p, err := resolveAndProbeOnce(ctx, engine, opts, host, port)
-		resolvedHost, resolvedPort = h, p
-		return err
-	}, reachability.IsRefused)
-	return resolvedHost, resolvedPort, err
+	return Connect(ctx, engine, opts, host, port, func(ctx context.Context, h string, p uint16) (T, error) {
+		resolved := uri
+		if h != host || p != port {
+			resolved = containerip.RewriteHostPortInURIWithPort(uri, h, p)
+		}
+		return connect(ctx, resolved, net.JoinHostPort(h, strconv.Itoa(int(p))))
+	})
 }
 
 func resolveAndProbeOnce(ctx context.Context, engine string, opts containerip.Opts, host string, port uint16) (string, uint16, error) {
-	h, p, err := resolveEndpoint(ctx, opts, host, port)
+	h, p, err := resolveEndpoint(ctx, engine, opts, host, port)
 	if err != nil {
 		return host, port, err
 	}
@@ -77,15 +95,21 @@ func resolveAndProbeOnce(ctx context.Context, engine string, opts containerip.Op
 		return h, p, probeErr
 	}
 	containerip.RefreshOpts(opts)
-	h2, p2, err := resolveEndpoint(ctx, opts, host, port)
+	h2, p2, err := resolveEndpoint(ctx, engine, opts, host, port)
 	if err != nil {
 		return h, p, fmt.Errorf("%w (re-resolving the container after that also failed: %w)", probeErr, err)
 	}
 	return h2, p2, reachability.ProbeCtx(ctx, engine, h2, p2)
 }
 
-func resolveEndpoint(ctx context.Context, opts containerip.Opts, host string, port uint16) (string, uint16, error) {
+// resolveEndpoint returns the address of the container opts names, or
+// host:port when it names none. A container that is stopped or not
+// created yet is an engine that is down: an *UnreachableError.
+func resolveEndpoint(ctx context.Context, engine string, opts containerip.Opts, host string, port uint16) (string, uint16, error) {
 	addr, err := containerip.ResolveAddr(ctx, opts)
+	if nr, ok := errors.AsType[*containerip.NotRunningError](err); ok {
+		return "", 0, &reachability.UnreachableError{Engine: engine, Addr: nr.Ref, Reason: reachability.ContainerDown, Err: err}
+	}
 	if err != nil {
 		return "", 0, fmt.Errorf("resolve container: %w", err)
 	}

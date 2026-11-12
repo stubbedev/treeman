@@ -3,17 +3,52 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/db/reachability"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
 func refused(engine string) error {
-	return fmt.Errorf("%s unreachable at 127.0.0.1:9200 (tcp connect refused: %w)", engine, syscall.ECONNREFUSED)
+	return &reachability.UnreachableError{Engine: engine, Addr: "127.0.0.1:9200", Reason: reachability.Refused, Err: syscall.ECONNREFUSED}
+}
+
+// Regression for #212: every shape of an engine that is down or still
+// starting is retried like a refusal; a failure the engine reports is
+// not.
+func TestCreateRetryForTagsEveryUnreachableShape(t *testing.T) {
+	failed := func(err error) error {
+		return fmt.Errorf("prepare: %w", &prepare.RunError{Failed: []*prepare.DBError{{Index: 1, Engine: "mysql", Err: err}}})
+	}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			"container stopped",
+			&reachability.UnreachableError{Engine: "mysql", Addr: "app-mysql-1", Reason: reachability.ContainerDown},
+			true,
+		},
+		{"connect timeout", &reachability.UnreachableError{Engine: "mysql", Addr: "10.0.0.2:3306", Reason: reachability.TimedOut}, true},
+		{"handshake dropped", fmt.Errorf("ping mysql: %w", &reachability.UnreachableError{
+			Engine: "mysql", Addr: "127.0.0.1:3306", Reason: reachability.HandshakeDropped, Err: io.EOF,
+		}), true},
+		{"engine starting", reachability.StartingError("postgres", "127.0.0.1:5432", errors.New("57P03")), true},
+		{"authentication failed", errors.New("ping mysql: Error 1045 (28000): Access denied for user 'app'"), false},
+		{"wrapped EOF without classification", fmt.Errorf("migrate: %w", io.EOF), false},
+	}
+	for _, tc := range cases {
+		r, ok := createRetryFor(failed(tc.err), 0)
+		if ok != tc.want || (ok && (r.Cause != store.RetryEngineUnreachable || !slices.Equal(r.DBs, []int{1}))) {
+			t.Errorf("%s: createRetryFor = %+v, %v; want an engine-unreachable retry = %v", tc.name, r, ok, tc.want)
+		}
+	}
 }
 
 // #187 part 3: a create that failed because an engine was still

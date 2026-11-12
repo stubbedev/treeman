@@ -150,8 +150,8 @@ func TestProbeCtxRefusedOnLoopbackSaysEngineNotListening(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected refused probe to fail")
 	}
-	if !IsRefused(err) {
-		t.Fatalf("IsRefused(%v) = false, want true", err)
+	if !isReason(err, Refused) {
+		t.Fatalf("err = %v, want a refused *UnreachableError", err)
 	}
 	msg := err.Error()
 	for _, want := range []string{"refused", "down or still starting", "treeman doctor"} {
@@ -188,8 +188,8 @@ func TestProbeCtxBracketsIPv6HostInRefusedError(t *testing.T) {
 	_ = ln.Close()
 	port := uint16(addr.Port) //nolint:gosec // a TCP listener port always fits uint16
 	err = ProbeCtx(context.Background(), "postgres", "::1", port)
-	if !IsRefused(err) {
-		t.Fatalf("IsRefused(%v) = false, want true", err)
+	if !isReason(err, Refused) {
+		t.Fatalf("err = %v, want a refused *UnreachableError", err)
 	}
 	want := net.JoinHostPort("::1", strconv.Itoa(int(port)))
 	if !strings.Contains(err.Error(), "unreachable at "+want+" ") {
@@ -292,7 +292,7 @@ func TestWaitForProbeSeesEngineStartLate(t *testing.T) {
 	defer cancel()
 	err := WaitFor(ctx, func(ctx context.Context) error {
 		return ProbeCtx(ctx, "elasticsearch", "127.0.0.1", port)
-	}, IsRefused)
+	}, IsUnreachable)
 	ln := <-listening
 	if ln == nil {
 		t.Skipf("port %d was taken before the late listener could bind", port)
@@ -332,7 +332,7 @@ func TestWaitForDoesNotRetryCancelledProbe(t *testing.T) {
 	err := WaitFor(ctx, func(ctx context.Context) error {
 		attempts++
 		return ProbeCtx(ctx, "elasticsearch", "198.51.100.1", 9200)
-	}, IsRefused)
+	}, IsUnreachable)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want it to wrap context.Canceled", err)
 	}

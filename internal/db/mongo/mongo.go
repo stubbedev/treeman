@@ -16,6 +16,7 @@ import (
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
+	"github.com/stubbedev/treeman/internal/db/reachability"
 )
 
 // Driver wraps the mongo Client.
@@ -37,21 +38,25 @@ type Driver struct {
 }
 
 // Connect parses cfg.URI, probes TCP reachability (when the URI
-// isn't mongodb+srv:// where the host is a SRV record), and dials.
+// isn't mongodb+srv:// where the host is a SRV record), dials and
+// completes one ping. A ping the server never got to answer (the
+// connection refused, reset or closed) is an engine-unreachable
+// failure.
 func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
-	uri := cfg.URI
-	if !strings.HasPrefix(uri, "mongodb+srv://") {
-		resolved, err := adapter.ResolveAndProbeURL(
-			ctx,
-			"mongodb",
-			containerip.FromRef(cfg.ContainerRef, containerip.URIPort(uri, 27017)),
-			uri,
-		)
+	if strings.HasPrefix(cfg.URI, "mongodb+srv://") {
+		host, _, err := reachability.HostPort("mongodb", cfg.URI)
 		if err != nil {
 			return nil, err
 		}
-		uri = resolved
+		return adapter.Await(ctx, func(ctx context.Context) (*Driver, error) { return dial(ctx, cfg, cfg.URI, host) })
 	}
+	opts := containerip.FromRef(cfg.ContainerRef, containerip.URIPort(cfg.URI, 27017))
+	return adapter.ConnectURL(ctx, "mongodb", opts, cfg.URI, func(ctx context.Context, uri, addr string) (*Driver, error) {
+		return dial(ctx, cfg, uri, addr)
+	})
+}
+
+func dial(ctx context.Context, cfg config.MongoConn, uri, addr string) (*Driver, error) {
 	clientOpts := options.Client().ApplyURI(uri)
 	if cfg.PoolMax > 0 {
 		clientOpts.SetMaxPoolSize(uint64(cfg.PoolMax))
@@ -62,7 +67,7 @@ func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 	}
 	if err := c.Ping(ctx, nil); err != nil {
 		_ = c.Disconnect(ctx)
-		return nil, fmt.Errorf("mongo ping: %w", err)
+		return nil, fmt.Errorf("mongo ping: %w", reachability.HandshakeError(ctx, "mongodb", addr, err))
 	}
 	return &Driver{Client: c, cfg: cfg}, nil
 }

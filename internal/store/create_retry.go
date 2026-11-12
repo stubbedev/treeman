@@ -15,8 +15,9 @@ const (
 	// timed out, typically a cold nix build that keeps running in the
 	// nix daemon and is done (or further along) on the next attempt.
 	RetryEnvLoadTimeout RetryCause = "env_load_timeout"
-	// RetryEngineUnreachable: an engine refused the connection (down or
-	// still starting). The re-run waits until the engines of DBs answer.
+	// RetryEngineUnreachable: an engine was down or still starting (the
+	// connect refused or timed out, its container stopped, the handshake
+	// dropped). The re-run waits until the engines of DBs answer.
 	RetryEngineUnreachable RetryCause = "engine_unreachable"
 	// RetryDaemonRestart: treemand restarted while the create was in
 	// flight; nothing about the worktree caused the failure.
@@ -38,8 +39,8 @@ type CreateRetry struct {
 	// Attempt counts the automatic re-runs made before this failure:
 	// 0 for a failed create, n for the n-th automatic re-run failing.
 	Attempt int `json:"attempt"`
-	// DBs lists the `databases[]` indices whose engine refused the
-	// connection; set for RetryEngineUnreachable only.
+	// DBs lists the `databases[]` indices whose engine was unreachable;
+	// set for RetryEngineUnreachable only.
 	DBs []int `json:"dbs,omitempty"`
 }
 

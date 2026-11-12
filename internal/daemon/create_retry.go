@@ -41,23 +41,25 @@ func transientCause(err error) (store.CreateRetry, bool) {
 	if de, ok := errors.AsType[*shellenv.DirenvError](err); ok && de.Transient() {
 		return store.CreateRetry{Cause: store.RetryEnvLoadTimeout}, true
 	}
-	if dbs, ok := refusedDatabases(err); ok {
+	if dbs, ok := unreachableDatabases(err); ok {
 		return store.CreateRetry{Cause: store.RetryEngineUnreachable, DBs: dbs}, true
 	}
 	return store.CreateRetry{}, false
 }
 
-// refusedDatabases returns the indices of the databases a prepare failed
-// on when every one of them failed because its engine refused the
-// connection (down or still starting).
-func refusedDatabases(err error) ([]int, bool) {
+// unreachableDatabases returns the indices of the databases a prepare
+// failed on when every one of them failed because its engine was down
+// or still starting (reachability.IsUnreachable: the connect refused or
+// timed out, the container stopped or not created, the handshake
+// dropped).
+func unreachableDatabases(err error) ([]int, bool) {
 	re, ok := errors.AsType[*prepare.RunError](err)
 	if !ok || len(re.Failed) == 0 {
 		return nil, false
 	}
 	dbs := make([]int, len(re.Failed))
 	for i, f := range re.Failed {
-		if !reachability.IsRefused(f.Err) {
+		if !reachability.IsUnreachable(f.Err) {
 			return nil, false
 		}
 		dbs[i] = f.Index
@@ -166,9 +168,9 @@ func launchCreateRetry(st *State, p store.PendingCreateRetry) {
 }
 
 // enginesAnswer probes the engines of the databases an engine-unreachable
-// create failed on. Only a refusal holds the re-run back: any other
-// failure (the config changed, a different error) lets the re-run
-// surface it.
+// create failed on. Only an engine that is still unreachable holds the
+// re-run back: any other failure (the config changed, a different
+// error) lets the re-run surface it.
 func enginesAnswer(ctx context.Context, wt store.WorktreeRow, dbs []int) bool {
 	cfg, err := resolve.LoadResolvedForWorktree(wt.RepoPath, wt.Path)
 	if err != nil {
@@ -178,7 +180,7 @@ func enginesAnswer(ctx context.Context, wt store.WorktreeRow, dbs []int) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, createRetryProbeTimeout)
 	defer cancel()
 	err = prepare.ProbeDatabases(probeCtx, &cfg, dbs)
-	if reachability.IsRefused(err) {
+	if reachability.IsUnreachable(err) {
 		slog.Debug("create retry: engine still unreachable", "wt", wt.Path, "dbs", dbs, "err", err)
 		return false
 	}

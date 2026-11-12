@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	// Register the pgx database/sql driver under the name "pgx".
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/ident"
+	"github.com/stubbedev/treeman/internal/db/reachability"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 )
 
@@ -47,13 +49,26 @@ func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 5432
 	}
-	socketMode := strings.HasPrefix(cfg.Host, "/")
-	if !socketMode {
-		opts := containerip.FromRef(cfg.ContainerRef, cfg.Port)
-		if err := adapter.ResolveAndProbe(ctx, "postgres", opts, &cfg.Host, &cfg.Port); err != nil {
-			return nil, err
-		}
+	if strings.HasPrefix(cfg.Host, "/") {
+		return adapter.Await(ctx, func(ctx context.Context) (*Driver, error) { return dial(ctx, cfg, cfg.Host) })
 	}
+	return adapter.Connect(ctx, "postgres", containerip.FromRef(cfg.ContainerRef, cfg.Port), cfg.Host, cfg.Port,
+		func(ctx context.Context, host string, port uint16) (*Driver, error) {
+			c := cfg
+			c.Host, c.Port = host, port
+			return dial(ctx, c, net.JoinHostPort(host, strconv.Itoa(int(port))))
+		})
+}
+
+// sqlstateCannotConnectNow is the SQLSTATE a postgres server answers a
+// connection with while it starts up, shuts down or recovers.
+const sqlstateCannotConnectNow = "57P03"
+
+// dial opens a server-level pool against cfg and completes one
+// handshake. A handshake the server never got to answer (the
+// connection refused, reset or closed), or answered with "the database
+// system is starting up", is an engine-unreachable failure at addr.
+func dial(ctx context.Context, cfg config.PostgresConn, addr string) (*Driver, error) {
 	db, err := sql.Open("pgx", dsn(cfg, "postgres"))
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
@@ -61,7 +76,10 @@ func Connect(ctx context.Context, cfg config.PostgresConn) (*Driver, error) {
 	adapter.ConfigurePool(db, int(cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("ping postgres: %w", err)
+		if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == sqlstateCannotConnectNow {
+			return nil, fmt.Errorf("ping postgres: %w", reachability.StartingError("postgres", addr, err))
+		}
+		return nil, fmt.Errorf("ping postgres: %w", reachability.HandshakeError(ctx, "postgres", addr, err))
 	}
 	return &Driver{DB: db, cfg: cfg}, nil
 }

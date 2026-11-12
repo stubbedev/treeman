@@ -60,12 +60,9 @@ func Connect(ctx context.Context, cfg config.S3Conn) (*Driver, error) {
 	}
 	endpoint := cfg.Endpoint
 	if endpoint != "" {
-		resolved, err := adapter.ResolveAndProbeURL(
-			ctx,
-			"s3",
-			containerip.FromRef(cfg.ContainerRef, containerip.URIPort(endpoint, 9000)),
-			endpoint,
-		)
+		resolved, err := adapter.ConnectURL(ctx, "s3",
+			containerip.FromRef(cfg.ContainerRef, containerip.URIPort(endpoint, 9000)), endpoint,
+			func(_ context.Context, uri, _ string) (string, error) { return uri, nil })
 		if err != nil {
 			return nil, err
 		}

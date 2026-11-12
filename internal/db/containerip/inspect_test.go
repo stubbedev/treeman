@@ -7,6 +7,7 @@ import (
 )
 
 const sampleInspect = `[{
+  "State": {"Running": true},
   "Config": {"Env": ["MYSQL_ROOT_PASSWORD=secret", "PATH=/usr/bin"]},
   "NetworkSettings": {
     "IPAddress": "",

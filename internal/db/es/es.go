@@ -40,20 +40,33 @@ func escSeg(s string) string { return url.PathEscape(s) }
 // accept connections and reach at least yellow health, both within one
 // reachability.StartupWait bound, so a container that is still booting
 // (or a cluster recovering its shards) delays the caller instead of
-// failing it. Auth (api key / basic) is left for a future patch; the
-// local-dev target uses unauthenticated Elasticsearch.
+// failing it; a cluster still below yellow when the bound runs out is
+// an engine-unreachable failure. Auth (api key / basic) is left for a
+// future patch; the local-dev target uses unauthenticated
+// Elasticsearch.
 func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 	ctx, cancel := context.WithTimeout(ctx, reachability.StartupWait)
 	defer cancel()
-	url, err := adapter.ResolveAndProbeURL(
-		ctx,
-		"elasticsearch",
-		containerip.FromRef(cfg.ContainerRef, containerip.URIPort(cfg.URL, 9200)),
-		cfg.URL,
-	)
-	if err != nil {
-		return nil, err
-	}
+	opts := containerip.FromRef(cfg.ContainerRef, containerip.URIPort(cfg.URL, 9200))
+	return adapter.ConnectURL(ctx, "elasticsearch", opts, cfg.URL, func(ctx context.Context, url, _ string) (*Driver, error) {
+		d, err := newDriver(cfg, url)
+		if err != nil {
+			return nil, err
+		}
+		if !reachability.StartupWaitEnabled(ctx) {
+			return d, nil
+		}
+		if err := d.clusterReady(ctx); err != nil {
+			if nr, ok := errors.AsType[*clusterNotReadyError](err); ok {
+				return nil, reachability.StartingError("elasticsearch", d.Base, nr)
+			}
+			return nil, fmt.Errorf("elasticsearch at %s: %w", d.Base, err)
+		}
+		return d, nil
+	})
+}
+
+func newDriver(cfg config.EsConn, url string) (*Driver, error) {
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 	if cfg.PoolMax > 0 {
 		// Cap simultaneous + idle HTTP connections to the cluster, the
@@ -67,17 +80,7 @@ func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 		tr.MaxIdleConnsPerHost = int(cfg.PoolMax)
 		httpClient.Transport = tr
 	}
-	d := &Driver{
-		Base: strings.TrimRight(url, "/"),
-		HTTP: httpClient,
-	}
-	if !reachability.StartupWaitEnabled(ctx) {
-		return d, nil
-	}
-	if err := reachability.WaitFor(ctx, d.clusterReady, isClusterNotReady); err != nil {
-		return nil, fmt.Errorf("elasticsearch at %s: %w", d.Base, err)
-	}
-	return d, nil
+	return &Driver{Base: strings.TrimRight(url, "/"), HTTP: httpClient}, nil
 }
 
 // clusterNotReadyError is a cluster that answered, or tried to, but
@@ -96,11 +99,6 @@ func (e *clusterNotReadyError) Error() string {
 }
 
 func (e *clusterNotReadyError) Unwrap() error { return e.err }
-
-func isClusterNotReady(err error) bool {
-	var nr *clusterNotReadyError
-	return errors.As(err, &nr)
-}
 
 const clusterHealthPath = "/_cluster/health?wait_for_status=yellow&timeout=5s&master_timeout=5s"
 

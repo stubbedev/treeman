@@ -28,6 +28,7 @@ import (
 	"github.com/stubbedev/treeman/internal/db/adapter"
 	"github.com/stubbedev/treeman/internal/db/containerip"
 	"github.com/stubbedev/treeman/internal/db/ident"
+	"github.com/stubbedev/treeman/internal/db/reachability"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 )
 
@@ -97,13 +98,21 @@ func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
 	if cfg.Port == 0 {
 		cfg.Port = 3306
 	}
-	socketMode := strings.HasPrefix(cfg.Host, "/")
-	if !socketMode {
-		opts := containerip.FromRef(cfg.ContainerRef, cfg.Port)
-		if err := adapter.ResolveAndProbe(ctx, "mysql", opts, &cfg.Host, &cfg.Port); err != nil {
-			return nil, err
-		}
+	if strings.HasPrefix(cfg.Host, "/") {
+		return adapter.Await(ctx, func(ctx context.Context) (*Driver, error) { return dial(ctx, cfg, cfg.Host) })
 	}
+	return adapter.Connect(ctx, "mysql", containerip.FromRef(cfg.ContainerRef, cfg.Port), cfg.Host, cfg.Port,
+		func(ctx context.Context, host string, port uint16) (*Driver, error) {
+			c := cfg
+			c.Host, c.Port = host, port
+			return dial(ctx, c, net.JoinHostPort(host, strconv.Itoa(int(port))))
+		})
+}
+
+// dial opens a pool against cfg and completes one handshake. A
+// handshake the server never got to answer (the connection refused,
+// reset or closed) is an engine-unreachable failure at addr.
+func dial(ctx context.Context, cfg config.MysqlConn, addr string) (*Driver, error) {
 	dsn, err := connDSN(cfg)
 	if err != nil {
 		return nil, err
@@ -115,7 +124,8 @@ func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
 	adapter.ConfigurePool(db, int(cfg.PoolMax))
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("ping mysql: %w", err)
+		return nil, fmt.Errorf("ping mysql: %w",
+			reachability.HandshakeError(ctx, "mysql", addr, err, gomysql.ErrInvalidConn, driver.ErrBadConn))
 	}
 	return &Driver{DB: db, cfg: cfg}, nil
 }

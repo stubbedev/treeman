@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
 	"net"
 	"strconv"
 	"testing"
@@ -33,61 +34,67 @@ func TestConfigurePoolAppliesLimits(t *testing.T) {
 	}
 }
 
-// TestResolveAndProbePlainHost covers the no-container path: a live
-// listener probes clean and host/port stay untouched; a closed port
-// surfaces an error instead of hanging.
-func TestResolveAndProbePlainHost(t *testing.T) {
+func endpoint(_ context.Context, h string, p uint16) (string, error) {
+	return net.JoinHostPort(h, strconv.Itoa(int(p))), nil
+}
+
+func listenerPort(t *testing.T, l net.Listener) uint16 {
+	t.Helper()
+	_, portStr, _ := net.SplitHostPort(l.Addr().String())
+	p, _ := strconv.Atoi(portStr)
+	return uint16(p) //nolint:gosec // listener port fits uint16
+}
+
+// TestConnectPlainHost covers the no-container path: a live listener
+// probes clean and connect gets host/port untouched; a closed port
+// surfaces a refusal instead of hanging.
+func TestConnectPlainHost(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = l.Close() }()
-	_, portStr, _ := net.SplitHostPort(l.Addr().String())
-	p, _ := strconv.Atoi(portStr)
-
-	host := "127.0.0.1"
-	port := uint16(p) //nolint:gosec // listener port fits uint16
+	port := listenerPort(t, l)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := ResolveAndProbe(ctx, "mysql", containerip.Opts{}, &host, &port); err != nil {
+	got, err := Connect(ctx, "mysql", containerip.Opts{}, "127.0.0.1", port, endpoint)
+	if err != nil {
 		t.Fatalf("live listener: %v", err)
 	}
-	if host != "127.0.0.1" || int(port) != p {
-		t.Errorf("host/port rewritten without container opts: %s:%d", host, port)
+	if want := l.Addr().String(); got != want {
+		t.Errorf("connect got %s without container opts, want %s", got, want)
 	}
 
 	_ = l.Close()
 	start := time.Now()
-	if err := ResolveAndProbe(context.Background(), "mysql", containerip.Opts{}, &host, &port); !reachability.IsRefused(err) {
-		t.Errorf("closed port: want refused probe error, got %v", err)
+	_, err = Connect(context.Background(), "mysql", containerip.Opts{}, "127.0.0.1", port, endpoint)
+	if ue, ok := errors.AsType[*reachability.UnreachableError](err); !ok || ue.Reason != reachability.Refused {
+		t.Errorf("closed port: want a refused *UnreachableError, got %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("closed port without startup wait took %v, want an immediate failure", elapsed)
 	}
 }
 
-// TestResolveAndProbeWaitsForRefusedEngine: under a startup-wait ctx a
-// refused port is retried until the caller's deadline instead of
-// failing on the first dial, and the final error still names the
-// refusal.
-func TestResolveAndProbeWaitsForRefusedEngine(t *testing.T) {
+// TestConnectWaitsForRefusedEngine: under a startup-wait ctx a refused
+// port is retried until the caller's deadline instead of failing on
+// the first dial, and the final error still names the refusal.
+func TestConnectWaitsForRefusedEngine(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, portStr, _ := net.SplitHostPort(l.Addr().String())
+	port := listenerPort(t, l)
 	_ = l.Close()
-	p, _ := strconv.Atoi(portStr)
-	host, port := "127.0.0.1", uint16(p) //nolint:gosec // listener port fits uint16
 
 	ctx, cancel := context.WithTimeout(reachability.WithStartupWait(context.Background()), 600*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	err = ResolveAndProbe(ctx, "mysql", containerip.Opts{}, &host, &port)
+	_, err = Connect(ctx, "mysql", containerip.Opts{}, "127.0.0.1", port, endpoint)
 	elapsed := time.Since(start)
-	if !reachability.IsRefused(err) {
-		t.Fatalf("want refused error after the wait, got %v", err)
+	if ue, ok := errors.AsType[*reachability.UnreachableError](err); !ok || ue.Reason != reachability.Refused {
+		t.Fatalf("want a refused *UnreachableError after the wait, got %v", err)
 	}
 	if elapsed < 500*time.Millisecond {
 		t.Errorf("returned after %v, want it to keep retrying until the 600ms deadline", elapsed)
@@ -97,21 +104,68 @@ func TestResolveAndProbeWaitsForRefusedEngine(t *testing.T) {
 	}
 }
 
-// TestResolveAndProbeURLKeepsURIWithoutContainer: with no container
-// reference the URI comes back byte-identical.
-func TestResolveAndProbeURLKeepsURIWithoutContainer(t *testing.T) {
+// Regression for #212: under a startup-wait ctx a dropped handshake
+// (docker's userland proxy accepting before the engine listens) is
+// waited out like a refusal, while a failure the engine reports ends
+// the wait at once.
+func TestConnectWaitsOutDroppedHandshakes(t *testing.T) {
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	port := listenerPort(t, l)
+	ctx, cancel := context.WithTimeout(reachability.WithStartupWait(context.Background()), 10*time.Second)
+	defer cancel()
+
+	attempts := 0
+	got, err := Connect(ctx, "mysql", containerip.Opts{}, "127.0.0.1", port, func(ctx context.Context, _ string, _ uint16) (int, error) {
+		attempts++
+		if attempts < 3 {
+			return 0, reachability.HandshakeError(ctx, "mysql", l.Addr().String(), io.EOF)
+		}
+		return attempts, nil
+	})
+	if err != nil || got != 3 {
+		t.Fatalf("Connect = %d, %v; want the third attempt to succeed", got, err)
+	}
+
+	denied := errors.New("Error 1045 (28000): Access denied")
+	attempts = 0
+	_, err = Connect(ctx, "mysql", containerip.Opts{}, "127.0.0.1", port, func(ctx context.Context, _ string, _ uint16) (int, error) {
+		attempts++
+		return 0, reachability.HandshakeError(ctx, "mysql", l.Addr().String(), denied)
+	})
+	if !errors.Is(err, denied) || attempts != 1 {
+		t.Errorf("Connect = %v after %d attempts, want the authentication failure at once", err, attempts)
+	}
+}
+
+// TestConnectURLKeepsURIWithoutContainer: with no container reference
+// connect gets the URI byte-identical, and the dialled address.
+func TestConnectURLKeepsURIWithoutContainer(t *testing.T) {
 	l, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = l.Close() }()
 	uri := "http://" + l.Addr().String() + "/"
-	got, err := ResolveAndProbeURL(context.Background(), "elasticsearch", containerip.Opts{}, uri)
+	var gotURI, gotAddr string
+	_, err = ConnectURL(
+		context.Background(),
+		"elasticsearch",
+		containerip.Opts{},
+		uri,
+		func(_ context.Context, u, addr string) (struct{}, error) {
+			gotURI, gotAddr = u, addr
+			return struct{}{}, nil
+		},
+	)
 	if err != nil {
 		t.Fatalf("live listener: %v", err)
 	}
-	if got != uri {
-		t.Errorf("uri = %q, want %q unchanged", got, uri)
+	if gotURI != uri || gotAddr != l.Addr().String() {
+		t.Errorf("connect got (%q, %q), want (%q, %q)", gotURI, gotAddr, uri, l.Addr().String())
 	}
 }
 
