@@ -22,6 +22,7 @@ import (
 	"github.com/stubbedev/treeman/internal/engine"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
+	"github.com/stubbedev/treeman/internal/prepare/progress"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/template"
@@ -850,6 +851,7 @@ func (a branchScopedArgs) seedFreshFrom(ctx context.Context, active, branch stri
 				if err := a.loadDump(ctx, active, dr); err != nil {
 					return false, "", fmt.Errorf("load dump %s: %w", dr.Path, err)
 				}
+				progress.Report(ctx)
 			}
 			how = "dump"
 		} else {
@@ -1502,6 +1504,8 @@ func resetHint(engine string) string {
 }
 
 func (a branchScopedArgs) runStep(ctx context.Context, spec runner.Spec, active, label string) error {
+	progress.Report(ctx)
+	defer progress.Report(ctx)
 	spec = spec.WithLogPath(runnerLogPath(a.worktreePath, a.eng.engine, label, active))
 	out, err := runner.Run(ctx, spec, a.worktreePath, active, a.tplCtx, a.inheritedEnv)
 	if err != nil {

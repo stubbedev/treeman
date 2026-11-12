@@ -80,11 +80,14 @@ and re-runs the finalize as soon as they answer; it gives up when the
 engines still refuse 30 minutes later.
 
 A finalize is cancelled as stalled when it makes no progress for 15
-minutes. The clock starts once it holds its worktree lock, restarts
-whenever one of its clone restores is admitted to a slot or finishes,
-and pauses while a restore waits for a slot. A stalled finalize
-records its own failure once its work returns; a prepare that
-finishes despite the cancel carries on to `ready`.
+minutes. The clock starts once it holds its worktree lock and restarts
+on every step forward: a copy/link pass or a hook run starting or
+finishing, a database's prepare starting or finishing, each of its
+phases (every dump file loaded, migrate, seed, snapshot), a clone
+restore admitted to a slot or finishing, an Elasticsearch shard
+recovery advancing. It pauses while a restore waits for a slot. A
+stalled finalize records its own failure once its work returns; a
+prepare that finishes despite the cancel carries on to `ready`.
 
 The daemon's socket is 0600 and ownership-checked on every
 accept; on Linux via `SO_PEERCRED`, on other platforms via

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/prepare/progress"
 )
 
 // finalizeStalledError is the cancel cause of a finalize the watchdog
@@ -16,8 +17,10 @@ type finalizeStalledError struct {
 }
 
 func (e *finalizeStalledError) Error() string {
-	return fmt.Sprintf("finalize made no progress for %s (no step or clone restore finished, none waiting for a clone slot) - child wedged",
-		e.idle.Round(time.Second))
+	return fmt.Sprintf(
+		"finalize made no progress for %s (no phase, hook, dump load, clone restore or shard recovery advanced, none waiting for a clone slot) - child wedged",
+		e.idle.Round(time.Second),
+	)
 }
 
 // stallCause returns the stall that cancelled ctx, or nil when ctx is
@@ -86,12 +89,20 @@ type finalizeLease struct {
 
 // leaseFinalize arms the stall watchdog for the finalize of wtPath and
 // returns its lease. The clock starts now: time spent waiting for the
-// slot and the cross-process lock does not count. The caller MUST call
-// end.
+// slot and the cross-process lock does not count. Every step forward
+// the work reports through progress.Report on the lease's context
+// restarts it. The caller MUST call end.
 func (st *State) leaseFinalize(parent context.Context, wtPath string) *finalizeLease {
+	parent = progress.With(parent, func() { st.leaseProgressed(wtPath) })
 	l := &finalizeLease{st: st, wtPath: wtPath, parent: parent}
 	l.renew()
 	return l
+}
+
+// leaseProgressed restarts the stall clock of the in-flight finalize of
+// wtPath. A finalize the watchdog already cancelled stays cancelled.
+func (st *State) leaseProgressed(wtPath string) {
+	st.updateLease(wtPath, func(ls *leaseState) { ls.lastProgress = time.Now() })
 }
 
 // renew replaces a stall-cancelled work context with a fresh one and
@@ -140,21 +151,20 @@ func (st *State) updateLease(wtPath string, fn func(*leaseState)) {
 }
 
 // finalizeRunOptions are the prepare options of a finalize of wtPath:
-// the daemon-wide clone slots, with clone progress feeding the lease.
+// the daemon-wide clone slots, whose queue pauses the lease while a
+// restore waits for a slot and whose admissions and finishes renew it.
 func (st *State) finalizeRunOptions(wtPath string) prepare.RunOptions {
 	return prepare.RunOptions{
 		CloneSlots: st.cloneSlots,
 		Progress: func(p prepare.CloneProgress) {
-			st.updateLease(wtPath, func(ls *leaseState) {
-				switch p {
-				case prepare.CloneQueued:
-					ls.queuedClones++
-				case prepare.CloneDequeued:
-					ls.queuedClones--
-				case prepare.CloneAdmitted, prepare.CloneFinished:
-					ls.lastProgress = time.Now()
-				}
-			})
+			switch p {
+			case prepare.CloneQueued:
+				st.updateLease(wtPath, func(ls *leaseState) { ls.queuedClones++ })
+			case prepare.CloneDequeued:
+				st.updateLease(wtPath, func(ls *leaseState) { ls.queuedClones-- })
+			case prepare.CloneAdmitted, prepare.CloneFinished:
+				st.leaseProgressed(wtPath)
+			}
 		},
 	}
 }

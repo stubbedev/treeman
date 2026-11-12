@@ -6,9 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/prepare/progress"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -138,5 +140,26 @@ func TestFileColdBuildRecordsLedgerAndFansOutThroughBudget(t *testing.T) {
 	}
 	if len(batches) != 1 {
 		t.Errorf("ledger = %s, want the one migration in it", ledger)
+	}
+}
+
+// TestColdBuildReportsPhaseProgress: a cold build reports progress on
+// its context as its phases start and finish, so the daemon's stall
+// lease is renewed by a build that makes no clone progress (#209).
+func TestColdBuildReportsPhaseProgress(t *testing.T) {
+	w := newSQLiteWorktree(t)
+	var reports atomic.Int32
+	ctx := progress.With(context.Background(), func() { reports.Add(1) })
+	w.prepare(ctx, t, config.DatabaseConfig{
+		Migrate: &config.Step{Run: "touch " + w.source},
+		Seed:    &config.Step{Run: "true"},
+	}, RunOptions{})
+	const want = 6
+	if got := reports.Load(); got < want {
+		t.Errorf(
+			"reported progress %d times, want at least %d (database start, migrate start and end, seed start and end, snapshot, database end)",
+			got,
+			want,
+		)
 	}
 }

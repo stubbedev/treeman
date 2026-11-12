@@ -19,6 +19,7 @@ import (
 	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/ports"
 	"github.com/stubbedev/treeman/internal/prepare"
+	"github.com/stubbedev/treeman/internal/prepare/progress"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/slug"
@@ -454,10 +455,12 @@ func bringInWithEvents(
 		if len(paths) == 0 {
 			return nil
 		}
+		progress.Report(ctx)
 		_ = st.Store.WriteEvent(ctx, store.LevelInfo, startEvt,
 			fmt.Sprintf("entries=%d", len(paths)),
 			repoID, wtID, "", 0, map[string]any{"entries": len(paths)})
 		results, brErr := wt.BringInFilesReport(ctx, repoRoot, wtRoot, paths, mode, nil)
+		progress.Report(ctx)
 		var files, brought, skipped int
 		var bytes, totalMs int64
 		for _, r := range results {
@@ -1253,8 +1256,10 @@ func runTriggerActions(
 	if len(actions) == 0 {
 		return nil
 	}
+	progress.Report(ctx)
 	started := hooks.EmitHookStart(ctx, st.Store, repoID, wtID, trigger, len(actions))
 	out, err := hooks.RunHooks(ctx, trigger, actions, repoRoot, wtRoot, slugVal, isMain, inheritedEnv, true)
+	progress.Report(ctx)
 	runIDs := hooks.PersistOutcome(ctx, st.Store, repoID, wtID, trigger, started, nowMillis(), out)
 	if summary, ok := ctx.Value(hookSummaryKey{}).(*hookSummary); ok {
 		summary.record(trigger, out, runIDs)

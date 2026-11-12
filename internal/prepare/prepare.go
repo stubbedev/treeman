@@ -45,6 +45,7 @@ import (
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/migrations/runner"
 	"github.com/stubbedev/treeman/internal/migrations/testfw"
+	"github.com/stubbedev/treeman/internal/prepare/progress"
 	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/snapshot"
@@ -112,6 +113,7 @@ func stepFailure(phase, target string, out runner.Outcome, err error) error {
 func emitPhaseDone(ctx context.Context, st *store.Store, repoID, worktreeID int64,
 	engine, sourceDB, phase string, stepStart time.Time,
 ) {
+	progress.Report(ctx)
 	if st == nil {
 		return
 	}
@@ -220,6 +222,7 @@ func emitCacheMiss(ctx context.Context, st *store.Store, repoID, worktreeID int6
 func emitDumpLoadPhase(ctx context.Context, st *store.Store, repoID, worktreeID int64,
 	engine, sourceDB, path string, index, total int, stepStart time.Time, strategy string,
 ) {
+	progress.Report(ctx)
 	if st == nil {
 		return
 	}
@@ -875,7 +878,9 @@ func prepareOneEngine(
 			repoID, worktreeID, "", 0, nil)
 		return Outcome{}, nil
 	}
+	progress.Report(ctx)
 	out, err := prepareFamily(ctx, fam, cfg, d, dbIdx, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
+	progress.Report(ctx)
 	maybeSpawnPrewarm(cfg, st, repoID, worktreeID, d, out, err)
 	return out, err
 }
@@ -1439,6 +1444,7 @@ func runPhase(
 	spec runner.Spec,
 	inheritedEnv map[string]string,
 ) error {
+	progress.Report(ctx)
 	stepStart := time.Now()
 	spec = spec.WithLogPath(runnerLogPath(worktreePath, d.Engine, phase, target))
 	out, err := runner.Run(ctx, spec, worktreePath, target, tplCtx, inheritedEnv)
@@ -1972,6 +1978,7 @@ func tryIncrementalBuild(
 	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "incremental-restore", restoreStart)
 
 	if d.Migrate != nil {
+		progress.Report(ctx)
 		migrateStart := time.Now()
 		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, d.Engine, "migrate", source))
 		out, err := runner.Run(ctx, spec, worktreePath, source, tplCtx, inheritedEnv)

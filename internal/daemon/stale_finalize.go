@@ -12,11 +12,15 @@ import (
 
 // finalizeTimeout is how long a finalize may go without progress
 // before FinalizeWatchdogLoop cancels its work as stalled. The clock
-// starts when the finalize holds its cross-process lock, restarts on
-// every clone restore admitted to or finishing in its slot, and is
-// paused while a restore waits for a daemon-wide clone slot (#199):
-// eight concurrent creates queue behind each other's restores, and
-// that wait is progress, not a wedge.
+// starts when the finalize holds its cross-process lock and restarts on
+// every step forward its work reports (progress.Report): a bring-in or
+// hook run starting or finishing, a database's prepare starting or
+// finishing, each of its phases (dump load per file, migrate, seed,
+// snapshot) starting or finishing, a clone restore admitted to or
+// finishing in its slot, an Elasticsearch shard recovery advancing
+// (#209). It is paused while a restore waits for a daemon-wide clone
+// slot (#199): eight concurrent creates queue behind each other's
+// restores, and that wait is progress, not a wedge.
 //
 // 15 minutes sits just above the largest realistic single step we've
 // measured (largest production schema with seed data: ~12 min) so a

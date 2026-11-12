@@ -31,6 +31,8 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/stubbedev/treeman/internal/prepare/progress"
 )
 
 // srcBlockRegistry refcounts `index.blocks.write` per (cluster, index)
@@ -454,8 +456,9 @@ func (d *Driver) cloneAPICall(ctx context.Context, src, dst string) error {
 	// without blocking until shards are active. Large indices can take
 	// longer than the HTTP client's read timeout to clone server-side; the
 	// async dispatch keeps each HTTP round-trip short. We poll _recovery
-	// below until all shards reach DONE, with the caller's context deadline
-	// (finalizeTimeout) as the safety net.
+	// below until all shards reach DONE; the caller's context is the
+	// safety net (in treemand, the finalize stall lease, which every
+	// advance of the recovery renews).
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		fmt.Sprintf("%s/%s/_clone/%s?wait_for_active_shards=0", d.Base, src, dst),
 		bytes.NewReader(cloneBody))
@@ -487,67 +490,97 @@ func (d *Driver) cloneAPICall(ctx context.Context, src, dst string) error {
 
 // waitForRecovery polls /_recovery for index until all shards report DONE,
 // sleeping 500 ms between probes. Each probe is a short HTTP call that
-// comfortably fits within the driver's client timeout; the caller's context
-// deadline is the overall safety net for a clone that never completes.
+// comfortably fits within the driver's client timeout. Every probe that
+// sees the recovery advance (a shard done, more bytes recovered) is
+// reported as progress on ctx, so a stall watchdog tells a large clone
+// that is still copying from one that never completes.
 func (d *Driver) waitForRecovery(ctx context.Context, index string) error {
+	var last recoveryState
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
-		done, err := d.recoveryDone(ctx, index)
+		cur, err := d.recoveryStatus(ctx, index)
 		if err != nil {
 			return fmt.Errorf("recovery poll %s: %w", index, err)
 		}
-		if done {
+		if cur.done() {
 			return nil
 		}
+		if cur.advancedFrom(last) {
+			progress.Report(ctx)
+		}
+		last = cur
 	}
 }
 
-// recoveryDone fetches /_recovery for index and reports whether every shard
-// is in the DONE stage. Returns (false, nil) on HTTP 404 — the index may
-// not be visible immediately after the async clone POST.
-func (d *Driver) recoveryDone(ctx context.Context, index string) (bool, error) {
+// recoveryState is one /_recovery reading of an index: how many of its
+// shards there are, how many reached DONE, and the bytes recovered.
+type recoveryState struct {
+	shards, doneShards int
+	recoveredBytes     int64
+}
+
+// done reports whether every shard finished; a reading with no shards
+// means the recovery has not started.
+func (r recoveryState) done() bool {
+	return r.shards > 0 && r.doneShards == r.shards
+}
+
+func (r recoveryState) advancedFrom(prev recoveryState) bool {
+	return r.doneShards > prev.doneShards || r.recoveredBytes > prev.recoveredBytes
+}
+
+// recoveryStatus fetches /_recovery for index. A 404 reads as a
+// recovery that has not started: the index may not be visible
+// immediately after the async clone POST.
+func (d *Driver) recoveryStatus(ctx context.Context, index string) (recoveryState, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		d.Base+"/"+escSeg(index)+"/_recovery?human=false", nil)
 	if err != nil {
-		return false, err
+		return recoveryState{}, err
 	}
 	resp, err := d.HTTP.Do(req)
 	if err != nil {
-		return false, err
+		return recoveryState{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return false, fmt.Errorf("read body: %w", err)
+		return recoveryState{}, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		return false, nil // index not yet visible; keep polling
+		return recoveryState{}, nil
 	}
 	if resp.StatusCode >= 400 {
-		return false, fmt.Errorf("GET /%s/_recovery → HTTP %d: %s", index, resp.StatusCode, body)
+		return recoveryState{}, fmt.Errorf("GET /%s/_recovery → HTTP %d: %s", index, resp.StatusCode, body)
 	}
 	var parsed map[string]struct {
 		Shards []struct {
 			Stage string `json:"stage"`
+			Index struct {
+				Size struct {
+					RecoveredInBytes int64 `json:"recovered_in_bytes"`
+				} `json:"size"`
+			} `json:"index"`
 		} `json:"shards"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return false, fmt.Errorf("parse recovery response: %w", err)
+		return recoveryState{}, fmt.Errorf("parse recovery response: %w", err)
 	}
-	total := 0
+	var st recoveryState
 	for _, idx := range parsed {
 		for _, shard := range idx.Shards {
-			total++
-			if shard.Stage != "DONE" {
-				return false, nil
+			st.shards++
+			st.recoveredBytes += shard.Index.Size.RecoveredInBytes
+			if shard.Stage == "DONE" {
+				st.doneShards++
 			}
 		}
 	}
-	return total > 0, nil // total == 0: recovery not yet started
+	return st, nil
 }
 
 // setIndexBlock toggles `index.blocks.write` on the given index.
