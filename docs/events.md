@@ -93,6 +93,7 @@ that emits it.
 | `snapshots:cache:miss` | `store.EvtSnapshotsCacheMiss` |
 | `snapshots:cache:fallback` | `store.EvtSnapshotsCacheFallback` |
 | `snapshots:strategy` | `store.EvtSnapshotsStrategy` |
+| `snapshots:ledger:unknown` | `store.EvtSnapshotsLedgerUnknown` |
 | `snapshots:evict:cap` | `store.EvtSnapshotsEvictCap` |
 | `snapshots:evict:source` | `store.EvtSnapshotsEvictSource` |
 | `snapshots:evict:age` | `store.EvtSnapshotsEvictAge` |
