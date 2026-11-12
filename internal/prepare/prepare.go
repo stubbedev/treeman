@@ -2692,13 +2692,10 @@ func prepareMongo(
 		return out, err
 	}
 
+	ops := incrementalOps{exists: drv.DatabaseExists, snapshotRestore: drv.SnapshotRestore, snapshotCreate: drv.SnapshotCreate}
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, sourceDB, templateName, version, opts.localBudget(), key, inputs,
-		inheritedEnv, started, incrementalOps{
-			exists:          drv.DatabaseExists,
-			snapshotRestore: drv.SnapshotRestore,
-			snapshotCreate:  drv.SnapshotCreate,
-		})
+		inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
 	}
@@ -2718,24 +2715,10 @@ func prepareMongo(
 	); err != nil {
 		return Outcome{}, err
 	}
-	snapStart := time.Now()
-	if err := drv.SnapshotCreate(ctx, sourceDB, templateName); err != nil {
-		return Outcome{}, fmt.Errorf("mongo snapshot create %s → %s: %w", sourceDB, templateName, err)
-	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceDB, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourceDB, templateName,
-		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
-		return Outcome{}, err
-	}
-	spawnEvict(cfg, st, repoID)
-
-	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+		sourceDB, templateName, version, opts.localBudget(), key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
-		return Outcome{}, err
-	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, drv.SnapshotRestore, templateName, clones,
-		d.Engine, d.Fanout, opts.localBudget()); err != nil {
-		return Outcome{}, err
+		return Outcome{}, fmt.Errorf("mongo cold build: %w", err)
 	}
 
 	ms := time.Since(started).Milliseconds()
@@ -3256,16 +3239,10 @@ func prepareES(
 		return out, err
 	}
 
+	ops := incrementalOps{exists: esTemplateExists, snapshotRestore: esRestore, snapshotCreate: esCreate}
 	out, done, err = tryIncrementalBuild(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, sourcePrefix, templatePrefix, version, opts.localBudget(), key, inputs,
-		inheritedEnv, started, incrementalOps{
-			exists: func(ctx context.Context, name string) (bool, error) {
-				m, err := drv.ListMatching(ctx, name)
-				return len(m) > 0, err
-			},
-			snapshotRestore: esRestore,
-			snapshotCreate:  esCreate,
-		})
+		inheritedEnv, started, ops)
 	if done || err != nil {
 		return out, err
 	}
@@ -3285,24 +3262,10 @@ func prepareES(
 	); err != nil {
 		return Outcome{}, err
 	}
-	snapStart := time.Now()
-	if err := esCreate(ctx, sourcePrefix, templatePrefix); err != nil {
-		return Outcome{}, fmt.Errorf("es snapshot create %s → %s: %w", sourcePrefix, templatePrefix, err)
-	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourcePrefix, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, version, sourcePrefix, templatePrefix,
-		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
-		return Outcome{}, err
-	}
-	spawnEvict(cfg, st, repoID)
-
-	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+		sourcePrefix, templatePrefix, version, opts.localBudget(), key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
-		return Outcome{}, err
-	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, esRestore, templatePrefix, clones,
-		d.Engine, d.Fanout, opts.localBudget()); err != nil {
-		return Outcome{}, err
+		return Outcome{}, fmt.Errorf("elasticsearch cold build: %w", err)
 	}
 
 	ms := time.Since(started).Milliseconds()
@@ -3486,6 +3449,18 @@ func prepareFileEngine(
 		return dbfile.CopyDatabase(tmpl, p)
 	}
 
+	resolveClones := func(names []string) ([]string, error) {
+		out := make([]string, len(names))
+		for i, c := range names {
+			p, perr := resolveFile(c)
+			if perr != nil {
+				return nil, fmt.Errorf("resolve clone %s: %w", c, perr)
+			}
+			out[i] = p
+		}
+		return out, nil
+	}
+
 	out, done, flight, err := cacheHitGeneric(ctx, fileExists, fileRestore, d, tplCtx, worktreePath,
 		st, repoID, worktreeID, sourceFile, key, opts.localBudget(), started)
 	defer flight.finish()
@@ -3493,12 +3468,8 @@ func prepareFileEngine(
 		return out, err
 	}
 	if done {
-		for i, c := range out.Clones {
-			p, perr := resolveFile(c)
-			if perr != nil {
-				return Outcome{}, fmt.Errorf("resolve clone %s: %w", c, perr)
-			}
-			out.Clones[i] = p
+		if out.Clones, err = resolveClones(out.Clones); err != nil {
+			return Outcome{}, err
 		}
 		return out, nil
 	}
@@ -3507,23 +3478,15 @@ func prepareFileEngine(
 	if err := fileColdBuildSteps(ctx, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceFile, templatePath, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
-	snapStart := time.Now()
-	if err := dbfile.CopyDatabase(sourceFile, templatePath); err != nil {
-		return Outcome{}, fmt.Errorf("file snapshot create %s → %s: %w", sourceFile, templatePath, err)
-	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, sourceFile, "snapshot-create", snapStart)
-	if err := recordSnapshot(ctx, st, key, d.Engine, "", sourceFile, templatePath,
-		inputs, store.NewAppliedLedger(inputs), repoID); err != nil {
-		return Outcome{}, err
-	}
-	spawnEvict(cfg, st, repoID)
-
-	clones, err := fileCloneNames(cfg, d, tplCtx, worktreePath)
+	fileCreate := func(_ context.Context, src, tmpl string) error { return dbfile.CopyDatabase(src, tmpl) }
+	ops := incrementalOps{exists: fileExists, snapshotRestore: fileRestore, snapshotCreate: fileCreate}
+	names, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+		sourceFile, templatePath, "", opts.localBudget(), key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
-		return Outcome{}, err
+		return Outcome{}, fmt.Errorf("%s cold build: %w", d.Engine, err)
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, fileRestore, templatePath, clones,
-		d.Engine, d.Fanout, opts.localBudget()); err != nil {
+	clones, err := resolveClones(names)
+	if err != nil {
 		return Outcome{}, err
 	}
 
@@ -3546,24 +3509,6 @@ func prepareFileEngine(
 		CacheHit:     false,
 		Clones:       clones,
 	}, nil
-}
-
-// fileCloneNames resolves the test-clone fan-out names and joins them
-// onto the family's base dir, exactly like the source path.
-func fileCloneNames(cfg *config.Config, d config.DatabaseConfig, tplCtx template.Context, worktreePath string) ([]string, error) {
-	rendered, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, len(rendered))
-	for i, r := range rendered {
-		p, perr := dbfile.SourcePathFor(cfg, d.Connection, worktreePath, r)
-		if perr != nil {
-			return nil, perr
-		}
-		out[i] = p
-	}
-	return out, nil
 }
 
 // fileColdBuildSteps rebuilds the source database file from scratch:
