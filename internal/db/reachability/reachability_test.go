@@ -164,6 +164,39 @@ func TestProbeCtxRefusedOnLoopbackSaysEngineNotListening(t *testing.T) {
 	}
 }
 
+func TestProbeCtxBracketsIPv6HostInInterruptedError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := ProbeCtx(ctx, "postgres", "::1", 5432)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want it to wrap context.Canceled", err)
+	}
+	if !strings.Contains(err.Error(), "[::1]:5432") {
+		t.Errorf("error %q should render the address as [::1]:5432", err)
+	}
+}
+
+func TestProbeCtxBracketsIPv6HostInRefusedError(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener addr is %T, not *net.TCPAddr", ln.Addr())
+	}
+	_ = ln.Close()
+	port := uint16(addr.Port) //nolint:gosec // a TCP listener port always fits uint16
+	err = ProbeCtx(context.Background(), "postgres", "::1", port)
+	if !IsRefused(err) {
+		t.Fatalf("IsRefused(%v) = false, want true", err)
+	}
+	want := net.JoinHostPort("::1", strconv.Itoa(int(port)))
+	if !strings.Contains(err.Error(), "unreachable at "+want+" ") {
+		t.Errorf("error %q should render the address as %s", err, want)
+	}
+}
+
 var errStarting = errors.New("starting")
 
 func isStarting(err error) bool { return errors.Is(err, errStarting) }

@@ -37,21 +37,21 @@ const pollInterval = 250 * time.Millisecond
 func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
 	probeCtx, cancel := context.WithTimeout(ctx, DefaultTimeout)
 	defer cancel()
+	addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 	d := net.Dialer{}
-	conn, err := d.DialContext(probeCtx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	conn, err := d.DialContext(probeCtx, "tcp", addr)
 	if err == nil {
 		_ = conn.Close()
 		return nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return fmt.Errorf("%s probe of %s:%d interrupted: %w", engine, host, port, ctxErr)
+		return fmt.Errorf("%s probe of %s interrupted: %w", engine, addr, ctxErr)
 	}
 	if probeCtx.Err() != nil {
 		return fmt.Errorf(
-			"%s unreachable at %s:%d (tcp connect timeout — is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`)",
+			"%s unreachable at %s (tcp connect timeout — is the service running and the port exposed? if it's in docker, try `container:`, `compose_service:`, or publish the port with `-p HOST:%d`)",
 			engine,
-			host,
-			port,
+			addr,
 			port,
 		)
 	}
@@ -62,7 +62,7 @@ func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
 			hint = "nothing is listening there: the engine is down or still starting, check `treeman doctor`"
 		}
 	}
-	return fmt.Errorf("%s unreachable at %s:%d (tcp connect %s: %w — %s)", engine, host, port, outcome, err, hint)
+	return fmt.Errorf("%s unreachable at %s (tcp connect %s: %w — %s)", engine, addr, outcome, err, hint)
 }
 
 // ProbeURLCtx parses a URL-style connection string and probes the
