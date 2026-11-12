@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -566,6 +567,21 @@ func unregenerableState(ctx context.Context, wtPath string) ([]string, error) {
 	return reasons, nil
 }
 
+// deleteTargetRisks is unregenerableState for a delete target whose
+// directory may already be gone: a stale registry entry has nothing
+// left on disk to lose, so it reports no reasons and is left to the
+// teardown's own stale-entry handling.
+func deleteTargetRisks(ctx context.Context, wtPath string) ([]string, error) {
+	_, err := os.Stat(wtPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat %s before deleting it: %w", wtPath, err)
+	}
+	return unregenerableState(ctx, wtPath)
+}
+
 // resolveDeleteTarget maps a delete target (registered basename,
 // branch, slug or prefix, else a path relative to the cwd) to the
 // worktree path it names.
@@ -607,9 +623,9 @@ func confirmBatchDelete(ctx context.Context, repoRoot string, targets []string) 
 		if err != nil {
 			return batchDeletePlan{}, err
 		}
-		reasons, err := unregenerableState(ctx, wtPath)
+		reasons, err := deleteTargetRisks(ctx, wtPath)
 		if err != nil {
-			return batchDeletePlan{}, err
+			return batchDeletePlan{}, fmt.Errorf("delete target %s: %w", target, err)
 		}
 		if len(reasons) == 0 {
 			continue
@@ -691,9 +707,9 @@ func deleteWorktreeTarget(ctx context.Context, c *cli.Command, repoRoot, target 
 	// warrant a stop, and then as a default-yes warning naming
 	// the reason.
 	if !c.Bool("yes") && !preConfirmed {
-		reasons, err := unregenerableState(ctx, wtPath)
+		reasons, err := deleteTargetRisks(ctx, wtPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("delete target %s: %w", target, err)
 		}
 		if len(reasons) > 0 {
 			q := fmt.Sprintf("Worktree %s has %s — destroy?", wtPath, strings.Join(reasons, ", "))

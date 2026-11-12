@@ -578,6 +578,52 @@ func TestWtDeleteBatchDeclineKeepsCleanTargets(t *testing.T) {
 	}
 }
 
+// TestWtDeleteBatchRemovesStaleTarget pins #201: a non-interactive
+// multi-target `delete --force` whose batch includes a registered
+// worktree with its directory already removed treats that stale target
+// as clean instead of failing the whole batch on its git probe. Both
+// targets are torn down and the run exits 0.
+func TestWtDeleteBatchRemovesStaleTarget(t *testing.T) {
+	repo := newGitRepo(t)
+	e := newEnv(t)
+	addSibling := func(name string) string {
+		p := filepath.Join(filepath.Dir(repo), name)
+		mustGit(t, repo, "worktree", "add", "-b", name+"-branch", p, "HEAD")
+		res := e.run(t, p, "worktree", "register", "--branch", name+"-branch")
+		if res.err != nil {
+			t.Fatalf("register %s: %v\nstderr:\n%s", name, res.err, res.stderr)
+		}
+		return p
+	}
+	clean := addSibling("clean")
+	stale := addSibling("stale")
+	if err := os.RemoveAll(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	res := e.run(t, repo, "worktree", "delete", "--force", "stale-branch", "clean-branch")
+	if res.err != nil {
+		t.Fatalf("batch delete with a stale target must succeed: %v\nstdout:\n%s\nstderr:\n%s", res.err, res.stdout, res.stderr)
+	}
+	for _, p := range []string{stale, clean} {
+		if !strings.Contains(res.stdout, "deleting "+p) {
+			t.Errorf("target %s must be deleted:\nstdout:\n%s\nstderr:\n%s", p, res.stdout, res.stderr)
+		}
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		list := e.run(t, repo, "worktree", "list", "--json")
+		if !strings.Contains(list.stdout, `"clean-branch"`) && !strings.Contains(list.stdout, `"stale-branch"`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("both targets must be torn down; still registered:\n%s", list.stdout)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 // TestWtSwitchAlwaysLandsInWorktree pins the zsh `gwt` contract that
 // #91 broke (#117): `worktree switch` lands in the branch's worktree —
 // the existing one, else a new linked worktree — and never checks out
