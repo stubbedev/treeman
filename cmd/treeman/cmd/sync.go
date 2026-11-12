@@ -29,10 +29,18 @@ func SyncCmd() *cli.Command {
 		Action: func(ctx context.Context, c *cli.Command) error {
 			target := ""
 			if c.NArg() > 0 {
-				target = MustAbs(c.Args().First())
+				abs, err := absPath(c.Args().First())
+				if err != nil {
+					return err
+				}
+				target = abs
 			} else if !c.Bool("all") {
+				cwd, err := absPath(".")
+				if err != nil {
+					return err
+				}
 				// Default: scope to cwd's repo if we can find one.
-				if root, err := DiscoverRepoRoot(MustAbs(".")); err == nil {
+				if root, err := DiscoverRepoRoot(cwd); err == nil {
 					target = root
 				}
 			}

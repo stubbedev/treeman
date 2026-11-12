@@ -488,7 +488,11 @@ Examples:
 				if len(targets) == 0 {
 					return err
 				}
-				repoRoot, err = DiscoverRepoRoot(MustAbs(targets[0]))
+				first, absErr := absPath(targets[0])
+				if absErr != nil {
+					return absErr
+				}
+				repoRoot, err = DiscoverRepoRoot(first)
 				if err != nil {
 					return err
 				}
@@ -510,7 +514,7 @@ Examples:
 				// stderr, ahead of any prompt or teardown output.
 				names := make([]string, len(targets))
 				for i, t := range targets {
-					names[i] = filepath.Base(MustAbs(t))
+					names[i] = filepath.Base(t)
 				}
 				ui.Hint("selected %d worktree(s): %s", len(targets), strings.Join(names, ", "))
 			}
@@ -593,7 +597,7 @@ func resolveDeleteTarget(ctx context.Context, repoRoot, target string) (string, 
 	if ok {
 		return p, nil
 	}
-	return MustAbs(target), nil
+	return absPath(target)
 }
 
 // batchDeletePlan is the outcome of a multi-target delete's single
@@ -980,7 +984,10 @@ func wtRegister() *cli.Command {
 			if c.NArg() >= 1 {
 				path = c.Args().First()
 			}
-			path = MustAbs(path)
+			path, err := absPath(path)
+			if err != nil {
+				return err
+			}
 			repoRoot, err := resolveRepo(c.String("repo"))
 			if err != nil {
 				repoRoot, err = DiscoverRepoRoot(path)
@@ -1026,10 +1033,12 @@ func wtUnregister() *cli.Command {
 			if c.NArg() >= 1 {
 				path = c.Args().First()
 			}
-			path = MustAbs(path)
+			path, err := absPath(path)
+			if err != nil {
+				return err
+			}
 			var repoRoot string
 			if r := c.String("repo"); r != "" {
-				var err error
 				if repoRoot, err = resolveRepo(r); err != nil {
 					return err
 				}
@@ -1123,9 +1132,13 @@ func loadWtRows(ctx context.Context, st *store.Store, repoFilter, sortMode strin
 		orderBy string
 	)
 	if repoFilter != "" {
-		repoID, err := st.LookupRepoID(ctx, MustAbs(repoFilter))
+		root, err := absPath(repoFilter)
 		if err != nil {
-			return nil, fmt.Errorf("look up repo %s: %w", MustAbs(repoFilter), err)
+			return nil, err
+		}
+		repoID, err := st.LookupRepoID(ctx, root)
+		if err != nil {
+			return nil, fmt.Errorf("look up repo %s: %w", root, err)
 		}
 		if repoID == 0 {
 			return nil, fmt.Errorf("no repo registered at %s", repoFilter)
@@ -1488,16 +1501,22 @@ func resolveFinalizeTarget(ctx context.Context, arg, repoRoot string, repoErr er
 	var wtPath string
 	switch arg {
 	case "", ".":
-		wtPath = MustAbs(".")
+		var err error
+		wtPath, err = absPath(".")
+		if err != nil {
+			return "", "", err
+		}
 		if repoErr != nil {
-			var err error
 			repoRoot, err = DiscoverRepoRoot(wtPath)
 			if err != nil {
 				return "", "", err
 			}
 		}
 	default:
-		abs := MustAbs(arg)
+		abs, err := absPath(arg)
+		if err != nil {
+			return "", "", err
+		}
 		if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
 			wtPath = abs
 			if repoErr != nil {
@@ -1576,7 +1595,7 @@ func runLocalFinalizeFlow(ctx context.Context, repoRoot, wtPath string) error {
 // from cwd.
 func resolveRepo(override string) (string, error) {
 	if override != "" {
-		return MustAbs(override), nil
+		return absPath(override)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {

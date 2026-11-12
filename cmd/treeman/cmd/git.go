@@ -62,7 +62,7 @@ func GitCmd() *cli.Command {
 // repo-root-relative) and resolves it directly.
 func gitWorkdir(c *cli.Command) (string, error) {
 	if r := c.String("repo"); r != "" {
-		return MustAbs(r), nil
+		return absPath(r)
 	}
 	return os.Getwd()
 }

@@ -324,8 +324,11 @@ func resolveHooksScope(ctx context.Context, st *store.Store, c *cli.Command, all
 		return 0, "", nil
 	}
 
-	cwd, _ := os.Getwd()
-	row, err := lookupWorktreeContainingCwd(ctx, st, MustAbs(cwd))
+	cwd, err := os.Getwd()
+	if err != nil {
+		return 0, "", fmt.Errorf("resolve the current directory to find its worktree: %w", err)
+	}
+	row, err := lookupWorktreeContainingCwd(ctx, st, cwd)
 	if err != nil {
 		return 0, "", err
 	}
@@ -525,11 +528,11 @@ func buildFilterWithScope(ctx context.Context, c *cli.Command) (filterScope, err
 	}
 
 	// Auto-resolve: cwd → worktree row.
-	cwd, _ := os.Getwd()
-	if cwd == "" {
-		return scope, nil
+	cwd, err := os.Getwd()
+	if err != nil {
+		return scope, fmt.Errorf("resolve the current directory to scope the logs to its worktree: %w", err)
 	}
-	row, err := lookupWorktreeContainingCwd(ctx, st, MustAbs(cwd))
+	row, err := lookupWorktreeContainingCwd(ctx, st, cwd)
 	if err != nil {
 		return scope, err
 	}
@@ -555,9 +558,6 @@ func buildFilterWithScope(ctx context.Context, c *cli.Command) (filterScope, err
 // zero value when no row matches — callers treat that as
 // "logs scope = all worktrees".
 func lookupWorktreeContainingCwd(ctx context.Context, st *store.Store, cwd string) (store.WorktreeRow, error) {
-	if cwd == "" {
-		return store.WorktreeRow{}, nil
-	}
 	row, err := st.LookupActiveWorktreeByPath(ctx, cwd)
 	if err != nil {
 		return store.WorktreeRow{}, fmt.Errorf("look up the worktree at %s: %w", cwd, err)

@@ -97,7 +97,11 @@ func runWorktreeGc(ctx context.Context, c *cli.Command) error {
 		return err
 	}
 	if repo := c.String("repo"); repo != "" {
-		rows = filterWorktreeRows(rows, MustAbs(repo))
+		repoRoot, err := absPath(repo)
+		if err != nil {
+			return err
+		}
+		rows = filterWorktreeRows(rows, repoRoot)
 	}
 
 	cands, skipped, err := gcPlan(ctx, st, rows, gcOptions{

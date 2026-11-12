@@ -54,14 +54,14 @@ func CaptureInheritedEnv() map[string]string {
 	return out
 }
 
-// MustAbs canonicalises a path or fails. Used to keep cmd handlers
-// terse.
-func MustAbs(p string) string {
+// absPath resolves p against the current working directory, failing
+// with an error naming p when that directory cannot be determined.
+func absPath(p string) (string, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {
-		return p
+		return "", fmt.Errorf("resolve %s to an absolute path: %w", p, err)
 	}
-	return abs
+	return abs, nil
 }
 
 // PrintOK / PrintWarn delegate to the ui package's colored helpers.

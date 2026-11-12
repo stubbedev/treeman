@@ -180,7 +180,10 @@ func cwdRepoRoot() string {
 }
 
 func lookupExplicitRepoID(ctx context.Context, st *store.Store, repo string) (int64, error) {
-	root := MustAbs(repo)
+	root, err := absPath(repo)
+	if err != nil {
+		return 0, err
+	}
 	repoID, err := st.LookupRepoID(ctx, root)
 	if err != nil {
 		return 0, fmt.Errorf("look up repo %s: %w", root, err)
@@ -594,11 +597,10 @@ type worktreeRow struct {
 // worktree row. Lets `treeman worktree show` (and friends) run argument-
 // free from anywhere inside a worktree.
 func worktreeFromCwd(ctx context.Context, st *store.Store) (worktreeRow, error) {
-	cwd, err := os.Getwd()
+	dir, err := os.Getwd()
 	if err != nil {
-		return worktreeRow{}, err
+		return worktreeRow{}, fmt.Errorf("resolve the current directory to find its worktree: %w", err)
 	}
-	dir := MustAbs(cwd)
 	for {
 		row, err := st.LookupActiveWorktreeByPath(ctx, dir)
 		if err != nil {

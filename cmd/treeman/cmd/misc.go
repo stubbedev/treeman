@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -341,12 +342,10 @@ func printTaskEvent(ev rpc.EventEnvelope) {
 // daemon's cwd is not the user's). Mirrors the resolution the prepare /
 // db-reset cores do inline.
 func resolveWtRepo(worktree, repoOverride string) (wtPath, repoRoot string, err error) {
-	wtPath = worktree
-	if wtPath == "" {
-		cwd, _ := os.Getwd()
-		wtPath = cwd
+	wtPath, err = absPath(cmp.Or(worktree, "."))
+	if err != nil {
+		return "", "", err
 	}
-	wtPath = MustAbs(wtPath)
 	repoRoot, err = resolveRepo(repoOverride)
 	if err != nil {
 		repoRoot, err = DiscoverRepoRoot(wtPath)
@@ -509,12 +508,10 @@ func DbCmd() *cli.Command {
 // branch_scoped swap state per database. Shared by `treeman db status`
 // and the MCP branch_scoped_status tool.
 func RunDbStatusOnWorktree(ctx context.Context, worktree, repoOverride string) ([]prepare.BranchScopedDB, error) {
-	wt := worktree
-	if wt == "" {
-		cwd, _ := os.Getwd()
-		wt = cwd
+	wt, err := absPath(cmp.Or(worktree, "."))
+	if err != nil {
+		return nil, err
 	}
-	wt = MustAbs(wt)
 	repoRoot, err := resolveRepo(repoOverride)
 	if err != nil {
 		repoRoot, err = DiscoverRepoRoot(wt)
@@ -1424,7 +1421,10 @@ func SlugCmd() *cli.Command {
 			if c.NArg() >= 1 {
 				path = c.Args().First()
 			}
-			path = MustAbs(path)
+			path, err := absPath(path)
+			if err != nil {
+				return err
+			}
 			branch := detectBranchOfWorktree(path)
 			sl, err := slugForPath(ctx, path, branch)
 			if err != nil {
