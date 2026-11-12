@@ -14,7 +14,6 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/fspath"
 	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/resolve"
@@ -494,7 +493,8 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 	// before-engines + after-engines hooks against a log dir under
 	// XDG_STATE_HOME instead of the (deleted) worktree.
 	logDir := hooks.OrphanLogDir(repoPath, row.Slug)
-	runOrphan := func(trigger string, actions []config.Action) {
+	runOrphan := func(trigger hooks.Trigger) {
+		actions := trigger.Actions(&cfg.Hooks)
 		if len(actions) == 0 {
 			return
 		}
@@ -506,7 +506,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 		}
 		hooks.PersistOutcome(ctx, st.Store, repoID, row.ID, trigger, started, nowMillis(), out)
 	}
-	runOrphan("delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
+	runOrphan(hooks.DeleteBeforeEngines)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -523,7 +523,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	runOrphan("delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
+	runOrphan(hooks.DeleteAfterEngines)
 	if err := ctx.Err(); err != nil {
 		return err
 	}

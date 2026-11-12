@@ -57,10 +57,6 @@ type finalizeFailure struct {
 	err            error
 }
 
-// hookCreateBeforeEngines is the trigger of the setup hooks a finalize
-// runs before engine prepare.
-const hookCreateBeforeEngines = "create-before-engines"
-
 // recordFinalizeFailure is FinalizeWorktree's terminal-failure tail:
 // recover the engine namespaces (when prepare actually ran) and write
 // the worktree:create:error event that flips the row out of `preparing`
@@ -603,8 +599,8 @@ func runFinalizeSetupPipeline(
 	if stop, err := stopBefore(ctx, st, "pre-hooks", repoID, wtID, nil); stop {
 		return err == nil, err
 	}
-	if err := runTriggerActions(ctx, st, hookCreateBeforeEngines,
-		cfg.Hooks.OnCreateBeforeEngines, repoRoot, wtRoot, sl.Value,
+	if err := runTriggerActions(ctx, st, hooks.CreateBeforeEngines,
+		&cfg.Hooks, repoRoot, wtRoot, sl.Value,
 		isMain, repoID, wtID, inheritedEnv); err != nil {
 		return false, beforeEnginesFailure(err)
 	}
@@ -629,8 +625,8 @@ func runFinalizeSetupPipeline(
 	if stop, err := stopBefore(ctx, st, "post-hooks", repoID, wtID, prepErr); stop {
 		return err == nil, err
 	}
-	if err := runTriggerActions(ctx, st, "create-after-engines",
-		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
+	if err := runTriggerActions(ctx, st, hooks.CreateAfterEngines,
+		&cfg.Hooks, repoRoot, wtRoot, sl.Value,
 		isMain, repoID, wtID, inheritedEnv); err != nil {
 		return false, err
 	}
@@ -958,8 +954,8 @@ func FinalizeWorktreeForWatch(
 	if stop, err := stopBefore(ctx, st, "post-hooks", repoID, wtID, prepErr); stop {
 		return err
 	}
-	if err := runTriggerActions(ctx, st, "create-after-engines",
-		cfg.Hooks.OnCreateAfterEngines, repoRoot, wtRoot, sl.Value,
+	if err := runTriggerActions(ctx, st, hooks.CreateAfterEngines,
+		&cfg.Hooks, repoRoot, wtRoot, sl.Value,
 		id.IsMain, repoID, wtID, inheritedEnv); err != nil {
 		return fmt.Errorf("post-hooks (watch-trigger): %w", err)
 	}
@@ -1146,8 +1142,8 @@ func runTeardownBeforeRemoval(
 	repoID int64,
 	inheritedEnv map[string]string,
 ) error {
-	_ = runTriggerActions(ctx, st, "delete-before-engines",
-		cfg.Hooks.OnDeleteBeforeEngines, repoRoot, wtRoot, row.Slug,
+	_ = runTriggerActions(ctx, st, hooks.DeleteBeforeEngines,
+		&cfg.Hooks, repoRoot, wtRoot, row.Slug,
 		row.IsMain, repoID, row.ID, inheritedEnv)
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1160,8 +1156,8 @@ func runTeardownBeforeRemoval(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_ = runTriggerActions(ctx, st, "delete-after-engines",
-		cfg.Hooks.OnDeleteAfterEngines, repoRoot, wtRoot, row.Slug,
+	_ = runTriggerActions(ctx, st, hooks.DeleteAfterEngines,
+		&cfg.Hooks, repoRoot, wtRoot, row.Slug,
 		row.IsMain, repoID, row.ID, inheritedEnv)
 	return ctx.Err()
 }
@@ -1250,13 +1246,14 @@ func lowPriorityCommand(ctx context.Context, name string, args []string) *exec.C
 func runTriggerActions(
 	ctx context.Context,
 	st *State,
-	trigger string,
-	actions []config.Action,
+	trigger hooks.Trigger,
+	h *config.HooksConfig,
 	repoRoot, wtRoot, slugVal string,
 	isMain bool,
 	repoID, wtID int64,
 	inheritedEnv map[string]string,
 ) error {
+	actions := trigger.Actions(h)
 	if len(actions) == 0 {
 		return nil
 	}

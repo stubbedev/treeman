@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -72,11 +74,11 @@ func TestSnapshotLookupByEngineSource_NoMatchReturnsNil(t *testing.T) {
 // tool worth having over a generic file read.
 func TestHookLogReadTool_TruncatesWhenMaxBytesSet(t *testing.T) {
 	dir := t.TempDir()
-	hooksDir := filepath.Join(dir, ".treeman-hooks")
+	hooksDir := hooks.WorktreeLogDir(dir)
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(hooksDir, "setup-0.log")
+	path := hooks.CreateBeforeEngines.LogPath(hooksDir, 0)
 	body := fmt.Appendf(nil, "HEAD-PADDING-%s\nTAIL", string(make([]byte, 1000)))
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatal(err)
@@ -84,7 +86,7 @@ func TestHookLogReadTool_TruncatesWhenMaxBytesSet(t *testing.T) {
 
 	_, out, err := hookLogReadTool(context.Background(), nil, hookLogReadIn{
 		WorktreePath: dir,
-		Phase:        "setup",
+		Phase:        hooks.CreateBeforeEngines.String(),
 		GroupIdx:     0,
 		MaxBytes:     32,
 	})
@@ -104,15 +106,15 @@ func TestHookLogReadTool_TruncatesWhenMaxBytesSet(t *testing.T) {
 
 func TestHookLogReadTool_FullReadWhenMaxBytesZero(t *testing.T) {
 	dir := t.TempDir()
-	hooksDir := filepath.Join(dir, ".treeman-hooks")
+	hooksDir := hooks.WorktreeLogDir(dir)
 	_ = os.MkdirAll(hooksDir, 0o755)
-	path := filepath.Join(hooksDir, "teardown-2.log")
+	path := hooks.DeleteBeforeEngines.LogPath(hooksDir, 2)
 	body := []byte("complete file body")
 	_ = os.WriteFile(path, body, 0o644)
 
 	_, out, err := hookLogReadTool(context.Background(), nil, hookLogReadIn{
 		WorktreePath: dir,
-		Phase:        "teardown",
+		Phase:        hooks.DeleteBeforeEngines.String(),
 		GroupIdx:     2,
 	})
 	if err != nil {
@@ -135,10 +137,20 @@ func TestHookLogReadTool_RequiresWorktreeAndPhase(t *testing.T) {
 	}
 }
 
+func TestHookLogReadTool_RejectsUnknownPhase(t *testing.T) {
+	_, _, err := hookLogReadTool(context.Background(), nil, hookLogReadIn{
+		WorktreePath: t.TempDir(),
+		Phase:        "../../etc/passwd",
+	})
+	if err == nil || !strings.Contains(err.Error(), hooks.JoinTriggers(hooks.Triggers())) {
+		t.Errorf("unknown phase: got %v, want an error listing the triggers", err)
+	}
+}
+
 func TestHookLogReadTool_MissingFileSurfacesStatError(t *testing.T) {
 	_, _, err := hookLogReadTool(context.Background(), nil, hookLogReadIn{
 		WorktreePath: t.TempDir(),
-		Phase:        "setup",
+		Phase:        hooks.CreateBeforeEngines.String(),
 	})
 	if err == nil {
 		t.Errorf("missing file should error")

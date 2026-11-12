@@ -56,6 +56,11 @@ type GroupOutcome struct {
 	LogBody []byte
 }
 
+// WorktreeLogDir is where RunHooks logs the groups it runs in worktreePath.
+func WorktreeLogDir(worktreePath string) string {
+	return filepath.Join(worktreePath, ".treeman-hooks")
+}
+
 // OrphanLogDir is where RunHooksOrphan's logs go for a worktree whose
 // directory (which would normally host `.treeman-hooks/`) no longer
 // exists: a per-repo, per-run path under XDG_STATE_HOME.
@@ -88,7 +93,7 @@ func OrphanLogDir(repoPath, slug string) string {
 // exit.
 func RunHooksOrphan(
 	ctx context.Context,
-	phase string,
+	trigger Trigger,
 	entries []config.Action,
 	repoRoot, worktreePath, slug, logDir string,
 	isMain bool,
@@ -115,7 +120,7 @@ func RunHooksOrphan(
 		if len(entry.Run) == 0 {
 			continue
 		}
-		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
+		logPath := trigger.LogPath(logDir, i)
 		// Default cwd is the repo root, not the (deleted) worktree.
 		cmdStr, err := renderAction(ctx, entry, repoRoot)
 		if err != nil {
@@ -153,7 +158,7 @@ func RunHooksOrphan(
 // changes whether RunHooks itself blocks on their completion.
 func RunHooks(
 	ctx context.Context,
-	phase string,
+	trigger Trigger,
 	entries []config.Action,
 	repoRoot, worktreePath, slug string,
 	isMain bool,
@@ -164,7 +169,7 @@ func RunHooks(
 	if len(entries) == 0 {
 		return out, nil
 	}
-	logDir := filepath.Join(worktreePath, ".treeman-hooks")
+	logDir := WorktreeLogDir(worktreePath)
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return out, fmt.Errorf("create %s: %w", logDir, err)
 	}
@@ -178,7 +183,7 @@ func RunHooks(
 		if len(entry.Run) == 0 {
 			continue
 		}
-		logPath := filepath.Join(logDir, fmt.Sprintf("%s-%d.log", phase, i))
+		logPath := trigger.LogPath(logDir, i)
 		cmdStr, err := renderAction(ctx, entry, worktreePath)
 		if err != nil {
 			return out, err
@@ -219,7 +224,7 @@ func RunHooks(
 // success a later phase depends on — so the abort surfaces the true
 // cause (e.g. `composer install` exit 1) instead of a downstream
 // symptom (a `migrate` that fails only because vendor/ is half-written).
-func FirstFailureError(trigger string, out RunOutcome, runIDs []int64) error {
+func FirstFailureError(trigger Trigger, out RunOutcome, runIDs []int64) error {
 	for i, g := range out.Groups {
 		if g.ExitCode == 0 || g.ContinueOnError {
 			continue

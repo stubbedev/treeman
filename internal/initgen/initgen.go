@@ -20,6 +20,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	enginepkg "github.com/stubbedev/treeman/internal/engine"
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
 	"github.com/stubbedev/treeman/internal/schema"
 	"github.com/stubbedev/treeman/internal/yamlpatch"
@@ -445,8 +446,7 @@ func renderTemplateDetected(cwd string, detected []framework.Spec) string {
 		actions.Style = yaml.FlowStyle
 		actions.HeadComment = "add install commands here — each action is one parallel group;\nuse run: [step1, step2] for sequenced commands inside one group."
 	}
-	hooks := mapNode("create-before-engines", actions)
-	mapSet(root, "hooks", hooks)
+	mapSet(root, "hooks", mapNode(hooks.CreateBeforeEngines.String(), actions))
 	if len(detected) == 0 {
 		// Attach the "no databases yet" hint as a HeadComment on the
 		// hooks key so it lands above the hooks: section, taking the

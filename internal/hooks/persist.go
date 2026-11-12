@@ -30,7 +30,7 @@ func PersistOutcome(
 	ctx context.Context,
 	st *store.Store,
 	repoID, wtID int64,
-	phase string,
+	phase Trigger,
 	startedMs, finishedMs int64,
 	out RunOutcome,
 ) []int64 {
@@ -93,7 +93,7 @@ func PersistOutcome(
 
 	msg := fmt.Sprintf("groups=%d failed=%d", len(out.Groups), failed)
 	if persistErr := errors.Join(persistErrs...); persistErr != nil {
-		slog.Error("hook runs not recorded", "phase", phase, "worktree_id", wtID, "err", persistErr)
+		slog.Error("hook runs not recorded", "phase", phase.String(), "worktree_id", wtID, "err", persistErr)
 		payload["persist_error"] = persistErr.Error()
 		msg += "; hook runs not recorded: " + persistErr.Error()
 		if level == store.LevelInfo {
@@ -107,7 +107,7 @@ func PersistOutcome(
 			msg += " (continuing)"
 		}
 	}
-	_ = st.WriteEvent(ctx, level, store.EvtHooksEnd, msg, repoID, wtID, phase, dur, payload)
+	_ = st.WriteEvent(ctx, level, store.EvtHooksEnd, msg, repoID, wtID, phase.String(), dur, payload)
 	return runIDs
 }
 
@@ -115,13 +115,13 @@ func persistGroup(
 	ctx context.Context,
 	st *store.Store,
 	wtID int64,
-	phase string,
+	phase Trigger,
 	i int,
 	cmd string,
 	startedMs, finishedMs int64,
 	g GroupOutcome,
 ) (int64, error) {
-	runID, err := st.WriteHookRun(ctx, wtID, phase, i, cmd,
+	runID, err := st.WriteHookRun(ctx, wtID, phase.String(), i, cmd,
 		startedMs, finishedMs, g.ExitCode, g.StdoutTail, g.StderrTail)
 	if err != nil {
 		return 0, fmt.Errorf("record %s hook group %d (%s): %w", phase, i, g.Command, err)
@@ -137,14 +137,14 @@ func persistGroup(
 // EmitHookStart writes a hooks:start event so `treeman logs tail` shows
 // the phase began even when every group succeeds and the only signal
 // would otherwise be a single hooks:end. Safe to call with st == nil.
-func EmitHookStart(ctx context.Context, st *store.Store, repoID, wtID int64, phase string, entryCount int) int64 {
+func EmitHookStart(ctx context.Context, st *store.Store, repoID, wtID int64, phase Trigger, entryCount int) int64 {
 	now := time.Now().UnixMilli()
 	if st == nil || wtID == 0 {
 		return now
 	}
 	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtHooksStart,
 		fmt.Sprintf("groups=%d", entryCount),
-		repoID, wtID, phase, 0,
+		repoID, wtID, phase.String(), 0,
 		map[string]any{"groups": entryCount})
 	return now
 }

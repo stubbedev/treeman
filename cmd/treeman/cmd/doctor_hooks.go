@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/resolve"
 )
 
@@ -32,16 +33,20 @@ func checkHooks(repoRoot string) doctorResult {
 	if err != nil {
 		return doctorResult{Name: "hooks", Status: "skip", Detail: "config not loadable: " + err.Error()}
 	}
-	before := cfg.Hooks.OnCreateBeforeEngines
+	before := hooks.CreateBeforeEngines.Actions(&cfg.Hooks)
 	if len(before) == 0 {
-		return doctorResult{Name: "hooks", Status: "skip", Detail: "no create-before-engines hooks"}
+		return doctorResult{Name: "hooks", Status: "skip", Detail: fmt.Sprintf("no %s hooks", hooks.CreateBeforeEngines)}
 	}
 	bootScripts := repoBootScripts(repoRoot)
 	if len(bootScripts) == 0 {
 		return doctorResult{
 			Name:   "hooks",
 			Status: "ok",
-			Detail: fmt.Sprintf("%d create-before-engines action(s); no framework boot scripts in the repo's manifests", len(before)),
+			Detail: fmt.Sprintf(
+				"%d %s action(s); no framework boot scripts in the repo's manifests",
+				len(before),
+				hooks.CreateBeforeEngines,
+			),
 		}
 	}
 
@@ -57,19 +62,22 @@ func checkHooks(repoRoot string) doctorResult {
 		return doctorResult{
 			Name:   "hooks",
 			Status: "ok",
-			Detail: fmt.Sprintf("%d create-before-engines action(s); no unguarded dependency install", len(before)),
+			Detail: fmt.Sprintf("%d %s action(s); no unguarded dependency install", len(before), hooks.CreateBeforeEngines),
 		}
 	}
 	return doctorResult{
 		Name:   "hooks",
 		Status: "warn",
-		Detail: "create-before-engines installs dependencies with framework boot scripts armed, but the engine databases do not exist in that phase: " +
-			strings.Join(
-				risky,
-				"; ",
-			),
-		Hint: "disarm the scripts in this phase (`composer install --no-scripts` / `npm install --ignore-scripts`) and re-run them from " +
-			"create-after-engines, or move the whole install there — see the Laravel recipe in docs/configuration.md#hooks",
+		Detail: fmt.Sprintf(
+			"%s installs dependencies with framework boot scripts armed, but the engine databases do not exist in that phase: %s",
+			hooks.CreateBeforeEngines,
+			strings.Join(risky, "; "),
+		),
+		Hint: fmt.Sprintf(
+			"disarm the scripts in this phase (`composer install --no-scripts` / `npm install --ignore-scripts`) and re-run them from "+
+				"%s, or move the whole install there — see the Laravel recipe in docs/configuration.md#hooks",
+			hooks.CreateAfterEngines,
+		),
 	}
 }
 

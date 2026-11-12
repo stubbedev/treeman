@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -30,14 +31,14 @@ func TestSweepStalePreparingRecordsTheInterruptedPhase(t *testing.T) {
 		{
 			name:      "during create-before-engines hooks",
 			trigger:   trigger{Source: triggerRPC},
-			progress:  []store.Event{{EventType: store.EvtHooksStart, Phase: hookCreateBeforeEngines}},
+			progress:  []store.Event{{EventType: store.EvtHooksStart, Phase: hooks.CreateBeforeEngines.String()}},
 			wantPhase: store.FinalizeSetup, wantRetry: true,
 		},
 		{
 			name:    "during engine prepare",
 			trigger: trigger{Source: triggerRPC},
 			progress: []store.Event{
-				{EventType: store.EvtHooksStart, Phase: hookCreateBeforeEngines},
+				{EventType: store.EvtHooksStart, Phase: hooks.CreateBeforeEngines.String()},
 				{EventType: store.EvtPrepareStart},
 			},
 			wantPhase: store.FinalizeEngines, wantRetry: true, wantRecovery: true,
@@ -47,7 +48,7 @@ func TestSweepStalePreparingRecordsTheInterruptedPhase(t *testing.T) {
 			trigger: trigger{Source: triggerRPC},
 			progress: []store.Event{
 				{EventType: store.EvtPrepareStart},
-				{EventType: store.EvtHooksStart, Phase: "create-after-engines"},
+				{EventType: store.EvtHooksStart, Phase: hooks.CreateAfterEngines.String()},
 			},
 			wantPhase: store.FinalizeEngines, wantRetry: true, wantRecovery: true,
 		},
@@ -59,7 +60,7 @@ func TestSweepStalePreparingRecordsTheInterruptedPhase(t *testing.T) {
 		{
 			name:      "last automatic re-run",
 			trigger:   trigger{Source: triggerCreateRetry, Attempt: createRetryAttempts},
-			progress:  []store.Event{{EventType: store.EvtHooksStart, Phase: hookCreateBeforeEngines}},
+			progress:  []store.Event{{EventType: store.EvtHooksStart, Phase: hooks.CreateBeforeEngines.String()}},
 			wantPhase: store.FinalizeSetup, wantRetry: false,
 		},
 	}

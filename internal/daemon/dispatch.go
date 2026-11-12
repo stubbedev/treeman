@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/store"
@@ -729,8 +730,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 		// the regular finalize re-run (no ordering — both react to
 		// the same event independently).
 		safeGo(lblHeadActions, wtPath, func() {
-			fireTriggerActions(runid.With(st.BgCtx, rid), st, repoPath, wtPath, "checkout", env,
-				func(cfg *config.Config) []config.Action { return cfg.Hooks.OnCheckout })
+			fireTriggerActions(runid.With(st.BgCtx, rid), st, repoPath, wtPath, hooks.Checkout, env)
 		})
 		safeGo(lblHeadFinalize, wtPath, func() {
 			if err := FinalizeWorktreeForHead(runid.With(st.BgCtx, rid), st, repoPath, wtPath, env); err != nil {
@@ -902,18 +902,13 @@ func fireOnFileChange(
 		slog.Warn("file-change: load config", "wt", wtPath, "err", err)
 		return
 	}
-	all := cfg.Hooks.OnFileChange
-	if len(all) == 0 {
-		return
-	}
-	// Filter by label match (empty Match list = wildcard).
-	matched := make([]config.Action, 0, len(all))
-	for _, fa := range all {
+	matched := config.HooksConfig{OnFileChange: make([]config.FilteredAction, 0, len(cfg.Hooks.OnFileChange))}
+	for _, fa := range cfg.Hooks.OnFileChange {
 		if fa.Matches(label) {
-			matched = append(matched, fa.Action)
+			matched.OnFileChange = append(matched.OnFileChange, fa)
 		}
 	}
-	if len(matched) == 0 {
+	if len(matched.OnFileChange) == 0 {
 		return
 	}
 	repoID, err := st.Store.EnsureRepo(ctx, repoPath, filepath.Base(repoPath))
@@ -959,7 +954,7 @@ func fireOnFileChange(
 	env["TREEMAN_WATCH_LABEL"] = label
 	env["TREEMAN_WATCH_ENGINE"] = engine
 	env["TREEMAN_WATCH_DB_NAME"] = dbName
-	if err := runTriggerActions(ctx, st, "file-change", matched, repoPath, wtPath, sl.Value, isMain, repoID, wtID, env); err != nil {
+	if err := runTriggerActions(ctx, st, hooks.FileChange, &matched, repoPath, wtPath, sl.Value, isMain, repoID, wtID, env); err != nil {
 		slog.Warn("file-change: run actions", "wt", wtPath, "err", err)
 	}
 }
@@ -978,17 +973,16 @@ func fireOnFileChange(
 func fireTriggerActions(
 	ctx context.Context,
 	st *State,
-	repoPath, wtPath, trigger string,
+	repoPath, wtPath string,
+	trigger hooks.Trigger,
 	inheritedEnv map[string]string,
-	pick func(*config.Config) []config.Action,
 ) {
 	cfg, err := resolve.LoadResolvedForWorktree(repoPath, wtPath)
 	if err != nil {
 		slog.Warn("trigger actions: load config", "trigger", trigger, "wt", wtPath, "err", err)
 		return
 	}
-	actions := pick(&cfg)
-	if len(actions) == 0 {
+	if len(trigger.Actions(&cfg.Hooks)) == 0 {
 		return
 	}
 	repoID, err := st.Store.EnsureRepo(ctx, repoPath, filepath.Base(repoPath))
@@ -1007,7 +1001,7 @@ func fireTriggerActions(
 		ctx,
 		st,
 		trigger,
-		actions,
+		&cfg.Hooks,
 		repoPath,
 		wtPath,
 		id.Slug.Value,

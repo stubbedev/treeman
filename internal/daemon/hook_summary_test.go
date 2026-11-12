@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/stubbedev/treeman/internal/config"
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -142,7 +143,7 @@ func TestHookSummaryCleanRetry(t *testing.T) {
 	ctx := context.Background()
 	repoID, _ := st.Store.EnsureRepo(ctx, t.TempDir(), "repo")
 	wtID, _ := st.Store.EnsureWorktree(ctx, repoID, t.TempDir(), "slug", "feature")
-	(&hookSummary{warnings: []hookWarning{{Phase: "create-before-engines", ExitCode: 1}}}).emit(
+	(&hookSummary{warnings: []hookWarning{{Phase: hooks.CreateBeforeEngines, ExitCode: 1}}}).emit(
 		ctx,
 		st.Store,
 		repoID,

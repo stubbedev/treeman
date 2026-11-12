@@ -270,17 +270,18 @@ func runPrepare(ctx context.Context, worktree, repoOverride string) ([]prepare.O
 // these paths mutate engine content just like finalize, so hooks that
 // react to fresh data (cache flushes) must run here too.
 func runPostEngineHooks(ctx context.Context, sc *worktreeScope) error {
-	actions := sc.cfg.Hooks.OnCreateAfterEngines
+	trigger := hooks.CreateAfterEngines
+	actions := trigger.Actions(&sc.cfg.Hooks)
 	if len(actions) == 0 {
 		return nil
 	}
-	started := hooks.EmitHookStart(ctx, sc.st, sc.repoID, sc.id.WtID, "create-after-engines", len(actions))
-	out, err := hooks.RunHooks(ctx, "create-after-engines", actions, sc.repoRoot, sc.wt, sc.id.Slug.Value, sc.id.IsMain, captureEnv(), true)
-	runIDs := hooks.PersistOutcome(ctx, sc.st, sc.repoID, sc.id.WtID, "create-after-engines", started, time.Now().UnixMilli(), out)
+	started := hooks.EmitHookStart(ctx, sc.st, sc.repoID, sc.id.WtID, trigger, len(actions))
+	out, err := hooks.RunHooks(ctx, trigger, actions, sc.repoRoot, sc.wt, sc.id.Slug.Value, sc.id.IsMain, captureEnv(), true)
+	runIDs := hooks.PersistOutcome(ctx, sc.st, sc.repoID, sc.id.WtID, trigger, started, time.Now().UnixMilli(), out)
 	if err != nil {
-		return fmt.Errorf("create-after-engines: %w", err)
+		return fmt.Errorf("%s: %w", trigger, err)
 	}
-	return hooks.FirstFailureError("create-after-engines", out, runIDs)
+	return hooks.FirstFailureError(trigger, out, runIDs)
 }
 
 // runDbReset is the self-contained equivalent of cmd's
@@ -411,37 +412,17 @@ func canElicit(req *mcpsdk.CallToolRequest) bool {
 // are merged on top of the captured os.Environ() so an MCP caller can
 // tweak one var (e.g. retry a flaky setup with `DEBUG=1`) without
 // editing .treeman.yaml.
-func runHookPhase(ctx context.Context, phase, worktree string, envOverrides map[string]string) (hooks.RunOutcome, error) {
+func runHookPhase(ctx context.Context, trigger hooks.Trigger, worktree string, envOverrides map[string]string) (hooks.RunOutcome, error) {
 	sc, err := openWorktreeScope(ctx, worktree, "")
 	if err != nil {
 		return hooks.RunOutcome{}, err
 	}
 	defer func() { _ = sc.st.Close() }()
-	cfg := sc.cfg
 	env := captureEnv()
 	maps.Copy(env, envOverrides)
-
-	var entries []config.Action
-	switch phase {
-	case "create-before-engines":
-		entries = cfg.Hooks.OnCreateBeforeEngines
-	case "create-after-engines":
-		entries = cfg.Hooks.OnCreateAfterEngines
-	case "delete-before-engines":
-		entries = cfg.Hooks.OnDeleteBeforeEngines
-	case "delete-after-engines":
-		entries = cfg.Hooks.OnDeleteAfterEngines
-	case "checkout":
-		entries = cfg.Hooks.OnCheckout
-	default:
-		return hooks.RunOutcome{}, fmt.Errorf(
-			"unknown phase %q (want create-before-engines|create-after-engines|delete-before-engines|delete-after-engines|checkout)",
-			phase,
-		)
-	}
-
-	started := hooks.EmitHookStart(ctx, sc.st, sc.repoID, sc.id.WtID, phase, len(entries))
-	out, rErr := hooks.RunHooks(ctx, phase, entries, sc.repoRoot, sc.wt, sc.id.Slug.Value, sc.id.IsMain, env, true)
-	hooks.PersistOutcome(ctx, sc.st, sc.repoID, sc.id.WtID, phase, started, time.Now().UnixMilli(), out)
+	entries := trigger.Actions(&sc.cfg.Hooks)
+	started := hooks.EmitHookStart(ctx, sc.st, sc.repoID, sc.id.WtID, trigger, len(entries))
+	out, rErr := hooks.RunHooks(ctx, trigger, entries, sc.repoRoot, sc.wt, sc.id.Slug.Value, sc.id.IsMain, env, true)
+	hooks.PersistOutcome(ctx, sc.st, sc.repoID, sc.id.WtID, trigger, started, time.Now().UnixMilli(), out)
 	return out, rErr
 }

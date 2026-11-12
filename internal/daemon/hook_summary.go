@@ -17,17 +17,17 @@ const (
 )
 
 type hookWarning struct {
-	Phase    string `json:"phase"`
-	Command  string `json:"command"`
-	ExitCode int    `json:"exit_code"`
-	RunID    int64  `json:"run_id"`
+	Phase    hooks.Trigger `json:"phase"`
+	Command  string        `json:"command"`
+	ExitCode int           `json:"exit_code"`
+	RunID    int64         `json:"run_id"`
 }
 
 type hookSummary struct {
 	warnings []hookWarning
 }
 
-func (s *hookSummary) record(phase string, out hooks.RunOutcome, runIDs []int64) {
+func (s *hookSummary) record(phase hooks.Trigger, out hooks.RunOutcome, runIDs []int64) {
 	for i, g := range out.Groups {
 		if g.ExitCode == 0 || !g.ContinueOnError {
 			continue

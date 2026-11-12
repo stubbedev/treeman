@@ -279,11 +279,15 @@ type hookOut struct {
 }
 
 func hookTool(ctx context.Context, _ *mcpsdk.CallToolRequest, in hookIn) (*mcpsdk.CallToolResult, hookOut, error) {
-	out, err := runHookPhase(ctx, in.Phase, in.Worktree, in.EnvOverrides)
+	trigger, err := hooks.ParseManualTrigger(in.Phase)
 	if err != nil {
 		return nil, hookOut{}, err
 	}
-	return nil, hookOut{Phase: in.Phase, Outcome: out}, nil
+	out, err := runHookPhase(ctx, trigger, in.Worktree, in.EnvOverrides)
+	if err != nil {
+		return nil, hookOut{}, err
+	}
+	return nil, hookOut{Phase: trigger.String(), Outcome: out}, nil
 }
 
 // ─── config_write ─────────────────────────────────────────────────

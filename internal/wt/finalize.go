@@ -71,7 +71,8 @@ func runLocalFinalizeSteps(
 	skipPrepare bool,
 	sink Sink,
 ) (enginesTouched bool, err error) {
-	runTrigger := func(trigger string, actions []config.Action) error {
+	runTrigger := func(trigger hooks.Trigger) error {
+		actions := trigger.Actions(&cfg.Hooks)
 		if len(actions) == 0 {
 			return nil
 		}
@@ -81,8 +82,8 @@ func runLocalFinalizeSteps(
 		if err != nil {
 			return err
 		}
-		sink.Info("%s: %d action(s) complete (logs in %s/.treeman-hooks/)",
-			trigger, len(actions), wtPath)
+		sink.Info("%s: %d action(s) complete (logs in %s/)",
+			trigger, len(actions), hooks.WorktreeLogDir(wtPath))
 		return nil
 	}
 	// Materialize links/copies + render patches before hooks fire (a
@@ -113,11 +114,11 @@ func runLocalFinalizeSteps(
 			return false, err
 		}
 	}
-	if err := runTrigger("create-before-engines", cfg.Hooks.OnCreateBeforeEngines); err != nil {
+	if err := runTrigger(hooks.CreateBeforeEngines); err != nil {
 		return false, err
 	}
 	if skipPrepare || len(cfg.Databases) == 0 {
-		return false, runTrigger("create-after-engines", cfg.Hooks.OnCreateAfterEngines)
+		return false, runTrigger(hooks.CreateAfterEngines)
 	}
 	outs, err := prepare.Run(ctx, cfg, wtPath, sl, st, repoID, wtID, env)
 	for _, o := range outs {
@@ -130,5 +131,5 @@ func runLocalFinalizeSteps(
 		// over a stale or half-built database (#123).
 		return true, fmt.Errorf("prepare: %w", err)
 	}
-	return true, runTrigger("create-after-engines", cfg.Hooks.OnCreateAfterEngines)
+	return true, runTrigger(hooks.CreateAfterEngines)
 }

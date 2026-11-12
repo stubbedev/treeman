@@ -16,7 +16,7 @@ func TestRunHooksWaitReportsProgressForEachGroup(t *testing.T) {
 	var reports atomic.Int32
 	ctx := progress.With(context.Background(), func() { reports.Add(1) })
 	entries := []config.Action{{Run: []string{"true"}}, {Run: []string{"true"}}}
-	if _, err := RunHooks(ctx, "setup", entries, wt, wt, "slug", false, emptyEnv(), true); err != nil {
+	if _, err := RunHooks(ctx, CreateBeforeEngines, entries, wt, wt, "slug", false, emptyEnv(), true); err != nil {
 		t.Fatal(err)
 	}
 	if n := int(reports.Load()); n < len(entries) {

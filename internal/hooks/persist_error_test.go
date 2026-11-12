@@ -22,7 +22,7 @@ func TestPersistOutcomeReportsHookRunsItCouldNotRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	PersistOutcome(ctx, s, repoID, wtID, "setup", 1000, 1500, RunOutcome{
+	PersistOutcome(ctx, s, repoID, wtID, CreateBeforeEngines, 1000, 1500, RunOutcome{
 		Groups: []GroupOutcome{{Command: "echo hi", ExitCode: 0}},
 	})
 

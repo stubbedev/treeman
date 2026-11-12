@@ -37,7 +37,7 @@ func TestPersistContinueOnError(t *testing.T) {
 				out.Groups = append(out.Groups, GroupOutcome{Command: "composer install", ExitCode: 1})
 				wantLevel, wantFailed = store.LevelError, 2
 			}
-			ids := PersistOutcome(ctx, st, repoID, wtID, "create-before-engines", 1000, 2000, out)
+			ids := PersistOutcome(ctx, st, repoID, wtID, CreateBeforeEngines, 1000, 2000, out)
 			if len(ids) != wantFailed || ids[0] == 0 {
 				t.Fatalf("run IDs: %v", ids)
 			}

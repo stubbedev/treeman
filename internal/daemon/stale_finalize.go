@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/prepare"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/store"
@@ -165,7 +166,7 @@ func interruptedPhase(t trigger, start, reached store.Event) store.FinalizePhase
 	if reached.ID <= start.ID {
 		return store.FinalizeSetup
 	}
-	if reached.EventType == store.EvtHooksStart && reached.Phase == hookCreateBeforeEngines {
+	if reached.EventType == store.EvtHooksStart && reached.Phase == hooks.CreateBeforeEngines.String() {
 		return store.FinalizeSetup
 	}
 	return store.FinalizeEngines

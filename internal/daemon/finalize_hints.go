@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/shellenv"
 )
 
@@ -19,13 +20,15 @@ func beforeEnginesFailure(err error) error {
 	// (deps must install so migrate can find them) — a hook that boots
 	// the app and queries the DB here hits "Unknown database" (#18).
 	return fmt.Errorf(
-		"%w\nhint: create-before-engines hooks run before this worktree's databases exist; move any app-boot / DB-touching step to create-after-engines. Retry this worktree with `treeman worktree finalize`",
+		"%w\nhint: %s hooks run before this worktree's databases exist; move any app-boot / DB-touching step to %s. Retry this worktree with `treeman worktree finalize`",
 		err,
+		hooks.CreateBeforeEngines,
+		hooks.CreateAfterEngines,
 	)
 }
 
 func envLoadHint(de *shellenv.DirenvError) string {
-	const noHookRan = "loading this worktree's direnv environment failed before any create-before-engines hook ran"
+	noHookRan := fmt.Sprintf("loading this worktree's direnv environment failed before any %s hook ran", hooks.CreateBeforeEngines)
 	switch de.Failure {
 	case shellenv.DirenvTimedOut:
 		return noHookRan + "; a cold `use flake` build keeps running in the nix daemon after the timeout. Once `direnv exec . true` returns promptly in the worktree, retry with `treeman worktree finalize`"

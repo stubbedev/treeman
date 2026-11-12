@@ -37,6 +37,7 @@ import (
 	dbredis "github.com/stubbedev/treeman/internal/db/redis"
 	dbs3 "github.com/stubbedev/treeman/internal/db/s3"
 	"github.com/stubbedev/treeman/internal/engine"
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -1214,11 +1215,14 @@ type hookLogReadOut struct {
 }
 
 func hookLogReadTool(_ context.Context, _ *mcpsdk.CallToolRequest, in hookLogReadIn) (*mcpsdk.CallToolResult, hookLogReadOut, error) {
-	if in.WorktreePath == "" || in.Phase == "" {
-		return nil, hookLogReadOut{}, errors.New("worktree_path and phase required")
+	if in.WorktreePath == "" {
+		return nil, hookLogReadOut{}, errors.New("worktree_path required")
 	}
-	p := filepath.Join(in.WorktreePath, ".treeman-hooks",
-		fmt.Sprintf("%s-%d.log", in.Phase, in.GroupIdx))
+	trigger, err := hooks.ParseTrigger(in.Phase)
+	if err != nil {
+		return nil, hookLogReadOut{}, err
+	}
+	p := trigger.LogPath(hooks.WorktreeLogDir(in.WorktreePath), in.GroupIdx)
 	info, err := os.Stat(p)
 	if err != nil {
 		return nil, hookLogReadOut{}, fmt.Errorf("stat %s: %w", p, err)

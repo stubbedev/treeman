@@ -48,7 +48,7 @@ func TestGroupRunsSequenceWithin(t *testing.T) {
 			"touch b",
 		}},
 	}
-	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), false)
+	out, err := RunHooks(context.Background(), CreateBeforeEngines, entries, wt, wt, "slug", false, emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestGroupsRunParallelAcross(t *testing.T) {
 		{Run: []string{"sleep 0.5 && touch one"}},
 		{Run: []string{"sleep 0.5 && touch two"}},
 	}
-	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), false)
+	_, err := RunHooks(context.Background(), CreateBeforeEngines, entries, wt, wt, "slug", false, emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestRunHooksReturnsFastRegardlessOfCommandDuration(t *testing.T) {
 	wt := t.TempDir()
 	entries := []config.Action{{Run: []string{"sleep 10"}}}
 	started := time.Now()
-	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), false)
+	_, err := RunHooks(context.Background(), CreateBeforeEngines, entries, wt, wt, "slug", false, emptyEnv(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestRunHooksWaitBlocksUntilGroupsExit(t *testing.T) {
 		{Run: []string{rendezvous("a", "b")}},
 		{Run: []string{rendezvous("b", "a")}},
 	}
-	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), true)
+	out, err := RunHooks(context.Background(), CreateBeforeEngines, entries, wt, wt, "slug", false, emptyEnv(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestRunHooksWaitSurfacesNonZeroExit(t *testing.T) {
 		{Run: []string{"true"}},
 		{Run: []string{"exit 7"}},
 	}
-	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, emptyEnv(), true)
+	out, err := RunHooks(context.Background(), CreateBeforeEngines, entries, wt, wt, "slug", false, emptyEnv(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestInheritedEnvReachesSubprocess(t *testing.T) {
 	entries := []config.Action{
 		{Run: []string{"printenv TREEMAN_TEST_PATH_PROBE > probe.out"}},
 	}
-	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, env, false)
+	_, err := RunHooks(context.Background(), CreateBeforeEngines, entries, wt, wt, "slug", false, env, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestFirstFailureErrorNilWhenAllZero(t *testing.T) {
 		{Command: "composer install", ExitCode: 0},
 		{Command: "yarn install", ExitCode: 0},
 	}}
-	if err := FirstFailureError("create-before-engines", out, []int64{1, 2}); err != nil {
+	if err := FirstFailureError(CreateBeforeEngines, out, []int64{1, 2}); err != nil {
 		t.Fatalf("want nil, got %v", err)
 	}
 }
@@ -372,7 +372,7 @@ func TestFirstFailureErrorReportsFirstFailureWithIDAndTail(t *testing.T) {
 		{Command: "composer install", ExitCode: 0},
 		{Command: "yarn install", ExitCode: 1, StderrTail: "ENOENT: clean-css missing"},
 	}}
-	err := FirstFailureError("create-before-engines", out, []int64{10, 11})
+	err := FirstFailureError(CreateBeforeEngines, out, []int64{10, 11})
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
@@ -386,7 +386,7 @@ func TestFirstFailureErrorReportsFirstFailureWithIDAndTail(t *testing.T) {
 
 func TestFirstFailureErrorFallsBackWhenIDUnknown(t *testing.T) {
 	out := RunOutcome{Groups: []GroupOutcome{{Command: "composer install", ExitCode: 2}}}
-	err := FirstFailureError("create-before-engines", out, nil)
+	err := FirstFailureError(CreateBeforeEngines, out, nil)
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
@@ -426,7 +426,7 @@ func TestRunHooksLoadDirenvEnvironment(t *testing.T) {
 	env := emptyEnv()
 	env["PATH"] = shellenvtest.FlakeDirenv(t, tools) + ":" + env["PATH"]
 	entries := []config.Action{{Run: []string{"composer install"}}}
-	out, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, env, true)
+	out, err := RunHooks(context.Background(), CreateBeforeEngines, entries, wt, wt, "slug", false, env, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +443,7 @@ func TestRunHooksFailsWhenDirenvCannotLoad(t *testing.T) {
 	env := emptyEnv()
 	env["PATH"] = shellenvtest.FakeDirenv(t, "echo '.envrc is blocked' >&2; exit 1\n") + ":" + env["PATH"]
 	entries := []config.Action{{Run: []string{"true"}}}
-	_, err := RunHooks(context.Background(), "setup", entries, wt, wt, "slug", false, env, true)
+	_, err := RunHooks(context.Background(), CreateBeforeEngines, entries, wt, wt, "slug", false, env, true)
 	if err == nil || !strings.Contains(err.Error(), ".envrc is blocked") {
 		t.Fatalf("err = %v, want the direnv failure", err)
 	}

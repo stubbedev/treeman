@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/gitcmd"
 	"github.com/stubbedev/treeman/internal/gitenv"
 	"github.com/stubbedev/treeman/internal/hooks"
@@ -240,7 +239,8 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteEnd,
 			"in-process teardown complete", repoID, id.WtID, "", 0, nil)
 	}()
-	runTrigger := func(trigger string, actions []config.Action) {
+	runTrigger := func(trigger hooks.Trigger) {
+		actions := trigger.Actions(&cfg.Hooks)
 		if len(actions) == 0 {
 			return
 		}
@@ -260,11 +260,11 @@ func inlineTeardown(ctx context.Context, repoRoot, wtPath string, force bool, en
 			sink.Warn("%s hooks failed for %s (teardown continues): %v", trigger, wtPath, hookErr)
 		}
 	}
-	runTrigger("delete-before-engines", cfg.Hooks.OnDeleteBeforeEngines)
+	runTrigger(hooks.DeleteBeforeEngines)
 	if err := prepare.TeardownDatabases(ctx, &cfg, id.Slug.Value, repoID, id.WtID, st); err != nil {
 		sink.Warn("dropping the databases of %s failed; the daemon retries it on its next sweep: %v", wtPath, err)
 	}
-	runTrigger("delete-after-engines", cfg.Hooks.OnDeleteAfterEngines)
+	runTrigger(hooks.DeleteAfterEngines)
 	if !gone {
 		if err := gitcmd.RunPiped(ctx, repoRoot, os.Stderr, os.Stderr, "worktree", "remove", "--force", wtPath); err != nil && !force {
 			return fmt.Errorf("git worktree remove %s: %w", wtPath, err)

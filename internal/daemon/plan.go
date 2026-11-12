@@ -231,8 +231,8 @@ func runTaskPrepare(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	}
 	// Same post-hook contract as finalize: prepare mutated engine
 	// content, so hooks that react to fresh data (cache flushes) fire.
-	if err := runTriggerActions(ctx, st, "create-after-engines",
-		id.cfg.Hooks.OnCreateAfterEngines, task.RepoPath, task.WorktreePath,
+	if err := runTriggerActions(ctx, st, hooks.CreateAfterEngines,
+		&id.cfg.Hooks, task.RepoPath, task.WorktreePath,
 		id.sl.Value, id.isMain, id.repoID, id.wtID, task.InheritedEnv); err != nil {
 		return nil, err
 	}
@@ -275,8 +275,8 @@ func runTaskDBReset(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 		return nil, resetErr
 	}
 	// db_reset re-seeded content — post-hooks fire like any prepare.
-	if err := runTriggerActions(ctx, st, "create-after-engines",
-		id.cfg.Hooks.OnCreateAfterEngines, task.RepoPath, task.WorktreePath,
+	if err := runTriggerActions(ctx, st, hooks.CreateAfterEngines,
+		&id.cfg.Hooks, task.RepoPath, task.WorktreePath,
 		id.sl.Value, id.isMain, id.repoID, id.wtID, task.InheritedEnv); err != nil {
 		return nil, err
 	}
@@ -341,30 +341,19 @@ func runTaskHookRun(ctx context.Context, st *State, task rpc.Task) (json.RawMess
 	if err != nil {
 		return nil, err
 	}
-	phase := task.Params[rpc.ParamPhase]
-	var entries []config.Action
-	switch phase {
-	case hookCreateBeforeEngines:
-		entries = id.cfg.Hooks.OnCreateBeforeEngines
-	case "create-after-engines":
-		entries = id.cfg.Hooks.OnCreateAfterEngines
-	case "delete-before-engines":
-		entries = id.cfg.Hooks.OnDeleteBeforeEngines
-	case "delete-after-engines":
-		entries = id.cfg.Hooks.OnDeleteAfterEngines
-	case "checkout":
-		entries = id.cfg.Hooks.OnCheckout
-	default:
-		return nil, fmt.Errorf("run_plan hook_run: unknown phase %q", phase)
+	trigger, err := hooks.ParseManualTrigger(task.Params[rpc.ParamPhase])
+	if err != nil {
+		return nil, fmt.Errorf("run_plan hook_run: %w", err)
 	}
-	started := hooks.EmitHookStart(ctx, st.Store, id.repoID, id.wtID, phase, len(entries))
-	out, runErr := hooks.RunHooks(ctx, phase, entries, task.RepoPath,
+	entries := trigger.Actions(&id.cfg.Hooks)
+	started := hooks.EmitHookStart(ctx, st.Store, id.repoID, id.wtID, trigger, len(entries))
+	out, runErr := hooks.RunHooks(ctx, trigger, entries, task.RepoPath,
 		task.WorktreePath, id.sl.Value, id.isMain, task.InheritedEnv, true)
-	hooks.PersistOutcome(ctx, st.Store, id.repoID, id.wtID, phase, started, time.Now().UnixMilli(), out)
+	hooks.PersistOutcome(ctx, st.Store, id.repoID, id.wtID, trigger, started, time.Now().UnixMilli(), out)
 	if runErr != nil {
 		return nil, runErr
 	}
-	return json.Marshal(map[string]any{"phase": phase, "outcome": out})
+	return json.Marshal(map[string]any{"phase": trigger, "outcome": out})
 }
 
 // resolveRepoTask is the preamble for repo-scoped tasks (no worktree):
