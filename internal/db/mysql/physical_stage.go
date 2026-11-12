@@ -82,21 +82,12 @@ func (d *Driver) resolveStageTarget(ctx context.Context, template string) (
 	if d.cfg.Container == "" && d.cfg.ComposeService == "" {
 		return "", "", "", "", nil, &physicalSkippedError{reason: "no ContainerRef on connections.mysql"}, nil
 	}
-	opts := containerip.Opts{
-		Container:      d.cfg.Container,
-		ComposeService: d.cfg.ComposeService,
-		ComposeProject: d.cfg.ComposeProject,
-		Engine:         d.cfg.ContainerEngine,
-		Network:        d.cfg.Network,
-	}
+	opts := containerip.FromRef(d.cfg.ContainerRef, 0)
 	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return "", "", "", "", nil, &physicalSkippedError{reason: "container not resolvable: " + cerr.Error()}, nil
 	}
-	engineBin = opts.Engine
-	if engineBin == "" {
-		engineBin = "docker"
-	}
+	engineBin = opts.EngineBin()
 	if _, lerr := exec.LookPath(engineBin); lerr != nil {
 		return "", "", "", "", nil, &physicalSkippedError{reason: engineBin + " binary not on PATH"}, nil
 	}
@@ -403,17 +394,8 @@ func (d *Driver) dropStage(ctx context.Context, template string) error {
 	if d.cfg.Container == "" && d.cfg.ComposeService == "" {
 		return nil
 	}
-	opts := containerip.Opts{
-		Container:      d.cfg.Container,
-		ComposeService: d.cfg.ComposeService,
-		ComposeProject: d.cfg.ComposeProject,
-		Engine:         d.cfg.ContainerEngine,
-		Network:        d.cfg.Network,
-	}
-	engineBin := opts.Engine
-	if engineBin == "" {
-		engineBin = "docker"
-	}
+	opts := containerip.FromRef(d.cfg.ContainerRef, 0)
+	engineBin := opts.EngineBin()
 	if _, err := exec.LookPath(engineBin); errors.Is(err, exec.ErrNotFound) {
 		return nil
 	} else if err != nil {

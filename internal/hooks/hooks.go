@@ -312,16 +312,14 @@ func renderAction(ctx context.Context, a config.Action, defaultCwd string) (stri
 		return strings.Join(parts, " && "), nil
 	}
 	// Container exec path.
-	engine := a.Engine
-	if engine == "" {
-		engine = "docker"
-	}
-	id, err := containerip.ContainerID(ctx, containerip.Opts{
+	opts := containerip.Opts{
 		Container:      a.Container,
 		ComposeService: a.ComposeService,
 		ComposeProject: a.ComposeProject,
-		Engine:         engine,
-	})
+		Engine:         a.Engine,
+	}
+	engine := opts.EngineBin()
+	id, err := containerip.ContainerID(ctx, opts)
 	if err != nil {
 		return "", fmt.Errorf("action container resolve: %w", err)
 	}

@@ -45,14 +45,12 @@ func escSeg(s string) string { return url.PathEscape(s) }
 func Connect(ctx context.Context, cfg config.EsConn) (*Driver, error) {
 	ctx, cancel := context.WithTimeout(ctx, reachability.StartupWait)
 	defer cancel()
-	url, err := adapter.ResolveAndProbeURL(ctx, "elasticsearch", containerip.Opts{
-		Container:      cfg.Container,
-		ComposeService: cfg.ComposeService,
-		ComposeProject: cfg.ComposeProject,
-		Engine:         cfg.ContainerEngine,
-		Network:        cfg.Network,
-		InternalPort:   containerip.URIPort(cfg.URL, 9200),
-	}, cfg.URL)
+	url, err := adapter.ResolveAndProbeURL(
+		ctx,
+		"elasticsearch",
+		containerip.FromRef(cfg.ContainerRef, containerip.URIPort(cfg.URL, 9200)),
+		cfg.URL,
+	)
 	if err != nil {
 		return nil, err
 	}

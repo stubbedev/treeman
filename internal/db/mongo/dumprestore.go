@@ -155,21 +155,12 @@ func (d *Driver) resolveContainer(ctx context.Context) (cid, engineBin string, e
 	if d.cfg.Container == "" && d.cfg.ComposeService == "" {
 		return "", "", fmt.Errorf("%w: no ContainerRef on connections.mongodb", errCloneToolsUnavailable)
 	}
-	opts := containerip.Opts{
-		Container:      d.cfg.Container,
-		ComposeService: d.cfg.ComposeService,
-		ComposeProject: d.cfg.ComposeProject,
-		Engine:         d.cfg.ContainerEngine,
-		Network:        d.cfg.Network,
-	}
+	opts := containerip.FromRef(d.cfg.ContainerRef, 0)
 	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return "", "", fmt.Errorf("%w: container not resolvable: %w", errCloneToolsUnavailable, cerr)
 	}
-	engineBin = opts.Engine
-	if engineBin == "" {
-		engineBin = "docker"
-	}
+	engineBin = opts.EngineBin()
 	if _, lerr := exec.LookPath(engineBin); lerr != nil {
 		return "", "", fmt.Errorf("%w: %s binary not on PATH", errCloneToolsUnavailable, engineBin)
 	}

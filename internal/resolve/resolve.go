@@ -162,12 +162,7 @@ func fillMysqlPasswordFromContainerEnv(m *config.MysqlConn) {
 	if m == nil || m.Password != "" || (m.Container == "" && m.ComposeService == "") {
 		return
 	}
-	env, _ := containerip.EnvLookup(context.Background(), containerip.Opts{
-		Container:      m.Container,
-		ComposeService: m.ComposeService,
-		ComposeProject: m.ComposeProject,
-		Engine:         m.ContainerEngine,
-	})
+	env, _ := containerip.EnvLookup(context.Background(), containerip.FromRef(m.ContainerRef, 0))
 	for _, k := range []string{"MYSQL_ROOT_PASSWORD", "MARIADB_ROOT_PASSWORD", "MYSQL_PASSWORD"} {
 		if v, ok := env[k]; ok && nonEmpty(v) {
 			m.Password = v
@@ -180,12 +175,7 @@ func fillPostgresPasswordFromContainerEnv(p *config.PostgresConn) {
 	if p == nil || p.Password != "" || (p.Container == "" && p.ComposeService == "") {
 		return
 	}
-	env, _ := containerip.EnvLookup(context.Background(), containerip.Opts{
-		Container:      p.Container,
-		ComposeService: p.ComposeService,
-		ComposeProject: p.ComposeProject,
-		Engine:         p.ContainerEngine,
-	})
+	env, _ := containerip.EnvLookup(context.Background(), containerip.FromRef(p.ContainerRef, 0))
 	for _, k := range []string{"POSTGRES_PASSWORD", "POSTGRESQL_PASSWORD"} {
 		if v, ok := env[k]; ok && nonEmpty(v) {
 			p.Password = v
@@ -210,12 +200,7 @@ func fillS3FromContainerEnv(s *config.S3Conn) {
 	if s == nil || (s.Container == "" && s.ComposeService == "") {
 		return
 	}
-	env, _ := containerip.EnvLookup(context.Background(), containerip.Opts{
-		Container:      s.Container,
-		ComposeService: s.ComposeService,
-		ComposeProject: s.ComposeProject,
-		Engine:         s.ContainerEngine,
-	})
+	env, _ := containerip.EnvLookup(context.Background(), containerip.FromRef(s.ContainerRef, 0))
 	fillS3KeysFromEnv(s, env)
 }
 

@@ -31,6 +31,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/stubbedev/treeman/internal/config"
 )
 
 // CacheTTL is how long a successful lookup is cached. Long enough
@@ -79,6 +81,20 @@ type Opts struct {
 	RemoteHost func(ctx context.Context, engine string) string
 }
 
+// FromRef builds the Opts for a configured container reference.
+// internalPort is the in-container port the caller dials, or 0 when it
+// only needs the container itself (exec, env, health).
+func FromRef(ref config.ContainerRef, internalPort uint16) Opts {
+	return Opts{
+		Container:      ref.Container,
+		ComposeService: ref.ComposeService,
+		ComposeProject: ref.ComposeProject,
+		Engine:         ref.ContainerEngine,
+		Network:        ref.Network,
+		InternalPort:   internalPort,
+	}
+}
+
 // Addr is a resolved (host, port) pair. Port == 0 means the caller
 // should keep its configured port.
 type Addr struct {
@@ -103,12 +119,14 @@ var (
 )
 
 func cacheKey(opts Opts) string {
-	return opts.normEngine() + "/" + opts.Container + "/" + opts.ComposeProject + "/" + opts.ComposeService + "/" + opts.Network + "/" + strconv.Itoa(
+	return opts.EngineBin() + "/" + opts.Container + "/" + opts.ComposeProject + "/" + opts.ComposeService + "/" + opts.Network + "/" + strconv.Itoa(
 		int(opts.InternalPort),
 	)
 }
 
-func (o Opts) normEngine() string {
+// EngineBin is the container engine binary to invoke: Engine, or
+// docker when unset.
+func (o Opts) EngineBin() string {
 	if o.Engine == "" {
 		return "docker"
 	}
@@ -174,19 +192,19 @@ func ResolveAddr(ctx context.Context, opts Opts) (*Addr, error) {
 // RemoteHost stub wins when set.
 func (o Opts) daemonHost(ctx context.Context) string {
 	if o.RemoteHost != nil {
-		if h := o.RemoteHost(ctx, o.normEngine()); h != "" {
+		if h := o.RemoteHost(ctx, o.EngineBin()); h != "" {
 			return h
 		}
 		return "127.0.0.1"
 	}
-	if h := remoteEndpointHost(ctx, o.normEngine()); h != "" {
+	if h := remoteEndpointHost(ctx, o.EngineBin()); h != "" {
 		return h
 	}
 	return "127.0.0.1"
 }
 
 func resolveUncached(ctx context.Context, opts Opts) (*Addr, error) {
-	engine := opts.normEngine()
+	engine := opts.EngineBin()
 	if InsideContainer() && !engineSocketReachable(ctx, engine) {
 		// Skip the inspect path entirely — let the caller's
 		// configured host (sibling compose DNS) handle it.
@@ -247,10 +265,7 @@ func Refresh(container, engine string) {
 	if container == "" {
 		return
 	}
-	if engine == "" {
-		engine = "docker"
-	}
-	prefix := engine + "/" + container + "/"
+	prefix := Opts{Engine: engine}.EngineBin() + "/" + container + "/"
 	mu.Lock()
 	for k := range cache {
 		if strings.HasPrefix(k, prefix) {
@@ -310,7 +325,7 @@ func resolveContainerID(ctx context.Context, opts Opts) (string, error) {
 	if project == "" {
 		project = os.Getenv("COMPOSE_PROJECT_NAME")
 	}
-	engine := opts.normEngine()
+	engine := opts.EngineBin()
 	args := []string{
 		"ps", "-q", "--filter", "status=running",
 		"--filter", "label=com.docker.compose.service=" + opts.ComposeService,
@@ -442,7 +457,7 @@ func EnvLookup(ctx context.Context, opts Opts) (map[string]string, error) {
 	if opts.empty() {
 		return nil, nil
 	}
-	engine := opts.normEngine()
+	engine := opts.EngineBin()
 	id, err := resolveContainerID(ctx, opts)
 	if err != nil {
 		return nil, err
@@ -479,7 +494,7 @@ func ContainerHealth(ctx context.Context, opts Opts) (Health, error) {
 	if opts.empty() {
 		return Health{}, nil
 	}
-	engine := opts.normEngine()
+	engine := opts.EngineBin()
 	id, err := resolveContainerID(ctx, opts)
 	if err != nil {
 		return Health{}, err

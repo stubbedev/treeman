@@ -98,14 +98,7 @@ func Connect(ctx context.Context, cfg config.MysqlConn) (*Driver, error) {
 	}
 	socketMode := strings.HasPrefix(cfg.Host, "/")
 	if !socketMode {
-		opts := containerip.Opts{
-			Container:      cfg.Container,
-			ComposeService: cfg.ComposeService,
-			ComposeProject: cfg.ComposeProject,
-			Engine:         cfg.ContainerEngine,
-			Network:        cfg.Network,
-			InternalPort:   cfg.Port,
-		}
+		opts := containerip.FromRef(cfg.ContainerRef, cfg.Port)
 		if err := adapter.ResolveAndProbe(ctx, "mysql", opts, &cfg.Host, &cfg.Port); err != nil {
 			return nil, err
 		}

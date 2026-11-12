@@ -35,14 +35,7 @@ type Driver struct {
 // Connect probes TCP reachability + parses the URL once. Per-db
 // clients are opened lazily.
 func Connect(ctx context.Context, cfg config.RedisConn) (*Driver, error) {
-	url, err := adapter.ResolveAndProbeURL(ctx, "redis", containerip.Opts{
-		Container:      cfg.Container,
-		ComposeService: cfg.ComposeService,
-		ComposeProject: cfg.ComposeProject,
-		Engine:         cfg.ContainerEngine,
-		Network:        cfg.Network,
-		InternalPort:   containerip.URIPort(cfg.URL, 6379),
-	}, cfg.URL)
+	url, err := adapter.ResolveAndProbeURL(ctx, "redis", containerip.FromRef(cfg.ContainerRef, containerip.URIPort(cfg.URL, 6379)), cfg.URL)
 	if err != nil {
 		return nil, err
 	}

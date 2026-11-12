@@ -54,21 +54,12 @@ func tryDockerExecESBulk(ctx context.Context, conn *config.EsConn, sourcePrefix,
 	if conn == nil || (conn.Container == "" && conn.ComposeService == "") {
 		return false, nil
 	}
-	opts := containerip.Opts{
-		Container:      conn.Container,
-		ComposeService: conn.ComposeService,
-		ComposeProject: conn.ComposeProject,
-		Engine:         conn.ContainerEngine,
-		Network:        conn.Network,
-	}
+	opts := containerip.FromRef(conn.ContainerRef, 0)
 	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return false, nil //nolint:nilerr // container not resolvable; fall through to wire HTTP
 	}
-	engineBin := opts.Engine
-	if engineBin == "" {
-		engineBin = "docker"
-	}
+	engineBin := opts.EngineBin()
 	if _, err := exec.LookPath(engineBin); err != nil {
 		return false, nil //nolint:nilerr // engine binary missing; fall through
 	}

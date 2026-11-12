@@ -100,13 +100,7 @@ func engineProbes(cfg *config.Config) []engineProbe {
 // Container liveness takes priority (a dead/crash-looping container is
 // the actionable root cause); TCP reachability is the fallback signal.
 func probeOneEngine(ctx context.Context, p engineProbe) (status, line, hint string) {
-	h, herr := containerip.ContainerHealth(ctx, containerip.Opts{
-		Container:      p.ref.Container,
-		ComposeService: p.ref.ComposeService,
-		ComposeProject: p.ref.ComposeProject,
-		Engine:         p.ref.ContainerEngine,
-		Network:        p.ref.Network,
-	})
+	h, herr := containerip.ContainerHealth(ctx, containerip.FromRef(p.ref, 0))
 	if herr == nil && h.Found {
 		if !h.Running {
 			return "fail", p.name + ": container not running",

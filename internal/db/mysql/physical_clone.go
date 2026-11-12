@@ -75,21 +75,12 @@ func (d *Driver) tryPhysicalSnapshotCreate(ctx context.Context, source, template
 	if d.cfg.Container == "" && d.cfg.ComposeService == "" {
 		return false, &physicalSkippedError{reason: "no ContainerRef on connections.mysql"}
 	}
-	opts := containerip.Opts{
-		Container:      d.cfg.Container,
-		ComposeService: d.cfg.ComposeService,
-		ComposeProject: d.cfg.ComposeProject,
-		Engine:         d.cfg.ContainerEngine,
-		Network:        d.cfg.Network,
-	}
+	opts := containerip.FromRef(d.cfg.ContainerRef, 0)
 	cid, err := containerip.ContainerID(ctx, opts)
 	if err != nil {
 		return false, &physicalSkippedError{reason: "container not resolvable: " + err.Error()}
 	}
-	engineBin := opts.Engine
-	if engineBin == "" {
-		engineBin = "docker"
-	}
+	engineBin := opts.EngineBin()
 	if _, err := exec.LookPath(engineBin); err != nil {
 		return false, &physicalSkippedError{reason: engineBin + " binary not on PATH"}
 	}

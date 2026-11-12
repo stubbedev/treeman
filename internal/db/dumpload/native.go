@@ -62,15 +62,12 @@ func tryDockerExecMySQL(ctx context.Context, conn *config.MysqlConn, targetDB st
 	if conn == nil || (conn.Container == "" && conn.ComposeService == "") {
 		return false, nil
 	}
-	opts := containerOpts(conn.ContainerRef)
+	opts := containerip.FromRef(conn.ContainerRef, 0)
 	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return false, nil //nolint:nilerr // container not resolvable; fall through to the next strategy
 	}
-	engineBin := opts.Engine
-	if engineBin == "" {
-		engineBin = "docker"
-	}
+	engineBin := opts.EngineBin()
 	if _, err := exec.LookPath(engineBin); err != nil {
 		return false, nil //nolint:nilerr // CLI not on PATH; soft fall-through to the next strategy
 	}
@@ -151,15 +148,12 @@ func tryDockerExecPostgres(ctx context.Context, conn *config.PostgresConn, targe
 	if conn == nil || (conn.Container == "" && conn.ComposeService == "") {
 		return false, nil
 	}
-	opts := containerOpts(conn.ContainerRef)
+	opts := containerip.FromRef(conn.ContainerRef, 0)
 	cid, cerr := containerip.ContainerID(ctx, opts)
 	if cerr != nil {
 		return false, nil //nolint:nilerr // container not resolvable; fall through to the next strategy
 	}
-	engineBin := opts.Engine
-	if engineBin == "" {
-		engineBin = "docker"
-	}
+	engineBin := opts.EngineBin()
 	if _, err := exec.LookPath(engineBin); err != nil {
 		return false, nil //nolint:nilerr // CLI not on PATH; soft fall-through to the next strategy
 	}
@@ -219,17 +213,4 @@ func tryNativeCLIPostgres(ctx context.Context, conn *config.PostgresConn, target
 		return false, fmt.Errorf("native psql: %w (stderr: %s)", err, stderr.String())
 	}
 	return true, nil
-}
-
-// containerOpts adapts a config.ContainerRef into the containerip.Opts
-// the resolver expects. Keeps the dispatch helpers free of any
-// containerip imports beyond ContainerID.
-func containerOpts(ref config.ContainerRef) containerip.Opts {
-	return containerip.Opts{
-		Container:      ref.Container,
-		ComposeService: ref.ComposeService,
-		ComposeProject: ref.ComposeProject,
-		Engine:         ref.ContainerEngine,
-		Network:        ref.Network,
-	}
 }

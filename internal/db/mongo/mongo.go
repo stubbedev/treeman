@@ -41,14 +41,12 @@ type Driver struct {
 func Connect(ctx context.Context, cfg config.MongoConn) (*Driver, error) {
 	uri := cfg.URI
 	if !strings.HasPrefix(uri, "mongodb+srv://") {
-		resolved, err := adapter.ResolveAndProbeURL(ctx, "mongodb", containerip.Opts{
-			Container:      cfg.Container,
-			ComposeService: cfg.ComposeService,
-			ComposeProject: cfg.ComposeProject,
-			Engine:         cfg.ContainerEngine,
-			Network:        cfg.Network,
-			InternalPort:   containerip.URIPort(uri, 27017),
-		}, uri)
+		resolved, err := adapter.ResolveAndProbeURL(
+			ctx,
+			"mongodb",
+			containerip.FromRef(cfg.ContainerRef, containerip.URIPort(uri, 27017)),
+			uri,
+		)
 		if err != nil {
 			return nil, err
 		}

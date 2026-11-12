@@ -1929,16 +1929,9 @@ func engineLogsTool(
 	if lines > 5000 {
 		lines = 5000
 	}
-	bin := ref.ContainerEngine
-	if bin == "" {
-		bin = "docker"
-	}
-	id, err := containerip.ContainerID(ctx, containerip.Opts{
-		Container:      ref.Container,
-		ComposeService: ref.ComposeService,
-		ComposeProject: ref.ComposeProject,
-		Engine:         bin,
-	})
+	opts := containerip.FromRef(*ref, 0)
+	bin := opts.EngineBin()
+	id, err := containerip.ContainerID(ctx, opts)
 	if err != nil {
 		return nil, engineLogsOut{}, fmt.Errorf("resolve container: %w", err)
 	}

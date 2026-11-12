@@ -2,8 +2,11 @@ package containerip
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stubbedev/treeman/internal/config"
 )
 
 func TestRewriteHostPortInURI(t *testing.T) {
@@ -49,12 +52,36 @@ func TestResolveEmptyContainerReturnsEmpty(t *testing.T) {
 // container_engine: an unset engine resolves to docker; an explicit one
 // is passed through verbatim. This is the per-engine `container_engine`
 // option's resolution, shared identically by all five DB drivers.
-func TestNormEngineDefaultsToDocker(t *testing.T) {
-	if got := (Opts{}).normEngine(); got != "docker" {
-		t.Errorf("unset engine normEngine()=%q want docker", got)
+func TestFromRefCarriesEveryContainerRefField(t *testing.T) {
+	ref := config.ContainerRef{
+		Container:       "db",
+		ComposeService:  "mysql",
+		ComposeProject:  "app",
+		ContainerEngine: "podman",
+		Network:         "backend",
 	}
-	if got := (Opts{Engine: "podman"}).normEngine(); got != "podman" {
-		t.Errorf("explicit engine normEngine()=%q want podman", got)
+	want := Opts{
+		Container:      "db",
+		ComposeService: "mysql",
+		ComposeProject: "app",
+		Engine:         "podman",
+		Network:        "backend",
+		InternalPort:   3306,
+	}
+	if got := FromRef(ref, 3306); !reflect.DeepEqual(got, want) {
+		t.Errorf("FromRef(%+v, 3306) = %+v, want %+v", ref, got, want)
+	}
+	if n := reflect.TypeFor[config.ContainerRef]().NumField(); n != 5 {
+		t.Errorf("config.ContainerRef has %d fields; FromRef maps 5, so map the new one", n)
+	}
+}
+
+func TestEngineBinDefaultsToDocker(t *testing.T) {
+	if got := (Opts{}).EngineBin(); got != "docker" {
+		t.Errorf("unset engine EngineBin()=%q want docker", got)
+	}
+	if got := (Opts{Engine: "podman"}).EngineBin(); got != "podman" {
+		t.Errorf("explicit engine EngineBin()=%q want podman", got)
 	}
 }
 
