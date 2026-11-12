@@ -193,8 +193,8 @@ func TestHookRun(t *testing.T) {
 		if res.err == nil {
 			t.Errorf("expected unknown phase to error")
 		}
-		if !strings.Contains(res.stderr, "unknown phase") {
-			t.Errorf("expected 'unknown phase' message:\n%s", res.stderr)
+		if !strings.Contains(res.stderr, `unknown hook trigger "not-a-phase"`) || !strings.Contains(res.stderr, "create-before-engines") {
+			t.Errorf("expected the unknown trigger named with the valid ones listed:\n%s", res.stderr)
 		}
 	})
 

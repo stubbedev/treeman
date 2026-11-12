@@ -1,14 +1,12 @@
 // Package hooks runs the configured hook entries for a worktree
-// phase.
+// trigger.
 //
-// Model: every entry under setup / teardown is a
-// "group". Each group spawns one detached driver via setsid; the
-// driver runs the group's commands chained with `&&` so a failure
-// short-circuits the rest of the group. Groups never wait for each
-// other — they all kick off in parallel and `RunHooks` returns as
-// soon as the drivers are spawned.
-//
-// `setup` is the one synchronous phase via RunHooks.
+// Model: every entry under a trigger (see Trigger) is a "group". Each
+// group spawns one detached driver via setsid; the driver runs the
+// group's commands chained with `&&` so a failure short-circuits the
+// rest of the group. Groups never wait for each other: they all kick
+// off in parallel, and RunHooks either returns once they are spawned
+// or, with wait, once every group has exited.
 package hooks
 
 import (

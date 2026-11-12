@@ -21,6 +21,7 @@ import (
 	"github.com/stubbedev/treeman/internal/daemonctl"
 	"github.com/stubbedev/treeman/internal/fspath"
 	"github.com/stubbedev/treeman/internal/gitenv"
+	"github.com/stubbedev/treeman/internal/hooks"
 	"github.com/stubbedev/treeman/internal/initgen"
 	mcpsrv "github.com/stubbedev/treeman/internal/mcp"
 	"github.com/stubbedev/treeman/internal/migrations/framework"
@@ -549,7 +550,7 @@ func HookCmd() *cli.Command {
 		Commands: []*cli.Command{{
 			Name:      "run",
 			Usage:     "run a hook phase using the cwd's repo config",
-			ArgsUsage: "<phase>",
+			ArgsUsage: "<" + hooks.JoinTriggers(hooks.ManualTriggers()) + ">",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "worktree", Aliases: []string{"w"}},
 				&cli.BoolFlag{Name: "json"},
@@ -557,9 +558,13 @@ func HookCmd() *cli.Command {
 			},
 			Action: func(ctx context.Context, c *cli.Command) error {
 				if c.NArg() < 1 {
-					return errors.New("usage: treeman hook run <phase>")
+					return fmt.Errorf("usage: treeman hook run <%s>", hooks.JoinTriggers(hooks.ManualTriggers()))
 				}
-				phase := c.Args().First()
+				trigger, err := hooks.ParseManualTrigger(c.Args().First())
+				if err != nil {
+					return err
+				}
+				phase := trigger.String()
 				wtPath, repoRoot, err := resolveWtRepo(c.String("worktree"), "")
 				if err != nil {
 					return err
