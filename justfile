@@ -81,7 +81,7 @@ test:
 test-e2e batch="all" parallel="4":
     #!/usr/bin/env bash
     set -euo pipefail
-    go_version=$(awk '$1 == "toolchain" { sub(/^go/, "", $2); print $2 }' go.mod)
+    go_version=$(awk '$1 == "go" { print $2 }' go.mod)
     docker build -q -t treeman-e2e-sandbox --build-arg GO_VERSION="$go_version" e2e/sandbox >/dev/null
     tty=()
     if [ -t 0 ] && [ -t 1 ]; then tty=(-it); fi
