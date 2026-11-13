@@ -1,7 +1,7 @@
 {
   perSystem = { go, lib, pkgs, ... }:
     let
-      version = "2.5.124";
+      version = "2.5.125";
       treeman = pkgs.buildGoModule.override { inherit go; } {
         pname = "treeman";
         inherit version;
