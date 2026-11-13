@@ -509,6 +509,11 @@ func (d *Driver) waitForRecovery(ctx context.Context, index string) error {
 		if cur.done() {
 			return nil
 		}
+		if cur.shards == 0 {
+			if err := d.primaryUnallocatable(ctx, index); err != nil {
+				return err
+			}
+		}
 		if cur.advancedFrom(last) {
 			progress.Report(ctx)
 		}
@@ -581,6 +586,60 @@ func (d *Driver) recoveryStatus(ctx context.Context, index string) (recoveryStat
 		}
 	}
 	return st, nil
+}
+
+func (d *Driver) primaryUnallocatable(ctx context.Context, index string) error {
+	payload, err := json.Marshal(map[string]any{"index": index, "shard": 0, "primary": true})
+	if err != nil {
+		return fmt.Errorf("allocation explain %s: marshal payload: %w", index, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.Base+"/_cluster/allocation/explain", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build GET /_cluster/allocation/explain for %s: %w", index, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := d.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("GET /_cluster/allocation/explain for %s: %w", index, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("GET /_cluster/allocation/explain for %s: read body: %w", index, err)
+	}
+	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("GET /_cluster/allocation/explain for %s → HTTP %d: %s", index, resp.StatusCode, body)
+	}
+	var explain struct {
+		CanAllocate         string `json:"can_allocate"`
+		AllocateExplanation string `json:"allocate_explanation"`
+		Nodes               []struct {
+			NodeName string `json:"node_name"`
+			Deciders []struct {
+				Decider     string `json:"decider"`
+				Decision    string `json:"decision"`
+				Explanation string `json:"explanation"`
+			} `json:"deciders"`
+		} `json:"node_allocation_decisions"`
+	}
+	if err := json.Unmarshal(body, &explain); err != nil {
+		return fmt.Errorf("parse allocation explain for %s: %w", index, err)
+	}
+	if explain.CanAllocate != "no" {
+		return nil
+	}
+	reasons := []string{explain.AllocateExplanation}
+	for _, n := range explain.Nodes {
+		for _, dec := range n.Deciders {
+			if dec.Decision == "NO" {
+				reasons = append(reasons, fmt.Sprintf("%s: %s: %s", n.NodeName, dec.Decider, dec.Explanation))
+			}
+		}
+	}
+	return fmt.Errorf("primary shard of %s cannot be allocated: %s", index, strings.Join(reasons, "; "))
 }
 
 // setIndexBlock toggles `index.blocks.write` on the given index.
