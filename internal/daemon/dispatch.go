@@ -19,6 +19,7 @@ import (
 
 	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/hooks"
+	"github.com/stubbedev/treeman/internal/patcher"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/store"
@@ -748,7 +749,7 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 			}
 			_ = SyncWorktree(runid.With(st.BgCtx, rid), st, repoID, wtPath, cfg.AutoFetch.ResolvedMode())
 		})
-	})
+	}, patchedIndexHook(wtPath, repoPath, &cfg))
 	if err != nil {
 		slog.Warn("head watcher init failed", "wt", wtPath, "err", err)
 	} else {
@@ -793,6 +794,21 @@ func startWorktreeWatcher(ctx context.Context, st *State, repoPath, wtPath strin
 	st.RegisterWtWatcher(wtPath, entry)
 	slog.Info("worktree watcher started", "repo", repoPath, "wt", wtPath)
 	return nil
+}
+
+func patchedIndexHook(wtPath, repoPath string, cfg *config.Config) func(context.Context) {
+	if wtPath == repoPath || len(cfg.Patches) == 0 {
+		return nil
+	}
+	files := make([]string, 0, len(cfg.Patches))
+	for _, p := range cfg.Patches {
+		files = append(files, p.File)
+	}
+	return func(ctx context.Context) {
+		if err := patcher.DetachIndexStat(ctx, wtPath, files); err != nil {
+			slog.Warn("detach patched files from the index stat data", "wt", wtPath, "err", err)
+		}
+	}
 }
 
 // aggregateWatches walks every `databases[i].inputs[]` block and

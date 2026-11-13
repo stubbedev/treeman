@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/stubbedev/treeman/internal/atomicfile"
@@ -153,7 +155,7 @@ func EnsureFilter(ctx context.Context, worktreePath string, files []string) erro
 		append([]string{"add", "--renormalize", "--"}, tracked...)...); err != nil {
 		return nil //nolint:nilerr // best-effort: gitignored / filter unreachable — nothing staged
 	}
-	if err := detachIndexStat(worktreePath, tracked); err != nil {
+	if err := DetachIndexStat(ctx, worktreePath, tracked); err != nil {
 		return err
 	}
 	if err := gitcmd.RunOptional(ctx, worktreePath, append(
@@ -181,7 +183,7 @@ func EnsureFilter(ctx context.Context, worktreePath string, files []string) erro
 // ensureGitConfig writes the filter program lines into the
 // per-worktree git config so git invokes `treeman patch-filter` for
 // the relevant attribute matches, plus core.checkStat=minimal so git
-// ignores the inode detachIndexStat moves patched files to. Values
+// ignores the inode DetachIndexStat moves patched files to. Values
 // are idempotent: re-runs just overwrite the same keys.
 //
 // `treeman` is resolved via PATH on each filter invocation — using
@@ -240,13 +242,93 @@ func ensureGitConfig(ctx context.Context, worktreePath string) error {
 	return nil
 }
 
-func detachIndexStat(worktreePath string, files []string) error {
+// DetachIndexStat moves each of files whose inode git's index has
+// recorded onto a fresh inode, so libgit2 (and Nix through it) sees
+// a patched file as modified while git, with core.checkStat=minimal,
+// keeps it clean. Files whose index entry already differs, untracked
+// files and missing files are left alone, so running it again, or
+// after a git command that did not rewrite a patched file, is a no-op.
+func DetachIndexStat(ctx context.Context, worktreePath string, files []string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	out, err := gitcmd.Output(ctx, worktreePath, append([]string{"ls-files", "--debug", "-z", "--"}, files...)...)
+	if err != nil {
+		return fmt.Errorf("read index stat data for %s: %w", strings.Join(files, ", "), err)
+	}
+	recorded, err := parseIndexInodes(out)
+	if err != nil {
+		return fmt.Errorf("parse index stat data for %s: %w", strings.Join(files, ", "), err)
+	}
 	for _, f := range files {
-		if err := atomicfile.Refresh(filepath.Join(worktreePath, f)); err != nil {
+		ino, tracked := recorded[filepath.ToSlash(f)]
+		if !tracked {
+			continue
+		}
+		path := filepath.Join(worktreePath, f)
+		cur, known, err := indexInode(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("stat patched file %s: %w", f, err)
+		}
+		if !known || cur != ino {
+			continue
+		}
+		if err := atomicfile.Refresh(path); err != nil {
 			return fmt.Errorf("move patched file %s to a fresh inode: %w", f, err)
 		}
 	}
 	return nil
+}
+
+func parseIndexInodes(out []byte) (map[string]uint32, error) {
+	chunks := strings.Split(string(out), "\x00")
+	inodes := make(map[string]uint32, len(chunks))
+	name := chunks[0]
+	for _, chunk := range chunks[1:] {
+		cut := statBlockEnd(chunk)
+		if cut < 0 {
+			return nil, fmt.Errorf("entry %q has no stat block", name)
+		}
+		ino, err := debugField(chunk[:cut], "ino:")
+		if err != nil {
+			return nil, fmt.Errorf("entry %q: %w", name, err)
+		}
+		inodes[name] = ino
+		name = chunk[cut:]
+	}
+	return inodes, nil
+}
+
+const statBlockLines = 5
+
+func statBlockEnd(chunk string) int {
+	end := 0
+	for range statBlockLines {
+		nl := strings.IndexByte(chunk[end:], '\n')
+		if nl < 0 {
+			return -1
+		}
+		end += nl + 1
+	}
+	return end
+}
+
+func debugField(block, label string) (uint32, error) {
+	fields := strings.Fields(block)
+	for i, f := range fields[:max(len(fields)-1, 0)] {
+		if f != label {
+			continue
+		}
+		v, err := strconv.ParseUint(fields[i+1], 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("field %s: %w", label, err)
+		}
+		return uint32(v), nil
+	}
+	return 0, fmt.Errorf("no %s field in %q", label, block)
 }
 
 // absUnder resolves a git-reported dir against the worktree root.
