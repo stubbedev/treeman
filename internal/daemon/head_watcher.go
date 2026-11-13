@@ -32,14 +32,18 @@ type HeadWatcher struct {
 	headDir      string // parent dir of headPath (the dir we subscribe to)
 	headName     string // basename of headPath
 	onChange     func(ctx context.Context, newRef string)
+	onIndex      func(ctx context.Context)
 
-	debounce time.Duration
-	mu       sync.Mutex
-	lastSeen string
-	lastOp   string // last observed in-progress git op (merge/rebase/…), "" when clean
-	pending  *time.Timer
-	fsw      *fsnotify.Watcher
+	debounce     time.Duration
+	mu           sync.Mutex
+	lastSeen     string
+	lastOp       string // last observed in-progress git op (merge/rebase/…), "" when clean
+	pending      *time.Timer
+	pendingIndex *time.Timer
+	fsw          *fsnotify.Watcher
 }
+
+const indexName = "index"
 
 // resolveHeadPath returns the absolute path of the HEAD file for
 // `worktreePath` — the shared fork-free gitenv resolver (handles the
@@ -49,10 +53,16 @@ func resolveHeadPath(worktreePath string) (string, error) {
 	return gitenv.HeadPath(worktreePath)
 }
 
-// NewHeadWatcher constructs a HeadWatcher. Returns an error when the
-// HEAD path can't be resolved (corrupt .git pointer) or when
-// fsnotify init fails.
-func NewHeadWatcher(worktreePath string, debounce time.Duration, onChange func(ctx context.Context, newRef string)) (*HeadWatcher, error) {
+// NewHeadWatcher constructs a HeadWatcher. onIndex, when non-nil, runs
+// (debounced like onChange) whenever git rewrites the worktree's index.
+// Returns an error when the HEAD path can't be resolved (corrupt .git
+// pointer) or when fsnotify init fails.
+func NewHeadWatcher(
+	worktreePath string,
+	debounce time.Duration,
+	onChange func(ctx context.Context, newRef string),
+	onIndex func(ctx context.Context),
+) (*HeadWatcher, error) {
 	headPath, err := resolveHeadPath(worktreePath)
 	if err != nil {
 		return nil, err
@@ -70,6 +80,7 @@ func NewHeadWatcher(worktreePath string, debounce time.Duration, onChange func(c
 		headDir:      filepath.Dir(headPath),
 		headName:     filepath.Base(headPath),
 		onChange:     onChange,
+		onIndex:      onIndex,
 		debounce:     debounce,
 		fsw:          fsw,
 	}, nil
@@ -114,6 +125,12 @@ func (h *HeadWatcher) Start(ctx context.Context) error {
 			// on macOS / Linux when git does its tmp + rename dance, so
 			// basename matching is reliable in practice.
 			base := filepath.Base(ev.Name)
+			if base == indexName && h.onIndex != nil {
+				if ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) != 0 {
+					h.scheduleIndex(ctx)
+				}
+				continue
+			}
 			if base != h.headName && !isGitOpMarker(base) {
 				continue
 			}
@@ -145,6 +162,15 @@ func (h *HeadWatcher) schedule(ctx context.Context) {
 		h.pending.Stop()
 	}
 	h.pending = time.AfterFunc(h.debounce, func() { h.fire(ctx) })
+}
+
+func (h *HeadWatcher) scheduleIndex(ctx context.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pendingIndex != nil {
+		h.pendingIndex.Stop()
+	}
+	h.pendingIndex = time.AfterFunc(h.debounce, func() { h.onIndex(ctx) })
 }
 
 func (h *HeadWatcher) fire(ctx context.Context) {

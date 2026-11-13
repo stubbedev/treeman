@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stubbedev/treeman/internal/config"
 )
 
 func requireGitHW(t *testing.T) {
@@ -42,7 +44,7 @@ func TestHeadWatcherFiresOnBranchSwitch(t *testing.T) {
 		case got <- ref:
 		default:
 		}
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("NewHeadWatcher: %v", err)
 	}
@@ -85,7 +87,7 @@ func TestHeadWatcherDebouncesRapidChanges(t *testing.T) {
 	var fired atomic.Int32
 	hw, err := NewHeadWatcher(repo, 200*time.Millisecond, func(_ context.Context, _ string) {
 		fired.Add(1)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +136,7 @@ func TestHeadWatcherDefersAndRecoversOnGitOp(t *testing.T) {
 	var fired atomic.Int32
 	hw, err := NewHeadWatcher(repo, 50*time.Millisecond, func(_ context.Context, _ string) {
 		fired.Add(1)
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("NewHeadWatcher: %v", err)
 	}
@@ -204,5 +206,65 @@ func TestResolveHeadPathHandlesLinkedWorktree(t *testing.T) {
 	body, _ := os.ReadFile(got)
 	if !contains(string(body), "refs/heads/feature") {
 		t.Errorf("resolved HEAD does not point at feature: %q", body)
+	}
+}
+
+func TestHeadWatcherFiresOnIndexRewriteOnly(t *testing.T) {
+	requireGitHW(t)
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	run("commit", "--allow-empty", "-m", "init")
+
+	var headFired atomic.Int32
+	indexed := make(chan struct{}, 1)
+	hw, err := NewHeadWatcher(repo, 50*time.Millisecond, func(context.Context, string) {
+		headFired.Add(1)
+	}, func(context.Context) {
+		select {
+		case indexed <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("NewHeadWatcher: %v", err)
+	}
+	defer hw.Stop()
+	go func() { _ = hw.Start(t.Context()) }()
+	time.Sleep(100 * time.Millisecond)
+
+	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "f")
+
+	select {
+	case <-indexed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("index rewrite did not fire onIndex within 2s")
+	}
+	if n := headFired.Load(); n != 0 {
+		t.Errorf("an index-only change fired onChange %d time(s)", n)
+	}
+}
+
+func TestPatchedIndexHookOnlyForPatchedLinkedWorktrees(t *testing.T) {
+	patched := &config.Config{Patches: []config.Patch{{File: ".env"}}}
+	if patchedIndexHook("/repo", "/repo", patched) != nil {
+		t.Error("the main checkout is never patched, so it needs no index hook")
+	}
+	if patchedIndexHook("/wt", "/repo", &config.Config{}) != nil {
+		t.Error("a config without patches needs no index hook")
+	}
+	if patchedIndexHook("/wt", "/repo", patched) == nil {
+		t.Error("a patched linked worktree needs the index hook")
 	}
 }

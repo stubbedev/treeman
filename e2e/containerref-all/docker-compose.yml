@@ -99,6 +99,7 @@ services:
     container_name: treeman-e2e-ctra-es-pub
     environment:
       discovery.type: single-node
+      cluster.routing.allocation.disk.threshold_enabled: "false"
       xpack.security.enabled: "false"
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
     ports: ["19202:9200"]
@@ -114,6 +115,7 @@ services:
     container_name: treeman-e2e-ctra-es-int
     environment:
       discovery.type: single-node
+      cluster.routing.allocation.disk.threshold_enabled: "false"
       xpack.security.enabled: "false"
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
     healthcheck:

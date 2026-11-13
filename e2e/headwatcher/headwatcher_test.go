@@ -48,7 +48,7 @@ func TestHeadWatcherFiresOnCheckout(t *testing.T) {
 		mu.Lock()
 		seen = append(seen, ref)
 		mu.Unlock()
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("NewHeadWatcher: %v", err)
 	}

@@ -300,6 +300,147 @@ func TestEnsureFilter_DegradedFilterDoesNotPoisonIndex(t *testing.T) {
 	}
 }
 
+func TestEnsureFilter_PatchedFileLeavesIndexInode(t *testing.T) {
+	repo, envPath := patchedRepo(t)
+	if err := EnsureFilter(context.Background(), repo, []string{".env.testing"}); err != nil {
+		t.Fatalf("EnsureFilter: %v", err)
+	}
+	if got := runCapture(t, repo, "config", "core.checkStat"); got != "minimal" {
+		t.Errorf("core.checkStat = %q, want minimal", got)
+	}
+	assertDetached(t, repo, envPath)
+}
+
+func TestDetachIndexStat_RedetachesAfterGitRewritesPatchedFile(t *testing.T) {
+	repo, envPath := patchedRepo(t)
+	ctx := context.Background()
+	if err := EnsureFilter(ctx, repo, []string{".env.testing"}); err != nil {
+		t.Fatalf("EnsureFilter: %v", err)
+	}
+	if err := os.WriteFile(envPath, []byte("DB=edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, repo, "restore", ".env.testing")
+	if got, cur := recordedInode(t, repo, ".env.testing"), currentInode(t, envPath); got != cur {
+		t.Fatalf("precondition: git restore should record the new file's inode, index %d file %d", got, cur)
+	}
+	if err := DetachIndexStat(ctx, repo, []string{".env.testing", "untracked.env"}); err != nil {
+		t.Fatalf("DetachIndexStat: %v", err)
+	}
+	assertDetached(t, repo, envPath)
+	before := currentInode(t, envPath)
+	if err := DetachIndexStat(ctx, repo, []string{".env.testing"}); err != nil {
+		t.Fatalf("DetachIndexStat again: %v", err)
+	}
+	if after := currentInode(t, envPath); after != before {
+		t.Errorf("second DetachIndexStat moved an already detached file: inode %d -> %d", before, after)
+	}
+}
+
+func TestParseIndexInodes(t *testing.T) {
+	block := func(ino string) string {
+		return "  ctime: 1:2\n  mtime: 1:2\n  dev: 50\tino: " + ino + "\n  uid: 1\tgid: 1\n  size: 2\tflags: 0\n"
+	}
+	out := "a b\x00" + block("7") + "line\nbreak\x00" + block("4294967295")
+	got, err := parseIndexInodes([]byte(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got["a b"] != 7 || got["line\nbreak"] != 4294967295 {
+		t.Errorf("parseIndexInodes = %v", got)
+	}
+	if got, err := parseIndexInodes(nil); err != nil || len(got) != 0 {
+		t.Errorf("empty output = %v, %v", got, err)
+	}
+	if _, err := parseIndexInodes([]byte("a\x00garbage")); err == nil {
+		t.Error("an entry without a stat block must be an error")
+	}
+}
+
+const patchedEnv = "DB=app_testing_kon_99\n"
+
+func patchedRepo(t *testing.T) (repo, envPath string) {
+	t.Helper()
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	tmp := t.TempDir()
+	fakeBin := filepath.Join(tmp, "fakebin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	filter := "#!/bin/sh\nfrom=DB=app_testing_kon_99 to=DB=app_testing\n" +
+		"[ \"$2\" = smudge ] && from=DB=app_testing to=DB=app_testing_kon_99\n" +
+		"while IFS= read -r l; do [ \"$l\" = \"$from\" ] && l=$to; printf '%s\\n' \"$l\"; done\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "treeman"), []byte(filter), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+filepath.Dir(gitPath))
+	repo = filepath.Join(tmp, "repo")
+	mustRun(t, tmp, "init", "-q", "-b", "master", repo)
+	mustRun(t, repo, "config", "user.email", "t@t")
+	mustRun(t, repo, "config", "user.name", "t")
+	envPath = filepath.Join(repo, ".env.testing")
+	if err := os.WriteFile(envPath, []byte("DB=app_testing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, repo, "add", ".env.testing")
+	mustRun(t, repo, "commit", "-q", "-m", "v1")
+	if err := os.WriteFile(envPath, []byte(patchedEnv), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return repo, envPath
+}
+
+func assertDetached(t *testing.T, repo, envPath string) {
+	t.Helper()
+	if got := runCapture(t, repo, "status", "--porcelain"); got != "" {
+		t.Errorf("git status must stay clean, got %q", got)
+	}
+	mustRun(t, repo, "update-index", "--refresh")
+	if got := runCapture(t, repo, "status", "--porcelain"); got != "" {
+		t.Errorf("git status after refresh must stay clean, got %q", got)
+	}
+	if idx, cur := recordedInode(t, repo, ".env.testing"), currentInode(t, envPath); idx == cur {
+		t.Errorf("index records the file's current inode %d; libgit2 would trust the stat data and call the tree clean", idx)
+	}
+	if got, _ := os.ReadFile(envPath); string(got) != patchedEnv {
+		t.Errorf("working tree = %q, want the patched content %q", got, patchedEnv)
+	}
+}
+
+func currentInode(t *testing.T, path string) uint32 {
+	t.Helper()
+	ino, known, err := indexInode(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !known {
+		t.Skip("platform exposes no inode")
+	}
+	return ino
+}
+
+func recordedInode(t *testing.T, repo, file string) uint32 {
+	t.Helper()
+	cmd := exec.Command("git", "ls-files", "--debug", "-z", "--", file)
+	cmd.Dir = repo
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git ls-files --debug: %v", err)
+	}
+	inodes, err := parseIndexInodes(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino, ok := inodes[file]
+	if !ok {
+		t.Fatalf("%s not in the index", file)
+	}
+	return ino
+}
+
 func mustRun(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
