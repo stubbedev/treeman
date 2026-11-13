@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -298,6 +300,79 @@ func TestEnsureFilter_DegradedFilterDoesNotPoisonIndex(t *testing.T) {
 	if string(wt) != patched {
 		t.Errorf("working tree should keep patched content, got %q", wt)
 	}
+}
+
+func TestEnsureFilter_PatchedFileLeavesIndexInode(t *testing.T) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	tmp := t.TempDir()
+	fakeBin := filepath.Join(tmp, "fakebin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	clean := "#!/bin/sh\nwhile IFS= read -r l; do [ \"$l\" = DB=app_testing_kon_99 ] && l=DB=app_testing; printf '%s\\n' \"$l\"; done\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "treeman"), []byte(clean), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+filepath.Dir(gitPath))
+
+	repo := filepath.Join(tmp, "repo")
+	mustRun(t, tmp, "init", "-q", "-b", "master", repo)
+	mustRun(t, repo, "config", "user.email", "t@t")
+	mustRun(t, repo, "config", "user.name", "t")
+	envPath := filepath.Join(repo, ".env.testing")
+	if err := os.WriteFile(envPath, []byte("DB=app_testing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, repo, "add", ".env.testing")
+	mustRun(t, repo, "commit", "-q", "-m", "v1")
+	const patched = "DB=app_testing_kon_99\n"
+	if err := os.WriteFile(envPath, []byte(patched), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := EnsureFilter(context.Background(), repo, []string{".env.testing"}); err != nil {
+		t.Fatalf("EnsureFilter: %v", err)
+	}
+	if got := runCapture(t, repo, "config", "core.checkStat"); got != "minimal" {
+		t.Errorf("core.checkStat = %q, want minimal", got)
+	}
+	if got := runCapture(t, repo, "status", "--porcelain"); got != "" {
+		t.Errorf("git status must stay clean, got %q", got)
+	}
+	mustRun(t, repo, "update-index", "--refresh")
+	if got := runCapture(t, repo, "status", "--porcelain"); got != "" {
+		t.Errorf("git status after refresh must stay clean, got %q", got)
+	}
+	fi, err := os.Stat(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("stat of %s carries no inode: %T", envPath, fi.Sys())
+	}
+	fileIno := strconv.FormatUint(st.Ino, 10)
+	if idx := indexIno(t, repo, ".env.testing"); idx == fileIno {
+		t.Errorf("index records the file's current inode %s; libgit2 would trust the stat data and call the tree clean", idx)
+	}
+	if got, _ := os.ReadFile(envPath); string(got) != patched {
+		t.Errorf("working tree = %q, want the patched content %q", got, patched)
+	}
+}
+
+func indexIno(t *testing.T, repo, file string) string {
+	t.Helper()
+	fields := strings.Fields(runCapture(t, repo, "ls-files", "--debug", "--", file))
+	for i, f := range fields {
+		if f == "ino:" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	t.Fatalf("no ino in `git ls-files --debug` for %s", file)
+	return ""
 }
 
 func mustRun(t *testing.T, dir string, args ...string) {

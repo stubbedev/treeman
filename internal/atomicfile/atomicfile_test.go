@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestWriteKeepsModeAndSymlink(t *testing.T) {
@@ -50,5 +51,46 @@ func TestWriteRefusesDanglingSymlink(t *testing.T) {
 	}
 	if err := Write(link, []byte("x"), 0o600); err == nil {
 		t.Fatal("dangling symlink must be refused")
+	}
+}
+
+func TestRefreshMovesToFreshInodeKeepingContentModeAndMtime(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "phpunit.xml")
+	if err := os.WriteFile(path, []byte("<php/>\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Date(2001, 2, 3, 4, 5, 6, 789, time.UTC)
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Refresh(path); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Error("file kept its inode")
+	}
+	if got, _ := os.ReadFile(path); string(got) != "<php/>\n" {
+		t.Errorf("content = %q", got)
+	}
+	if after.Mode().Perm() != 0o640 || !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("mode %v mtime %v, want 0640 %v", after.Mode().Perm(), after.ModTime(), before.ModTime())
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("temp file left behind: %v", entries)
+	}
+}
+
+func TestRefreshMissingFileFails(t *testing.T) {
+	if err := Refresh(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing file must be an error")
 	}
 }

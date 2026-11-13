@@ -1225,6 +1225,17 @@ re-applies the patch after. The file must be tracked by git for
 the filter to engage; gitignored files are patched in-place
 without any git interaction.
 
+Tools that do not run git filters (libgit2, and through it Nix)
+must still see a patched file as modified, or Nix caches the
+patched content under the commit and other worktrees at that
+commit fail with a narHash mismatch. treeman therefore sets
+`core.checkStat=minimal` in the repository and moves each patched
+file to a fresh inode after staging: git compares only mtime and
+size and keeps the file clean, while libgit2 compares the inode,
+rehashes the file and reports the tree dirty. Nix warns that the
+tree is dirty in patched worktrees, and libgit2-based git clients
+list patched files as modified.
+
 #### `file` *(string)* — **required**
 
 File path relative to the worktree root. Required.

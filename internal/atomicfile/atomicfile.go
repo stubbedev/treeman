@@ -5,9 +5,11 @@ package atomicfile
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Write replaces the file at path with data. A symlink at path is
@@ -30,6 +32,47 @@ func Write(path string, data []byte, perm fs.FileMode) error {
 		return fmt.Errorf("create temp file for %s: %w", target, err)
 	}
 	if err := fill(tmp, data, perm); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("write %s: %w", target, err)
+	}
+	if err := os.Rename(tmp.Name(), target); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("replace %s: %w", target, err)
+	}
+	return nil
+}
+
+// Refresh moves the file at path onto a fresh inode holding the same
+// bytes, permission bits and modification time, following a symlink to
+// its target like Write. The modification time is set before the
+// rename, so no reader ever sees the new inode with a different one.
+func Refresh(path string) error {
+	target, err := resolve(path)
+	if err != nil {
+		return err
+	}
+	src, err := os.Open(target)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", target, err)
+	}
+	defer func() { _ = src.Close() }()
+	fi, err := src.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", target, err)
+	}
+	data, err := io.ReadAll(src)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", target, err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file for %s: %w", target, err)
+	}
+	err = fill(tmp, data, fi.Mode().Perm())
+	if err == nil {
+		err = os.Chtimes(tmp.Name(), time.Time{}, fi.ModTime())
+	}
+	if err != nil {
 		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("write %s: %w", target, err)
 	}
