@@ -91,7 +91,7 @@ func runFinalize(t *testing.T, repoRoot string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	state := daemon.NewState(ctx, st)
+	state := daemon.NewState(ctx, st, config.DefaultLifecycleSlots)
 	env := map[string]string{
 		"PATH":     os.Getenv("PATH"),
 		"MYSQL_PW": "rootpw",

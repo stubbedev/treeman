@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/runid"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/internal/testsock"
@@ -34,7 +35,7 @@ func startStreamServer(ctx context.Context, t *testing.T) *store.Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	go func() {
 		for {
 			conn, err := ln.Accept()

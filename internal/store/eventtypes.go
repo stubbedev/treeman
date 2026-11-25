@@ -106,15 +106,18 @@ const (
 	EvtMainPurge   = "main:purge"
 
 	// worktree lifecycle (no config key)
+	EvtWorktreeCreateQueued   = "worktree:create:queued"
 	EvtWorktreeCreateStart    = "worktree:create:start"
 	EvtWorktreeCreateCheckout = "worktree:create:checkout"
 	EvtWorktreeCreateEnd      = "worktree:create:end"
 	EvtWorktreeCreateError    = "worktree:create:error"
 	EvtWorktreeCreateCancel   = "worktree:create:cancel"
 	EvtWorktreeCreateDeferred = "worktree:create:deferred"
+	EvtWorktreeDeleteQueued   = "worktree:delete:queued"
 	EvtWorktreeDeleteStart    = "worktree:delete:start"
 	EvtWorktreeDeleteEnd      = "worktree:delete:end"
 	EvtWorktreeDeleteError    = "worktree:delete:error"
+	EvtWorktreeReapQueued     = "worktree:reap:queued"
 	EvtWorktreeReapStart      = "worktree:reap:start"
 	EvtWorktreeReapEnd        = "worktree:reap:end"
 	EvtWorktreeReapError      = "worktree:reap:error"

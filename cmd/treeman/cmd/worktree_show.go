@@ -712,7 +712,7 @@ func finalizeStateDetail(last store.Event) string {
 	switch state, _ := store.DeriveWorktreeState(last); state {
 	case store.StatePreparing, store.StateTeardown:
 		return "(started " + formatTs(last.Ts) + ")"
-	case store.StateDeferred:
+	case store.StateQueued, store.StateDeferred:
 		return "— " + last.Message
 	case store.StateError:
 		return "— " + last.Message + " (retry: treeman worktree finalize)"

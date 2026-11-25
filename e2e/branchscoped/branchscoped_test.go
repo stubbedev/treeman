@@ -298,7 +298,7 @@ databases:
 	// closed DB ("sql: database is closed") and leaks a goroutine into the
 	// next test.
 	daemonCtx, cancelDaemon := context.WithCancel(ctx)
-	state := daemon.NewState(daemonCtx, st)
+	state := daemon.NewState(daemonCtx, st, config.DefaultLifecycleSlots)
 	t.Cleanup(func() { // registered after st.Close → runs FIRST
 		cancelDaemon()
 		_ = state.WaitFinalizeCleared(context.Background(), repoRoot, 10*time.Second)

@@ -36,7 +36,8 @@ const finalizeTimeout = 15 * time.Minute
 const watchdogInterval = 2 * time.Minute
 
 // SweepStalePreparing fails-out any worktree row whose most recent
-// finalize event is `worktree:create:start` — by definition, no goroutine
+// finalize event is `worktree:create:queued` or `worktree:create:start`
+// — by definition, no goroutine
 // owns that work anymore once the daemon has restarted. That holds only
 // because treemand claims the store-wide daemon lock (wtlock.AcquireDaemon)
 // before this runs: a second daemon on the same store would otherwise
@@ -75,6 +76,7 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 	// One query for every row's latest finalize event — the sweep used
 	// to fire two queries per worktree at boot (row lookup + events).
 	latest, err := st.Store.LatestEventPerWorktree(ctx, ids, []string{
+		store.EvtWorktreeCreateQueued,
 		store.EvtWorktreeCreateStart,
 		store.EvtWorktreeCreateEnd,
 		store.EvtWorktreeCreateError,
@@ -87,7 +89,7 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 	var stale []store.WorktreeRow
 	var staleIDs []int64
 	for _, row := range wts {
-		if last, ok := latest[row.ID]; ok && last.EventType == store.EvtWorktreeCreateStart {
+		if last, ok := latest[row.ID]; ok && finalizeOpen(last) {
 			stale = append(stale, row)
 			staleIDs = append(staleIDs, row.ID)
 		}
@@ -105,6 +107,10 @@ func SweepStalePreparing(ctx context.Context, st *State) {
 	}
 }
 
+func finalizeOpen(last store.Event) bool {
+	return last.EventType == store.EvtWorktreeCreateQueued || last.EventType == store.EvtWorktreeCreateStart
+}
+
 // failStaleFinalize records the restart-interrupted finalize of row,
 // opened by start, whose newest hook-run or prepare start is reached
 // (the zero Event when it has none), and recovers the engines it
@@ -115,7 +121,7 @@ func failStaleFinalize(ctx context.Context, st *State, row store.WorktreeRow, st
 		slog.Warn("stale-preparing sweep: read the trigger of the interrupted finalize", "wt", row.Path, "err", err)
 	}
 	phase := interruptedPhase(t, start, reached)
-	msg := "stale finalize: daemon restarted while it was in flight"
+	msg := "stale finalize: daemon restarted while it was queued or in flight"
 	payload := map[string]any{
 		"reason":         "daemon_restart",
 		"start_event_ts": start.Ts,
@@ -156,10 +162,14 @@ func failStaleFinalize(ctx context.Context, st *State, row store.WorktreeRow, st
 
 // interruptedPhase is the phase a finalize opened by start, run for
 // trigger t, was in when the daemon stopped, given reached, the newest
-// hook-run or prepare start of its worktree. A watch re-prepare runs no
-// setup. A full finalize is in setup until a database's prepare or a
+// hook-run or prepare start of its worktree. A run still queued for a
+// lifecycle slot touched nothing, so it is in setup. A watch re-prepare
+// runs no setup. A full finalize is in setup until a database's prepare or a
 // hook run of a later trigger starts.
 func interruptedPhase(t trigger, start, reached store.Event) store.FinalizePhase {
+	if start.EventType == store.EvtWorktreeCreateQueued {
+		return store.FinalizeSetup
+	}
 	if t.Source == triggerFileChange {
 		return store.FinalizeEngines
 	}

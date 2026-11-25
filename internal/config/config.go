@@ -33,7 +33,7 @@ type Config struct {
 	// `databases:`/`connections:` fragment (#78).
 	Include []string `yaml:"include,omitempty" scope:"both"`
 
-	// Daemon process settings: stderr log level. Typically lives in
+	// Daemon process settings: stderr log level and lifecycle slots. Typically lives in
 	// the user-global config.
 	Daemon DaemonConfig `yaml:"daemon,omitempty" scope:"global"`
 
@@ -399,8 +399,8 @@ type LogsConfig struct {
 	KeepDays int `yaml:"keep_days,omitempty"`
 }
 
-// DaemonConfig — `daemon:` block. Only `log_level` is user-tunable;
-// the socket path and event-log location are derived from
+// DaemonConfig — `daemon:` block. `log_level` and `lifecycle_slots`
+// are user-tunable; the socket path and event-log location are derived from
 // $XDG_RUNTIME_DIR / $XDG_STATE_HOME respectively and are not
 // configurable through YAML (one source of truth — the runtime
 // dirs the OS already manages).
@@ -409,7 +409,16 @@ type DaemonConfig struct {
 	// `warn`, `error`. Read once at startup; reload by restarting
 	// the daemon. Hook output is always captured regardless.
 	LogLevel string `yaml:"log_level,omitempty"`
+
+	// How many worktree finalizes (setup hooks + engine prepare) and
+	// teardowns the daemon runs at once, across every repo. Further
+	// ones wait in the `queued` state for a free slot. Default 3.
+	// Read once at startup; reload by restarting the daemon.
+	LifecycleSlots uint `yaml:"lifecycle_slots,omitempty"`
 }
+
+// DefaultLifecycleSlots is daemon.lifecycle_slots when unset.
+const DefaultLifecycleSlots = 3
 
 // ConnectionsConfig — `connections:` block.
 type ConnectionsConfig struct {
@@ -2229,8 +2238,7 @@ type CustomFramework struct {
 
 // LoadGlobal returns the user-global config alone (no repo or
 // repo-local overlay). Used by the daemon at startup to read fields
-// that need to be live before any repo is known — currently just
-// daemon.log_level. Missing global file → defaults-only Config.
+// that need to be live before any repo is known — the daemon: block. Missing global file → defaults-only Config.
 //
 // An explicit config (`--config` / TREEMAN_CONFIG) is exempt from the
 // global-layer scope check: it is chosen per invocation, so it may also
@@ -2488,6 +2496,9 @@ func mergeYAMLFile(cfg *Config, path string, seen ...string) error {
 func applyDefaults(cfg *Config) {
 	if cfg.Daemon.LogLevel == "" {
 		cfg.Daemon.LogLevel = "info"
+	}
+	if cfg.Daemon.LifecycleSlots == 0 {
+		cfg.Daemon.LifecycleSlots = DefaultLifecycleSlots
 	}
 	if cfg.Worktrees.Root == "" {
 		// `<main>/.worktrees/` is the default sibling-style layout.

@@ -29,6 +29,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/stubbedev/treeman/e2e/harness"
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -89,7 +90,7 @@ databases:
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	state := daemon.NewState(ctx, st)
+	state := daemon.NewState(ctx, st, config.DefaultLifecycleSlots)
 	env := map[string]string{"PATH": os.Getenv("PATH")}
 
 	// ── Main worktree: overlay applies (name + clones:0) ──

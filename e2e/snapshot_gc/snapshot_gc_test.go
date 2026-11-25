@@ -209,7 +209,7 @@ snapshots:
 
 	loopCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go daemon.SnapshotGCLoop(loopCtx, daemon.NewState(loopCtx, st))
+	go daemon.SnapshotGCLoop(loopCtx, daemon.NewState(loopCtx, st, config.DefaultLifecycleSlots))
 
 	// First tick lands at ~60s (1-minute cadence). Poll until the
 	// over-age template is evicted, with headroom for a second tick.

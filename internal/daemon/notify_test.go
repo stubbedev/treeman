@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/notify"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -51,7 +52,7 @@ func newTestState(t *testing.T) *State {
 		t.Fatalf("store open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return NewState(ctx, s)
+	return NewState(ctx, s, config.DefaultLifecycleSlots)
 }
 
 func writeGlobalConfig(t *testing.T, cfgDir, body string) {

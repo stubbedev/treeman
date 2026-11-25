@@ -66,6 +66,25 @@ func TestWorktreeStateEvent(t *testing.T) {
 			wantState: StateTeardown,
 		},
 		{
+			name:      "finalize waiting for a lifecycle slot reads queued and hides a later prepare terminal",
+			op:        op(6, EvtWorktreeCreateQueued, LevelInfo),
+			prepare:   op(7, EvtPrepareEnd, LevelInfo),
+			wantType:  EvtWorktreeCreateQueued,
+			wantState: StateQueued,
+		},
+		{
+			name:      "teardown waiting for a lifecycle slot reads queued",
+			op:        op(8, EvtWorktreeDeleteQueued, LevelInfo),
+			wantType:  EvtWorktreeDeleteQueued,
+			wantState: StateQueued,
+		},
+		{
+			name:      "orphan reap waiting for a lifecycle slot reads queued",
+			op:        op(9, EvtWorktreeReapQueued, LevelInfo),
+			wantType:  EvtWorktreeReapQueued,
+			wantState: StateQueued,
+		},
+		{
 			name:      "no events at all reads ready",
 			wantState: StateReady,
 		},
@@ -127,5 +146,34 @@ func TestLatestWorktreeStates(t *testing.T) {
 	}
 	if _, ok := states[nothing]; ok {
 		t.Error("worktree without lifecycle events must be absent from the map")
+	}
+}
+
+func TestQueuedTeardownHidesWorktreeAndIsResumable(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "treeman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	repoID, _ := st.EnsureRepo(ctx, "/tmp/repo", "repo")
+	queued, _ := st.EnsureWorktree(ctx, repoID, "/tmp/repo/queued", "queued", "q")
+	live, _ := st.EnsureWorktree(ctx, repoID, "/tmp/repo/live", "live", "l")
+	_ = st.WriteEvent(ctx, LevelInfo, EvtWorktreeDeleteQueued, "queued", repoID, queued, "", 0, nil)
+	st.FlushEvents(ctx)
+
+	active, err := st.ListActiveWorktreeRows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ID != live {
+		t.Errorf("active rows = %+v, want only the live worktree", active)
+	}
+	interrupted, err := st.ListInterruptedTeardowns(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(interrupted) != 1 || interrupted[0].ID != queued {
+		t.Errorf("interrupted teardowns = %+v, want the queued one so a restart resumes it", interrupted)
 	}
 }

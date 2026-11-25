@@ -18,6 +18,7 @@ import (
 	"time"
 
 	_ "github.com/stubbedev/treeman/e2e/harness"
+	"github.com/stubbedev/treeman/internal/config"
 
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/store"
@@ -56,7 +57,7 @@ hooks:
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	state := daemon.NewState(ctx, st)
+	state := daemon.NewState(ctx, st, config.DefaultLifecycleSlots)
 
 	if _, err := daemon.EnrollMainWorktree(ctx, state, repoRoot); err != nil {
 		t.Fatalf("enroll: %v", err)

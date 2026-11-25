@@ -91,6 +91,7 @@ each worktree as one of:
 
 | State | Meaning |
 |---|---|
+| `queued` | a create or delete is waiting for one of the daemon's `daemon.lifecycle_slots` (default 3) |
 | `preparing` | create is running |
 | `ready` | the last create or prepare succeeded |
 | `deferred` | paused while a merge, rebase, cherry-pick or revert is in progress; resumes when it finishes |
@@ -105,7 +106,9 @@ them live, `treeman worktree show <name>` summarises one worktree, and
 
 `treemand` is a per-user daemon that runs hooks and prepares, watches
 inputs with fsnotify, fetches upstream on a timer (`auto_fetch`),
-sweeps old snapshots and logs, and serialises work per worktree. The
+sweeps old snapshots and logs, and serialises work per worktree. At
+most `daemon.lifecycle_slots` creates and deletes (default 3) run at
+once across every repo; the rest wait in the `queued` state. The
 `treeman` CLI and the MCP server talk to it over a unix socket that only
 the owning user can connect to.
 

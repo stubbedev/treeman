@@ -26,6 +26,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/stubbedev/treeman/e2e/harness"
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -112,7 +113,7 @@ databases:
 
 	return fixture{
 		repoRoot: repoRoot,
-		state:    daemon.NewState(ctx, st),
+		state:    daemon.NewState(ctx, st, config.DefaultLifecycleSlots),
 		rawDB:    rawDB,
 		env: map[string]string{
 			"PATH":     os.Getenv("PATH"),

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	_ "github.com/stubbedev/treeman/e2e/harness"
+	"github.com/stubbedev/treeman/internal/config"
 
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/slug"
@@ -370,7 +371,7 @@ func bootDaemon(t *testing.T, repoRoot string) (*store.Store, *daemon.State) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	state := daemon.NewState(ctx, st)
+	state := daemon.NewState(ctx, st, config.DefaultLifecycleSlots)
 	return st, state
 }
 

@@ -254,8 +254,9 @@ func (s *Store) LastEventTsPerWorktree(ctx context.Context, wtIDs []int64) (map[
 
 // WorktreeNotTearingDown is a SQL predicate fragment (over a worktrees
 // alias `w`) that excludes worktrees whose teardown is in flight: the
-// latest delete-lifecycle event is delete:start with no later
-// delete:end / delete:error. The daemon writes delete:start the moment
+// latest delete-lifecycle event is delete:queued or delete:start with no
+// later delete:end / delete:error. The daemon writes delete:queued when
+// the teardown waits for a lifecycle slot and delete:start the moment
 // teardown begins but flips deleted_at only when the final git-remove
 // lands, so `deleted_at IS NULL` alone keeps a tearing-down worktree
 // "live" for the whole DB-drop + hooks window. Every user-facing
@@ -266,7 +267,7 @@ func (s *Store) LastEventTsPerWorktree(ctx context.Context, wtIDs []int64) (map[
 // concatenate into queries.
 const WorktreeNotTearingDown = `NOT EXISTS (
 	SELECT 1 FROM events e
-	WHERE e.worktree_id = w.id AND e.event_type = '` + EvtWorktreeDeleteStart + `'
+	WHERE e.worktree_id = w.id AND e.event_type IN ('` + EvtWorktreeDeleteQueued + `','` + EvtWorktreeDeleteStart + `')
 	AND e.id > COALESCE((
 		SELECT MAX(e2.id) FROM events e2
 		WHERE e2.worktree_id = w.id

@@ -22,6 +22,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/stubbedev/treeman/e2e/harness"
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -97,7 +98,7 @@ hooks:
 		t.Fatal(err)
 	}
 	defer st.Close()
-	state := daemon.NewState(ctx, st)
+	state := daemon.NewState(ctx, st, config.DefaultLifecycleSlots)
 	rawDB, _ := sql.Open("sqlite", dbPath)
 	defer rawDB.Close()
 

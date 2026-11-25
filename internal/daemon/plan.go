@@ -87,7 +87,7 @@ func RunPlanInProcess(ctx context.Context, args rpc.RunPlanArgs) (rpc.Response, 
 		return rpc.Response{}, err
 	}
 	defer func() { _ = st.Close() }()
-	state := NewState(ctx, st)
+	state := NewState(ctx, st, config.DefaultLifecycleSlots)
 	state.SyncFinalize = true
 	ctx = withTrigger(ctx, trigger{Source: triggerRPC, RequestedBy: rpc.CurrentRequester()})
 	return rpc.Response{Kind: rpc.KindPlanResult, TaskResults: ExecutePlan(ctx, state, args.Groups)}, nil

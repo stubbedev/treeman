@@ -177,7 +177,7 @@ func openState(t *testing.T) *daemon.State {
 		t.Fatalf("store open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return daemon.NewState(ctx, s)
+	return daemon.NewState(ctx, s, config.DefaultLifecycleSlots)
 }
 
 func mustEnsureRepo(t *testing.T, st *daemon.State, work string) int64 {

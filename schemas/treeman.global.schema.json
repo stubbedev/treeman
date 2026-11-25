@@ -276,11 +276,15 @@
         "log_level": {
           "type": "string",
           "description": "Log level for daemon stderr: `debug`, `info` (default),\n`warn`, `error`. Read once at startup; reload by restarting\nthe daemon. Hook output is always captured regardless."
+        },
+        "lifecycle_slots": {
+          "type": "integer",
+          "description": "How many worktree finalizes (setup hooks + engine prepare) and\nteardowns the daemon runs at once, across every repo. Further\nones wait in the `queued` state for a free slot. Default 3.\nRead once at startup; reload by restarting the daemon."
         }
       },
       "additionalProperties": false,
       "type": "object",
-      "description": "DaemonConfig — `daemon:` block. Only `log_level` is user-tunable;\nthe socket path and event-log location are derived from\n$XDG_RUNTIME_DIR / $XDG_STATE_HOME respectively and are not\nconfigurable through YAML (one source of truth — the runtime\ndirs the OS already manages)."
+      "description": "DaemonConfig — `daemon:` block. `log_level` and `lifecycle_slots`\nare user-tunable; the socket path and event-log location are derived from\n$XDG_RUNTIME_DIR / $XDG_STATE_HOME respectively and are not\nconfigurable through YAML (one source of truth — the runtime\ndirs the OS already manages)."
     },
     "DatabaseConfig": {
       "properties": {
@@ -1203,7 +1207,7 @@
     },
     "daemon": {
       "$ref": "#/$defs/DaemonConfig",
-      "description": "Daemon process settings: stderr log level. Typically lives in\nthe user-global config."
+      "description": "Daemon process settings: stderr log level and lifecycle slots. Typically lives in\nthe user-global config."
     },
     "connections": {
       "$ref": "#/$defs/ConnectionsConfig",

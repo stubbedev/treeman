@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -295,8 +296,12 @@ func RenderGlobalTemplate() string {
 
 	// daemon: process-level settings (global-only). Plain scalars render
 	// unquoted, so `info`/`30`/`true` parse as the right YAML types.
-	daemon := mapNode("log_level", scalar("info"))
+	daemon := mapNode(
+		"log_level", scalar("info"),
+		"lifecycle_slots", scalar(strconv.Itoa(config.DefaultLifecycleSlots)),
+	)
 	mapKeyNode(daemon, "log_level").LineComment = "debug | info | warn | error"
+	mapKeyNode(daemon, "lifecycle_slots").LineComment = "finalizes + teardowns run at once; the rest queue"
 	mapSet(root, "daemon", daemon)
 
 	// snapshots: machine-wide template cache + retention (global-only).

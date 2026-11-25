@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/stubbedev/treeman/e2e/harness"
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/daemon"
 	"github.com/stubbedev/treeman/internal/store"
 )
@@ -81,7 +82,7 @@ hooks:
 		t.Fatal(err)
 	}
 	defer st.Close()
-	state := daemon.NewState(ctx, st)
+	state := daemon.NewState(ctx, st, config.DefaultLifecycleSlots)
 	env := map[string]string{
 		"PATH":     os.Getenv("PATH"),
 		"MYSQL_PW": "rootpw",

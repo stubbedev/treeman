@@ -654,15 +654,45 @@ func beginFinalize(ctx context.Context, st *State, wtRoot string, claimed bool) 
 	if !claimed {
 		return nil, nil
 	}
+	releaseSlot, err := st.lifecycleSlots.acquire(ctx, func() { reportFinalizeQueued(ctx, st, wtRoot) })
+	if err != nil {
+		replayReruns(st, wtRoot, st.UnmarkFinalizeInFlight(wtRoot))
+		return nil, unlessCancelled(ctx, err)
+	}
 	unlock, err := wtlock.Acquire(ctx, wtlock.Finalize, wtRoot, nil)
 	if err == nil {
 		return func() {
 			unlock()
+			releaseSlot()
 			replayReruns(st, wtRoot, st.UnmarkFinalizeInFlight(wtRoot))
 		}, nil
 	}
+	releaseSlot()
 	replayReruns(st, wtRoot, st.UnmarkFinalizeInFlight(wtRoot))
 	return nil, unlessCancelled(ctx, err)
+}
+
+// reportFinalizeQueued records that the finalize of wtRoot waits for a
+// lifecycle slot, unless its worktree already reads as queued (the
+// detached finalize RPC reports it at submission).
+func reportFinalizeQueued(ctx context.Context, st *State, wtRoot string) {
+	row, err := st.Store.LookupActiveWorktreeByPath(ctx, wtRoot)
+	if err != nil {
+		slog.Warn("finalize queued for a lifecycle slot; its worktree row could not be read to report it", "wt", wtRoot, "err", err)
+		return
+	}
+	if row.ID != 0 {
+		latest, err := st.Store.LatestWorktreeStateEvent(ctx, row.ID)
+		if err != nil {
+			slog.Warn("finalize queued for a lifecycle slot; its state could not be read to report it", "wt", wtRoot, "err", err)
+			return
+		}
+		if latest.EventType == store.EvtWorktreeCreateQueued {
+			return
+		}
+	}
+	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateQueued, st.lifecycleSlots.queuedMessage(),
+		row.RepoID, row.ID, "", 0, queuedPayload(ctx, wtRoot))
 }
 
 // replayReruns runs, off the releasing goroutine, the reruns that were
@@ -1061,6 +1091,15 @@ func TeardownWorktree(
 			"wt", wtRoot, "id", row.ID)
 	}
 	wtID := row.ID
+
+	releaseSlot, err := st.lifecycleSlots.acquire(ctx, func() {
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteQueued, st.lifecycleSlots.queuedMessage(),
+			repoID, wtID, "", 0, queuedPayload(ctx, wtRoot))
+	})
+	if err != nil {
+		return err
+	}
+	defer releaseSlot()
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteStart,
 		"daemon-detached teardown hooks + db teardown + git remove beginning",

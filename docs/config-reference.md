@@ -49,9 +49,10 @@ Complete examples covering every key valid in each layer, generated from the sch
 # Other config files to merge BEFORE this file's own keys
 include:
     - '...'
-# Daemon process settings: stderr log level. Typically lives in
+# Daemon process settings: stderr log level and lifecycle slots. Typically lives in
 daemon:
     log_level: '...'
+    lifecycle_slots: 0
 # Connection blocks per supported engine (MySQL, Postgres,
 connections:
     mysql: '...'
@@ -327,7 +328,7 @@ including file. Lets a fleet of repos share one
 
 ### `daemon` *([DaemonConfig](#daemonconfig))* _[global]_
 
-Daemon process settings: stderr log level. Typically lives in
+Daemon process settings: stderr log level and lifecycle slots. Typically lives in
 the user-global config.
 
 ### `connections` *([ConnectionsConfig](#connectionsconfig))* _[both]_
@@ -649,8 +650,8 @@ RollbackEnv is the env-var override map for the rollback command.
 
 ### DaemonConfig
 
-DaemonConfig — `daemon:` block. Only `log_level` is user-tunable;
-the socket path and event-log location are derived from
+DaemonConfig — `daemon:` block. `log_level` and `lifecycle_slots`
+are user-tunable; the socket path and event-log location are derived from
 $XDG_RUNTIME_DIR / $XDG_STATE_HOME respectively and are not
 configurable through YAML (one source of truth — the runtime
 dirs the OS already manages).
@@ -660,6 +661,13 @@ dirs the OS already manages).
 Log level for daemon stderr: `debug`, `info` (default),
 `warn`, `error`. Read once at startup; reload by restarting
 the daemon. Hook output is always captured regardless.
+
+#### `lifecycle_slots` *(integer)*
+
+How many worktree finalizes (setup hooks + engine prepare) and
+teardowns the daemon runs at once, across every repo. Further
+ones wait in the `queued` state for a free slot. Default 3.
+Read once at startup; reload by restarting the daemon.
 
 ### DatabaseConfig
 

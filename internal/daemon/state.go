@@ -95,6 +95,10 @@ type State struct {
 	// runs, per engine server (#199).
 	cloneSlots *prepare.CloneSlots
 
+	// lifecycleSlots caps the finalizes and teardowns running at once
+	// across every repo (#223).
+	lifecycleSlots lifecycleSlots
+
 	// reapQueuesMu guards reapQueues. Each repo gets a single worker
 	// goroutine draining a buffered channel of trash paths — bursty
 	// `gwtd` runs that delete five worktrees at once don't spawn five
@@ -209,8 +213,9 @@ type WatcherEntry struct {
 
 // NewState constructs a fresh daemon state. `bg` is the
 // daemon-lifetime context — cancelled on signal/shutdown — that
-// background goroutines should derive from.
-func NewState(bg context.Context, s *store.Store) *State {
+// background goroutines should derive from. lifecycleSlots is
+// daemon.lifecycle_slots and must be at least 1.
+func NewState(bg context.Context, s *store.Store, lifecycleSlots uint) *State {
 	if bg == nil {
 		bg = context.Background()
 	}
@@ -228,6 +233,7 @@ func NewState(bg context.Context, s *store.Store) *State {
 		inFlightFinalizes: map[string]inFlightFinalize{},
 		inFlightCreates:   map[string]int{},
 		cloneSlots:        prepare.NewCloneSlots(),
+		lifecycleSlots:    newLifecycleSlots(lifecycleSlots),
 		reapQueues:        map[string]chan string{},
 		syncBackoff:       map[string]time.Time{},
 		syncFailCount:     map[string]int{},

@@ -327,15 +327,10 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 		}
 	}
 
-	// Fan out onCreate / onRemove across reconcileWorkers goroutines.
-	// Each onCreate calls FinalizeWorktree (db setup + hook chains),
-	// each onRemove calls teardownOrphan (db teardown + hook chains) —
-	// on boot of a daemon with N stale worktrees, the old serial loop
-	// stalled the constructor for N×finalize-time before the event
-	// loop could serve its first RPC.
-	const reconcileWorkers = 4
+	// Fan out onCreate / onRemove, one goroutine each: the finalizes
+	// and teardowns they start share the daemon's lifecycle slots
+	// (#223), which bound how many run at once.
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, reconcileWorkers)
 
 	for admin, wtPath := range onDisk {
 		lw.mu.Lock()
@@ -350,10 +345,8 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 		}
 		if !ok || row.Deleted {
 			wg.Add(1)
-			sem <- struct{}{}
 			safeGo(lblLifecycle, admin, func() {
 				defer wg.Done()
-				defer func() { <-sem }()
 				lw.onCreate(ctx, admin)
 			})
 		}
@@ -368,14 +361,12 @@ func (lw *LifecycleWatcher) reconcile(ctx context.Context) error {
 		}
 
 		wg.Add(1)
-		sem <- struct{}{}
 		safeGo(lblLifecycle, admin, func() {
 			defer wg.Done()
-			defer func() { <-sem }()
 			lw.onRemove(ctx, admin)
 		})
 	}
-	errs = append(errs, lw.reapUnstamped(ctx, unstampedByPath, onDisk, &wg, sem)...)
+	errs = append(errs, lw.reapUnstamped(ctx, unstampedByPath, onDisk, &wg)...)
 	wg.Wait()
 	return errors.Join(errs...)
 }
@@ -405,7 +396,6 @@ func (lw *LifecycleWatcher) reapUnstamped(
 	unstampedByPath map[string]store.WorktreeRow,
 	onDisk map[string]string,
 	wg *sync.WaitGroup,
-	sem chan struct{},
 ) []error {
 	onDiskPaths := make(map[string]bool, len(onDisk))
 	for _, p := range onDisk {
@@ -424,10 +414,8 @@ func (lw *LifecycleWatcher) reapUnstamped(
 			continue
 		}
 		wg.Add(1)
-		sem <- struct{}{}
 		safeGo(lblLifecycle, path, func() {
 			defer wg.Done()
-			defer func() { <-sem }()
 			if lw.st.IsTeardownInFlight(path) {
 				return
 			}
@@ -473,6 +461,15 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 	if row.Deleted {
 		return nil
 	}
+
+	releaseSlot, err := st.lifecycleSlots.acquire(ctx, func() {
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeReapQueued, st.lifecycleSlots.queuedMessage(),
+			repoID, row.ID, "", 0, queuedPayload(ctx, wtPath))
+	})
+	if err != nil {
+		return err
+	}
+	defer releaseSlot()
 
 	_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeReapStart,
 		"lifecycle watcher: teardown hooks + db teardown beginning",

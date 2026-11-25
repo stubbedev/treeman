@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/resolve"
 	"github.com/stubbedev/treeman/internal/slug"
 	"github.com/stubbedev/treeman/internal/store"
@@ -31,7 +32,7 @@ func TestEnrollMainWorktreeFastPathSkipsRepoWithoutConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 
 	id, err := EnrollMainWorktree(ctx, st, repo)
 	if err != nil {
@@ -67,7 +68,7 @@ func TestEnrollMainWorktreeEnableDisableRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 
 	// First enroll — fresh row.
 	id, err := EnrollMainWorktree(ctx, st, repo)

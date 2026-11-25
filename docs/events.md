@@ -144,15 +144,18 @@ that emits it.
 
 | Event | Constant |
 |-------|----------|
+| `worktree:create:queued` | `store.EvtWorktreeCreateQueued` |
 | `worktree:create:start` | `store.EvtWorktreeCreateStart` |
 | `worktree:create:checkout` | `store.EvtWorktreeCreateCheckout` |
 | `worktree:create:end` | `store.EvtWorktreeCreateEnd` |
 | `worktree:create:error` | `store.EvtWorktreeCreateError` |
 | `worktree:create:cancel` | `store.EvtWorktreeCreateCancel` |
 | `worktree:create:deferred` | `store.EvtWorktreeCreateDeferred` |
+| `worktree:delete:queued` | `store.EvtWorktreeDeleteQueued` |
 | `worktree:delete:start` | `store.EvtWorktreeDeleteStart` |
 | `worktree:delete:end` | `store.EvtWorktreeDeleteEnd` |
 | `worktree:delete:error` | `store.EvtWorktreeDeleteError` |
+| `worktree:reap:queued` | `store.EvtWorktreeReapQueued` |
 | `worktree:reap:start` | `store.EvtWorktreeReapStart` |
 | `worktree:reap:end` | `store.EvtWorktreeReapEnd` |
 | `worktree:reap:error` | `store.EvtWorktreeReapError` |

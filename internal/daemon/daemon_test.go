@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/store"
 	"github.com/stubbedev/treeman/pkg/rpc"
 )
@@ -16,7 +17,7 @@ func setup(t *testing.T) (*State, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	return st, func() { _ = s.Close() }
 }
 

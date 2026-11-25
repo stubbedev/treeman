@@ -10,8 +10,6 @@ import (
 	"github.com/stubbedev/treeman/internal/store"
 )
 
-const resumeTeardownWorkers = 4
-
 // SweepInterruptedTeardowns finishes every teardown the previous daemon
 // stopped in the middle of. Such a worktree's delete:start has no
 // terminal event, so it reads as tearing down forever, and whatever the
@@ -31,13 +29,10 @@ func SweepInterruptedTeardowns(ctx context.Context, st *State) {
 	}
 	ctx = withTrigger(ctx, trigger{Source: triggerDaemonRestart})
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, resumeTeardownWorkers)
 	for _, row := range rows {
 		wg.Add(1)
-		sem <- struct{}{}
 		safeGo(lblTeardownResume, row.Path, func() {
 			defer wg.Done()
-			defer func() { <-sem }()
 			resumeTeardown(ctx, st, row)
 		})
 	}

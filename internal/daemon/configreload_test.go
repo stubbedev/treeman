@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -23,7 +24,7 @@ func TestLockRepoSerialisesConcurrentReloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	cr, err := NewConfigReloader(st)
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +64,7 @@ func TestLockRepoDifferentReposParallelise(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	cr, err := NewConfigReloader(st)
 	if err != nil {
 		t.Fatal(err)

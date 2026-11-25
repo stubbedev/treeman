@@ -49,6 +49,9 @@ func TestRenderGlobalTemplateScopeAndParse(t *testing.T) {
 	if cfg.Daemon.LogLevel != "info" {
 		t.Errorf("daemon.log_level = %q, want info", cfg.Daemon.LogLevel)
 	}
+	if cfg.Daemon.LifecycleSlots != config.DefaultLifecycleSlots {
+		t.Errorf("daemon.lifecycle_slots = %d, want %d", cfg.Daemon.LifecycleSlots, config.DefaultLifecycleSlots)
+	}
 	if cfg.AutoFetch.Enabled == nil || !*cfg.AutoFetch.Enabled {
 		t.Errorf("auto_fetch.enabled should parse as bool true")
 	}

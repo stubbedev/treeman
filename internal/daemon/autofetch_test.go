@@ -171,7 +171,7 @@ func TestRefsDigestChangedGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 
 	if !st.RefsDigestChanged("/repo", "a") {
 		t.Error("first digest must count as changed")
@@ -208,7 +208,7 @@ func TestAutoFetchAdvancesCleanWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 
 	repoID, err := s.EnsureRepo(ctx, work, "work")
 	if err != nil {
@@ -245,7 +245,7 @@ func TestAutoFetchSkipsDirtyWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	if _, err := s.EnsureRepo(ctx, work, "work"); err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestAutoFetchSkipsNonFastForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	if _, err := s.EnsureRepo(ctx, work, "work"); err != nil {
 		t.Fatal(err)
 	}

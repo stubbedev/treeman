@@ -74,7 +74,7 @@ func setup(t *testing.T) (*daemon.State, int64, int64) {
 		t.Fatalf("store open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	st := daemon.NewState(ctx, s)
+	st := daemon.NewState(ctx, s, config.DefaultLifecycleSlots)
 
 	repoID, err := s.EnsureRepo(ctx, "/repos/myrepo", "myrepo")
 	if err != nil {

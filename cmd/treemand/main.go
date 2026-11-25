@@ -69,20 +69,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "treemand:", err)
 		os.Exit(1)
 	}
-	level := slog.LevelInfo
-	if gcfg, err := config.LoadGlobal(); err == nil {
-		level = slogLevel(gcfg.Daemon.LogLevel)
+	gcfg, err := config.LoadGlobal()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "treemand: load the global config:", err)
+		os.Exit(1)
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slogLevel(gcfg.Daemon.LogLevel)}))
 	slog.SetDefault(logger)
 
-	if err := run(); err != nil {
+	if err := run(gcfg.Daemon); err != nil {
 		slog.Error("treemand exited", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(dcfg config.DaemonConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -130,7 +131,7 @@ func run() error {
 		return err
 	}
 
-	st := daemon.NewState(ctx, s)
+	st := daemon.NewState(ctx, s, dcfg.LifecycleSlots)
 	slog.Info("treemand listening",
 		"event_type", store.EvtDaemonStart,
 		"socket", sockPath,

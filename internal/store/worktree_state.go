@@ -17,6 +17,7 @@ const (
 // Worktree lifecycle states derived by DeriveWorktreeState.
 const (
 	StateReady     = "ready"
+	StateQueued    = "queued"
 	StatePreparing = "preparing"
 	StateDeferred  = "deferred"
 	StateError     = "error"
@@ -29,10 +30,10 @@ const PhaseBeforeEngines = "before-engines"
 // finalize, a watch re-prepare, a teardown or a reap. Its start event
 // opens the operation and its terminals (end/error/deferred) close it.
 var WorktreeOpEventTypes = []string{
-	EvtWorktreeCreateStart, EvtWorktreeCreateEnd, EvtWorktreeCreateError,
+	EvtWorktreeCreateQueued, EvtWorktreeCreateStart, EvtWorktreeCreateEnd, EvtWorktreeCreateError,
 	EvtWorktreeCreateDeferred,
-	EvtWorktreeDeleteStart, EvtWorktreeDeleteEnd, EvtWorktreeDeleteError,
-	EvtWorktreeReapStart, EvtWorktreeReapEnd, EvtWorktreeReapError,
+	EvtWorktreeDeleteQueued, EvtWorktreeDeleteStart, EvtWorktreeDeleteEnd, EvtWorktreeDeleteError,
+	EvtWorktreeReapQueued, EvtWorktreeReapStart, EvtWorktreeReapEnd, EvtWorktreeReapError,
 }
 
 // PrepareStateEventTypes are the terminals of a STANDALONE prepare run
@@ -51,6 +52,10 @@ var WorktreeStateEventTypes = append(
 // Event when it has none) to its state and bucket.
 func DeriveWorktreeState(last Event) (state, bucket string) {
 	switch last.EventType {
+	case EvtWorktreeCreateQueued:
+		return StateQueued, BucketUp
+	case EvtWorktreeDeleteQueued, EvtWorktreeReapQueued:
+		return StateQueued, BucketDown
 	case EvtWorktreeCreateStart:
 		return StatePreparing, BucketUp
 	case EvtWorktreeCreateDeferred:
@@ -86,7 +91,9 @@ func WorktreeStateEvent(latestOp, latestPrepareTerminal Event) Event {
 // event has closed yet.
 func opInFlight(e Event) bool {
 	switch e.EventType {
-	case EvtWorktreeCreateStart, EvtWorktreeDeleteStart, EvtWorktreeReapStart:
+	case EvtWorktreeCreateQueued, EvtWorktreeCreateStart,
+		EvtWorktreeDeleteQueued, EvtWorktreeDeleteStart,
+		EvtWorktreeReapQueued, EvtWorktreeReapStart:
 		return true
 	}
 	return false

@@ -18,7 +18,7 @@ func TestRetryPendingTeardowns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	repoID, err := s.EnsureRepo(ctx, "/r", "r")
 	if err != nil {
 		t.Fatal(err)

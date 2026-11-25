@@ -62,8 +62,8 @@ func StatusCmd() *cli.Command {
 		Name:  "status",
 		Usage: "summarize worktree health across all repos (bar/waybar widget)",
 		Description: `Aggregates every active worktree across all registered repos into
-four buckets — stable (ready), up (preparing), down (tearing down),
-failed (last finalize errored) — and renders them.
+four buckets — stable (ready), up (queued or preparing), down (queued
+or tearing down), failed (last finalize errored) — and renders them.
 
 Formats (--format):
   table   aligned per-worktree table, colored states + relative age

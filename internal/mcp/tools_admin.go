@@ -42,7 +42,7 @@ func registerAdminGapTools(srv *mcpsdk.Server) {
 
 	addTool(srv, &mcpsdk.Tool{
 		Name:        "status_overview",
-		Description: "Cross-repo fleet rollup: registered worktrees across every repo, bucketed stable/up(preparing)/down(teardown)/failed, derived from the latest lifecycle event per worktree. The fleet-wide answer to \"what's the state of everything?\" — worktree_list is per-repo and has no health bucket. Paged in worktree-id order: counts cover the returned page; when truncated=true, re-call with after_id=next_after_id.",
+		Description: "Cross-repo fleet rollup: registered worktrees across every repo, bucketed stable/up(queued, preparing)/down(queued, teardown)/failed, derived from the latest lifecycle event per worktree. The fleet-wide answer to \"what's the state of everything?\" — worktree_list is per-repo and has no health bucket. Paged in worktree-id order: counts cover the returned page; when truncated=true, re-call with after_id=next_after_id.",
 		Annotations: readOnlyAnno("Status overview", false),
 	}, statusOverviewTool)
 

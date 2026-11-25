@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stubbedev/treeman/internal/config"
 	"github.com/stubbedev/treeman/internal/store"
 )
 
@@ -23,7 +24,7 @@ func TestEmitSkipDedupesUnchangedReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	repoID, err := s.EnsureRepo(ctx, "/tmp/repo", "repo")
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +82,7 @@ func TestSyncNowAdvancesTargetedRepo(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	if _, err := s.EnsureRepo(ctx, work, "work"); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +131,7 @@ func TestSyncNowReportsSkipReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	st := NewState(ctx, s)
+	st := NewState(ctx, s, config.DefaultLifecycleSlots)
 	if _, err := s.EnsureRepo(ctx, work, "work"); err != nil {
 		t.Fatal(err)
 	}
