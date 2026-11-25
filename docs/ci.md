@@ -92,5 +92,7 @@ mode.
 Where a daemon *is* expected (a self-hosted runner with a long-lived
 user session), `treeman daemon status --fail-if-down` exits `3` when it
 is unreachable, distinct from `1` for a broken command. `treeman
-worktree wait <name>` blocks until a worktree's finalize completes and
-exits non-zero if it failed. See [exit codes](cli.md#exit-codes).
+worktree finalize <name> --wait` re-runs a worktree's finalize and
+blocks until it completes; `treeman worktree wait <name>` blocks until
+the newest finalize already queued or running completes. Both exit
+non-zero if it failed. See [exit codes](cli.md#exit-codes).

@@ -72,8 +72,9 @@ type finalizeFailure struct {
 // into a rebuild-from-nothing (#21).
 //
 // A failure before the worktree's row is resolved (config load,
-// EnsureRepo, ResolveIdentity) has f.wtID == 0 and is recorded as a
-// repo-less event carrying the paths in its payload.
+// EnsureRepo, ResolveIdentity) has f.wtID == 0: it is recorded against
+// the worktree registered at f.wtRoot, or as a worktree-less event
+// carrying the paths in its payload when there is none.
 //
 // Reaching here with f.err != nil already means a GENUINE failure: the
 // pipeline converts every cancellation/timeout into `done=true,
@@ -91,6 +92,9 @@ type finalizeFailure struct {
 func recordFinalizeFailure(ctx context.Context, st *State, cfg *config.Config, f finalizeFailure) {
 	termCtx, termCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)
 	defer termCancel()
+	if f.wtID == 0 {
+		f.repoID, f.wtID = registeredWorktreeIDs(termCtx, st, f.repoID, f.wtRoot)
+	}
 	// Best-effort: drops surface as their own `worktree:recover:*`
 	// events and never mask the failure event written below.
 	if f.enginesTouched {
@@ -112,6 +116,21 @@ func recordFinalizeFailure(ctx context.Context, st *State, cfg *config.Config, f
 	}
 	_ = st.Store.WriteEvent(termCtx, store.LevelError, store.EvtWorktreeCreateError, msg,
 		f.repoID, f.wtID, f.phase.EventPhase(), 0, payload)
+}
+
+// registeredWorktreeIDs returns the ids of the registered worktree at
+// wtRoot, so a finalize that failed before resolving its identity still
+// closes the worktree's queued state; repoID and 0 when none is.
+func registeredWorktreeIDs(ctx context.Context, st *State, repoID int64, wtRoot string) (int64, int64) {
+	row, err := st.Store.LookupActiveWorktreeByPath(ctx, wtRoot)
+	if err != nil {
+		slog.Warn("finalize failed before resolving its worktree; the failure is recorded without it", "wt", wtRoot, "err", err)
+		return repoID, 0
+	}
+	if row.ID == 0 {
+		return repoID, 0
+	}
+	return row.RepoID, row.ID
 }
 
 // FinalizeWorktree is the daemon's tokio-equivalent (just a Go

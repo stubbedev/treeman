@@ -215,16 +215,15 @@ func runResultJSON(ctx context.Context, task rpc.Task) error {
 	return werr
 }
 
-// finalizeRequest builds a fire-and-forget run_plan for the worktree-
-// finalize tail (setup hooks + prepare) — used by `wt finalize` and
-// `main enable`.
-func finalizeRequest(repoRoot, wtPath string) rpc.Request {
-	return rpc.Plan(false, rpc.One(rpc.Task{
+// finalizeTask is the worktree-finalize tail (setup hooks + prepare) —
+// used by `wt finalize` and `main enable`.
+func finalizeTask(repoRoot, wtPath string) rpc.Task {
+	return rpc.Task{
 		Type:         rpc.TaskWorktreeFinalize,
 		RepoPath:     repoRoot,
 		WorktreePath: wtPath,
 		InheritedEnv: CaptureInheritedEnv(),
-	}))
+	}
 }
 
 // writeConfig persists a CLI-rendered config body through the daemon —

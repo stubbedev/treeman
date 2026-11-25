@@ -69,7 +69,7 @@ func TestPrepareSummaryFailsWhenEventsAreUnreadable(t *testing.T) {
 	if err := printWtPrepareSummary(context.Background(), st, wtID); err == nil {
 		t.Fatal("an unreadable event log must fail the prepare summary, not print nothing")
 	}
-	if _, err := newestStartTs(context.Background(), st, wtID); err == nil {
+	if _, err := finalizeAnchor(context.Background(), st, wtID); err == nil {
 		t.Fatal("an unreadable event log must fail `worktree wait`'s anchor lookup, not anchor at creation time")
 	}
 }

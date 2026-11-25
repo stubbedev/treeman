@@ -56,6 +56,9 @@ func handleRunPlan(ctx context.Context, st *State, req rpc.Request) rpc.Response
 		return rpc.Response{Kind: rpc.KindPlanResult, TaskResults: results}
 	}
 
+	if err := announceQueuedFinalizes(withTrigger(runid.With(ctx, id), requested), st, args.Groups); err != nil {
+		return errResp("run_plan: " + err.Error())
+	}
 	safeGo(lblPlanRun, "", func() {
 		bg := withTrigger(runid.With(st.BgCtx, id), requested)
 		_ = st.Store.WriteEvent(bg, store.LevelInfo, store.EvtPlanStart, "plan beginning", 0, 0, "", 0, triggerPayload(bg))
@@ -68,6 +71,34 @@ func handleRunPlan(ctx context.Context, st *State, req rpc.Request) rpc.Response
 		_ = st.Store.WriteEvent(bg, store.LevelInfo, store.EvtPlanEnd, "plan complete", 0, 0, "", 0, nil)
 	})
 	return rpc.Response{Kind: rpc.KindPlanQueued}
+}
+
+// announceQueuedFinalizes records worktree:create:queued for every
+// finalize that heads a lane of a detached plan, before the plan is
+// acknowledged: once the caller holds the acknowledgement, `worktree
+// wait` anchors on this run rather than on an older finalize whose
+// terminal event would answer for it (#224). Only a lane's first task is
+// certain to run, so later ones are left to report themselves.
+func announceQueuedFinalizes(ctx context.Context, st *State, groups [][]rpc.Task) error {
+	for _, lane := range groups {
+		if len(lane) == 0 || lane[0].Type != rpc.TaskWorktreeFinalize {
+			continue
+		}
+		wtPath := lane[0].WorktreePath
+		row, err := st.Store.LookupActiveWorktreeByPath(ctx, wtPath)
+		if err != nil {
+			return fmt.Errorf("look up the worktree at %s to record its finalize as queued: %w", wtPath, err)
+		}
+		if row.ID == 0 {
+			continue
+		}
+		if err := st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateQueued,
+			"queued: finalize accepted by the daemon", row.RepoID, row.ID, "", 0, queuedPayload(ctx, wtPath)); err != nil {
+			return fmt.Errorf("record the finalize of %s as queued: %w", wtPath, err)
+		}
+	}
+	st.Store.FlushEvents(ctx)
+	return nil
 }
 
 // RunPlanInProcess runs a plan locally — opening the store, building an

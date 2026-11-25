@@ -1468,6 +1468,7 @@ func wtFinalize() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "repo", Aliases: []string{"r"}},
 			&cli.BoolFlag{Name: "local", Usage: "run setup + prepare in this process instead of dispatching to the daemon"},
+			foregroundFlag(),
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.NArg() > 1 {
@@ -1488,17 +1489,7 @@ func wtFinalize() *cli.Command {
 				return runLocalFinalizeFlow(ctx, repoRoot, wtPath)
 			}
 
-			// Dispatch to the daemon when reachable, else run the tail
-			// in-process — `wt finalize` works daemon-less.
-			switch resp := submitPlan(ctx, finalizeRequest(repoRoot, wtPath)); resp.Kind {
-			case rpc.KindPlanQueued:
-				PrintOK("queued: setup + prepare detached to daemon — follow with `treeman logs tail --follow`")
-			case rpc.KindError:
-				return fmt.Errorf("finalize: %s", resp.Message)
-			default:
-				PrintOK("finalize complete")
-			}
-			return nil
+			return dispatchTask(ctx, finalizeTask(repoRoot, wtPath), c.Bool("foreground"), "finalize")
 		},
 	}
 }

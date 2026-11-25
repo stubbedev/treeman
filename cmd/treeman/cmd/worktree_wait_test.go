@@ -33,7 +33,7 @@ func TestPollFinalizeQuietPipedOutput(t *testing.T) {
 			time.Sleep(600 * time.Millisecond)
 			_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateEnd, "done", repoID, wtID, "", 0, nil)
 		}()
-		err := pollFinalize(ctx, st, wt, 0, time.Now().Add(5*time.Second), 5*time.Second, true)
+		err := pollFinalize(ctx, st, wt, store.Event{}, time.Now().Add(5*time.Second), 5*time.Second, true)
 		if err != nil {
 			t.Fatalf("pollFinalize should succeed on create:end, got %v", err)
 		}
@@ -57,14 +57,14 @@ func TestPollFinalizeQuietPipedOutput(t *testing.T) {
 		); err != nil {
 			t.Fatal(err)
 		}
-		err := pollFinalize(ctx, st, wtErr, 0, time.Now().Add(5*time.Second), 5*time.Second, true)
+		err := pollFinalize(ctx, st, wtErr, store.Event{}, time.Now().Add(5*time.Second), 5*time.Second, true)
 		if err == nil || !strings.Contains(err.Error(), "migrate exploded") {
 			t.Fatalf("want failure carrying the event message, got %v", err)
 		}
 	})
 
 	t.Run("timeout", func(t *testing.T) {
-		err := pollFinalize(ctx, st, wt, 1<<62, time.Now().Add(1200*time.Millisecond), time.Second, true)
+		err := pollFinalize(ctx, st, wt, store.Event{ID: 1 << 62, Ts: 1 << 62}, time.Now().Add(1200*time.Millisecond), time.Second, true)
 		if err == nil || !strings.Contains(err.Error(), "timed out") {
 			t.Fatalf("want timeout error, got %v", err)
 		}
@@ -93,7 +93,44 @@ func TestPollFinalizeSpinnerOnlyOnTTY(t *testing.T) {
 		time.Sleep(1200 * time.Millisecond)
 		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateEnd, "done", repoID, wtID, "", 0, nil)
 	}()
-	if err := pollFinalize(ctx, st, wt, 0, time.Now().Add(5*time.Second), 5*time.Second, false); err != nil {
+	if err := pollFinalize(ctx, st, wt, store.Event{}, time.Now().Add(5*time.Second), 5*time.Second, false); err != nil {
 		t.Fatalf("non-quiet piped poll should still succeed: %v", err)
+	}
+}
+
+func TestWaitIgnoresThePreviousFinalizeOnceANewOneIsQueued(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "treeman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	repoID, _ := st.EnsureRepo(ctx, "/tmp/repo", "repo")
+	wtID, _ := st.EnsureWorktree(ctx, repoID, "/tmp/repo/wt", "slug", "feature")
+	wt := worktreeRow{ID: wtID, Slug: "slug", Branch: "feature", Path: "/tmp/repo/wt", CreatedAt: 1}
+	for _, e := range []struct{ level, eventType, msg string }{
+		{store.LevelInfo, store.EvtWorktreeCreateStart, "previous run"},
+		{store.LevelError, store.EvtWorktreeCreateError, "previous run failed"},
+		{store.LevelInfo, store.EvtWorktreeCreateQueued, "queued: finalize accepted by the daemon"},
+	} {
+		if err := st.WriteEvent(ctx, e.level, e.eventType, e.msg, repoID, wtID, "", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.FlushEvents(ctx)
+
+	anchor, err := finalizeAnchor(ctx, st, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anchor.EventType != store.EvtWorktreeCreateQueued {
+		t.Fatalf("anchor = %q, want the queued run's %q", anchor.EventType, store.EvtWorktreeCreateQueued)
+	}
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateEnd, "done", repoID, wtID, "", 0, nil)
+	}()
+	if err := pollFinalize(ctx, st, wt, anchor, time.Now().Add(5*time.Second), 5*time.Second, true); err != nil {
+		t.Fatalf("wait must report the queued run, not the previous run's failure: %v", err)
 	}
 }

@@ -424,8 +424,8 @@ func wtLogs() *cli.Command {
 	}
 }
 
-// wtWait — `treeman worktree wait <name>` blocks until the most-recent
-// daemon-detached finalize for that worktree has either succeeded
+// wtWait — `treeman worktree wait <name>` blocks until the newest
+// finalize for that worktree — queued or running — has either succeeded
 // (`worktree:create:end`) or failed (level=error, event_type=worktree:create:error).
 // Exit code reflects the outcome — 0 on success, non-zero on failure
 // or timeout — so CI scripts can `treeman worktree create FOO && treeman
@@ -460,16 +460,9 @@ func wtWait() *cli.Command {
 				return err
 			}
 
-			// Anchor the wait at the newest worktree:create:start we can
-			// see. If none exists yet, fall back to the wt's creation
-			// time so we don't terminate prematurely against a
-			// historical "done" row.
-			anchor, err := newestStartTs(ctx, st, wt.ID)
+			anchor, err := finalizeAnchor(ctx, st, wt.ID)
 			if err != nil {
 				return err
-			}
-			if anchor == 0 {
-				anchor = wt.CreatedAt
 			}
 			deadline := time.Now().Add(c.Duration("timeout"))
 			if !c.Bool("quiet") {
@@ -482,12 +475,12 @@ func wtWait() *cli.Command {
 }
 
 // pollFinalize polls the event log every 500ms until the worktree's
-// finalize completes (success → nil), fails (error event → error) or the
-// deadline passes (timeout → error).
+// finalize opened by anchor (the zero Event: any) completes (success → nil),
+// fails (error event → error) or the deadline passes (timeout → error).
 //
 // On a real terminal (and not --quiet) each tick re-renders one wait
 // line in place: a spinner, elapsed/timeout, and the newest prepare /
-// hook event message seen since the anchor — so a 10-minute default
+// hook event message seen after the anchor — so a 10-minute default
 // wait isn't a frozen prompt (#54). --quiet and piped stderr keep the
 // byte-identical initial-info + final-result pair CI consumers rely
 // on.
@@ -495,7 +488,7 @@ func pollFinalize(
 	ctx context.Context,
 	st *store.Store,
 	wt worktreeRow,
-	anchor int64,
+	anchor store.Event,
 	deadline time.Time,
 	timeout time.Duration,
 	quiet bool,
@@ -527,7 +520,8 @@ func pollFinalize(
 		rows, err := st.QueryEvents(ctx, store.EventFilter{
 			WorktreeID:  wt.ID,
 			EventTypes:  []string{store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError},
-			SinceMs:     anchor,
+			SinceMs:     anchor.Ts,
+			AfterID:     anchor.ID,
 			OldestFirst: true,
 			Limit:       50,
 		})
@@ -549,7 +543,7 @@ func pollFinalize(
 			}
 		}
 		if spinner {
-			// Newest prepare/hook event since the anchor feeds the
+			// Newest prepare/hook event after the anchor feeds the
 			// status segment; a newer event replaces the message, an
 			// equal timestamp keeps it (idempotent re-read).
 			if phase, ms := newestProgressEvent(ctx, st, wt.ID, anchor); ms > lastPhaseMs {
@@ -570,13 +564,14 @@ func pollFinalize(
 }
 
 // newestProgressEvent returns the newest prepare:phase / hooks:start /
-// hooks:end message for the worktree since `anchor` (with its ts), or
+// hooks:end message for the worktree after `anchor` (with its ts), or
 // "" when none exists yet.
-func newestProgressEvent(ctx context.Context, st *store.Store, wtID, anchor int64) (string, int64) {
+func newestProgressEvent(ctx context.Context, st *store.Store, wtID int64, anchor store.Event) (string, int64) {
 	rows, err := st.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
 		EventTypes: []string{store.EvtPreparePhase, store.EvtHooksStart, store.EvtHooksEnd},
-		SinceMs:    anchor,
+		SinceMs:    anchor.Ts,
+		AfterID:    anchor.ID,
 		Limit:      1,
 	})
 	if err != nil || len(rows) == 0 {
@@ -722,17 +717,21 @@ func finalizeStateDetail(last store.Event) string {
 	return ""
 }
 
-func newestStartTs(ctx context.Context, st *store.Store, wtID int64) (int64, error) {
+// finalizeAnchor is the event that opened the worktree's newest
+// finalize — its create:queued, recorded when the detached finalize RPC
+// is accepted, or its create:start — or the zero Event when it has
+// none. Terminal events after it belong to that finalize (#224).
+func finalizeAnchor(ctx context.Context, st *store.Store, wtID int64) (store.Event, error) {
 	rows, err := st.QueryEvents(ctx, store.EventFilter{
 		WorktreeID: wtID,
-		EventTypes: []string{store.EvtWorktreeCreateStart},
+		EventTypes: []string{store.EvtWorktreeCreateQueued, store.EvtWorktreeCreateStart},
 		Limit:      1,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("read the newest finalize start of worktree #%d: %w", wtID, err)
+		return store.Event{}, fmt.Errorf("read the newest finalize start of worktree #%d: %w", wtID, err)
 	}
 	if len(rows) == 0 {
-		return 0, nil
+		return store.Event{}, nil
 	}
-	return rows[0].Ts, nil
+	return rows[0], nil
 }

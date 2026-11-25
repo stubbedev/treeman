@@ -214,7 +214,7 @@ func renderMainWorktreeConfig(repoRoot string, enabled bool) (string, []byte, er
 func requestWorktreeFinalize(ctx context.Context, repoRoot, wtPath string) error {
 	// submitPlan dispatches to the daemon when reachable, else runs the
 	// finalize tail in-process — so `main enable` works daemon-less.
-	if resp := submitPlan(ctx, finalizeRequest(repoRoot, wtPath)); resp.Kind == rpc.KindError {
+	if resp := submitPlan(ctx, rpc.Plan(false, rpc.One(finalizeTask(repoRoot, wtPath)))); resp.Kind == rpc.KindError {
 		return fmt.Errorf("finalize: %s", resp.Message)
 	}
 	return nil

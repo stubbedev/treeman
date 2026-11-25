@@ -162,6 +162,7 @@ rerun setup + prepare for a worktree (default via daemon; --local runs inline)
 |---|---|
 | `-r`, `--repo` |  |
 | `--local` | run setup + prepare in this process instead of dispatching to the daemon |
+| `-f`, `--wait`, `--foreground` | stream the daemon's live progress and block until done, exiting non-zero on failure (default: dispatch and return) |
 
 ### `treeman worktree back`
 
