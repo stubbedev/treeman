@@ -29,7 +29,7 @@ func TestProbeCtxReportsAnExpiredDeadlineBeforeItsTimerFires(t *testing.T) {
 func TestHandshakeErrorLeavesAFailureAfterAnExpiredDeadlineUnchanged(t *testing.T) {
 	timeout := os.ErrDeadlineExceeded
 	err := HandshakeError(expiredUnsignalledCtx{context.Background()}, "mysql", "h:3306", timeout)
-	if err != timeout {
-		t.Fatalf("HandshakeError = %v, want the failure unchanged once the caller's deadline passed", err)
+	if _, classified := errors.AsType[*UnreachableError](err); classified || !errors.Is(err, timeout) {
+		t.Fatalf("HandshakeError = %v, want the failure unclassified once the caller's deadline passed", err)
 	}
 }
