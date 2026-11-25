@@ -462,10 +462,7 @@ func teardownOrphan(ctx context.Context, st *State, repoPath, wtPath string) (er
 		return nil
 	}
 
-	releaseSlot, err := st.lifecycleSlots.acquire(ctx, func() {
-		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeReapQueued, st.lifecycleSlots.queuedMessage(),
-			repoID, row.ID, "", 0, queuedPayload(ctx, wtPath))
-	})
+	releaseSlot, err := st.acquireTeardownSlot(ctx, store.EvtWorktreeReapQueued, repoID, row.ID, wtPath)
 	if err != nil {
 		return err
 	}

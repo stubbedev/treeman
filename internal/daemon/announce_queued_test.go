@@ -61,7 +61,11 @@ func TestFinalizeFailingBeforeItsIdentityClosesTheQueuedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := announceQueuedFinalizes(ctx, st, [][]rpc.Task{{{Type: rpc.TaskWorktreeFinalize, RepoPath: repo, WorktreePath: wt}}}); err != nil {
+	if err := announceQueuedFinalizes(
+		ctx,
+		st,
+		[][]rpc.Task{{{Type: rpc.TaskWorktreeFinalize, RepoPath: repo, WorktreePath: wt}}},
+	); err != nil {
 		t.Fatal(err)
 	}
 	if err := FinalizeWorktree(ctx, st, repo, wt, nil, false); err == nil {

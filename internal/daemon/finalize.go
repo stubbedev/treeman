@@ -691,6 +691,34 @@ func beginFinalize(ctx context.Context, st *State, wtRoot string, claimed bool) 
 	return nil, unlessCancelled(ctx, err)
 }
 
+// preemptFinalize cancels any in-flight FinalizeWorktree of wtRoot so
+// its late-arriving prepare doesn't resurrect databases or the registry
+// row after teardown completes, then blocks until the finalize
+// goroutine has actually exited (its phase boundaries observe ctx.Err()
+// and bail) before the teardown reads state and starts dropping things.
+// The wait is generous because setup hooks can be slow (npm install,
+// composer install) and the cancel only takes effect at the next phase
+// boundary.
+func preemptFinalize(ctx context.Context, st *State, wtRoot string) {
+	if !st.CancelFinalize(wtRoot) {
+		return
+	}
+	slog.Info("teardown: cancelled in-flight finalize", "wt", wtRoot)
+	if err := st.WaitFinalizeCleared(ctx, wtRoot, 5*time.Minute); err != nil {
+		slog.Warn("teardown: finalize did not clear in time, proceeding anyway",
+			"wt", wtRoot, "err", err)
+	}
+}
+
+// acquireTeardownSlot takes a lifecycle slot for the teardown of
+// wtPath, recording queuedEvent when it has to wait for one.
+func (st *State) acquireTeardownSlot(ctx context.Context, queuedEvent string, repoID, wtID int64, wtPath string) (func(), error) {
+	return st.lifecycleSlots.acquire(ctx, func() {
+		_ = st.Store.WriteEvent(ctx, store.LevelInfo, queuedEvent, st.lifecycleSlots.queuedMessage(),
+			repoID, wtID, "", 0, queuedPayload(ctx, wtPath))
+	})
+}
+
 // reportFinalizeQueued records that the finalize of wtRoot waits for a
 // lifecycle slot, unless its worktree already reads as queued (the
 // detached finalize RPC reports it at submission).
@@ -1051,21 +1079,7 @@ func TeardownWorktree(
 	}
 	defer st.UnmarkTeardownInFlight(wtRoot)
 
-	// Preempt any in-flight FinalizeWorktree for this path so its
-	// late-arriving prepare doesn't resurrect databases or the
-	// registry row after teardown completes. Then block until the
-	// finalize goroutine has actually exited (its phase boundaries
-	// observe ctx.Err() and bail) before we read state and start
-	// dropping things. The wait is generous because setup hooks can
-	// be slow (npm install, composer install) and the cancel only
-	// takes effect at the next phase boundary.
-	if st.CancelFinalize(wtRoot) {
-		slog.Info("teardown: cancelled in-flight finalize", "wt", wtRoot)
-		if err := st.WaitFinalizeCleared(ctx, wtRoot, 5*time.Minute); err != nil {
-			slog.Warn("teardown: finalize did not clear in time, proceeding anyway",
-				"wt", wtRoot, "err", err)
-		}
-	}
+	preemptFinalize(ctx, st, wtRoot)
 
 	repoID, err := st.Store.LookupRepoID(ctx, repoRoot)
 	if err != nil {
@@ -1111,10 +1125,7 @@ func TeardownWorktree(
 	}
 	wtID := row.ID
 
-	releaseSlot, err := st.lifecycleSlots.acquire(ctx, func() {
-		_ = st.Store.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeDeleteQueued, st.lifecycleSlots.queuedMessage(),
-			repoID, wtID, "", 0, queuedPayload(ctx, wtRoot))
-	})
+	releaseSlot, err := st.acquireTeardownSlot(ctx, store.EvtWorktreeDeleteQueued, repoID, wtID, wtRoot)
 	if err != nil {
 		return err
 	}
