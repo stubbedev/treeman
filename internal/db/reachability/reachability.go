@@ -120,7 +120,7 @@ func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
 		_ = conn.Close()
 		return nil
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	if ctxErr := callerEnded(ctx); ctxErr != nil {
 		return fmt.Errorf("%s probe of %s interrupted: %w", engine, addr, ctxErr)
 	}
 	if probeCtx.Err() != nil || isTimeout(err) {
@@ -138,6 +138,19 @@ func ProbeCtx(ctx context.Context, engine, host string, port uint16) error {
 		hint = "nothing is listening there: the engine is down or still starting, check `treeman doctor`"
 	}
 	return &UnreachableError{Engine: engine, Addr: addr, Reason: Refused, Hint: hint, Err: err}
+}
+
+// callerEnded reports why ctx is over, counting a deadline that has
+// passed even before ctx's own timer marks it done: the dialer arms the
+// socket with that deadline, so its i/o timeout can arrive first.
+func callerEnded(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 // ProbeURLCtx parses a URL-style connection string and probes the
@@ -159,7 +172,7 @@ func ProbeURLCtx(ctx context.Context, engine, raw string) error {
 // (authentication, an unknown database), and any failure after ctx
 // ended, is returned unchanged.
 func HandshakeError(ctx context.Context, engine, addr string, err error, lost ...error) error {
-	if err == nil || ctx.Err() != nil {
+	if err == nil || callerEnded(ctx) != nil {
 		return err
 	}
 	var reason Reason
