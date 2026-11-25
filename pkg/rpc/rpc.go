@@ -460,6 +460,22 @@ type TaskResult struct {
 
 // ─────────────────────────── Response ───────────────────────────
 
+// Failure is the error a run_plan response reports: the daemon's error,
+// or the message of the first failed task of a plan that ran to
+// completion. Nil for a queued plan and for one whose tasks all
+// succeeded.
+func (r Response) Failure() error {
+	if r.Kind == KindError {
+		return errors.New(r.Message)
+	}
+	for _, t := range r.TaskResults {
+		if !t.OK {
+			return errors.New(t.Message)
+		}
+	}
+	return nil
+}
+
 // Response kinds. Wire shape: {"kind": "ok", ...}.
 const (
 	KindOk             = "ok"

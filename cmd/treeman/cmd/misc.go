@@ -161,13 +161,8 @@ func foregroundTask(ctx context.Context, task rpc.Task, label string) error {
 // reportInlineResult prints the outcome of an in-process plan run and
 // surfaces the first failed task as an error.
 func reportInlineResult(resp rpc.Response, label string) error {
-	if resp.Kind == rpc.KindError {
-		return fmt.Errorf("%s: %s", label, resp.Message)
-	}
-	for _, r := range resp.TaskResults {
-		if !r.OK {
-			return fmt.Errorf("%s: %s", label, r.Message)
-		}
+	if err := resp.Failure(); err != nil {
+		return fmt.Errorf("%s: %w", label, err)
 	}
 	PrintOK("%s complete", label)
 	return nil

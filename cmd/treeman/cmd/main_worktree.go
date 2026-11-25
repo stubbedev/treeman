@@ -74,12 +74,18 @@ func mainEnableAction(ctx context.Context, c *cli.Command) error {
 	// MainWorktree has run and the row exists, so FinalizeWorktree
 	// routes through the main-wt path (slug.ForMain + overlay) and
 	// fires create-* hooks with $TREEMAN_IS_MAIN=1.
-	if err := requestWorktreeFinalize(ctx, repoRoot, repoRoot); err != nil {
-		ui.Warn("daemon finalize dispatch failed: %v", err)
-		ui.Hint("run `treeman worktree finalize .` at the repo root to retry")
+	resp := submitPlan(ctx, rpc.Plan(false, rpc.One(finalizeTask(repoRoot, repoRoot))))
+	if err := resp.Failure(); err != nil {
+		return fmt.Errorf(
+			"main worktree enabled (%s), but its setup hooks + prepare failed: %w\nretry with `treeman worktree finalize .` at the repo root",
+			repoRoot, err,
+		)
+	}
+	if resp.Kind == rpc.KindPlanQueued {
+		PrintOK("main worktree enabled (%s) — setup hooks + prepare queued (see `treeman logs tail --follow`)", repoRoot)
 		return nil
 	}
-	PrintOK("main worktree enabled (%s) — setup hooks + prepare queued (see `treeman logs tail --follow`)", repoRoot)
+	PrintOK("main worktree enabled (%s) — setup hooks + prepare complete", repoRoot)
 	return nil
 }
 
@@ -203,21 +209,6 @@ func renderMainWorktreeConfig(repoRoot string, enabled bool) (string, []byte, er
 		return "", nil, err
 	}
 	return target, body, nil
-}
-
-// requestWorktreeFinalize dispatches a finalize RPC for wtPath under
-// repoRoot. Used by `main enable` to kick off create-* hooks +
-// prepare against the freshly-enrolled main row without making the
-// user manually run `treeman worktree finalize .`. The CLI captures the
-// user's env here because the daemon goroutine wouldn't otherwise
-// see PATH / nvm shims / etc.
-func requestWorktreeFinalize(ctx context.Context, repoRoot, wtPath string) error {
-	// submitPlan dispatches to the daemon when reachable, else runs the
-	// finalize tail in-process — so `main enable` works daemon-less.
-	if resp := submitPlan(ctx, rpc.Plan(false, rpc.One(finalizeTask(repoRoot, wtPath)))); resp.Kind == rpc.KindError {
-		return fmt.Errorf("finalize: %s", resp.Message)
-	}
-	return nil
 }
 
 func lookupMainStatus(ctx context.Context, repoRoot string) (store.WorktreeRow, string, error) {

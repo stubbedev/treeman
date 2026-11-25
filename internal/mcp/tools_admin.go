@@ -96,19 +96,6 @@ func submitMCPPlan(ctx context.Context, req rpc.Request) rpc.Response {
 	return resp
 }
 
-// mcpPlanErr collapses a plan response to an error — KindError, or the
-// first failed task — or nil on success.
-func mcpPlanErr(resp rpc.Response) error {
-	if resp.Kind == rpc.KindError {
-		return errors.New(resp.Message)
-	}
-	for _, r := range resp.TaskResults {
-		if !r.OK {
-			return errors.New(r.Message)
-		}
-	}
-	return nil
-}
 
 // ─── worktree_finalize ─────────────────────────────────────────────
 
@@ -138,7 +125,7 @@ func worktreeFinalizeTool(
 	if wtPath == "" {
 		wtPath = repoRoot
 	}
-	if err := mcpPlanErr(submitMCPPlan(ctx, finalizePlan(repoRoot, wtPath))); err != nil {
+	if err := submitMCPPlan(ctx, finalizePlan(repoRoot, wtPath)).Failure(); err != nil {
 		return nil, worktreeFinalizeOut{}, fmt.Errorf("finalize: %w", err)
 	}
 	writeMCPEvent(context.Background(), store.EvtMCPWorktreeFinalize, "queued finalize for "+wtPath, 0, map[string]string{
@@ -224,7 +211,7 @@ func mainWorktreeEnable(ctx context.Context, repoRoot string) (*mcpsdk.CallToolR
 	}
 	// Reload is synchronous; the main row exists by the time it returns,
 	// so finalize routes through the main-wt path and fires create-*.
-	if err := mcpPlanErr(submitMCPPlan(ctx, finalizePlan(repoRoot, repoRoot))); err != nil {
+	if err := submitMCPPlan(ctx, finalizePlan(repoRoot, repoRoot)).Failure(); err != nil {
 		out.Detail = "enabled + reloaded; finalize failed (" + err.Error() + ") — run worktree_finalize at the repo root to retry"
 		return nil, out, nil //nolint:nilerr // failure reported via out.Detail, not as a transport error
 	}

@@ -972,7 +972,7 @@ func worktreeCreateTool(
 // and parses the returned CreateResult.
 func dispatchCreatePlan(ctx context.Context, task rpc.Task) (wt.CreateResult, error) {
 	resp := submitMCPPlan(ctx, rpc.Plan(true, rpc.One(task)))
-	if err := mcpPlanErr(resp); err != nil {
+	if err := resp.Failure(); err != nil {
 		return wt.CreateResult{}, fmt.Errorf("create: %w", err)
 	}
 	if len(resp.TaskResults) == 0 {
