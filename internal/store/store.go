@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -132,7 +133,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 	dsn := fmt.Sprintf(
 		"file:%s?_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)",
-		path, busyTimeout.Milliseconds(),
+		sqliteURIPath.Replace(path), busyTimeout.Milliseconds(),
 	)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -151,6 +152,8 @@ func Open(ctx context.Context, path string) (*Store, error) {
 }
 
 const busyTimeout = 5 * time.Second
+
+var sqliteURIPath = strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23")
 
 func ensureWAL(ctx context.Context, db *sql.DB, deadline time.Time) error {
 	for {
