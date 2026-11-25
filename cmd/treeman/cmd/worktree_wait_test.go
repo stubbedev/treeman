@@ -134,3 +134,41 @@ func TestWaitIgnoresThePreviousFinalizeOnceANewOneIsQueued(t *testing.T) {
 		t.Fatalf("wait must report the queued run, not the previous run's failure: %v", err)
 	}
 }
+
+func TestWaitFailsFastWhenTheFinalizeIsDeferred(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "treeman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	repoID, _ := st.EnsureRepo(ctx, "/tmp/repo", "repo")
+	wtID, _ := st.EnsureWorktree(ctx, repoID, "/tmp/repo/wt", "slug", "feature")
+	wt := worktreeRow{ID: wtID, Slug: "slug", Branch: "feature", Path: "/tmp/repo/wt", CreatedAt: 1}
+	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtWorktreeCreateQueued, "queued", repoID, wtID, "", 0, nil)
+	_ = st.WriteEvent(
+		ctx,
+		store.LevelInfo,
+		store.EvtWorktreeCreateDeferred,
+		"finalize deferred: rebase in progress",
+		repoID,
+		wtID,
+		"",
+		0,
+		nil,
+	)
+	st.FlushEvents(ctx)
+	anchor, err := finalizeAnchor(ctx, st, wtID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	err = pollFinalize(ctx, st, wt, anchor, time.Now().Add(30*time.Second), 30*time.Second, true)
+	if err == nil || !strings.Contains(err.Error(), "rebase in progress") || !strings.Contains(err.Error(), "deferred") {
+		t.Fatalf("want a deferral error carrying the event message, got %v", err)
+	}
+	if time.Since(started) > 5*time.Second {
+		t.Errorf("a deferred finalize must end the wait at once, took %s", time.Since(started))
+	}
+}

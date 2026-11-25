@@ -95,4 +95,6 @@ is unreachable, distinct from `1` for a broken command. `treeman
 worktree finalize <name> --wait` re-runs a worktree's finalize and
 blocks until it completes; `treeman worktree wait <name>` blocks until
 the newest finalize already queued or running completes. Both exit
-non-zero if it failed. See [exit codes](cli.md#exit-codes).
+non-zero if it failed. `worktree wait` also exits non-zero at once when
+the finalize is deferred by a merge, rebase, cherry-pick or revert in
+progress, rather than waiting out its timeout. See [exit codes](cli.md#exit-codes).

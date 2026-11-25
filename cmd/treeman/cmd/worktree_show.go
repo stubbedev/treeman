@@ -476,7 +476,9 @@ func wtWait() *cli.Command {
 
 // pollFinalize polls the event log every 500ms until the worktree's
 // finalize opened by anchor (the zero Event: any) completes (success → nil),
-// fails (error event → error) or the deadline passes (timeout → error).
+// fails (error event → error), is deferred by an in-progress git
+// operation (deferred event → error, since the re-run waits on the
+// user) or the deadline passes (timeout → error).
 //
 // On a real terminal (and not --quiet) each tick re-renders one wait
 // line in place: a spinner, elapsed/timeout, and the newest prepare /
@@ -519,7 +521,7 @@ func pollFinalize(
 		}
 		rows, err := st.QueryEvents(ctx, store.EventFilter{
 			WorktreeID:  wt.ID,
-			EventTypes:  []string{store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError},
+			EventTypes:  []string{store.EvtWorktreeCreateEnd, store.EvtWorktreeCreateError, store.EvtWorktreeCreateDeferred},
 			SinceMs:     anchor.Ts,
 			AfterID:     anchor.ID,
 			OldestFirst: true,
@@ -540,6 +542,13 @@ func pollFinalize(
 			if finalizeFailed(e) {
 				finishSpinner()
 				return fmt.Errorf("finalize failed: %s", e.Message)
+			}
+			if e.EventType == store.EvtWorktreeCreateDeferred {
+				finishSpinner()
+				return fmt.Errorf(
+					"finalize deferred: %s\nit re-runs once the git operation finishes; run `treeman worktree wait %s` again then",
+					e.Message, wt.Slug,
+				)
 			}
 		}
 		if spinner {

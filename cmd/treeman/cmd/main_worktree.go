@@ -78,7 +78,8 @@ func mainEnableAction(ctx context.Context, c *cli.Command) error {
 	if err := resp.Failure(); err != nil {
 		return fmt.Errorf(
 			"main worktree enabled (%s), but its setup hooks + prepare failed: %w\nretry with `treeman worktree finalize .` at the repo root",
-			repoRoot, err,
+			repoRoot,
+			err,
 		)
 	}
 	if resp.Kind == rpc.KindPlanQueued {

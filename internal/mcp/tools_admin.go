@@ -96,7 +96,6 @@ func submitMCPPlan(ctx context.Context, req rpc.Request) rpc.Response {
 	return resp
 }
 
-
 // ─── worktree_finalize ─────────────────────────────────────────────
 
 type worktreeFinalizeIn struct {
