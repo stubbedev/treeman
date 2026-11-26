@@ -19,6 +19,11 @@ func TestRestoreKeepsTargetExistingWhileAClientRecreatesIt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
+	admin, err := dbmysql.Connect(ctx, *buildConfig().Connections.Mysql)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
 	drv, err := dbmysql.Connect(ctx, *buildConfig().Connections.Mysql)
 	if err != nil {
 		t.Fatal(err)
@@ -28,7 +33,7 @@ func TestRestoreKeepsTargetExistingWhileAClientRecreatesIt(t *testing.T) {
 	const src, tpl, target = "tm_swap_src", "tm_swap_tpl", "tm_swap_target"
 	t.Cleanup(func() {
 		for _, n := range []string{src, tpl, target} {
-			_ = drv.DropDatabase(context.Background(), n)
+			_ = admin.DropDatabase(context.Background(), n)
 		}
 	})
 	for _, q := range []string{
@@ -105,12 +110,15 @@ func TestRestoreKeepsTargetExistingWhileAClientRecreatesIt(t *testing.T) {
 		t.Fatalf("child FK references schema %q (err %v), want %q", refSchema, err, target)
 	}
 
-	left, err := drv.ListMatching(ctx, restorestage.Prefix)
+	if err := drv.Close(); err != nil {
+		t.Fatalf("close the restoring driver: %v", err)
+	}
+	left, err := admin.ListMatching(ctx, restorestage.Prefix)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(left) > 0 {
-		t.Fatalf("restore stages left behind: %v", left)
+		t.Fatalf("restore stages left behind after the driver drained its drops: %v", left)
 	}
 }
 
@@ -122,7 +130,7 @@ func TestRestoreReapsStagesOfACrashedRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = drv.Close() }()
+	t.Cleanup(func() { _ = drv.Close() })
 
 	crashed := fmt.Sprintf("_tmrs_%x_0123456789abcdef_n", time.Now().Add(-48*time.Hour).Unix())
 	live := fmt.Sprintf("_tmrs_%x_fedcba9876543210_n", time.Now().Unix())

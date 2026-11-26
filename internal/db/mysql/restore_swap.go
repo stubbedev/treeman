@@ -27,9 +27,11 @@ const (
 // build clones template's base tables into a private incoming schema;
 // swapInto then moves target's tables out and the clone's tables in
 // with one atomic RENAME TABLE, and the views and triggers are replayed
-// into target from template. Both private schemas are dropped on every
-// return path; a crashed run's leftovers are reaped by a later restore
-// once they are restorestage.MaxAge old.
+// into target from template. On every return path both private schemas
+// are handed to the driver's background drops, so the restore does not
+// wait for the DROP DATABASE of target's previous tables; Close waits
+// for them. A crashed run's leftovers, and a drop that failed, are
+// reaped by a later restore once they are restorestage.MaxAge old.
 func (d *Driver) restoreViaSwap(
 	ctx context.Context,
 	template, target string,
@@ -45,10 +47,9 @@ func (d *Driver) restoreViaSwap(
 	d.reapStaleRestoreStages(ctx, now)
 	stage := restorestage.New(now)
 	defer func() {
-		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		if derr := d.dropSchemas(dropCtx, stage.Incoming, stage.Retired); derr != nil {
-			err = errors.Join(err, fmt.Errorf("restore %s into %s: %w", template, target, derr))
+		if serr := d.drops.start(func(ctx context.Context) { d.dropRestoreStage(ctx, stage) }); serr != nil {
+			err = errors.Join(err, fmt.Errorf("restore %s into %s: drop %s and %s: %w",
+				template, target, stage.Incoming, stage.Retired, serr))
 		}
 	}()
 	if err := build(ctx, template, stage.Incoming); err != nil {
@@ -325,6 +326,17 @@ func (d *Driver) dropSchemas(ctx context.Context, names ...string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// dropRestoreStage drops both schemas of stage. It runs after the
+// restore has returned, so a failure is logged and the leftovers are
+// reaped by a later restore.
+func (d *Driver) dropRestoreStage(ctx context.Context, stage restorestage.Stage) {
+	ctx, cancel := context.WithTimeout(ctx, stageDropTimeout)
+	defer cancel()
+	if err := d.dropSchemas(ctx, stage.Incoming, stage.Retired); err != nil {
+		slog.Warn("mysql: drop restore stage", "schemas", []string{stage.Incoming, stage.Retired}, "err", err)
+	}
 }
 
 // reapStaleRestoreStages drops the restore stages a crashed run left

@@ -63,6 +63,11 @@ type Driver struct {
 	// Written once by SetPhysicalCloneMinBytes immediately after
 	// Connect, before the driver is shared with any goroutine.
 	physicalMinBytes *int64
+
+	// drops runs the DROP DATABASE of each finished restore's stage
+	// off the restore's critical path. Close drains it before closing
+	// DB. See background_drops.go.
+	drops *backgroundDrops
 }
 
 // LastCloneStrategy returns the CloneStrategy used by the most recent
@@ -127,7 +132,7 @@ func dial(ctx context.Context, cfg config.MysqlConn, addr string) (*Driver, erro
 		return nil, fmt.Errorf("ping mysql: %w",
 			reachability.HandshakeError(ctx, "mysql", addr, err, gomysql.ErrInvalidConn, driver.ErrBadConn))
 	}
-	return &Driver{DB: db, cfg: cfg}, nil
+	return &Driver{DB: db, cfg: cfg, drops: newBackgroundDrops(backgroundDropLimit)}, nil
 }
 
 // connDSN renders cfg as a go-sql-driver DSN: a unix socket when Host
@@ -155,7 +160,11 @@ func connDSN(cfg config.MysqlConn) (string, error) {
 // address after container resolution, or the unix socket path.
 func (d *Driver) Endpoint() (host string, port uint16) { return d.cfg.Host, d.cfg.Port }
 
+// Close waits for the restore stages still being dropped in the
+// background (at most dropDrainTimeout), removes the staging dirs and
+// closes the pool.
 func (d *Driver) Close() error {
+	d.drops.close(dropDrainTimeout)
 	d.removeStages()
 	return d.DB.Close()
 }
