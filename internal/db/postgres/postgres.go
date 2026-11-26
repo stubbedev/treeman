@@ -185,23 +185,37 @@ func (d *Driver) MaxConnections(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// WriteWatermark returns a sound, monotonic, PER-DATABASE write-counter
-// token: tup_inserted + tup_updated + tup_deleted from pg_stat_database
-// for `db`. The statistics collector is on by default (track_counts) and
-// these counters only increase, so an unchanged token between two calls
-// proves `db` received no row writes in between. Per-database (unlike the
-// server-wide MySQL token), so it isn't perturbed by writes to sibling
-// databases. An error or a missing row returns "" so the caller declines
-// to skip work.
+// WriteWatermark returns a token for `db` that stays equal between two
+// calls only if no row write reached `db` in between, so the caller can
+// skip a redundant capture or copy. An error or a missing row returns ""
+// so the caller declines to skip work.
+//
+// The row counters (tup_inserted + tup_updated + tup_deleted from
+// pg_stat_database; DDL counts too, as catalog rows) are per database
+// but not monotonic: pg_stat_reset() zeroes them, and crash recovery
+// or an immediate shutdown discards every statistic. The token
+// therefore also carries the database's oid (a drop and recreate gets
+// a new one), its stats_reset, and pg_stat_wal's stats_reset, which
+// every discard of the statistics sets anew. Times are epoch seconds
+// so the session's TimeZone and DateStyle cannot change the token.
 func (d *Driver) WriteWatermark(ctx context.Context, db string) (string, error) {
-	var n sql.NullInt64
-	err := d.DB.QueryRowContext(ctx,
-		`SELECT COALESCE(tup_inserted,0) + COALESCE(tup_updated,0) + COALESCE(tup_deleted,0)
-		 FROM pg_stat_database WHERE datname = $1`, db).Scan(&n)
+	var (
+		oid             int64
+		dbReset, wReset string
+		writes          int64
+	)
+	err := d.DB.QueryRowContext(ctx, `
+		SELECT d.oid,
+		       COALESCE(EXTRACT(EPOCH FROM s.stats_reset)::text, '-'),
+		       COALESCE((SELECT EXTRACT(EPOCH FROM w.stats_reset)::text FROM pg_stat_wal w), '-'),
+		       COALESCE(s.tup_inserted, 0) + COALESCE(s.tup_updated, 0) + COALESCE(s.tup_deleted, 0)
+		  FROM pg_database d
+		  JOIN pg_stat_database s ON s.datid = d.oid
+		 WHERE d.datname = $1`, db).Scan(&oid, &dbReset, &wReset, &writes)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("write watermark of %s: %w", db, err)
 	}
-	return "pg:" + strconv.FormatInt(n.Int64, 10), nil
+	return fmt.Sprintf("pg:%d:%s:%s:%d", oid, dbReset, wReset, writes), nil
 }
 
 func (d *Driver) EnsureDB(ctx context.Context, name string) error {
