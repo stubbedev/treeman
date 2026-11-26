@@ -163,3 +163,36 @@ func TestColdBuildReportsPhaseProgress(t *testing.T) {
 		)
 	}
 }
+
+// TestFileColdBuildForgetsBuiltAtRecordBeforeWriting: a file cold build
+// that fails part way leaves no record vouching for the files it
+// half-wrote, so a later run at the recorded fingerprint restores them
+// instead of trusting them (#233).
+func TestFileColdBuildForgetsBuiltAtRecordBeforeWriting(t *testing.T) {
+	ctx := context.Background()
+	w := newSQLiteWorktree(t)
+	if err := w.st.SetTemplateBuilt(ctx, w.wtID, w.source, "sqlite", "", store.TemplateBuilt{Fingerprint: "fp-before"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := RunFiltered(
+		ctx,
+		&config.Config{Databases: []config.DatabaseConfig{{
+			Engine:       "sqlite",
+			NameTemplate: "data/app_{slug}.db",
+			Migrate:      &config.Step{Run: "touch " + w.source + " && false"},
+		}}},
+		w.path,
+		w.wtSlug,
+		w.st,
+		w.repoID,
+		w.wtID,
+		nil,
+		RunOptions{},
+	)
+	if err == nil {
+		t.Fatal("prepare with a failing migrate succeeded")
+	}
+	if built, ok, err := w.st.GetTemplateBuilt(ctx, w.wtID, w.source, "sqlite", ""); err != nil || ok {
+		t.Fatalf("built-at record after a failed cold build = %+v ok=%v err=%v, want none", built, ok, err)
+	}
+}

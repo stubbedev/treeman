@@ -3776,6 +3776,9 @@ func prepareFileEngine(
 		return out, nil
 	}
 
+	if _, _, err := forgetTemplateBuilt(ctx, st, worktreeID, sourceFile, d.Engine, d.Connection); err != nil {
+		return Outcome{}, err
+	}
 	// Cold build: drop the family, seed the source file, snapshot it.
 	if err := fileColdBuildSteps(ctx, d, tplCtx, worktreePath, st, repoID, worktreeID, sourceFile, templatePath, inheritedEnv); err != nil {
 		return Outcome{}, err
