@@ -3681,6 +3681,19 @@ func prepareS3(
 	return Outcome{Engine: "s3", SourceDB: bucket}, nil
 }
 
+// resolveFileClones resolves every clone name to its file path.
+func resolveFileClones(names []string, resolve func(string) (string, error)) ([]string, error) {
+	out := make([]string, len(names))
+	for i, c := range names {
+		p, err := resolve(c)
+		if err != nil {
+			return nil, fmt.Errorf("resolve clone %s: %w", c, err)
+		}
+		out[i] = p
+	}
+	return out, nil
+}
+
 // prepareFileEngine is the file-backed family's prepare (engine
 // "sqlite" / "duckdb"). The "database" is a regular file at the
 // rendered `name_template` path (inside the worktree, or under
@@ -3752,18 +3765,6 @@ func prepareFileEngine(
 		return dbfile.CopyDatabase(tmpl, p)
 	}
 
-	resolveClones := func(names []string) ([]string, error) {
-		out := make([]string, len(names))
-		for i, c := range names {
-			p, perr := resolveFile(c)
-			if perr != nil {
-				return nil, fmt.Errorf("resolve clone %s: %w", c, perr)
-			}
-			out[i] = p
-		}
-		return out, nil
-	}
-
 	out, done, flight, err := cacheHitGeneric(ctx, fileExists, fileRestore, nil, d, tplCtx, worktreePath,
 		st, repoID, worktreeID, sourceFile, key, opts.localBudget(), started)
 	defer flight.finish()
@@ -3771,7 +3772,7 @@ func prepareFileEngine(
 		return out, err
 	}
 	if done {
-		if out.Clones, err = resolveClones(out.Clones); err != nil {
+		if out.Clones, err = resolveFileClones(out.Clones, resolveFile); err != nil {
 			return Outcome{}, err
 		}
 		return out, nil
@@ -3791,7 +3792,7 @@ func prepareFileEngine(
 	if err != nil {
 		return Outcome{}, fmt.Errorf("%s cold build: %w", d.Engine, err)
 	}
-	clones, err := resolveClones(names)
+	clones, err := resolveFileClones(names, resolveFile)
 	if err != nil {
 		return Outcome{}, err
 	}
