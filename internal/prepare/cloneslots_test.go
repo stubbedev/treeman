@@ -214,3 +214,53 @@ func TestCloneSlotsAbandonedWaiterFreesItsPlace(t *testing.T) {
 		t.Fatalf("the abandoned waiter must not keep the slot: %v", err)
 	}
 }
+
+// TestBackgroundDropsShareTheServerSlots: a driver's background stage
+// drop waits for a server slot like a clone restore, so the drops every
+// prepare leaves behind count against the server budget (#231).
+func TestBackgroundDropsShareTheServerSlots(t *testing.T) {
+	ctx := context.Background()
+	key := serverKey{family: engine.FamilyMySQL, host: "127.0.0.1", port: 3306}
+	budget := RunOptions{CloneSlots: NewCloneSlots()}.serverBudget(0, key)
+	const override = 2
+	gate := budget.dropGate(override, "mysql")
+
+	holding := make(chan struct{})
+	finish := make(chan struct{})
+	var restores sync.WaitGroup
+	for range override {
+		restores.Go(func() {
+			_ = budget.runRestore(ctx, override, "mysql", func() error {
+				holding <- struct{}{}
+				<-finish
+				return nil
+			})
+		})
+	}
+	for range override {
+		<-holding
+	}
+
+	admitted := make(chan func())
+	go func() {
+		release, err := gate(ctx)
+		if err != nil {
+			t.Errorf("drop gate: %v", err)
+			close(admitted)
+			return
+		}
+		admitted <- release
+	}()
+	select {
+	case <-admitted:
+		t.Fatal("a drop was admitted while every server slot was held by a restore")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(finish)
+	restores.Wait()
+	release, ok := <-admitted
+	if !ok {
+		return
+	}
+	release()
+}

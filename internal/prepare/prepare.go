@@ -1032,6 +1032,7 @@ func prepareMySQL(
 	version, _ := cachedProbe(ctx, "mysql-version:"+d.Connection, func() (string, error) { return drv.EngineVersion(ctx) })
 	maxConns, _ := cachedProbe(ctx, "mysql-maxconns:"+d.Connection, func() (int, error) { return drv.MaxConnections(ctx) })
 	budget := opts.serverBudget(maxConns, mysqlServerKey(drv))
+	drv.GateBackgroundDrops(budget.dropGate(d.Fanout, d.Engine))
 
 	// branch_scoped databases bypass the fingerprint template cache
 	// entirely — their content is per-branch live data swapped through

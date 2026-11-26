@@ -70,6 +70,14 @@ type Driver struct {
 	drops *backgroundDrops
 }
 
+// GateBackgroundDrops makes every background stage drop wait for gate
+// before it runs, so the drops share a budget with the restores that
+// produce them. Call it immediately after Connect, before the driver
+// restores anything or is shared with any goroutine.
+func (d *Driver) GateBackgroundDrops(gate DropGate) {
+	d.drops.gate = gate
+}
+
 // LastCloneStrategy returns the CloneStrategy used by the most recent
 // SnapshotCreate call on this driver. "" before any call. Used by the
 // prepare layer to emit a snapshot_clone_strategy event so users can

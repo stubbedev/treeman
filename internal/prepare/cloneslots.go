@@ -224,8 +224,7 @@ func (o RunOptions) localBudget() fanoutBudget {
 // limit is the fan-out limit the database would get with unlimited
 // clones, so a single prepare is never throttled below its own limit.
 func (b fanoutBudget) runRestore(ctx context.Context, override uint32, eng string, restore func() error) error {
-	serverLimit, _ := fanOutLimit(override, b.maxConns, math.MaxInt, eng)
-	if err := b.server.acquire(ctx, serverLimit, b.progress); err != nil {
+	if err := b.server.acquire(ctx, b.serverLimit(override, eng), b.progress); err != nil {
 		return err
 	}
 	defer func() {
@@ -233,4 +232,24 @@ func (b fanoutBudget) runRestore(ctx context.Context, override uint32, eng strin
 		b.progress.report(CloneFinished)
 	}()
 	return restore()
+}
+
+// serverLimit is how many restores may run on the server at once: the
+// fan-out limit the database would get with unlimited clones.
+func (b fanoutBudget) serverLimit(override uint32, eng string) int {
+	limit, _ := fanOutLimit(override, b.maxConns, math.MaxInt, eng)
+	return limit
+}
+
+// dropGate admits a driver's background stage drop through the same
+// server slots as the clone restores, so the drops every prepare leaves
+// behind count against the server's connection budget instead of
+// running beside it. Without slots it admits at once.
+func (b fanoutBudget) dropGate(override uint32, eng string) dbmysql.DropGate {
+	return func(ctx context.Context) (func(), error) {
+		if err := b.server.acquire(ctx, b.serverLimit(override, eng), nil); err != nil {
+			return nil, fmt.Errorf("admit a background stage drop: %w", err)
+		}
+		return b.server.release, nil
+	}
 }
