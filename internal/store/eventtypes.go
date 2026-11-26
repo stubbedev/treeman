@@ -39,6 +39,7 @@ const (
 	EvtPrepareSkip                = "prepare:skip"
 	EvtPrepareIncrementalStart    = "prepare:incremental:start"
 	EvtPrepareIncrementalFallback = "prepare:incremental:fallback"
+	EvtPrepareIncrementalTarget   = "prepare:incremental:target"
 	EvtPrepareDumpOnlyStart       = "prepare:dumponly:start"
 	EvtPrepareDumpOnlyFallback    = "prepare:dumponly:fallback"
 	EvtPrepareRollbackStart       = "prepare:rollback:start"

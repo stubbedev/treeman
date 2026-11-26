@@ -51,6 +51,7 @@ that emits it.
 | `prepare:skip` | `store.EvtPrepareSkip` |
 | `prepare:incremental:start` | `store.EvtPrepareIncrementalStart` |
 | `prepare:incremental:fallback` | `store.EvtPrepareIncrementalFallback` |
+| `prepare:incremental:target` | `store.EvtPrepareIncrementalTarget` |
 | `prepare:dumponly:start` | `store.EvtPrepareDumpOnlyStart` |
 | `prepare:dumponly:fallback` | `store.EvtPrepareDumpOnlyFallback` |
 | `prepare:rollback:start` | `store.EvtPrepareRollbackStart` |

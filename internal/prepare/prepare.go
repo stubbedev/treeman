@@ -274,6 +274,11 @@ type Outcome struct {
 	// build from an incremental build that ran migrate-only on top of
 	// a cached ancestor.
 	IncrementalBase string
+	// watermarks maps each template-path target this run populated (the
+	// source and every test clone) to the engine write watermark read
+	// right after the build; Run records them with the fingerprint so the
+	// next incremental build can migrate an untouched target in place.
+	watermarks map[string]string
 }
 
 // emitPrepareSkipped writes the `prepare:skip` info event used by
@@ -642,14 +647,8 @@ func cacheHitRestoreAndFanout(
 	budget fanoutBudget,
 	fingerprint string,
 ) (templateGone bool, err error) {
-	targets := make([]string, 0, len(clones)+1)
-	targets = append(targets, source)
-	for _, c := range clones {
-		if c != source {
-			targets = append(targets, c)
-		}
-	}
-	fanoutErr := fanOutClones(ctx, st, repoID, worktreeID, restore, template, targets, d.Engine, d.Fanout, budget)
+	fanoutErr := fanOutClones(ctx, st, repoID, worktreeID, restore, template, templateTargets(source, clones),
+		d.Engine, d.Fanout, budget)
 	if fanoutErr == nil {
 		return false, nil
 	}
@@ -795,7 +794,8 @@ func RunFiltered(
 		g.Go(func() error {
 			o, err := prepareOneEngine(ctx, cfg, d, i, tplCtx, worktreePath, st, repoID, worktreeID, inheritedEnv, opts)
 			if err == nil && !o.CacheHit && o.Fingerprint != "" && o.SourceDB != "" {
-				err = recordTemplateBuilt(ctx, st, worktreeID, o.SourceDB, d.Engine, d.Connection, o.Fingerprint)
+				err = recordTemplateBuilt(ctx, st, worktreeID, o.SourceDB, d.Engine, d.Connection,
+					store.TemplateBuilt{Fingerprint: o.Fingerprint, Watermarks: o.watermarks})
 			}
 			if err == nil {
 				results[i] = o
@@ -1079,6 +1079,7 @@ func prepareMySQL(
 		ctx,
 		drv.DatabaseExists,
 		restore,
+		drv.WriteWatermark,
 		d,
 		tplCtx,
 		worktreePath,
@@ -1107,6 +1108,7 @@ func prepareMySQL(
 		cloneStrategy:         func() string { return string(drv.LastCloneStrategy()) },
 		mergeFanout:           drv.PreferLogicalFor,
 		appliedBatches:        drv.AppliedBatches,
+		watermark:             drv.WriteWatermark,
 	}
 	dumpKey := dumpOnlySnapshotKey(d.Engine, d.Connection, version, key.DumpHashHex)
 
@@ -1188,7 +1190,7 @@ func prepareMySQL(
 	if err != nil {
 		return Outcome{}, err
 	}
-	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+	clones, watermarks, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
 		sourceDB, templateName, version, budget, key, inputs, ledger, ops)
 	if err != nil {
 		return Outcome{}, err
@@ -1212,6 +1214,7 @@ func prepareMySQL(
 		Fingerprint:  key.Fingerprint(),
 		CacheHit:     false,
 		Clones:       clones,
+		watermarks:   watermarks,
 	}, nil
 }
 
@@ -1236,6 +1239,7 @@ func cacheHitGeneric(
 	ctx context.Context,
 	exists func(context.Context, string) (bool, error),
 	restore func(context.Context, string, string) error,
+	watermark watermarker,
 	d config.DatabaseConfig,
 	tplCtx template.Context,
 	worktreePath string,
@@ -1329,6 +1333,9 @@ func cacheHitGeneric(
 	// between the existence probe and the restore/fanout), rebuild it
 	// under a build flight so sibling worktrees wait for the rebuild
 	// instead of racing their own.
+	if _, _, err := forgetTemplateBuilt(ctx, st, worktreeID, sourceDB, d.Engine, d.Connection); err != nil {
+		return Outcome{}, false, buildFlight{}, err
+	}
 	templateGone, err := cacheHitRestoreAndFanout(ctx, st, repoID, worktreeID, exists, restore,
 		d, rec.TemplateName, sourceDB, clones, budget, key.Fingerprint())
 	if err != nil {
@@ -1337,7 +1344,10 @@ func cacheHitGeneric(
 	if templateGone {
 		return Outcome{}, false, beginBuild(d.Engine, key.Fingerprint()), nil
 	}
-	if err := recordTemplateBuilt(ctx, st, worktreeID, sourceDB, d.Engine, d.Connection, key.Fingerprint()); err != nil {
+	if err := recordTemplateBuilt(ctx, st, worktreeID, sourceDB, d.Engine, d.Connection, store.TemplateBuilt{
+		Fingerprint: key.Fingerprint(),
+		Watermarks:  targetWatermarks(ctx, watermark, templateTargets(sourceDB, clones)),
+	}); err != nil {
 		return Outcome{}, false, buildFlight{}, err
 	}
 	ms := time.Since(started).Milliseconds()
@@ -1375,21 +1385,14 @@ func templateBuiltTargets(
 	clones []string,
 	fingerprint string,
 ) (bool, error) {
-	builtFP, ok, err := st.GetTemplateBuilt(ctx, worktreeID, sourceDB, engine, connection)
+	built, ok, err := st.GetTemplateBuilt(ctx, worktreeID, sourceDB, engine, connection)
 	if err != nil {
 		return false, fmt.Errorf("read the built-at fingerprint of %s %s: %w", engine, sourceDB, err)
 	}
-	if !ok || builtFP != fingerprint {
+	if !ok || built.Fingerprint != fingerprint {
 		return false, nil
 	}
-	targets := make([]string, 0, len(clones)+1)
-	targets = append(targets, sourceDB)
-	for _, c := range clones {
-		if c != sourceDB {
-			targets = append(targets, c)
-		}
-	}
-	for _, t := range targets {
+	for _, t := range templateTargets(sourceDB, clones) {
 		present, err := exists(ctx, t)
 		if err != nil {
 			return false, fmt.Errorf("probe %s %s: %w", engine, t, err)
@@ -1449,11 +1452,65 @@ func liveSnapshot(
 	return false, nil
 }
 
-func recordTemplateBuilt(ctx context.Context, st *store.Store, worktreeID int64, sourceDB, engine, connection, fingerprint string) error {
-	if err := st.SetTemplateBuilt(ctx, worktreeID, sourceDB, engine, connection, fingerprint); err != nil {
-		return fmt.Errorf("record that %s %s was built at %s: %w", engine, sourceDB, fingerprint, err)
+func recordTemplateBuilt(
+	ctx context.Context,
+	st *store.Store,
+	worktreeID int64,
+	sourceDB, engine, connection string,
+	built store.TemplateBuilt,
+) error {
+	if err := st.SetTemplateBuilt(ctx, worktreeID, sourceDB, engine, connection, built); err != nil {
+		return fmt.Errorf("record that %s %s was built at %s: %w", engine, sourceDB, built.Fingerprint, err)
 	}
 	return nil
+}
+
+// forgetTemplateBuilt deletes what sourceDB's targets were recorded as
+// built with, before a build writes to any of them: a build that fails
+// part way must not leave a record vouching for targets it half-wrote.
+// It returns the deleted record, ok=false when there was none.
+func forgetTemplateBuilt(
+	ctx context.Context,
+	st *store.Store,
+	worktreeID int64,
+	sourceDB, engine, connection string,
+) (store.TemplateBuilt, bool, error) {
+	built, ok, err := st.TakeTemplateBuilt(ctx, worktreeID, sourceDB, engine, connection)
+	if err != nil {
+		return store.TemplateBuilt{}, false, fmt.Errorf("forget what %s %s was built at: %w", engine, sourceDB, err)
+	}
+	return built, ok, nil
+}
+
+// templateTargets lists the namespaces a template build populates: the
+// source first, then every test clone that is not the source itself.
+func templateTargets(source string, clones []string) []string {
+	targets := make([]string, 0, len(clones)+1)
+	targets = append(targets, source)
+	for _, c := range clones {
+		if c != source {
+			targets = append(targets, c)
+		}
+	}
+	return targets
+}
+
+// targetWatermarks reads the write watermark of every target once the
+// build has finished writing to them; nil when the engine has none. A
+// target whose probe fails or reads "" is left out, which only means
+// the next incremental build re-copies it instead of migrating it in
+// place.
+func targetWatermarks(ctx context.Context, watermark watermarker, targets []string) map[string]string {
+	if watermark == nil {
+		return nil
+	}
+	out := make(map[string]string, len(targets))
+	for _, t := range targets {
+		if w, err := watermark(ctx, t); err == nil && w != "" {
+			out[t] = w
+		}
+	}
+	return out
 }
 
 // runPhase runs one cold-build runner phase (migrate or seed) against
@@ -1723,7 +1780,16 @@ type incrementalOps struct {
 	// appliedBatches reads a framework's batch ledger table from a
 	// database; nil for engines that hold no such table.
 	appliedBatches batchReader
+	// watermark reads a namespace's write watermark (see
+	// nsDriver.Watermark); nil for engines without a sound
+	// per-namespace write counter, whose targets are always re-copied.
+	watermark watermarker
 }
+
+// watermarker returns a sound, monotonic write-counter token for a
+// namespace: an unchanged token proves nothing wrote to it in between.
+// "" means the engine has no sound signal for it.
+type watermarker func(ctx context.Context, ns string) (string, error)
 
 // batchReader reads framework batch table t from database db: the batch
 // of every migration it records, keyed by name; found is false when db
@@ -1782,12 +1848,26 @@ func builtLedger(
 // path. (Outcome{}, false, nil) means "no incremental possible, do the
 // full cold build."
 //
-// Generic across all five engines: takes engine-specific primitives
-// (exists / snapshotRestore / snapshotCreate) in an `incrementalOps`
-// struct so the orchestration is written once.
+// A target (the source or a test clone) that this worktree's previous
+// build left at exactly the ancestor's fingerprint, and that provably
+// has not been written to since (see unprovenTargets), is migrated
+// forward in place instead of being re-copied: the source skips the
+// ancestor restore, and such a clone runs migrate against itself in
+// parallel with its peers. Only the template is still copied from the
+// migrated source, plus every clone that could not be proven or whose
+// in-place migrate failed. A `prepare:incremental:target` event says
+// which way each target went and why.
 //
-// Contract mirrors the cache-hit fallbacks: any error inside is
-// converted into a fall-through so the cold-build path can still
+// It is the first build step after a cache miss, so it forgets the
+// worktree's built-at record before anything writes to a target, even
+// when it then finds no ancestor and a later path builds instead.
+//
+// Generic across all five engines: takes engine-specific primitives
+// (exists / snapshotRestore / snapshotCreate / watermark) in an
+// `incrementalOps` struct so the orchestration is written once.
+//
+// Contract mirrors the cache-hit fallbacks: a failed ancestor restore
+// is converted into a fall-through so the cold-build path can still
 // recover. The `prepare_incremental_start` /
 // `prepare_incremental_fallback` events surface why the path was taken
 // or abandoned.
@@ -1809,6 +1889,10 @@ func tryIncrementalBuild(
 	started time.Time,
 	ops incrementalOps,
 ) (Outcome, bool, error) {
+	prior, hasPrior, err := forgetTemplateBuilt(ctx, st, worktreeID, source, d.Engine, d.Connection)
+	if err != nil {
+		return Outcome{}, false, err
+	}
 	commandsHash := key.LockfileHashes[store.CommandsHashKey]
 	anc, err := st.FindAncestorSnapshot(ctx, repoID, d.Engine, version, key.DumpHashHex, commandsHash, inputs)
 	if err != nil {
@@ -1826,6 +1910,13 @@ func tryIncrementalBuild(
 		return Outcome{}, false, err
 	}
 
+	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
+	if err != nil {
+		return Outcome{}, false, err
+	}
+	targets := templateTargets(source, clones)
+	unproven := unprovenTargets(ctx, ops, prior, hasPrior, anc.Fingerprint, targets)
+
 	delta := vectorDelta(anc.Inputs, inputs)
 	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareIncrementalStart,
 		fmt.Sprintf("engine=%s ancestor=%s files_added=%d", d.Engine, anc.TemplateName, delta),
@@ -1838,53 +1929,43 @@ func tryIncrementalBuild(
 			"ancestor_fingerprint": anc.Fingerprint,
 			"files_added":          strconv.Itoa(delta),
 		})
-
-	// Restore ancestor template → source. SnapshotRestore drops the
-	// target first, so any stale source contents are cleared.
-	restoreStart := time.Now()
-	if err := ops.snapshotRestore(ctx, anc.TemplateName, source); err != nil {
-		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtPrepareIncrementalFallback,
-			fmt.Sprintf("ancestor restore failed: %v", err),
-			repoID, worktreeID, "", 0, map[string]string{
-				"engine":               d.Engine,
-				"ancestor_template":    anc.TemplateName,
-				"ancestor_fingerprint": anc.Fingerprint,
-				"error":                err.Error(),
-			})
-		return Outcome{}, false, nil
-	}
-	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "incremental-restore", restoreStart)
-
-	if d.Migrate != nil {
-		progress.Report(ctx)
-		migrateStart := time.Now()
-		spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, d.Engine, "migrate", source))
-		out, err := runner.Run(ctx, spec, worktreePath, source, tplCtx, inheritedEnv)
-		if err != nil {
-			return Outcome{}, false, fmt.Errorf("incremental migrate %s: %w", source, err)
-		}
-		if out.ExitCode != 0 {
-			emitRunnerError(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", out)
-			return Outcome{}, false, &runner.StepError{Label: "incremental migrate", Target: source, Outcome: out}
-		}
-		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", migrateStart)
+	for _, t := range targets {
+		emitIncrementalTarget(ctx, st, repoID, worktreeID, d.Engine, t, store.LevelInfo, unproven[t])
 	}
 
-	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
-		source, templateName, version, budget, key, inputs, anc.Ledger.Advance(inputs), ops)
+	if _, dirty := unproven[source]; dirty {
+		if !restoreAncestorSource(ctx, st, repoID, worktreeID, d.Engine, anc, source, ops) {
+			return Outcome{}, false, nil
+		}
+	}
+	if err := migrateIncrementalSource(ctx, st, repoID, worktreeID, d, tplCtx, worktreePath, source,
+		inheritedEnv); err != nil {
+		return Outcome{}, false, err
+	}
+
+	inPlace := clonesWhere(clones, func(c string) bool { _, dirty := unproven[c]; return !dirty })
+	failed, err := migrateInPlace(ctx, st, repoID, worktreeID, d, tplCtx, worktreePath, source,
+		inheritedEnv, budget, inPlace)
 	if err != nil {
 		return Outcome{}, false, fmt.Errorf("incremental build: %w", err)
 	}
+	rebuild := clonesWhere(clones, func(c string) bool { _, dirty := unproven[c]; return dirty || failed[c] })
+	if err := buildTemplateAndClones(ctx, cfg, d, st, repoID, worktreeID, source, templateName, version,
+		budget, key, inputs, anc.Ledger.Advance(inputs), ops, rebuild); err != nil {
+		return Outcome{}, false, fmt.Errorf("incremental build: %w", err)
+	}
+	watermarks := targetWatermarks(ctx, ops.watermark, targets)
 
 	ms := time.Since(started).Milliseconds()
 	_ = st.WriteEvent(ctx, store.LevelInfo, store.EvtPrepareEnd,
-		fmt.Sprintf("incremental clones=%d duration=%dms ancestor=%s files_added=%d",
-			len(clones), ms, anc.TemplateName, delta),
+		fmt.Sprintf("incremental clones=%d in_place=%d duration=%dms ancestor=%s files_added=%d",
+			len(clones), len(inPlace)-len(failed), ms, anc.TemplateName, delta),
 		repoID, worktreeID, "", 0, map[string]string{
 			"engine":               d.Engine,
 			"source_db":            source,
 			"template":             templateName,
 			"clones":               strconv.Itoa(len(clones)),
+			"clones_in_place":      strconv.Itoa(len(inPlace) - len(failed)),
 			"fingerprint":          key.Fingerprint(),
 			"cache_hit":            "false",
 			"incremental":          "true",
@@ -1901,7 +1982,220 @@ func tryIncrementalBuild(
 		CacheHit:        false,
 		Clones:          clones,
 		IncrementalBase: anc.Fingerprint,
+		watermarks:      watermarks,
 	}, true, nil
+}
+
+// restoreAncestorSource restores the ancestor template into source.
+// SnapshotRestore drops the target first, so any stale source contents
+// are cleared. A failed restore is reported as an incremental fallback
+// and returns false, so the caller falls through to a cold build.
+func restoreAncestorSource(
+	ctx context.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+	engine string,
+	anc *store.SnapshotRecord,
+	source string,
+	ops incrementalOps,
+) bool {
+	restoreStart := time.Now()
+	if err := ops.snapshotRestore(ctx, anc.TemplateName, source); err != nil {
+		_ = st.WriteEvent(ctx, store.LevelWarn, store.EvtPrepareIncrementalFallback,
+			fmt.Sprintf("ancestor restore failed: %v", err),
+			repoID, worktreeID, "", 0, map[string]string{
+				"engine":               engine,
+				"ancestor_template":    anc.TemplateName,
+				"ancestor_fingerprint": anc.Fingerprint,
+				"error":                err.Error(),
+			})
+		return false
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, engine, source, "incremental-restore", restoreStart)
+	return true
+}
+
+// migrateIncrementalSource runs the migrate step against source, which
+// holds the ancestor's state; a no-op when d has no migrate step.
+func migrateIncrementalSource(
+	ctx context.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath, source string,
+	inheritedEnv map[string]string,
+) error {
+	if d.Migrate == nil {
+		return nil
+	}
+	progress.Report(ctx)
+	migrateStart := time.Now()
+	spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, d.Engine, "migrate", source))
+	out, err := runner.Run(ctx, spec, worktreePath, source, tplCtx, inheritedEnv)
+	if err != nil {
+		return fmt.Errorf("incremental migrate %s: %w", source, err)
+	}
+	if out.ExitCode != 0 {
+		emitRunnerError(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", out)
+		return &runner.StepError{Label: "incremental migrate", Target: source, Outcome: out}
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "migrate", migrateStart)
+	return nil
+}
+
+// clonesWhere returns the clones keep accepts, in order.
+func clonesWhere(clones []string, keep func(string) bool) []string {
+	out := make([]string, 0, len(clones))
+	for _, c := range clones {
+		if keep(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// unprovenTargets returns, for every target that cannot be migrated
+// forward in place from the ancestor at fingerprint, why not; a target
+// absent from the result can. A target can when this worktree's previous
+// build (prior) left it at fingerprint, it still exists, and its write
+// watermark still reads what was recorded right after that build. Every
+// target is probed before the build writes to any of them, so a
+// server-wide watermark is not moved by this build's own writes.
+func unprovenTargets(
+	ctx context.Context,
+	ops incrementalOps,
+	prior store.TemplateBuilt,
+	hasPrior bool,
+	fingerprint string,
+	targets []string,
+) map[string]string {
+	every := func(reason string) map[string]string {
+		out := make(map[string]string, len(targets))
+		for _, t := range targets {
+			out[t] = reason
+		}
+		return out
+	}
+	switch {
+	case ops.watermark == nil:
+		return every("the engine has no write watermark")
+	case !hasPrior:
+		return every("no record of the build that last populated it")
+	case prior.Fingerprint != fingerprint:
+		return every("last built at " + prior.Fingerprint + ", not at the ancestor")
+	}
+	out := make(map[string]string, len(targets))
+	for _, t := range targets {
+		if reason := targetUnproven(ctx, ops, t, prior.Watermarks[t]); reason != "" {
+			out[t] = reason
+		}
+	}
+	return out
+}
+
+// targetUnproven says why target cannot be shown untouched since its
+// watermark read recorded, "" when it can.
+func targetUnproven(ctx context.Context, ops incrementalOps, target, recorded string) string {
+	if recorded == "" {
+		return "no write watermark was recorded at its build"
+	}
+	present, err := ops.exists(ctx, target)
+	if err != nil {
+		return fmt.Sprintf("probe whether it exists: %v", err)
+	}
+	if !present {
+		return "it no longer exists"
+	}
+	current, err := ops.watermark(ctx, target)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("read its write watermark: %v", err)
+	case current == "":
+		return "the engine has no write watermark for it now"
+	case current != recorded:
+		return "written to since its build"
+	}
+	return ""
+}
+
+// migrateInPlace runs migrate against every clone in parallel, bounded
+// like a clone fan-out, and returns the clones whose migrate failed: the
+// caller re-copies those from the new template, which overwrites
+// whatever a failed migrate left behind. The error is only ever the
+// run's own cancellation.
+func migrateInPlace(
+	ctx context.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+	d config.DatabaseConfig,
+	tplCtx template.Context,
+	worktreePath, source string,
+	inheritedEnv map[string]string,
+	budget fanoutBudget,
+	clones []string,
+) (map[string]bool, error) {
+	if d.Migrate == nil || len(clones) == 0 {
+		return nil, nil
+	}
+	start := time.Now()
+	limit, _ := fanOutLimit(d.Fanout, budget.maxConns, len(clones), d.Engine)
+	var (
+		mu     sync.Mutex
+		failed = make(map[string]bool, len(clones))
+		g      errgroup.Group
+	)
+	g.SetLimit(limit)
+	for _, c := range clones {
+		g.Go(func() error {
+			err := budget.runRestore(ctx, d.Fanout, d.Engine, func() error {
+				spec := runner.FromMigrate(*d.Migrate).WithLogPath(runnerLogPath(worktreePath, d.Engine, "migrate", c))
+				out, err := runner.Run(ctx, spec, worktreePath, c, tplCtx, inheritedEnv)
+				return stepFailure("in-place migrate", c, out, err)
+			})
+			if err == nil {
+				return nil
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("in-place migrate %s: %w", c, ctxErr)
+			}
+			mu.Lock()
+			failed[c] = true
+			mu.Unlock()
+			emitIncrementalTarget(ctx, st, repoID, worktreeID, d.Engine, c, store.LevelWarn, err.Error())
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "clones-migrate", start)
+	return failed, nil
+}
+
+// emitIncrementalTarget records which way an incremental build takes
+// target: migrated forward in place (reason "") or re-copied, and why.
+func emitIncrementalTarget(
+	ctx context.Context,
+	st *store.Store,
+	repoID, worktreeID int64,
+	engine, target, level, reason string,
+) {
+	path := "in-place"
+	if reason != "" {
+		path = "restore"
+	}
+	msg := fmt.Sprintf("%s/%s path=%s", engine, target, path)
+	if reason != "" {
+		msg += " reason=" + reason
+	}
+	_ = st.WriteEvent(ctx, level, store.EvtPrepareIncrementalTarget, msg,
+		repoID, worktreeID, "", 0, map[string]string{
+			"engine": engine,
+			"db":     target,
+			"path":   path,
+			"reason": reason,
+		})
 }
 
 // vectorDelta sums the per-input file count by which the current input
@@ -1978,7 +2272,9 @@ func seedDumpOnlyTemplate(
 // row with the given applied ledger, fire LRU eviction, then fan out
 // the test clones. When ops.mergeFanout picks it, the template is
 // created in the same wave as the clones, all straight from the source,
-// and recorded once that wave has succeeded.
+// and recorded once that wave has succeeded. It returns the test clones
+// and the watermark of every target read once nothing writes to them
+// any more (see targetWatermarks).
 func snapshotRecordFanout(
 	ctx context.Context,
 	cfg *config.Config,
@@ -1993,11 +2289,34 @@ func snapshotRecordFanout(
 	inputs map[string]store.InputVector,
 	ledger *store.AppliedLedger,
 	ops incrementalOps,
-) ([]string, error) {
+) ([]string, map[string]string, error) {
 	clones, err := resolveCloneNames(d.TestClones, tplCtx, worktreePath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	if err := buildTemplateAndClones(ctx, cfg, d, st, repoID, worktreeID, source, templateName, version,
+		budget, key, inputs, ledger, ops, clones); err != nil {
+		return nil, nil, err
+	}
+	return clones, targetWatermarks(ctx, ops.watermark, templateTargets(source, clones)), nil
+}
+
+// buildTemplateAndClones creates the template from the populated source,
+// records it and fans it out to clones (see snapshotRecordFanout).
+func buildTemplateAndClones(
+	ctx context.Context,
+	cfg *config.Config,
+	d config.DatabaseConfig,
+	st *store.Store,
+	repoID, worktreeID int64,
+	source, templateName, version string,
+	budget fanoutBudget,
+	key snapshot.Key,
+	inputs map[string]store.InputVector,
+	ledger *store.AppliedLedger,
+	ops incrementalOps,
+	clones []string,
+) error {
 	record := func(snapStart time.Time) error {
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "snapshot-create", snapStart)
 		if ops.cloneStrategy != nil {
@@ -2019,29 +2338,23 @@ func snapshotRecordFanout(
 			targets:  append([]string{templateName}, clones...),
 		}
 		if err := fanOutWave(ctx, st, repoID, worktreeID, wave, d.Engine, d.Fanout, budget); err != nil {
-			return nil, err
+			return err
 		}
-		if err := record(snapStart); err != nil {
-			return nil, err
-		}
-		return clones, nil
+		return record(snapStart)
 	}
 
 	if err := ops.snapshotCreate(ctx, source, templateName); err != nil {
-		return nil, fmt.Errorf("snapshot create %s → %s: %w", source, templateName, err)
+		return fmt.Errorf("snapshot create %s → %s: %w", source, templateName, err)
 	}
 	if err := record(snapStart); err != nil {
-		return nil, err
+		return err
 	}
 	fanoutRestore := ops.snapshotRestore
 	if ops.snapshotRestoreFanout != nil {
 		fanoutRestore = ops.snapshotRestoreFanout
 	}
-	if err := fanOutClones(ctx, st, repoID, worktreeID, fanoutRestore, templateName,
-		clones, d.Engine, d.Fanout, budget); err != nil {
-		return nil, err
-	}
-	return clones, nil
+	return fanOutClones(ctx, st, repoID, worktreeID, fanoutRestore, templateName,
+		clones, d.Engine, d.Fanout, budget)
 }
 
 // tryDumpOnlyBuild rebuilds from the post-dump intermediate template
@@ -2121,7 +2434,7 @@ func tryDumpOnlyBuild(
 	if err != nil {
 		return Outcome{}, false, err
 	}
-	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st,
+	clones, watermarks, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, source, templateName, version, budget, key, inputs, ledger, ops)
 	if err != nil {
 		return Outcome{}, false, err
@@ -2139,7 +2452,7 @@ func tryDumpOnlyBuild(
 	return Outcome{
 		Engine: d.Engine, SourceDB: source, TemplateName: templateName,
 		Fingerprint: key.Fingerprint(), CacheHit: false, Clones: clones,
-		IncrementalBase: anc.Fingerprint,
+		IncrementalBase: anc.Fingerprint, watermarks: watermarks,
 	}, true, nil
 }
 
@@ -2268,7 +2581,7 @@ func tryRollbackIncrementalBuild(
 		emitPhaseDone(ctx, st, repoID, worktreeID, d.Engine, source, "seed", sdStart)
 	}
 
-	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st,
+	clones, watermarks, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st,
 		repoID, worktreeID, source, templateName, version, budget, key, inputs, plan.Kept.Advance(inputs), ops)
 	if err != nil {
 		return Outcome{}, false, err
@@ -2288,7 +2601,7 @@ func tryRollbackIncrementalBuild(
 	return Outcome{
 		Engine: d.Engine, SourceDB: source, TemplateName: templateName,
 		Fingerprint: key.Fingerprint(), CacheHit: false, Clones: clones,
-		IncrementalBase: anc.Fingerprint,
+		IncrementalBase: anc.Fingerprint, watermarks: watermarks,
 	}, true, nil
 }
 
@@ -2383,6 +2696,7 @@ func preparePostgres(
 		ctx,
 		drv.DatabaseExists,
 		restore,
+		drv.WriteWatermark,
 		d,
 		tplCtx,
 		worktreePath,
@@ -2408,6 +2722,7 @@ func preparePostgres(
 		snapshotRestore: drv.SnapshotRestore,
 		snapshotCreate:  drv.SnapshotCreate,
 		appliedBatches:  drv.AppliedBatches,
+		watermark:       drv.WriteWatermark,
 	}
 	dumpKey := dumpOnlySnapshotKey(d.Engine, d.Connection, version, key.DumpHashHex)
 
@@ -2453,7 +2768,7 @@ func preparePostgres(
 	if err != nil {
 		return Outcome{}, err
 	}
-	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+	clones, watermarks, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
 		sourceDB, templateName, version, budget, key, inputs, ledger, ops)
 	if err != nil {
 		return Outcome{}, err
@@ -2472,6 +2787,7 @@ func preparePostgres(
 	return Outcome{
 		Engine: d.Engine, SourceDB: sourceDB, TemplateName: templateName,
 		Fingerprint: key.Fingerprint(), CacheHit: false, Clones: clones,
+		watermarks: watermarks,
 	}, nil
 }
 
@@ -2656,6 +2972,7 @@ func prepareMongo(
 		ctx,
 		drv.DatabaseExists,
 		drv.SnapshotRestore,
+		nil,
 		d,
 		tplCtx,
 		worktreePath,
@@ -2695,7 +3012,7 @@ func prepareMongo(
 	); err != nil {
 		return Outcome{}, err
 	}
-	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+	clones, watermarks, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
 		sourceDB, templateName, version, opts.localBudget(), key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("mongo cold build: %w", err)
@@ -2719,6 +3036,7 @@ func prepareMongo(
 		Fingerprint:  key.Fingerprint(),
 		CacheHit:     false,
 		Clones:       clones,
+		watermarks:   watermarks,
 	}, nil
 }
 
@@ -2935,6 +3253,7 @@ func prepareRedisPrefix(
 		ctx,
 		drv.PrefixExists,
 		rdRestore,
+		nil,
 		d,
 		tplCtx,
 		worktreePath,
@@ -2963,7 +3282,7 @@ func prepareRedisPrefix(
 	if err := redisColdBuildSteps(ctx, drv, rc, d, tplCtx, worktreePath, st, repoID, worktreeID, sourcePrefix, inheritedEnv); err != nil {
 		return Outcome{}, err
 	}
-	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+	clones, watermarks, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
 		sourcePrefix, templatePrefix, version, opts.localBudget(), key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("redis cold build: %w", err)
@@ -2987,6 +3306,7 @@ func prepareRedisPrefix(
 		Fingerprint:  key.Fingerprint(),
 		CacheHit:     false,
 		Clones:       clones,
+		watermarks:   watermarks,
 	}, nil
 }
 
@@ -3203,6 +3523,7 @@ func prepareES(
 		ctx,
 		esTemplateExists,
 		esRestore,
+		nil,
 		d,
 		tplCtx,
 		worktreePath,
@@ -3242,7 +3563,7 @@ func prepareES(
 	); err != nil {
 		return Outcome{}, err
 	}
-	clones, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+	clones, watermarks, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
 		sourcePrefix, templatePrefix, version, opts.localBudget(), key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("elasticsearch cold build: %w", err)
@@ -3266,6 +3587,7 @@ func prepareES(
 		Fingerprint:  key.Fingerprint(),
 		CacheHit:     false,
 		Clones:       clones,
+		watermarks:   watermarks,
 	}, nil
 }
 
@@ -3441,7 +3763,7 @@ func prepareFileEngine(
 		return out, nil
 	}
 
-	out, done, flight, err := cacheHitGeneric(ctx, fileExists, fileRestore, d, tplCtx, worktreePath,
+	out, done, flight, err := cacheHitGeneric(ctx, fileExists, fileRestore, nil, d, tplCtx, worktreePath,
 		st, repoID, worktreeID, sourceFile, key, opts.localBudget(), started)
 	defer flight.finish()
 	if err != nil {
@@ -3460,7 +3782,7 @@ func prepareFileEngine(
 	}
 	fileCreate := func(_ context.Context, src, tmpl string) error { return dbfile.CopyDatabase(src, tmpl) }
 	ops := incrementalOps{exists: fileExists, snapshotRestore: fileRestore, snapshotCreate: fileCreate}
-	names, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
+	names, watermarks, err := snapshotRecordFanout(ctx, cfg, d, tplCtx, worktreePath, st, repoID, worktreeID,
 		sourceFile, templatePath, "", opts.localBudget(), key, inputs, store.NewAppliedLedger(inputs), ops)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("%s cold build: %w", d.Engine, err)
@@ -3488,6 +3810,7 @@ func prepareFileEngine(
 		Fingerprint:  key.Fingerprint(),
 		CacheHit:     false,
 		Clones:       clones,
+		watermarks:   watermarks,
 	}, nil
 }
 

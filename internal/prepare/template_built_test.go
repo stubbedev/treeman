@@ -32,7 +32,7 @@ func TestTemplateBuiltTargets(t *testing.T) {
 	if builtTargets(ctx, t, st, present, wtID, clones, "fp1") {
 		t.Fatal("no recorded row: must restore")
 	}
-	if err := st.SetTemplateBuilt(ctx, wtID, "db_a", "mysql", "", "fp1"); err != nil {
+	if err := st.SetTemplateBuilt(ctx, wtID, "db_a", "mysql", "", store.TemplateBuilt{Fingerprint: "fp1"}); err != nil {
 		t.Fatal(err)
 	}
 	if !builtTargets(ctx, t, st, present, wtID, clones, "fp1") {
@@ -90,12 +90,19 @@ func TestCacheHitGenericAlwaysReturnsCallableFinish(t *testing.T) {
 			// The skip gate needs a recorded built-at fingerprint matching
 			// this key AND every target present (exists always true here).
 			if scenario == "skip-gate" {
-				if err := st.SetTemplateBuilt(ctx, wtID, "db_a", "mysql", "", key.Fingerprint()); err != nil {
+				if err := st.SetTemplateBuilt(
+					ctx,
+					wtID,
+					"db_a",
+					"mysql",
+					"",
+					store.TemplateBuilt{Fingerprint: key.Fingerprint()},
+				); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			_, _, finish, cerr := cacheHitGeneric(ctx, exists, restore, d, tplCtx, "/wt", st,
+			_, _, finish, cerr := cacheHitGeneric(ctx, exists, restore, nil, d, tplCtx, "/wt", st,
 				repoID, wtID, "db_a", key, fanoutBudget{}, time.Now())
 			if cerr != nil {
 				t.Fatalf("unexpected error: %v", cerr)

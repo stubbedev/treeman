@@ -92,7 +92,7 @@ func runMySQLRecordFanout(t *testing.T, f *fakeMySQLOps) recordFanoutRun {
 	}
 	inputs := map[string]store.InputVector{"migrations/*.php": {{Path: "migrations/001.php", Hash: "h1"}}}
 	r := recordFanoutRun{st: st, wtID: wtID, ledger: store.NewAppliedLedger(inputs), key: snapshot.New("mysql", "8.0", "", "", "", "", nil)}
-	r.clones, r.err = snapshotRecordFanout(context.Background(), &config.Config{}, d, template.Context{}, t.TempDir(), st,
+	r.clones, _, r.err = snapshotRecordFanout(context.Background(), &config.Config{}, d, template.Context{}, t.TempDir(), st,
 		repoID, wtID, "app", r.key.TemplateName(), "8.0", f.budget(), r.key, inputs, r.ledger, f.ops())
 	return r
 }

@@ -1,0 +1,16 @@
+-- Record, per template-path target namespace (the source and each test
+-- clone), the engine's write watermark observed right after the build
+-- that left it at template_db_built.fingerprint (#229).
+--
+-- An incremental prepare whose ancestor IS that fingerprint can then
+-- migrate a target forward in place instead of re-copying it from the
+-- ancestor template: an unchanged watermark proves nothing wrote to the
+-- target since it was left there. Re-copying costs a full per-table DDL
+-- rebuild of every target (about 15s each on a 276-table mysql schema)
+-- to apply what is often a single new migration.
+--
+-- Shape: JSON object mapping each target namespace to its watermark
+-- token. '{}' (every row predating this column, and every build on an
+-- engine without a sound watermark) proves nothing, so those targets
+-- keep taking the restore.
+ALTER TABLE template_db_built ADD COLUMN watermarks_json TEXT NOT NULL DEFAULT '{}';
