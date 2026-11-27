@@ -132,7 +132,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		}
 	}
 	dsn := fmt.Sprintf(
-		"file:%s?_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)",
+		"file:%s?_txlock=immediate&_pragma=busy_timeout(%d)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)",
 		sqliteURIPath.Replace(path), busyTimeout.Milliseconds(),
 	)
 	db, err := sql.Open("sqlite", dsn)
